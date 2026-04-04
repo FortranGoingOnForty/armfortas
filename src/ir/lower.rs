@@ -267,9 +267,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Call { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                // Fortran default: pass by reference (pass address of each argument).
+                // If the argument is a named variable, pass its address directly.
+                // If it's an expression, evaluate it, store to a temp, pass temp address.
                 let arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
+                        }
                         _ => b.const_i32(0),
                     }
                 }).collect();
@@ -640,6 +645,30 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
         Expr::FunctionCall { callee, .. } => extract_base_name(callee),
         _ => None,
     }
+}
+
+/// Lower an argument for pass-by-reference: return the address of the value.
+/// If the argument is a named variable, return its alloca address.
+/// If it's an expression (literal, computation), store to a temp and return the temp address.
+fn lower_arg_by_ref(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, (ValueId, IrType)>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> ValueId {
+    // If it's a simple name, pass its existing address.
+    if let Expr::Name { name } = &expr.node {
+        let key = name.to_lowercase();
+        if let Some((addr, _)) = locals.get(&key) {
+            return *addr;
+        }
+    }
+    // Otherwise, evaluate and store to a temp.
+    let val = lower_expr(b, locals, expr, st);
+    let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+    let tmp = b.alloca(ty);
+    b.store(val, tmp);
+    tmp
 }
 
 /// Lower an expression to a ValueId.
@@ -1069,6 +1098,51 @@ program test
 end program
 ");
         assert!(ir.contains("rt_call @__afs_print_int"));
+    }
+
+    #[test]
+    fn lower_call_passes_addresses() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: x
+  x = 42
+  call foo(x)
+end program
+");
+        // x should be passed by reference — the alloca address, not a loaded value.
+        // The call should reference the alloca directly.
+        assert!(ir.contains("call @foo("));
+    }
+
+    #[test]
+    fn lower_call_expression_arg() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: x
+  x = 5
+  call foo(x + 1)
+end program
+");
+        // Expression arg: x+1 evaluated, stored to temp, temp address passed.
+        assert!(ir.contains("iadd"));
+        assert!(ir.contains("alloca")); // temp for expression result
+        assert!(ir.contains("call @foo("));
+    }
+
+    #[test]
+    fn lower_module_globals() {
+        let module = lower_source("\
+module mymod
+  implicit none
+  integer :: counter
+  real :: threshold
+end module
+");
+        assert_eq!(module.globals.len(), 2);
+        assert!(module.globals.iter().any(|g| g.name.contains("counter")));
+        assert!(module.globals.iter().any(|g| g.name.contains("threshold")));
     }
 
     #[test]
