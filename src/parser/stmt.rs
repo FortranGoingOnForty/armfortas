@@ -221,7 +221,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.consume_end("select");
+        self.consume_end("select")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::SelectCase { name: None, selector, cases }, span))
     }
@@ -406,7 +406,7 @@ impl<'a> Parser<'a> {
             let ew_body = self.parse_stmt_block(&["where"])?;
             elsewhere.push((ew_mask, ew_body));
         }
-        self.consume_end("where");
+        self.consume_end("where")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::WhereConstruct { name: None, mask, body, elsewhere }, span))
     }
@@ -441,7 +441,7 @@ impl<'a> Parser<'a> {
         }
 
         let body = self.parse_stmt_block(&["forall"])?;
-        self.consume_end("forall");
+        self.consume_end("forall")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::ForallConstruct { name: None, specs, mask, body }, span))
     }
@@ -449,7 +449,7 @@ impl<'a> Parser<'a> {
     fn parse_block_construct(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'block'
         let body = self.parse_stmt_block(&["block"])?;
-        self.consume_end("block");
+        self.consume_end("block")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Block { name: None, body }, span))
     }
@@ -467,7 +467,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokenKind::RParen)?;
         let body = self.parse_stmt_block(&["associate"])?;
-        self.consume_end("associate");
+        self.consume_end("associate")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Associate { name: None, assocs, body }, span))
     }
@@ -516,9 +516,29 @@ impl<'a> Parser<'a> {
                         cases.push(CaseBlock { selectors, body });
                     } else { break; }
                 }
-                self.consume_end("select");
+                self.consume_end("select")?;
                 let span = span_from_to(start, self.prev_span());
                 Ok(Spanned::new(Stmt::SelectCase { name: Some(name), selector, cases }, span))
+            }
+            "where" => {
+                let mut s = self.parse_where_construct(start)?;
+                if let Stmt::WhereConstruct { name: n, .. } = &mut s.node { *n = Some(name); }
+                Ok(s)
+            }
+            "forall" => {
+                let mut s = self.parse_forall_construct(start)?;
+                if let Stmt::ForallConstruct { name: n, .. } = &mut s.node { *n = Some(name); }
+                Ok(s)
+            }
+            "block" => {
+                let mut s = self.parse_block_construct(start)?;
+                if let Stmt::Block { name: n, .. } = &mut s.node { *n = Some(name); }
+                Ok(s)
+            }
+            "associate" => {
+                let mut s = self.parse_associate(start)?;
+                if let Stmt::Associate { name: n, .. } = &mut s.node { *n = Some(name); }
+                Ok(s)
             }
             _ => Err(self.error(format!("expected construct keyword after '{}:', got '{}'", name, text))),
         }
@@ -534,7 +554,7 @@ impl<'a> Parser<'a> {
             let condition = self.parse_expr()?;
             self.expect(&TokenKind::RParen)?;
             let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
+            self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
             return Ok(Spanned::new(Stmt::DoWhile { name: None, condition, body }, span));
         }
@@ -561,7 +581,7 @@ impl<'a> Parser<'a> {
             let mask = if self.peek() != &TokenKind::RParen { Some(self.parse_expr()?) } else { None };
             self.expect(&TokenKind::RParen)?;
             let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
+            self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
             return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, body }, span));
         }
@@ -569,7 +589,7 @@ impl<'a> Parser<'a> {
         // Infinite DO
         if self.at_stmt_end() {
             let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
+            self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
             return Ok(Spanned::new(Stmt::DoLoop {
                 name: None, var: None, start: None, end: None, step: None, body,
@@ -584,14 +604,14 @@ impl<'a> Parser<'a> {
         let do_end = self.parse_expr()?;
         let step = if self.eat(&TokenKind::Comma) { Some(self.parse_expr()?) } else { None };
         let body = self.parse_stmt_block(&["do"])?;
-        self.consume_end("do");
+        self.consume_end("do")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::DoLoop {
             name: None, var: Some(var), start: Some(do_start), end: Some(do_end), step, body,
         }, span))
     }
 
-    fn consume_end(&mut self, keyword: &str) {
+    fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
         let combined = format!("end{}", keyword);
@@ -600,11 +620,14 @@ impl<'a> Parser<'a> {
         } else if text == "end" {
             self.advance();
             self.eat_ident(keyword);
+        } else {
+            return Err(self.error(format!("expected 'end {}' or 'end{}', got '{}'", keyword, keyword, text)));
         }
         // Skip optional construct name after end.
         if self.peek() == &TokenKind::Identifier {
             self.advance();
         }
+        Ok(())
     }
 }
 
@@ -883,5 +906,89 @@ end if
             assert_eq!(assocs.len(), 1);
             assert_eq!(assocs[0].0, "n");
         } else { panic!("not Associate"); }
+    }
+
+    // ---- Missing test coverage from audit ----
+
+    #[test]
+    fn do_concurrent() {
+        let s = parse_one("do concurrent (i = 1:n)\n  a(i) = 0\nend do\n");
+        assert!(matches!(s.node, Stmt::DoConcurrent { .. }));
+    }
+
+    #[test]
+    fn forall_construct() {
+        let s = parse_one("forall (i = 1:n)\n  a(i) = i\nend forall\n");
+        assert!(matches!(s.node, Stmt::ForallConstruct { .. }));
+    }
+
+    #[test]
+    fn forall_single_line() {
+        let s = parse_one("forall (i = 1:n) a(i) = i\n");
+        assert!(matches!(s.node, Stmt::ForallStmt { .. }));
+    }
+
+    #[test]
+    fn where_single_line() {
+        let s = parse_one("where (a > 0) b = 1\n");
+        assert!(matches!(s.node, Stmt::WhereStmt { .. }));
+    }
+
+    #[test]
+    fn goto_two_words() {
+        let s = parse_one("go to 100\n");
+        if let Stmt::Goto { label } = &s.node {
+            assert_eq!(*label, 100);
+        } else { panic!("not Goto"); }
+    }
+
+    #[test]
+    fn case_multiple_selectors() {
+        let s = parse_one("select case (x)\ncase (1, 2, 3)\n  y = 1\nend select\n");
+        if let Stmt::SelectCase { cases, .. } = &s.node {
+            assert_eq!(cases[0].selectors.len(), 3);
+        } else { panic!("not SelectCase"); }
+    }
+
+    #[test]
+    fn case_open_range_low() {
+        let s = parse_one("select case (x)\ncase (:10)\n  y = 1\nend select\n");
+        if let Stmt::SelectCase { cases, .. } = &s.node {
+            assert!(matches!(cases[0].selectors[0], CaseSelector::Range { low: None, .. }));
+        } else { panic!("not SelectCase"); }
+    }
+
+    #[test]
+    fn case_open_range_high() {
+        let s = parse_one("select case (x)\ncase (10:)\n  y = 1\nend select\n");
+        if let Stmt::SelectCase { cases, .. } = &s.node {
+            assert!(matches!(cases[0].selectors[0], CaseSelector::Range { high: None, .. }));
+        } else { panic!("not SelectCase"); }
+    }
+
+    #[test]
+    fn stop_with_string() {
+        let s = parse_one("stop 'error message'\n");
+        assert!(matches!(s.node, Stmt::Stop { code: Some(_), .. }));
+    }
+
+    #[test]
+    fn error_stop_with_code() {
+        let s = parse_one("error stop 1\n");
+        assert!(matches!(s.node, Stmt::ErrorStop { code: Some(_), .. }));
+    }
+
+    #[test]
+    fn return_with_value() {
+        let s = parse_one("return 1\n");
+        assert!(matches!(s.node, Stmt::Return { value: Some(_) }));
+    }
+
+    #[test]
+    fn error_missing_end_do() {
+        let tokens = Lexer::tokenize("do i = 1, 10\n  x = i\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let result = parser.parse_stmt();
+        assert!(result.is_err(), "missing end do should error");
     }
 }
