@@ -30,9 +30,10 @@ struct LoopScope {
 struct LocalInfo {
     addr: ValueId,
     ty: IrType,
-    /// For arrays: (lower_bound, size) per dimension.
-    /// Empty for scalars.
+    /// For arrays: (lower_bound, extent) per dimension. Empty for scalars.
     dims: Vec<(i64, i64)>,
+    /// Is this an allocatable variable?
+    allocatable: bool,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -49,11 +50,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![] });
-    }
-
-    fn insert_array(&mut self, name: String, addr: ValueId, ty: IrType, dims: Vec<(i64, i64)>) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -98,6 +95,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls);
                 lower_stmts(&mut b, &mut ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    insert_implicit_dealloc(&mut b, &ctx.locals);
+                }
                 ensure_termination(&mut b, None);
             }
 
@@ -124,6 +124,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls);
                 lower_stmts(&mut b, &mut ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    insert_implicit_dealloc(&mut b, &ctx.locals);
+                }
                 ensure_termination(&mut b, None);
             }
 
@@ -159,6 +162,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
+                    insert_implicit_dealloc(&mut b, &ctx.locals);
                     let rv = b.load(result_addr);
                     b.ret(Some(rv));
                 }
@@ -192,10 +196,10 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let elem_ty = lower_type_spec(type_spec);
 
-            // Check for DIMENSION attribute on the declaration.
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
+            let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
 
             for entity in entities {
                 let key = entity.name.to_lowercase();
@@ -210,11 +214,11 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                     let addr = b.alloca(arr_ty);
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: is_allocatable });
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![] });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false });
                 }
             }
         }
@@ -247,6 +251,16 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
             eval_const_int(operand).map(|v| -v)
         }
         _ => None,
+    }
+}
+
+/// Insert implicit deallocation calls for all local allocatable variables.
+fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
+    for info in locals.values() {
+        if info.allocatable {
+            let ptr = b.load(info.addr);
+            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+        }
     }
 }
 
@@ -479,7 +493,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![] });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false });
             }
             lower_stmts(b, ctx, body);
         }
@@ -569,7 +583,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![] });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false });
             addr
         });
 
@@ -1292,6 +1306,50 @@ end program
 ");
         assert!(ir.contains("rt_call @__afs_print_int"));
     }
+
+    // ---- Allocatable / strings ----
+
+    #[test]
+    fn lower_allocate_deallocate() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  real, allocatable :: a(:)
+  allocate(a(100))
+  deallocate(a)
+end program
+");
+        assert!(ir.contains("rt_call @__afs_allocate"), "expected allocate call in:\n{}", ir);
+        assert!(ir.contains("rt_call @__afs_deallocate"), "expected deallocate call in:\n{}", ir);
+    }
+
+    #[test]
+    fn lower_implicit_dealloc_at_scope_exit() {
+        let (_, ir) = lower_and_verify("\
+subroutine foo()
+  implicit none
+  real, allocatable :: temp(:)
+  allocate(temp(10))
+end subroutine
+");
+        // Should have implicit deallocation before ret.
+        let dealloc_count = ir.matches("rt_call @__afs_deallocate").count();
+        assert!(dealloc_count >= 1, "expected implicit deallocation, got {} in:\n{}", dealloc_count, ir);
+    }
+
+    #[test]
+    fn lower_string_literal() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  print *, 'hello'
+end program
+");
+        assert!(ir.contains("const_string"), "expected string constant in:\n{}", ir);
+        assert!(ir.contains("rt_call @__afs_print"));
+    }
+
+    // ---- Calls ----
 
     #[test]
     fn lower_call_passes_addresses() {
