@@ -5,6 +5,7 @@
 //! carries a Span for source location tracking.
 
 pub mod expr;
+pub mod decl;
 
 use crate::lexer::Span;
 
