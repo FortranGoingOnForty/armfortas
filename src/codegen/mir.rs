@@ -134,7 +134,7 @@ pub enum MachineOperand {
 }
 
 /// Physical register reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysReg {
     /// 64-bit general purpose register (X0-X30).
     Gp(u8),

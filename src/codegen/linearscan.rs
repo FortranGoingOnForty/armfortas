@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use super::mir::*;
-use super::liveness::{LiveInterval, compute_liveness};
+use super::liveness::compute_liveness;
 
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
 /// Ordered: caller-saved first (prefer these to avoid save/restore overhead),
@@ -63,10 +63,6 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     let mut free_gp: Vec<u8> = GP_ALLOC_ORDER.to_vec();
     let mut free_fp: Vec<u8> = FP_ALLOC_ORDER.to_vec();
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
-
-    let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
-        .map(|v| (v.id, v.class))
-        .collect();
 
     for interval in &liveness.intervals {
         let is_fp = matches!(interval.class, RegClass::Fp32 | RegClass::Fp64);
@@ -193,13 +189,6 @@ pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult, liveness
     let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
         .map(|v| (v.id, v.class))
         .collect();
-
-    // Build a map from vreg → physical register for assigned vregs.
-    // We use this to determine which physical registers are "in use" at each point.
-    let assigned_regs: HashSet<u8> = result.assignments.values().filter_map(|p| match p {
-        PhysReg::Gp(n) | PhysReg::Gp32(n) => Some(*n),
-        _ => None,
-    }).collect();
 
     // Build interval lookup: for each vreg, its live range.
     let intervals: HashMap<VRegId, (u32, u32)> = liveness.intervals.iter()
@@ -410,7 +399,7 @@ pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
                     def: None,
                 });
             }
-            for (j, restore) in restores.into_iter().enumerate() {
+            for restore in restores {
                 block.insts.insert(ldp_idx, restore);
             }
         }
@@ -421,10 +410,11 @@ pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
 pub fn coalesce_moves(mf: &mut MachineFunction) {
     for block in &mut mf.blocks {
         block.insts.retain(|inst| {
-            if matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg) {
-                if inst.operands.len() == 2 && inst.operands[0] == inst.operands[1] {
-                    return false; // eliminate self-move
-                }
+            if matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
+                && inst.operands.len() == 2
+                && inst.operands[0] == inst.operands[1]
+            {
+                return false; // eliminate self-move
             }
             true
         });

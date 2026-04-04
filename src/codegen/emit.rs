@@ -191,7 +191,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
-            if offset_val >= -256 && offset_val <= 255 {
+            if (-256..=255).contains(&offset_val) {
                 format!("ldr {}, [{}, #{}]", dest, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then load.
@@ -207,7 +207,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
-            if offset_val >= -256 && offset_val <= 255 {
+            if (-256..=255).contains(&offset_val) {
                 format!("str {}, [{}, #{}]", src, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then store.

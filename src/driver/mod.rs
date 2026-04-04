@@ -84,15 +84,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
 
     // 2. Preprocess.
-    let mut pp_config = crate::preprocess::PreprocConfig::default();
-    pp_config.filename = opts.input.to_str().unwrap_or("<input>").to_string();
+    let pp_config = crate::preprocess::PreprocConfig {
+        filename: opts.input.to_str().unwrap_or("<input>").to_string(),
+        ..crate::preprocess::PreprocConfig::default()
+    };
     let pp_result = crate::preprocess::preprocess(&source, &pp_config)
         .map_err(|e| format!("{}", e))?;
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
         let out = opts.output_path();
-        if out == PathBuf::from("-") {
+        if out.as_os_str() == "-" {
             print!("{}", preprocessed);
         } else {
             fs::write(&out, &preprocessed)

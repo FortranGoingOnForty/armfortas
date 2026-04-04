@@ -3,7 +3,7 @@
 //! Computes live intervals for each virtual register using backward
 //! dataflow. Used by the linear scan register allocator.
 
-use std::collections::{HashMap, HashSet, BTreeSet};
+use std::collections::{HashMap, BTreeSet};
 use super::mir::*;
 
 /// A live interval: the range of instruction positions where a vreg is live.
