@@ -260,18 +260,45 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
                 if is_allocatable {
-                    // Allocatable variable: alloca a descriptor (384 bytes).
-                    // The actual data is allocated at runtime via afs_allocate_*.
+                    // Allocatable variable: alloca a descriptor (384 bytes), zero-initialized.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
                     let addr = b.alloca(desc_ty);
+                    // Zero-initialize the descriptor so flags=0 (not allocated).
+                    let zero = b.const_i32(0);
+                    let size = b.const_i64(384);
+                    b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                     locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                    let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
-                    let addr = b.alloca(arr_ty);
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false });
+                    let elem_bytes = match &elem_ty {
+                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+                        _ => 8,
+                    };
+                    let total_bytes = total_size * elem_bytes;
+                    const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
+
+                    if total_bytes >= STACK_THRESHOLD {
+                        // Large array: use descriptor + heap allocation (prevents stack overflow).
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let addr = b.alloca(desc_ty);
+                        let zero = b.const_i32(0);
+                        let size384 = b.const_i64(384);
+                        b.call(FuncRef::External("memset".into()), vec![addr, zero, size384], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        // Auto-allocate with the declared shape.
+                        let es = b.const_i64(elem_bytes);
+                        let n = b.const_i64(total_size);
+                        b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
+                        // Mark as allocatable so scope-exit dealloc fires.
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false });
+                    } else {
+                        // Small array: stack allocation.
+                        let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                        let addr = b.alloca(arr_ty);
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false });
+                    }
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
@@ -719,11 +746,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if let Some(name) = base_name {
                     if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
                         if info.allocatable {
-                            // Pass descriptor address to runtime.
-                            let null = b.const_i64(0); // null STAT pointer
+                            // Pass descriptor address to runtime with null STAT.
+                            // Alloca a dummy STAT to avoid abort on already-deallocated.
+                            let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
-                                vec![info.addr, null],
+                                vec![info.addr, stat_slot],
                                 IrType::Void,
                             );
                         } else {
