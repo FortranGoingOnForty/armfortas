@@ -41,6 +41,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a type specifier for IMPLICIT — without consuming a kind selector,
+    /// since the parenthesized part is the letter range, not a kind.
+    fn parse_implicit_type_spec(&mut self) -> Option<Result<TypeSpec, ParseError>> {
+        let text = self.peek_text().to_lowercase();
+        match text.as_str() {
+            "integer" => { self.advance(); Some(Ok(TypeSpec::Integer(None))) }
+            "real" => { self.advance(); Some(Ok(TypeSpec::Real(None))) }
+            "doubleprecision" | "double" => {
+                self.advance();
+                if self.peek_text().eq_ignore_ascii_case("precision") {
+                    self.advance();
+                }
+                Some(Ok(TypeSpec::DoublePrecision))
+            }
+            "complex" => { self.advance(); Some(Ok(TypeSpec::Complex(None))) }
+            "logical" => { self.advance(); Some(Ok(TypeSpec::Logical(None))) }
+            "character" => { self.advance(); Some(Ok(TypeSpec::Character(None))) }
+            _ => None,
+        }
+    }
+
     fn parse_kind_selector(&mut self) -> Result<Option<KindSelector>, ParseError> {
         // Check for *N (old-style)
         if self.eat(&TokenKind::Star) {
@@ -488,9 +509,13 @@ impl<'a> Parser<'a> {
         }
 
         // IMPLICIT type-spec (letter-range-list)
+        // Note: we parse the type keyword WITHOUT its kind selector, because
+        // the parenthesized part after the type keyword is the letter range,
+        // not a kind selector. E.g., "implicit integer (i-n)" — the (i-n)
+        // is a letter range, not kind=i-n.
         let mut specs = Vec::new();
         loop {
-            let type_spec = self.try_parse_type_spec()
+            let type_spec = self.parse_implicit_type_spec()
                 .ok_or_else(|| self.error("expected type specifier in IMPLICIT".into()))??;
             self.expect(&TokenKind::LParen)?;
             let mut ranges = Vec::new();
@@ -508,6 +533,248 @@ impl<'a> Parser<'a> {
 
         let span = crate::parser::expr::span_from_to(start, self.prev_span());
         Ok(Spanned::new(Decl::ImplicitStmt { specs }, span))
+    }
+
+    // ---- Derived type definition ----
+
+    pub fn parse_derived_type_def(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        // Already consumed 'type'. Next could be :: or , attrs.
+
+        let mut attrs = Vec::new();
+
+        // Parse type attributes: abstract, bind(c), extends(parent), public, private
+        while self.eat(&TokenKind::Comma) {
+            let text = self.peek_text().to_lowercase();
+            match text.as_str() {
+                "abstract" => { self.advance(); attrs.push(TypeAttr::Abstract); }
+                "public" => { self.advance(); attrs.push(TypeAttr::Public); }
+                "private" => { self.advance(); attrs.push(TypeAttr::Private); }
+                "bind" => {
+                    self.advance();
+                    let name = self.parse_bind_spec()?;
+                    attrs.push(TypeAttr::Bind(name));
+                }
+                "extends" => {
+                    self.advance();
+                    self.expect(&TokenKind::LParen)?;
+                    let parent = self.advance().clone().text;
+                    self.expect(&TokenKind::RParen)?;
+                    attrs.push(TypeAttr::Extends(parent));
+                }
+                _ => break,
+            }
+        }
+
+        self.eat(&TokenKind::ColonColon);
+        let name = self.advance().clone().text;
+        self.skip_newlines();
+
+        // Parse components until 'contains' or 'end type'.
+        let mut components = Vec::new();
+        let mut type_bound_procs = Vec::new();
+        let mut final_procs = Vec::new();
+
+        loop {
+            self.skip_newlines();
+            let text = self.peek_text().to_lowercase();
+
+            if text == "contains" {
+                self.advance();
+                self.skip_newlines();
+                // Parse type-bound procedures until 'end type'.
+                loop {
+                    self.skip_newlines();
+                    let proc_text = self.peek_text().to_lowercase();
+                    if proc_text == "end" { break; }
+                    if proc_text == "endtype" { break; }
+
+                    if proc_text == "procedure" {
+                        self.advance();
+                        let tbp = self.parse_type_bound_proc()?;
+                        type_bound_procs.push(tbp);
+                    } else if proc_text == "generic" {
+                        self.advance();
+                        let tbp = self.parse_type_bound_proc_generic()?;
+                        type_bound_procs.push(tbp);
+                    } else if proc_text == "final" {
+                        self.advance();
+                        self.eat(&TokenKind::ColonColon);
+                        let name = self.advance().clone().text;
+                        final_procs.push(name);
+                    } else {
+                        // Skip unknown lines in contains section.
+                        while !self.at_stmt_end() { self.advance(); }
+                    }
+                    self.skip_newlines();
+                }
+                break;
+            }
+
+            if text == "end" || text == "endtype" {
+                break;
+            }
+
+            // Try to parse a component declaration.
+            if let Some(ts_result) = self.try_parse_type_spec() {
+                let ts = ts_result?;
+                let comp = self.parse_type_decl(ts)?;
+                components.push(comp);
+            } else {
+                // Skip unrecognized lines.
+                while !self.at_stmt_end() { self.advance(); }
+                self.skip_newlines();
+            }
+        }
+
+        // Consume 'end type [name]'.
+        if self.peek_text().eq_ignore_ascii_case("endtype") {
+            self.advance();
+        } else if self.peek_text().eq_ignore_ascii_case("end") {
+            self.advance();
+            self.eat_ident("type");
+        }
+        // Optional name after end type.
+        if self.peek() == &TokenKind::Identifier {
+            self.advance();
+        }
+
+        let extends = attrs.iter().find_map(|a| {
+            if let TypeAttr::Extends(ref p) = a { Some(p.clone()) } else { None }
+        });
+
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::DerivedTypeDef {
+            name, extends, attrs, components, type_bound_procs, final_procs,
+        }, span))
+    }
+
+    fn parse_type_bound_proc(&mut self) -> Result<TypeBoundProc, ParseError> {
+        // procedure [, attrs] :: name [=> binding]
+        let mut proc_attrs = Vec::new();
+        while self.eat(&TokenKind::Comma) {
+            let text = self.peek_text().to_lowercase();
+            match text.as_str() {
+                "pass" | "nopass" | "deferred" | "non_overridable" => {
+                    proc_attrs.push(self.advance().clone().text);
+                }
+                _ => break,
+            }
+        }
+        self.eat(&TokenKind::ColonColon);
+        let name = self.advance().clone().text;
+        let binding = if self.eat(&TokenKind::Arrow) {
+            Some(self.advance().clone().text)
+        } else {
+            None
+        };
+        Ok(TypeBoundProc { name, binding, attrs: proc_attrs, is_generic: false })
+    }
+
+    fn parse_type_bound_proc_generic(&mut self) -> Result<TypeBoundProc, ParseError> {
+        // generic :: operator(+) => specific_name
+        // or generic :: name => specific_name
+        self.eat(&TokenKind::ColonColon);
+        let mut name = self.advance().clone().text;
+        // Handle operator(...) form.
+        if name.eq_ignore_ascii_case("operator") || name.eq_ignore_ascii_case("assignment") {
+            self.expect(&TokenKind::LParen)?;
+            let op = self.advance().clone().text;
+            self.expect(&TokenKind::RParen)?;
+            name = format!("{}({})", name, op);
+        }
+        let binding = if self.eat(&TokenKind::Arrow) {
+            Some(self.advance().clone().text)
+        } else {
+            None
+        };
+        Ok(TypeBoundProc { name, binding, attrs: Vec::new(), is_generic: true })
+    }
+
+    // ---- PARAMETER, COMMON, EQUIVALENCE, DATA ----
+
+    pub fn parse_parameter_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        // Already consumed 'parameter'. Expect (name=expr, ...)
+        self.expect(&TokenKind::LParen)?;
+        let mut pairs = Vec::new();
+        loop {
+            let name = self.advance().clone().text;
+            self.expect(&TokenKind::Assign)?;
+            let value = self.parse_expr()?;
+            pairs.push((name, value));
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        self.expect(&TokenKind::RParen)?;
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::ParameterStmt { pairs }, span))
+    }
+
+    pub fn parse_common_block(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        // Already consumed 'common'. Expect /name/ var-list.
+        let name = if self.eat(&TokenKind::Slash) {
+            let n = self.advance().clone().text;
+            self.expect(&TokenKind::Slash)?;
+            Some(n)
+        } else {
+            None
+        };
+        let mut vars = Vec::new();
+        loop {
+            vars.push(self.advance().clone().text);
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::CommonBlock { name, vars }, span))
+    }
+
+    pub fn parse_data_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
+        use crate::parser::expr::BP_MUL;
+        let start = self.current_span();
+        // Already consumed 'data'. Format: obj-list /value-list/ [, obj-list /value-list/]
+        // Note: / delimiters conflict with division operator. We parse expressions
+        // at a binding power that excludes * and / to prevent consuming the delimiter.
+        let mut sets = Vec::new();
+        loop {
+            let mut objects = Vec::new();
+            while self.peek() != &TokenKind::Slash {
+                objects.push(self.parse_expr_bp(BP_MUL.right)?);
+                if !self.eat(&TokenKind::Comma) { break; }
+            }
+            self.expect(&TokenKind::Slash)?;
+            let mut values = Vec::new();
+            while self.peek() != &TokenKind::Slash {
+                values.push(self.parse_expr_bp(BP_MUL.right)?);
+                if !self.eat(&TokenKind::Comma) { break; }
+            }
+            self.expect(&TokenKind::Slash)?;
+            sets.push(DataSet { objects, values });
+            if !self.eat(&TokenKind::Comma) { break; }
+            // Check if next batch starts or if we're at end of statement.
+            if self.at_stmt_end() { break; }
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::DataStmt { sets }, span))
+    }
+
+    pub fn parse_equivalence_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        // Already consumed 'equivalence'. Format: (var-list), (var-list), ...
+        let mut groups = Vec::new();
+        loop {
+            self.expect(&TokenKind::LParen)?;
+            let mut group = Vec::new();
+            loop {
+                group.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) { break; }
+            }
+            self.expect(&TokenKind::RParen)?;
+            groups.push(group);
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::EquivalenceStmt { groups }, span))
     }
 }
 
@@ -537,6 +804,30 @@ mod tests {
         if parser.peek_text().eq_ignore_ascii_case("implicit") {
             parser.advance();
             return parser.parse_implicit().unwrap();
+        }
+
+        // Try PARAMETER.
+        if parser.peek_text().eq_ignore_ascii_case("parameter") {
+            parser.advance();
+            return parser.parse_parameter_stmt().unwrap();
+        }
+
+        // Try COMMON.
+        if parser.peek_text().eq_ignore_ascii_case("common") {
+            parser.advance();
+            return parser.parse_common_block().unwrap();
+        }
+
+        // Try DATA.
+        if parser.peek_text().eq_ignore_ascii_case("data") {
+            parser.advance();
+            return parser.parse_data_stmt().unwrap();
+        }
+
+        // Try EQUIVALENCE.
+        if parser.peek_text().eq_ignore_ascii_case("equivalence") {
+            parser.advance();
+            return parser.parse_equivalence_stmt().unwrap();
         }
 
         panic!("could not parse as declaration: {}", src);
@@ -738,5 +1029,154 @@ mod tests {
             assert!(matches!(specs[0].type_spec, TypeSpec::DoublePrecision));
             assert_eq!(specs[0].ranges.len(), 2);
         } else { panic!("not ImplicitStmt"); }
+    }
+
+    // ---- PARAMETER, COMMON, DATA, EQUIVALENCE ----
+
+    #[test]
+    fn parameter_stmt() {
+        let d = parse_decl("parameter (pi = 3.14159, e = 2.71828)");
+        if let Decl::ParameterStmt { pairs } = &d.node {
+            assert_eq!(pairs.len(), 2);
+            assert_eq!(pairs[0].0, "pi");
+            assert_eq!(pairs[1].0, "e");
+        } else { panic!("not ParameterStmt"); }
+    }
+
+    #[test]
+    fn common_block() {
+        let d = parse_decl("common /block1/ x, y, z");
+        if let Decl::CommonBlock { name, vars } = &d.node {
+            assert_eq!(name.as_deref(), Some("block1"));
+            assert_eq!(vars.len(), 3);
+        } else { panic!("not CommonBlock"); }
+    }
+
+    #[test]
+    fn data_stmt() {
+        let d = parse_decl("data x /1.0/, y /2.0/");
+        if let Decl::DataStmt { sets } = &d.node {
+            assert_eq!(sets.len(), 2);
+        } else { panic!("not DataStmt"); }
+    }
+
+    #[test]
+    fn equivalence_stmt() {
+        let d = parse_decl("equivalence (a, b), (c, d)");
+        if let Decl::EquivalenceStmt { groups } = &d.node {
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].len(), 2);
+        } else { panic!("not EquivalenceStmt"); }
+    }
+
+    // ---- Audit test gap coverage ----
+
+    #[test]
+    fn real_star8_old_style() {
+        let d = parse_decl("real*8 :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::Real(Some(KindSelector::Star(_)))));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn character_bare_length() {
+        let d = parse_decl("character(10) :: s");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            if let TypeSpec::Character(Some(cs)) = type_spec {
+                assert!(matches!(cs.len, Some(LenSpec::Expr(_))));
+            } else { panic!("not character type"); }
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn integer_kind_keyword() {
+        let d = parse_decl("integer(kind=4) :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::Integer(Some(_))));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn class_derived_type() {
+        let d = parse_decl("class(my_type) :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::Class(ref n) if n == "my_type"));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn type_star_assumed() {
+        let d = parse_decl("type(*) :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::TypeStar));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn entity_array_spec() {
+        let d = parse_decl("integer :: a(10), b(20,30)");
+        if let Decl::TypeDecl { entities, .. } = &d.node {
+            assert!(entities[0].array_spec.is_some());
+            assert_eq!(entities[0].array_spec.as_ref().unwrap().len(), 1);
+            assert!(entities[1].array_spec.is_some());
+            assert_eq!(entities[1].array_spec.as_ref().unwrap().len(), 2);
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn logical_type() {
+        let d = parse_decl("logical :: flag");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::Logical(None)));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn complex_type() {
+        let d = parse_decl("complex :: z");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::Complex(None)));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn implicit_integer() {
+        let d = parse_decl("implicit integer (i-n)");
+        if let Decl::ImplicitStmt { specs } = &d.node {
+            assert!(matches!(specs[0].type_spec, TypeSpec::Integer(_)));
+        } else { panic!("not ImplicitStmt"); }
+    }
+
+    #[test]
+    fn use_double_colon() {
+        let d = parse_decl("use :: my_module");
+        if let Decl::UseStmt { module, .. } = &d.node {
+            assert_eq!(module, "my_module");
+        } else { panic!("not UseStmt"); }
+    }
+
+    #[test]
+    fn bind_with_name() {
+        let d = parse_decl("integer, bind(c, name='cfunc') :: x");
+        if let Decl::TypeDecl { attrs, .. } = &d.node {
+            assert!(attrs.iter().any(|a| matches!(a, Attribute::Bind(Some(_)))));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn save_attribute() {
+        let d = parse_decl("integer, save :: x");
+        if let Decl::TypeDecl { attrs, .. } = &d.node {
+            assert!(attrs.contains(&Attribute::Save));
+        } else { panic!("not TypeDecl"); }
+    }
+
+    #[test]
+    fn value_attribute() {
+        let d = parse_decl("integer, value :: x");
+        if let Decl::TypeDecl { attrs, .. } = &d.node {
+            assert!(attrs.contains(&Attribute::Value));
+        } else { panic!("not TypeDecl"); }
     }
 }

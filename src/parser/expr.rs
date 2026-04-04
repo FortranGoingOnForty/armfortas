@@ -16,9 +16,9 @@ use super::{Parser, ParseError};
 /// For right-associative: left bp > right bp.
 /// For non-associative: left bp == right bp (disallows chaining).
 #[derive(Debug, Clone, Copy)]
-struct Bp {
-    left: u8,
-    right: u8,
+pub(crate) struct Bp {
+    pub(crate) left: u8,
+    pub(crate) right: u8,
 }
 
 // Precedence levels (from Fortran standard, lowest to highest).
@@ -33,7 +33,7 @@ const BP_COMPARISON: Bp = Bp { left: 12, right: 12 };    // ==, /=, <, >, <=, >=
 const BP_CONCAT: Bp = Bp { left: 14, right: 15 };        // //
 const BP_ADD: Bp = Bp { left: 16, right: 17 };           // +, - (binary)
 const BP_UNARY_ADD: u8 = 18;                              // +, - (unary)
-const BP_MUL: Bp = Bp { left: 20, right: 21 };           // *, /
+pub(crate) const BP_MUL: Bp = Bp { left: 20, right: 21 };           // *, /
 const BP_POW: Bp = Bp { left: 23, right: 22 };           // ** (RIGHT-assoc: left > right)
 const BP_DEFINED_UNARY: u8 = 24;                          // .myop. (unary)
 
@@ -44,7 +44,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an expression with at least `min_bp` binding power (Pratt core).
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<SpannedExpr, ParseError> {
+    pub fn parse_expr_bp(&mut self, min_bp: u8) -> Result<SpannedExpr, ParseError> {
         // Parse prefix (atom or unary operator).
         let mut left = self.parse_prefix()?;
 
