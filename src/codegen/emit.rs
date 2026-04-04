@@ -243,8 +243,16 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::AdrpLdr => {
             if let MachineOperand::ConstPool(idx) = &inst.operands[1] {
                 let label = const_pool_label(&mf.name, *idx);
-                format!("adrp {0}, {1}@PAGE\n    ldr {0}, [{0}, {1}@PAGEOFF]",
-                    op_str(&inst.operands[0]), label)
+                let dest = op_str(&inst.operands[0]);
+                // ADRP requires a GP register. If dest is FP (s/d), use x8 as scratch.
+                let is_fp = dest.starts_with('s') || dest.starts_with('d');
+                if is_fp {
+                    format!("adrp x8, {1}@PAGE\n    ldr {0}, [x8, {1}@PAGEOFF]",
+                        dest, label)
+                } else {
+                    format!("adrp {0}, {1}@PAGE\n    ldr {0}, [{0}, {1}@PAGEOFF]",
+                        dest, label)
+                }
             } else {
                 "nop ; bad adrp+ldr".into()
             }

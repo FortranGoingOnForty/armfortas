@@ -1060,11 +1060,33 @@ fn lower_expr(
         }
 
         Expr::BinaryOp { op, left, right } => {
-            let lhs = lower_expr(b, locals, left, st);
-            let rhs = lower_expr(b, locals, right, st);
+            let mut lhs = lower_expr(b, locals, left, st);
+            let mut rhs = lower_expr(b, locals, right, st);
             let lty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+            let rty = b.func().value_type(rhs).unwrap_or(IrType::Int(IntWidth::I32));
 
-            match (op, &lty) {
+            // Implicit type promotion: if one side is int and the other float,
+            // convert the int to float (Fortran mixed-mode arithmetic).
+            let result_ty = if lty.is_float() || rty.is_float() {
+                let fw = match (&lty, &rty) {
+                    (IrType::Float(FloatWidth::F64), _) | (_, IrType::Float(FloatWidth::F64)) => FloatWidth::F64,
+                    _ => FloatWidth::F32,
+                };
+                if lty.is_int() { lhs = b.int_to_float(lhs, fw); }
+                if rty.is_int() { rhs = b.int_to_float(rhs, fw); }
+                // Promote f32 to f64 if other is f64.
+                if matches!(lty, IrType::Float(FloatWidth::F32)) && fw == FloatWidth::F64 {
+                    lhs = b.float_extend(lhs, FloatWidth::F64);
+                }
+                if matches!(rty, IrType::Float(FloatWidth::F32)) && fw == FloatWidth::F64 {
+                    rhs = b.float_extend(rhs, FloatWidth::F64);
+                }
+                IrType::Float(fw)
+            } else {
+                lty.clone()
+            };
+
+            match (op, &result_ty) {
                 (BinaryOp::Add, IrType::Int(_)) => b.iadd(lhs, rhs),
                 (BinaryOp::Add, IrType::Float(_)) => b.fadd(lhs, rhs),
                 (BinaryOp::Sub, IrType::Int(_)) => b.isub(lhs, rhs),
@@ -1075,7 +1097,6 @@ fn lower_expr(
                 (BinaryOp::Div, IrType::Float(_)) => b.fdiv(lhs, rhs),
                 (BinaryOp::Pow, IrType::Float(_)) => b.fpow(lhs, rhs),
                 (BinaryOp::Pow, IrType::Int(_)) => {
-                    // Integer power: convert to float, fpow, convert back.
                     let fl = b.int_to_float(lhs, FloatWidth::F64);
                     let fr = b.int_to_float(rhs, FloatWidth::F64);
                     let result = b.fpow(fl, fr);
