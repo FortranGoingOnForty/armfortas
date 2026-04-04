@@ -737,10 +737,11 @@ fn eval_and(expr: &str) -> Result<i64, String> {
 }
 
 fn eval_comparison(expr: &str) -> Result<i64, String> {
+    // Scan right-to-left for left-associative evaluation.
     for (op, op_len) in [("==", 2), ("!=", 2), (">=", 2), ("<=", 2), (">", 1), ("<", 1)] {
-        if let Some(pos) = find_op(expr, op) {
-            let left = eval_unary(&expr[..pos])?;
-            let right = eval_unary(&expr[pos + op_len..])?;
+        if let Some(pos) = find_op_right(expr, op) {
+            let left = eval_comparison(&expr[..pos])?;
+            let right = eval_additive(&expr[pos + op_len..])?;
             let result = match op {
                 "==" => left == right,
                 "!=" => left != right,
@@ -753,6 +754,46 @@ fn eval_comparison(expr: &str) -> Result<i64, String> {
             return Ok(if result { 1 } else { 0 });
         }
     }
+    eval_additive(expr)
+}
+
+fn eval_additive(expr: &str) -> Result<i64, String> {
+    // Scan right-to-left for left-associative + and -.
+    // But be careful: don't match unary minus (no left operand).
+    if let Some(pos) = find_op_right(expr, "+") {
+        let left = eval_additive(&expr[..pos])?;
+        let right = eval_multiplicative(&expr[pos + 1..])?;
+        return Ok(left + right);
+    }
+    // For minus, only match if there's a non-empty left side (not unary).
+    if let Some(pos) = find_op_right(expr, "-") {
+        if pos > 0 && !expr[..pos].trim().is_empty() {
+            let left = eval_additive(&expr[..pos])?;
+            let right = eval_multiplicative(&expr[pos + 1..])?;
+            return Ok(left - right);
+        }
+    }
+    eval_multiplicative(expr)
+}
+
+fn eval_multiplicative(expr: &str) -> Result<i64, String> {
+    if let Some(pos) = find_op_right(expr, "*") {
+        let left = eval_multiplicative(&expr[..pos])?;
+        let right = eval_unary(&expr[pos + 1..])?;
+        return Ok(left * right);
+    }
+    if let Some(pos) = find_op_right(expr, "/") {
+        let left = eval_multiplicative(&expr[..pos])?;
+        let right = eval_unary(&expr[pos + 1..])?;
+        if right == 0 { return Err("division by zero in #if expression".into()); }
+        return Ok(left / right);
+    }
+    if let Some(pos) = find_op_right(expr, "%") {
+        let left = eval_multiplicative(&expr[..pos])?;
+        let right = eval_unary(&expr[pos + 1..])?;
+        if right == 0 { return Err("modulo by zero in #if expression".into()); }
+        return Ok(left % right);
+    }
     eval_unary(expr)
 }
 
@@ -761,6 +802,13 @@ fn eval_unary(expr: &str) -> Result<i64, String> {
     if let Some(rest) = trimmed.strip_prefix('!') {
         let val = eval_unary(rest)?;
         return Ok(if val == 0 { 1 } else { 0 });
+    }
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        let val = eval_unary(rest)?;
+        return Ok(-val);
+    }
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        return eval_unary(rest);
     }
     eval_primary(trimmed)
 }
@@ -816,6 +864,40 @@ fn find_op(expr: &str, op: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Find the rightmost occurrence of an operator at the top level (not inside parentheses).
+/// Used for left-associative binary operators.
+fn find_op_right(expr: &str, op: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut depth = 0i32;
+    let mut last_match = None;
+    let mut i = 0;
+    while i + op_bytes.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {
+                if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
+                    // Don't match multi-char operators as part of longer ones.
+                    // e.g., don't match ">" inside ">=" or "!" inside "!=".
+                    let after = i + op_bytes.len();
+                    let is_part_of_longer = match op {
+                        ">" => after < bytes.len() && bytes[after] == b'=',
+                        "<" => after < bytes.len() && bytes[after] == b'=',
+                        "!" => after < bytes.len() && bytes[after] == b'=',
+                        _ => false,
+                    };
+                    if !is_part_of_longer {
+                        last_match = Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    last_match
 }
 
 fn find_matching_paren(s: &str) -> Option<usize> {
@@ -1283,6 +1365,58 @@ end module
     #[test]
     fn eval_hex() {
         assert!(eval_expr("0xFF > 200").unwrap());
+    }
+
+    // Arithmetic
+    #[test]
+    fn eval_addition() {
+        assert_eq!(eval_expr("3 + 4").unwrap(), true); // 7 != 0
+        assert!(eval_expr("100 + 200 > 250").unwrap());
+    }
+
+    #[test]
+    fn eval_subtraction() {
+        assert!(eval_expr("10 - 5 > 0").unwrap());
+        assert!(!eval_expr("5 - 10 > 0").unwrap());
+    }
+
+    #[test]
+    fn eval_multiplication() {
+        assert!(eval_expr("6 * 7 == 42").unwrap());
+    }
+
+    #[test]
+    fn eval_division() {
+        assert!(eval_expr("42 / 6 == 7").unwrap());
+    }
+
+    #[test]
+    fn eval_modulo() {
+        assert!(eval_expr("10 % 3 == 1").unwrap());
+    }
+
+    #[test]
+    fn eval_unary_minus() {
+        assert!(eval_expr("-1 < 0").unwrap());
+        assert!(eval_expr("-(-1) > 0").unwrap());
+    }
+
+    #[test]
+    fn eval_complex_arithmetic() {
+        // (1024 + 1) > 512
+        assert!(eval_expr("1024 + 1 > 512").unwrap());
+    }
+
+    #[test]
+    fn eval_precedence() {
+        // 2 + 3 * 4 = 14 (not 20)
+        assert!(eval_expr("2 + 3 * 4 == 14").unwrap());
+    }
+
+    #[test]
+    fn if_with_arithmetic() {
+        let out = pp_with("#if MAX + 1 > 512\nbig\n#else\nsmall\n#endif\n", &[("MAX", "1024")]);
+        assert!(lines(&out).contains(&"big"));
     }
 
     // ---- Variadic macros ----
