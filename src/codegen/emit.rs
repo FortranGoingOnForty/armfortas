@@ -205,12 +205,16 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
 
         ArmOpcode::StpPre => {
+            // Prologue: allocate frame, save FP/LR at top.
             let frame_size = mf.frame.size;
-            format!("stp x29, x30, [sp, #-{}]!", frame_size)
+            format!("sub sp, sp, #{}\n    stp x29, x30, [sp, #{}]",
+                frame_size, frame_size - 16)
         }
         ArmOpcode::LdpPost => {
+            // Epilogue: restore FP/LR from top, deallocate frame.
             let frame_size = mf.frame.size;
-            format!("ldp x29, x30, [sp], #{}", frame_size)
+            format!("ldp x29, x30, [sp, #{}]\n    add sp, sp, #{}",
+                frame_size - 16, frame_size)
         }
 
         ArmOpcode::AdrpLdr => {
@@ -321,8 +325,10 @@ mod tests {
     #[test]
     fn emit_prologue_epilogue() {
         let asm = emit_simple(|b| b.ret_void());
-        assert!(asm.contains("stp x29, x30, [sp,"), "missing prologue: {}", asm);
-        assert!(asm.contains("ldp x29, x30, [sp],"), "missing epilogue: {}", asm);
+        assert!(asm.contains("sub sp, sp,"), "missing frame allocation: {}", asm);
+        assert!(asm.contains("stp x29, x30, [sp,"), "missing prologue save: {}", asm);
+        assert!(asm.contains("ldp x29, x30, [sp,"), "missing epilogue restore: {}", asm);
+        assert!(asm.contains("add sp, sp,"), "missing frame deallocation: {}", asm);
         assert!(asm.contains("ret"), "missing ret: {}", asm);
     }
 
@@ -357,7 +363,7 @@ mod tests {
             b.ret_void();
         });
         assert!(asm.contains("b.ne"), "missing conditional branch: {}", asm);
-        assert!(asm.contains("then:"), "missing then label: {}", asm);
-        assert!(asm.contains("else:"), "missing else label: {}", asm);
+        assert!(asm.contains("then_"), "missing then label: {}", asm);
+        assert!(asm.contains("else_"), "missing else label: {}", asm);
     }
 }

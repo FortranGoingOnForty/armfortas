@@ -741,21 +741,11 @@ fn emit_prologue(mf: &mut MachineFunction, mb: MBlockId) {
 }
 
 /// Emit function epilogue:
-///   sub sp, x29, #FRAME_SIZE - 16  (restore SP to bottom of frame)
-///   ldp x29, x30, [sp], #FRAME_SIZE
+///   ldp x29, x30, [sp, #FRAME_SIZE-16]
+///   add sp, sp, #FRAME_SIZE
 ///   ret
 fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
-    // SUB sp, x29, #FRAME_SIZE - 16 (sentinel -1 replaced during emit)
-    mf.block_mut(mb).insts.push(MachineInst {
-        opcode: ArmOpcode::SubImm,
-        operands: vec![
-            MachineOperand::PhysReg(PhysReg::Sp),
-            MachineOperand::PhysReg(PhysReg::FP),
-            MachineOperand::Imm(-1), // sentinel: replaced during emit
-        ],
-        def: None,
-    });
-    // LDP x29, x30, [sp], #FRAME_SIZE
+    // LDP + ADD emitted as a single LdpPost pseudo-op, expanded during emit.
     mf.block_mut(mb).insts.push(MachineInst {
         opcode: ArmOpcode::LdpPost,
         operands: vec![
