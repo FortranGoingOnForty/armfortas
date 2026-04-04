@@ -275,8 +275,23 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     scope: st.current_scope(),
                 });
             }
-            ProgramUnit::Function { name, return_type, .. } => {
-                let ret_type_info = return_type.as_ref().map(type_spec_to_info);
+            ProgramUnit::Function { name, return_type, result, decls, .. } => {
+                let ret_type_info = return_type.as_ref().map(type_spec_to_info)
+                    .or_else(|| {
+                        // Infer return type from result variable's declaration.
+                        let result_name = result.as_deref().unwrap_or(name.as_str());
+                        let key = result_name.to_lowercase();
+                        for d in decls {
+                            if let decl::Decl::TypeDecl { type_spec, entities, .. } = &d.node {
+                                for e in entities {
+                                    if e.name.to_lowercase() == key {
+                                        return Some(type_spec_to_info(type_spec));
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    });
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
