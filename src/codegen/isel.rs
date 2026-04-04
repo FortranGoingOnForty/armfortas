@@ -99,7 +99,8 @@ impl ISelCtx {
 
     /// Get the vreg for an IR value, assuming it was already mapped.
     fn lookup_vreg(&self, val: ValueId) -> VRegId {
-        *self.value_map.get(&val).unwrap_or(&VRegId(0))
+        *self.value_map.get(&val)
+            .unwrap_or_else(|| panic!("isel: unmapped IR value %{}", val.0))
     }
 
     /// Get machine block for an IR block.
@@ -182,14 +183,14 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 ],
                 def: Some(tmp),
             });
-            // dest = msub a, tmp, b  (a - tmp * b)
+            // dest = msub tmp, vb, va → va - tmp * vb = a - (a/b)*b
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::Msub,
                 operands: vec![
                     MachineOperand::VReg(dest),
-                    MachineOperand::VReg(va),
                     MachineOperand::VReg(tmp),
                     MachineOperand::VReg(vb),
+                    MachineOperand::VReg(va),
                 ],
                 def: Some(dest),
             });
@@ -291,7 +292,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 opcode: ArmOpcode::OrnReg,
                 operands: vec![
                     MachineOperand::VReg(dest),
-                    MachineOperand::PhysReg(PhysReg::XZR),
+                    MachineOperand::PhysReg(PhysReg::Xzr),
                     MachineOperand::VReg(va),
                 ],
                 def: Some(dest),
@@ -355,13 +356,14 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             // The "address" is a frame slot offset. Map the ValueId to the offset.
             if let Some(&offset) = ctx.alloca_offsets.get(&inst.id) {
                 let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
-                // Materialize the address: ADD dest, FP, #offset
+                // Materialize address: SUB dest, FP, #abs(offset) (offsets are negative from FP)
+                let abs_offset = (-offset) as i64;
                 mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::AddImm,
+                    opcode: ArmOpcode::SubImm,
                     operands: vec![
                         MachineOperand::VReg(dest),
                         MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::FrameSlot(offset),
+                        MachineOperand::Imm(abs_offset),
                     ],
                     def: Some(dest),
                 });
@@ -434,14 +436,16 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             let base_vreg = ctx.lookup_vreg(*base);
 
+            // Determine element size from the GEP result type (Ptr<elem_ty>).
+            let elem_size = match &inst.ty {
+                IrType::Ptr(inner) => alloca_size(inner) as i64,
+                _ => 4, // fallback
+            };
+
             if let Some(idx) = indices.first() {
                 let idx_vreg = ctx.lookup_vreg(*idx);
-                // Simplified: assume elem_size fits in shift (4 bytes = LSL #2, 8 bytes = LSL #3).
-                // For now: ADD dest, base, idx, LSL #2 (i32 elements).
-                // Full implementation would compute elem_size * idx.
                 let tmp = mf.new_vreg(RegClass::Gp64);
-                // tmp = idx * 4 (for i32 elements — simplified)
-                emit_const_int(mf, mb, tmp, 4, IntWidth::I64);
+                emit_const_int(mf, mb, tmp, elem_size, IntWidth::I64);
                 let scaled = mf.new_vreg(RegClass::Gp64);
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::Mul,
@@ -599,10 +603,10 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
             });
         }
         Terminator::Unreachable => {
-            // Emit a trap or nothing — unreachable code after STOP.
+            // Debug trap — should never execute. brk #1 triggers SIGTRAP.
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::Nop,
-                operands: vec![],
+                opcode: ArmOpcode::Brk,
+                operands: vec![MachineOperand::Imm(1)],
                 def: None,
             });
         }
@@ -618,7 +622,7 @@ fn emit_prologue(mf: &mut MachineFunction, mb: MBlockId) {
         operands: vec![
             MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::PhysReg(PhysReg::LR),
-            MachineOperand::PhysReg(PhysReg::SP),
+            MachineOperand::PhysReg(PhysReg::Sp),
             // Frame size filled in during emission (needs final frame.size).
         ],
         def: None,
@@ -627,7 +631,7 @@ fn emit_prologue(mf: &mut MachineFunction, mb: MBlockId) {
         opcode: ArmOpcode::MovReg,
         operands: vec![
             MachineOperand::PhysReg(PhysReg::FP),
-            MachineOperand::PhysReg(PhysReg::SP),
+            MachineOperand::PhysReg(PhysReg::Sp),
         ],
         def: None,
     });
@@ -640,7 +644,7 @@ fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
         operands: vec![
             MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::PhysReg(PhysReg::LR),
-            MachineOperand::PhysReg(PhysReg::SP),
+            MachineOperand::PhysReg(PhysReg::Sp),
         ],
         def: None,
     });
@@ -661,7 +665,7 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64
             opcode: ArmOpcode::MovReg,
             operands: vec![
                 MachineOperand::VReg(dest),
-                MachineOperand::PhysReg(PhysReg::XZR),
+                MachineOperand::PhysReg(PhysReg::Xzr),
             ],
             def: Some(dest),
         });
@@ -890,8 +894,8 @@ mod tests {
             b.store(val, addr);
             b.ret_void();
         });
-        // Should have an AddImm (address materialization) and StrImm.
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::AddImm));
+        // Should have SubImm (address materialization from FP) and StrImm.
+        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::SubImm));
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::StrImm));
     }
 
@@ -946,7 +950,7 @@ mod tests {
         let insts = &mf.blocks[0].insts;
         let has_mov_xzr = insts.iter().any(|i| {
             i.opcode == ArmOpcode::MovReg &&
-            i.operands.iter().any(|o| matches!(o, MachineOperand::PhysReg(PhysReg::XZR)))
+            i.operands.iter().any(|o| matches!(o, MachineOperand::PhysReg(PhysReg::Xzr)))
         });
         assert!(has_mov_xzr, "const 0 should use MOV from XZR");
     }
