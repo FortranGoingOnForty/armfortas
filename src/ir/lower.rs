@@ -122,9 +122,10 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
         ProgramUnit::Subroutine { name, decls, body, args, .. } => {
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
+                    let elem_ty = arg_type_from_decls(n, decls);
                     Some(Param {
                         name: n.clone(),
-                        ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                        ty: IrType::Ptr(Box::new(elem_ty)),
                         id: ValueId(i as u32),
                     })
                 } else { None }
@@ -133,17 +134,23 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut ctx = LowerCtx::new(st, globals);
 
             // Collect param info before borrowing func mutably.
-            let param_info: Vec<(String, ValueId)> = func.params.iter()
-                .map(|p| (p.name.to_lowercase(), p.id))
+            let param_info: Vec<(String, ValueId, IrType)> = func.params.iter()
+                .map(|p| {
+                    let elem_ty = match &p.ty {
+                        IrType::Ptr(inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    (p.name.to_lowercase(), p.id, elem_ty)
+                })
                 .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
 
-                for (pname, pid) in &param_info {
-                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+                for (pname, pid, elem_ty) in &param_info {
+                    let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
                     b.store(*pid, slot);
-                    ctx.insert_param_by_ref(pname.clone(), slot, IrType::Int(IntWidth::I32));
+                    ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls);
@@ -162,9 +169,10 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 .unwrap_or(IrType::Int(IntWidth::I32));
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
+                    let elem_ty = arg_type_from_decls(n, decls);
                     Some(Param {
                         name: n.clone(),
-                        ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                        ty: IrType::Ptr(Box::new(elem_ty)),
                         id: ValueId(i as u32),
                     })
                 } else { None }
@@ -172,17 +180,23 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut func = Function::new(name.clone(), params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals);
 
-            let param_info: Vec<(String, ValueId)> = func.params.iter()
-                .map(|p| (p.name.to_lowercase(), p.id))
+            let param_info: Vec<(String, ValueId, IrType)> = func.params.iter()
+                .map(|p| {
+                    let elem_ty = match &p.ty {
+                        IrType::Ptr(inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    (p.name.to_lowercase(), p.id, elem_ty)
+                })
                 .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
 
-                for (pname, pid) in &param_info {
-                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+                for (pname, pid, elem_ty) in &param_info {
+                    let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
                     b.store(*pid, slot);
-                    ctx.insert_param_by_ref(pname.clone(), slot, IrType::Int(IntWidth::I32));
+                    ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
                 }
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
@@ -354,6 +368,22 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         _ => None,
     }
+}
+
+/// Look up a dummy argument's declared type from the declaration list.
+/// Returns the IR type for the argument, defaulting to I32 if not found.
+fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> IrType {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return lower_type_spec(type_spec);
+                }
+            }
+        }
+    }
+    IrType::Int(IntWidth::I32) // fallback
 }
 
 /// Get the length of a string literal expression (for PRINT).
