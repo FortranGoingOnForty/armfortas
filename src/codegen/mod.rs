@@ -7,4 +7,5 @@ pub mod mir;
 pub mod isel;
 pub mod liveness;
 pub mod regalloc;
+pub mod linearscan;
 pub mod emit;
