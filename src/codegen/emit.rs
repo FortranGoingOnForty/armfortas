@@ -300,6 +300,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 }
             } else { "bl ???".into() }
         }
+        ArmOpcode::Sxtw => format!("sxtw {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
         ArmOpcode::Brk => {

@@ -673,17 +673,9 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
             if *signed {
-                // SXTW Xd, Wn (sign-extend 32→64)
-                // On ARM64, SXTW is an alias for SBFM Xd, Xn, #0, #31.
-                // Simplest: use MOV from w to x (zero-extend), then handle sign.
-                // Actually, ARM64 `sxtw Xd, Wn` is the instruction we need.
-                // But we don't have a dedicated opcode. Use MovReg from 32→64
-                // which on ARM64 zero-extends. For sign-extend, we need SXTW.
-                // For now, add a dedicated opcode.
-                // HACK: use MovReg — if the 32-bit value is positive, zero-extend works.
-                // For negative values this is wrong. TODO: add SXTW opcode.
+                // SXTW Xd, Wn — sign-extend 32-bit to 64-bit.
                 mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::MovReg,
+                    opcode: ArmOpcode::Sxtw,
                     operands: vec![
                         MachineOperand::VReg(dest),
                         MachineOperand::VReg(src),
