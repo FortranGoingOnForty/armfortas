@@ -224,10 +224,12 @@ impl std::fmt::Display for BinaryOp {
 }
 
 /// A function/subroutine argument (positional or keyword).
+/// The value is a SectionSubscript to support both plain expressions
+/// and range subscripts like a(1:5) or a(1:10:2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Argument {
     pub keyword: Option<String>,
-    pub value: SpannedExpr,
+    pub value: SectionSubscript,
 }
 
 /// Array constructor value — either an expression or an implied-do loop.
@@ -252,4 +254,21 @@ pub enum SectionSubscript {
         end: Option<SpannedExpr>,
         stride: Option<SpannedExpr>,
     },
+}
+
+impl SectionSubscript {
+    pub fn to_sexpr(&self) -> String {
+        match self {
+            SectionSubscript::Element(e) => e.to_sexpr(),
+            SectionSubscript::Range { start, end, stride } => {
+                let s = start.as_ref().map_or(String::new(), |e| e.to_sexpr());
+                let e = end.as_ref().map_or(String::new(), |e| e.to_sexpr());
+                if let Some(st) = stride {
+                    format!("{}:{}:{}", s, e, st.to_sexpr())
+                } else {
+                    format!("{}:{}", s, e)
+                }
+            }
+        }
+    }
 }

@@ -288,66 +288,71 @@ impl<'a> Parser<'a> {
 
     fn parse_argument(&mut self) -> Result<Argument, ParseError> {
         // Check for keyword argument: name = expr.
-        // We need lookahead: if current is Identifier and next is =, it's a keyword arg.
         if self.peek() == &TokenKind::Identifier {
             let next_pos = self.pos + 1;
             if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
                 let name_tok = self.advance().clone();
                 self.advance(); // skip =
                 let value = self.parse_expr()?;
-                return Ok(Argument { keyword: Some(name_tok.text), value });
+                return Ok(Argument {
+                    keyword: Some(name_tok.text),
+                    value: SectionSubscript::Element(value),
+                });
             }
         }
 
-        // Check for section subscript (colon range).
-        if self.peek() == &TokenKind::Colon || self.is_range_context() {
-            let sub = self.parse_section_subscript()?;
+        // Leading colon → range with no start: :end or : or ::stride
+        if matches!(self.peek(), TokenKind::Colon | TokenKind::ColonColon) {
+            let sub = self.parse_range(None)?;
             return Ok(Argument { keyword: None, value: sub });
         }
 
-        let value = self.parse_expr()?;
+        // Parse an expression.
+        let expr = self.parse_expr()?;
 
-        // After parsing expr, check if a colon follows (range like start:end).
+        // If followed by colon, it's a range: start:end[:stride]
         if self.peek() == &TokenKind::Colon {
-            return self.parse_range_after_start(value);
+            let sub = self.parse_range(Some(expr))?;
+            return Ok(Argument { keyword: None, value: sub });
         }
 
-        Ok(Argument { keyword: None, value })
+        // Plain element.
+        Ok(Argument { keyword: None, value: SectionSubscript::Element(expr) })
     }
 
-    fn is_range_context(&self) -> bool {
-        // A leading colon means `:end` or `:` (full range).
-        self.peek() == &TokenKind::Colon
-    }
-
-    fn parse_section_subscript(&mut self) -> Result<SpannedExpr, ParseError> {
-        let start_span = self.current_span();
-
-        let start = if self.peek() == &TokenKind::Colon {
-            None
-        } else {
-            Some(Box::new(self.parse_expr()?))
-        };
-
-        if !self.eat(&TokenKind::Colon) {
-            // Just an element, not a range.
-            if let Some(s) = start {
-                return Ok(*s);
-            }
-            return Err(self.error("expected expression in subscript".into()));
+    /// Parse a range subscript: [start]:end[:stride] or [start]: or :
+    /// `start` is already parsed if present.
+    fn parse_range(&mut self, start: Option<SpannedExpr>) -> Result<SectionSubscript, ParseError> {
+        // Handle :: (ColonColon token) as two colons — means start::stride with no end.
+        if self.eat(&TokenKind::ColonColon) {
+            let stride = if !matches!(self.peek(),
+                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket)
+            {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            return Ok(SectionSubscript::Range { start, end: None, stride });
         }
 
-        // Parse end (optional).
-        let end = if !matches!(self.peek(), TokenKind::Colon | TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket) {
-            Some(Box::new(self.parse_expr()?))
+        self.expect(&TokenKind::Colon)?; // consume first colon
+
+        // Parse end (optional — absent if next is colon, comma, ), ], or ::).
+        let end = if !matches!(self.peek(),
+            TokenKind::Colon | TokenKind::ColonColon | TokenKind::Comma |
+            TokenKind::RParen | TokenKind::RBracket)
+        {
+            Some(self.parse_expr()?)
         } else {
             None
         };
 
         // Parse stride (optional, after second colon).
         let stride = if self.eat(&TokenKind::Colon) {
-            if !matches!(self.peek(), TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket) {
-                Some(Box::new(self.parse_expr()?))
+            if !matches!(self.peek(),
+                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket)
+            {
+                Some(self.parse_expr()?)
             } else {
                 None
             }
@@ -355,26 +360,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // Build a synthetic "range" expression. We'll represent this as a
-        // FunctionCall-like node that sema can distinguish. For now, use Name
-        // as a placeholder — the parser returns the range components as a
-        // colon-separated expression which the caller handles.
-        let span = span_from_to(start_span, self.prev_span());
-        // Return the start expression (the caller builds the range from context).
-        // Actually, for simplicity, return start if it exists, otherwise a placeholder.
-        if let Some(s) = start {
-            Ok(*s)
-        } else {
-            Ok(Spanned::new(Expr::Name { name: ":".into() }, span))
-        }
-    }
-
-    fn parse_range_after_start(&mut self, start: SpannedExpr) -> Result<Argument, ParseError> {
-        // We already parsed `start` and see `:`.
-        // This handles a(start:end) or a(start:end:stride).
-        // For now, emit as a regular argument — the parser for subscripts
-        // will need more sophisticated range handling in Sprint 8+.
-        Ok(Argument { keyword: None, value: start })
+        Ok(SectionSubscript::Range { start, end, stride })
     }
 
     // ---- Array constructors ----
@@ -664,6 +650,47 @@ mod tests {
     #[test]
     fn array_constructor_typed() {
         assert_eq!(sexpr("[integer :: 1, 2]"), "[integer :: 1, 2]");
+    }
+
+    // ---- Range subscripts ----
+
+    #[test]
+    fn range_start_end() {
+        assert_eq!(sexpr("a(1:5)"), "a(1:5)");
+    }
+
+    #[test]
+    fn range_start_end_stride() {
+        assert_eq!(sexpr("a(1:10:2)"), "a(1:10:2)");
+    }
+
+    #[test]
+    fn range_colon_only() {
+        // a(:) — full range
+        assert_eq!(sexpr("a(:)"), "a(:)");
+    }
+
+    #[test]
+    fn range_no_start() {
+        // a(:5) — range with no start
+        assert_eq!(sexpr("a(:5)"), "a(:5)");
+    }
+
+    #[test]
+    fn range_no_end() {
+        // a(2:) — range with no end
+        assert_eq!(sexpr("a(2:)"), "a(2:)");
+    }
+
+    #[test]
+    fn range_stride_only() {
+        // a(::2) — full range with stride
+        assert_eq!(sexpr("a(::2)"), "a(::2)");
+    }
+
+    #[test]
+    fn multi_dim_with_ranges() {
+        assert_eq!(sexpr("a(1:5, :, 3)"), "a(1:5, :, 3)");
     }
 
     // ---- Complex expressions ----
