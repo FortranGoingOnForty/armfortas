@@ -127,6 +127,8 @@ struct Preprocessor {
     include_depth: u32,
     /// Fixed-form source mode.
     fixed_form: bool,
+    /// #line overrides for source map reporting.
+    line_override: Option<(u32, String)>,
 }
 
 impl Preprocessor {
@@ -135,8 +137,18 @@ impl Preprocessor {
             defines: config.defines.clone(),
             include_paths: config.include_paths.clone(),
             fixed_form: config.fixed_form,
+            line_override: None,
             cond_stack: Vec::new(),
             include_depth: 0,
+        }
+    }
+
+    fn make_source_loc(&self, filename: &str, line: u32) -> SourceLoc {
+        if let Some((override_line, ref override_file)) = self.line_override {
+            let fname = if override_file.is_empty() { filename } else { override_file.as_str() };
+            SourceLoc { filename: fname.into(), line: override_line }
+        } else {
+            SourceLoc { filename: filename.into(), line }
         }
     }
 
@@ -225,7 +237,7 @@ impl Preprocessor {
                         output.push_str(&logical_line);
                     }
                     output.push('\n');
-                    source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
+                    source_map.push(self.make_source_loc(filename, orig_line_num));
                     continue;
                 }
             }
@@ -236,7 +248,7 @@ impl Preprocessor {
             if trimmed.starts_with('#') {
                 self.process_directive(trimmed, filename, orig_line_num, output, source_map)?;
                 output.push('\n');
-                source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
+                source_map.push(self.make_source_loc(filename, orig_line_num));
                 continue;
             }
 
@@ -245,7 +257,7 @@ impl Preprocessor {
                 output.push_str(&expanded);
             }
             output.push('\n');
-            source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
+            source_map.push(self.make_source_loc(filename, orig_line_num));
         }
 
         Ok(())
@@ -290,7 +302,7 @@ impl Preprocessor {
                 eprintln!("{}:{}: warning: #warning {}", filename, line_num, args);
                 Ok(())
             }
-            "line" => Ok(()), // TODO: update source location tracking
+            "line" => self.do_line(args, filename, line_num),
             "" => Ok(()), // bare # is allowed (null directive)
             _ => Ok(()), // unknown directives are ignored (like #pragma)
         }
@@ -415,6 +427,23 @@ impl Preprocessor {
     fn do_undef(&mut self, args: &str) -> Result<(), PreprocError> {
         let name = args.split_whitespace().next().unwrap_or("");
         self.defines.remove(name);
+        Ok(())
+    }
+
+    // ---- #line ----
+
+    fn do_line(&mut self, args: &str, _filename: &str, _line_num: u32) -> Result<(), PreprocError> {
+        let args = args.trim();
+        let (line_str, rest) = split_first_word(args);
+        if let Ok(line_num) = line_str.parse::<u32>() {
+            let filename = if !rest.is_empty() {
+                // Strip quotes from filename.
+                rest.trim_matches('"').to_string()
+            } else {
+                String::new()
+            };
+            self.line_override = Some((line_num, filename));
+        }
         Ok(())
     }
 
@@ -711,7 +740,7 @@ impl Preprocessor {
 
         let va_args_str = if def.is_variadic {
             let va_start = def.params.len();
-            args[va_start..].join(", ")
+            args.get(va_start..).unwrap_or(&[]).join(", ")
         } else {
             String::new()
         };
@@ -722,9 +751,13 @@ impl Preprocessor {
         let mut bi = 0;
 
         while bi < body_bytes.len() {
-            // Stringification: # followed by identifier
+            // Stringification: # followed by identifier (whitespace between # and name is allowed).
             if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
-                let id_start = bi + 1;
+                let mut id_start = bi + 1;
+                // Skip whitespace between # and the parameter name.
+                while id_start < body_bytes.len() && body_bytes[id_start] == b' ' {
+                    id_start += 1;
+                }
                 let mut id_end = id_start;
                 while id_end < body_bytes.len() && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_') {
                     id_end += 1;
@@ -1078,22 +1111,6 @@ fn split_first_word(s: &str) -> (&str, &str) {
     } else {
         (s, "")
     }
-}
-
-/// Join backslash-continued lines: a line ending with `\` is joined
-/// with the following line (with the `\` and newline removed).
-fn join_continuations(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
-    let mut lines = source.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line.ends_with('\\') && lines.peek().is_some() {
-            result.push_str(&line[..line.len() - 1]);
-        } else {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-    result
 }
 
 /// Get current date and time strings for __DATE__ and __TIME__.
@@ -1933,5 +1950,67 @@ deep
         // #define FOO (x) should be object-like with body "(x)", not function-like.
         let out = pp("#define FOO (x)\ny = FOO\n");
         assert!(out.contains("y = (x)"), "got: {:?}", out);
+    }
+
+    // ---- #line directive ----
+
+    #[test]
+    fn line_directive_updates_source_map() {
+        let config = PreprocConfig::default();
+        let result = preprocess("a\n#line 100 \"other.f90\"\nb\n", &config).unwrap();
+        // Line 3 (b) should have source map entry pointing to other.f90:100.
+        assert_eq!(result.source_map[2].line, 100);
+        assert_eq!(result.source_map[2].filename, "other.f90");
+    }
+
+    #[test]
+    fn line_directive_without_filename() {
+        let config = PreprocConfig::default();
+        let result = preprocess("a\n#line 50\nb\n", &config).unwrap();
+        assert_eq!(result.source_map[2].line, 50);
+    }
+
+    // ---- Stringify with space ----
+
+    #[test]
+    fn stringify_with_space() {
+        // # x (with space) should still stringify.
+        let out = pp("#define STR(x) # x\ny = STR(hello)\n");
+        assert!(out.contains("y = \"hello\""), "got: {:?}", out);
+    }
+
+    // ---- Variadic edge cases ----
+
+    #[test]
+    fn variadic_zero_args() {
+        let out = pp("#define M(...) [__VA_ARGS__]\ny = M()\n");
+        assert!(out.contains("y = []"), "got: {:?}", out);
+    }
+
+    // ---- #warning doesn't error ----
+
+    #[test]
+    fn warning_continues_processing() {
+        let out = pp("#warning test warning\nok\n");
+        assert!(lines(&out).contains(&"ok"));
+    }
+
+    // ---- Include recursion guard ----
+
+    #[test]
+    fn include_recursion_guard() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_pp_recurse.inc");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#include \"test_pp_recurse.inc\"").unwrap();
+        drop(f);
+
+        let mut config = PreprocConfig::default();
+        config.include_paths.push(dir);
+        let result = preprocess("#include \"test_pp_recurse.inc\"\n", &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.msg.contains("depth") || err.msg.contains("recursion"), "got: {}", err.msg);
     }
 }
