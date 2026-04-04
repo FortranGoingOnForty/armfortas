@@ -186,35 +186,58 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
-            let offset = match &inst.operands[2] {
-                MachineOperand::FrameSlot(off) => format!("#{}", off),
-                MachineOperand::Imm(v) => format!("#{}", v),
-                _ => "#0".into(),
+            let offset_val = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) => *off as i64,
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
             };
-            format!("ldr {}, [{}, {}]", dest, base, offset)
+            if offset_val >= -256 && offset_val <= 255 {
+                format!("ldr {}, [{}, #{}]", dest, base, offset_val)
+            } else {
+                // Large offset: compute address in x8, then load.
+                format!("mov x8, #{}\n    add x8, {}, x8\n    ldr {}, [x8]",
+                    offset_val, base, dest)
+            }
         }
         ArmOpcode::StrImm | ArmOpcode::StrFpImm => {
             let src = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
-            let offset = match &inst.operands[2] {
-                MachineOperand::FrameSlot(off) => format!("#{}", off),
-                MachineOperand::Imm(v) => format!("#{}", v),
-                _ => "#0".into(),
+            let offset_val = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) => *off as i64,
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
             };
-            format!("str {}, [{}, {}]", src, base, offset)
+            if offset_val >= -256 && offset_val <= 255 {
+                format!("str {}, [{}, #{}]", src, base, offset_val)
+            } else {
+                // Large offset: compute address in x8, then store.
+                format!("mov x8, #{}\n    add x8, {}, x8\n    str {}, [x8]",
+                    offset_val, base, src)
+            }
         }
 
         ArmOpcode::StpPre => {
-            // Prologue: allocate frame, save FP/LR at top.
             let frame_size = mf.frame.size;
-            format!("sub sp, sp, #{}\n    stp x29, x30, [sp, #{}]",
-                frame_size, frame_size - 16)
+            let stp_offset = frame_size - 16;
+            if stp_offset <= 504 {
+                format!("sub sp, sp, #{}\n    stp x29, x30, [sp, #{}]",
+                    frame_size, stp_offset)
+            } else {
+                // Large frame: use SUB + STP at [sp] approach.
+                format!("sub sp, sp, #{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
+                    frame_size, stp_offset, stp_offset + 8)
+            }
         }
         ArmOpcode::LdpPost => {
-            // Epilogue: restore FP/LR from top, deallocate frame.
             let frame_size = mf.frame.size;
-            format!("ldp x29, x30, [sp, #{}]\n    add sp, sp, #{}",
-                frame_size - 16, frame_size)
+            let ldp_offset = frame_size - 16;
+            if ldp_offset <= 504 {
+                format!("ldp x29, x30, [sp, #{}]\n    add sp, sp, #{}",
+                    ldp_offset, frame_size)
+            } else {
+                format!("ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    add sp, sp, #{}",
+                    ldp_offset, ldp_offset + 8, frame_size)
+            }
         }
 
         ArmOpcode::AdrpLdr => {
