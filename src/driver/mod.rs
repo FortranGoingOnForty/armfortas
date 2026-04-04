@@ -11,7 +11,7 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 use crate::ir::{lower, verify, printer as ir_printer};
-use crate::codegen::{isel, regalloc, emit};
+use crate::codegen::{isel, linearscan, emit};
 
 /// Compilation options.
 pub struct Options {
@@ -139,10 +139,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 7. Instruction selection.
     let machine_funcs = isel::select_module(&ir_module);
 
-    // 8. Register allocation (naive).
+    // 8. Register allocation (linear scan).
     let mut allocated: Vec<_> = machine_funcs;
     for mf in &mut allocated {
-        regalloc::regalloc_naive(mf);
+        let result = linearscan::linear_scan(mf);
+        linearscan::apply_allocation(mf, &result);
+        linearscan::insert_callee_saves(mf, &result.callee_saved_used);
+        linearscan::coalesce_moves(mf);
     }
 
     // 9. Emit assembly.

@@ -13,6 +13,7 @@ pub struct LiveInterval {
     pub class: RegClass,
     pub start: u32,   // first instruction position (definition)
     pub end: u32,     // last instruction position (final use)
+    pub crosses_call: bool, // true if a BL instruction falls within [start, end]
 }
 
 /// Result of liveness analysis.
@@ -171,6 +172,19 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         }
     }
 
+    // Collect positions of all call instructions.
+    let mut call_positions: Vec<u32> = Vec::new();
+    for block in &mf.blocks {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.opcode == ArmOpcode::Bl {
+                if let Some(&p) = position_map.get(&(block.id, i)) {
+                    call_positions.push(p);
+                }
+            }
+        }
+    }
+    call_positions.sort();
+
     // Build intervals.
     let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
         .map(|v| (v.id, v.class))
@@ -180,7 +194,9 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         .filter_map(|(&vreg, &start)| {
             let end = ends.get(&vreg).copied()?;
             let class = vreg_classes.get(&vreg).copied().unwrap_or(RegClass::Gp64);
-            Some(LiveInterval { vreg, class, start, end })
+            // Check if any call falls within [start, end].
+            let crosses_call = call_positions.iter().any(|&cp| cp > start && cp < end);
+            Some(LiveInterval { vreg, class, start, end, crosses_call })
         })
         .collect();
 
