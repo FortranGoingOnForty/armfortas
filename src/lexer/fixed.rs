@@ -87,33 +87,35 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
 
 /// Tokenize a fixed-form statement body with whitespace insensitivity.
 ///
-/// Strips all whitespace outside string literals, then scans left to right
-/// using longest-match: keyword → number → operator → identifier.
+/// Three-phase approach:
+/// 1. Protect Hollerith constants (nH...) by converting to string literals before stripping
+/// 2. Strip all whitespace outside string literals
+/// 3. Tokenize with keyword-splitting: longest keyword prefix match at letter runs
 fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexError> {
-    // Strip whitespace outside string literals.
-    let stripped = strip_whitespace_outside_strings(body);
+    // Phase 1: Convert Hollerith constants to string literals (preserves their spaces).
+    let hollerith_protected = protect_hollerith(body);
+    // Phase 2: Strip whitespace outside string literals.
+    let stripped = strip_whitespace_outside_strings(&hollerith_protected);
     let bytes = stripped.as_bytes();
     let mut tokens = Vec::new();
     let mut pos = 0;
 
     while pos < bytes.len() {
-        let col = (pos as u32) + 7; // column 7+ in original source
+        let col = (pos as u32) + 7;
         let start = Position { line, col };
-
         let ch = bytes[pos];
 
         // Comment (! to end).
         if ch == b'!' {
-            let text: String = stripped[pos..].to_string();
             tokens.push(Token {
                 kind: TokenKind::Comment,
-                text,
+                text: stripped[pos..].to_string(),
                 span: Span { file_id, start, end: Position { line, col: col + (bytes.len() - pos) as u32 } },
             });
             break;
         }
 
-        // String literal (whitespace is significant inside).
+        // String literal.
         if ch == b'\'' || ch == b'"' {
             let (tok, consumed) = lex_fixed_string(&stripped, pos, file_id, line)?;
             tokens.push(tok);
@@ -124,7 +126,6 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
         // Dot-operator or real starting with dot.
         if ch == b'.' {
             if pos + 1 < bytes.len() && bytes[pos + 1].is_ascii_digit() {
-                // Real literal starting with dot: .5, .123e4
                 let (tok, consumed) = lex_fixed_number(&stripped, pos, file_id, line);
                 tokens.push(tok);
                 pos += consumed;
@@ -136,27 +137,25 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
             continue;
         }
 
-        // Number — could be integer, real, or start of Hollerith.
+        // Number (integer or real).
         if ch.is_ascii_digit() {
-            // Try Hollerith first (nH...).
-            if let Some((hol_text, consumed)) = try_hollerith_in_stripped(&stripped, pos) {
-                let end_col = col + consumed as u32;
-                tokens.push(Token {
-                    kind: TokenKind::StringLiteral, // Hollerith → string
-                    text: hol_text,
-                    span: Span { file_id, start, end: Position { line, col: end_col } },
-                });
-                pos += consumed;
-                continue;
-            }
-
             let (tok, consumed) = lex_fixed_number(&stripped, pos, file_id, line);
             tokens.push(tok);
             pos += consumed;
             continue;
         }
 
-        // Letter — keyword or identifier. Use longest keyword match.
+        // BOZ literal: B/O/Z followed by quote.
+        if matches!(ch, b'B' | b'b' | b'O' | b'o' | b'Z' | b'z')
+            && pos + 1 < bytes.len() && matches!(bytes[pos + 1], b'\'' | b'"')
+        {
+            let (tok, consumed) = lex_fixed_boz(&stripped, pos, file_id, line)?;
+            tokens.push(tok);
+            pos += consumed;
+            continue;
+        }
+
+        // Letter — keyword or identifier with keyword-splitting.
         if ch.is_ascii_alphabetic() || ch == b'_' {
             let (tok, consumed) = lex_fixed_ident_or_keyword(&stripped, pos, file_id, line);
             tokens.push(tok);
@@ -171,6 +170,67 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
     }
 
     Ok(tokens)
+}
+
+/// Convert Hollerith constants (nH...) to quoted string literals BEFORE whitespace stripping.
+/// This preserves spaces inside Hollerith content: `6H HELLO` → `' HELLO'`.
+fn protect_hollerith(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut result = String::with_capacity(body.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Inside a string literal: copy verbatim.
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let quote = bytes[i];
+            result.push(bytes[i] as char);
+            i += 1;
+            while i < bytes.len() {
+                result.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == quote {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Check for Hollerith: digits followed by H, not preceded by a letter/digit.
+        if bytes[i].is_ascii_digit() {
+            let preceded_by_alnum = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !preceded_by_alnum {
+                let digit_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                if i < bytes.len() && (bytes[i] == b'H' || bytes[i] == b'h') {
+                    if let Ok(count) = body[digit_start..i].parse::<usize>() {
+                        i += 1; // skip H
+                        if count > 0 && i + count <= bytes.len() {
+                            // Replace nH... with '...'
+                            result.push('\'');
+                            result.push_str(&body[i..i + count]);
+                            result.push('\'');
+                            i += count;
+                            continue;
+                        }
+                    }
+                }
+                // Not Hollerith — put the digits back.
+                result.push_str(&body[digit_start..i]);
+                continue;
+            }
+        }
+
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
 }
 
 /// Strip whitespace from body text, preserving content inside string literals.
@@ -324,18 +384,25 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
         }
     }
 
-    // Exponent.
+    // Exponent — only consume e/d if followed by digit or +/- then digit.
+    // This prevents `10DO` from being lexed as real `10D` + identifier `O`.
     if end < bytes.len() && matches!(bytes[end], b'e' | b'E' | b'd' | b'D') {
-        is_real = true;
-        tok_text.push(bytes[end] as char);
-        end += 1;
-        if end < bytes.len() && matches!(bytes[end], b'+' | b'-') {
+        let after_ed = if end + 1 < bytes.len() { bytes[end + 1] } else { 0 };
+        let has_exponent_digits = after_ed.is_ascii_digit()
+            || (matches!(after_ed, b'+' | b'-') && end + 2 < bytes.len() && bytes[end + 2].is_ascii_digit());
+
+        if has_exponent_digits {
+            is_real = true;
             tok_text.push(bytes[end] as char);
             end += 1;
-        }
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            tok_text.push(bytes[end] as char);
-            end += 1;
+            if end < bytes.len() && matches!(bytes[end], b'+' | b'-') {
+                tok_text.push(bytes[end] as char);
+                end += 1;
+            }
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                tok_text.push(bytes[end] as char);
+                end += 1;
+            }
         }
     }
 
@@ -359,20 +426,141 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 }
 
 /// Lex an identifier or keyword in whitespace-stripped body.
-/// Since whitespace is stripped, we consume all alphanumeric/underscore chars.
+///
+/// This is the heart of fixed-form whitespace insensitivity. When we encounter
+/// a letter run like `GOTO100` or `INTEGERI`, we try longest keyword prefix match:
+/// 1. Collect the full alphanumeric run.
+/// 2. For lengths from full down to 1, check if that prefix is a keyword.
+/// 3. If a keyword matches, emit just the keyword (consume its length).
+/// 4. Special case: DO + digits triggers DO/assignment ambiguity resolution.
+/// 5. If no keyword matches, emit the full run as one identifier.
 fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
     let bytes = text.as_bytes();
-    let mut end = pos;
-    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-        end += 1;
+    let mut run_end = pos;
+    while run_end < bytes.len() && (bytes[run_end].is_ascii_alphanumeric() || bytes[run_end] == b'_') {
+        run_end += 1;
     }
-    let tok_text = text[pos..end].to_string();
+    let run = &text[pos..run_end];
+    let run_lower = run.to_lowercase();
+    let col = (pos as u32) + 7;
+
+    // Try longest keyword prefix match.
+    if let Some(kw_len) = find_longest_keyword_prefix(&run_lower) {
+        let kw_lower = &run_lower[..kw_len];
+
+        // DO ambiguity: DO followed by digits could be a DO loop or a variable name.
+        if kw_lower == "do"
+            && kw_len < run.len()
+            && run.as_bytes()[kw_len].is_ascii_digit()
+            && !is_do_loop_context(text, pos + kw_len)
+        {
+            // Not a DO loop — the entire run is a variable name.
+            return make_ident_token(run, pos, file_id, line);
+        }
+
+        // Emit the keyword (as Identifier — keywords are not reserved).
+        let kw_text = &run[..kw_len];
+        return (Token {
+            kind: TokenKind::Identifier,
+            text: kw_text.to_string(),
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position { line, col: col + kw_len as u32 },
+            },
+        }, kw_len);
+    }
+
+    // No keyword match: entire run is an identifier.
+    make_ident_token(run, pos, file_id, line)
+}
+
+fn make_ident_token(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
     let col = (pos as u32) + 7;
     (Token {
         kind: TokenKind::Identifier,
+        text: text.to_string(),
+        span: Span {
+            file_id,
+            start: Position { line, col },
+            end: Position { line, col: col + text.len() as u32 },
+        },
+    }, text.len())
+}
+
+/// Find the longest prefix of `run` (lowercased) that is a Fortran keyword.
+fn find_longest_keyword_prefix(run_lower: &str) -> Option<usize> {
+    use super::is_keyword;
+    for len in (1..=run_lower.len()).rev() {
+        if is_keyword(&run_lower[..len]).is_some() {
+            return Some(len);
+        }
+    }
+    None
+}
+
+/// Check if the rest of the statement after DO+digits looks like a DO loop.
+/// A DO loop has: DO [label] variable = start , end [, step]
+/// An assignment has: DO[label][var] = expr (no top-level comma after =).
+fn is_do_loop_context(text: &str, after_do: usize) -> bool {
+    let bytes = text.as_bytes();
+
+    // Look for '=' anywhere after this position.
+    let eq_pos = bytes[after_do..].iter().position(|&b| b == b'=');
+    let eq_pos = match eq_pos {
+        Some(p) => after_do + p,
+        None => return false,
+    };
+
+    // Make sure '=' is not '==' (comparison).
+    if eq_pos + 1 < bytes.len() && bytes[eq_pos + 1] == b'=' {
+        return false;
+    }
+
+    // Check for a top-level comma after the '='.
+    let mut depth = 0i32;
+    for &b in &bytes[(eq_pos + 1)..] {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Lex a BOZ literal in fixed-form body.
+fn lex_fixed_boz(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Token, usize), LexError> {
+    let bytes = text.as_bytes();
+    let mut end = pos;
+    let mut tok_text = String::new();
+
+    tok_text.push(bytes[end] as char); // B/O/Z
+    end += 1;
+    let quote = bytes[end];
+    tok_text.push(quote as char); // opening quote
+    end += 1;
+
+    while end < bytes.len() && bytes[end] != quote {
+        tok_text.push(bytes[end] as char);
+        end += 1;
+    }
+    if end >= bytes.len() {
+        return Err(LexError {
+            span: Span { file_id, start: Position { line, col: (pos as u32) + 7 }, end: Position { line, col: (pos as u32) + 7 } },
+            msg: "unterminated BOZ literal".into(),
+        });
+    }
+    tok_text.push(bytes[end] as char); // closing quote
+    end += 1;
+
+    let col = (pos as u32) + 7;
+    Ok((Token {
+        kind: TokenKind::BozLiteral,
         text: tok_text,
         span: Span { file_id, start: Position { line, col }, end: Position { line, col: col + (end - pos) as u32 } },
-    }, end - pos)
+    }, end - pos))
 }
 
 /// Lex an operator or punctuation in whitespace-stripped body.
@@ -421,35 +609,6 @@ fn lex_fixed_punct(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(T
         text: tok_text.into(),
         span: Span { file_id, start, end: Position { line, col: col + consumed as u32 } },
     }, consumed))
-}
-
-/// Try Hollerith constant in whitespace-stripped text.
-/// Format: nH followed by exactly n characters.
-fn try_hollerith_in_stripped(text: &str, pos: usize) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    let mut p = pos;
-
-    // Read count digits.
-    if !bytes[p].is_ascii_digit() { return None; }
-    while p < bytes.len() && bytes[p].is_ascii_digit() {
-        p += 1;
-    }
-
-    // Must be followed by H/h.
-    if p >= bytes.len() || (bytes[p] != b'H' && bytes[p] != b'h') { return None; }
-
-    let count: usize = text[pos..p].parse().ok()?;
-    p += 1; // skip H
-
-    // Need to distinguish Hollerith from identifier starting with H.
-    // Hollerith only appears in specific contexts (FORMAT, CALL arguments).
-    // Heuristic: only match if count > 0 and we have enough characters.
-    if count == 0 { return None; }
-    if p + count > bytes.len() { return None; }
-
-    let hol_content = &text[p..p + count];
-    let full = format!("{}H{}", &text[pos..pos + (p - pos - 1)], hol_content);
-    Some((full, p + count - pos))
 }
 
 // ---- Line preprocessing ----
@@ -620,33 +779,6 @@ fn extract_fixed_columns(line: &str) -> (String, String) {
 }
 
 // ---- Hollerith constants ----
-
-/// Check if the text at the current position starts a Hollerith constant (nH...).
-/// Returns Some((hollerith_text, length_consumed)) if found.
-pub fn try_hollerith(text: &str, pos: usize) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    let start = pos;
-    let mut p = pos;
-
-    // Read digits for the count.
-    if p >= bytes.len() || !bytes[p].is_ascii_digit() { return None; }
-    while p < bytes.len() && bytes[p].is_ascii_digit() {
-        p += 1;
-    }
-
-    // Must be followed by 'H' or 'h'.
-    if p >= bytes.len() || (bytes[p] != b'H' && bytes[p] != b'h') { return None; }
-
-    let count_str = &text[start..p];
-    let count: usize = count_str.parse().ok()?;
-    p += 1; // skip H
-
-    // Read exactly `count` characters.
-    if p + count > bytes.len() { return None; }
-
-    let hol_text = format!("{}{}", count_str, &text[p - 1..p + count]); // includes H
-    Some((hol_text, p + count - start))
-}
 
 #[cfg(test)]
 mod tests {
@@ -843,20 +975,27 @@ C     Hello World
     // ---- Hollerith ----
 
     #[test]
-    fn hollerith_parse() {
-        assert_eq!(try_hollerith("3HABC", 0), Some(("3HABC".to_string(), 5)));
-        assert_eq!(try_hollerith("6HFOOBAR", 0), Some(("6HFOOBAR".to_string(), 8)));
+    fn hollerith_protect_converts_to_string() {
+        assert_eq!(protect_hollerith("3HABC"), "'ABC'");
+        assert_eq!(protect_hollerith("6HFOOBAR"), "'FOOBAR'");
     }
 
     #[test]
-    fn hollerith_zero() {
-        assert_eq!(try_hollerith("0HX", 0), Some(("0H".to_string(), 2)));
+    fn hollerith_with_spaces_preserved() {
+        // 6H HELLO has a leading space — must be preserved.
+        assert_eq!(protect_hollerith("6H HELLO"), "' HELLO'");
     }
 
     #[test]
-    fn hollerith_not_matched() {
-        assert_eq!(try_hollerith("ABC", 0), None);
-        assert_eq!(try_hollerith("3XABC", 0), None);
+    fn hollerith_not_after_letter() {
+        // X3HABC — the 3H is preceded by a letter, so it's NOT a Hollerith.
+        assert_eq!(protect_hollerith("X3HABC"), "X3HABC");
+    }
+
+    #[test]
+    fn hollerith_after_operator() {
+        // =3HABC — preceded by =, not a letter, so IS a Hollerith.
+        assert_eq!(protect_hollerith("=3HABC"), "='ABC'");
     }
 
     // ---- Real fixed-form files from refs ----
@@ -893,21 +1032,32 @@ C     Hello World
 
     #[test]
     fn whitespace_stripped_goto() {
-        // GOTO100 → GO TO 100 → identifier GOTO100 (parser handles keyword split)
-        // After stripping whitespace, this is a single identifier. That's correct —
-        // the lexer produces GOTO100 as an identifier, and the parser would need to
-        // handle the GOTO keyword. In a true fixed-form scanner, this is one token.
+        // GOTO100 → keyword GOTO + integer 100 (keyword splitting!)
         let kinds = fixed_kinds("      GOTO100\n");
-        // Should be a single identifier (whitespace stripped: "GOTO100").
-        assert!(kinds.contains(&TokenKind::Identifier), "got: {:?}", kinds);
+        assert_eq!(kinds, vec![TokenKind::Identifier, TokenKind::IntegerLiteral],
+            "GOTO100 should split into keyword+number, got: {:?}", kinds);
+        let texts = fixed_texts("      GOTO100\n");
+        assert_eq!(texts[0], "GOTO");
+        assert_eq!(texts[1], "100");
     }
 
     #[test]
     fn whitespace_stripped_integer_decl() {
-        // INTEGERI → after strip: "INTEGERI" → one identifier.
-        // The parser handles "INTEGERI" as a keyword+identifier pair.
+        // INTEGERI → keyword INTEGER + identifier I (keyword splitting!)
         let kinds = fixed_kinds("      INTEGERI\n");
-        assert!(kinds.contains(&TokenKind::Identifier));
+        assert_eq!(kinds, vec![TokenKind::Identifier, TokenKind::Identifier],
+            "INTEGERI should split into keyword+ident, got: {:?}", kinds);
+        let texts = fixed_texts("      INTEGERI\n");
+        assert_eq!(texts[0], "INTEGER");
+        assert_eq!(texts[1], "I");
+    }
+
+    #[test]
+    fn whitespace_stripped_doubleprecision() {
+        // DOUBLEPRECISIONX → keyword DOUBLEPRECISION + identifier X
+        let texts = fixed_texts("      DOUBLEPRECISIONX\n");
+        assert_eq!(texts[0], "DOUBLEPRECISION", "got: {:?}", texts);
+        assert_eq!(texts[1], "X");
     }
 
     #[test]
@@ -987,13 +1137,67 @@ C     Hello World
         assert_eq!(int_count, 2, "blank line should not break continuation, got: {:?}", kinds);
     }
 
+    // ---- DO/assignment ambiguity ----
+
+    #[test]
+    fn do_loop_with_comma() {
+        // DO10I=1,10 → DO loop: DO + 10 + I + = + 1 + , + 10
+        let kinds = fixed_kinds("      DO10I=1,10\n");
+        assert!(kinds.contains(&TokenKind::Comma),
+            "DO loop must have comma, got: {:?}", kinds);
+        let texts = fixed_texts("      DO10I=1,10\n");
+        assert_eq!(texts[0], "DO", "first token should be DO keyword, got: {:?}", texts);
+    }
+
+    #[test]
+    fn do_assignment_no_comma() {
+        // DO10I=1.10 → assignment: DO10I + = + 1.10 (no comma → not a loop)
+        let kinds = fixed_kinds("      DO10I=1.10\n");
+        assert!(!kinds.contains(&TokenKind::Comma),
+            "assignment should have no comma, got: {:?}", kinds);
+        let texts = fixed_texts("      DO10I=1.10\n");
+        assert_eq!(texts[0], "DO10I", "should be single identifier, got: {:?}", texts);
+    }
+
+    #[test]
+    fn do_assignment_no_comma_integer() {
+        // DO10I=1 → assignment (no comma)
+        let kinds = fixed_kinds("      DO10I=1\n");
+        assert!(!kinds.contains(&TokenKind::Comma));
+        let texts = fixed_texts("      DO10I=1\n");
+        assert_eq!(texts[0], "DO10I");
+    }
+
+    // ---- BOZ in fixed-form ----
+
+    #[test]
+    fn boz_in_fixed_form() {
+        let kinds = fixed_kinds("      X=B'1010'\n");
+        assert!(kinds.contains(&TokenKind::BozLiteral), "got: {:?}", kinds);
+    }
+
+    #[test]
+    fn boz_hex_in_fixed_form() {
+        let kinds = fixed_kinds("      X=Z'FF'\n");
+        assert!(kinds.contains(&TokenKind::BozLiteral), "got: {:?}", kinds);
+    }
+
     // ---- Hollerith integration ----
 
     #[test]
     fn hollerith_in_source() {
-        // 3HABC in a statement should produce a string literal "ABC".
+        // 3HABC in a statement should produce a string literal.
         let kinds = fixed_kinds("      X=3HABC\n");
         assert!(kinds.contains(&TokenKind::StringLiteral), "got: {:?}", kinds);
+        let texts = fixed_texts("      X=3HABC\n");
+        assert!(texts.iter().any(|t| t.contains("ABC")), "Hollerith content missing, got: {:?}", texts);
+    }
+
+    #[test]
+    fn hollerith_with_spaces_in_source() {
+        // 6H HELLO preserves the space.
+        let texts = fixed_texts("      X=6H HELLO\n");
+        assert!(texts.iter().any(|t| t.contains(" HELLO")), "space lost, got: {:?}", texts);
     }
 
     // ---- String in fixed-form ----
