@@ -30,8 +30,15 @@ impl<'a> Parser<'a> {
             "logical" => { self.advance(); Some(self.parse_kind_selector().map(TypeSpec::Logical)) }
             "character" => { self.advance(); Some(self.parse_char_selector().map(TypeSpec::Character)) }
             "type" => {
-                self.advance();
-                Some(self.parse_type_or_class_spec(false))
+                // type(name) is a type specifier, but type :: name is a derived type definition.
+                // Only consume if followed by (.
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::LParen {
+                    self.advance();
+                    Some(self.parse_type_or_class_spec(false))
+                } else {
+                    None // Not a type specifier — could be a derived type def.
+                }
             }
             "class" => {
                 self.advance();

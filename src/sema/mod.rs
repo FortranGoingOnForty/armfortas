@@ -2,3 +2,6 @@
 //!
 //! Symbol tables, scoping, type checking, module resolution,
 //! interface validation, and standard conformance checks.
+
+pub mod symtab;
+pub mod resolve;

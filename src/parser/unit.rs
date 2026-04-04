@@ -348,7 +348,21 @@ impl<'a> Parser<'a> {
             }
             if text == "contains" { break; }
 
-            // Try as declaration first.
+            // Check for derived type definition: type [, attrs] :: name
+            if text == "type" {
+                let next_pos = self.pos + 1;
+                let next_text = if next_pos < self.tokens.len() {
+                    self.tokens[next_pos].text.to_lowercase()
+                } else { String::new() };
+                // type :: or type , → derived type definition (not type(name) specifier).
+                if next_text == "::" || self.tokens.get(next_pos).is_some_and(|t| t.kind == TokenKind::Comma || t.kind == TokenKind::ColonColon) {
+                    self.advance(); // consume 'type'
+                    decls.push(self.parse_derived_type_def()?);
+                    continue;
+                }
+            }
+
+            // Try as type declaration.
             if let Some(ts_result) = self.try_parse_type_spec() {
                 let ts = ts_result?;
                 decls.push(self.parse_type_decl(ts)?);
