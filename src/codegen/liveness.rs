@@ -14,6 +14,9 @@ pub struct LiveInterval {
     pub start: u32,   // first instruction position (definition)
     pub end: u32,     // last instruction position (final use)
     pub crosses_call: bool, // true if a BL instruction falls within [start, end]
+    /// Preferred physical register (hint). If set, the allocator tries this register first.
+    /// Used to avoid unnecessary moves (e.g., arg values prefer xN, return values prefer x0).
+    pub hint: Option<u8>,
 }
 
 /// Result of liveness analysis.
@@ -58,29 +61,25 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
     }
 
     // Build successor map from branch targets.
+    // Our codegen emits conditional branches as: CmpImm, BCond, B (unconditional fallback).
+    // So a block can have both BCond and B targets.
     let mut successors: HashMap<MBlockId, Vec<MBlockId>> = HashMap::new();
     for block in &mf.blocks {
         let mut succs = Vec::new();
-        if let Some(last) = block.insts.last() {
-            match last.opcode {
+        // Scan ALL instructions in the block for branch targets (not just the last).
+        for inst in &block.insts {
+            match inst.opcode {
                 ArmOpcode::B => {
-                    if let Some(MachineOperand::BlockRef(target)) = last.operands.first() {
-                        succs.push(*target);
+                    if let Some(MachineOperand::BlockRef(target)) = inst.operands.first() {
+                        if !succs.contains(target) {
+                            succs.push(*target);
+                        }
                     }
                 }
                 ArmOpcode::BCond => {
-                    // B.cond is always followed by an unconditional B in our codegen.
-                    // The B.cond target is operand[1], the B target is in the next inst.
-                    if let Some(MachineOperand::BlockRef(target)) = last.operands.get(1) {
-                        succs.push(*target);
-                    }
-                    // Check the second-to-last instruction for B.cond + B pattern.
-                    if block.insts.len() >= 2 {
-                        let prev = &block.insts[block.insts.len() - 2];
-                        if prev.opcode == ArmOpcode::BCond {
-                            if let Some(MachineOperand::BlockRef(target)) = prev.operands.get(1) {
-                                succs.push(*target);
-                            }
+                    if let Some(MachineOperand::BlockRef(target)) = inst.operands.get(1) {
+                        if !succs.contains(target) {
+                            succs.push(*target);
                         }
                     }
                 }
@@ -196,7 +195,7 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
             let class = vreg_classes.get(&vreg).copied().unwrap_or(RegClass::Gp64);
             // Check if any call falls within [start, end].
             let crosses_call = call_positions.iter().any(|&cp| cp > start && cp < end);
-            Some(LiveInterval { vreg, class, start, end, crosses_call })
+            Some(LiveInterval { vreg, class, start, end, crosses_call, hint: None })
         })
         .collect();
 
