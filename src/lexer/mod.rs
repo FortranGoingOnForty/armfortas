@@ -528,42 +528,42 @@ impl<'a> Lexer<'a> {
         let quote = self.advance();
         let mut text = String::new();
         text.push(quote as char);
-        let mut value = String::new();
 
         loop {
             // Handle continuation inside strings.
             if self.peek() == b'&' {
                 let saved_text_len = text.len();
-                let saved_value_len = value.len();
                 let save_pos = self.pos;
                 let save_line = self.line;
                 let save_col = self.col;
 
                 self.advance(); // &
-                // Check if this is a continuation (rest of line is whitespace/comment then newline).
+                // Check if rest of line is whitespace and/or comment, then newline.
                 let mut is_cont = true;
                 while !self.at_end() && self.peek() != b'\n' {
-                    if self.peek() == b' ' || self.peek() == b'\t' || self.peek() == b'\r' {
-                        self.advance();
-                    } else {
-                        is_cont = false;
-                        break;
+                    match self.peek() {
+                        b' ' | b'\t' | b'\r' => { self.advance(); }
+                        b'!' => {
+                            // Comment after & — skip to newline.
+                            while !self.at_end() && self.peek() != b'\n' {
+                                self.advance();
+                            }
+                            break;
+                        }
+                        _ => { is_cont = false; break; }
                     }
                 }
                 if is_cont && !self.at_end() {
                     self.advance(); // newline
                     self.skip_spaces();
                     if self.peek() == b'&' { self.advance(); }
-                    // Don't add & to text or value — it's a continuation marker.
                     continue;
                 }
-                // Not a continuation — the & is part of the string? That's unusual.
-                // Restore and treat & as a literal character.
+                // Not a continuation — restore and treat & as literal character.
                 self.pos = save_pos;
                 self.line = save_line;
                 self.col = save_col;
                 text.truncate(saved_text_len);
-                value.truncate(saved_value_len);
             }
 
             if self.at_end() || self.peek() == b'\n' {
@@ -574,17 +574,13 @@ impl<'a> Lexer<'a> {
             text.push(c as char);
 
             if c == quote {
-                // Doubled quote escape?
                 if self.peek() == quote {
-                    let c2 = self.advance();
-                    text.push(c2 as char);
-                    value.push(quote as char);
+                    // Doubled quote escape.
+                    text.push(self.advance() as char);
                 } else {
                     // End of string.
                     break;
                 }
-            } else {
-                value.push(c as char);
             }
         }
 
@@ -729,7 +725,7 @@ impl<'a> Lexer<'a> {
         }
 
         let lower = name.to_lowercase();
-        let text = format!(".{}.", lower);
+        let text = format!(".{}.", name); // preserve original case in text
 
         // Check for logical literals.
         if lower == "true" || lower == "false" {
