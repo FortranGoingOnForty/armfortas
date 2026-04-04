@@ -723,16 +723,20 @@ fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
 }
 
 /// Emit a constant integer using movz/movk sequence.
-fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64, _width: IntWidth) {
-    let uval = val as u64;
+/// Respects width: 32-bit values mask to 32 bits and only emit shifts 0/16.
+fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64, width: IntWidth) {
+    let is_32 = matches!(width, IntWidth::I8 | IntWidth::I16 | IntWidth::I32);
+    // Mask to the appropriate width to prevent sign-extension artifacts.
+    let uval = if is_32 { (val as u32) as u64 } else { val as u64 };
+    let max_shift = if is_32 { 2 } else { 4 }; // 2 chunks for 32-bit, 4 for 64-bit
 
     if uval == 0 {
-        // MOV dest, XZR
+        let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
         mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::MovReg,
             operands: vec![
                 MachineOperand::VReg(dest),
-                MachineOperand::PhysReg(PhysReg::Xzr),
+                MachineOperand::PhysReg(zr),
             ],
             def: Some(dest),
         });
@@ -741,9 +745,10 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64
 
     // MOVZ for the first non-zero 16-bit chunk, MOVK for the rest.
     let mut first = true;
-    for shift in (0..4).map(|i| i * 16) {
+    for i in 0..max_shift {
+        let shift = i * 16;
         let chunk = ((uval >> shift) & 0xFFFF) as u16;
-        if chunk != 0 || (first && shift == 48) {
+        if chunk != 0 || (first && i == max_shift - 1) {
             let opcode = if first { ArmOpcode::Movz } else { ArmOpcode::Movk };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -752,20 +757,19 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64
                     MachineOperand::Imm(chunk as i64),
                     MachineOperand::Shift(shift as u8),
                 ],
-                def: Some(dest), // all steps (movz + movk) write to dest
+                def: Some(dest),
             });
             first = false;
         }
     }
 
-    // If value was all zeros in upper chunks but we never emitted, emit movz #0.
     if first {
+        let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
         mf.block_mut(mb).insts.push(MachineInst {
-            opcode: ArmOpcode::Movz,
+            opcode: ArmOpcode::MovReg,
             operands: vec![
                 MachineOperand::VReg(dest),
-                MachineOperand::Imm(0),
-                MachineOperand::Shift(0),
+                MachineOperand::PhysReg(zr),
             ],
             def: Some(dest),
         });
@@ -1010,17 +1014,20 @@ mod tests {
     }
 
     #[test]
-    fn const_zero_uses_xzr() {
+    fn const_zero_uses_zr() {
         let mf = select_simple(|b| {
             b.const_i32(0);
             b.ret_void();
         });
-        // const 0 should use MOV dest, XZR (not MOVZ).
+        // const_i32(0) should use MOV dest, WZR (32-bit zero register).
         let insts = &mf.blocks[0].insts;
-        let has_mov_xzr = insts.iter().any(|i| {
+        let has_mov_zr = insts.iter().any(|i| {
             i.opcode == ArmOpcode::MovReg &&
-            i.operands.iter().any(|o| matches!(o, MachineOperand::PhysReg(PhysReg::Xzr)))
+            i.operands.iter().any(|o| matches!(o,
+                MachineOperand::PhysReg(PhysReg::Xzr) |
+                MachineOperand::PhysReg(PhysReg::Wzr)
+            ))
         });
-        assert!(has_mov_xzr, "const 0 should use MOV from XZR");
+        assert!(has_mov_zr, "const 0 should use MOV from XZR or WZR");
     }
 }
