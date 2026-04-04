@@ -166,7 +166,11 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
         ProgramUnit::Function { name, decls, body, args, result, return_type, .. } => {
             let ret_ty = return_type.as_ref()
                 .map(lower_type_spec)
-                .unwrap_or(IrType::Int(IntWidth::I32));
+                .unwrap_or_else(|| {
+                    // No prefix type — infer from the result variable's declaration.
+                    let result_name = result.as_deref().unwrap_or(name.as_str());
+                    arg_type_from_decls(result_name, decls)
+                });
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
@@ -1292,7 +1296,10 @@ fn lower_expr(
                 }).collect();
 
                 // Look up callee return type from symbol table.
-                let ret_ty = st.lookup(&key)
+                // Search all scopes since the current scope may be global after resolve.
+                let callee_sym = st.scopes.iter()
+                    .find_map(|scope| scope.symbols.get(&key));
+                let ret_ty = callee_sym
                     .and_then(|sym| sym.type_info.as_ref())
                     .map(|info| crate::sema::types::type_info_to_fortran_type(info))
                     .map(|ft| match ft {
