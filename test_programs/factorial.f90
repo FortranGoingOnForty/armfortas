@@ -1,3 +1,4 @@
+! CHECK: 3628800
 program test_factorial
     implicit none
     integer :: n, result

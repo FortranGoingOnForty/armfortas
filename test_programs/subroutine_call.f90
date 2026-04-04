@@ -1,3 +1,4 @@
+! CHECK: 30
 program test_sub
     implicit none
     integer :: a, b, c

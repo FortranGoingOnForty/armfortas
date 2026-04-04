@@ -1,3 +1,13 @@
+! CHECK: 1
+! CHECK: 1
+! CHECK: 2
+! CHECK: 3
+! CHECK: 5
+! CHECK: 8
+! CHECK: 13
+! CHECK: 21
+! CHECK: 34
+! CHECK: 55
 program test_fib
     implicit none
     integer :: i

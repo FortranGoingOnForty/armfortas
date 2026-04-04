@@ -1,3 +1,4 @@
+! CHECK: positive
 program test_if
     implicit none
     integer :: x

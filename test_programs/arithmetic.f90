@@ -1,3 +1,4 @@
+! CHECK: 30
 program arithmetic
     implicit none
     integer :: a, b, c

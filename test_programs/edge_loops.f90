@@ -1,3 +1,5 @@
+! CHECK: 0
+! CHECK: 22
 program test_edge_loops
     implicit none
     integer :: i, s

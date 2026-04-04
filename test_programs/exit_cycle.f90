@@ -1,3 +1,4 @@
+! CHECK: 25
 program test_exit_cycle
     implicit none
     integer :: i, s

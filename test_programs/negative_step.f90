@@ -1,3 +1,8 @@
+! CHECK: 5
+! CHECK: 4
+! CHECK: 3
+! CHECK: 2
+! CHECK: 1
 program test_negative_step
     implicit none
     integer :: i

@@ -1,3 +1,4 @@
+! CHECK: 55
 program loop_sum
     implicit none
     integer :: i, s

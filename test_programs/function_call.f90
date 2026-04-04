@@ -1,3 +1,4 @@
+! CHECK: 25
 program test_func
     implicit none
     integer :: x, y

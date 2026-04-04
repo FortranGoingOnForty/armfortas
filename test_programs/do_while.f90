@@ -1,3 +1,4 @@
+! CHECK: 1
 program test_do_while
     implicit none
     integer :: x

@@ -1,3 +1,4 @@
+! CHECK: 25
 program test_nested
     implicit none
     integer :: i, j, total

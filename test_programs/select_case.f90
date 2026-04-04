@@ -1,3 +1,4 @@
+! CHECK: three
 program test_select
     implicit none
     integer :: x
