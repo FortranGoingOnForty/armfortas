@@ -60,14 +60,35 @@ pub fn print_function(func: &Function) -> String {
     writeln!(out, ") -> {} {{", func.return_type).unwrap();
 
     for block in &func.blocks {
-        write!(out, "{}", print_block(block)).unwrap();
+        write!(out, "{}", print_block_in(block, func)).unwrap();
     }
 
     writeln!(out, "  }}").unwrap();
     out
 }
 
-/// Print a basic block to a string.
+/// Print a basic block to a string (with function context for named branches).
+pub fn print_block_in(block: &BasicBlock, func: &Function) -> String {
+    let mut out = String::new();
+    write!(out, "    {}(", block.name).unwrap();
+    for (i, bp) in block.params.iter().enumerate() {
+        if i > 0 { write!(out, ", ").unwrap(); }
+        write!(out, "%{}: {}", bp.id.0, bp.ty).unwrap();
+    }
+    writeln!(out, "):").unwrap();
+
+    for inst in &block.insts {
+        writeln!(out, "      {}", print_inst(inst)).unwrap();
+    }
+
+    if let Some(term) = &block.terminator {
+        writeln!(out, "      {}", print_terminator_with_names(term, func)).unwrap();
+    }
+
+    out
+}
+
+/// Print a basic block to a string (fallback, no function context).
 pub fn print_block(block: &BasicBlock) -> String {
     let mut out = String::new();
     write!(out, "    {}(", block.name).unwrap();
@@ -164,30 +185,60 @@ pub fn print_inst(inst: &Inst) -> String {
     }
 }
 
-/// Print a terminator to a string.
-pub fn print_terminator(term: &Terminator) -> String {
+/// Print a terminator to a string. Uses block names for readability.
+pub fn print_terminator_with_names(term: &Terminator, func: &Function) -> String {
+    let bname = |id: &BlockId| -> String { func.block(*id).name.clone() };
     match term {
         Terminator::Return(None) => "ret void".into(),
         Terminator::Return(Some(v)) => format!("ret %{}", v.0),
         Terminator::Branch(dest, args) => {
             if args.is_empty() {
-                format!("br {}", dest.0)
+                format!("br {}", bname(dest))
             } else {
                 let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();
-                format!("br {}({})", dest.0, args_str.join(", "))
+                format!("br {}({})", bname(dest), args_str.join(", "))
             }
         }
         Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
             let ta: Vec<String> = true_args.iter().map(|a| format!("%{}", a.0)).collect();
             let fa: Vec<String> = false_args.iter().map(|a| format!("%{}", a.0)).collect();
             format!("cond_br %{}, {}({}), {}({})",
+                cond.0, bname(true_dest), ta.join(", "), bname(false_dest), fa.join(", "))
+        }
+        Terminator::Switch { selector, cases, default } => {
+            let cases_str: Vec<String> = cases.iter()
+                .map(|(v, b)| format!("{} -> {}", v, bname(b)))
+                .collect();
+            format!("switch %{}, [{}], default {}", selector.0, cases_str.join(", "), bname(default))
+        }
+        Terminator::Unreachable => "unreachable".into(),
+    }
+}
+
+/// Print a terminator without function context (fallback to block IDs).
+pub fn print_terminator(term: &Terminator) -> String {
+    match term {
+        Terminator::Return(None) => "ret void".into(),
+        Terminator::Return(Some(v)) => format!("ret %{}", v.0),
+        Terminator::Branch(dest, args) => {
+            if args.is_empty() {
+                format!("br bb{}", dest.0)
+            } else {
+                let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();
+                format!("br bb{}({})", dest.0, args_str.join(", "))
+            }
+        }
+        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
+            let ta: Vec<String> = true_args.iter().map(|a| format!("%{}", a.0)).collect();
+            let fa: Vec<String> = false_args.iter().map(|a| format!("%{}", a.0)).collect();
+            format!("cond_br %{}, bb{}({}), bb{}({})",
                 cond.0, true_dest.0, ta.join(", "), false_dest.0, fa.join(", "))
         }
         Terminator::Switch { selector, cases, default } => {
             let cases_str: Vec<String> = cases.iter()
-                .map(|(v, b)| format!("{} -> {}", v, b.0))
+                .map(|(v, b)| format!("{} -> bb{}", v, b.0))
                 .collect();
-            format!("switch %{}, [{}], default {}", selector.0, cases_str.join(", "), default.0)
+            format!("switch %{}, [{}], default bb{}", selector.0, cases_str.join(", "), default.0)
         }
         Terminator::Unreachable => "unreachable".into(),
     }
@@ -267,7 +318,7 @@ mod tests {
             b.ret_void();
         }
         let output = print_function(&func);
-        assert!(output.contains("cond_br %0, 1(), 2()"));
+        assert!(output.contains("cond_br %0, then(), else()"));
     }
 
     #[test]
@@ -303,7 +354,7 @@ mod tests {
         let output = print_function(&func);
         assert!(output.contains("header(%"));
         assert!(output.contains(": i32)"));
-        // The const_i32(0) gets some value ID; branch passes it.
-        assert!(output.contains("br 1("), "expected 'br 1(' in:\n{}", output);
+        // Branch to header with the init value.
+        assert!(output.contains("br header("), "expected 'br header(' in:\n{}", output);
     }
 }
