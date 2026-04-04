@@ -318,7 +318,7 @@ mod tests {
             b.ret_void();
         }
         let output = print_function(&func);
-        assert!(output.contains("cond_br %0, then(), else()"));
+        assert!(output.contains("cond_br %0, then_1(), else_2()"));
     }
 
     #[test]
@@ -352,9 +352,8 @@ mod tests {
             b.ret_void();
         }
         let output = print_function(&func);
-        assert!(output.contains("header(%"));
+        assert!(output.contains("header_1(%"));
         assert!(output.contains(": i32)"));
-        // Branch to header with the init value.
-        assert!(output.contains("br header("), "expected 'br header(' in:\n{}", output);
+        assert!(output.contains("br header_1("), "expected 'br header_1(' in:\n{}", output);
     }
 }

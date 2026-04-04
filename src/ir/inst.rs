@@ -223,10 +223,12 @@ impl Function {
     }
 
     /// Allocate a fresh BlockId and create the block.
+    /// Appends the block ID to ensure unique label names.
     pub fn create_block(&mut self, name: &str) -> BlockId {
         let id = BlockId(self.next_block);
         self.next_block += 1;
-        self.blocks.push(BasicBlock::new(id, name.into()));
+        let unique_name = format!("{}_{}", name, id.0);
+        self.blocks.push(BasicBlock::new(id, unique_name));
         id
     }
 
