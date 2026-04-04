@@ -211,7 +211,7 @@ fn protect_hollerith(body: &str) -> String {
                 if i < bytes.len() && (bytes[i] == b'H' || bytes[i] == b'h') {
                     if let Ok(count) = body[digit_start..i].parse::<usize>() {
                         i += 1; // skip H
-                        if count > 0 && i + count <= bytes.len() {
+                        if i + count <= bytes.len() {
                             // Replace nH... with '...'
                             result.push('\'');
                             result.push_str(&body[i..i + count]);
@@ -275,6 +275,7 @@ fn lex_fixed_string(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
     let mut tok_text = String::new();
     tok_text.push(quote as char);
 
+    let mut closed = false;
     while end < bytes.len() {
         tok_text.push(bytes[end] as char);
         if bytes[end] == quote {
@@ -283,11 +284,20 @@ fn lex_fixed_string(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
                 tok_text.push(bytes[end] as char);
                 end += 1;
             } else {
+                closed = true;
                 break;
             }
         } else {
             end += 1;
         }
+    }
+
+    if !closed {
+        let col = (pos as u32) + 7;
+        return Err(LexError {
+            span: Span { file_id, start: Position { line, col }, end: Position { line, col } },
+            msg: "unterminated string literal in fixed-form body".into(),
+        });
     }
 
     let col = (pos as u32) + 7;
@@ -450,8 +460,11 @@ fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -
 
     // DO/assignment ambiguity: if the run starts with "do" followed by digits,
     // check if this is a DO loop (has comma after =) or an assignment.
-    if run_lower.starts_with("do") && run.len() > 2 && run.as_bytes()[2].is_ascii_digit() {
-        if is_do_loop_context(text, pos + 2) {
+    if run_lower.starts_with("do")
+        && run.len() > 2
+        && run.as_bytes()[2].is_ascii_digit()
+        && is_do_loop_context(text, pos + 2)
+    {
             // IS a DO loop — emit just "DO" (2 chars). Subsequent calls
             // will pick up the label (digits) and variable (letters) separately.
             let col = (pos as u32) + 7;
@@ -464,8 +477,6 @@ fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -
                     end: Position { line, col: col + 2 },
                 },
             }, 2);
-        }
-        // Not a DO loop — fall through to emit entire run as identifier.
     }
 
     // Emit the entire alphanumeric run as one identifier.
@@ -491,10 +502,10 @@ fn make_ident_token(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 fn is_do_loop_context(text: &str, after_do: usize) -> bool {
     let bytes = text.as_bytes();
 
-    // Look for '=' anywhere after this position.
-    let eq_pos = bytes[after_do..].iter().position(|&b| b == b'=');
+    // Find '=' that is not inside strings or parens.
+    let eq_pos = find_top_level_char(bytes, after_do, b'=');
     let eq_pos = match eq_pos {
-        Some(p) => after_do + p,
+        Some(p) => p,
         None => return false,
     };
 
@@ -504,16 +515,45 @@ fn is_do_loop_context(text: &str, after_do: usize) -> bool {
     }
 
     // Check for a top-level comma after the '='.
+    find_top_level_char(bytes, eq_pos + 1, b',').is_some()
+}
+
+/// Find the first occurrence of `target` byte at the top level
+/// (not inside parentheses or string literals).
+fn find_top_level_char(bytes: &[u8], start: usize, target: u8) -> Option<usize> {
+    let mut i = start;
     let mut depth = 0i32;
-    for &b in &bytes[(eq_pos + 1)..] {
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Skip string literals.
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == quote {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == quote {
+                        i += 1; // doubled quote escape
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
         match b {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => return true,
+            b'(' => { depth += 1; }
+            b')' => { depth -= 1; }
+            c if c == target && depth == 0 => return Some(i),
             _ => {}
         }
+        i += 1;
     }
-    false
+    None
 }
 
 /// Lex a BOZ literal in fixed-form body.
@@ -1042,7 +1082,7 @@ C     Hello World
     #[test]
     fn index_not_broken() {
         // INDEX must NOT be split into IN+DEX — this was the showstopper bug.
-        let kinds = fixed_kinds("      X=INDEX(A,'B')\n");
+        let _kinds = fixed_kinds("      X=INDEX(A,'B')\n");
         let texts = fixed_texts("      X=INDEX(A,'B')\n");
         assert!(texts.contains(&"INDEX".to_string()), "INDEX was incorrectly split, got: {:?}", texts);
     }
@@ -1201,6 +1241,12 @@ C     Hello World
         assert!(texts.iter().any(|t| t.contains(" HELLO")), "space lost, got: {:?}", texts);
     }
 
+    #[test]
+    fn hollerith_zero_length() {
+        // 0H should produce empty string literal.
+        assert_eq!(protect_hollerith("=0H+"), "=''+");
+    }
+
     // ---- String in fixed-form ----
 
     #[test]
@@ -1209,6 +1255,26 @@ C     Hello World
         assert!(kinds.contains(&TokenKind::StringLiteral));
         let texts = fixed_texts("      X = 'IT''S'\n");
         assert!(texts.iter().any(|t| t.contains("IT''S")), "got: {:?}", texts);
+    }
+
+    #[test]
+    fn unterminated_string_error() {
+        let result = tokenize_fixed("      X = 'UNTERMINATED\n", 0);
+        assert!(result.is_err(), "should error on unterminated string");
+    }
+
+    #[test]
+    fn doublecomplex_keyword() {
+        use crate::lexer::is_keyword;
+        assert!(is_keyword("doublecomplex").is_some());
+        assert!(is_keyword("DOUBLECOMPLEX").is_some());
+    }
+
+    #[test]
+    fn continue_keyword() {
+        use crate::lexer::is_keyword;
+        assert!(is_keyword("continue").is_some());
+        assert!(is_keyword("CONTINUE").is_some());
     }
 
 }
