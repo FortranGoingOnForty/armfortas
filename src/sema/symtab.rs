@@ -49,6 +49,14 @@ impl SymbolTable {
         id
     }
 
+    /// Enter an existing scope by ID without creating a new one.
+    /// Returns the previous scope ID for later restoration.
+    pub fn enter_scope(&mut self, id: ScopeId) -> ScopeId {
+        let saved = self.current;
+        self.current = id;
+        saved
+    }
+
     /// Return to the parent scope.
     pub fn pop_scope(&mut self) {
         if let Some(parent) = self.scopes[self.current].parent {

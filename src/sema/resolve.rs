@@ -40,22 +40,16 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             st.pop_scope();
         }
         ProgramUnit::Module { name, uses, imports: _, implicit, decls, contains } => {
-            // Find the pre-created module scope.
+            // Find the pre-created module scope and enter it.
             if let Some(mod_id) = st.find_module_scope(name) {
-                // Re-enter the pre-created scope. We can't just push_scope again.
-                // Instead, set current to the existing scope.
-                let saved = st.current_scope();
-                // Manually navigate to the module scope.
-                // This is a bit hacky — ideally we'd have enter_scope(id).
-                st.scopes[mod_id].parent = Some(saved);
-                st.current = mod_id;
+                let saved = st.enter_scope(mod_id);
 
                 process_uses(st, uses)?;
                 process_implicit(st, implicit)?;
                 process_decls(st, decls)?;
                 process_contains(st, contains)?;
 
-                st.current = saved;
+                st.enter_scope(saved);
             }
         }
         ProgramUnit::Subroutine { name, args, prefix: _, bind: _, uses, imports: _, implicit, decls, body: _, contains } => {
