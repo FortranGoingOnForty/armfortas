@@ -160,9 +160,6 @@ impl Preprocessor {
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
     ) -> Result<(), PreprocError> {
-        // Join backslash-continued lines before processing.
-        let joined = join_continuations(source);
-
         // Set dynamic macros.
         self.defines.insert("__FILE__".into(), MacroDef::object(&format!("\"{}\"", filename)));
 
@@ -170,28 +167,42 @@ impl Preprocessor {
         self.defines.insert("__DATE__".into(), MacroDef::object(&format!("\"{}\"", now.0)));
         self.defines.insert("__TIME__".into(), MacroDef::object(&format!("\"{}\"", now.1)));
 
-        for (line_num, line) in joined.lines().enumerate() {
-            let line_1based = (line_num + 1) as u32;
+        // Process lines with inline backslash continuation joining,
+        // tracking original line numbers so __LINE__ and source_map are correct.
+        let raw_lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < raw_lines.len() {
+            let orig_line_num = (i + 1) as u32; // 1-based, tracks original source line
+            let mut logical_line = String::new();
 
-            // Update __LINE__.
-            self.defines.insert("__LINE__".into(), MacroDef::object(&line_1based.to_string()));
+            // Join backslash-continued lines.
+            while i < raw_lines.len() && raw_lines[i].ends_with('\\') {
+                logical_line.push_str(&raw_lines[i][..raw_lines[i].len() - 1]);
+                i += 1;
+            }
+            if i < raw_lines.len() {
+                logical_line.push_str(raw_lines[i]);
+                i += 1;
+            }
 
-            let trimmed = line.trim_start();
+            // Update __LINE__ to the original starting line of this logical line.
+            self.defines.insert("__LINE__".into(), MacroDef::object(&orig_line_num.to_string()));
+
+            let trimmed = logical_line.trim_start();
 
             if trimmed.starts_with('#') {
-                self.process_directive(trimmed, filename, line_1based, output, source_map)?;
-                // Emit blank line to keep line numbers aligned.
+                self.process_directive(trimmed, filename, orig_line_num, output, source_map)?;
                 output.push('\n');
-                source_map.push(SourceLoc { filename: filename.into(), line: line_1based });
+                source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
                 continue;
             }
 
             if self.is_emitting() {
-                let expanded = self.expand_macros(line, filename, line_1based);
+                let expanded = self.expand_macros(&logical_line, filename, orig_line_num);
                 output.push_str(&expanded);
             }
             output.push('\n');
-            source_map.push(SourceLoc { filename: filename.into(), line: line_1based });
+            source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
         }
 
         Ok(())
@@ -1477,6 +1488,13 @@ end module
         // The body gets trimmed during define processing, so it becomes "((a) +      (b))".
         assert!(out.contains("((1) +"), "got: {:?}", out.lines().collect::<Vec<_>>());
         assert!(out.contains("(2))"));
+    }
+
+    #[test]
+    fn line_number_correct_after_continuation() {
+        // Lines 1-3 are a continued #define. Line 4 should report __LINE__ = 4.
+        let out = pp("#define M \\\n    42\na\nb = __LINE__\n");
+        assert!(out.contains("b = 4"), "got: {:?}", out.lines().collect::<Vec<_>>());
     }
 
     // ---- Self-referencing macro (no infinite loop) ----
