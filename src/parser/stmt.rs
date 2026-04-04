@@ -69,10 +69,12 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             if self.peek() == &TokenKind::Eof { break; }
             let text = self.peek_text().to_lowercase();
-            if terminators.iter().any(|t| text == *t || text == format!("end{}", t)) {
+
+            // Check for combined end-keyword: "endif", "enddo", "endselect", etc.
+            if terminators.iter().any(|t| text == format!("end{}", t)) {
                 break;
             }
-            // Also check for "end" followed by a terminator keyword.
+            // Check for "end" followed by a terminator keyword: "end if", "end do", etc.
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
@@ -173,18 +175,7 @@ impl<'a> Parser<'a> {
         }
 
         // Consume END IF / ENDIF
-        self.skip_newlines();
-        let end_text = self.peek_text().to_lowercase();
-        if end_text == "endif" {
-            self.advance();
-        } else if end_text == "end" {
-            self.advance();
-            self.eat_ident("if");
-        }
-        // Optional name after end if.
-        if self.peek() == &TokenKind::Identifier && name.is_some() {
-            self.advance();
-        }
+        self.consume_end("if")?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::IfConstruct {
@@ -990,5 +981,34 @@ end if
         let mut parser = Parser::new(&tokens);
         let result = parser.parse_stmt();
         assert!(result.is_err(), "missing end do should error");
+    }
+
+    // ---- Same-type nesting (critical regression tests) ----
+
+    #[test]
+    fn if_inside_if() {
+        let s = parse_one("if (a > 0) then\n  if (b > 0) then\n    x = 1\n  end if\nend if\n");
+        if let Stmt::IfConstruct { then_body, .. } = &s.node {
+            assert_eq!(then_body.len(), 1, "outer IF should have 1 stmt in body");
+            assert!(matches!(then_body[0].node, Stmt::IfConstruct { .. }), "inner should be IfConstruct");
+        } else { panic!("not IfConstruct"); }
+    }
+
+    #[test]
+    fn do_inside_do() {
+        let s = parse_one("do i = 1, 10\n  do j = 1, 10\n    x = i + j\n  end do\nend do\n");
+        if let Stmt::DoLoop { body, .. } = &s.node {
+            assert_eq!(body.len(), 1, "outer DO should have 1 stmt in body");
+            assert!(matches!(body[0].node, Stmt::DoLoop { .. }), "inner should be DoLoop");
+        } else { panic!("not DoLoop"); }
+    }
+
+    #[test]
+    fn select_inside_select() {
+        let s = parse_one("select case (x)\ncase (1)\n  select case (y)\n  case (2)\n    z = 1\n  end select\nend select\n");
+        if let Stmt::SelectCase { cases, .. } = &s.node {
+            assert!(!cases.is_empty());
+            assert!(matches!(cases[0].body[0].node, Stmt::SelectCase { .. }), "inner should be SelectCase");
+        } else { panic!("not SelectCase"); }
     }
 }
