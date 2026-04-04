@@ -188,11 +188,11 @@ pub extern "C" fn afs_assign_allocatable(
         dest.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
     }
 
-    // Copy data.
+    // Copy data. Use ptr::copy (not copy_nonoverlapping) to handle self-assignment.
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
         unsafe {
-            ptr::copy_nonoverlapping(source.base_addr, dest.base_addr, bytes as usize);
+            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
         }
     }
 }
@@ -294,7 +294,8 @@ pub extern "C" fn afs_create_section(
 
     // Result base_addr = source base_addr + offset.
     if !source.base_addr.is_null() {
-        result.base_addr = unsafe { source.base_addr.add(byte_offset as usize) };
+        // byte_offset can be negative for negative-stride sections.
+        result.base_addr = unsafe { source.base_addr.offset(byte_offset as isize) };
     } else {
         result.base_addr = ptr::null_mut();
     }
