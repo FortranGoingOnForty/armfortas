@@ -52,6 +52,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p afs-as --lib
 
+  test-afs-as-harness:
+    name: "Tests: afs-as differential harness"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test differential_harness
+
+  test-afs-as-corpus:
+    name: "Tests: afs-as corpus compatibility"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test corpus_compat
+
   test-afs-as-roundtrip:
     name: "Tests: afs-as round-trip"
     runs-on: macos-latest
