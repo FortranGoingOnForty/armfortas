@@ -5,3 +5,4 @@
 
 pub mod symtab;
 pub mod resolve;
+pub mod types;
