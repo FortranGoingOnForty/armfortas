@@ -96,6 +96,7 @@ pub enum Stmt {
     Backspace { specs: Vec<IoControl> },
     Endfile { specs: Vec<IoControl> },
     Flush { specs: Vec<IoControl> },
+    Wait { specs: Vec<IoControl> },
 
     // ---- Memory ----
     Allocate { items: Vec<SpannedExpr>, opts: Vec<IoControl> },

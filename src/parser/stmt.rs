@@ -62,6 +62,7 @@ impl<'a> Parser<'a> {
             "backspace" => { self.advance(); self.parse_io_paren_stmt(start, "backspace") }
             "endfile" => { self.advance(); self.parse_io_paren_stmt(start, "endfile") }
             "flush" => { self.advance(); self.parse_io_paren_stmt(start, "flush") }
+            "wait" => { self.advance(); self.parse_io_paren_stmt(start, "wait") }
             "allocate" => { self.advance(); self.parse_allocate(start, false) }
             "deallocate" => { self.advance(); self.parse_allocate(start, true) }
             "nullify" => { self.advance(); self.parse_nullify(start) }
@@ -679,6 +680,7 @@ impl<'a> Parser<'a> {
             "backspace" => Stmt::Backspace { specs },
             "endfile" => Stmt::Endfile { specs },
             "flush" => Stmt::Flush { specs },
+            "wait" => Stmt::Wait { specs },
             _ => unreachable!(),
         }, span))
     }
@@ -727,10 +729,65 @@ impl<'a> Parser<'a> {
     fn parse_io_expr_list(&mut self) -> Result<Vec<SpannedExpr>, ParseError> {
         let mut items = Vec::new();
         loop {
+            // Check for implied-DO: (expr-list, var=start,end[,step])
+            if self.peek() == &TokenKind::LParen {
+                let save = self.pos;
+                if let Ok(implied) = self.try_parse_io_implied_do() {
+                    items.push(implied);
+                    if !self.eat(&TokenKind::Comma) { break; }
+                    continue;
+                }
+                self.pos = save;
+            }
             items.push(self.parse_expr()?);
             if !self.eat(&TokenKind::Comma) { break; }
         }
         Ok(items)
+    }
+
+    fn try_parse_io_implied_do(&mut self) -> Result<SpannedExpr, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::LParen)?;
+
+        // Parse items until we find var=start,end pattern.
+        let mut inner_items = vec![self.parse_expr()?];
+        while self.eat(&TokenKind::Comma) {
+            // Check for var=start pattern (identifier followed by =).
+            if self.peek() == &TokenKind::Identifier {
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
+                    let var = self.advance().clone().text;
+                    self.advance(); // =
+                    let loop_start = self.parse_expr()?;
+                    self.expect(&TokenKind::Comma)?;
+                    let end = self.parse_expr()?;
+                    let step = if self.eat(&TokenKind::Comma) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else { None };
+                    self.expect(&TokenKind::RParen)?;
+
+                    // Build as a synthetic expression — a FunctionCall-like node
+                    // that sema can recognize as an I/O implied-do.
+                    let span = span_from_to(start, self.prev_span());
+                    use crate::ast::expr::{Expr, AcValue};
+                    let values: Vec<AcValue> = inner_items.into_iter()
+                        .map(AcValue::Expr).collect();
+                    return Ok(Spanned::new(Expr::ArrayConstructor {
+                        type_spec: None,
+                        values: vec![AcValue::ImpliedDo {
+                            values,
+                            var,
+                            start: loop_start,
+                            end,
+                            step: step.map(|s| *s),
+                        }],
+                    }, span));
+                }
+            }
+            inner_items.push(self.parse_expr()?);
+        }
+        // If we got here without finding var=, it's not an implied-do.
+        Err(self.error("expected implied-do variable assignment".into()))
     }
 
     // ---- ALLOCATE / DEALLOCATE ----
@@ -739,6 +796,21 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen)?;
         let mut items = Vec::new();
         let mut opts = Vec::new();
+
+        // Check for typed allocation: allocate(type-spec :: items)
+        // E.g., allocate(integer :: x), allocate(base_type :: poly_var)
+        if !is_dealloc {
+            let save = self.pos;
+            if let Some(ts_result) = self.try_parse_type_spec() {
+                if ts_result.is_ok() && self.peek() == &TokenKind::ColonColon {
+                    self.advance(); // consume ::
+                    // Continue to parse items normally below.
+                } else {
+                    // Not a typed allocate — restore.
+                    self.pos = save;
+                }
+            }
+        }
 
         loop {
             // Check for keyword=value (stat=, errmsg=, source=, mold=).
@@ -1402,5 +1474,54 @@ end if
             assert_eq!(groups[0].0, "in");
             assert_eq!(groups[1].0, "out");
         } else { panic!("not Namelist"); }
+    }
+
+    // ---- Audit fixes ----
+
+    #[test]
+    fn wait_stmt() {
+        let s = parse_one("wait(unit=10, iostat=ios)\n");
+        assert!(matches!(s.node, Stmt::Wait { .. }));
+    }
+
+    #[test]
+    fn endfile_stmt() {
+        let s = parse_one("endfile(10)\n");
+        assert!(matches!(s.node, Stmt::Endfile { .. }));
+    }
+
+    #[test]
+    fn write_implied_do() {
+        let s = parse_one("write(*, *) (a(i), i=1,10)\n");
+        if let Stmt::Write { items, .. } = &s.node {
+            assert_eq!(items.len(), 1, "implied-do should produce 1 item");
+        } else { panic!("not Write"); }
+    }
+
+    #[test]
+    fn allocate_typed() {
+        // allocate(integer :: x) — typed allocation.
+        let s = parse_one("allocate(integer :: x(100))\n");
+        assert!(matches!(s.node, Stmt::Allocate { .. }));
+    }
+
+    #[test]
+    fn allocate_mold() {
+        let s = parse_one("allocate(y, mold=template)\n");
+        if let Stmt::Allocate { opts, .. } = &s.node {
+            assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("mold")));
+        } else { panic!("not Allocate"); }
+    }
+
+    #[test]
+    fn call_method_syntax() {
+        let s = parse_one("call obj%method(a, b)\n");
+        assert!(matches!(s.node, Stmt::Call { .. }));
+    }
+
+    #[test]
+    fn print_label_format() {
+        let s = parse_one("print 100, x\n");
+        assert!(matches!(s.node, Stmt::Print { .. }));
     }
 }
