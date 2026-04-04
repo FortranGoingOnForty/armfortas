@@ -270,7 +270,9 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
         // Register the subprogram name in the current scope before descending.
         match &unit.node {
             ProgramUnit::Subroutine { name, .. } => {
-                let _ = st.define(Symbol {
+                // Ignore duplicate if subprogram name already declared (e.g., as a variable).
+                // This is a name collision that sema will validate later.
+                let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
                     type_info: None,
@@ -280,7 +282,9 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                 });
             }
             ProgramUnit::Function { name, .. } => {
-                let _ = st.define(Symbol {
+                // Ignore duplicate if subprogram name already declared (e.g., as a variable).
+                // This is a name collision that sema will validate later.
+                let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
                     type_info: None,
