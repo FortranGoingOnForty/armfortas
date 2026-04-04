@@ -82,6 +82,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let base = op_str(&inst.operands[1]);
             let offset = match &inst.operands[2] {
                 MachineOperand::FrameSlot(off) => format!("#{}", off),
+                MachineOperand::Imm(-1) => {
+                    // Sentinel: prologue FP setup → frame_size - 16
+                    format!("#{}", mf.frame.size.saturating_sub(16))
+                }
                 MachineOperand::Imm(v) => format!("#{}", v),
                 _ => op_str(&inst.operands[2]),
             };
@@ -89,9 +93,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
         ArmOpcode::SubReg => format!("sub {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::SubImm => format!("sub {}, {}, #{}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
-            if let MachineOperand::Imm(v) = &inst.operands[2] { *v } else { 0 }),
+        ArmOpcode::SubImm => {
+            let imm = match &inst.operands[2] {
+                MachineOperand::Imm(-1) => {
+                    // Sentinel: epilogue SP restore → frame_size - 16
+                    mf.frame.size.saturating_sub(16) as i64
+                }
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            format!("sub {}, {}, #{}", op_str(&inst.operands[0]), op_str(&inst.operands[1]), imm)
+        }
         ArmOpcode::Mul => format!("mul {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::Sdiv => format!("sdiv {}, {}, {}",

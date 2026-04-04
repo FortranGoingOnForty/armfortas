@@ -376,7 +376,8 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             // The "address" is a frame slot offset. Map the ValueId to the offset.
             if let Some(&offset) = ctx.alloca_offsets.get(&inst.id) {
                 let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
-                // Materialize address: SUB dest, FP, #abs(offset) (offsets are negative from FP)
+                // Materialize address: SUB dest, FP, #abs(offset)
+                // Offsets are negative from FP, so we subtract the absolute value.
                 let abs_offset = (-offset) as i64;
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::SubImm,
@@ -515,7 +516,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 let arg_vreg = ctx.lookup_vreg(arg_val);
                 let arg_class = mf.vregs.iter().find(|v| v.id == arg_vreg).map(|v| v.class);
                 match arg_class {
-                    Some(RegClass::Fp32) | Some(RegClass::Fp64) => {
+                    Some(RegClass::Fp64) => {
                         if fp_idx < 8 {
                             mf.block_mut(mb).insts.push(MachineInst {
                                 opcode: ArmOpcode::FmovReg,
@@ -528,7 +529,34 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                             fp_idx += 1;
                         }
                     }
+                    Some(RegClass::Fp32) => {
+                        if fp_idx < 8 {
+                            mf.block_mut(mb).insts.push(MachineInst {
+                                opcode: ArmOpcode::FmovReg,
+                                operands: vec![
+                                    MachineOperand::PhysReg(PhysReg::Fp32(fp_idx)),
+                                    MachineOperand::VReg(arg_vreg),
+                                ],
+                                def: None,
+                            });
+                            fp_idx += 1;
+                        }
+                    }
+                    Some(RegClass::Gp32) => {
+                        if gp_idx < 8 {
+                            mf.block_mut(mb).insts.push(MachineInst {
+                                opcode: ArmOpcode::MovReg,
+                                operands: vec![
+                                    MachineOperand::PhysReg(PhysReg::Gp32(gp_idx)),
+                                    MachineOperand::VReg(arg_vreg),
+                                ],
+                                def: None,
+                            });
+                            gp_idx += 1;
+                        }
+                    }
                     _ => {
+                        // Gp64 or unknown — use 64-bit register.
                         if gp_idx < 8 {
                             mf.block_mut(mb).insts.push(MachineInst {
                                 opcode: ArmOpcode::MovReg,
@@ -556,8 +584,10 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 let class = type_to_reg_class(&inst.ty);
                 let dest = ctx.get_vreg(mf, inst.id, class);
                 let (src_reg, opcode) = match class {
-                    RegClass::Fp32 | RegClass::Fp64 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
-                    _ => (PhysReg::Gp(0), ArmOpcode::MovReg),
+                    RegClass::Fp64 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
+                    RegClass::Fp32 => (PhysReg::Fp32(0), ArmOpcode::FmovReg),
+                    RegClass::Gp32 => (PhysReg::Gp32(0), ArmOpcode::MovReg),
+                    RegClass::Gp64 => (PhysReg::Gp(0), ArmOpcode::MovReg),
                 };
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode,
@@ -682,30 +712,50 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
 
 // ---- Helpers ----
 
-/// Emit function prologue: STP x29, x30, [sp, -framesize]!; MOV x29, sp
+/// Emit function prologue:
+///   stp x29, x30, [sp, #-FRAME_SIZE]!
+///   add x29, sp, #FRAME_SIZE - 16
+/// FP points at the saved FP/LR pair at the top of the frame.
 fn emit_prologue(mf: &mut MachineFunction, mb: MBlockId) {
+    // STP x29, x30, [sp, #-FRAME_SIZE]!
     mf.block_mut(mb).insts.push(MachineInst {
         opcode: ArmOpcode::StpPre,
         operands: vec![
             MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::PhysReg(PhysReg::LR),
             MachineOperand::PhysReg(PhysReg::Sp),
-            // Frame size filled in during emission (needs final frame.size).
         ],
         def: None,
     });
+    // ADD x29, sp, #FRAME_SIZE - 16
+    // (frame_size - 16 computed during emission when final size is known)
     mf.block_mut(mb).insts.push(MachineInst {
-        opcode: ArmOpcode::MovReg,
+        opcode: ArmOpcode::AddImm,
         operands: vec![
             MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::PhysReg(PhysReg::Sp),
+            MachineOperand::Imm(-1), // sentinel: replaced with frame_size-16 during emit
         ],
         def: None,
     });
 }
 
-/// Emit function epilogue: LDP x29, x30, [sp], framesize; RET
+/// Emit function epilogue:
+///   sub sp, x29, #FRAME_SIZE - 16  (restore SP to bottom of frame)
+///   ldp x29, x30, [sp], #FRAME_SIZE
+///   ret
 fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
+    // SUB sp, x29, #FRAME_SIZE - 16 (sentinel -1 replaced during emit)
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::SubImm,
+        operands: vec![
+            MachineOperand::PhysReg(PhysReg::Sp),
+            MachineOperand::PhysReg(PhysReg::FP),
+            MachineOperand::Imm(-1), // sentinel: replaced during emit
+        ],
+        def: None,
+    });
+    // LDP x29, x30, [sp], #FRAME_SIZE
     mf.block_mut(mb).insts.push(MachineInst {
         opcode: ArmOpcode::LdpPost,
         operands: vec![
@@ -1009,7 +1059,7 @@ mod tests {
         });
         let insts = &mf.blocks[0].insts;
         assert_eq!(insts[0].opcode, ArmOpcode::StpPre, "first inst should be STP (prologue)");
-        assert_eq!(insts[1].opcode, ArmOpcode::MovReg, "second inst should be MOV FP, SP");
+        assert_eq!(insts[1].opcode, ArmOpcode::AddImm, "second inst should be ADD FP, SP, #offset");
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Ret), "should have RET");
     }
 
