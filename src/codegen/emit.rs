@@ -161,7 +161,9 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let shift = if let MachineOperand::Shift(s) = &inst.operands[2] { *s } else { 0 };
             format!("movn {}, #{}, lsl #{}", op_str(&inst.operands[0]), imm, shift)
         }
-        ArmOpcode::MovReg | ArmOpcode::FmovReg => format!("mov {}, {}",
+        ArmOpcode::MovReg => format!("mov {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FmovReg => format!("fmov {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
 
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
@@ -223,6 +225,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
+        ArmOpcode::Brk => {
+            let imm = if let MachineOperand::Imm(v) = &inst.operands[0] { *v } else { 1 };
+            format!("brk #{}", imm)
+        }
     }
 }
 
@@ -230,7 +236,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
 fn op_str(op: &MachineOperand) -> String {
     match op {
         MachineOperand::VReg(id) => format!("v{}", id.0), // placeholder until regalloc
-        MachineOperand::PhysReg(PhysReg::Gp(31)) => "sp".into(), // SP/XZR context-dependent
+        MachineOperand::PhysReg(PhysReg::Sp) => "sp".into(),
+        MachineOperand::PhysReg(PhysReg::Xzr) => "xzr".into(),
         MachineOperand::PhysReg(PhysReg::Gp(n)) => format!("x{}", n),
         MachineOperand::PhysReg(PhysReg::Fp(n)) => format!("d{}", n),
         MachineOperand::Imm(v) => format!("#{}", v),
