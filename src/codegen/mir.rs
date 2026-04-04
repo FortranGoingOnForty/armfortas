@@ -213,25 +213,43 @@ pub struct FrameSlot {
 
 impl StackFrame {
     pub fn new() -> Self {
-        // Start after saved FP+LR (16 bytes).
-        Self { locals: Vec::new(), size: 16, next_offset: -16 }
+        // Apple ARM64 frame layout:
+        //   FP points at saved FP/LR (top of frame).
+        //   Locals are at negative offsets from FP.
+        //   SP is at the bottom of the frame.
+        //
+        //   [FP+0]  = saved x29
+        //   [FP+8]  = saved x30
+        //   [FP-8]  = first local
+        //   [FP-16] = second local
+        //   ...
+        //   [SP]    = bottom of frame
+        //
+        // Prologue: stp x29, x30, [sp, #-FRAME_SIZE]!
+        //           add x29, sp, #FRAME_SIZE - 16
+        // Epilogue: sub sp, x29, #FRAME_SIZE - 16
+        //           ldp x29, x30, [sp], #FRAME_SIZE
+        //           ret
+        Self { locals: Vec::new(), size: 16, next_offset: 0 }
     }
 
-    /// Allocate a local variable slot. Returns the offset from FP (negative).
+    /// Allocate a local variable slot. Returns a negative offset from FP.
+    /// Locals grow downward from FP: first local at [FP-8], etc.
     pub fn alloc_local(&mut self, size: u32) -> i32 {
-        // Align to natural alignment (at least 4 bytes, 8 for 8-byte values).
-        let align: i32 = if size >= 8 { 8 } else { 4 };
-        self.next_offset = (self.next_offset - size as i32) & !(align - 1);
-        let offset = self.next_offset;
+        let align = if size >= 8 { 8i32 } else { 4 };
+        self.next_offset += size as i32;
+        // Align the running offset.
+        self.next_offset = (self.next_offset + align - 1) & !(align - 1);
+        let offset = -self.next_offset; // negative from FP
         self.locals.push(FrameSlot { offset, size });
         self.recompute_size();
         offset
     }
 
-    /// Finalize frame size with 16-byte alignment.
+    /// Frame size = 16 (FP+LR) + locals, 16-byte aligned.
     fn recompute_size(&mut self) {
-        let raw = (-self.next_offset) as u32 + 16; // +16 for saved FP+LR
-        self.size = (raw + 15) & !15; // round up to 16-byte boundary
+        let raw = 16 + self.next_offset as u32; // 16 for FP/LR + locals
+        self.size = (raw + 15) & !15;
     }
 }
 
