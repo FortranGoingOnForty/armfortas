@@ -58,17 +58,46 @@ pub fn select_function(func: &Function) -> MachineFunction {
     emit_prologue(&mut mf, MBlockId(0));
 
     // Phase 3.5: move incoming argument registers into param vregs.
-    // The regalloc will then spill these to stack as needed.
-    for (i, (_param_id, vreg)) in param_info.iter().enumerate() {
-        if i < 8 {
-            mf.block_mut(MBlockId(0)).insts.push(MachineInst {
-                opcode: ArmOpcode::MovReg,
-                operands: vec![
-                    MachineOperand::VReg(*vreg),
-                    MachineOperand::PhysReg(PhysReg::Gp(i as u8)),
-                ],
-                def: Some(*vreg),
-            });
+    // Dispatch by register class: GP args from x0-x7, FP args from d0-d7.
+    let mut gp_idx: u8 = 0;
+    let mut fp_idx: u8 = 0;
+    for (_param_id, vreg) in &param_info {
+        let class = mf.vregs.iter().find(|v| v.id == *vreg).map(|v| v.class);
+        match class {
+            Some(RegClass::Fp64) if fp_idx < 8 => {
+                mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                    opcode: ArmOpcode::FmovReg,
+                    operands: vec![
+                        MachineOperand::VReg(*vreg),
+                        MachineOperand::PhysReg(PhysReg::Fp(fp_idx)),
+                    ],
+                    def: Some(*vreg),
+                });
+                fp_idx += 1;
+            }
+            Some(RegClass::Fp32) if fp_idx < 8 => {
+                mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                    opcode: ArmOpcode::FmovReg,
+                    operands: vec![
+                        MachineOperand::VReg(*vreg),
+                        MachineOperand::PhysReg(PhysReg::Fp32(fp_idx)),
+                    ],
+                    def: Some(*vreg),
+                });
+                fp_idx += 1;
+            }
+            _ if gp_idx < 8 => {
+                mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(*vreg),
+                        MachineOperand::PhysReg(PhysReg::Gp(gp_idx)),
+                    ],
+                    def: Some(*vreg),
+                });
+                gp_idx += 1;
+            }
+            _ => {} // 9+ args: stack passing not yet implemented
         }
     }
 
