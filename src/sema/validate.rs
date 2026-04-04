@@ -136,39 +136,50 @@ pub fn validate_file_with_std(
     ctx.diags
 }
 
-/// Find the scope ID for a program unit by matching the scope kind.
-fn find_scope_for_unit(st: &SymbolTable, unit: &ProgramUnit) -> Option<ScopeId> {
-    match unit {
+/// Find the scope ID for a program unit, preferring children of `parent_scope`.
+/// This resolves ambiguity when multiple scopes share a name (e.g., a module
+/// subroutine and a CONTAINS subroutine with the same name).
+fn find_scope_for_unit(st: &SymbolTable, unit: &ProgramUnit, parent_scope: ScopeId) -> Option<ScopeId> {
+    #[allow(clippy::type_complexity)]
+    let (kind_matcher, _name): (Box<dyn Fn(&ScopeKind) -> bool>, Option<String>) = match unit {
         ProgramUnit::Program { name, .. } => {
             let target = name.clone().unwrap_or_else(|| "<main>".into());
-            st.scopes.iter().find_map(|s| {
-                if let ScopeKind::Program(ref n) = s.kind {
-                    if n == &target { Some(s.id) } else { None }
-                } else { None }
-            })
+            (Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)), None)
         }
-        ProgramUnit::Module { name, .. } => st.find_module_scope(name),
+        ProgramUnit::Module { name, .. } => {
+            let n = name.clone();
+            (Box::new(move |k| matches!(k, ScopeKind::Module(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
+        }
         ProgramUnit::Subroutine { name, .. } => {
-            st.scopes.iter().find_map(|s| {
-                if let ScopeKind::Subroutine(ref n) = s.kind {
-                    if n.eq_ignore_ascii_case(name) { Some(s.id) } else { None }
-                } else { None }
-            })
+            let n = name.clone();
+            (Box::new(move |k| matches!(k, ScopeKind::Subroutine(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
         }
         ProgramUnit::Function { name, .. } => {
-            st.scopes.iter().find_map(|s| {
-                if let ScopeKind::Function(ref n) = s.kind {
-                    if n.eq_ignore_ascii_case(name) { Some(s.id) } else { None }
-                } else { None }
-            })
+            let n = name.clone();
+            (Box::new(move |k| matches!(k, ScopeKind::Function(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
         }
-        _ => None,
+        ProgramUnit::BlockData { name, .. } => {
+            let target = name.clone().unwrap_or_else(|| "<block_data>".into());
+            (Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)), None)
+        }
+        _ => return None,
+    };
+
+    // Prefer a child of the current parent scope.
+    let child = st.scopes.iter().find(|s| {
+        s.parent == Some(parent_scope) && kind_matcher(&s.kind)
+    });
+    if let Some(s) = child {
+        return Some(s.id);
     }
+
+    // Fall back to any matching scope.
+    st.scopes.iter().find(|s| kind_matcher(&s.kind)).map(|s| s.id)
 }
 
 fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     let saved_scope = ctx.scope_id;
-    if let Some(scope_id) = find_scope_for_unit(ctx.st, &unit.node) {
+    if let Some(scope_id) = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id) {
         ctx.scope_id = scope_id;
     }
 
@@ -231,6 +242,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
+        ProgramUnit::Submodule { decls, contains, .. } => {
+            validate_decls(ctx, decls);
+            for sub in contains {
+                validate_unit(ctx, sub);
+            }
+        }
+        ProgramUnit::BlockData { decls, .. } => {
+            validate_decls(ctx, decls);
+        }
         ProgramUnit::InterfaceBlock { name, is_abstract, bodies } => {
             // Validate defined operator interfaces.
             if let Some(ref iface_name) = name {
@@ -254,7 +274,6 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 }
             }
         }
-        _ => {}
     }
 
     ctx.scope_id = saved_scope;
@@ -421,10 +440,30 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // Call in pure: callee must be pure (we check if it's known impure).
-        Stmt::Call { callee, .. } => {
+        Stmt::Call { callee, args, .. } => {
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
             }
+            validate_call_site_intent(ctx, callee, args, stmt.span);
+        }
+
+        // Nullify: items must be pointers.
+        Stmt::Nullify { items } => {
+            for item in items {
+                if let Some(ref name) = extract_base_name(item) {
+                    let is_pointer = ctx.lookup(name).map(|s| s.attrs.pointer).unwrap_or(true);
+                    if !is_pointer {
+                        ctx.error(item.span, format!(
+                            "NULLIFY target '{}' must have pointer attribute", name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Embedded declarations (e.g., inside BLOCK constructs).
+        Stmt::Declaration(decl) => {
+            validate_decls(ctx, std::slice::from_ref(decl));
         }
 
         _ => {}
@@ -434,9 +473,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 // ---- Specific validation checks ----
 
 /// Check that an assignment target is modifiable (not intent(in), not parameter).
+/// Handles component access (x%field) and array elements (a(i)) — the base
+/// variable's intent/parameter status applies to all parts.
 fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedExpr, span: Span) {
-    if let Expr::Name { name } = &target.node {
-        let (is_intent_in, is_parameter) = ctx.lookup(name)
+    if let Some(name) = extract_base_name(target) {
+        let (is_intent_in, is_parameter) = ctx.lookup(&name)
             .map(|sym| (matches!(sym.attrs.intent, Some(Intent::In)), sym.attrs.parameter))
             .unwrap_or((false, false));
         if is_intent_in {
@@ -455,21 +496,26 @@ fn validate_pointer_assignment(
     value: &crate::ast::expr::SpannedExpr,
     span: Span,
 ) {
-    if let Expr::Name { name } = &target.node {
-        let is_pointer = ctx.lookup(name).map(|s| s.attrs.pointer).unwrap_or(true);
+    // For component access (p%ptr_field => x), the final component determines
+    // pointer-ness, but we only have the base name. Check the base for now.
+    if let Some(name) = extract_base_name(target) {
+        let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
         if !is_pointer {
             ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
         }
     }
 
-    // RHS must have target attribute or be a pointer (or null()).
-    if let Expr::Name { name } = &value.node {
-        let ok = ctx.lookup(name).map(|s| s.attrs.target || s.attrs.pointer).unwrap_or(true);
+    // RHS must have target attribute or be a pointer (or null()/function call).
+    if let Some(name) = extract_base_name(value) {
+        // Skip if the value is a function call — could be null() or pointer-valued function.
+        if matches!(value.node, Expr::FunctionCall { .. }) {
+            return;
+        }
+        let ok = ctx.lookup(&name).map(|s| s.attrs.target || s.attrs.pointer).unwrap_or(true);
         if !ok {
             ctx.error(span, format!("pointer assignment source '{}' must have target or pointer attribute", name));
         }
     }
-    // If RHS is a function call (e.g., null()), we allow it — can't check further without type info.
 }
 
 /// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
@@ -489,16 +535,53 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
 }
 
 /// Check if a call in a pure procedure is to a known impure procedure.
-fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, span: Span) {
-    if let Expr::Name { name } = &callee.node {
-        if let Some(sym) = ctx.lookup(name) {
-            // We can only catch subroutines/functions that are locally known.
-            // If the callee is defined in a CONTAINS and was resolved, we could check its prefix.
-            // For now, we flag calls to known I/O routines.
-            // Full check requires tracking pure attribute in symbol table — deferred.
-            let _ = sym;
+/// NOTE: This is a partial check — full validation requires tracking the
+/// pure attribute in the symbol table, which isn't done yet. Currently we
+/// only catch I/O, STOP, and SAVE violations (in validate_stmt). This stub
+/// exists for when symbol-level pure tracking is added.
+fn validate_pure_call(_ctx: &mut Ctx, _callee: &crate::ast::expr::SpannedExpr, _span: Span) {
+    // Deferred: requires pure/impure attribute on Symbol.
+}
+
+/// Validate call-site argument intent constraints.
+/// Can't pass a literal, parameter, or expression to intent(out/inout).
+fn validate_call_site_intent(
+    ctx: &mut Ctx,
+    callee: &crate::ast::expr::SpannedExpr,
+    args: &[crate::ast::expr::Argument],
+    span: Span,
+) {
+    // Look up the callee to find its dummy argument intents.
+    let callee_name = if let Expr::Name { name } = &callee.node { name.clone() } else { return; };
+
+    // For each actual argument, check if it's an lvalue when the dummy requires out/inout.
+    // We can only check this if the callee's dummy arg info is in the symbol table.
+    // For now, check the simpler case: passing a literal or parameter to ANY subroutine arg.
+    for arg in args {
+        let actual = match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => e,
+            _ => continue,
+        };
+        // Check if actual is a literal (not an lvalue).
+        let is_literal = matches!(actual.node,
+            Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } |
+            Expr::StringLiteral { .. } | Expr::LogicalLiteral { .. } |
+            Expr::ComplexLiteral { .. }
+        );
+        // Check if actual is a named constant (parameter).
+        let is_parameter = if let Some(name) = extract_base_name(actual) {
+            ctx.lookup(&name).map(|s| s.attrs.parameter).unwrap_or(false)
+        } else { false };
+
+        if is_literal || is_parameter {
+            // We can't tell without the callee's interface whether this arg is
+            // intent(out/inout). But if the callee IS known and has dummy arg info,
+            // we could check. For now, this infrastructure is in place for when
+            // we have full interface resolution.
+            // Full check deferred until interfaces are tracked in symbol table.
         }
     }
+    let _ = callee_name;
     let _ = span;
 }
 
@@ -644,7 +727,10 @@ fn validate_derived_type(
         }
 
         // PASS and NOPASS are mutually exclusive.
-        let has_pass = tbp.attrs.iter().any(|a| a.to_lowercase().starts_with("pass"));
+        let has_pass = tbp.attrs.iter().any(|a| {
+            let lower = a.to_lowercase();
+            lower == "pass" || lower.starts_with("pass(")
+        });
         let has_nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
         if has_pass && has_nopass {
             ctx.error(span, format!(
