@@ -25,6 +25,17 @@ struct LoopScope {
     exit: BlockId,    // EXIT target
 }
 
+/// Character variable kind: how string storage is managed.
+#[derive(Clone, PartialEq)]
+enum CharKind {
+    /// Not a character variable.
+    None,
+    /// Fixed-length character(N): addr points to N-byte stack buffer.
+    Fixed(i64),
+    /// Deferred-length character(:), allocatable: addr points to 32-byte StringDescriptor.
+    Deferred,
+}
+
 /// Info about a local variable.
 #[derive(Clone)]
 struct LocalInfo {
@@ -37,6 +48,8 @@ struct LocalInfo {
     /// Is this a pass-by-reference parameter? If true, `addr` holds a pointer
     /// to the caller's storage. Reads/writes go through the pointer.
     by_ref: bool,
+    /// Character variable kind (fixed-length, deferred, or not character).
+    char_kind: CharKind,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -57,11 +70,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -259,6 +272,54 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
+                // Check for character type.
+                let char_len = match type_spec {
+                    TypeSpec::Character(Some(sel)) => {
+                        match &sel.len {
+                            Some(crate::ast::decl::LenSpec::Expr(e)) => eval_const_int(e),
+                            Some(crate::ast::decl::LenSpec::Star) => None, // assumed
+                            Some(crate::ast::decl::LenSpec::Colon) => None, // deferred
+                            None => Some(1), // default len=1
+                        }
+                    }
+                    TypeSpec::Character(None) => Some(1),
+                    _ => None,
+                };
+                let is_deferred_char = matches!(type_spec,
+                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+                );
+
+                if is_deferred_char && is_allocatable {
+                    // Deferred-length allocatable character: 32-byte StringDescriptor.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
+                    let addr = b.alloca(desc_ty);
+                    let zero = b.const_i32(0);
+                    let size32 = b.const_i64(32);
+                    b.call(FuncRef::External("memset".into()), vec![addr, zero, size32], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    locals.insert(key, LocalInfo {
+                        addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        dims: vec![], allocatable: true, by_ref: false,
+                        char_kind: CharKind::Deferred,
+                    });
+                    continue;
+                } else if let Some(len) = char_len {
+                    if !is_allocatable {
+                        // Fixed-length character(N): alloca N bytes buffer.
+                        let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), len as u64);
+                        let addr = b.alloca(buf_ty);
+                        // Initialize with spaces.
+                        let space = b.const_i32(b' ' as i32);
+                        let len_val = b.const_i64(len);
+                        b.call(FuncRef::External("memset".into()), vec![addr, space, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        locals.insert(key, LocalInfo {
+                            addr, ty: IrType::Int(IntWidth::I8),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::Fixed(len),
+                        });
+                        continue; // skip normal path
+                    }
+                }
+
                 if is_allocatable {
                     // Allocatable variable: alloca a descriptor (384 bytes), zero-initialized.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
@@ -267,7 +328,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
@@ -292,17 +353,17 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None });
                     }
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
                 }
             }
         }
@@ -423,6 +484,66 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
     IrType::Int(IntWidth::I32) // fallback
 }
 
+/// Lower a string expression, returning (ptr, len) as ValueIds.
+/// String literals return (const_string_ptr, const_len).
+/// Character variables return (buffer_addr, known_len).
+/// Deferred-length variables load ptr and len from the StringDescriptor.
+fn lower_string_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> (ValueId, ValueId) {
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            let len = b.const_i64(value.len() as i64);
+            (ptr, len)
+        }
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                match &info.char_kind {
+                    CharKind::Fixed(len) => {
+                        let len_val = b.const_i64(*len);
+                        (info.addr, len_val)
+                    }
+                    CharKind::Deferred => {
+                        // Load data ptr (offset 0) and len (offset 8) from StringDescriptor.
+                        let ptr = b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        // For len at offset 8, we'd need a GEP. For now, use a second load
+                        // with manual offset. This is a simplification — proper struct access
+                        // would use ExtractField or GEP with field index.
+                        // The StringDescriptor layout: [data(8), len(8), capacity(8), flags(4)]
+                        // Load len from addr + 8 bytes.
+                        let eight = b.const_i64(8);
+                        let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I64));
+                        let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+                        (ptr, len)
+                    }
+                    CharKind::None => {
+                        // Not a character variable — shouldn't happen but fall back.
+                        let val = lower_expr(b, locals, expr, st);
+                        let zero = b.const_i64(0);
+                        (val, zero)
+                    }
+                }
+            } else {
+                let val = lower_expr(b, locals, expr, st);
+                let zero = b.const_i64(0);
+                (val, zero)
+            }
+        }
+        _ => {
+            // For other expressions (function calls, etc.), evaluate as value
+            // and return with zero length. TODO: handle concatenation expressions.
+            let val = lower_expr(b, locals, expr, st);
+            let len = b.const_i64(string_literal_len(expr));
+            (val, len)
+        }
+    }
+}
+
 /// Get the length of a string literal expression (for PRINT).
 fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
     match &expr.node {
@@ -434,10 +555,17 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
-    // Alloca a temporary STAT variable for safe deallocation.
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     for info in locals.values() {
-        if info.allocatable {
+        if info.char_kind == CharKind::Deferred {
+            // Deferred-length string: call afs_dealloc_string.
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![info.addr],
+                IrType::Void,
+            );
+        } else if info.allocatable {
+            // Allocatable array: call afs_deallocate_array.
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
                 vec![info.addr, stat_addr],
@@ -508,27 +636,52 @@ fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
 fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } => {
-            let val = lower_expr(b, &ctx.locals, value, ctx.st);
             match &target.node {
                 Expr::Name { name } => {
                     let key = name.to_lowercase();
-                    if let Some(info) = ctx.locals.get(&key) {
-                        if info.by_ref {
-                            // Write through the pointer to caller's storage.
-                            let ptr = b.load(info.addr);
-                            b.store(val, ptr);
-                        } else {
-                            b.store(val, info.addr);
+                    if let Some(info) = ctx.locals.get(&key).cloned() {
+                        match &info.char_kind {
+                            CharKind::Fixed(len) => {
+                                // Fixed-length character assignment: copy with space padding.
+                                // Get source pointer and length from the expression.
+                                let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                let dest_len = b.const_i64(*len);
+                                b.call(
+                                    FuncRef::External("afs_assign_char_fixed".into()),
+                                    vec![info.addr, dest_len, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
+                            CharKind::Deferred => {
+                                // Deferred-length: call afs_assign_char_deferred.
+                                let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                b.call(
+                                    FuncRef::External("afs_assign_char_deferred".into()),
+                                    vec![info.addr, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
+                            CharKind::None => {
+                                // Non-character: normal store.
+                                let val = lower_expr(b, &ctx.locals, value, ctx.st);
+                                if info.by_ref {
+                                    let ptr = b.load(info.addr);
+                                    b.store(val, ptr);
+                                } else {
+                                    b.store(val, info.addr);
+                                }
+                            }
                         }
                     }
                 }
                 Expr::FunctionCall { callee, args } => {
                     // Array element assignment: a(i) = val
+                    let arr_val = lower_expr(b, &ctx.locals, value, ctx.st);
                     if let Expr::Name { name } = &callee.node {
-                        let key = name.to_lowercase();
-                        if let Some(info) = ctx.locals.get(&key).cloned() {
+                        let akey = name.to_lowercase();
+                        if let Some(info) = ctx.locals.get(&akey).cloned() {
                             if !info.dims.is_empty() || info.allocatable {
-                                lower_array_store(b, &ctx.locals, &info, args, val, ctx.st);
+                                lower_array_store(b, &ctx.locals, &info, args, arr_val, ctx.st);
                             }
                         }
                     }
@@ -539,24 +692,36 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Print { items, .. } | Stmt::Write { items, .. } => {
             for item in items {
-                let val = lower_expr(b, &ctx.locals, item, ctx.st);
-                let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
-                let rt_func = match &ty {
-                    IrType::Int(_) => RuntimeFunc::PrintInt,
-                    IrType::Float(_) => RuntimeFunc::PrintReal,
-                    IrType::Bool => RuntimeFunc::PrintLogical,
-                    IrType::Ptr(_) => RuntimeFunc::PrintString,
-                    _ => RuntimeFunc::PrintInt,
-                };
-                if matches!(rt_func, RuntimeFunc::PrintString) {
-                    // String print needs ptr + length. For string literals,
-                    // extract length from the ConstString instruction.
-                    // For now, pass the value and a length constant.
-                    let len = string_literal_len(item);
-                    let len_val = b.const_i64(len);
-                    b.runtime_call(RuntimeFunc::PrintString, vec![val, len_val], IrType::Void);
+                // Check if this item is a character variable.
+                let is_char = if let Expr::Name { name } = &item.node {
+                    ctx.locals.get(&name.to_lowercase())
+                        .map(|i| i.char_kind != CharKind::None)
+                        .unwrap_or(false)
                 } else {
-                    b.runtime_call(rt_func, vec![val], IrType::Void);
+                    false
+                };
+
+                if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+                    // Character: use lower_string_expr to get ptr + len.
+                    let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+                    b.runtime_call(RuntimeFunc::PrintString, vec![ptr, len], IrType::Void);
+                } else {
+                    let val = lower_expr(b, &ctx.locals, item, ctx.st);
+                    let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+                    let rt_func = match &ty {
+                        IrType::Int(_) => RuntimeFunc::PrintInt,
+                        IrType::Float(_) => RuntimeFunc::PrintReal,
+                        IrType::Bool => RuntimeFunc::PrintLogical,
+                        IrType::Ptr(_) => RuntimeFunc::PrintString,
+                        _ => RuntimeFunc::PrintInt,
+                    };
+                    if matches!(rt_func, RuntimeFunc::PrintString) {
+                        let len = string_literal_len(item);
+                        let len_val = b.const_i64(len);
+                        b.runtime_call(RuntimeFunc::PrintString, vec![val, len_val], IrType::Void);
+                    } else {
+                        b.runtime_call(rt_func, vec![val], IrType::Void);
+                    }
                 }
             }
             b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
@@ -778,7 +943,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
             }
             lower_stmts(b, ctx, body);
 
@@ -873,7 +1038,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
             addr
         });
 
