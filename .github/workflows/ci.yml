@@ -6,27 +6,78 @@ on:
   pull_request:
     branches: [trunk]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
+  build:
+    name: Build
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+  clippy:
+    name: Clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - run: cargo clippy --workspace -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace
+  test-armfortas:
+    name: "Tests: armfortas"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p armfortas
 
-      - name: Unit tests
-        run: cargo test --workspace --lib
+  test-afs-as-unit:
+    name: "Tests: afs-as unit"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --lib
 
-      - name: Integration tests (afs-as vs system assembler)
-        run: cargo test -p afs-as --test verify_against_system_as
+  test-afs-as-roundtrip:
+    name: "Tests: afs-as round-trip"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test roundtrip
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+  test-afs-as-system:
+    name: "Tests: afs-as vs system assembler"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test verify_against_system_as
+
+  test-afs-as-e2e:
+    name: "Tests: afs-as end-to-end"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test hello_world
