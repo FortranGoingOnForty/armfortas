@@ -4,7 +4,7 @@
 //! and expression type checking.
 
 /// A Fortran type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FortranType {
     Integer { kind: u8 },        // kind in bytes: 1, 2, 4, 8
     Real { kind: u8 },           // 4 (single), 8 (double), 16 (quad)
@@ -20,7 +20,7 @@ pub enum FortranType {
 }
 
 /// Character length.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CharLen {
     Known(i64),
     Assumed,    // len=*
@@ -118,15 +118,10 @@ pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option
     let left_kind = left.kind().unwrap_or(4);
     let right_kind = right.kind().unwrap_or(4);
 
-    // Promote to the wider type.
+    // Promote to the wider type class and the larger kind.
+    // F2018 10.1.5.5: kind parameter is max of both operands' kinds.
     let result_rank = left_rank.max(right_rank);
-    let result_kind = if left_rank == right_rank {
-        left_kind.max(right_kind) // same type class → larger kind
-    } else if result_rank == left_rank {
-        left_kind
-    } else {
-        right_kind
-    };
+    let result_kind = left_kind.max(right_kind);
 
     Some(match result_rank {
         1 => FortranType::Integer { kind: result_kind },
@@ -162,26 +157,37 @@ pub fn comparison_result_type() -> FortranType {
 }
 
 /// Concatenation produces character with combined length.
+/// Both operands must have the same character kind.
 pub fn concat_result_type(left: &FortranType, right: &FortranType) -> Option<FortranType> {
-    if !left.is_character() || !right.is_character() {
+    let (left_kind, left_len) = match left {
+        FortranType::Character { kind, len } => (*kind, len),
+        _ => return None,
+    };
+    let (right_kind, right_len) = match right {
+        FortranType::Character { kind, len } => (*kind, len),
+        _ => return None,
+    };
+    // Kind parameters must match for concatenation.
+    if left_kind != right_kind {
         return None;
     }
-    let left_len = if let FortranType::Character { len, .. } = left { len } else { return None; };
-    let right_len = if let FortranType::Character { len, .. } = right { len } else { return None; };
-
     let result_len = match (left_len, right_len) {
         (CharLen::Known(a), CharLen::Known(b)) => CharLen::Known(a + b),
         _ => CharLen::Unknown,
     };
-    Some(FortranType::Character { kind: 1, len: result_len })
+    Some(FortranType::Character { kind: left_kind, len: result_len })
 }
 
 /// Check if an implicit conversion is needed from `from` to `to`.
 /// Returns None if no conversion needed, or the target type if needed.
+/// Complex→non-complex requires explicit conversion per standard.
 pub fn needs_conversion(from: &FortranType, to: &FortranType) -> Option<FortranType> {
     if from == to { return None; }
     if from.is_numeric() && to.is_numeric() {
-        // Numeric → numeric conversion always possible.
+        // Complex → non-complex requires explicit conversion (REAL(), INT()).
+        if matches!(from, FortranType::Complex { .. }) && !matches!(to, FortranType::Complex { .. }) {
+            return None;
+        }
         return Some(to.clone());
     }
     None
@@ -217,7 +223,7 @@ pub fn binary_op_result_type(op: &crate::ast::expr::BinaryOp, left: &FortranType
         BinaryOp::Concat => concat_result_type(left, right),
         BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le |
         BinaryOp::Gt | BinaryOp::Ge => {
-            if left.is_numeric() && right.is_numeric() || left.is_character() && right.is_character() {
+            if (left.is_numeric() && right.is_numeric()) || (left.is_character() && right.is_character()) {
                 Some(comparison_result_type())
             } else {
                 None
@@ -471,10 +477,12 @@ pub fn check_arguments(
     let mut errors = Vec::new();
     let mut matched = vec![false; dummy_args.len()];
 
-    // Phase 1: match positional arguments
+    // Phase 1: match positional and keyword arguments
     let mut pos = 0;
-    for (i, (keyword, actual_type)) in actual_args.iter().enumerate() {
+    let mut seen_keyword = false;
+    for (keyword, actual_type) in actual_args.iter() {
         if let Some(kw) = keyword {
+            seen_keyword = true;
             // Keyword argument — find matching dummy
             if let Some(idx) = dummy_args.iter().position(|d| d.name.eq_ignore_ascii_case(kw)) {
                 if matched[idx] {
@@ -487,6 +495,11 @@ pub fn check_arguments(
                 errors.push(format!("unknown keyword argument '{}'", kw));
             }
         } else {
+            // Positional argument after keyword is illegal
+            if seen_keyword {
+                errors.push("positional argument after keyword argument".into());
+                continue;
+            }
             // Positional — match to next unmatched dummy
             while pos < dummy_args.len() && matched[pos] {
                 pos += 1;
@@ -500,7 +513,6 @@ pub fn check_arguments(
                 break;
             }
         }
-        let _ = i; // suppress unused
     }
 
     // Phase 2: check that all non-optional dummies were supplied
@@ -524,21 +536,21 @@ fn check_arg_type(dummy: &DummyArgDesc, actual: &FortranType, errors: &mut Vec<S
 
     // Check type compatibility
     if actual != &dummy.type_ {
-        // Allow numeric conversions
         if actual.is_numeric() && dummy.type_.is_numeric() {
-            // Implicit conversion allowed for intent(in)
+            // Numeric conversion only allowed for intent(in) or unspecified intent.
+            // intent(out/inout) requires exact type match — can't convert in-place.
+            if matches!(dummy.intent, Some(Intent::Out) | Some(Intent::InOut)) {
+                errors.push(format!(
+                    "type mismatch for intent(out/inout) argument '{}': expected {:?}, got {:?}",
+                    dummy.name, dummy.type_, actual
+                ));
+            }
             return;
         }
         errors.push(format!(
             "type mismatch for '{}': expected {:?}, got {:?}",
             dummy.name, dummy.type_, actual
         ));
-    }
-
-    // Check intent: can't pass a literal/expression to intent(out/inout)
-    // This is a simplified check — full check needs lvalue analysis
-    if matches!(dummy.intent, Some(Intent::Out) | Some(Intent::InOut)) {
-        // Would need to check if actual is an lvalue — deferred to expression analysis
     }
 }
 
@@ -614,9 +626,23 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "iand" | "ior" | "ieor" | "ishft" | "ibits" => args.first().cloned(),
         "bit_size" | "leadz" | "trailz" | "popcount" => Some(FortranType::default_integer()),
 
-        // Real-valued.
-        "real" | "float" | "dble" | "dfloat" => Some(FortranType::default_real()),
-        "aimag" | "conjg" => args.first().cloned(),
+        // Real-valued conversions.
+        "real" | "float" => Some(FortranType::default_real()),
+        "dble" | "dfloat" => Some(FortranType::double_precision()),
+        "aimag" => {
+            // aimag(complex(k)) → real(k)
+            match args.first()? {
+                FortranType::Complex { kind } => Some(FortranType::Real { kind: *kind }),
+                _ => None,
+            }
+        }
+        "conjg" => {
+            // conjg(complex(k)) → complex(k)
+            match args.first()? {
+                FortranType::Complex { kind } => Some(FortranType::Complex { kind: *kind }),
+                _ => None,
+            }
+        }
 
         // Logical-valued.
         "allocated" | "associated" | "present" | "btest" => Some(FortranType::default_logical()),
@@ -631,6 +657,37 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Complex-valued.
         "cmplx" => Some(FortranType::default_complex()),
+
+        // Reduction / array intrinsics — return type matches first arg.
+        "sum" | "product" => args.first().cloned(),
+        "dot_product" => args.first().cloned(),
+        "maxval" | "minval" => args.first().cloned(),
+        "count" => Some(FortranType::default_integer()),
+        "maxloc" | "minloc" => Some(FortranType::default_integer()),
+
+        // Transfer / data movement.
+        "transfer" => args.get(1).cloned().or(Some(FortranType::Unknown)), // mold determines type
+        "merge" => args.first().cloned(),
+        "pack" | "unpack" | "spread" | "reshape" => args.first().cloned(),
+
+        // Inquiry intrinsics.
+        "huge" | "tiny" | "epsilon" => args.first().cloned(),
+        "precision" | "range" | "digits" | "radix" | "exponent" => Some(FortranType::default_integer()),
+        "storage_size" | "c_sizeof" => Some(FortranType::default_integer()),
+        "iachar" | "ichar" => Some(FortranType::default_integer()),
+
+        // System / misc.
+        "command_argument_count" => Some(FortranType::default_integer()),
+        "null" => Some(FortranType::Unknown), // null pointer — type from context
+        "new_line" => Some(FortranType::Character { kind: 1, len: CharLen::Known(1) }),
+        "logical" => Some(FortranType::default_logical()),
+
+        // iso_c_binding.
+        "c_loc" | "c_funloc" => Some(FortranType::Derived { name: "c_ptr".into() }),
+        "c_associated" => Some(FortranType::default_logical()),
+
+        // Status inquiry.
+        "is_iostat_end" | "is_iostat_eor" => Some(FortranType::default_logical()),
 
         _ => None, // Unknown intrinsic.
     }
@@ -1529,5 +1586,180 @@ mod tests {
             &FortranType::Logical { kind: 8 },
         ).unwrap();
         assert_eq!(result, FortranType::Logical { kind: 8 });
+    }
+
+    // ---- Audit fix: C1 — cross-type-class kind promotion ----
+
+    #[test]
+    fn real8_plus_complex4_promotes_kind() {
+        // real(8) + complex(4) → complex(8), not complex(4)
+        let result = arithmetic_result_type(
+            &FortranType::Real { kind: 8 },
+            &FortranType::Complex { kind: 4 },
+        ).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 8 });
+    }
+
+    #[test]
+    fn int8_plus_real4_promotes_kind() {
+        // integer(8) + real(4) → real(8), not real(4)
+        let result = arithmetic_result_type(
+            &FortranType::Integer { kind: 8 },
+            &FortranType::Real { kind: 4 },
+        ).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn int8_plus_complex4_promotes_kind() {
+        // integer(8) + complex(4) → complex(8)
+        let result = arithmetic_result_type(
+            &FortranType::Integer { kind: 8 },
+            &FortranType::Complex { kind: 4 },
+        ).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 8 });
+    }
+
+    // ---- Audit fix: C3 — positional after keyword ----
+
+    #[test]
+    fn positional_after_keyword_rejected() {
+        let dummies = vec![
+            DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+            DummyArgDesc { name: "b".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+        ];
+        let actuals = vec![
+            (Some("a".into()), FortranType::Real { kind: 4 }),
+            (None, FortranType::Real { kind: 4 }), // positional after keyword
+        ];
+        let errs = check_arguments(&dummies, &actuals);
+        assert!(errs.iter().any(|e| e.contains("positional argument after keyword")));
+    }
+
+    // ---- Audit fix: M5 — intent(out/inout) rejects numeric conversion ----
+
+    #[test]
+    fn intent_inout_rejects_numeric_conversion() {
+        use super::super::symtab::Intent;
+        let dummies = vec![
+            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 8 }, intent: Some(Intent::InOut), optional: false },
+        ];
+        let actuals = vec![
+            (None, FortranType::Integer { kind: 4 }),
+        ];
+        let errs = check_arguments(&dummies, &actuals);
+        assert!(!errs.is_empty());
+        assert!(errs[0].contains("intent(out/inout)"));
+    }
+
+    #[test]
+    fn intent_in_allows_numeric_conversion() {
+        use super::super::symtab::Intent;
+        let dummies = vec![
+            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 8 }, intent: Some(Intent::In), optional: false },
+        ];
+        let actuals = vec![
+            (None, FortranType::Integer { kind: 4 }),
+        ];
+        assert!(check_arguments(&dummies, &actuals).is_empty());
+    }
+
+    // ---- Audit fix: M6 — intrinsic return types ----
+
+    #[test]
+    fn dble_returns_real8() {
+        let result = intrinsic_result_type("dble", &[FortranType::Integer { kind: 4 }]).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn aimag_complex8_returns_real8() {
+        let result = intrinsic_result_type("aimag", &[FortranType::Complex { kind: 8 }]).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn aimag_non_complex_returns_none() {
+        assert!(intrinsic_result_type("aimag", &[FortranType::Real { kind: 4 }]).is_none());
+    }
+
+    #[test]
+    fn conjg_complex4() {
+        let result = intrinsic_result_type("conjg", &[FortranType::Complex { kind: 4 }]).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 4 });
+    }
+
+    #[test]
+    fn conjg_non_complex_returns_none() {
+        assert!(intrinsic_result_type("conjg", &[FortranType::Real { kind: 4 }]).is_none());
+    }
+
+    // ---- Audit fix: M7 — complex→integer implicit conversion blocked ----
+
+    #[test]
+    fn complex_to_integer_no_implicit_conversion() {
+        assert!(needs_conversion(
+            &FortranType::Complex { kind: 4 },
+            &FortranType::Integer { kind: 4 },
+        ).is_none());
+    }
+
+    #[test]
+    fn complex_to_real_no_implicit_conversion() {
+        assert!(needs_conversion(
+            &FortranType::Complex { kind: 4 },
+            &FortranType::Real { kind: 4 },
+        ).is_none());
+    }
+
+    #[test]
+    fn int_to_complex_implicit_conversion_ok() {
+        let conv = needs_conversion(
+            &FortranType::Integer { kind: 4 },
+            &FortranType::Complex { kind: 4 },
+        ).unwrap();
+        assert_eq!(conv, FortranType::Complex { kind: 4 });
+    }
+
+    // ---- Audit fix: M9 — concat kind mismatch ----
+
+    #[test]
+    fn concat_mismatched_kind_returns_none() {
+        assert!(concat_result_type(
+            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
+            &FortranType::Character { kind: 4, len: CharLen::Known(5) },
+        ).is_none());
+    }
+
+    // ---- New intrinsics ----
+
+    #[test]
+    fn intrinsic_sum() {
+        let result = intrinsic_result_type("sum", &[FortranType::Real { kind: 8 }]).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn intrinsic_c_associated() {
+        let result = intrinsic_result_type("c_associated", &[
+            FortranType::Derived { name: "c_ptr".into() }
+        ]).unwrap();
+        assert_eq!(result, FortranType::default_logical());
+    }
+
+    #[test]
+    fn intrinsic_huge() {
+        let result = intrinsic_result_type("huge", &[FortranType::Real { kind: 4 }]).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 4 });
+    }
+
+    #[test]
+    fn intrinsic_merge() {
+        let result = intrinsic_result_type("merge", &[
+            FortranType::Integer { kind: 4 },
+            FortranType::Integer { kind: 4 },
+            FortranType::default_logical(),
+        ]).unwrap();
+        assert_eq!(result, FortranType::Integer { kind: 4 });
     }
 }
