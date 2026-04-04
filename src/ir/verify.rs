@@ -4,7 +4,7 @@
 //! Checks: SSA dominance, type consistency, block structure,
 //! terminator completeness, block param/branch arg matching.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use super::inst::*;
 
 /// Verification error.
@@ -130,7 +130,147 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
+    // 8. SSA dominance: every use must be dominated by its definition.
+    check_dominance(func, &mut errors);
+
     errors
+}
+
+/// Compute the dominator set for each block using iterative dataflow.
+/// Returns a map from BlockId to the set of BlockIds that dominate it.
+fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+    let all_blocks: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let mut doms: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+
+    // Entry block is dominated only by itself.
+    let mut entry_set = HashSet::new();
+    entry_set.insert(func.entry);
+    doms.insert(func.entry, entry_set);
+
+    // All other blocks start dominated by every block.
+    for block in &func.blocks {
+        if block.id != func.entry {
+            doms.insert(block.id, all_blocks.clone());
+        }
+    }
+
+    // Build predecessor map.
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &func.blocks {
+        preds.entry(block.id).or_default();
+        if let Some(term) = &block.terminator {
+            for target in terminator_targets(term) {
+                preds.entry(target).or_default().push(block.id);
+            }
+        }
+    }
+
+    // Iterate until fixed point.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            if block.id == func.entry { continue; }
+            let pred_list = preds.get(&block.id).cloned().unwrap_or_default();
+            if pred_list.is_empty() { continue; }
+
+            // dom(B) = {B} ∪ ∩{dom(P) for P in preds(B)}
+            let mut new_dom = all_blocks.clone();
+            for pred in &pred_list {
+                if let Some(pred_doms) = doms.get(pred) {
+                    new_dom = new_dom.intersection(pred_doms).copied().collect();
+                }
+            }
+            new_dom.insert(block.id);
+
+            if doms.get(&block.id) != Some(&new_dom) {
+                doms.insert(block.id, new_dom);
+                changed = true;
+            }
+        }
+    }
+
+    doms
+}
+
+/// Map each ValueId to the block where it's defined.
+fn value_def_block(func: &Function) -> HashMap<ValueId, BlockId> {
+    let mut map = HashMap::new();
+    // Function params are defined in the entry block.
+    for p in &func.params {
+        map.insert(p.id, func.entry);
+    }
+    for block in &func.blocks {
+        for bp in &block.params {
+            map.insert(bp.id, block.id);
+        }
+        for inst in &block.insts {
+            map.insert(inst.id, block.id);
+        }
+    }
+    map
+}
+
+/// Check SSA dominance: every use of a value must be in a block dominated
+/// by the block where the value is defined. For same-block uses, the
+/// definition must precede the use in instruction order.
+fn check_dominance(func: &Function, errors: &mut Vec<VerifyError>) {
+    let doms = compute_dominators(func);
+    let def_blocks = value_def_block(func);
+
+    for block in &func.blocks {
+        let block_doms = doms.get(&block.id).cloned().unwrap_or_default();
+
+        // Build intra-block ordering: map ValueId → instruction index.
+        // Block params have index -1 (always dominate all instructions).
+        let mut inst_order: HashMap<ValueId, i32> = HashMap::new();
+        for bp in &block.params {
+            inst_order.insert(bp.id, -1);
+        }
+        for (idx, inst) in block.insts.iter().enumerate() {
+            inst_order.insert(inst.id, idx as i32);
+        }
+
+        let check_use = |val: ValueId, use_idx: i32, errors: &mut Vec<VerifyError>| {
+            if let Some(def_block) = def_blocks.get(&val) {
+                if *def_block == block.id {
+                    // Same-block: def must precede use in instruction order.
+                    if let Some(&def_idx) = inst_order.get(&val) {
+                        if def_idx >= use_idx {
+                            errors.push(VerifyError {
+                                msg: format!(
+                                    "value %{} used before its definition in block '{}'",
+                                    val.0, block.name,
+                                ),
+                            });
+                        }
+                    }
+                } else if !block_doms.contains(def_block) {
+                    // Cross-block: def block must dominate use block.
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "value %{} defined in '{}' does not dominate use in '{}'",
+                            val.0,
+                            func.block(*def_block).name,
+                            block.name,
+                        ),
+                    });
+                }
+            }
+        };
+
+        for (idx, inst) in block.insts.iter().enumerate() {
+            for used in inst_uses(&inst.kind) {
+                check_use(used, idx as i32, errors);
+            }
+        }
+        if let Some(term) = &block.terminator {
+            let term_idx = block.insts.len() as i32; // terminators come after all instructions
+            for used in terminator_uses(term) {
+                check_use(used, term_idx, errors);
+            }
+        }
+    }
 }
 
 /// Collect all defined ValueIds in a function.
@@ -479,6 +619,97 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("non-pointer")));
+    }
+
+    #[test]
+    fn dominance_cross_block_violation() {
+        // Value defined in block B used in block A that B doesn't dominate.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let bb_a = b.create_block("block_a");
+            let bb_b = b.create_block("block_b");
+
+            // Entry branches to A.
+            b.branch(bb_a, vec![]);
+
+            // Block A uses a value from block B (which it can't reach yet).
+            b.set_block(bb_a);
+            // Manually insert a use of a value that will be defined in block B.
+            let future_val = ValueId(100);
+            b.emit_bogus_iadd(future_val, future_val);
+            b.branch(bb_b, vec![]);
+
+            // Block B defines the value.
+            b.set_block(bb_b);
+            let _v = b.const_i32(42); // This gets some ID, but we used 100 above.
+            b.ret_void();
+        }
+        // Manually inject the value definition in block B with the ID we referenced.
+        use crate::lexer::{Span, Position};
+        let span = Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
+        func.blocks[2].insts.insert(0, Inst {
+            id: ValueId(100),
+            kind: InstKind::ConstInt(99, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span,
+        });
+        let errs = verify_function(&func);
+        assert!(errs.iter().any(|e| e.msg.contains("does not dominate")),
+            "expected dominance error, got: {:?}", errs);
+    }
+
+    #[test]
+    fn dominance_same_block_order_violation() {
+        // Use a value before it's defined in the same block.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        use crate::lexer::{Span, Position};
+        let span = Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
+
+        // Manually construct: %1 = iadd %0, %0 then %0 = const_int 42
+        // (use of %0 before its definition)
+        func.blocks[0].insts.push(Inst {
+            id: ValueId(1),
+            kind: InstKind::IAdd(ValueId(0), ValueId(0)),
+            ty: IrType::Int(IntWidth::I32),
+            span,
+        });
+        func.blocks[0].insts.push(Inst {
+            id: ValueId(0),
+            kind: InstKind::ConstInt(42, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span,
+        });
+        func.blocks[0].terminator = Some(Terminator::Return(None));
+        let errs = verify_function(&func);
+        assert!(errs.iter().any(|e| e.msg.contains("used before its definition")),
+            "expected same-block order error, got: {:?}", errs);
+    }
+
+    #[test]
+    fn dominance_valid_loop() {
+        // A valid loop: entry → header → body → header. Block params carry the value.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let i_param = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let init = b.const_i32(0);
+            b.branch(header, vec![init]);
+
+            b.set_block(header);
+            let one = b.const_i32(1);
+            let next = b.iadd(i_param, one);
+            let limit = b.const_i32(10);
+            let done = b.icmp(CmpOp::Ge, next, limit);
+            let exit = b.create_block("exit");
+            b.cond_branch(done, exit, vec![], header, vec![next]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(errs.is_empty(), "valid loop should pass, got: {:?}", errs);
     }
 
     #[test]
