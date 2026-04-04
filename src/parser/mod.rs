@@ -5,6 +5,7 @@
 //! matching the Fortran standard exactly.
 
 pub mod expr;
+pub mod decl;
 
 use crate::lexer::{Token, TokenKind, Span, Position};
 use crate::ast::Spanned;
@@ -124,6 +125,15 @@ impl<'a> Parser<'a> {
     /// Get the span of the current token.
     pub fn current_span(&self) -> Span {
         self.current().span
+    }
+
+    /// Get the span of the previous token.
+    pub fn prev_span(&self) -> Span {
+        if self.pos > 0 {
+            self.tokens[self.pos - 1].span
+        } else {
+            self.current_span()
+        }
     }
 
     /// Check if we're at a statement-ending token.

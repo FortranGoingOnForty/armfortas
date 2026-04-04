@@ -491,14 +491,6 @@ impl<'a> Parser<'a> {
     }
 
     // ---- Helpers ----
-
-    fn prev_span(&self) -> Span {
-        if self.pos > 0 {
-            self.tokens[self.pos - 1].span
-        } else {
-            self.current_span()
-        }
-    }
 }
 
 // ---- Token to operator conversion ----
@@ -549,7 +541,7 @@ fn split_kind_suffix(text: &str) -> (String, Option<String>) {
     }
 }
 
-fn span_from_to(start: Span, end: Span) -> Span {
+pub(crate) fn span_from_to(start: Span, end: Span) -> Span {
     Span {
         file_id: start.file_id,
         start: start.start,
