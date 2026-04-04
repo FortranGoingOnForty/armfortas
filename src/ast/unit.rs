@@ -43,7 +43,7 @@ pub enum ProgramUnit {
     Subroutine {
         name: String,
         args: Vec<DummyArg>,
-        bind: Option<String>,
+        bind: Option<BindInfo>,
         prefix: Vec<Prefix>,
         uses: Vec<SpannedDecl>,
         implicit: Vec<SpannedDecl>,
@@ -57,7 +57,7 @@ pub enum ProgramUnit {
         args: Vec<DummyArg>,
         result: Option<String>,
         return_type: Option<TypeSpec>,
-        bind: Option<String>,
+        bind: Option<BindInfo>,
         prefix: Vec<Prefix>,
         uses: Vec<SpannedDecl>,
         implicit: Vec<SpannedDecl>,
@@ -96,6 +96,12 @@ pub enum Prefix {
 pub enum DummyArg {
     Name(String),
     Star, // alternate return: *
+}
+
+/// BIND(C) specification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindInfo {
+    pub name: Option<String>, // BIND(C, NAME="cname") — None if just BIND(C)
 }
 
 /// Body of an interface block — either a subprogram interface or a module procedure name.

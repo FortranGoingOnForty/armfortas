@@ -364,7 +364,23 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             if self.peek() == &TokenKind::Eof { break; }
             let text = self.peek_text().to_lowercase();
-            if text == "end" || text.starts_with("end") { break; }
+            // Only break on END that closes the parent unit — not on inner subprograms'
+            // END keywords (those are consumed by parse_program_unit).
+            // Combined forms like "endprogram", "endmodule" etc. close the parent.
+            if text == "end" {
+                let next = if self.pos + 1 < self.tokens.len() {
+                    self.tokens[self.pos + 1].text.to_lowercase()
+                } else { String::new() };
+                // Bare "end" or "end program/module/submodule" closes the parent.
+                if next.is_empty() || self.at_stmt_end()
+                    || matches!(next.as_str(), "program" | "module" | "submodule")
+                {
+                    break;
+                }
+            }
+            if matches!(text.as_str(), "endprogram" | "endmodule" | "endsubmodule") {
+                break;
+            }
             units.push(self.parse_program_unit()?);
         }
         Ok(units)
@@ -384,7 +400,42 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    fn try_parse_bind(&mut self) -> Result<Option<String>, ParseError> {
+    /// Parse an IMPORT statement.
+    pub fn parse_import(&mut self) -> Result<ImportStmt, ParseError> {
+        // Already consumed 'import'.
+        if self.eat(&TokenKind::Comma) {
+            let text = self.peek_text().to_lowercase();
+            match text.as_str() {
+                "all" => { self.advance(); return Ok(ImportStmt::All); }
+                "none" => { self.advance(); return Ok(ImportStmt::None); }
+                "only" => {
+                    self.advance();
+                    self.expect(&TokenKind::Colon)?;
+                    let mut names = Vec::new();
+                    loop {
+                        names.push(self.advance().clone().text);
+                        if !self.eat(&TokenKind::Comma) { break; }
+                    }
+                    return Ok(ImportStmt::Only(names));
+                }
+                _ => {}
+            }
+        }
+        // import :: name1, name2
+        self.eat(&TokenKind::ColonColon);
+        let mut names = Vec::new();
+        if !self.at_stmt_end() {
+            loop {
+                names.push(self.advance().clone().text);
+                if !self.eat(&TokenKind::Comma) { break; }
+            }
+        }
+        Ok(ImportStmt::Default(names))
+    }
+
+    /// Parse optional BIND(C [, NAME="..."]) clause.
+    /// Returns `None` if no BIND, `Some(BindInfo)` if present.
+    fn try_parse_bind(&mut self) -> Result<Option<BindInfo>, ParseError> {
         if !self.peek_text().eq_ignore_ascii_case("bind") {
             return Ok(None);
         }
@@ -399,7 +450,7 @@ impl<'a> Parser<'a> {
             } else { None }
         } else { None };
         self.expect(&TokenKind::RParen)?;
-        Ok(name)
+        Ok(Some(BindInfo { name }))
     }
 }
 
@@ -542,7 +593,17 @@ mod tests {
     fn subroutine_bind_c() {
         let u = parse_unit("subroutine cfunc(x) bind(c)\n  real :: x\nend subroutine\n");
         if let ProgramUnit::Subroutine { bind, .. } = &u.node {
-            assert!(bind.is_none()); // bind(c) with no name= returns None for the name
+            assert!(bind.is_some(), "should have BindInfo");
+            assert!(bind.as_ref().unwrap().name.is_none(), "no name= specified");
+        } else { panic!("not Subroutine"); }
+    }
+
+    #[test]
+    fn subroutine_bind_c_with_name() {
+        let u = parse_unit("subroutine foo(x) bind(c, name='c_foo')\n  real :: x\nend subroutine\n");
+        if let ProgramUnit::Subroutine { bind, .. } = &u.node {
+            assert!(bind.is_some());
+            assert_eq!(bind.as_ref().unwrap().name.as_deref(), Some("'c_foo'"));
         } else { panic!("not Subroutine"); }
     }
 }
