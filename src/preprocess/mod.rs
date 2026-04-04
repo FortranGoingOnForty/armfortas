@@ -534,12 +534,17 @@ impl Preprocessor {
                 let quote = bytes[i];
                 result.push(quote as char);
                 i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    if bytes[i] == quote && i + 1 < bytes.len() && bytes[i + 1] == quote {
-                        // Doubled quote escape.
-                        result.push(quote as char);
-                        result.push(quote as char);
-                        i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            // Doubled quote escape (Fortran style: '' or "").
+                            result.push(quote as char);
+                            result.push(quote as char);
+                            i += 2;
+                        } else {
+                            // End of string literal.
+                            break;
+                        }
                     } else {
                         result.push(bytes[i] as char);
                         i += 1;
@@ -1028,6 +1033,21 @@ mod tests {
     fn no_expansion_in_string_double() {
         let out = pp_with("x = \"FOO is great\"\n", &[("FOO", "BAR")]);
         assert!(out.contains("\"FOO is great\""));
+    }
+
+    #[test]
+    fn no_expansion_in_doubled_quote_string() {
+        // Fortran doubled-quote escape: 'it''s' should be preserved intact.
+        let out = pp_with("x = 'it''s a FOO'\n", &[("FOO", "BAR")]);
+        assert!(out.contains("'it''s a FOO'"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn doubled_quote_does_not_end_string_early() {
+        // Regression test: the '' must not cause early string termination.
+        let out = pp_with("x = 'he said ''hello'' there' + FOO\n", &[("FOO", "1")]);
+        assert!(out.contains("'he said ''hello'' there'"), "got: {:?}", out);
+        assert!(out.contains("+ 1"), "FOO after string should expand, got: {:?}", out);
     }
 
     #[test]
