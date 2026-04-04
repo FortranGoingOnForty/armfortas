@@ -205,6 +205,15 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 "nop ; bad adrp+ldr".into()
             }
         }
+        ArmOpcode::AdrpAdd => {
+            if let MachineOperand::ConstPool(idx) = &inst.operands[1] {
+                let label = const_pool_label(&mf.name, *idx);
+                format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
+                    op_str(&inst.operands[0]), label)
+            } else {
+                "nop ; bad adrp+add".into()
+            }
+        }
 
         ArmOpcode::B => {
             if let MachineOperand::BlockRef(id) = &inst.operands[0] {
@@ -220,7 +229,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
         ArmOpcode::Bl => {
             if let MachineOperand::Extern(name) = &inst.operands[0] {
-                format!("bl {}", name)
+                // Mach-O convention: C symbols get a _ prefix.
+                if name.starts_with('_') {
+                    format!("bl {}", name) // already prefixed
+                } else {
+                    format!("bl _{}", name) // add Mach-O prefix
+                }
             } else { "bl ???".into() }
         }
         ArmOpcode::Ret => "ret".into(),

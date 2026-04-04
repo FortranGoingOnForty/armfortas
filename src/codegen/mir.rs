@@ -85,7 +85,8 @@ pub enum ArmOpcode {
     LdrFpImm,    // LDR Dt, [Xn, #imm]  (float load)
     StpPre,      // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
     LdpPost,     // LDP Xt1, Xt2, [Xn], #imm   (post-index)
-    AdrpLdr,     // ADRP + LDR sequence (PC-relative literal)
+    AdrpLdr,     // ADRP + LDR sequence (load value from PC-relative address)
+    AdrpAdd,     // ADRP + ADD sequence (compute PC-relative address)
 
     // ---- Branch ----
     B,           // B label
