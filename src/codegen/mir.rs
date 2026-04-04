@@ -4,7 +4,7 @@
 //! by the register allocator. Before allocation, all vregs are spilled.
 
 /// Virtual register identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VRegId(pub u32);
 
 /// Virtual register with type class.
