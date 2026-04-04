@@ -531,9 +531,23 @@ fn lower_string_expr(
                 (val, zero)
             }
         }
+        Expr::BinaryOp { op: BinaryOp::Concat, left, right } => {
+            // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
+            let (a_ptr, a_len) = lower_string_expr(b, locals, left, st);
+            let (b_ptr, b_len) = lower_string_expr(b, locals, right, st);
+            let total_len = b.iadd(a_len, b_len);
+            // Allocate temp buffer for the result.
+            let result_buf = b.runtime_call(RuntimeFunc::Allocate, vec![total_len], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            // Call afs_concat(result, a, a_len, b, b_len).
+            b.call(
+                FuncRef::External("afs_concat".into()),
+                vec![result_buf, a_ptr, a_len, b_ptr, b_len],
+                IrType::Void,
+            );
+            (result_buf, total_len)
+        }
         _ => {
-            // For other expressions (function calls, etc.), evaluate as value
-            // and return with zero length. TODO: handle concatenation expressions.
+            // For other expressions, evaluate as value and use literal length if available.
             let val = lower_expr(b, locals, expr, st);
             let len = b.const_i64(string_literal_len(expr));
             (val, len)
