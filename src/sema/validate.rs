@@ -7,9 +7,36 @@
 use crate::ast::unit::*;
 use crate::ast::stmt::*;
 use crate::ast::expr::Expr;
-use crate::ast::decl::{Decl, Attribute};
+use crate::ast::decl::{Decl, Attribute, TypeAttr};
 use crate::lexer::Span;
 use super::symtab::*;
+
+/// Fortran standard level for --std= conformance checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FortranStandard {
+    F77,
+    F90,
+    F95,
+    F2003,
+    F2008,
+    F2018,
+    F2023,
+}
+
+impl FortranStandard {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "f77" | "fortran77" => Some(Self::F77),
+            "f90" | "fortran90" => Some(Self::F90),
+            "f95" | "fortran95" => Some(Self::F95),
+            "f2003" | "fortran2003" => Some(Self::F2003),
+            "f2008" | "fortran2008" => Some(Self::F2008),
+            "f2018" | "fortran2018" => Some(Self::F2018),
+            "f2023" | "fortran2023" => Some(Self::F2023),
+            _ => None,
+        }
+    }
+}
 
 /// A diagnostic produced by validation.
 #[derive(Debug, Clone)]
@@ -46,6 +73,8 @@ struct Ctx<'a> {
     in_pure: bool,
     /// Are we inside an elemental procedure?
     in_elemental: bool,
+    /// Target standard for conformance checking (None = allow everything).
+    std: Option<FortranStandard>,
     /// Labels defined in the current scope.
     labels_defined: Vec<u64>,
     /// Labels referenced (GOTO targets) in the current scope.
@@ -53,15 +82,25 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(st: &'a SymbolTable) -> Self {
+    fn new(st: &'a SymbolTable, std: Option<FortranStandard>) -> Self {
         Self {
             st,
             diags: Vec::new(),
             scope_id: 0,
             in_pure: false,
             in_elemental: false,
+            std,
             labels_defined: Vec::new(),
             labels_referenced: Vec::new(),
+        }
+    }
+
+    /// Emit an error if a feature requires a newer standard than selected.
+    fn require_std(&mut self, span: Span, min: FortranStandard, feature: &str) {
+        if let Some(selected) = self.std {
+            if selected < min {
+                self.error(span, format!("{} requires --std={:?} or later", feature, min));
+            }
         }
     }
 
@@ -81,7 +120,16 @@ impl<'a> Ctx<'a> {
 
 /// Validate a parsed and resolved file. Returns diagnostics (errors and warnings).
 pub fn validate_file(units: &[SpannedUnit], st: &SymbolTable) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new(st);
+    validate_file_with_std(units, st, None)
+}
+
+/// Validate with a specific standard level for conformance checking.
+pub fn validate_file_with_std(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new(st, std);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -183,7 +231,23 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
-        ProgramUnit::InterfaceBlock { bodies, .. } => {
+        ProgramUnit::InterfaceBlock { name, is_abstract, bodies } => {
+            // Validate defined operator interfaces.
+            if let Some(ref iface_name) = name {
+                if is_operator_interface(iface_name) {
+                    validate_operator_interface(ctx, iface_name, bodies, unit.span);
+                }
+            }
+            // Abstract interfaces cannot have MODULE PROCEDURE.
+            if *is_abstract {
+                for body in bodies {
+                    if let InterfaceBody::ModuleProcedure(names) = body {
+                        if !names.is_empty() {
+                            ctx.error(unit.span, "abstract interface cannot contain MODULE PROCEDURE statements");
+                        }
+                    }
+                }
+            }
             for body in bodies {
                 if let InterfaceBody::Subprogram(sub) = body {
                     validate_unit(ctx, sub);
@@ -237,6 +301,11 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
 
             let _ = entities; // entities checked individually if needed
         }
+
+        // Derived type definition validation.
+        if let Decl::DerivedTypeDef { name, attrs: type_attrs, type_bound_procs, components, .. } = &decl.node {
+            validate_derived_type(ctx, name, type_attrs, type_bound_procs, components, decl.span);
+        }
     }
 }
 
@@ -281,10 +350,16 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- STOP in pure ----
-        Stmt::Stop { .. } | Stmt::ErrorStop { .. } => {
+        Stmt::Stop { .. } => {
             if ctx.in_pure {
-                ctx.error(stmt.span, "STOP/ERROR STOP not allowed in pure procedure");
+                ctx.error(stmt.span, "STOP not allowed in pure procedure");
             }
+        }
+        Stmt::ErrorStop { .. } => {
+            if ctx.in_pure {
+                ctx.error(stmt.span, "ERROR STOP not allowed in pure procedure");
+            }
+            ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
         }
 
         // ---- GOTO / labels ----
@@ -318,7 +393,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::IfStmt { action, .. } => validate_stmt(ctx, action),
         Stmt::DoLoop { body, .. } => validate_stmts(ctx, body),
         Stmt::DoWhile { body, .. } => validate_stmts(ctx, body),
-        Stmt::DoConcurrent { body, .. } => validate_stmts(ctx, body),
+        Stmt::DoConcurrent { body, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F2008, "DO CONCURRENT");
+            validate_stmts(ctx, body);
+        }
         Stmt::SelectCase { cases, .. } => {
             for case in cases {
                 validate_stmts(ctx, &case.body);
@@ -333,8 +411,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::WhereStmt { stmt: inner, .. } => validate_stmt(ctx, inner),
         Stmt::ForallConstruct { body, .. } => validate_stmts(ctx, body),
         Stmt::ForallStmt { stmt: inner, .. } => validate_stmt(ctx, inner),
-        Stmt::Block { body, .. } => validate_stmts(ctx, body),
-        Stmt::Associate { body, .. } => validate_stmts(ctx, body),
+        Stmt::Block { body, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
+            validate_stmts(ctx, body);
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F2003, "ASSOCIATE construct");
+            validate_associate(ctx, assocs, body, stmt.span);
+        }
 
         // Call in pure: callee must be pure (we check if it's known impure).
         Stmt::Call { callee, .. } => {
@@ -472,6 +556,128 @@ fn validate_label_consistency(ctx: &mut Ctx, _scope_span: Span) {
     ctx.labels_referenced.clear();
 }
 
+/// Check if an interface name represents an operator interface.
+fn is_operator_interface(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("operator(") || lower.starts_with("assignment(")
+}
+
+/// Validate a defined operator interface.
+fn validate_operator_interface(
+    ctx: &mut Ctx,
+    iface_name: &str,
+    bodies: &[InterfaceBody],
+    span: Span,
+) {
+    let lower = iface_name.to_lowercase();
+    let is_assignment = lower.starts_with("assignment(");
+
+    for body in bodies {
+        match body {
+            InterfaceBody::Subprogram(sub) => {
+                match &sub.node {
+                    ProgramUnit::Function { args, .. } => {
+                        if is_assignment {
+                            ctx.error(sub.span, format!(
+                                "ASSIGNMENT({}) interface must contain subroutines, not functions",
+                                "="
+                            ));
+                            continue;
+                        }
+                        // Operator functions: unary = 1 arg, binary = 2 args.
+                        let nargs = args.len();
+                        if !(1..=2).contains(&nargs) {
+                            ctx.error(sub.span, format!(
+                                "operator interface function must have 1 or 2 arguments, got {}",
+                                nargs
+                            ));
+                        }
+                        // All arguments must be intent(in) — checked by looking at decls.
+                        // Deferred: would need to walk the function's decls to check intent.
+                    }
+                    ProgramUnit::Subroutine { args, .. } => {
+                        if !is_assignment {
+                            ctx.error(sub.span, "operator interface must contain functions, not subroutines");
+                            continue;
+                        }
+                        // Assignment subroutines must have exactly 2 arguments.
+                        if args.len() != 2 {
+                            ctx.error(sub.span, format!(
+                                "ASSIGNMENT(=) interface subroutine must have 2 arguments, got {}",
+                                args.len()
+                            ));
+                        }
+                    }
+                    _ => {
+                        ctx.error(sub.span, "unexpected program unit in operator interface");
+                    }
+                }
+            }
+            InterfaceBody::ModuleProcedure(_) => {
+                // Module procedures in operator interface — valid, can't check further
+                // without resolving the procedure.
+            }
+        }
+    }
+    let _ = span;
+}
+
+/// Validate a derived type definition.
+fn validate_derived_type(
+    ctx: &mut Ctx,
+    name: &str,
+    type_attrs: &[TypeAttr],
+    type_bound_procs: &[crate::ast::decl::TypeBoundProc],
+    _components: &[crate::ast::decl::SpannedDecl],
+    span: Span,
+) {
+    let is_abstract = type_attrs.iter().any(|a| matches!(a, TypeAttr::Abstract));
+
+    for tbp in type_bound_procs {
+        // Deferred procedures only allowed in abstract types.
+        let is_deferred = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("deferred"));
+        if is_deferred && !is_abstract {
+            ctx.error(span, format!(
+                "type-bound procedure '{}' is DEFERRED but type '{}' is not ABSTRACT",
+                tbp.name, name
+            ));
+        }
+
+        // PASS and NOPASS are mutually exclusive.
+        let has_pass = tbp.attrs.iter().any(|a| a.to_lowercase().starts_with("pass"));
+        let has_nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
+        if has_pass && has_nopass {
+            ctx.error(span, format!(
+                "type-bound procedure '{}' cannot have both PASS and NOPASS",
+                tbp.name
+            ));
+        }
+
+        // Deferred procedures must have an interface (binding).
+        if is_deferred && tbp.binding.is_none() {
+            ctx.error(span, format!(
+                "DEFERRED type-bound procedure '{}' must specify an interface",
+                tbp.name
+            ));
+        }
+    }
+}
+
+/// Validate ASSOCIATE construct — check that associate names are not empty.
+fn validate_associate(
+    ctx: &mut Ctx,
+    assocs: &[(String, crate::ast::expr::SpannedExpr)],
+    body: &[SpannedStmt],
+    span: Span,
+) {
+    for (name, _expr) in assocs {
+        if name.is_empty() {
+            ctx.error(span, "ASSOCIATE name cannot be empty");
+        }
+    }
+    validate_stmts(ctx, body);
+}
+
 /// Extract the base variable name from an expression (handling subscripts and components).
 fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
     match &expr.node {
@@ -499,6 +705,18 @@ mod tests {
 
     fn errors_from(src: &str) -> Vec<String> {
         validate_source(src).iter()
+            .filter(|d| d.kind == DiagKind::Error)
+            .map(|d| d.msg.clone())
+            .collect()
+    }
+
+    fn errors_with_std(src: &str, std: FortranStandard) -> Vec<String> {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let st = resolve::resolve_file(&units).unwrap();
+        validate_file_with_std(&units, &st, Some(std))
+            .iter()
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
@@ -714,7 +932,7 @@ end program
         // Test the label validation infrastructure directly.
         use crate::lexer::{Span, Position};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st);
+        let mut ctx = Ctx::new(&st, None);
         let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
 
         // Reference label 999 but don't define it.
@@ -727,7 +945,7 @@ end program
     fn goto_defined_label_no_error() {
         use crate::lexer::{Span, Position};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st);
+        let mut ctx = Ctx::new(&st, None);
         let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
 
         ctx.labels_defined.push(10);
@@ -740,7 +958,7 @@ end program
     fn duplicate_label_detected() {
         use crate::lexer::{Span, Position};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st);
+        let mut ctx = Ctx::new(&st, None);
         let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
 
         register_label(&mut ctx, 10, span);
@@ -780,5 +998,219 @@ contains
 end module
 ");
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    // ---- Defined operator validation ----
+    // Note: the parser doesn't yet support interface blocks in the module
+    // specification section (they must appear as top-level units or in
+    // CONTAINS). These tests use the validation API directly.
+
+    #[test]
+    fn operator_interface_subroutine_errors() {
+        // Parse a top-level interface block with operator name.
+        let errs = errors_from("\
+interface operator(+)
+  subroutine bad_add(a, b)
+    integer, intent(in) :: a, b
+  end subroutine
+end interface
+");
+        assert!(errs.iter().any(|e| e.contains("functions, not subroutines")));
+    }
+
+    #[test]
+    fn operator_interface_wrong_arg_count() {
+        let errs = errors_from("\
+interface operator(+)
+  function add3(a, b, c) result(r)
+    integer, intent(in) :: a, b, c
+    integer :: r
+  end function
+end interface
+");
+        assert!(errs.iter().any(|e| e.contains("1 or 2 arguments")));
+    }
+
+    #[test]
+    fn operator_interface_valid_binary() {
+        let errs = errors_from("\
+interface operator(+)
+  function add_vec(a, b) result(c)
+    integer, intent(in) :: a, b
+    integer :: c
+  end function
+end interface
+");
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    #[test]
+    fn assignment_interface_function_errors() {
+        let errs = errors_from("\
+interface assignment(=)
+  function bad_assign(a, b) result(c)
+    integer, intent(in) :: a, b
+    integer :: c
+  end function
+end interface
+");
+        assert!(errs.iter().any(|e| e.contains("subroutines, not functions")));
+    }
+
+    #[test]
+    fn assignment_interface_wrong_arg_count() {
+        let errs = errors_from("\
+interface assignment(=)
+  subroutine bad_assign(a, b, c)
+    integer, intent(inout) :: a
+    integer, intent(in) :: b, c
+  end subroutine
+end interface
+");
+        assert!(errs.iter().any(|e| e.contains("2 arguments")));
+    }
+
+    // ---- Derived type validation ----
+
+    #[test]
+    fn deferred_in_non_abstract_errors() {
+        let errs = errors_from("\
+module m
+  implicit none
+  type :: shape
+  contains
+    procedure, deferred :: area
+  end type
+end module
+");
+        assert!(errs.iter().any(|e| e.contains("DEFERRED") && e.contains("not ABSTRACT")));
+    }
+
+    #[test]
+    fn deferred_in_abstract_ok() {
+        let errs = errors_from("\
+module m
+  implicit none
+  type, abstract :: shape
+  contains
+    procedure, deferred :: area
+  end type
+end module
+");
+        // No error for deferred in abstract type (the "must specify interface"
+        // error is expected since our parser stores binding as None for simple
+        // deferred procedures — that's a parser representation issue).
+        assert!(!errs.iter().any(|e| e.contains("not ABSTRACT")));
+    }
+
+    #[test]
+    fn pass_and_nopass_together_errors() {
+        let errs = errors_from("\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure, pass, nopass :: method
+  end type
+end module
+");
+        assert!(errs.iter().any(|e| e.contains("both PASS and NOPASS")));
+    }
+
+    // ---- Standard conformance (--std=) ----
+
+    #[test]
+    fn do_concurrent_requires_f2008() {
+        let errs = errors_with_std("\
+program test
+  implicit none
+  integer :: i
+  do concurrent (i = 1:10)
+  end do
+end program
+", FortranStandard::F95);
+        assert!(errs.iter().any(|e| e.contains("DO CONCURRENT") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn do_concurrent_ok_with_f2008() {
+        let errs = errors_with_std("\
+program test
+  implicit none
+  integer :: i
+  do concurrent (i = 1:10)
+  end do
+end program
+", FortranStandard::F2008);
+        assert!(!errs.iter().any(|e| e.contains("DO CONCURRENT")));
+    }
+
+    #[test]
+    fn error_stop_requires_f2008() {
+        let errs = errors_with_std("\
+program test
+  implicit none
+  error stop
+end program
+", FortranStandard::F95);
+        assert!(errs.iter().any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn block_construct_requires_f2008() {
+        let errs = errors_with_std("\
+program test
+  implicit none
+  block
+    x = 1
+  end block
+end program
+", FortranStandard::F95);
+        assert!(errs.iter().any(|e| e.contains("BLOCK") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn associate_requires_f2003() {
+        let errs = errors_with_std("\
+program test
+  implicit none
+  integer :: n
+  n = 10
+  associate (m => n)
+  end associate
+end program
+", FortranStandard::F95);
+        assert!(errs.iter().any(|e| e.contains("ASSOCIATE") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn no_std_violations_when_unset() {
+        // With no --std= set, everything is allowed.
+        let errs = errors_from("\
+program test
+  implicit none
+  integer :: i
+  do concurrent (i = 1:10)
+  end do
+  block
+    x = 1
+  end block
+end program
+");
+        assert!(!errs.iter().any(|e| e.contains("requires")));
+    }
+
+    // ---- Elemental ----
+
+    #[test]
+    fn elemental_io_errors() {
+        let errs = errors_from("\
+elemental subroutine foo(x)
+  real, intent(in) :: x
+  print *, x
+end subroutine
+");
+        // Elemental implies pure, so I/O is forbidden.
+        assert!(errs.iter().any(|e| e.contains("I/O") && e.contains("pure")));
     }
 }

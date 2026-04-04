@@ -242,15 +242,16 @@ impl<'a> Parser<'a> {
         } else { false };
         self.advance(); // consume 'interface'
 
-        // Optional name or operator.
-        let name = if self.peek() == &TokenKind::Identifier {
-            Some(self.advance().clone().text)
-        } else if self.peek_text().eq_ignore_ascii_case("operator") || self.peek_text().eq_ignore_ascii_case("assignment") {
+        // Optional name or operator/assignment interface.
+        // Check operator/assignment BEFORE generic identifier — they lex as identifiers.
+        let name = if self.peek_text().eq_ignore_ascii_case("operator") || self.peek_text().eq_ignore_ascii_case("assignment") {
             let op_kw = self.advance().clone().text;
             self.expect(&TokenKind::LParen)?;
             let op = self.advance().clone().text;
             self.expect(&TokenKind::RParen)?;
             Some(format!("{}({})", op_kw, op))
+        } else if self.peek() == &TokenKind::Identifier {
+            Some(self.advance().clone().text)
         } else { None };
         self.skip_newlines();
 
