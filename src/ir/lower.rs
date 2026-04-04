@@ -259,13 +259,19 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
-                if let Some(specs) = array_spec {
-                    // Array variable.
+                if is_allocatable {
+                    // Allocatable variable: alloca a descriptor (384 bytes).
+                    // The actual data is allocated at runtime via afs_allocate_*.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let addr = b.alloca(desc_ty);
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false });
+                } else if let Some(specs) = array_spec {
+                    // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                     let addr = b.alloca(arr_ty);
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: is_allocatable, by_ref: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false });
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
@@ -402,8 +408,13 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
     for info in locals.values() {
         if info.allocatable {
-            let ptr = b.load(info.addr);
-            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+            // Pass descriptor address to afs_deallocate_array.
+            let null = b.const_i64(0); // null STAT pointer
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![info.addr, null],
+                IrType::Void,
+            );
         }
     }
 }
@@ -628,61 +639,73 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Allocate { items, .. } => {
             for item in items {
-                // allocate(a(n, m)) → extract shape from subscripts, compute byte count.
                 if let Expr::FunctionCall { callee, args } = &item.node {
                     let base_name = extract_base_name(callee);
                     if let Some(name) = base_name {
                         if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
-                            // Compute total elements from shape subscripts.
-                            let mut total: Option<ValueId> = None;
-                            for arg in args {
-                                let dim_size = match &arg.value {
-                                    crate::ast::expr::SectionSubscript::Element(e) => {
-                                        lower_expr(b, &ctx.locals, e, ctx.st)
-                                    }
-                                    _ => b.const_i32(1),
-                                };
-                                total = Some(match total {
-                                    Some(prev) => b.imul(prev, dim_size),
-                                    None => dim_size,
-                                });
-                            }
-                            let total_elems = total.unwrap_or_else(|| b.const_i32(1));
-
-                            // Compute byte count: total_elements * elem_size.
-                            let elem_size = match &info.ty {
-                                IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8i32,
+                            let elem_size_bytes: i64 = match &info.ty {
+                                IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
                                 IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                                 IrType::Bool => 4,
-                                _ => 8, // pointers, etc.
-                            };
-                            let size_val = if elem_size != 1 {
-                                let es = b.const_i32(elem_size);
-                                b.imul(total_elems, es)
-                            } else {
-                                total_elems
+                                _ => 8,
                             };
 
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size_val],
-                                IrType::Ptr(Box::new(info.ty.clone())),
-                            );
-                            b.store(ptr, info.addr);
-                        }
-                    }
-                } else {
-                    // Simple allocate(a) without shape — allocate 1 element.
-                    let base_name = extract_base_name(item);
-                    if let Some(name) = base_name {
-                        if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
-                            let size = b.const_i32(8); // default pointer size
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size],
-                                IrType::Ptr(Box::new(info.ty.clone())),
-                            );
-                            b.store(ptr, info.addr);
+                            if info.allocatable {
+                                // Allocatable: call afs_allocate_1d for 1D, afs_allocate_array for multi-D.
+                                // info.addr is the descriptor alloca.
+                                let es = b.const_i64(elem_size_bytes);
+                                if args.len() == 1 {
+                                    let n = match &args[0].value {
+                                        crate::ast::expr::SectionSubscript::Element(e) => {
+                                            lower_expr(b, &ctx.locals, e, ctx.st)
+                                        }
+                                        _ => b.const_i64(1),
+                                    };
+                                    // Widen to i64 if needed.
+                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
+                                        b.int_extend(n, IntWidth::I64, true)
+                                    } else { n };
+                                    b.call(
+                                        FuncRef::External("afs_allocate_1d".into()),
+                                        vec![info.addr, es, n64],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    // Multi-D: compute each dim and call afs_allocate_array.
+                                    // For now, fall back to computing total size and using simple allocate.
+                                    let mut total: Option<ValueId> = None;
+                                    for arg in args {
+                                        let dim_size = match &arg.value {
+                                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                                lower_expr(b, &ctx.locals, e, ctx.st)
+                                            }
+                                            _ => b.const_i32(1),
+                                        };
+                                        total = Some(match total {
+                                            Some(prev) => b.imul(prev, dim_size),
+                                            None => dim_size,
+                                        });
+                                    }
+                                    let n = total.unwrap_or_else(|| b.const_i64(1));
+                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
+                                        b.int_extend(n, IntWidth::I64, true)
+                                    } else { n };
+                                    b.call(
+                                        FuncRef::External("afs_allocate_1d".into()),
+                                        vec![info.addr, es, n64],
+                                        IrType::Void,
+                                    );
+                                }
+                            } else {
+                                // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
+                                let size_val = b.const_i32(elem_size_bytes as i32);
+                                let ptr = b.runtime_call(
+                                    RuntimeFunc::Allocate,
+                                    vec![size_val],
+                                    IrType::Ptr(Box::new(info.ty.clone())),
+                                );
+                                b.store(ptr, info.addr);
+                            }
                         }
                     }
                 }
@@ -694,8 +717,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let base_name = extract_base_name(item);
                 if let Some(name) = base_name {
                     if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
-                        let ptr = b.load(info.addr);
-                        b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                        if info.allocatable {
+                            // Pass descriptor address to runtime.
+                            let null = b.const_i64(0); // null STAT pointer
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![info.addr, null],
+                                IrType::Void,
+                            );
+                        } else {
+                            let ptr = b.load(info.addr);
+                            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                        }
                     }
                 }
             }
@@ -1029,7 +1062,8 @@ fn lower_array_element(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    let base = array_base_addr(b, info);
+    let elem_ptr = b.gep(base, vec![idx], info.ty.clone());
     b.load(elem_ptr)
 }
 
@@ -1076,8 +1110,21 @@ fn lower_array_store(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    let base = array_base_addr(b, info);
+    let elem_ptr = b.gep(base, vec![idx], info.ty.clone());
     b.store(value, elem_ptr);
+}
+
+/// Get the data base address for an array variable.
+/// For fixed arrays, this is the alloca address directly.
+/// For allocatable arrays, load base_addr from the descriptor (offset 0).
+fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.allocatable {
+        // Load base_addr (first 8 bytes of descriptor).
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
 }
 
 /// Extract base variable name from an expression.
@@ -1678,8 +1725,8 @@ program test
   deallocate(a)
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_allocate"), "expected allocate call in:\n{}", ir);
-        assert!(ir.contains("rt_call @__afs_deallocate"), "expected deallocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_allocate_1d"), "expected allocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_deallocate_array"), "expected deallocate call in:\n{}", ir);
     }
 
     #[test]
@@ -1692,7 +1739,7 @@ subroutine foo()
 end subroutine
 ");
         // Should have implicit deallocation before ret.
-        let dealloc_count = ir.matches("rt_call @__afs_deallocate").count();
+        let dealloc_count = ir.matches("call @afs_deallocate_array").count();
         assert!(dealloc_count >= 1, "expected implicit deallocation, got {} in:\n{}", dealloc_count, ir);
     }
 
