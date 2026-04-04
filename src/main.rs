@@ -16,13 +16,30 @@ mod driver;
 mod runtime;
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: armfortas [options] <files...>");
-        eprintln!("       afs [options] <files...>");
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        eprintln!("usage: armfortas [options] <file.f90>");
+        eprintln!("       afs [options] <file.f90>");
+        eprintln!();
+        eprintln!("options:");
+        eprintln!("  -o <file>    output file");
+        eprintln!("  -S           emit assembly");
+        eprintln!("  -c           compile to object file");
+        eprintln!("  -E           preprocess only");
+        eprintln!("  --emit-ir    emit IR");
         process::exit(1);
     }
-    // TODO: parse args, dispatch to driver
-    eprintln!("armfortas: not yet implemented");
-    process::exit(1);
+
+    let opts = match driver::Options::from_args(&args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("armfortas: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if let Err(e) = driver::compile(&opts) {
+        eprintln!("armfortas: {}", e);
+        process::exit(1);
+    }
 }

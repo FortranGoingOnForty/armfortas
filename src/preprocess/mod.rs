@@ -100,7 +100,7 @@ impl fmt::Display for PreprocError {
 
 impl std::error::Error for PreprocError {}
 
-/// Preprocess Fortran source text.
+/// Preprocess Fortran source text with given configuration.
 pub fn preprocess(source: &str, config: &PreprocConfig) -> Result<PreprocOutput, PreprocError> {
     let mut pp = Preprocessor::new(config);
     pp.process(source, &config.filename)

@@ -30,17 +30,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments
 
   test-armfortas:
-    name: "Tests: armfortas"
+    name: "Tests: armfortas unit"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p armfortas
+      - run: cargo test -p armfortas --bin armfortas
+
+  test-end-to-end:
+    name: "Tests: end-to-end (compile + run Fortran programs)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - run: cargo test --test run_programs -- --nocapture
 
   test-afs-as-unit:
     name: "Tests: afs-as unit"

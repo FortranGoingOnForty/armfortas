@@ -12,3 +12,7 @@ version = "0.1.0"
 dependencies = [
  "afs-as",
 ]
+
+[[package]]
+name = "armfortas-rt"
+version = "0.1.0"

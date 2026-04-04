@@ -1,0 +1,9 @@
+[package]
+name = "armfortas-rt"
+version = "0.1.0"
+edition = "2021"
+description = "ARMFORTAS Fortran runtime library"
+
+[lib]
+name = "armfortas_rt"
+crate-type = ["staticlib"]
