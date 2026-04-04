@@ -86,7 +86,7 @@ pub enum TokenKind {
 
     // ---- Special ----
     Newline,
-    Comment(String),
+    Comment,
     Eof,
 }
 
@@ -126,7 +126,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Assign => write!(f, "="),
             TokenKind::Ampersand => write!(f, "&"),
             TokenKind::Newline => write!(f, "newline"),
-            TokenKind::Comment(_) => write!(f, "comment"),
+            TokenKind::Comment => write!(f, "comment"),
             TokenKind::Eof => write!(f, "end of file"),
         }
     }
@@ -181,7 +181,7 @@ pub fn is_keyword(name: &str) -> Option<Keyword> {
         "endsubroutine" => Some(Keyword::EndSubroutine),
         "function" => Some(Keyword::Function),
         "endfunction" => Some(Keyword::EndFunction),
-        "blockdata" | "block data" => Some(Keyword::BlockData),
+        "blockdata" => Some(Keyword::BlockData),
         "endblockdata" => Some(Keyword::EndBlockData),
         "contains" => Some(Keyword::Contains),
         "use" => Some(Keyword::Use),
@@ -431,6 +431,27 @@ impl<'a> Lexer<'a> {
         // Consume the newline.
         self.advance();
 
+        // Skip blank lines and comment-only lines between continued lines.
+        // Per F2018 6.3.2.4: comment lines and blank lines may appear between
+        // a continuation line and its successor.
+        loop {
+            self.skip_spaces();
+            if self.peek() == b'\n' {
+                // Blank line — skip it.
+                self.advance();
+                continue;
+            }
+            if self.peek() == b'!' {
+                // Comment-only line — skip to end.
+                while !self.at_end() && self.peek() != b'\n' {
+                    self.advance();
+                }
+                if !self.at_end() { self.advance(); }
+                continue;
+            }
+            break;
+        }
+
         // Skip leading whitespace on continuation line.
         self.skip_spaces();
 
@@ -480,7 +501,7 @@ impl<'a> Lexer<'a> {
                 text.push(self.advance() as char);
             }
             return Ok(Token {
-                kind: TokenKind::Comment(text.clone()),
+                kind: TokenKind::Comment,
                 text,
                 span: self.span_from(start),
             });
@@ -1123,7 +1144,7 @@ mod tests {
     fn comment() {
         let toks = kinds("x ! this is a comment\n");
         assert_eq!(toks.len(), 3); // identifier, comment, newline
-        assert!(matches!(toks[1], TokenKind::Comment(_)));
+        assert!(toks[1] == TokenKind::Comment);
     }
 
     // ---- Newlines ----
@@ -1556,6 +1577,76 @@ end program hello
             tokens.len(), all_source.lines().count(), elapsed);
         assert!(elapsed.as_secs_f64() < 1.0,
             "too slow: {:?} (must be < 1s)", elapsed);
+    }
+
+    // ======================================================================
+    // Final audit test coverage
+    // ======================================================================
+
+    #[test]
+    fn continuation_over_comment_line() {
+        // Per F2018 6.3.2.4: comment lines between continued lines are allowed.
+        let k = kinds("x + & \n! this is a comment\n  y");
+        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+    }
+
+    #[test]
+    fn continuation_over_blank_line() {
+        let k = kinds("x + &\n\n  y");
+        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+    }
+
+    #[test]
+    fn continuation_over_multiple_comments_and_blanks() {
+        let k = kinds("x + &\n! comment 1\n\n! comment 2\n  y");
+        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+    }
+
+    #[test]
+    fn mixed_case_dot_operators() {
+        assert_eq!(kinds(".True.")[0], TokenKind::LogicalLiteral);
+        assert_eq!(kinds(".FALSE.")[0], TokenKind::LogicalLiteral);
+        assert!(matches!(kinds(".And.")[0], TokenKind::DotOp(_)));
+        assert!(matches!(kinds(".OR.")[0], TokenKind::DotOp(_)));
+    }
+
+    #[test]
+    fn literal_ampersand_in_string() {
+        // & inside a string followed by non-whitespace is NOT a continuation.
+        let t = &toks("'foo & bar'")[0];
+        assert_eq!(t.kind, TokenKind::StringLiteral);
+        assert_eq!(t.text, "'foo & bar'");
+    }
+
+    #[test]
+    fn round_trip_simple() {
+        // Round-trip: tokens -> text -> tokens should produce identical kinds.
+        let src = "integer :: x = 42\n";
+        let tokens1 = Lexer::tokenize(src, 0).unwrap();
+        let reconstructed: String = tokens1.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let tokens2 = Lexer::tokenize(&reconstructed, 0).unwrap();
+
+        let kinds1: Vec<_> = tokens1.iter().map(|t| &t.kind).collect();
+        let kinds2: Vec<_> = tokens2.iter().map(|t| &t.kind).collect();
+        assert_eq!(kinds1, kinds2, "round-trip failed:\n  original: {:?}\n  reconstructed: {:?}", src, reconstructed);
+    }
+
+    #[test]
+    fn round_trip_operators() {
+        let src = "x = a + b * c ** d // e\n";
+        let tokens1 = Lexer::tokenize(src, 0).unwrap();
+        let reconstructed: String = tokens1.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let tokens2 = Lexer::tokenize(&reconstructed, 0).unwrap();
+
+        let kinds1: Vec<_> = tokens1.iter().map(|t| &t.kind).collect();
+        let kinds2: Vec<_> = tokens2.iter().map(|t| &t.kind).collect();
+        assert_eq!(kinds1, kinds2);
+    }
+
+    #[test]
+    fn hash_character_produces_error() {
+        let result = Lexer::tokenize("# bad", 0);
+        assert!(result.is_err());
     }
 
     // ---- fortsh tokenization ----
