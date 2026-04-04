@@ -179,11 +179,12 @@ _main:
     }
 
     // 10. Assemble (using system assembler for now).
-    let asm_path = std::env::temp_dir().join("armfortas_tmp.s");
+    let pid = std::process::id();
+    let asm_path = std::env::temp_dir().join(format!("armfortas_{}.s", pid));
     let obj_path = if opts.emit_obj {
         opts.output_path()
     } else {
-        std::env::temp_dir().join("armfortas_tmp.o")
+        std::env::temp_dir().join(format!("armfortas_{}.o", pid))
     };
 
     fs::write(&asm_path, &asm_text)
