@@ -53,6 +53,19 @@ impl<'a> Parser<'a> {
             "goto" | "go" => self.parse_goto(start),
             "call" => { self.advance(); self.parse_call(start) }
             "print" => { self.advance(); self.parse_print(start) }
+            "write" => { self.advance(); self.parse_write(start) }
+            "read" => { self.advance(); self.parse_read(start) }
+            "open" => { self.advance(); self.parse_io_paren_stmt(start, "open") }
+            "close" => { self.advance(); self.parse_io_paren_stmt(start, "close") }
+            "inquire" => { self.advance(); self.parse_inquire(start) }
+            "rewind" => { self.advance(); self.parse_io_paren_stmt(start, "rewind") }
+            "backspace" => { self.advance(); self.parse_io_paren_stmt(start, "backspace") }
+            "endfile" => { self.advance(); self.parse_io_paren_stmt(start, "endfile") }
+            "flush" => { self.advance(); self.parse_io_paren_stmt(start, "flush") }
+            "allocate" => { self.advance(); self.parse_allocate(start, false) }
+            "deallocate" => { self.advance(); self.parse_allocate(start, true) }
+            "nullify" => { self.advance(); self.parse_nullify(start) }
+            "namelist" => { self.advance(); self.parse_namelist(start) }
             "continue" => {
                 self.advance();
                 let span = span_from_to(start, self.prev_span());
@@ -602,6 +615,198 @@ impl<'a> Parser<'a> {
         }, span))
     }
 
+    // ---- I/O statements ----
+
+    fn parse_write(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let controls = self.parse_io_control_list()?;
+        self.expect(&TokenKind::RParen)?;
+        let items = self.parse_io_item_list()?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::Write { controls, items }, span))
+    }
+
+    fn parse_read(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        // Read has two forms:
+        // 1. read(unit, fmt, ...) items  — parenthesized control list
+        // 2. read *, items               — simple form (format + items)
+        // 3. read fmt, items             — simple form with format label
+        if self.peek() == &TokenKind::LParen {
+            self.advance();
+            let controls = self.parse_io_control_list()?;
+            self.expect(&TokenKind::RParen)?;
+            let items = self.parse_io_item_list()?;
+            let span = span_from_to(start, self.prev_span());
+            Ok(Spanned::new(Stmt::Read { controls, items }, span))
+        } else {
+            // Simple form: read *, x, y  or  read fmt, x, y
+            let format = if self.peek() == &TokenKind::Star {
+                let tok = self.advance().clone();
+                Spanned::new(Expr::Name { name: "*".into() }, tok.span)
+            } else {
+                self.parse_expr()?
+            };
+            let controls = vec![IoControl { keyword: None, value: format }];
+            let items = if self.eat(&TokenKind::Comma) {
+                self.parse_io_expr_list()?
+            } else { Vec::new() };
+            let span = span_from_to(start, self.prev_span());
+            Ok(Spanned::new(Stmt::Read { controls, items }, span))
+        }
+    }
+
+    fn parse_inquire(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        // Check for IOLENGTH form: inquire(iolength=var) items
+        let specs = self.parse_io_control_list()?;
+        self.expect(&TokenKind::RParen)?;
+        let items = self.parse_io_item_list()?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::Inquire { specs, items }, span))
+    }
+
+    /// Parse a generic I/O statement with parenthesized specifiers:
+    /// OPEN/CLOSE/REWIND/BACKSPACE/ENDFILE/FLUSH
+    fn parse_io_paren_stmt(&mut self, start: crate::lexer::Span, kind: &str) -> Result<SpannedStmt, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let specs = self.parse_io_control_list()?;
+        self.expect(&TokenKind::RParen)?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(match kind {
+            "open" => Stmt::Open { specs },
+            "close" => Stmt::Close { specs },
+            "rewind" => Stmt::Rewind { specs },
+            "backspace" => Stmt::Backspace { specs },
+            "endfile" => Stmt::Endfile { specs },
+            "flush" => Stmt::Flush { specs },
+            _ => unreachable!(),
+        }, span))
+    }
+
+    /// Parse a comma-separated list of keyword=value or positional I/O control specifiers.
+    fn parse_io_control_list(&mut self) -> Result<Vec<IoControl>, ParseError> {
+        let mut controls = Vec::new();
+        if self.peek() == &TokenKind::RParen { return Ok(controls); }
+        loop {
+            // Check for keyword=value.
+            if self.peek() == &TokenKind::Identifier {
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
+                    let kw = self.advance().clone().text;
+                    self.advance(); // =
+                    let val = if self.peek() == &TokenKind::Star {
+                        let tok = self.advance().clone();
+                        Spanned::new(Expr::Name { name: "*".into() }, tok.span)
+                    } else {
+                        self.parse_expr()?
+                    };
+                    controls.push(IoControl { keyword: Some(kw), value: val });
+                    if !self.eat(&TokenKind::Comma) { break; }
+                    continue;
+                }
+            }
+            // Positional: could be * (format), integer (unit/label), or expression.
+            let val = if self.peek() == &TokenKind::Star {
+                let tok = self.advance().clone();
+                Spanned::new(Expr::Name { name: "*".into() }, tok.span)
+            } else {
+                self.parse_expr()?
+            };
+            controls.push(IoControl { keyword: None, value: val });
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        Ok(controls)
+    }
+
+    /// Parse I/O item list after the control list (for WRITE/READ/INQUIRE).
+    fn parse_io_item_list(&mut self) -> Result<Vec<SpannedExpr>, ParseError> {
+        if self.at_stmt_end() { return Ok(Vec::new()); }
+        self.parse_io_expr_list()
+    }
+
+    fn parse_io_expr_list(&mut self) -> Result<Vec<SpannedExpr>, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        Ok(items)
+    }
+
+    // ---- ALLOCATE / DEALLOCATE ----
+
+    fn parse_allocate(&mut self, start: crate::lexer::Span, is_dealloc: bool) -> Result<SpannedStmt, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let mut items = Vec::new();
+        let mut opts = Vec::new();
+
+        loop {
+            // Check for keyword=value (stat=, errmsg=, source=, mold=).
+            if self.peek() == &TokenKind::Identifier {
+                let text = self.peek_text().to_lowercase();
+                if matches!(text.as_str(), "stat" | "errmsg" | "source" | "mold") {
+                    let next_pos = self.pos + 1;
+                    if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
+                        let kw = self.advance().clone().text;
+                        self.advance(); // =
+                        let val = self.parse_expr()?;
+                        opts.push(IoControl { keyword: Some(kw), value: val });
+                        if !self.eat(&TokenKind::Comma) { break; }
+                        continue;
+                    }
+                }
+            }
+            items.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+
+        self.expect(&TokenKind::RParen)?;
+        let span = span_from_to(start, self.prev_span());
+        if is_dealloc {
+            Ok(Spanned::new(Stmt::Deallocate { items, opts }, span))
+        } else {
+            Ok(Spanned::new(Stmt::Allocate { items, opts }, span))
+        }
+    }
+
+    // ---- NULLIFY ----
+
+    fn parse_nullify(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        self.expect(&TokenKind::RParen)?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::Nullify { items }, span))
+    }
+
+    // ---- NAMELIST ----
+
+    fn parse_namelist(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        let mut groups = Vec::new();
+        loop {
+            self.expect(&TokenKind::Slash)?;
+            let name = self.advance().clone().text;
+            self.expect(&TokenKind::Slash)?;
+            let mut vars = Vec::new();
+            loop {
+                vars.push(self.advance().clone().text);
+                if !self.eat(&TokenKind::Comma) { break; }
+                // Check for next group starting with /
+                if self.peek() == &TokenKind::Slash { break; }
+            }
+            groups.push((name, vars));
+            if self.at_stmt_end() || self.peek() != &TokenKind::Slash { break; }
+        }
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::Namelist { groups }, span))
+    }
+
+    // ---- Helpers ----
+
     pub(crate) fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
@@ -1010,5 +1215,192 @@ end if
             assert!(!cases.is_empty());
             assert!(matches!(cases[0].body[0].node, Stmt::SelectCase { .. }), "inner should be SelectCase");
         } else { panic!("not SelectCase"); }
+    }
+
+    // ======================================================================
+    // Sprint 11: I/O, ALLOCATE, NAMELIST, NULLIFY
+    // ======================================================================
+
+    // ---- WRITE ----
+
+    #[test]
+    fn write_simple() {
+        let s = parse_one("write(*, *) x, y, z\n");
+        if let Stmt::Write { controls, items } = &s.node {
+            assert_eq!(controls.len(), 2); // unit=*, fmt=*
+            assert_eq!(items.len(), 3);
+        } else { panic!("not Write, got {:?}", s.node); }
+    }
+
+    #[test]
+    fn write_with_keywords() {
+        let s = parse_one("write(unit=10, fmt='(A)', iostat=ios) msg\n");
+        if let Stmt::Write { controls, items } = &s.node {
+            assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("unit")));
+            assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("fmt")));
+            assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("iostat")));
+            assert_eq!(items.len(), 1);
+        } else { panic!("not Write"); }
+    }
+
+    // ---- READ ----
+
+    #[test]
+    fn read_paren_form() {
+        let s = parse_one("read(10, '(A)') line\n");
+        if let Stmt::Read { controls, items } = &s.node {
+            assert_eq!(controls.len(), 2);
+            assert_eq!(items.len(), 1);
+        } else { panic!("not Read"); }
+    }
+
+    #[test]
+    fn read_simple_form() {
+        let s = parse_one("read *, x, y\n");
+        if let Stmt::Read { controls, items } = &s.node {
+            assert_eq!(controls.len(), 1); // format=*
+            assert_eq!(items.len(), 2);
+        } else { panic!("not Read"); }
+    }
+
+    // ---- OPEN ----
+
+    #[test]
+    fn open_stmt() {
+        let s = parse_one("open(unit=10, file='data.txt', status='old', action='read', iostat=ios)\n");
+        if let Stmt::Open { specs } = &s.node {
+            assert!(specs.len() >= 4);
+            assert!(specs.iter().any(|s| s.keyword.as_deref() == Some("file")));
+        } else { panic!("not Open"); }
+    }
+
+    #[test]
+    fn open_simple() {
+        let s = parse_one("open(10, file='data.txt')\n");
+        if let Stmt::Open { specs } = &s.node {
+            assert!(specs.len() >= 2);
+        } else { panic!("not Open"); }
+    }
+
+    // ---- CLOSE ----
+
+    #[test]
+    fn close_stmt() {
+        let s = parse_one("close(10)\n");
+        if let Stmt::Close { specs } = &s.node {
+            assert_eq!(specs.len(), 1);
+        } else { panic!("not Close"); }
+    }
+
+    #[test]
+    fn close_with_keywords() {
+        let s = parse_one("close(unit=10, status='delete', iostat=ios)\n");
+        if let Stmt::Close { specs } = &s.node {
+            assert!(specs.iter().any(|s| s.keyword.as_deref() == Some("status")));
+        } else { panic!("not Close"); }
+    }
+
+    // ---- INQUIRE ----
+
+    #[test]
+    fn inquire_by_file() {
+        let s = parse_one("inquire(file='test.dat', exist=ex)\n");
+        assert!(matches!(s.node, Stmt::Inquire { .. }));
+    }
+
+    #[test]
+    fn inquire_by_unit() {
+        let s = parse_one("inquire(unit=10, opened=op)\n");
+        assert!(matches!(s.node, Stmt::Inquire { .. }));
+    }
+
+    // ---- File positioning ----
+
+    #[test]
+    fn rewind_stmt() {
+        let s = parse_one("rewind(10)\n");
+        assert!(matches!(s.node, Stmt::Rewind { .. }));
+    }
+
+    #[test]
+    fn backspace_stmt() {
+        let s = parse_one("backspace(unit=10, iostat=ios)\n");
+        assert!(matches!(s.node, Stmt::Backspace { .. }));
+    }
+
+    #[test]
+    fn flush_stmt() {
+        let s = parse_one("flush(10)\n");
+        assert!(matches!(s.node, Stmt::Flush { .. }));
+    }
+
+    // ---- ALLOCATE / DEALLOCATE ----
+
+    #[test]
+    fn allocate_simple() {
+        let s = parse_one("allocate(a(n), b(m,k))\n");
+        if let Stmt::Allocate { items, opts } = &s.node {
+            assert_eq!(items.len(), 2);
+            assert!(opts.is_empty());
+        } else { panic!("not Allocate"); }
+    }
+
+    #[test]
+    fn allocate_with_stat() {
+        let s = parse_one("allocate(x(100), stat=ios, errmsg=msg)\n");
+        if let Stmt::Allocate { items, opts } = &s.node {
+            assert_eq!(items.len(), 1);
+            assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("stat")));
+            assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("errmsg")));
+        } else { panic!("not Allocate"); }
+    }
+
+    #[test]
+    fn allocate_with_source() {
+        let s = parse_one("allocate(x, source=template)\n");
+        if let Stmt::Allocate { opts, .. } = &s.node {
+            assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("source")));
+        } else { panic!("not Allocate"); }
+    }
+
+    #[test]
+    fn deallocate_stmt() {
+        let s = parse_one("deallocate(a, b, stat=ios)\n");
+        if let Stmt::Deallocate { items, opts } = &s.node {
+            assert_eq!(items.len(), 2);
+            assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("stat")));
+        } else { panic!("not Deallocate"); }
+    }
+
+    // ---- NULLIFY ----
+
+    #[test]
+    fn nullify_stmt() {
+        let s = parse_one("nullify(ptr1, ptr2)\n");
+        if let Stmt::Nullify { items } = &s.node {
+            assert_eq!(items.len(), 2);
+        } else { panic!("not Nullify"); }
+    }
+
+    // ---- NAMELIST ----
+
+    #[test]
+    fn namelist_stmt() {
+        let s = parse_one("namelist /input_data/ x, y, z\n");
+        if let Stmt::Namelist { groups } = &s.node {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].0, "input_data");
+            assert_eq!(groups[0].1.len(), 3);
+        } else { panic!("not Namelist"); }
+    }
+
+    #[test]
+    fn namelist_multiple_groups() {
+        let s = parse_one("namelist /in/ x, y /out/ z\n");
+        if let Stmt::Namelist { groups } = &s.node {
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].0, "in");
+            assert_eq!(groups[1].0, "out");
+        } else { panic!("not Namelist"); }
     }
 }

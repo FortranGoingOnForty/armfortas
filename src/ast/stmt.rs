@@ -86,13 +86,39 @@ pub enum Stmt {
     ComputedGoto { labels: Vec<u64>, selector: SpannedExpr },
     ArithmeticIf { expr: SpannedExpr, neg: u64, zero: u64, pos: u64 },
 
+    // ---- I/O ----
+    Write { controls: Vec<IoControl>, items: Vec<SpannedExpr> },
+    Read { controls: Vec<IoControl>, items: Vec<SpannedExpr> },
+    Open { specs: Vec<IoControl> },
+    Close { specs: Vec<IoControl> },
+    Inquire { specs: Vec<IoControl>, items: Vec<SpannedExpr> },
+    Rewind { specs: Vec<IoControl> },
+    Backspace { specs: Vec<IoControl> },
+    Endfile { specs: Vec<IoControl> },
+    Flush { specs: Vec<IoControl> },
+
+    // ---- Memory ----
+    Allocate { items: Vec<SpannedExpr>, opts: Vec<IoControl> },
+    Deallocate { items: Vec<SpannedExpr>, opts: Vec<IoControl> },
+    Nullify { items: Vec<SpannedExpr> },
+
     // ---- Other executable ----
     Continue { label: Option<u64> },
     Call { callee: SpannedExpr, args: Vec<crate::ast::expr::Argument> },
     Print { format: SpannedExpr, items: Vec<SpannedExpr> },
+    Namelist { groups: Vec<(String, Vec<String>)> },
 
     // ---- Declaration (embedded in statement context) ----
     Declaration(SpannedDecl),
+}
+
+/// I/O control specifier: either a positional value or keyword=value pair.
+/// Used for WRITE/READ control lists, OPEN/CLOSE/INQUIRE specifiers, and
+/// ALLOCATE options (stat=, errmsg=, source=, mold=).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoControl {
+    pub keyword: Option<String>,
+    pub value: SpannedExpr,
 }
 
 // ---- Supporting types ----
