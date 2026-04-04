@@ -621,7 +621,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Associate { assocs, body, .. } => {
-            // Associate names are aliases — lower the expression and bind the value.
+            // Associate names are scoped — they only exist within the body.
+            let added_keys: Vec<String> = assocs.iter()
+                .map(|(name, _)| name.to_lowercase())
+                .collect();
+
             for (name, expr) in assocs {
                 let val = lower_expr(b, &ctx.locals, expr, ctx.st);
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
@@ -630,6 +634,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
             }
             lower_stmts(b, ctx, body);
+
+            // Remove associate names from scope.
+            for key in &added_keys {
+                ctx.locals.remove(key);
+            }
         }
 
         Stmt::Continue { .. } => {} // no-op
