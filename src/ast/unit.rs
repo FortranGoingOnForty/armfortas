@@ -100,6 +100,7 @@ pub enum DummyArg {
 
 /// Body of an interface block — either a subprogram interface or a module procedure name.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InterfaceBody {
     Subprogram(SpannedUnit),
     ModuleProcedure(Vec<String>),

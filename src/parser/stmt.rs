@@ -602,7 +602,7 @@ impl<'a> Parser<'a> {
         }, span))
     }
 
-    fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
+    pub(crate) fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
         let combined = format!("end{}", keyword);
