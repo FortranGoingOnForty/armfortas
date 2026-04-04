@@ -42,11 +42,15 @@ struct LowerCtx<'a> {
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
     globals: &'a HashMap<String, (usize, IrType)>,
+    /// For functions: address of the result variable (for RETURN).
+    result_addr: Option<ValueId>,
+    /// For functions: the return type.
+    result_type: Option<IrType>,
 }
 
 impl<'a> LowerCtx<'a> {
     fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>) -> Self {
-        Self { locals: HashMap::new(), loops: Vec::new(), st, globals }
+        Self { locals: HashMap::new(), loops: Vec::new(), st, globals, result_addr: None, result_type: None }
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
@@ -157,6 +161,8 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
                 let result_addr = b.alloca(ret_ty.clone());
                 ctx.insert_scalar(result_name, result_addr, ret_ty.clone());
+                ctx.result_addr = Some(result_addr);
+                ctx.result_type = Some(ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -446,14 +452,22 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Return { .. } => {
-            b.ret_void();
+            insert_implicit_dealloc(b, &ctx.locals);
+            if let Some(addr) = ctx.result_addr {
+                let rv = b.load(addr);
+                b.ret(Some(rv));
+            } else {
+                b.ret_void();
+            }
         }
 
         Stmt::Stop { .. } => {
+            insert_implicit_dealloc(b, &ctx.locals);
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
         Stmt::ErrorStop { .. } => {
+            insert_implicit_dealloc(b, &ctx.locals);
             b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
             b.unreachable();
         }
@@ -605,10 +619,21 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
 
         b.branch(bb_check, vec![]);
 
-        // Check: i <= end (or i >= end for negative step).
+        // Check: i <= end for positive step, i >= end for negative step.
+        // Determine step direction: if step is a known negative constant, use Ge.
+        // For runtime-determined step, compare step against 0.
         b.set_block(bb_check);
         let cur = b.load(var_addr);
-        let cond = b.icmp(CmpOp::Le, cur, end_val);
+
+        let step_is_negative = if let Some(step_expr) = step {
+            // Try to determine step sign at compile time.
+            eval_const_int(step_expr).map(|v| v < 0).unwrap_or(false)
+        } else {
+            false
+        };
+
+        let cmp_op = if step_is_negative { CmpOp::Ge } else { CmpOp::Le };
+        let cond = b.icmp(cmp_op, cur, end_val);
         b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
 
         // Body.
@@ -942,7 +967,26 @@ fn lower_expr(
                 (BinaryOp::Ge, IrType::Float(_)) => b.fcmp(CmpOp::Ge, lhs, rhs),
                 (BinaryOp::And, _) => b.and(lhs, rhs),
                 (BinaryOp::Or, _) => b.or(lhs, rhs),
-                _ => b.iadd(lhs, rhs), // fallback
+                (BinaryOp::Eqv, _) => {
+                    // a .eqv. b = .not. (a .xor. b)
+                    let both = b.and(lhs, rhs);
+                    let either = b.or(lhs, rhs);
+                    let not_both = b.not(both);
+                    let xor = b.and(either, not_both);
+                    b.not(xor)
+                }
+                (BinaryOp::Neqv, _) => {
+                    // a .neqv. b = a .xor. b
+                    let both = b.and(lhs, rhs);
+                    let either = b.or(lhs, rhs);
+                    let not_both = b.not(both);
+                    b.and(either, not_both)
+                }
+                (BinaryOp::Concat, _) => {
+                    b.runtime_call(RuntimeFunc::StringConcat, vec![lhs, rhs],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                }
+                _ => b.iadd(lhs, rhs), // fallback for defined ops
             }
         }
 
@@ -1279,6 +1323,37 @@ end program
         // Two loops means at least 2 label lines "do_check():" in the output.
         let label_count = ir.matches("do_check():").count();
         assert_eq!(label_count, 2, "expected 2 loop header labels, got {} in:\n{}", label_count, ir);
+    }
+
+    #[test]
+    fn lower_do_negative_step() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: i, s
+  s = 0
+  do i = 10, 1, -1
+    s = s + i
+  end do
+end program
+");
+        // Negative step should use >= comparison, not <=.
+        assert!(ir.contains("icmp ge"), "expected 'icmp ge' for negative step in:\n{}", ir);
+    }
+
+    #[test]
+    fn lower_function_return() {
+        let (_, ir) = lower_and_verify("\
+function square(x) result(y)
+  integer, intent(in) :: x
+  integer :: y
+  y = x * x
+  return
+end function
+");
+        // RETURN should load the result variable and ret it, not ret void.
+        assert!(ir.contains("ret %"), "expected 'ret %value' in:\n{}", ir);
+        assert!(!ir.contains("ret void"), "function should not ret void in:\n{}", ir);
     }
 
     #[test]
