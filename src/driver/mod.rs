@@ -142,8 +142,9 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 8. Register allocation (linear scan).
     let mut allocated: Vec<_> = machine_funcs;
     for mf in &mut allocated {
+        let liveness = crate::codegen::liveness::compute_liveness(mf);
         let result = linearscan::linear_scan(mf);
-        linearscan::apply_allocation(mf, &result);
+        linearscan::apply_allocation(mf, &result, &liveness);
         linearscan::insert_callee_saves(mf, &result.callee_saved_used);
         linearscan::coalesce_moves(mf);
     }

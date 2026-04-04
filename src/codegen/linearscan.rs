@@ -15,20 +15,23 @@ use super::liveness::{LiveInterval, compute_liveness};
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
 /// Ordered: caller-saved first (prefer these to avoid save/restore overhead),
 /// then callee-saved.
-// x8, x9, x10, x11 reserved (x8 for large-offset addressing, x9-x11 for spill scratch).
+// x8 reserved for large-offset addressing in emit.
 // x16, x17 excluded (linker scratch, clobbered by dynamic dispatch stubs).
-const GP_ALLOC_ORDER: [u8; 22] = [
+// x9-x11 available — spill code borrows temporarily-free allocated registers,
+// falling back to GP_SPILL_SCRATCH only when no allocated register is available.
+const GP_ALLOC_ORDER: [u8; 25] = [
     // Caller-saved (temporary, no save needed)
-    12, 13, 14, 15,               // x12-x15
+    9, 10, 11, 12, 13, 14, 15,   // x9-x15
     0, 1, 2, 3, 4, 5, 6, 7,      // x0-x7 (args, but available between calls)
     // Callee-saved (must save/restore if used)
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
 
-// d29, d30, d31 reserved as FP spill scratch — NOT in the allocation pool.
-const FP_ALLOC_ORDER: [u8; 29] = [
+// All 32 FP registers available. Spill code borrows temporarily-free registers,
+// falling back to FP_SPILL_SCRATCH when no allocated register is available.
+const FP_ALLOC_ORDER: [u8; 32] = [
     // Caller-saved
-    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     0, 1, 2, 3, 4, 5, 6, 7,
     // Callee-saved
     8, 9, 10, 11, 12, 13, 14, 15,
@@ -183,40 +186,89 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
 }
 
 /// Apply allocation result: rewrite VReg operands to PhysReg, insert spill code.
-pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult) {
+/// For spilled operands, borrows a temporarily-free register from the allocation
+/// pool rather than using dedicated scratch registers. This avoids wasting
+/// registers in the pool and follows standard linear scan practice.
+pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult, liveness: &super::liveness::LivenessResult) {
     let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
         .map(|v| (v.id, v.class))
         .collect();
+
+    // Build a map from vreg → physical register for assigned vregs.
+    // We use this to determine which physical registers are "in use" at each point.
+    let assigned_regs: HashSet<u8> = result.assignments.values().filter_map(|p| match p {
+        PhysReg::Gp(n) | PhysReg::Gp32(n) => Some(*n),
+        _ => None,
+    }).collect();
+
+    // Build interval lookup: for each vreg, its live range.
+    let intervals: HashMap<VRegId, (u32, u32)> = liveness.intervals.iter()
+        .map(|i| (i.vreg, (i.start, i.end)))
+        .collect();
+
+    // Compute instruction positions for each block/instruction.
+    let mut inst_pos: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut pos: u32 = 0;
+    for (bi, block) in mf.blocks.iter().enumerate() {
+        for (ii, _) in block.insts.iter().enumerate() {
+            inst_pos.insert((bi, ii), pos);
+            pos += 2;
+        }
+    }
 
     for block_idx in 0..mf.blocks.len() {
         let mut new_insts = Vec::new();
         let insts = std::mem::take(&mut mf.blocks[block_idx].insts);
 
-        for inst in insts {
+        for (inst_idx, inst) in insts.iter().enumerate() {
             let mut rewritten = inst.clone();
+            let cur_pos = inst_pos.get(&(block_idx, inst_idx)).copied().unwrap_or(0);
 
-            // For spilled vregs used as inputs: insert load before.
-            // Each spilled operand gets a different scratch register to avoid aliasing.
+            // Find GP registers NOT occupied by any live interval at this position.
+            // These are safe to use as temporary spill registers.
+            let mut gp_temps: Vec<u8> = Vec::new();
+            let mut fp_temps: Vec<u8> = Vec::new();
+            for (&vreg, phys) in &result.assignments {
+                if let Some(&(start, end)) = intervals.get(&vreg) {
+                    if cur_pos < start || cur_pos > end {
+                        // This vreg's register is free at this point.
+                        match phys {
+                            PhysReg::Gp(n) | PhysReg::Gp32(n) => gp_temps.push(*n),
+                            PhysReg::Fp(n) | PhysReg::Fp32(n) => fp_temps.push(*n),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // Also include the dedicated fallback scratches in case no free regs found.
+            for &s in &GP_SPILL_SCRATCH { if !gp_temps.contains(&s) { gp_temps.push(s); } }
+            for &s in &FP_SPILL_SCRATCH { if !fp_temps.contains(&s) { fp_temps.push(s); } }
+
+            // For spilled vregs used as inputs: borrow a temp register.
             let mut loads = Vec::new();
-            let mut gp_scratch_idx = 0usize;
-            let mut fp_scratch_idx = 0usize;
+            let mut gp_temp_idx = 0usize;
+            let mut fp_temp_idx = 0usize;
             for (i, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
                     if let Some(&offset) = result.spills.get(vid) {
                         let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
-                        let idx = if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
-                            let i = fp_scratch_idx; fp_scratch_idx += 1; i
+                        let (temp_reg, load_op) = if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
+                            let r = fp_temps.get(fp_temp_idx).copied().unwrap_or(FP_SPILL_SCRATCH[0]);
+                            fp_temp_idx += 1;
+                            let phys = if matches!(class, RegClass::Fp32) { PhysReg::Fp32(r) } else { PhysReg::Fp(r) };
+                            (phys, ArmOpcode::LdrFpImm)
                         } else {
-                            let i = gp_scratch_idx; gp_scratch_idx += 1; i
+                            let r = gp_temps.get(gp_temp_idx).copied().unwrap_or(GP_SPILL_SCRATCH[0]);
+                            gp_temp_idx += 1;
+                            let phys = if matches!(class, RegClass::Gp32) { PhysReg::Gp32(r) } else { PhysReg::Gp(r) };
+                            (phys, ArmOpcode::LdrImm)
                         };
-                        let (scratch, load_op) = spill_scratch(class, idx);
-                        loads.push((i, scratch, load_op, offset));
+                        loads.push((i, temp_reg, load_op, offset));
                     }
                 }
             }
 
             for (op_idx, scratch, load_op, offset) in &loads {
-                // Skip if this is the def operand (index 0 and matches def).
                 if *op_idx == 0 && inst.def.as_ref().map(|d| result.spills.contains_key(d)).unwrap_or(false) {
                     continue;
                 }
@@ -241,12 +293,19 @@ pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult) {
                 }
             }
 
-            // Handle def — use a scratch index that doesn't alias any input scratch.
-            let def_scratch_idx = gp_scratch_idx.max(fp_scratch_idx);
+            // Handle def — use a temp that doesn't alias any input temp.
+            let def_temp_idx = gp_temp_idx.max(fp_temp_idx);
             let def_spill = if let Some(def_vid) = &inst.def {
                 if let Some(&offset) = result.spills.get(def_vid) {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
-                    let (scratch, _) = spill_scratch(class, def_scratch_idx);
+                    let temp_reg = if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
+                        let r = fp_temps.get(def_temp_idx).copied().unwrap_or(FP_SPILL_SCRATCH[0]);
+                        if matches!(class, RegClass::Fp32) { PhysReg::Fp32(r) } else { PhysReg::Fp(r) }
+                    } else {
+                        let r = gp_temps.get(def_temp_idx).copied().unwrap_or(GP_SPILL_SCRATCH[0]);
+                        if matches!(class, RegClass::Gp32) { PhysReg::Gp32(r) } else { PhysReg::Gp(r) }
+                    };
+                    let scratch = temp_reg;
                     // Replace def operand with scratch.
                     if let Some(MachineOperand::VReg(vid)) = rewritten.operands.first() {
                         if vid == def_vid {
