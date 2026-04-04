@@ -34,6 +34,9 @@ struct LocalInfo {
     dims: Vec<(i64, i64)>,
     /// Is this an allocatable variable?
     allocatable: bool,
+    /// Is this a pass-by-reference parameter? If true, `addr` holds a pointer
+    /// to the caller's storage. Reads/writes go through the pointer.
+    by_ref: bool,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -54,7 +57,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
+    }
+
+    fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -90,7 +97,7 @@ pub fn lower_file(
 
 fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (usize, IrType)>) {
     match &unit.node {
-        ProgramUnit::Program { name, decls, body, .. } => {
+        ProgramUnit::Program { name, decls, body, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let mut func = Function::new(fname, vec![], IrType::Void);
             let mut ctx = LowerCtx::new(st, globals);
@@ -106,6 +113,11 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             }
 
             module.add_function(func);
+
+            // Lower CONTAINS subprograms.
+            for sub in contains {
+                lower_unit(module, sub, st, globals);
+            }
         }
         ProgramUnit::Subroutine { name, decls, body, args, .. } => {
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
@@ -120,12 +132,20 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut func = Function::new(name.clone(), params, IrType::Void);
             let mut ctx = LowerCtx::new(st, globals);
 
-            for p in &func.params {
-                ctx.insert_scalar(p.name.to_lowercase(), p.id, p.ty.clone());
-            }
+            // Collect param info before borrowing func mutably.
+            let param_info: Vec<(String, ValueId)> = func.params.iter()
+                .map(|p| (p.name.to_lowercase(), p.id))
+                .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+
+                for (pname, pid) in &param_info {
+                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+                    b.store(*pid, slot);
+                    ctx.insert_param_by_ref(pname.clone(), slot, IrType::Int(IntWidth::I32));
+                }
+
                 alloc_decls(&mut b, &mut ctx.locals, decls);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -152,12 +172,19 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut func = Function::new(name.clone(), params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals);
 
-            for p in &func.params {
-                ctx.insert_scalar(p.name.to_lowercase(), p.id, p.ty.clone());
-            }
+            let param_info: Vec<(String, ValueId)> = func.params.iter()
+                .map(|p| (p.name.to_lowercase(), p.id))
+                .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+
+                for (pname, pid) in &param_info {
+                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+                    b.store(*pid, slot);
+                    ctx.insert_param_by_ref(pname.clone(), slot, IrType::Int(IntWidth::I32));
+                }
+
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
                 let result_addr = b.alloca(ret_ty.clone());
                 ctx.insert_scalar(result_name, result_addr, ret_ty.clone());
@@ -220,11 +247,11 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                     let addr = b.alloca(arr_ty);
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: is_allocatable });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: is_allocatable, by_ref: false });
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false });
                 }
             }
         }
@@ -413,7 +440,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 Expr::Name { name } => {
                     let key = name.to_lowercase();
                     if let Some(info) = ctx.locals.get(&key) {
-                        b.store(val, info.addr);
+                        if info.by_ref {
+                            // Write through the pointer to caller's storage.
+                            let ptr = b.load(info.addr);
+                            b.store(val, ptr);
+                        } else {
+                            b.store(val, info.addr);
+                        }
                     }
                 }
                 Expr::FunctionCall { callee, args } => {
@@ -594,7 +627,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
             }
             lower_stmts(b, ctx, body);
         }
@@ -684,7 +717,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false });
             addr
         });
 
@@ -961,10 +994,14 @@ fn lower_arg_by_ref(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
-    // If it's a simple name, pass its existing address.
+    // If it's a simple name, pass its address.
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
+            if info.by_ref {
+                // Already a pointer to caller's storage — load and pass it.
+                return b.load(info.addr);
+            }
             return info.addr;
         }
     }
@@ -1007,11 +1044,15 @@ fn lower_expr(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             if let Some(info) = locals.get(&key) {
-                if info.dims.is_empty() {
-                    b.load(info.addr)
-                } else {
+                if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
+                } else if info.by_ref {
+                    // Pass-by-reference param: load the pointer, then load through it.
+                    let ptr = b.load(info.addr);
+                    b.load(ptr)
+                } else {
+                    b.load(info.addr)
                 }
             } else {
                 b.const_i32(0) // implicit or unknown
@@ -1103,21 +1144,28 @@ fn lower_expr(
                     }
                 }
 
-                // Try intrinsic lowering first.
-                let arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                // Try intrinsic lowering first (intrinsics use values, not references).
+                let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
                         _ => b.const_i32(0),
                     }
                 }).collect();
 
-                if let Some(result) = lower_intrinsic(b, &key, &arg_vals) {
+                if let Some(result) = lower_intrinsic(b, &key, &intrinsic_arg_vals) {
                     return result;
                 }
 
-                // External function call.
+                // User function call: Fortran pass-by-reference — pass addresses.
+                let ref_arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                    match &a.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => lower_arg_by_ref(b, locals, e, st),
+                        _ => b.const_i32(0),
+                    }
+                }).collect();
+
                 let ret_ty = IrType::Int(IntWidth::I32); // default
-                b.call(FuncRef::External(name.clone()), arg_vals, ret_ty)
+                b.call(FuncRef::External(name.clone()), ref_arg_vals, ret_ty)
             } else {
                 b.const_i32(0)
             }
