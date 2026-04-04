@@ -1063,7 +1063,6 @@ fn lower_arg_by_ref(
 }
 
 /// Lower an expression to a ValueId.
-#[allow(clippy::only_used_in_recursion)]
 fn lower_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -1241,7 +1240,17 @@ fn lower_expr(
                     }
                 }).collect();
 
-                let ret_ty = IrType::Int(IntWidth::I32); // default
+                // Look up callee return type from symbol table.
+                let ret_ty = st.lookup(&key)
+                    .and_then(|sym| sym.type_info.as_ref())
+                    .map(|info| crate::sema::types::type_info_to_fortran_type(info))
+                    .map(|ft| match ft {
+                        crate::sema::types::FortranType::Real { kind } => IrType::float_from_kind(kind),
+                        crate::sema::types::FortranType::Integer { kind } => IrType::int_from_kind(kind),
+                        crate::sema::types::FortranType::Logical { .. } => IrType::Bool,
+                        _ => IrType::Int(IntWidth::I32),
+                    })
+                    .unwrap_or(IrType::Int(IntWidth::I32));
                 b.call(FuncRef::External(name.clone()), ref_arg_vals, ret_ty)
             } else {
                 b.const_i32(0)
