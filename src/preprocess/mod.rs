@@ -467,11 +467,18 @@ impl Preprocessor {
                 msg: format!("reading {}: {}", resolved.display(), e),
             })?;
 
+        // Save __FILE__ so it's restored after the include returns.
+        let saved_file = self.defines.get("__FILE__").cloned();
+
         self.include_depth += 1;
-        // Process included file directly into parent's output buffers.
         let inc_filename = resolved.to_string_lossy().into_owned();
         self.process_into(&content, &inc_filename, output, source_map)?;
         self.include_depth -= 1;
+
+        // Restore __FILE__ to the parent's filename.
+        if let Some(saved) = saved_file {
+            self.defines.insert("__FILE__".into(), saved);
+        }
         Ok(())
     }
 
@@ -1734,6 +1741,24 @@ deep
         let src = "#include \"test_pp_define.inc\"\nx = INCLUDED_VAL\n";
         let result = preprocess(src, &config).unwrap();
         assert!(result.text.contains("x = 99"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn file_macro_restored_after_include() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let inc_path = dir.join("test_pp_file_restore.inc");
+        let mut f = std::fs::File::create(&inc_path).unwrap();
+        writeln!(f, "! included").unwrap();
+        drop(f);
+
+        let mut config = PreprocConfig::default();
+        config.include_paths.push(dir);
+        config.filename = "parent.f90".into();
+        let src = "before = __FILE__\n#include \"test_pp_file_restore.inc\"\nafter = __FILE__\n";
+        let result = preprocess(src, &config).unwrap();
+        assert!(result.text.contains("before = \"parent.f90\""), "got: {:?}", result.text);
+        assert!(result.text.contains("after = \"parent.f90\""), "__FILE__ not restored, got: {:?}", result.text);
     }
 
     // ---- Fixed-form awareness ----
