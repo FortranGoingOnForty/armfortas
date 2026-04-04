@@ -510,27 +510,29 @@ impl Preprocessor {
     }
 
     /// Expand macros and `defined(NAME)` / `defined NAME` in a condition expression.
+    ///
+    /// Three passes:
+    /// 1. Replace `defined(X)` / `defined X` with "1" or "0"
+    /// 2. Recursively expand macros (reusing expand_macros_inner)
+    /// 3. Replace remaining undefined identifiers with "0" (per cpp standard)
     fn expand_condition_macros(&self, expr: &str) -> String {
+        // Pass 1: resolve `defined(...)` and `defined ...` operators.
+        let after_defined = self.resolve_defined_ops(expr);
+
+        // Pass 2: recursively expand macros (same engine as source lines).
+        let expanding = std::collections::HashSet::new();
+        let after_macros = self.expand_macros_inner(&after_defined, &expanding);
+
+        // Pass 3: replace remaining identifiers with 0 (undefined = 0 in #if).
+        replace_undefined_idents(&after_macros)
+    }
+
+    /// Replace `defined(NAME)` and `defined NAME` with "1" or "0".
+    fn resolve_defined_ops(&self, expr: &str) -> String {
         let mut result = String::new();
         let mut chars = expr.chars().peekable();
 
         while let Some(&ch) = chars.peek() {
-            // Skip numeric literals (including hex like 0xFF) without treating as identifiers.
-            if ch.is_ascii_digit() {
-                result.push(ch);
-                chars.next();
-                // Consume the rest of the number (digits, hex chars after 0x, etc.)
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        result.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                continue;
-            }
-
             if ch.is_alphabetic() || ch == '_' {
                 let mut ident = String::new();
                 while let Some(&c) = chars.peek() {
@@ -543,7 +545,6 @@ impl Preprocessor {
                 }
 
                 if ident == "defined" {
-                    // defined(NAME) or defined NAME
                     while chars.peek() == Some(&' ') { chars.next(); }
                     let has_paren = chars.peek() == Some(&'(');
                     if has_paren { chars.next(); }
@@ -561,15 +562,8 @@ impl Preprocessor {
                         if chars.peek() == Some(&')') { chars.next(); }
                     }
                     result.push_str(if self.defines.contains_key(&name) { "1" } else { "0" });
-                } else if let Some(def) = self.defines.get(&ident) {
-                    if !def.is_function {
-                        result.push_str(&def.body);
-                    } else {
-                        result.push_str(&ident);
-                    }
                 } else {
-                    // Undefined macro in #if context evaluates to 0 (per cpp standard).
-                    result.push('0');
+                    result.push_str(&ident);
                 }
             } else {
                 result.push(ch);
@@ -982,6 +976,38 @@ fn find_matching_paren(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Replace remaining identifiers with "0" in a #if expression.
+/// After macro expansion, any identifier that's still present is undefined
+/// and evaluates to 0 per the cpp standard.
+fn replace_undefined_idents(expr: &str) -> String {
+    let mut result = String::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Preserve numeric literals (including hex).
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        // Identifiers -> "0".
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let _ident = &expr[start..i];
+            result.push('0');
+            continue;
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -1526,6 +1552,32 @@ end module
     fn if_with_arithmetic() {
         let out = pp_with("#if MAX + 1 > 512\nbig\n#else\nsmall\n#endif\n", &[("MAX", "1024")]);
         assert!(lines(&out).contains(&"big"));
+    }
+
+    #[test]
+    fn if_chained_macros() {
+        // A -> 1, B -> A. #if B should expand B->A->1, evaluating to true.
+        let out = pp_with("#if B\nyes\n#endif\n", &[("A", "1"), ("B", "A")]);
+        assert!(lines(&out).contains(&"yes"), "chained macro in #if failed, got: {:?}", lines(&out));
+    }
+
+    #[test]
+    fn if_chained_three_levels() {
+        let out = pp_with("#if C > 10\nyes\n#endif\n", &[("A", "42"), ("B", "A"), ("C", "B")]);
+        assert!(lines(&out).contains(&"yes"), "3-level chain in #if failed, got: {:?}", lines(&out));
+    }
+
+    #[test]
+    fn if_defined_and_value() {
+        // Common real-world pattern: #if defined(FOO) && FOO > 5
+        let out = pp_with("#if defined(FOO) && FOO > 5\nyes\n#endif\n", &[("FOO", "10")]);
+        assert!(lines(&out).contains(&"yes"));
+    }
+
+    #[test]
+    fn if_not_defined_with_bang() {
+        let out = pp("#if !defined(NOPE)\nyes\n#endif\n");
+        assert!(lines(&out).contains(&"yes"));
     }
 
     // ---- Variadic macros ----
