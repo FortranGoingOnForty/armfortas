@@ -57,6 +57,14 @@ impl<'a> Parser<'a> {
             let Some(bp) = self.infix_bp() else { break };
             if bp.left < min_bp { break; }
 
+            // Non-associative operators: if left_bp == right_bp and we're at the
+            // same precedence level, reject chaining (e.g., a < b < c is illegal).
+            if bp.left == bp.right && bp.left == min_bp {
+                return Err(self.error(
+                    "chained comparison operators are not allowed in Fortran (non-associative)".into()
+                ));
+            }
+
             let op_token = self.advance().clone();
             let op = token_to_binary_op(&op_token)?;
             let right = self.parse_expr_bp(bp.right)?;
@@ -620,6 +628,15 @@ mod tests {
     #[test]
     fn comparison_ne() {
         assert_eq!(sexpr("a /= b"), "(a /= b)");
+    }
+
+    #[test]
+    fn comparison_chained_is_error() {
+        // a < b < c is illegal Fortran (non-associative).
+        let tokens = Lexer::tokenize("a < b < c", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let result = parser.parse_expr();
+        assert!(result.is_err(), "chained comparisons should error");
     }
 
     // ---- Logical operators ----
