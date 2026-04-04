@@ -4,8 +4,15 @@
 //! track allocations, detect leaks, and implement Fortran's
 //! automatic deallocation semantics.
 
-use std::alloc::{self, Layout};
 use std::ptr;
+
+// Use libc malloc/free directly so allocate/deallocate are paired correctly
+// without needing to track Rust Layout. The system allocator on macOS returns
+// 16-byte aligned pointers from malloc, satisfying our alignment requirement.
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
 
 /// Allocate `size` bytes on the heap. Returns a pointer.
 /// Aborts on allocation failure (Fortran ALLOCATE with no STAT=).
@@ -14,9 +21,7 @@ pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     if size <= 0 {
         return ptr::null_mut();
     }
-    let layout = Layout::from_size_align(size as usize, 16)
-        .expect("invalid allocation layout");
-    let ptr = unsafe { alloc::alloc(layout) };
+    let ptr = unsafe { malloc(size as usize) };
     if ptr.is_null() {
         eprintln!("ALLOCATE: out of memory ({} bytes)", size);
         std::process::exit(1);
@@ -24,17 +29,13 @@ pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     ptr
 }
 
-/// Deallocate memory previously allocated by _afs_allocate.
+/// Deallocate memory previously allocated by afs_allocate.
 #[no_mangle]
 pub extern "C" fn afs_deallocate(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    // We don't track the layout, so we use a minimum layout.
-    // In a full implementation, the descriptor carries the size.
-    // For now, this is a known simplification.
-    let layout = Layout::from_size_align(1, 1).unwrap();
-    unsafe { alloc::dealloc(ptr, layout) };
+    unsafe { free(ptr) };
 }
 
 /// Concatenate two strings. Returns a newly allocated string.
