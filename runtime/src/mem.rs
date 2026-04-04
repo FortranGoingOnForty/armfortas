@@ -10,7 +10,7 @@ use std::ptr;
 /// Allocate `size` bytes on the heap. Returns a pointer.
 /// Aborts on allocation failure (Fortran ALLOCATE with no STAT=).
 #[no_mangle]
-pub extern "C" fn _afs_allocate(size: i64) -> *mut u8 {
+pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     if size <= 0 {
         return ptr::null_mut();
     }
@@ -26,7 +26,7 @@ pub extern "C" fn _afs_allocate(size: i64) -> *mut u8 {
 
 /// Deallocate memory previously allocated by _afs_allocate.
 #[no_mangle]
-pub extern "C" fn _afs_deallocate(ptr: *mut u8) {
+pub extern "C" fn afs_deallocate(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -40,12 +40,12 @@ pub extern "C" fn _afs_deallocate(ptr: *mut u8) {
 /// Concatenate two strings. Returns a newly allocated string.
 /// Caller is responsible for freeing the result.
 #[no_mangle]
-pub extern "C" fn _afs_string_concat(
+pub extern "C" fn afs_string_concat(
     a: *const u8, alen: i64,
     b: *const u8, blen: i64,
 ) -> *mut u8 {
     let total = (alen + blen) as usize;
-    let result = _afs_allocate(total as i64);
+    let result = afs_allocate(total as i64);
     if !a.is_null() && alen > 0 {
         unsafe { ptr::copy_nonoverlapping(a, result, alen as usize) };
     }
@@ -58,7 +58,7 @@ pub extern "C" fn _afs_string_concat(
 /// Copy a string into a fixed-length buffer, padding with spaces.
 /// Used for character assignment to fixed-length variables.
 #[no_mangle]
-pub extern "C" fn _afs_string_copy(
+pub extern "C" fn afs_string_copy(
     dest: *mut u8, dest_len: i64,
     src: *const u8, src_len: i64,
 ) {
@@ -80,7 +80,7 @@ pub extern "C" fn _afs_string_copy(
 /// Compare two strings lexicographically.
 /// Returns negative, zero, or positive (like strcmp but for counted strings).
 #[no_mangle]
-pub extern "C" fn _afs_string_compare(
+pub extern "C" fn afs_string_compare(
     a: *const u8, alen: i64,
     b: *const u8, blen: i64,
 ) -> i32 {

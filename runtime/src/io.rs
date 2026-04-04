@@ -13,7 +13,7 @@ use std::io::{self, Write};
 /// Print a character string (list-directed).
 /// Fortran passes ptr + length (no null terminator).
 #[no_mangle]
-pub extern "C" fn _afs_print_string(ptr: *const u8, len: i64) {
+pub extern "C" fn afs_print_string(ptr: *const u8, len: i64) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let _ = out.write_all(b" ");
@@ -25,37 +25,37 @@ pub extern "C" fn _afs_print_string(ptr: *const u8, len: i64) {
 
 /// Print a 32-bit integer (list-directed).
 #[no_mangle]
-pub extern "C" fn _afs_print_int(val: i32) {
+pub extern "C" fn afs_print_int(val: i32) {
     print!(" {}", val);
 }
 
 /// Print a 64-bit integer (list-directed).
 #[no_mangle]
-pub extern "C" fn _afs_print_int64(val: i64) {
+pub extern "C" fn afs_print_int64(val: i64) {
     print!(" {}", val);
 }
 
 /// Print a single-precision real (list-directed, E-format).
 #[no_mangle]
-pub extern "C" fn _afs_print_real(val: f32) {
+pub extern "C" fn afs_print_real(val: f32) {
     // Fortran list-directed: processor-dependent, typically E format.
     print!("  {:14.7E}", val);
 }
 
 /// Print a double-precision real (list-directed, E-format).
 #[no_mangle]
-pub extern "C" fn _afs_print_real64(val: f64) {
+pub extern "C" fn afs_print_real64(val: f64) {
     print!("  {:22.15E}", val);
 }
 
 /// Print a logical value (list-directed: T or F).
 #[no_mangle]
-pub extern "C" fn _afs_print_logical(val: i32) {
+pub extern "C" fn afs_print_logical(val: i32) {
     print!(" {}", if val != 0 { "T" } else { "F" });
 }
 
 /// End a PRINT statement (newline).
 #[no_mangle]
-pub extern "C" fn _afs_print_newline() {
+pub extern "C" fn afs_print_newline() {
     println!();
 }
