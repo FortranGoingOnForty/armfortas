@@ -427,13 +427,18 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 
 /// Lex an identifier or keyword in whitespace-stripped body.
 ///
-/// This is the heart of fixed-form whitespace insensitivity. When we encounter
-/// a letter run like `GOTO100` or `INTEGERI`, we try longest keyword prefix match:
-/// 1. Collect the full alphanumeric run.
-/// 2. For lengths from full down to 1, check if that prefix is a keyword.
-/// 3. If a keyword matches, emit just the keyword (consume its length).
-/// 4. Special case: DO + digits triggers DO/assignment ambiguity resolution.
-/// 5. If no keyword matches, emit the full run as one identifier.
+/// Lex an identifier in whitespace-stripped fixed-form body.
+///
+/// Emits the full alphanumeric run as a single Identifier token. The parser
+/// handles keyword recognition from context — this matches how gfortran,
+/// flang, and LFortran handle fixed-form. Keyword prefix splitting (e.g.,
+/// splitting INTEGERI into INTEGER+I) is a parser concern because the lexer
+/// can't distinguish INDEX (intrinsic) from INTEGERI (keyword+ident) without
+/// statement context.
+///
+/// The one exception is the DO/assignment ambiguity, which genuinely must be
+/// resolved at lex time: DO10I=1,10 (loop) vs DO10I=1.10 (assignment) changes
+/// whether digits after DO are a label or part of a variable name.
 fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
     let bytes = text.as_bytes();
     let mut run_end = pos;
@@ -442,36 +447,28 @@ fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -
     }
     let run = &text[pos..run_end];
     let run_lower = run.to_lowercase();
-    let col = (pos as u32) + 7;
 
-    // Try longest keyword prefix match.
-    if let Some(kw_len) = find_longest_keyword_prefix(&run_lower) {
-        let kw_lower = &run_lower[..kw_len];
-
-        // DO ambiguity: DO followed by digits could be a DO loop or a variable name.
-        if kw_lower == "do"
-            && kw_len < run.len()
-            && run.as_bytes()[kw_len].is_ascii_digit()
-            && !is_do_loop_context(text, pos + kw_len)
-        {
-            // Not a DO loop — the entire run is a variable name.
-            return make_ident_token(run, pos, file_id, line);
+    // DO/assignment ambiguity: if the run starts with "do" followed by digits,
+    // check if this is a DO loop (has comma after =) or an assignment.
+    if run_lower.starts_with("do") && run.len() > 2 && run.as_bytes()[2].is_ascii_digit() {
+        if is_do_loop_context(text, pos + 2) {
+            // IS a DO loop — emit just "DO" (2 chars). Subsequent calls
+            // will pick up the label (digits) and variable (letters) separately.
+            let col = (pos as u32) + 7;
+            return (Token {
+                kind: TokenKind::Identifier,
+                text: run[..2].to_string(),
+                span: Span {
+                    file_id,
+                    start: Position { line, col },
+                    end: Position { line, col: col + 2 },
+                },
+            }, 2);
         }
-
-        // Emit the keyword (as Identifier — keywords are not reserved).
-        let kw_text = &run[..kw_len];
-        return (Token {
-            kind: TokenKind::Identifier,
-            text: kw_text.to_string(),
-            span: Span {
-                file_id,
-                start: Position { line, col },
-                end: Position { line, col: col + kw_len as u32 },
-            },
-        }, kw_len);
+        // Not a DO loop — fall through to emit entire run as identifier.
     }
 
-    // No keyword match: entire run is an identifier.
+    // Emit the entire alphanumeric run as one identifier.
     make_ident_token(run, pos, file_id, line)
 }
 
@@ -486,17 +483,6 @@ fn make_ident_token(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
             end: Position { line, col: col + text.len() as u32 },
         },
     }, text.len())
-}
-
-/// Find the longest prefix of `run` (lowercased) that is a Fortran keyword.
-fn find_longest_keyword_prefix(run_lower: &str) -> Option<usize> {
-    use super::is_keyword;
-    for len in (1..=run_lower.len()).rev() {
-        if is_keyword(&run_lower[..len]).is_some() {
-            return Some(len);
-        }
-    }
-    None
 }
 
 /// Check if the rest of the statement after DO+digits looks like a DO loop.
@@ -1032,32 +1018,47 @@ C     Hello World
 
     #[test]
     fn whitespace_stripped_goto() {
-        // GOTO100 → keyword GOTO + integer 100 (keyword splitting!)
-        let kinds = fixed_kinds("      GOTO100\n");
-        assert_eq!(kinds, vec![TokenKind::Identifier, TokenKind::IntegerLiteral],
-            "GOTO100 should split into keyword+number, got: {:?}", kinds);
+        // GOTO100 → single identifier (parser handles keyword+number split).
+        // This matches gfortran behavior: the lexer doesn't split keywords in
+        // fixed-form. The parser recognizes GOTO from statement context.
         let texts = fixed_texts("      GOTO100\n");
-        assert_eq!(texts[0], "GOTO");
-        assert_eq!(texts[1], "100");
+        assert_eq!(texts, vec!["GOTO100"], "got: {:?}", texts);
     }
 
     #[test]
     fn whitespace_stripped_integer_decl() {
-        // INTEGERI → keyword INTEGER + identifier I (keyword splitting!)
-        let kinds = fixed_kinds("      INTEGERI\n");
-        assert_eq!(kinds, vec![TokenKind::Identifier, TokenKind::Identifier],
-            "INTEGERI should split into keyword+ident, got: {:?}", kinds);
+        // INTEGERI → single identifier (parser splits INTEGER+I from context).
         let texts = fixed_texts("      INTEGERI\n");
-        assert_eq!(texts[0], "INTEGER");
-        assert_eq!(texts[1], "I");
+        assert_eq!(texts, vec!["INTEGERI"], "got: {:?}", texts);
     }
 
     #[test]
     fn whitespace_stripped_doubleprecision() {
-        // DOUBLEPRECISIONX → keyword DOUBLEPRECISION + identifier X
+        // DOUBLEPRECISIONX → single identifier (parser handles).
         let texts = fixed_texts("      DOUBLEPRECISIONX\n");
-        assert_eq!(texts[0], "DOUBLEPRECISION", "got: {:?}", texts);
-        assert_eq!(texts[1], "X");
+        assert_eq!(texts, vec!["DOUBLEPRECISIONX"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn index_not_broken() {
+        // INDEX must NOT be split into IN+DEX — this was the showstopper bug.
+        let kinds = fixed_kinds("      X=INDEX(A,'B')\n");
+        let texts = fixed_texts("      X=INDEX(A,'B')\n");
+        assert!(texts.contains(&"INDEX".to_string()), "INDEX was incorrectly split, got: {:?}", texts);
+    }
+
+    #[test]
+    fn include_not_broken() {
+        // INCLUDE must not become IN+CLUDE.
+        let texts = fixed_texts("      INCLUDEVAR=1\n");
+        assert_eq!(texts[0], "INCLUDEVAR", "got: {:?}", texts);
+    }
+
+    #[test]
+    fn if_ident_not_broken() {
+        // IFLAG must not become IF+LAG.
+        let texts = fixed_texts("      IFLAG=1\n");
+        assert_eq!(texts[0], "IFLAG", "got: {:?}", texts);
     }
 
     #[test]
@@ -1209,4 +1210,5 @@ C     Hello World
         let texts = fixed_texts("      X = 'IT''S'\n");
         assert!(texts.iter().any(|t| t.contains("IT''S")), "got: {:?}", texts);
     }
+
 }
