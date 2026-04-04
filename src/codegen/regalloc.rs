@@ -73,12 +73,22 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
                 if let Some(&offset) = vreg_slots.get(vid) {
                     let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
                     let (scratch, load_op) = match class {
-                        RegClass::Fp32 | RegClass::Fp64 => {
+                        RegClass::Fp64 => {
                             let s = FP_SCRATCH[fp_scratch_idx % FP_SCRATCH.len()];
                             fp_scratch_idx += 1;
                             (PhysReg::Fp(s), ArmOpcode::LdrFpImm)
                         }
-                        _ => {
+                        RegClass::Fp32 => {
+                            let s = FP_SCRATCH[fp_scratch_idx % FP_SCRATCH.len()];
+                            fp_scratch_idx += 1;
+                            (PhysReg::Fp32(s), ArmOpcode::LdrFpImm)
+                        }
+                        RegClass::Gp32 => {
+                            let s = GP_SCRATCH[gp_scratch_idx % GP_SCRATCH.len()];
+                            gp_scratch_idx += 1;
+                            (PhysReg::Gp32(s), ArmOpcode::LdrImm)
+                        }
+                        RegClass::Gp64 => {
                             let s = GP_SCRATCH[gp_scratch_idx % GP_SCRATCH.len()];
                             gp_scratch_idx += 1;
                             (PhysReg::Gp(s), ArmOpcode::LdrImm)
@@ -106,8 +116,10 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
                 if let Some(&offset) = vreg_slots.get(&def_vid) {
                     let class = vreg_classes.get(&def_vid).copied().unwrap_or(RegClass::Gp64);
                     let scratch = match class {
-                        RegClass::Fp32 | RegClass::Fp64 => PhysReg::Fp(FP_SCRATCH[0]),
-                        _ => PhysReg::Gp(GP_SCRATCH[0]),
+                        RegClass::Fp64 => PhysReg::Fp(FP_SCRATCH[0]),
+                        RegClass::Fp32 => PhysReg::Fp32(FP_SCRATCH[0]),
+                        RegClass::Gp32 => PhysReg::Gp32(GP_SCRATCH[0]),
+                        RegClass::Gp64 => PhysReg::Gp(GP_SCRATCH[0]),
                     };
 
                     // Replace def operand.
@@ -129,7 +141,7 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
             if let Some((scratch, offset, class)) = def_scratch {
                 let store_op = match class {
                     RegClass::Fp32 | RegClass::Fp64 => ArmOpcode::StrFpImm,
-                    _ => ArmOpcode::StrImm,
+                    RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
                 };
                 new_insts.push(MachineInst {
                     opcode: store_op,
@@ -214,10 +226,13 @@ mod tests {
                 i.operands.iter().any(|op| matches!(op,
                     MachineOperand::PhysReg(PhysReg::Gp(9)) |
                     MachineOperand::PhysReg(PhysReg::Gp(10)) |
-                    MachineOperand::PhysReg(PhysReg::Gp(11))
+                    MachineOperand::PhysReg(PhysReg::Gp(11)) |
+                    MachineOperand::PhysReg(PhysReg::Gp32(9)) |
+                    MachineOperand::PhysReg(PhysReg::Gp32(10)) |
+                    MachineOperand::PhysReg(PhysReg::Gp32(11))
                 ))
             })
         });
-        assert!(uses_scratch, "should use scratch registers x9-x11");
+        assert!(uses_scratch, "should use scratch registers x9-x11 or w9-w11");
     }
 }

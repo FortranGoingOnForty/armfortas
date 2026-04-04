@@ -136,10 +136,20 @@ pub enum MachineOperand {
 /// Physical register reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysReg {
-    Gp(u8),     // X0-X30
-    Fp(u8),     // D0-D31 / S0-S31
-    Sp,         // Stack pointer (encoding 31 in SP context)
-    Xzr,        // Zero register (encoding 31 in non-SP context)
+    /// 64-bit general purpose register (X0-X30).
+    Gp(u8),
+    /// 32-bit general purpose register (W0-W30).
+    Gp32(u8),
+    /// 64-bit FP/SIMD register (D0-D31).
+    Fp(u8),
+    /// 32-bit FP/SIMD register (S0-S31).
+    Fp32(u8),
+    /// Stack pointer.
+    Sp,
+    /// Zero register (64-bit context).
+    Xzr,
+    /// Zero register (32-bit context).
+    Wzr,
 }
 
 impl PhysReg {

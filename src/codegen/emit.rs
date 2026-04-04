@@ -52,10 +52,15 @@ pub fn emit_function(mf: &MachineFunction) -> String {
                     writeln!(out, "{}:", label).unwrap();
                     write!(out, "    .ascii \"").unwrap();
                     for &byte in b {
-                        if byte.is_ascii_graphic() || byte == b' ' {
-                            write!(out, "{}", byte as char).unwrap();
-                        } else {
-                            write!(out, "\\x{:02x}", byte).unwrap();
+                        match byte {
+                            b'\\' => write!(out, "\\\\").unwrap(),
+                            b'"' => write!(out, "\\\"").unwrap(),
+                            b'\n' => write!(out, "\\n").unwrap(),
+                            b'\t' => write!(out, "\\t").unwrap(),
+                            b if b.is_ascii_graphic() || b == b' ' => {
+                                write!(out, "{}", b as char).unwrap();
+                            }
+                            b => write!(out, "\\x{:02x}", b).unwrap(),
                         }
                     }
                     writeln!(out, "\"").unwrap();
@@ -252,8 +257,11 @@ fn op_str(op: &MachineOperand) -> String {
         MachineOperand::VReg(id) => format!("v{}", id.0), // placeholder until regalloc
         MachineOperand::PhysReg(PhysReg::Sp) => "sp".into(),
         MachineOperand::PhysReg(PhysReg::Xzr) => "xzr".into(),
+        MachineOperand::PhysReg(PhysReg::Wzr) => "wzr".into(),
         MachineOperand::PhysReg(PhysReg::Gp(n)) => format!("x{}", n),
+        MachineOperand::PhysReg(PhysReg::Gp32(n)) => format!("w{}", n),
         MachineOperand::PhysReg(PhysReg::Fp(n)) => format!("d{}", n),
+        MachineOperand::PhysReg(PhysReg::Fp32(n)) => format!("s{}", n),
         MachineOperand::Imm(v) => format!("#{}", v),
         MachineOperand::FrameSlot(off) => format!("[fp, #{}]", off),
         MachineOperand::Cond(c) => cond_str(*c).into(),
