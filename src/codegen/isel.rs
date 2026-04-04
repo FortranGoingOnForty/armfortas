@@ -229,24 +229,22 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             });
         }
         InstKind::FPow(a, b) => {
-            // FPow requires a runtime call (pow/powf).
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
             let va = ctx.lookup_vreg(*a);
             let vb = ctx.lookup_vreg(*b);
-            let func_name = match &inst.ty {
-                IrType::Float(FloatWidth::F32) => "_powf",
-                _ => "_pow",
+            let (func_name, arg0, arg1, ret) = match &inst.ty {
+                IrType::Float(FloatWidth::F32) => ("powf", PhysReg::Fp32(0), PhysReg::Fp32(1), PhysReg::Fp32(0)),
+                _ => ("pow", PhysReg::Fp(0), PhysReg::Fp(1), PhysReg::Fp(0)),
             };
-            // Move args to d0, d1.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::FmovReg,
-                operands: vec![MachineOperand::PhysReg(PhysReg::Fp(0)), MachineOperand::VReg(va)],
+                operands: vec![MachineOperand::PhysReg(arg0), MachineOperand::VReg(va)],
                 def: None,
             });
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::FmovReg,
-                operands: vec![MachineOperand::PhysReg(PhysReg::Fp(1)), MachineOperand::VReg(vb)],
+                operands: vec![MachineOperand::PhysReg(arg1), MachineOperand::VReg(vb)],
                 def: None,
             });
             mf.block_mut(mb).insts.push(MachineInst {
@@ -254,10 +252,9 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 operands: vec![MachineOperand::Extern(func_name.into())],
                 def: None,
             });
-            // Result in d0.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::FmovReg,
-                operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(PhysReg::Fp(0))],
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(ret)],
                 def: Some(dest),
             });
         }
@@ -329,9 +326,13 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         // ---- Conversions ----
         InstKind::IntToFloat(a, fw) => {
             let src = ctx.lookup_vreg(*a);
-            let (class, opcode) = match fw {
-                FloatWidth::F32 => (RegClass::Fp32, ArmOpcode::ScvtfSW),
-                FloatWidth::F64 => (RegClass::Fp64, ArmOpcode::ScvtfDW),
+            let src_class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
+            let is_64bit_src = matches!(src_class, Some(RegClass::Gp64));
+            let (class, opcode) = match (fw, is_64bit_src) {
+                (FloatWidth::F32, false) => (RegClass::Fp32, ArmOpcode::ScvtfSW),
+                (FloatWidth::F32, true) => (RegClass::Fp32, ArmOpcode::ScvtfSX),
+                (FloatWidth::F64, false) => (RegClass::Fp64, ArmOpcode::ScvtfDW),
+                (FloatWidth::F64, true) => (RegClass::Fp64, ArmOpcode::ScvtfDX),
             };
             let dest = ctx.get_vreg(mf, inst.id, class);
             mf.block_mut(mb).insts.push(MachineInst {
@@ -342,8 +343,16 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
         InstKind::FloatToInt(a, iw) => {
             let src = ctx.lookup_vreg(*a);
+            let src_class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
+            let is_f64_src = matches!(src_class, Some(RegClass::Fp64));
+            let is_64bit_dest = matches!(iw, IntWidth::I64);
             let class = int_width_class(iw);
-            let opcode = ArmOpcode::FcvtzsWS; // simplified — should vary by float width
+            let opcode = match (is_64bit_dest, is_f64_src) {
+                (false, false) => ArmOpcode::FcvtzsWS,
+                (false, true) => ArmOpcode::FcvtzsWD,
+                (true, false) => ArmOpcode::FcvtzsXS,
+                (true, true) => ArmOpcode::FcvtzsXD,
+            };
             let dest = ctx.get_vreg(mf, inst.id, class);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -628,7 +637,9 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
             let src = ctx.lookup_vreg(*val);
             let class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
             let (reg, opcode) = match class {
-                Some(RegClass::Fp32) | Some(RegClass::Fp64) => (PhysReg::Fp(0), ArmOpcode::FmovReg),
+                Some(RegClass::Fp64) => (PhysReg::Fp(0), ArmOpcode::FmovReg),
+                Some(RegClass::Fp32) => (PhysReg::Fp32(0), ArmOpcode::FmovReg),
+                Some(RegClass::Gp32) => (PhysReg::Gp32(0), ArmOpcode::MovReg),
                 _ => (PhysReg::Gp(0), ArmOpcode::MovReg),
             };
             mf.block_mut(mb).insts.push(MachineInst {

@@ -225,10 +225,11 @@ impl StackFrame {
         //   ...
         //   [SP]    = bottom of frame
         //
-        // Prologue: stp x29, x30, [sp, #-FRAME_SIZE]!
+        // Prologue: sub sp, sp, #FRAME_SIZE
+        //           stp x29, x30, [sp, #FRAME_SIZE - 16]
         //           add x29, sp, #FRAME_SIZE - 16
-        // Epilogue: sub sp, x29, #FRAME_SIZE - 16
-        //           ldp x29, x30, [sp], #FRAME_SIZE
+        // Epilogue: ldp x29, x30, [sp, #FRAME_SIZE - 16]
+        //           add sp, sp, #FRAME_SIZE
         //           ret
         Self { locals: Vec::new(), size: 16, next_offset: 0 }
     }
