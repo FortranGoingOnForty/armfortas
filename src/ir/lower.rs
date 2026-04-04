@@ -260,6 +260,14 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
     }
 }
 
+/// Get the length of a string literal expression (for PRINT).
+fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => value.len() as i64,
+        _ => 0,
+    }
+}
+
 /// Insert implicit deallocation calls for all local allocatable variables.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
     for info in locals.values() {
@@ -362,9 +370,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     IrType::Int(_) => RuntimeFunc::PrintInt,
                     IrType::Float(_) => RuntimeFunc::PrintReal,
                     IrType::Bool => RuntimeFunc::PrintLogical,
+                    IrType::Ptr(_) => RuntimeFunc::PrintString,
                     _ => RuntimeFunc::PrintInt,
                 };
-                b.runtime_call(rt_func, vec![val], IrType::Void);
+                if matches!(rt_func, RuntimeFunc::PrintString) {
+                    // String print needs ptr + length. For string literals,
+                    // extract length from the ConstString instruction.
+                    // For now, pass the value and a length constant.
+                    let len = string_literal_len(item);
+                    let len_val = b.const_i64(len);
+                    b.runtime_call(RuntimeFunc::PrintString, vec![val, len_val], IrType::Void);
+                } else {
+                    b.runtime_call(rt_func, vec![val], IrType::Void);
+                }
             }
             b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
         }
