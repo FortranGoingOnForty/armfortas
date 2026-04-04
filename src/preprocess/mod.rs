@@ -632,36 +632,74 @@ impl Preprocessor {
         if depth != 0 { return None; }
         args.push(current_arg.trim().to_string());
 
-        let mut body = def.body.clone();
-
-        // Substitute named parameters.
+        // Build parameter lookup table.
+        let mut param_map: HashMap<&str, usize> = HashMap::new();
         for (pi, param) in def.params.iter().enumerate() {
-            if let Some(arg) = args.get(pi) {
-                // Stringification: #param → "arg"
-                let stringify_pat = format!("#{}", param);
-                body = body.replace(&stringify_pat, &format!("\"{}\"", arg));
-                // Regular substitution.
-                body = body.replace(param, arg);
-            }
+            param_map.insert(param.as_str(), pi);
         }
 
-        // Variadic: __VA_ARGS__ → remaining args joined with ", "
-        if def.is_variadic {
+        let va_args_str = if def.is_variadic {
             let va_start = def.params.len();
-            let va_args: String = args[va_start..].join(", ");
-            body = body.replace("__VA_ARGS__", &va_args);
-        }
+            args[va_start..].join(", ")
+        } else {
+            String::new()
+        };
 
-        // Token pasting: remove ## and join adjacent tokens.
-        // "foo ## bar" → "foobar"
-        while body.contains("##") {
-            let pos = body.find("##").unwrap();
-            // Find the end of whitespace before ## and after ##.
-            let before_end = body[..pos].trim_end().len();
-            let after_start = pos + 2;
-            let after_trimmed = &body[after_start..].trim_start();
-            let after_skip = body[after_start..].len() - after_trimmed.len();
-            body = format!("{}{}", &body[..before_end], &body[after_start + after_skip..]);
+        // Single-pass word-boundary-aware substitution over the body.
+        let body_bytes = def.body.as_bytes();
+        let mut body = String::new();
+        let mut bi = 0;
+
+        while bi < body_bytes.len() {
+            // Stringification: # followed by identifier
+            if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
+                let id_start = bi + 1;
+                let mut id_end = id_start;
+                while id_end < body_bytes.len() && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_') {
+                    id_end += 1;
+                }
+                if id_end > id_start {
+                    let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
+                    if let Some(&pi) = param_map.get(id) {
+                        body.push_str(&format!("\"{}\"", args.get(pi).map(|s| s.as_str()).unwrap_or("")));
+                        bi = id_end;
+                        continue;
+                    }
+                }
+            }
+
+            // Token pasting: ##
+            if bi + 1 < body_bytes.len() && body_bytes[bi] == b'#' && body_bytes[bi + 1] == b'#' {
+                // Trim trailing whitespace from what we've built, skip ## and leading whitespace.
+                let trimmed = body.trim_end().to_string();
+                body = trimmed;
+                bi += 2;
+                while bi < body_bytes.len() && body_bytes[bi] == b' ' {
+                    bi += 1;
+                }
+                continue;
+            }
+
+            // Identifier: check if it's a parameter name.
+            if body_bytes[bi].is_ascii_alphabetic() || body_bytes[bi] == b'_' {
+                let id_start = bi;
+                while bi < body_bytes.len() && (body_bytes[bi].is_ascii_alphanumeric() || body_bytes[bi] == b'_') {
+                    bi += 1;
+                }
+                let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
+
+                if id == "__VA_ARGS__" && def.is_variadic {
+                    body.push_str(&va_args_str);
+                } else if let Some(&pi) = param_map.get(id) {
+                    body.push_str(args.get(pi).map(|s| s.as_str()).unwrap_or(""));
+                } else {
+                    body.push_str(id);
+                }
+                continue;
+            }
+
+            body.push(body_bytes[bi] as char);
+            bi += 1;
         }
 
         Some((body, i))
@@ -927,6 +965,27 @@ mod tests {
     fn function_macro_nested_parens() {
         let out = pp("#define F(x) (x)\ny = F(a(b, c))\n");
         assert!(out.contains("y = (a(b, c))"));
+    }
+
+    #[test]
+    fn param_substitution_word_boundary() {
+        // Parameter "a" must not match inside "abcdef".
+        let out = pp("#define F(a) abcdef + a\ny = F(99)\n");
+        assert!(out.contains("y = abcdef + 99"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn param_no_double_substitution() {
+        // F(a, b) with body "a + b": calling F(b, a) should give "b + a", not "a + a".
+        let out = pp("#define F(a, b) a + b\ny = F(b, a)\n");
+        assert!(out.contains("y = b + a"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn param_name_as_substring_of_another() {
+        // Parameter "x" should not match inside "x_extra".
+        let out = pp("#define F(x) x_extra + x\ny = F(42)\n");
+        assert!(out.contains("y = x_extra + 42"), "got: {:?}", out);
     }
 
     // ---- Conditionals ----
