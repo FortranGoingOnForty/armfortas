@@ -28,6 +28,38 @@ pub enum CharLen {
     Unknown,    // runtime expression
 }
 
+/// Array type information — wraps an element type with rank and shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayType {
+    pub element_type: FortranType,
+    pub rank: u8,
+    pub shape: ArrayShape,
+}
+
+/// Shape of an array.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArrayShape {
+    Explicit(Vec<Dimension>),
+    AssumedShape(u8),
+    AssumedSize,
+    Deferred(u8),
+    AssumedRank,
+}
+
+/// A single array dimension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dimension {
+    pub lower: Bound,
+    pub upper: Bound,
+}
+
+/// An array bound — known at compile time or determined at runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bound {
+    Constant(i64),
+    Runtime,
+}
+
 impl FortranType {
     /// Default integer: integer(4).
     pub fn default_integer() -> Self { Self::Integer { kind: 4 } }
@@ -153,6 +185,88 @@ pub fn needs_conversion(from: &FortranType, to: &FortranType) -> Option<FortranT
         return Some(to.clone());
     }
     None
+}
+
+/// Logical operators require logical operands and produce logical.
+pub fn logical_result_type(operand: &FortranType) -> Option<FortranType> {
+    if operand.is_logical() {
+        Some(FortranType::Logical { kind: operand.kind().unwrap_or(4) })
+    } else {
+        None // Error: logical operator applied to non-logical type
+    }
+}
+
+/// Binary logical operators: both operands must be logical, result is logical.
+pub fn binary_logical_result_type(left: &FortranType, right: &FortranType) -> Option<FortranType> {
+    if left.is_logical() && right.is_logical() {
+        let kind = left.kind().unwrap_or(4).max(right.kind().unwrap_or(4));
+        Some(FortranType::Logical { kind })
+    } else {
+        None
+    }
+}
+
+/// Compute the result type of any binary operation.
+pub fn binary_op_result_type(op: &crate::ast::expr::BinaryOp, left: &FortranType, right: &FortranType) -> Option<FortranType> {
+    use crate::ast::expr::BinaryOp;
+    match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            arithmetic_result_type(left, right)
+        }
+        BinaryOp::Pow => power_result_type(left, right),
+        BinaryOp::Concat => concat_result_type(left, right),
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le |
+        BinaryOp::Gt | BinaryOp::Ge => {
+            if left.is_numeric() && right.is_numeric() || left.is_character() && right.is_character() {
+                Some(comparison_result_type())
+            } else {
+                None
+            }
+        }
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eqv | BinaryOp::Neqv => {
+            binary_logical_result_type(left, right)
+        }
+        BinaryOp::Defined(_) => Some(FortranType::Unknown), // user-defined ops need interface resolution
+    }
+}
+
+/// Compute the result type of a unary operation.
+pub fn unary_op_result_type(op: &crate::ast::expr::UnaryOp, operand: &FortranType) -> Option<FortranType> {
+    use crate::ast::expr::UnaryOp;
+    match op {
+        UnaryOp::Plus | UnaryOp::Minus => {
+            if operand.is_numeric() { Some(operand.clone()) } else { None }
+        }
+        UnaryOp::Not => logical_result_type(operand),
+        UnaryOp::Defined(_) => Some(FortranType::Unknown),
+    }
+}
+
+/// What kind of entity is `A(I)` — array element, function call, or substring?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallKind {
+    ArrayElement,
+    FunctionCall,
+    Substring,
+    Unknown,
+}
+
+/// Disambiguate `A(I)` based on symbol table information.
+pub fn disambiguate_call(sym_kind: &super::symtab::SymbolKind, has_range_subscript: bool) -> CallKind {
+    use super::symtab::SymbolKind;
+    match sym_kind {
+        SymbolKind::Variable => {
+            if has_range_subscript {
+                CallKind::Substring // character variable with range → substring
+            } else {
+                CallKind::ArrayElement // variable with subscripts → array element
+            }
+        }
+        SymbolKind::Function | SymbolKind::ExternalProc |
+        SymbolKind::IntrinsicProc | SymbolKind::ProcedurePointer => CallKind::FunctionCall,
+        SymbolKind::NamedInterface => CallKind::FunctionCall, // generic → function call
+        _ => CallKind::Unknown,
+    }
 }
 
 /// Get the type of a common intrinsic function call.
