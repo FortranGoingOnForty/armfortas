@@ -194,12 +194,13 @@ impl Preprocessor {
             }
 
             // Also join Fortran &-continued lines (free-form).
-            // A line ending with & (before any comment) continues on the next line.
+            // A line ending with & in the code portion (not inside strings or after !)
+            // continues on the next line.
             if !self.fixed_form {
-                while logical_line.trim_end().ends_with('&') {
-                    // Remove the trailing &.
-                    let trimmed_len = logical_line.trim_end().len();
-                    logical_line.truncate(trimmed_len - 1);
+                while has_trailing_continuation(&logical_line) {
+                    // Remove the trailing & from the code portion.
+                    let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
+                    logical_line.truncate(amp_pos);
                     // Consume the next line, skipping leading & if present.
                     if i < raw_lines.len() {
                         let next = raw_lines[i].trim_start();
@@ -1017,6 +1018,59 @@ fn replace_undefined_idents(expr: &str) -> String {
     result
 }
 
+/// Check if a line has a trailing `&` in the code portion (not inside a string or comment).
+fn has_trailing_continuation(line: &str) -> bool {
+    find_code_trailing_ampersand(line).is_some()
+}
+
+/// Find the position of a trailing `&` that's in the code portion of a line.
+/// Returns None if there's no continuation, or if the `&` is inside a string or comment.
+fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_string: Option<u8> = None;
+    let mut last_amp: Option<usize> = None;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+
+        // Track string state.
+        if let Some(quote) = in_string {
+            if ch == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                    i += 2; // doubled quote escape
+                    continue;
+                }
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == b'\'' || ch == b'"' {
+            in_string = Some(ch);
+            i += 1;
+            continue;
+        }
+
+        // Comment — everything after ! is not code.
+        if ch == b'!' {
+            break;
+        }
+
+        if ch == b'&' {
+            last_amp = Some(i);
+        } else if !ch.is_ascii_whitespace() {
+            // Non-whitespace after the & means it's not trailing.
+            last_amp = None;
+        }
+
+        i += 1;
+    }
+
+    last_amp
+}
+
 fn split_first_word(s: &str) -> (&str, &str) {
     let s = s.trim();
     if let Some(pos) = s.find(|c: char| c.is_whitespace()) {
@@ -1790,6 +1844,22 @@ deep
     fn fortran_ampersand_continuation() {
         let out = pp_with("x = FOO + &\n    BAR\n", &[("FOO", "1"), ("BAR", "2")]);
         assert!(out.contains("x = 1 + 2"), "got: {:?}", out.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ampersand_in_string_not_continued() {
+        // & inside a string literal must NOT trigger continuation.
+        let out = pp("x = 'hello &'\ny = 2\n");
+        assert!(out.contains("'hello &'"), "string corrupted, got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(out.contains("y = 2"), "next line missing, got: {:?}", out.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ampersand_in_comment_not_continued() {
+        // & after ! comment must NOT trigger continuation.
+        let out = pp("x = 1 ! comment &\ny = 2\n");
+        assert!(out.contains("! comment &"), "comment corrupted, got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(out.contains("y = 2"), "next line missing, got: {:?}", out.lines().collect::<Vec<_>>());
     }
 
     // ---- __DATE__ and __TIME__ ----
