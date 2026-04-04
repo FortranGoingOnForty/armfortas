@@ -153,19 +153,37 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable) {
     }
 }
 
+/// Extract the kind value from a KindSelector, defaulting if absent.
+fn extract_kind(sel: &Option<crate::ast::decl::KindSelector>, default: u8) -> u8 {
+    use crate::ast::decl::KindSelector;
+    use crate::ast::expr::Expr;
+    match sel {
+        Some(KindSelector::Expr(e)) | Some(KindSelector::Star(e)) => {
+            if let Expr::IntegerLiteral { text, .. } = &e.node {
+                text.parse().unwrap_or(default)
+            } else { default }
+        }
+        None => default,
+    }
+}
+
 /// Lower a Fortran type specifier to an IR type.
 fn lower_type_spec(ts: &TypeSpec) -> IrType {
     match ts {
-        TypeSpec::Integer(_) => IrType::Int(IntWidth::I32),
-        TypeSpec::Real(_) => IrType::Float(FloatWidth::F32),
+        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind(sel, 4)),
+        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind(sel, 4)),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
-        TypeSpec::Complex(_) => {
-            // Complex is a struct of two floats — simplified for now.
-            IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2)
+        TypeSpec::Complex(sel) => {
+            let fw = match extract_kind(sel, 4) {
+                8 => FloatWidth::F64,
+                _ => FloatWidth::F32,
+            };
+            IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
+        TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
         TypeSpec::Logical(_) => IrType::Bool,
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        _ => IrType::Int(IntWidth::I32), // fallback
+        _ => IrType::Int(IntWidth::I32), // fallback for derived types etc.
     }
 }
 
@@ -276,7 +294,14 @@ fn lower_expr(
                 (BinaryOp::Mul, IrType::Float(_)) => b.fmul(lhs, rhs),
                 (BinaryOp::Div, IrType::Int(_)) => b.idiv(lhs, rhs),
                 (BinaryOp::Div, IrType::Float(_)) => b.fdiv(lhs, rhs),
-                (BinaryOp::Pow, _) => b.fpow(lhs, rhs),
+                (BinaryOp::Pow, IrType::Float(_)) => b.fpow(lhs, rhs),
+                (BinaryOp::Pow, IrType::Int(_)) => {
+                    // Integer power: convert to float, fpow, convert back.
+                    let fl = b.int_to_float(lhs, FloatWidth::F64);
+                    let fr = b.int_to_float(rhs, FloatWidth::F64);
+                    let result = b.fpow(fl, fr);
+                    b.float_to_int(result, IntWidth::I32)
+                }
                 (BinaryOp::Eq, IrType::Int(_)) => b.icmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Eq, IrType::Float(_)) => b.fcmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Ne, IrType::Int(_)) => b.icmp(CmpOp::Ne, lhs, rhs),
