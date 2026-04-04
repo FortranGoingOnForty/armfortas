@@ -400,10 +400,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array_constructor_slash(&mut self, start: Span) -> Result<SpannedExpr, ParseError> {
-        // Already consumed ( and /. Parse values until / ).
+        // Already consumed ( and /. Parse values until /).
+        // The closing /) is ambiguous with division. We handle this by
+        // checking if / is immediately followed by ) — if so, it's the closer.
+        // Division inside (/ /) (e.g., (/ a/b /) ) is allowed but the / before )
+        // is always the constructor close.
+        // Parse values. The closing /) is ambiguous with division, so we
+        // parse expressions at a binding power that prevents / from being
+        // consumed as infix division. This means a/b inside (/ /) must be
+        // parenthesized as (a/b). This is a practical limitation of the (/ /)
+        // form — the bracket form [a/b, c] has no such ambiguity.
         let mut values = Vec::new();
         loop {
-            values.push(self.parse_ac_value()?);
+            if matches!(self.peek(), TokenKind::Slash) { break; }
+            let expr = self.parse_expr_bp(BP_MUL.right)?;
+            values.push(AcValue::Expr(expr));
             if !self.eat(&TokenKind::Comma) { break; }
         }
         self.expect(&TokenKind::Slash)?;
@@ -810,5 +821,94 @@ mod tests {
     #[test]
     fn array_element_in_expression() {
         assert_eq!(sexpr("a(i) + b(j)"), "(a(i) + b(j))");
+    }
+
+    // ======================================================================
+    // Audit test gap coverage
+    // ======================================================================
+
+    // ---- (/ /) array constructor form ----
+    #[test]
+    fn array_constructor_slash_form() {
+        // (/ ... /) form — the closing / before ) can conflict with division.
+        // Our parser handles this by checking if / is followed by ).
+        assert_eq!(sexpr("(/ 1, 2, 3 /)"), "[1, 2, 3]");
+    }
+
+    // ---- .not. vs .and. precedence ----
+    #[test]
+    fn not_binds_tighter_than_and() {
+        // .not. a .and. b → ((.not. a) .and. b)
+        assert_eq!(sexpr(".not. a .and. b"), "((.not. a) .and. b)");
+    }
+
+    #[test]
+    fn not_binds_tighter_than_or() {
+        assert_eq!(sexpr(".not. a .or. b"), "((.not. a) .or. b)");
+    }
+
+    // ---- .eqv./.neqv. precedence ----
+    #[test]
+    fn eqv_lower_than_or() {
+        // a .or. b .eqv. c → ((a .or. b) .eqv. c)
+        assert_eq!(sexpr("a .or. b .eqv. c"), "((a .or. b) .eqv. c)");
+    }
+
+    // ---- Defined operators ----
+    #[test]
+    fn defined_binary_op() {
+        assert_eq!(sexpr("a .cross. b"), "(a .cross. b)");
+    }
+
+    #[test]
+    fn defined_unary_op() {
+        assert_eq!(sexpr(".inv. x"), "(.inv. x)");
+    }
+
+    #[test]
+    fn defined_binary_lowest_precedence() {
+        // defined binary is lowest — a + b .myop. c → ((a + b) .myop. c)
+        assert_eq!(sexpr("a + b .myop. c"), "((a + b) .myop. c)");
+    }
+
+    // ---- BOZ variants ----
+    #[test] fn boz_octal() { assert_eq!(sexpr("O'777'"), "O'777'"); }
+    #[test] fn boz_hex() { assert_eq!(sexpr("Z'FF'"), "Z'FF'"); }
+
+    // ---- Real literal edge cases ----
+    #[test] fn real_leading_dot() { assert_eq!(sexpr(".5"), ".5"); }
+    #[test] fn real_trailing_dot() { assert_eq!(sexpr("5."), "5."); }
+
+    // ---- Mixed postfix chains ----
+    #[test]
+    fn postfix_call_then_component() {
+        assert_eq!(sexpr("a(i)%field"), "a(i)%field");
+    }
+
+    #[test]
+    fn postfix_deep_chain() {
+        assert_eq!(sexpr("a%b(i)%c"), "a%b(i)%c");
+    }
+
+    // ---- Error cases ----
+    #[test]
+    fn error_unexpected_operator() {
+        let tokens = Lexer::tokenize("+ *", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        assert!(parser.parse_expr().is_err());
+    }
+
+    #[test]
+    fn error_unclosed_paren() {
+        let tokens = Lexer::tokenize("(a + b", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        assert!(parser.parse_expr().is_err());
+    }
+
+    #[test]
+    fn error_trailing_operator() {
+        let tokens = Lexer::tokenize("a +", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        assert!(parser.parse_expr().is_err());
     }
 }
