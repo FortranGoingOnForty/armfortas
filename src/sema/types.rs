@@ -115,13 +115,13 @@ pub fn power_result_type(base: &FortranType, exponent: &FortranType) -> Option<F
         let kind = base.kind().unwrap_or(4).max(exponent.kind().unwrap_or(4));
         return Some(FortranType::Integer { kind });
     }
-    // Otherwise, promote base to at least real.
+    // Otherwise, promote base to at least real, then apply normal promotion with exponent.
     let promoted_base = if matches!(base, FortranType::Integer { .. }) {
         FortranType::Real { kind: base.kind().unwrap_or(4) }
     } else {
         base.clone()
     };
-    Some(promoted_base)
+    arithmetic_result_type(&promoted_base, exponent).or(Some(promoted_base))
 }
 
 /// Comparison operators always produce logical.
@@ -284,6 +284,16 @@ mod tests {
             &FortranType::Integer { kind: 4 },
         ).unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn int_power_complex() {
+        // integer ** complex → complex (base promoted to real, then real+complex → complex)
+        let result = power_result_type(
+            &FortranType::Integer { kind: 4 },
+            &FortranType::Complex { kind: 8 },
+        ).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 8 });
     }
 
     // ---- Comparison ----
