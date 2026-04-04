@@ -233,9 +233,8 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::Store(value, addr), IrType::Void)
     }
 
-    pub fn gep(&mut self, base: ValueId, indices: Vec<ValueId>) -> ValueId {
-        let ty = self.func.value_type(base).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-        self.emit(InstKind::GetElementPtr(base, indices), ty)
+    pub fn gep(&mut self, base: ValueId, indices: Vec<ValueId>, result_ty: IrType) -> ValueId {
+        self.emit(InstKind::GetElementPtr(base, indices), IrType::Ptr(Box::new(result_ty)))
     }
 
     // ---- Calls ----
