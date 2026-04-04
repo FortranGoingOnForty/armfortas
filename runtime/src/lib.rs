@@ -5,6 +5,7 @@
 //!
 //! Built as a static library (.a) linked into every produced binary.
 
+pub mod descriptor;
 mod io;
 mod mem;
 mod lifecycle;
