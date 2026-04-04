@@ -752,7 +752,7 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64
                     MachineOperand::Imm(chunk as i64),
                     MachineOperand::Shift(shift as u8),
                 ],
-                def: if first { Some(dest) } else { None },
+                def: Some(dest), // all steps (movz + movk) write to dest
             });
             first = false;
         }
