@@ -1022,9 +1022,16 @@ fn lower_expr(
     st: &SymbolTable,
 ) -> ValueId {
     match &expr.node {
-        Expr::IntegerLiteral { text, .. } => {
+        Expr::IntegerLiteral { text, kind, .. } => {
             let val: i64 = text.parse().unwrap_or(0);
-            b.const_i32(val as i32)
+            let is_64bit = kind.as_ref().map(|k| k == "8").unwrap_or(false)
+                || val > i32::MAX as i64
+                || val < i32::MIN as i64;
+            if is_64bit {
+                b.const_i64(val)
+            } else {
+                b.const_i32(val as i32)
+            }
         }
         Expr::RealLiteral { text, .. } => {
             let val: f64 = text.replace('d', "e").replace('D', "E").parse().unwrap_or(0.0);
