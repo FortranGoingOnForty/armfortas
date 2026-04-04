@@ -121,3 +121,29 @@ Minor issues accepted during audits that don't block forward progress. Fix if th
 - **Contiguous array checking**: The CONTIGUOUS attribute and non-contiguous array section passing are not validated. Rare in practice.
 
 - **SELECT TYPE validation**: SELECT TYPE requires type guard matching against the selector's declared type. Parser doesn't implement SELECT TYPE yet (noted in Sprint 9).
+
+## IR — Basic Construction (Sprint 15)
+
+- **No I128 for integer(16)**: `int_from_kind(16)` falls back to i32. Add I128 when needed.
+
+- **`value_type()` is O(n) linear scan**: Every call walks all params, block params, and instructions. Will need a value-type cache for large functions. Not a correctness issue.
+
+## IR — Complex Lowering (Sprint 16)
+
+- **ALLOCATE ignores shape arguments**: `RuntimeFunc::Allocate` called with zero args — no size computed from the allocation shape subscripts. Fix when allocatable codegen lands.
+
+- **Subroutine/function params hardcoded to Ptr(I32)**: Dummy argument types not extracted from declarations. Need symbol table lookup during lowering for correct calling convention.
+
+- **Function call return types hardcoded to i32**: `FuncRef::External` calls always typed i32. Need callee type resolution from symbol table.
+
+- **Module globals never referenced at use-site**: The `globals` HashMap is always empty. Module variables are emitted as globals but USE association doesn't populate the map for downstream access.
+
+- **Runtime-variable negative DO step defaults to positive comparison**: Constant negative steps correctly use `>=`, but runtime-determined step direction falls back to `<=`. Need a runtime sign-check branch.
+
+- **No derived type lowering**: `StructDef`/`ExtractField`/`InsertField` exist in IR but lowerer doesn't use them. Derived types fall through to i32.
+
+- **ASSOCIATE leaks bindings into outer scope**: Associate-name locals persist after END ASSOCIATE. Need scope save/restore.
+
+- **Integer literal truncation**: `i64` cast to `i32` regardless of kind. Should use kind to select `const_i32` vs `const_i64`.
+
+- **DoConcurrent, PointerAssignment, Read, and other I/O statements silently dropped**: Fall through to `_ => {}` catch-all. Add as needed.
