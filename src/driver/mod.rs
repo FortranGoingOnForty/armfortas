@@ -153,6 +153,24 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         asm_text.push('\n');
     }
 
+    // Emit _main entry point (must be in __TEXT section).
+    if let Some(user_func) = allocated.first() {
+        asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
+        asm_text.push_str(&format!("\
+.globl _main
+.p2align 2
+_main:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    bl _afs_program_init
+    bl _{0}
+    bl _afs_program_finalize
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+", user_func.name));
+    }
+
     if opts.emit_asm {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
@@ -213,7 +231,8 @@ fn link(obj: &Path, output: &Path) -> Result<(), String> {
             obj.to_str().unwrap(),
             &rt_path,
             "-lSystem",
-            &format!("-syslibroot{}", sysroot),
+            "-syslibroot",
+            &sysroot,
             "-e", "_main",
             "-o", output.to_str().unwrap(),
         ])
