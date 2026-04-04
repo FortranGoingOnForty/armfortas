@@ -1,0 +1,16 @@
+[workspace]
+members = [".", "afs-as"]
+resolver = "2"
+
+[package]
+name = "armfortas"
+version = "0.1.0"
+edition = "2021"
+description = "Bespoke ARM64 Fortran compiler"
+
+[[bin]]
+name = "armfortas"
+path = "src/main.rs"
+
+[dependencies]
+afs-as = { path = "afs-as" }
