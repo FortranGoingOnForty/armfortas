@@ -149,6 +149,9 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RParen)?;
             return Ok(if is_class { TypeSpec::ClassStar } else { TypeSpec::TypeStar });
         }
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!("expected type name, got {}", self.peek())));
+        }
         let name_tok = self.advance().clone();
         let name = name_tok.text;
         self.expect(&TokenKind::RParen)?;
@@ -209,13 +212,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_one_array_spec(&mut self) -> Result<ArraySpec, ParseError> {
-        // Assumed rank: (..)
-        if self.peek() == &TokenKind::DotOp("dot".into()) {
-            // Not quite right — need to check for ".." specifically.
-            // For now, handle the common cases.
+        // Assumed rank: (..) — F2018. The lexer produces two Dot tokens or
+        // a DotOp. We check for consecutive dots.
+        if self.peek_text() == ".." || self.peek_text() == "." {
+            // Try consuming .. as assumed rank.
+            let save = self.pos;
+            if self.peek_text() == ".." {
+                self.advance();
+                return Ok(ArraySpec::AssumedRank);
+            }
+            self.pos = save;
         }
 
-        // Deferred shape / assumed shape: (:)
+        // Bare colon (:) — either deferred shape (allocatable/pointer) or
+        // assumed shape (dummy argument). The distinction depends on context
+        // (allocatable attribute), so we emit Deferred and let sema reclassify
+        // to AssumedShape if needed.
         if self.peek() == &TokenKind::Colon {
             self.advance();
             return Ok(ArraySpec::Deferred);
@@ -333,6 +345,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entity_decl(&mut self) -> Result<EntityDecl, ParseError> {
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!("expected entity name, got {}", self.peek())));
+        }
         let name_tok = self.advance().clone();
         let name = name_tok.text;
 
@@ -376,9 +391,13 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         // Already consumed 'use'.
 
-        // Optional nature: use, intrinsic :: mod or use, non_intrinsic :: mod
+        // Handle: use :: mod, use, intrinsic :: mod, use, non_intrinsic :: mod
         let mut nature = UseNature::Normal;
-        if self.eat(&TokenKind::Comma) {
+
+        // F2003: use :: module_name (optional :: without nature)
+        if self.eat(&TokenKind::ColonColon) {
+            // Just :: with no nature — normal use with explicit ::
+        } else if self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
             if text == "intrinsic" {
                 self.advance();
