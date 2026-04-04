@@ -5,13 +5,13 @@
 
 use super::Spanned;
 use super::expr::SpannedExpr;
-use crate::lexer::Span;
 
 /// A spanned declaration.
 pub type SpannedDecl = Spanned<Decl>;
 
 /// A Fortran declaration.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Decl {
     /// Type declaration: `integer, allocatable :: x(:), y`
     TypeDecl {

@@ -3,10 +3,10 @@
 //! Represents all Fortran expression forms: literals, names, operators,
 //! function calls, array constructors, component access, and more.
 
-use crate::lexer::Span;
 
 /// A Fortran expression.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Expr {
     // ---- Literals ----
 
@@ -249,6 +249,7 @@ pub struct Argument {
 
 /// Array constructor value — either an expression or an implied-do loop.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum AcValue {
     Expr(SpannedExpr),
     ImpliedDo {

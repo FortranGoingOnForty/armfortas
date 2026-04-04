@@ -5,8 +5,7 @@
 
 use crate::ast::Spanned;
 use crate::ast::decl::*;
-use crate::ast::expr::SpannedExpr;
-use crate::lexer::{TokenKind, Span};
+use crate::lexer::TokenKind;
 use super::{Parser, ParseError};
 
 impl<'a> Parser<'a> {
@@ -29,7 +28,7 @@ impl<'a> Parser<'a> {
             "complex" => { self.advance(); Some(self.parse_kind_selector().map(TypeSpec::Complex)) }
             "doublecomplex" => { self.advance(); Some(Ok(TypeSpec::DoubleComplex)) }
             "logical" => { self.advance(); Some(self.parse_kind_selector().map(TypeSpec::Logical)) }
-            "character" => { self.advance(); Some(self.parse_char_selector().map(|cs| TypeSpec::Character(cs))) }
+            "character" => { self.advance(); Some(self.parse_char_selector().map(TypeSpec::Character)) }
             "type" => {
                 self.advance();
                 Some(self.parse_type_or_class_spec(false))

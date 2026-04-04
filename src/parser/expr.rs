@@ -7,7 +7,7 @@
 
 use crate::ast::Spanned;
 use crate::ast::expr::*;
-use crate::lexer::{TokenKind, Span, Position};
+use crate::lexer::{TokenKind, Span};
 use super::{Parser, ParseError};
 
 /// Binding power for Pratt parsing.
@@ -264,11 +264,9 @@ impl<'a> Parser<'a> {
         let tok = self.advance().clone();
         let lower = tok.text.to_lowercase();
         let value = lower.contains("true");
-        let kind = if let Some(pos) = lower.find("._") {
-            Some(lower[pos+2..lower.len()-0].trim_end_matches('.').to_string())
-        } else {
-            None
-        };
+        let kind = lower.find("._").map(|pos| {
+            lower[pos+2..].trim_end_matches('.').to_string()
+        });
         Ok(Spanned::new(Expr::LogicalLiteral { value, kind }, tok.span))
     }
 

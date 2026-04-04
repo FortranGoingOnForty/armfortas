@@ -7,9 +7,7 @@
 pub mod expr;
 pub mod decl;
 
-use crate::lexer::{Token, TokenKind, Span, Position};
-use crate::ast::Spanned;
-use crate::ast::expr::SpannedExpr;
+use crate::lexer::{Token, TokenKind, Span};
 
 use std::fmt;
 
