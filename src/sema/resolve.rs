@@ -275,13 +275,12 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     scope: st.current_scope(),
                 });
             }
-            ProgramUnit::Function { name, .. } => {
-                // Ignore duplicate if subprogram name already declared (e.g., as a variable).
-                // This is a name collision that sema will validate later.
+            ProgramUnit::Function { name, return_type, .. } => {
+                let ret_type_info = return_type.as_ref().map(type_spec_to_info);
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
-                    type_info: None,
+                    type_info: ret_type_info,
                     attrs: SymbolAttrs::default(),
                     defined_at: unit.span,
                     scope: st.current_scope(),
