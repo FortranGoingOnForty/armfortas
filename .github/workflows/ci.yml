@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+    branches: [trunk]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Unit tests
+        run: cargo test --workspace --lib
+
+      - name: Integration tests (afs-as vs system assembler)
+        run: cargo test -p afs-as --test verify_against_system_as
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
