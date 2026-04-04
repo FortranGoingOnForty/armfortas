@@ -514,6 +514,11 @@ impl Preprocessor {
     // ---- Macro expansion in source lines ----
 
     fn expand_macros(&self, line: &str, _filename: &str, _line_num: u32) -> String {
+        let expanding = std::collections::HashSet::new();
+        self.expand_macros_inner(line, &expanding)
+    }
+
+    fn expand_macros_inner(&self, line: &str, expanding: &std::collections::HashSet<String>) -> String {
         if self.defines.is_empty() {
             return line.to_string();
         }
@@ -537,12 +542,10 @@ impl Preprocessor {
                 while i < bytes.len() {
                     if bytes[i] == quote {
                         if i + 1 < bytes.len() && bytes[i + 1] == quote {
-                            // Doubled quote escape (Fortran style: '' or "").
                             result.push(quote as char);
                             result.push(quote as char);
                             i += 2;
                         } else {
-                            // End of string literal.
                             break;
                         }
                     } else {
@@ -565,20 +568,30 @@ impl Preprocessor {
                 }
                 let ident = &line[start..i];
 
+                // Skip if this macro is currently being expanded (blue paint).
+                if expanding.contains(ident) {
+                    result.push_str(ident);
+                    continue;
+                }
+
                 if let Some(def) = self.defines.get(ident) {
                     if def.is_function {
-                        // Try to expand function-like macro.
                         if i < bytes.len() && bytes[i] == b'(' {
                             if let Some((expanded, new_i)) = self.expand_function_macro(def, line, i) {
-                                result.push_str(&expanded);
+                                // Re-expand the result with this macro marked as expanding.
+                                let mut next_expanding = expanding.clone();
+                                next_expanding.insert(ident.to_string());
+                                result.push_str(&self.expand_macros_inner(&expanded, &next_expanding));
                                 i = new_i;
                                 continue;
                             }
                         }
-                        // No parens — not a function call, keep as-is.
                         result.push_str(ident);
                     } else {
-                        result.push_str(&def.body);
+                        // Re-expand object macro body with this macro marked as expanding.
+                        let mut next_expanding = expanding.clone();
+                        next_expanding.insert(ident.to_string());
+                        result.push_str(&self.expand_macros_inner(&def.body, &next_expanding));
                     }
                 } else {
                     result.push_str(ident);
@@ -868,11 +881,31 @@ mod tests {
 
     #[test]
     fn macro_expands_to_macro() {
+        // A expands to B, B expands to 42. Recursive expansion required.
         let out = pp("#define A B\n#define B 42\nx = A\n");
-        // A expands to B, but we don't recursively re-expand in the simple impl.
-        // This is acceptable — cpp doesn't recursively expand object macros either
-        // in a single pass unless specifically triggered.
-        assert!(out.contains("x = B") || out.contains("x = 42"));
+        assert!(out.contains("x = 42"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn recursive_expansion_three_levels() {
+        let out = pp("#define X Y\n#define Y Z\n#define Z 99\nval = X\n");
+        assert!(out.contains("val = 99"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn self_referencing_macro_stops() {
+        // A macro referencing itself must not infinite-loop.
+        // Blue paint: FOO is marked as expanding, so inner FOO is not re-expanded.
+        let out = pp("#define FOO FOO + 1\nx = FOO\n");
+        assert!(out.contains("x = FOO + 1"), "got: {:?}", out);
+    }
+
+    #[test]
+    fn mutual_recursion_stops() {
+        // A → B, B → A. Must not infinite-loop.
+        let out = pp("#define A B\n#define B A\nx = A\n");
+        // A→B→A(blocked), so result is "A"
+        assert!(out.contains("x = A"), "got: {:?}", out);
     }
 
     // ---- Function-like macros ----
