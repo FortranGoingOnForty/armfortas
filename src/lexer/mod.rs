@@ -1,11 +1,17 @@
-//! Fortran tokenizer (free-form).
+//! Fortran tokenizer.
 //!
-//! Tokenizes preprocessed Fortran source into a stream of tokens.
+//! Supports both free-form (F90+) and fixed-form (F77) source.
 //! Handles continuation lines, string literals with doubled-quote escapes,
 //! numeric literals with kind suffixes, BOZ constants, dot-operators,
 //! and Fortran's context-sensitive keywords (lexed as identifiers).
+//!
+//! Fixed-form adds: column semantics, whitespace insensitivity,
+//! Hollerith constants, tab-form extension, and DO/assignment disambiguation.
+
+pub mod fixed;
 
 use std::fmt;
+use std::path::Path;
 
 // ---- Token types ----
 
@@ -317,7 +323,39 @@ impl fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-// ---- Lexer ----
+// ---- Source form ----
+
+/// Fortran source form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceForm {
+    FreeForm,
+    FixedForm,
+}
+
+/// Detect source form from filename extension.
+pub fn detect_source_form(filename: &str) -> SourceForm {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "f90" | "f95" | "f03" | "f08" | "f18" | "f23" => SourceForm::FreeForm,
+        "f" | "for" | "ftn" | "fpp" => SourceForm::FixedForm,
+        _ => SourceForm::FreeForm, // default to free-form
+    }
+}
+
+/// Tokenize Fortran source, automatically selecting the appropriate lexer.
+pub fn tokenize(src: &str, file_id: u32, form: SourceForm) -> Result<Vec<Token>, LexError> {
+    match form {
+        SourceForm::FreeForm => Lexer::tokenize(src, file_id),
+        SourceForm::FixedForm => fixed::tokenize_fixed(src, file_id),
+    }
+}
+
+// ---- Free-form lexer ----
 
 /// Fortran free-form lexer.
 pub struct Lexer<'a> {
