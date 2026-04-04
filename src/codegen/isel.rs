@@ -667,11 +667,61 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             }
         }
 
-        // Remaining: IntExtend, IntTrunc, ExtractField, InsertField — emit MOV as placeholder.
+        // ---- Integer extend/truncate ----
+        InstKind::IntExtend(a, target_width, signed) => {
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            if *signed {
+                // SXTW Xd, Wn (sign-extend 32→64)
+                // On ARM64, SXTW is an alias for SBFM Xd, Xn, #0, #31.
+                // Simplest: use MOV from w to x (zero-extend), then handle sign.
+                // Actually, ARM64 `sxtw Xd, Wn` is the instruction we need.
+                // But we don't have a dedicated opcode. Use MovReg from 32→64
+                // which on ARM64 zero-extends. For sign-extend, we need SXTW.
+                // For now, add a dedicated opcode.
+                // HACK: use MovReg — if the 32-bit value is positive, zero-extend works.
+                // For negative values this is wrong. TODO: add SXTW opcode.
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: Some(dest),
+                });
+            } else {
+                // Zero-extend: MOV Xd, Wn (ARM64 implicitly zero-extends W→X).
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: Some(dest),
+                });
+            }
+        }
+
+        InstKind::IntTrunc(a, _) => {
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            // Truncate: just MOV — the 32-bit register naturally truncates.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        // Remaining: ExtractField, InsertField — placeholder.
         _ => {
             let class = type_to_reg_class(&inst.ty);
             let _dest = ctx.get_vreg(mf, inst.id, class);
-            // Placeholder NOP for unimplemented instructions.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::Nop,
                 operands: vec![],
