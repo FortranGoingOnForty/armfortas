@@ -17,6 +17,7 @@ pub enum ProgramUnit {
     Program {
         name: Option<String>,
         uses: Vec<SpannedDecl>,
+        imports: Vec<ImportStmt>,
         implicit: Vec<SpannedDecl>,
         decls: Vec<SpannedDecl>,
         body: Vec<SpannedStmt>,
@@ -26,6 +27,7 @@ pub enum ProgramUnit {
     Module {
         name: String,
         uses: Vec<SpannedDecl>,
+        imports: Vec<ImportStmt>,
         implicit: Vec<SpannedDecl>,
         decls: Vec<SpannedDecl>,
         contains: Vec<SpannedUnit>,
@@ -46,6 +48,7 @@ pub enum ProgramUnit {
         bind: Option<BindInfo>,
         prefix: Vec<Prefix>,
         uses: Vec<SpannedDecl>,
+        imports: Vec<ImportStmt>,
         implicit: Vec<SpannedDecl>,
         decls: Vec<SpannedDecl>,
         body: Vec<SpannedStmt>,
@@ -60,6 +63,7 @@ pub enum ProgramUnit {
         bind: Option<BindInfo>,
         prefix: Vec<Prefix>,
         uses: Vec<SpannedDecl>,
+        imports: Vec<ImportStmt>,
         implicit: Vec<SpannedDecl>,
         decls: Vec<SpannedDecl>,
         body: Vec<SpannedStmt>,

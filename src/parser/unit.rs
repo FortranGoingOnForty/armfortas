@@ -103,21 +103,21 @@ impl<'a> Parser<'a> {
         } else { None };
         self.skip_newlines();
 
-        let (uses, implicit, decls, body) = self.parse_unit_body(&["program"])?;
+        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["program"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("program")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Program { name, uses, implicit, decls, body, contains }, span))
+        Ok(Spanned::new(ProgramUnit::Program { name, uses, imports, implicit, decls, body, contains }, span))
     }
 
     fn parse_implicit_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         // No PROGRAM keyword — implicit main program.
-        let (uses, implicit, decls, body) = self.parse_unit_body(&["program"])?;
+        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["program"])?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Program {
-            name: None, uses, implicit, decls, body, contains: Vec::new(),
+            name: None, uses, imports, implicit, decls, body, contains: Vec::new(),
         }, span))
     }
 
@@ -126,12 +126,12 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, implicit, decls, _body) = self.parse_unit_body(&["module"])?;
+        let (uses, imports, implicit, decls, _body) = self.parse_unit_body(&["module"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("module")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Module { name, uses, implicit, decls, contains }, span))
+        Ok(Spanned::new(ProgramUnit::Module { name, uses, imports, implicit, decls, contains }, span))
     }
 
     fn parse_submodule(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
@@ -145,7 +145,7 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, _implicit, decls, _body) = self.parse_unit_body(&["submodule"])?;
+        let (uses, _imports, _implicit, decls, _body) = self.parse_unit_body(&["submodule"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("submodule")?;
 
@@ -166,13 +166,13 @@ impl<'a> Parser<'a> {
         let bind = self.try_parse_bind()?;
         self.skip_newlines();
 
-        let (uses, implicit, decls, body) = self.parse_unit_body(&["subroutine"])?;
+        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["subroutine"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("subroutine")?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Subroutine {
-            name, args, bind, prefix, uses, implicit, decls, body, contains,
+            name, args, bind, prefix, uses, imports, implicit, decls, body, contains,
         }, span))
     }
 
@@ -201,13 +201,13 @@ impl<'a> Parser<'a> {
         let bind = self.try_parse_bind()?;
         self.skip_newlines();
 
-        let (uses, implicit, decls, body) = self.parse_unit_body(&["function"])?;
+        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["function"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("function")?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Function {
-            name, args, result, return_type, bind, prefix, uses, implicit, decls, body, contains,
+            name, args, result, return_type, bind, prefix, uses, imports, implicit, decls, body, contains,
         }, span))
     }
 
@@ -219,7 +219,7 @@ impl<'a> Parser<'a> {
         } else { None };
         self.skip_newlines();
 
-        let (uses, _implicit, decls, _body) = self.parse_unit_body(&["blockdata", "block"])?;
+        let (uses, _imports, _implicit, decls, _body) = self.parse_unit_body(&["blockdata", "block"])?;
         // End block data.
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
@@ -293,8 +293,10 @@ impl<'a> Parser<'a> {
 
     /// Parse the body of a program unit: uses, implicit, declarations, then executable statements.
     #[allow(clippy::type_complexity)]
-    fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>), ParseError> {
+    #[allow(clippy::type_complexity)]
+    fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>), ParseError> {
         let mut uses = Vec::new();
+        let mut imports = Vec::new();
         let mut implicit = Vec::new();
         let mut decls = Vec::new();
         let mut body = Vec::new();
@@ -305,6 +307,15 @@ impl<'a> Parser<'a> {
             if self.peek_text().eq_ignore_ascii_case("use") {
                 self.advance();
                 uses.push(self.parse_use_stmt()?);
+            } else { break; }
+        }
+
+        // Phase 1.5: IMPORT statements.
+        loop {
+            self.skip_newlines();
+            if self.peek_text().eq_ignore_ascii_case("import") {
+                self.advance();
+                imports.push(self.parse_import()?);
             } else { break; }
         }
 
@@ -348,7 +359,7 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
 
-        Ok((uses, implicit, decls, body))
+        Ok((uses, imports, implicit, decls, body))
     }
 
     fn parse_contains_section(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -373,12 +384,12 @@ impl<'a> Parser<'a> {
                 } else { String::new() };
                 // Bare "end" or "end program/module/submodule" closes the parent.
                 if next.is_empty() || self.at_stmt_end()
-                    || matches!(next.as_str(), "program" | "module" | "submodule")
+                    || matches!(next.as_str(), "program" | "module" | "submodule" | "subroutine" | "function")
                 {
                     break;
                 }
             }
-            if matches!(text.as_str(), "endprogram" | "endmodule" | "endsubmodule") {
+            if matches!(text.as_str(), "endprogram" | "endmodule" | "endsubmodule" | "endsubroutine" | "endfunction") {
                 break;
             }
             units.push(self.parse_program_unit()?);
