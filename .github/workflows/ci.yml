@@ -101,3 +101,73 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p afs-as --test hello_world
+
+  test-afs-as-cli:
+    name: "Tests: afs-as cli smoke"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test cli_smoke
+
+  test-afs-as-diagnostics:
+    name: "Tests: afs-as diagnostic snapshots"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test diagnostic_snapshots
+
+  test-afs-as-clang-dashboard:
+    name: "Tests: afs-as clang probe dashboard"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test clang_probe_dashboard
+
+  test-afs-as-generated-stress:
+    name: "Tests: afs-as generated stress"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test generated_stress
+
+  test-afs-as-differential-fuzz:
+    name: "Tests: afs-as differential fuzz"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test differential_fuzz
+
+  test-afs-as-malformed-mutation:
+    name: "Tests: afs-as malformed mutation"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test malformed_mutation
+
+  test-afs-as-perf:
+    name: "Tests: afs-as performance sanity"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p afs-as --test perf_sanity
