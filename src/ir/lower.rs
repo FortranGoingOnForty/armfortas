@@ -510,14 +510,11 @@ fn lower_string_expr(
                     }
                     CharKind::Deferred => {
                         // Load data ptr (offset 0) and len (offset 8) from StringDescriptor.
+                        // StringDescriptor layout: [data(8), len(8), capacity(8), flags(4)]
                         let ptr = b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        // For len at offset 8, we'd need a GEP. For now, use a second load
-                        // with manual offset. This is a simplification — proper struct access
-                        // would use ExtractField or GEP with field index.
-                        // The StringDescriptor layout: [data(8), len(8), capacity(8), flags(4)]
-                        // Load len from addr + 8 bytes.
+                        // GEP with byte offset: use Ptr<i8> result so elem_size=1.
                         let eight = b.const_i64(8);
-                        let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I64));
+                        let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I8));
                         let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
                         (ptr, len)
                     }
