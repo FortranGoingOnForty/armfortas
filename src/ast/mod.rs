@@ -7,6 +7,7 @@
 pub mod expr;
 pub mod decl;
 pub mod stmt;
+pub mod unit;
 
 use crate::lexer::Span;
 
