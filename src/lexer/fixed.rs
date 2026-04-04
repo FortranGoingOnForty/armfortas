@@ -696,10 +696,17 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
         while i < lines.len() {
             let next = lines[i];
 
-            // Blank lines between continuations: skip them (F77 allows this).
+            // Blank lines between continuations: skip them only if the line
+            // after the blank is actually a continuation. Otherwise, the blank
+            // terminates the statement and should be emitted by the outer loop.
             if next.trim().is_empty() {
-                i += 1;
-                continue;
+                // Peek ahead: is the line after this blank a continuation?
+                let lookahead = i + 1;
+                if lookahead < lines.len() && is_continuation_line(lines[lookahead]) {
+                    i += 1;
+                    continue;
+                }
+                break; // blank line ends the statement
             }
 
             let next_first = next.as_bytes().first().copied().unwrap_or(0);
