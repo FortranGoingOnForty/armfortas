@@ -1,3 +1,6 @@
+// Modules under active development — suppress dead_code warnings until wired up.
+#![allow(dead_code)]
+
 use std::env;
 use std::process;
 
