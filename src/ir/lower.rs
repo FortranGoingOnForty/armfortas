@@ -749,21 +749,31 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         b.branch(bb_check, vec![]);
 
         // Check: i <= end for positive step, i >= end for negative step.
-        // Determine step direction: if step is a known negative constant, use Ge.
-        // For runtime-determined step, compare step against 0.
         b.set_block(bb_check);
         let cur = b.load(var_addr);
 
-        let step_is_negative = if let Some(step_expr) = step {
-            // Try to determine step sign at compile time.
-            eval_const_int(step_expr).map(|v| v < 0).unwrap_or(false)
+        let const_step = step.as_ref().and_then(eval_const_int);
+        if let Some(sv) = const_step {
+            // Compile-time known step direction.
+            let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+            let cond = b.icmp(cmp_op, cur, end_val);
+            b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
         } else {
-            false
-        };
+            // Runtime step: check sign and use appropriate comparison.
+            let zero = b.const_i32(0);
+            let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+            let bb_neg_check = b.create_block("do_neg_check");
+            let bb_pos_check = b.create_block("do_pos_check");
+            b.cond_branch(step_neg, bb_neg_check, vec![], bb_pos_check, vec![]);
 
-        let cmp_op = if step_is_negative { CmpOp::Ge } else { CmpOp::Le };
-        let cond = b.icmp(cmp_op, cur, end_val);
-        b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
+            b.set_block(bb_neg_check);
+            let cond_neg = b.icmp(CmpOp::Ge, cur, end_val);
+            b.cond_branch(cond_neg, bb_body, vec![], bb_exit, vec![]);
+
+            b.set_block(bb_pos_check);
+            let cond_pos = b.icmp(CmpOp::Le, cur, end_val);
+            b.cond_branch(cond_pos, bb_body, vec![], bb_exit, vec![]);
+        }
 
         // Body.
         ctx.push_loop(name.clone(), bb_incr, bb_exit);
