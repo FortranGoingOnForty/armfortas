@@ -95,6 +95,7 @@ pub enum ArmOpcode {
 
     // ---- Special ----
     Nop,
+    Brk,         // BRK #imm16  (debug trap)
 }
 
 /// ARM64 condition codes.
@@ -134,15 +135,15 @@ pub enum MachineOperand {
 /// Physical register reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysReg {
-    Gp(u8),     // X0-X30, XZR(31), SP(31)
+    Gp(u8),     // X0-X30
     Fp(u8),     // D0-D31 / S0-S31
+    Sp,         // Stack pointer (encoding 31 in SP context)
+    Xzr,        // Zero register (encoding 31 in non-SP context)
 }
 
 impl PhysReg {
-    pub const SP: PhysReg = PhysReg::Gp(31);
     pub const FP: PhysReg = PhysReg::Gp(29);
     pub const LR: PhysReg = PhysReg::Gp(30);
-    pub const XZR: PhysReg = PhysReg::Gp(31);
 }
 
 /// Machine block identifier.
