@@ -43,8 +43,34 @@ pub fn select_function(func: &Function) -> MachineFunction {
         }
     }
 
+    // Phase 2.5: handle incoming parameters.
+    // Create a vreg for each param and map its ValueId.
+    // The physical register save happens after the prologue.
+    let mut param_info: Vec<(ValueId, VRegId)> = Vec::new();
+    for param in &func.params {
+        let class = type_to_reg_class(&param.ty);
+        let vreg = mf.new_vreg(class);
+        ctx.value_map.insert(param.id, vreg);
+        param_info.push((param.id, vreg));
+    }
+
     // Phase 3: emit prologue in entry block.
     emit_prologue(&mut mf, MBlockId(0));
+
+    // Phase 3.5: move incoming argument registers into param vregs.
+    // The regalloc will then spill these to stack as needed.
+    for (i, (_param_id, vreg)) in param_info.iter().enumerate() {
+        if i < 8 {
+            mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(*vreg),
+                    MachineOperand::PhysReg(PhysReg::Gp(i as u8)),
+                ],
+                def: Some(*vreg),
+            });
+        }
+    }
 
     // Phase 4: select instructions for each block.
     for block in &func.blocks {
