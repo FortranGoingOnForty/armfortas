@@ -12,7 +12,11 @@ use super::types::*;
 use super::inst::*;
 use super::builder::FuncBuilder;
 
+use crate::ast::decl::ArraySpec;
 use std::collections::HashMap;
+
+/// Maximum array rank (Fortran allows up to 15).
+const MAX_RANK: usize = 15;
 
 /// Loop context for EXIT/CYCLE targeting.
 struct LoopScope {
@@ -21,18 +25,35 @@ struct LoopScope {
     exit: BlockId,    // EXIT target
 }
 
+/// Info about a local variable.
+#[derive(Clone)]
+struct LocalInfo {
+    addr: ValueId,
+    ty: IrType,
+    /// For arrays: (lower_bound, size) per dimension.
+    /// Empty for scalars.
+    dims: Vec<(i64, i64)>,
+}
+
 /// Lowering context — tracks locals, loop scopes, and symbol table.
 struct LowerCtx<'a> {
-    locals: HashMap<String, (ValueId, IrType)>,
+    locals: HashMap<String, LocalInfo>,
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
-    /// Globals from module lowering (name → index in Module::globals).
     globals: &'a HashMap<String, (usize, IrType)>,
 }
 
 impl<'a> LowerCtx<'a> {
     fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>) -> Self {
         Self { locals: HashMap::new(), loops: Vec::new(), st, globals }
+    }
+
+    fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![] });
+    }
+
+    fn insert_array(&mut self, name: String, addr: ValueId, ty: IrType, dims: Vec<(i64, i64)>) {
+        self.locals.insert(name, LocalInfo { addr, ty, dims });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -96,7 +117,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut ctx = LowerCtx::new(st, globals);
 
             for p in &func.params {
-                ctx.locals.insert(p.name.to_lowercase(), (p.id, p.ty.clone()));
+                ctx.insert_scalar(p.name.to_lowercase(), p.id, p.ty.clone());
             }
 
             {
@@ -125,14 +146,14 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut ctx = LowerCtx::new(st, globals);
 
             for p in &func.params {
-                ctx.locals.insert(p.name.to_lowercase(), (p.id, p.ty.clone()));
+                ctx.insert_scalar(p.name.to_lowercase(), p.id, p.ty.clone());
             }
 
             {
                 let mut b = FuncBuilder::new(&mut func);
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
                 let result_addr = b.alloca(ret_ty.clone());
-                ctx.locals.insert(result_name, (result_addr, ret_ty.clone()));
+                ctx.insert_scalar(result_name, result_addr, ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -164,19 +185,68 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
     }
 }
 
-/// Allocate local variables from declarations.
-fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, (ValueId, IrType)>, decls: &[crate::ast::decl::SpannedDecl]) {
+/// Allocate local variables from declarations. Handles both scalars and arrays.
+fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, decls: &[crate::ast::decl::SpannedDecl]) {
+    use crate::ast::decl::Attribute;
     for decl in decls {
-        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
-            let ir_ty = lower_type_spec(type_spec);
+        if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
+            let elem_ty = lower_type_spec(type_spec);
+
+            // Check for DIMENSION attribute on the declaration.
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
+            });
+
             for entity in entities {
                 let key = entity.name.to_lowercase();
-                locals.entry(key).or_insert_with(|| {
-                    let addr = b.alloca(ir_ty.clone());
-                    (addr, ir_ty.clone())
-                });
+                if locals.contains_key(&key) { continue; }
+
+                // Use entity-level array spec, or fall back to attribute-level DIMENSION.
+                let array_spec = entity.array_spec.as_ref().or(attr_dims);
+
+                if let Some(specs) = array_spec {
+                    // Array variable.
+                    let dims = extract_array_dims(specs);
+                    let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
+                    let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                    let addr = b.alloca(arr_ty);
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims });
+                } else {
+                    // Scalar variable.
+                    let addr = b.alloca(elem_ty.clone());
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![] });
+                }
             }
         }
+    }
+}
+
+/// Extract compile-time array dimensions from array spec.
+/// Returns (lower_bound, extent) pairs. Runtime expressions default to (1, 1).
+fn extract_array_dims(specs: &[ArraySpec]) -> Vec<(i64, i64)> {
+    specs.iter().map(|spec| {
+        match spec {
+            ArraySpec::Explicit { lower, upper } => {
+                let lo = lower.as_ref().and_then(eval_const_int).unwrap_or(1);
+                let hi = eval_const_int(upper).unwrap_or(1);
+                (lo, hi - lo + 1)
+            }
+            ArraySpec::AssumedShape { .. } => (1, 0), // size unknown at compile time
+            ArraySpec::Deferred => (1, 0),
+            ArraySpec::AssumedSize { .. } => (1, 0),
+            ArraySpec::AssumedRank => (1, 0),
+        }
+    }).collect()
+}
+
+/// Try to evaluate a constant integer expression at compile time.
+fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => text.parse().ok(),
+        Expr::UnaryOp { op: UnaryOp::Minus, operand } => {
+            eval_const_int(operand).map(|v| -v)
+        }
+        _ => None,
     }
 }
 
@@ -242,11 +312,25 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } => {
             let val = lower_expr(b, &ctx.locals, value, ctx.st);
-            if let Expr::Name { name } = &target.node {
-                let key = name.to_lowercase();
-                if let Some((addr, _ty)) = ctx.locals.get(&key) {
-                    b.store(val, *addr);
+            match &target.node {
+                Expr::Name { name } => {
+                    let key = name.to_lowercase();
+                    if let Some(info) = ctx.locals.get(&key) {
+                        b.store(val, info.addr);
+                    }
                 }
+                Expr::FunctionCall { callee, args } => {
+                    // Array element assignment: a(i) = val
+                    if let Expr::Name { name } = &callee.node {
+                        let key = name.to_lowercase();
+                        if let Some(info) = ctx.locals.get(&key).cloned() {
+                            if !info.dims.is_empty() {
+                                lower_array_store(b, &ctx.locals, &info, args, val, ctx.st);
+                            }
+                        }
+                    }
+                }
+                _ => {} // component access etc. deferred
             }
         }
 
@@ -364,10 +448,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             for item in items {
                 let base_name = extract_base_name(item);
                 if let Some(name) = base_name {
-                    if let Some((addr, _ty)) = ctx.locals.get(&name.to_lowercase()) {
-                        // Runtime call: allocate and store pointer.
+                    if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
                         let ptr = b.runtime_call(RuntimeFunc::Allocate, vec![], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        b.store(ptr, *addr);
+                        b.store(ptr, info.addr);
                     }
                 }
             }
@@ -377,8 +460,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             for item in items {
                 let base_name = extract_base_name(item);
                 if let Some(name) = base_name {
-                    if let Some((addr, _ty)) = ctx.locals.get(&name.to_lowercase()) {
-                        let ptr = b.load(*addr);
+                    if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
+                        let ptr = b.load(info.addr);
                         b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
                     }
                 }
@@ -396,7 +479,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), (addr, ty));
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![] });
             }
             lower_stmts(b, ctx, body);
         }
@@ -484,9 +567,9 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
     if let (Some(var_name), Some(start_expr), Some(end_expr)) = (var, start, end) {
         // Counted DO loop.
         let key = var_name.to_lowercase();
-        let var_addr = ctx.locals.get(&key).map(|(a, _)| *a).unwrap_or_else(|| {
+        let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), (addr, IrType::Int(IntWidth::I32)));
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![] });
             addr
         });
 
@@ -638,6 +721,102 @@ fn lower_select_case(
     b.set_block(bb_end);
 }
 
+/// Lower an array element access: compute flat offset from subscripts, GEP, load.
+/// Fortran column-major: a(i, j) in a(m, n) → offset = (i - lower1) + (j - lower2) * m
+fn lower_array_element(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> ValueId {
+    // Compute flat index from subscripts.
+    let mut flat_offset: Option<ValueId> = None;
+    let mut stride: i64 = 1;
+
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let subscript = match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
+            _ => b.const_i32(0),
+        };
+
+        let (lower, extent) = if dim_idx < info.dims.len() {
+            info.dims[dim_idx]
+        } else {
+            (1, 1)
+        };
+
+        // offset_dim = (subscript - lower) * stride
+        let lower_val = b.const_i32(lower as i32);
+        let adjusted = b.isub(subscript, lower_val);
+
+        let dim_offset = if stride == 1 {
+            adjusted
+        } else {
+            let stride_val = b.const_i32(stride as i32);
+            b.imul(adjusted, stride_val)
+        };
+
+        flat_offset = Some(match flat_offset {
+            Some(prev) => b.iadd(prev, dim_offset),
+            None => dim_offset,
+        });
+
+        stride *= extent;
+    }
+
+    let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
+    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    b.load(elem_ptr)
+}
+
+/// Lower an array element store: compute flat offset, GEP, store.
+fn lower_array_store(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    value: ValueId,
+    st: &SymbolTable,
+) {
+    let mut flat_offset: Option<ValueId> = None;
+    let mut stride: i64 = 1;
+
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let subscript = match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
+            _ => b.const_i32(0),
+        };
+
+        let (lower, extent) = if dim_idx < info.dims.len() {
+            info.dims[dim_idx]
+        } else {
+            (1, 1)
+        };
+
+        let lower_val = b.const_i32(lower as i32);
+        let adjusted = b.isub(subscript, lower_val);
+
+        let dim_offset = if stride == 1 {
+            adjusted
+        } else {
+            let stride_val = b.const_i32(stride as i32);
+            b.imul(adjusted, stride_val)
+        };
+
+        flat_offset = Some(match flat_offset {
+            Some(prev) => b.iadd(prev, dim_offset),
+            None => dim_offset,
+        });
+
+        stride *= extent;
+    }
+
+    let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
+    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    b.store(value, elem_ptr);
+}
+
 /// Extract base variable name from an expression.
 fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
     match &expr.node {
@@ -652,15 +831,15 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
 fn lower_arg_by_ref(
     b: &mut FuncBuilder,
-    locals: &HashMap<String, (ValueId, IrType)>,
+    locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
     // If it's a simple name, pass its existing address.
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
-        if let Some((addr, _)) = locals.get(&key) {
-            return *addr;
+        if let Some(info) = locals.get(&key) {
+            return info.addr;
         }
     }
     // Otherwise, evaluate and store to a temp.
@@ -675,7 +854,7 @@ fn lower_arg_by_ref(
 #[allow(clippy::only_used_in_recursion)]
 fn lower_expr(
     b: &mut FuncBuilder,
-    locals: &HashMap<String, (ValueId, IrType)>,
+    locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
@@ -701,11 +880,15 @@ fn lower_expr(
 
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            if let Some((addr, _ty)) = locals.get(&key) {
-                b.load(*addr)
+            if let Some(info) = locals.get(&key) {
+                if info.dims.is_empty() {
+                    b.load(info.addr)
+                } else {
+                    // Array name without subscripts — return the base address.
+                    info.addr
+                }
             } else {
-                // Implicit or unknown — generate undef.
-                b.const_i32(0)
+                b.const_i32(0) // implicit or unknown
             }
         }
 
@@ -764,15 +947,25 @@ fn lower_expr(
         Expr::ParenExpr { inner } => lower_expr(b, locals, inner, st),
 
         Expr::FunctionCall { callee, args } => {
-            // Could be intrinsic, user function, or array access.
             if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+
+                // Check if this is an array element access.
+                if let Some(info) = locals.get(&key) {
+                    if !info.dims.is_empty() {
+                        // Array element: compute flat offset and load.
+                        return lower_array_element(b, locals, info, args, st);
+                    }
+                }
+
+                // Otherwise, function/intrinsic call.
                 let arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
                         _ => b.const_i32(0),
                     }
                 }).collect();
-                let ret_ty = IrType::Int(IntWidth::I32); // default, should use type info
+                let ret_ty = IrType::Int(IntWidth::I32); // default
                 b.call(FuncRef::External(name.clone()), arg_vals, ret_ty)
             } else {
                 b.const_i32(0)
@@ -1129,6 +1322,66 @@ end program
         assert!(ir.contains("iadd"));
         assert!(ir.contains("alloca")); // temp for expression result
         assert!(ir.contains("call @foo("));
+    }
+
+    // ---- Arrays ----
+
+    #[test]
+    fn lower_array_declaration() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: a(10)
+  a(1) = 42
+end program
+");
+        // Should alloca an array of 10 i32, then GEP + store.
+        assert!(ir.contains("[i32 x 10]"), "expected array alloca in:\n{}", ir);
+        assert!(ir.contains("gep"), "expected GEP in:\n{}", ir);
+    }
+
+    #[test]
+    fn lower_array_read() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: a(10), x
+  a(3) = 99
+  x = a(3)
+end program
+");
+        // Reading array element: GEP + load.
+        let gep_count = ir.matches("gep").count();
+        assert!(gep_count >= 2, "expected at least 2 GEPs (write + read), got {} in:\n{}", gep_count, ir);
+    }
+
+    #[test]
+    fn lower_2d_array() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: mat(3, 4)
+  mat(2, 3) = 42
+end program
+");
+        // 2D array: alloca [i32 x 12], column-major offset.
+        assert!(ir.contains("[i32 x 12]"), "expected 3*4=12 element array in:\n{}", ir);
+        assert!(ir.contains("gep"), "expected GEP in:\n{}", ir);
+    }
+
+    #[test]
+    fn lower_array_in_loop() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: a(10), i
+  do i = 1, 10
+    a(i) = i * 2
+  end do
+end program
+");
+        assert!(ir.contains("gep"));
+        assert!(ir.contains("imul"));
     }
 
     #[test]
