@@ -133,7 +133,14 @@ impl SpannedExpr {
             Expr::ArrayConstructor { values, type_spec } => {
                 let vals: Vec<String> = values.iter().map(|v| match v {
                     AcValue::Expr(e) => e.to_sexpr(),
-                    AcValue::ImpliedDo { .. } => "(implied-do)".into(),
+                    AcValue::ImpliedDo { values, var, start, end, step } => {
+                        let vals: Vec<String> = values.iter().map(|v| match v {
+                            AcValue::Expr(e) => e.to_sexpr(),
+                            AcValue::ImpliedDo { .. } => "(nested-implied-do)".into(),
+                        }).collect();
+                        let step_str = step.as_ref().map_or(String::new(), |s| format!(", {}", s.to_sexpr()));
+                        format!("({}, {}={}, {}{})", vals.join(", "), var, start.to_sexpr(), end.to_sexpr(), step_str)
+                    }
                 }).collect();
                 if let Some(ts) = type_spec {
                     format!("[{} :: {}]", ts, vals.join(", "))

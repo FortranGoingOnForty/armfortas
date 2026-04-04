@@ -418,10 +418,57 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_ac_value(&mut self) -> Result<AcValue, ParseError> {
-        // Could be an implied-do: (expr, var=start,end[,step])
-        // For now, just parse as expression. Implied-do support comes later.
+        // Check for implied-do: (value-list, var=start,end[,step])
+        if self.peek() == &TokenKind::LParen {
+            // Save position — we might need to backtrack if it's not an implied-do.
+            let save_pos = self.pos;
+            if let Ok(implied) = self.try_parse_implied_do() {
+                return Ok(implied);
+            }
+            // Not an implied-do — restore and parse as expression.
+            self.pos = save_pos;
+        }
+
         let expr = self.parse_expr()?;
         Ok(AcValue::Expr(expr))
+    }
+
+    fn try_parse_implied_do(&mut self) -> Result<AcValue, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+
+        // Parse value list (one or more expressions separated by commas).
+        let mut values = vec![self.parse_ac_value()?];
+        while self.eat(&TokenKind::Comma) {
+            // Check if this is the var=start part.
+            // Pattern: identifier = expr , expr [, expr]
+            if self.peek() == &TokenKind::Identifier {
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
+                    let var_tok = self.advance().clone();
+                    self.advance(); // skip =
+                    let start = self.parse_expr()?;
+                    self.expect(&TokenKind::Comma)?;
+                    let end = self.parse_expr()?;
+                    let step = if self.eat(&TokenKind::Comma) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::RParen)?;
+                    return Ok(AcValue::ImpliedDo {
+                        values,
+                        var: var_tok.text,
+                        start,
+                        end,
+                        step,
+                    });
+                }
+            }
+            values.push(self.parse_ac_value()?);
+        }
+
+        // If we get here, it wasn't an implied-do — fail so caller backtracks.
+        Err(self.error("expected implied-do variable assignment".into()))
     }
 
     // ---- Helpers ----
@@ -662,6 +709,21 @@ mod tests {
     #[test]
     fn array_constructor_typed() {
         assert_eq!(sexpr("[integer :: 1, 2]"), "[integer :: 1, 2]");
+    }
+
+    #[test]
+    fn implied_do_basic() {
+        assert_eq!(sexpr("[(i, i=1,10)]"), "[(i, i=1, 10)]");
+    }
+
+    #[test]
+    fn implied_do_with_step() {
+        assert_eq!(sexpr("[(i, i=1,10,2)]"), "[(i, i=1, 10, 2)]");
+    }
+
+    #[test]
+    fn implied_do_expression() {
+        assert_eq!(sexpr("[(i*2, i=1,5)]"), "[((i * 2), i=1, 5)]");
     }
 
     // ---- Range subscripts ----
