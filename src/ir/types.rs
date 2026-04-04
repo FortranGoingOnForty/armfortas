@@ -88,7 +88,7 @@ impl IrType {
             Self::Float(w) => w.bytes() as u64,
             Self::Ptr(_) => 8, // 64-bit pointers
             Self::Array(elem, count) => elem.size_bytes() * count,
-            Self::Struct(_) => 0, // needs struct_defs to compute
+            Self::Struct(_) => panic!("Struct size requires struct_defs; use Module::struct_size()"),
             Self::FuncPtr(_) => 8,
         }
     }
