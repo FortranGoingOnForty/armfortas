@@ -145,8 +145,9 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::ConstString(bytes) => {
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             let cp_idx = mf.add_const(ConstPoolEntry::Bytes(bytes.clone()));
+            // Use ADRP+ADD to compute the address (not ADRP+LDR which loads the value).
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::AdrpLdr,
+                opcode: ArmOpcode::AdrpAdd,
                 operands: vec![
                     MachineOperand::VReg(dest),
                     MachineOperand::ConstPool(cp_idx),
@@ -876,20 +877,22 @@ fn alloca_size(ty: &IrType) -> u32 {
 }
 
 /// Get the symbol name for a runtime function.
+/// Get the C-level symbol name for a runtime function.
+/// The emitter adds the Mach-O `_` prefix when emitting assembly.
 fn runtime_func_symbol(rf: &RuntimeFunc) -> String {
     match rf {
-        RuntimeFunc::PrintInt => "_afs_print_int".into(),
-        RuntimeFunc::PrintReal => "_afs_print_real".into(),
-        RuntimeFunc::PrintString => "_afs_print_string".into(),
-        RuntimeFunc::PrintLogical => "_afs_print_logical".into(),
-        RuntimeFunc::PrintNewline => "_afs_print_newline".into(),
-        RuntimeFunc::Allocate => "_afs_allocate".into(),
-        RuntimeFunc::Deallocate => "_afs_deallocate".into(),
-        RuntimeFunc::StringConcat => "_afs_string_concat".into(),
-        RuntimeFunc::StringCopy => "_afs_string_copy".into(),
-        RuntimeFunc::StringCompare => "_afs_string_compare".into(),
-        RuntimeFunc::Stop => "_afs_stop".into(),
-        RuntimeFunc::ErrorStop => "_afs_error_stop".into(),
+        RuntimeFunc::PrintInt => "afs_print_int".into(),
+        RuntimeFunc::PrintReal => "afs_print_real".into(),
+        RuntimeFunc::PrintString => "afs_print_string".into(),
+        RuntimeFunc::PrintLogical => "afs_print_logical".into(),
+        RuntimeFunc::PrintNewline => "afs_print_newline".into(),
+        RuntimeFunc::Allocate => "afs_allocate".into(),
+        RuntimeFunc::Deallocate => "afs_deallocate".into(),
+        RuntimeFunc::StringConcat => "afs_string_concat".into(),
+        RuntimeFunc::StringCopy => "afs_string_copy".into(),
+        RuntimeFunc::StringCompare => "afs_string_compare".into(),
+        RuntimeFunc::Stop => "afs_stop".into(),
+        RuntimeFunc::ErrorStop => "afs_error_stop".into(),
     }
 }
 
