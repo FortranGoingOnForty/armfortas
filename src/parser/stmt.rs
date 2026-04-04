@@ -891,8 +891,8 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.error(format!("expected 'end {}' or 'end{}', got '{}'", keyword, keyword, text)));
         }
-        // Skip optional construct name after end.
-        if self.peek() == &TokenKind::Identifier {
+        // Skip optional construct name after end, but only on the same line.
+        if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
             self.advance();
         }
         Ok(())
