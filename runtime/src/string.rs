@@ -32,7 +32,9 @@ pub extern "C" fn afs_assign_char_fixed(
     let copy_len = src_len.min(dest_len) as usize;
     unsafe {
         if !src.is_null() && copy_len > 0 {
-            ptr::copy_nonoverlapping(src, dest, copy_len);
+            // Use ptr::copy (not copy_nonoverlapping) to handle overlapping
+            // src/dest (e.g., s = s(2:) for fixed-length self-assignment).
+            ptr::copy(src, dest, copy_len);
         }
         // Pad remainder with spaces.
         let pad_len = (dest_len as usize).saturating_sub(copy_len);
@@ -115,7 +117,9 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     desc.data = ptr::null_mut();
     desc.len = 0;
     desc.capacity = 0;
-    desc.flags = 0;
+    // Preserve STR_DEFERRED — the variable is still character(:), allocatable
+    // after DEALLOCATE. Clear only STR_ALLOCATED.
+    desc.flags &= STR_DEFERRED; // keep deferred, clear everything else
 }
 
 // ---- Concatenation ----
@@ -151,8 +155,8 @@ pub extern "C" fn afs_compare_char(
 ) -> i32 {
     let max_len = a_len.max(b_len) as usize;
     for i in 0..max_len {
-        let ac = if i < a_len as usize { unsafe { *a.add(i) } } else { b' ' };
-        let bc = if i < b_len as usize { unsafe { *b.add(i) } } else { b' ' };
+        let ac = if i < a_len as usize && !a.is_null() { unsafe { *a.add(i) } } else { b' ' };
+        let bc = if i < b_len as usize && !b.is_null() { unsafe { *b.add(i) } } else { b' ' };
         if ac < bc { return -1; }
         if ac > bc { return 1; }
     }
