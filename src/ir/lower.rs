@@ -405,14 +405,15 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 }
 
 /// Insert implicit deallocation calls for all local allocatable variables.
+/// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
+    // Alloca a temporary STAT variable for safe deallocation.
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     for info in locals.values() {
         if info.allocatable {
-            // Pass descriptor address to afs_deallocate_array.
-            let null = b.const_i64(0); // null STAT pointer
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
-                vec![info.addr, null],
+                vec![info.addr, stat_addr],
                 IrType::Void,
             );
         }
@@ -499,7 +500,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     if let Expr::Name { name } = &callee.node {
                         let key = name.to_lowercase();
                         if let Some(info) = ctx.locals.get(&key).cloned() {
-                            if !info.dims.is_empty() {
+                            if !info.dims.is_empty() || info.allocatable {
                                 lower_array_store(b, &ctx.locals, &info, args, val, ctx.st);
                             }
                         }
@@ -1063,7 +1064,13 @@ fn lower_array_element(
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
     let base = array_base_addr(b, info);
-    let elem_ptr = b.gep(base, vec![idx], info.ty.clone());
+    // Widen index to i64 for pointer arithmetic if needed.
+    let idx64 = if info.allocatable {
+        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
+            b.int_extend(idx, IntWidth::I64, true)
+        } else { idx }
+    } else { idx };
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.load(elem_ptr)
 }
 
@@ -1111,7 +1118,12 @@ fn lower_array_store(
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
     let base = array_base_addr(b, info);
-    let elem_ptr = b.gep(base, vec![idx], info.ty.clone());
+    let idx64 = if info.allocatable {
+        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
+            b.int_extend(idx, IntWidth::I64, true)
+        } else { idx }
+    } else { idx };
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.store(value, elem_ptr);
 }
 
@@ -1120,8 +1132,9 @@ fn lower_array_store(
 /// For allocatable arrays, load base_addr from the descriptor (offset 0).
 fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.allocatable {
-        // Load base_addr (first 8 bytes of descriptor).
-        b.load(info.addr)
+        // Load base_addr (first 8 bytes of descriptor) as a pointer.
+        // The descriptor alloca is [i8 x 384], but the first field is a pointer.
+        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
     } else {
         info.addr
     }
@@ -1315,9 +1328,9 @@ fn lower_expr(
                 let key = name.to_lowercase();
 
                 // Check if this is an array element access.
+                // Fixed arrays have dims set; allocatable arrays have allocatable flag.
                 if let Some(info) = locals.get(&key) {
-                    if !info.dims.is_empty() {
-                        // Array element: compute flat offset and load.
+                    if !info.dims.is_empty() || info.allocatable {
                         return lower_array_element(b, locals, info, args, st);
                     }
                 }
