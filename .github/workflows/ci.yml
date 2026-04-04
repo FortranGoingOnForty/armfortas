@@ -40,7 +40,7 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p armfortas
+      - run: cargo test -p armfortas --bin armfortas
 
   test-end-to-end:
     name: "Tests: end-to-end (compile + run Fortran programs)"
