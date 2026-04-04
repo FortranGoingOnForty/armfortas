@@ -155,6 +155,9 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let mut asm_text = String::new();
     asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
     for mf in &allocated {
+        // Re-emit __TEXT section before each function in case the previous
+        // function's constant pool switched to __DATA.
+        asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
         asm_text.push_str(&emit::emit_function(mf));
         asm_text.push('\n');
     }
