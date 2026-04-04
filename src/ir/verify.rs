@@ -225,7 +225,7 @@ fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
     }
 }
 
-/// Check that branch arguments match block parameters in count.
+/// Check that branch arguments match block parameters in count and type.
 fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, errors: &mut Vec<VerifyError>) {
     let mut check = |dest: BlockId, args: &[ValueId]| {
         let target = func.block(dest);
@@ -236,6 +236,20 @@ fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, error
                     from_block, target.name, target.params.len(), args.len()
                 ),
             });
+        } else {
+            // Check types match.
+            for (i, (bp, arg)) in target.params.iter().zip(args.iter()).enumerate() {
+                if let Some(arg_ty) = func.value_type(*arg) {
+                    if arg_ty != bp.ty {
+                        errors.push(VerifyError {
+                            msg: format!(
+                                "branch from '{}' to '{}': arg {} type mismatch: expected {}, got {}",
+                                from_block, target.name, i, bp.ty, arg_ty
+                            ),
+                        });
+                    }
+                }
+            }
         }
     };
 
@@ -244,6 +258,23 @@ fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, error
         Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
             check(*true_dest, true_args);
             check(*false_dest, false_args);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            // Switch targets shouldn't have block params (simplified model).
+            let default_block = func.block(*default);
+            if !default_block.params.is_empty() {
+                errors.push(VerifyError {
+                    msg: format!("switch default target '{}' has block parameters", default_block.name),
+                });
+            }
+            for (_, dest) in cases {
+                let target = func.block(*dest);
+                if !target.params.is_empty() {
+                    errors.push(VerifyError {
+                        msg: format!("switch case target '{}' has block parameters", target.name),
+                    });
+                }
+            }
         }
         _ => {}
     }
