@@ -624,11 +624,62 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Allocate { items, .. } => {
             for item in items {
-                let base_name = extract_base_name(item);
-                if let Some(name) = base_name {
-                    if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
-                        let ptr = b.runtime_call(RuntimeFunc::Allocate, vec![], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        b.store(ptr, info.addr);
+                // allocate(a(n, m)) → extract shape from subscripts, compute byte count.
+                if let Expr::FunctionCall { callee, args } = &item.node {
+                    let base_name = extract_base_name(callee);
+                    if let Some(name) = base_name {
+                        if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                            // Compute total elements from shape subscripts.
+                            let mut total: Option<ValueId> = None;
+                            for arg in args {
+                                let dim_size = match &arg.value {
+                                    crate::ast::expr::SectionSubscript::Element(e) => {
+                                        lower_expr(b, &ctx.locals, e, ctx.st)
+                                    }
+                                    _ => b.const_i32(1),
+                                };
+                                total = Some(match total {
+                                    Some(prev) => b.imul(prev, dim_size),
+                                    None => dim_size,
+                                });
+                            }
+                            let total_elems = total.unwrap_or_else(|| b.const_i32(1));
+
+                            // Compute byte count: total_elements * elem_size.
+                            let elem_size = match &info.ty {
+                                IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8i32,
+                                IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+                                IrType::Bool => 4,
+                                _ => 8, // pointers, etc.
+                            };
+                            let size_val = if elem_size != 1 {
+                                let es = b.const_i32(elem_size);
+                                b.imul(total_elems, es)
+                            } else {
+                                total_elems
+                            };
+
+                            let ptr = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![size_val],
+                                IrType::Ptr(Box::new(info.ty.clone())),
+                            );
+                            b.store(ptr, info.addr);
+                        }
+                    }
+                } else {
+                    // Simple allocate(a) without shape — allocate 1 element.
+                    let base_name = extract_base_name(item);
+                    if let Some(name) = base_name {
+                        if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                            let size = b.const_i32(8); // default pointer size
+                            let ptr = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![size],
+                                IrType::Ptr(Box::new(info.ty.clone())),
+                            );
+                            b.store(ptr, info.addr);
+                        }
                     }
                 }
             }
