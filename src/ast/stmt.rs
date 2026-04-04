@@ -12,6 +12,7 @@ pub type SpannedStmt = Spanned<Stmt>;
 /// A Fortran executable statement.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
+#[allow(clippy::enum_variant_names)]
 pub enum Stmt {
     // ---- Assignment ----
     Assignment { target: SpannedExpr, value: SpannedExpr },

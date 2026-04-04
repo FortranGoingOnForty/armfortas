@@ -6,6 +6,7 @@
 
 pub mod expr;
 pub mod decl;
+pub mod stmt;
 
 use crate::lexer::{Token, TokenKind, Span};
 
