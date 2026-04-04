@@ -16,6 +16,17 @@ impl<'a> Parser<'a> {
     pub fn parse_stmt(&mut self) -> Result<SpannedStmt, ParseError> {
         self.skip_newlines();
         let start = self.current_span();
+
+        // Check for named construct: name: if/do/select/...
+        if self.peek() == &TokenKind::Identifier {
+            let next_pos = self.pos + 1;
+            if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Colon {
+                let name = self.advance().clone().text;
+                self.advance(); // consume :
+                return self.parse_named_construct(start, name);
+            }
+        }
+
         let text = self.peek_text().to_lowercase();
 
         match text.as_str() {
@@ -92,6 +103,17 @@ impl<'a> Parser<'a> {
         if self.peek_text().eq_ignore_ascii_case("then") {
             self.advance();
             return self.parse_if_construct(start, None, condition);
+        }
+
+        // Arithmetic IF: if (expr) label, label, label
+        if self.peek() == &TokenKind::IntegerLiteral {
+            let neg: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            self.expect(&TokenKind::Comma)?;
+            let zero: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            self.expect(&TokenKind::Comma)?;
+            let pos: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::ArithmeticIf { expr: condition, neg, zero, pos }, span));
         }
 
         // Single-line IF: if (cond) action
@@ -174,74 +196,7 @@ impl<'a> Parser<'a> {
 
     fn parse_do(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'do'
-
-        // DO WHILE
-        if self.peek_text().eq_ignore_ascii_case("while") {
-            self.advance();
-            self.expect(&TokenKind::LParen)?;
-            let condition = self.parse_expr()?;
-            self.expect(&TokenKind::RParen)?;
-            let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
-            let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoWhile { name: None, condition, body }, span));
-        }
-
-        // DO CONCURRENT
-        if self.peek_text().eq_ignore_ascii_case("concurrent") {
-            self.advance();
-            self.expect(&TokenKind::LParen)?;
-            let mut controls = Vec::new();
-            loop {
-                let var = self.advance().clone().text;
-                self.expect(&TokenKind::Assign)?;
-                let ctrl_start = self.parse_expr()?;
-                self.expect(&TokenKind::Colon)?;
-                let end = self.parse_expr()?;
-                let step = if self.eat(&TokenKind::Colon) { Some(self.parse_expr()?) } else { None };
-                controls.push(ConcurrentControl { var, start: ctrl_start, end, step });
-                if !self.eat(&TokenKind::Comma) { break; }
-                // Check for mask expression after controls.
-                if self.peek() != &TokenKind::Identifier || {
-                    let np = self.pos + 1;
-                    np >= self.tokens.len() || self.tokens[np].kind != TokenKind::Assign
-                } {
-                    break;
-                }
-            }
-            let mask = if self.peek() != &TokenKind::RParen {
-                Some(self.parse_expr()?)
-            } else { None };
-            self.expect(&TokenKind::RParen)?;
-            let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
-            let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, body }, span));
-        }
-
-        // Infinite DO (no variable).
-        if self.at_stmt_end() {
-            let body = self.parse_stmt_block(&["do"])?;
-            self.consume_end("do");
-            let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoLoop {
-                name: None, var: None, start: None, end: None, step: None, body,
-            }, span));
-        }
-
-        // Counted DO: do var = start, end [, step]
-        let var = self.advance().clone().text;
-        self.expect(&TokenKind::Assign)?;
-        let do_start = self.parse_expr()?;
-        self.expect(&TokenKind::Comma)?;
-        let do_end = self.parse_expr()?;
-        let step = if self.eat(&TokenKind::Comma) { Some(self.parse_expr()?) } else { None };
-        let body = self.parse_stmt_block(&["do"])?;
-        self.consume_end("do");
-        let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::DoLoop {
-            name: None, var: Some(var), start: Some(do_start), end: Some(do_end), step, body,
-        }, span))
+        self.parse_do_body(start)
     }
 
     // ---- SELECT CASE ----
@@ -519,6 +474,123 @@ impl<'a> Parser<'a> {
 
     // ---- Helpers ----
 
+    fn parse_named_construct(&mut self, start: crate::lexer::Span, name: String) -> Result<SpannedStmt, ParseError> {
+        let text = self.peek_text().to_lowercase();
+        match text.as_str() {
+            "if" => {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let condition = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                if self.peek_text().eq_ignore_ascii_case("then") {
+                    self.advance();
+                }
+                self.parse_if_construct(start, Some(name), condition)
+            }
+            "do" => {
+                self.advance();
+                // Reuse DO parsing but inject the name.
+                let mut stmt = self.parse_do_body(start)?;
+                // Inject name into the statement.
+                match &mut stmt.node {
+                    Stmt::DoLoop { name: n, .. } |
+                    Stmt::DoWhile { name: n, .. } |
+                    Stmt::DoConcurrent { name: n, .. } => *n = Some(name),
+                    _ => {}
+                }
+                Ok(stmt)
+            }
+            "select" => {
+                self.advance();
+                self.eat_ident("case");
+                self.expect(&TokenKind::LParen)?;
+                let selector = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                let mut cases = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.peek_text().eq_ignore_ascii_case("case") {
+                        self.advance();
+                        let selectors = self.parse_case_selectors()?;
+                        let body = self.parse_stmt_block(&["select"])?;
+                        cases.push(CaseBlock { selectors, body });
+                    } else { break; }
+                }
+                self.consume_end("select");
+                let span = span_from_to(start, self.prev_span());
+                Ok(Spanned::new(Stmt::SelectCase { name: Some(name), selector, cases }, span))
+            }
+            _ => Err(self.error(format!("expected construct keyword after '{}:', got '{}'", name, text))),
+        }
+    }
+
+    /// Parse the body of a DO statement (after 'do' keyword has been consumed).
+    /// Factored out so named constructs can reuse it.
+    fn parse_do_body(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        // DO WHILE
+        if self.peek_text().eq_ignore_ascii_case("while") {
+            self.advance();
+            self.expect(&TokenKind::LParen)?;
+            let condition = self.parse_expr()?;
+            self.expect(&TokenKind::RParen)?;
+            let body = self.parse_stmt_block(&["do"])?;
+            self.consume_end("do");
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::DoWhile { name: None, condition, body }, span));
+        }
+
+        // DO CONCURRENT
+        if self.peek_text().eq_ignore_ascii_case("concurrent") {
+            self.advance();
+            self.expect(&TokenKind::LParen)?;
+            let mut controls = Vec::new();
+            loop {
+                let var = self.advance().clone().text;
+                self.expect(&TokenKind::Assign)?;
+                let ctrl_start = self.parse_expr()?;
+                self.expect(&TokenKind::Colon)?;
+                let end = self.parse_expr()?;
+                let step = if self.eat(&TokenKind::Colon) { Some(self.parse_expr()?) } else { None };
+                controls.push(ConcurrentControl { var, start: ctrl_start, end, step });
+                if !self.eat(&TokenKind::Comma) { break; }
+                if self.peek() != &TokenKind::Identifier || {
+                    let np = self.pos + 1;
+                    np >= self.tokens.len() || self.tokens[np].kind != TokenKind::Assign
+                } { break; }
+            }
+            let mask = if self.peek() != &TokenKind::RParen { Some(self.parse_expr()?) } else { None };
+            self.expect(&TokenKind::RParen)?;
+            let body = self.parse_stmt_block(&["do"])?;
+            self.consume_end("do");
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, body }, span));
+        }
+
+        // Infinite DO
+        if self.at_stmt_end() {
+            let body = self.parse_stmt_block(&["do"])?;
+            self.consume_end("do");
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::DoLoop {
+                name: None, var: None, start: None, end: None, step: None, body,
+            }, span));
+        }
+
+        // Counted DO
+        let var = self.advance().clone().text;
+        self.expect(&TokenKind::Assign)?;
+        let do_start = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let do_end = self.parse_expr()?;
+        let step = if self.eat(&TokenKind::Comma) { Some(self.parse_expr()?) } else { None };
+        let body = self.parse_stmt_block(&["do"])?;
+        self.consume_end("do");
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::DoLoop {
+            name: None, var: Some(var), start: Some(do_start), end: Some(do_end), step, body,
+        }, span))
+    }
+
     fn consume_end(&mut self, keyword: &str) {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
@@ -723,5 +795,93 @@ mod tests {
     fn continue_stmt() {
         let s = parse_one("continue\n");
         assert!(matches!(s.node, Stmt::Continue { .. }));
+    }
+
+    // ---- Arithmetic IF ----
+
+    #[test]
+    fn arithmetic_if() {
+        let s = parse_one("if (x) 10, 20, 30\n");
+        if let Stmt::ArithmeticIf { neg, zero, pos, .. } = &s.node {
+            assert_eq!(*neg, 10);
+            assert_eq!(*zero, 20);
+            assert_eq!(*pos, 30);
+        } else { panic!("not ArithmeticIf, got {:?}", s.node); }
+    }
+
+    // ---- Named constructs ----
+
+    #[test]
+    fn named_do() {
+        let s = parse_one("outer: do i = 1, 10\n  x = i\nend do outer\n");
+        if let Stmt::DoLoop { name, var, .. } = &s.node {
+            assert_eq!(name.as_deref(), Some("outer"));
+            assert_eq!(var.as_deref(), Some("i"));
+        } else { panic!("not DoLoop, got {:?}", s.node); }
+    }
+
+    #[test]
+    fn named_if() {
+        let s = parse_one("check: if (x > 0) then\n  y = 1\nend if check\n");
+        if let Stmt::IfConstruct { name, .. } = &s.node {
+            assert_eq!(name.as_deref(), Some("check"));
+        } else { panic!("not IfConstruct, got {:?}", s.node); }
+    }
+
+    // ---- Nesting ----
+
+    #[test]
+    fn deeply_nested() {
+        let src = "\
+if (a > 0) then
+  do i = 1, n
+    select case (x)
+    case (1)
+      do while (cond)
+        if (done) exit
+      end do
+    end select
+  end do
+end if
+";
+        let s = parse_one(src);
+        if let Stmt::IfConstruct { then_body, .. } = &s.node {
+            assert!(!then_body.is_empty());
+            // DO inside IF.
+            assert!(matches!(then_body[0].node, Stmt::DoLoop { .. }));
+        } else { panic!("not IfConstruct"); }
+    }
+
+    // ---- Additional construct tests ----
+
+    #[test]
+    fn where_construct() {
+        let s = parse_one("where (a > 0)\n  b = 1\nelsewhere\n  b = 0\nend where\n");
+        if let Stmt::WhereConstruct { elsewhere, .. } = &s.node {
+            assert_eq!(elsewhere.len(), 1);
+        } else { panic!("not WhereConstruct"); }
+    }
+
+    #[test]
+    fn computed_goto() {
+        let s = parse_one("go to (10, 20, 30), i\n");
+        if let Stmt::ComputedGoto { labels, .. } = &s.node {
+            assert_eq!(labels, &[10, 20, 30]);
+        } else { panic!("not ComputedGoto"); }
+    }
+
+    #[test]
+    fn block_construct() {
+        let s = parse_one("block\n  x = 1\nend block\n");
+        assert!(matches!(s.node, Stmt::Block { .. }));
+    }
+
+    #[test]
+    fn associate_construct() {
+        let s = parse_one("associate (n => size(a))\n  x = n\nend associate\n");
+        if let Stmt::Associate { assocs, .. } = &s.node {
+            assert_eq!(assocs.len(), 1);
+            assert_eq!(assocs[0].0, "n");
+        } else { panic!("not Associate"); }
     }
 }
