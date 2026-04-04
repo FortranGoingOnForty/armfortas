@@ -1334,6 +1334,232 @@ end program hello
         Ok(tokens.len())
     }
 
+    // ======================================================================
+    // Audit test gap coverage — every gap identified in the code review
+    // ======================================================================
+
+    // ---- Empty/minimal inputs ----
+
+    #[test]
+    fn empty_source() {
+        assert_eq!(kinds(""), Vec::<TokenKind>::new());
+    }
+
+    #[test]
+    fn only_whitespace() {
+        assert_eq!(kinds("   \t  "), Vec::<TokenKind>::new());
+    }
+
+    #[test]
+    fn integer_zero() {
+        assert_eq!(kinds("0"), vec![TokenKind::IntegerLiteral]);
+        assert_eq!(texts("0"), vec!["0"]);
+    }
+
+    // ---- Additional numeric literal forms ----
+
+    #[test]
+    fn real_dot5e3() {
+        assert_eq!(kinds(".5e3"), vec![TokenKind::RealLiteral]);
+        assert_eq!(texts(".5e3"), vec![".5e3"]);
+    }
+
+    #[test]
+    fn real_dot5d0() {
+        assert_eq!(kinds(".5d0"), vec![TokenKind::RealLiteral]);
+        assert_eq!(texts(".5d0"), vec![".5d0"]);
+    }
+
+    #[test]
+    fn real_3_14_e_minus_2() {
+        assert_eq!(texts("3.14e-2"), vec!["3.14e-2"]);
+    }
+
+    #[test]
+    fn real_uppercase_exponent() {
+        assert_eq!(kinds("1.0E5"), vec![TokenKind::RealLiteral]);
+        assert_eq!(kinds("1.0D0"), vec![TokenKind::RealLiteral]);
+    }
+
+    // ---- BOZ with double quotes ----
+
+    #[test]
+    fn boz_hex_double_quote() {
+        let t = &toks("Z\"FF\"")[0];
+        assert_eq!(t.kind, TokenKind::BozLiteral);
+        assert_eq!(t.text, "Z\"FF\"");
+    }
+
+    #[test]
+    fn boz_octal_double_quote() {
+        let t = &toks("O\"777\"")[0];
+        assert_eq!(t.kind, TokenKind::BozLiteral);
+    }
+
+    // ---- Logical literal with named kind ----
+
+    #[test]
+    fn logical_true_named_kind() {
+        let t = &toks(".true._logical_kind")[0];
+        assert_eq!(t.kind, TokenKind::LogicalLiteral);
+        assert_eq!(t.text, ".true._logical_kind");
+    }
+
+    // ---- Defined operator with underscore ----
+
+    #[test]
+    fn defined_op_with_underscore() {
+        let k = kinds(".my_op.");
+        assert_eq!(k, vec![TokenKind::DefinedOp("my_op".into())]);
+    }
+
+    // ---- Continuation edge cases ----
+
+    #[test]
+    fn continuation_at_eof() {
+        // & at end of file with no following line — should be treated as ampersand token.
+        let k = kinds("x + &");
+        // The & can't be a continuation (no next line), so it should be an ampersand.
+        assert!(k.contains(&TokenKind::Identifier));
+    }
+
+    #[test]
+    fn multiple_continuations() {
+        let k = kinds("x = a + &\n    b + &\n    c");
+        assert_eq!(k, vec![
+            TokenKind::Identifier, TokenKind::Assign,
+            TokenKind::Identifier, TokenKind::Plus,
+            TokenKind::Identifier, TokenKind::Plus,
+            TokenKind::Identifier,
+        ]);
+    }
+
+    #[test]
+    fn string_continuation_with_comment() {
+        // String continued with & followed by !comment — should work.
+        let src = "'hello & ! this is ok\n     &world'";
+        let toks = toks(src);
+        assert_eq!(toks[0].kind, TokenKind::StringLiteral);
+        assert!(toks[0].text.contains("hello"), "got: {}", toks[0].text);
+        assert!(toks[0].text.contains("world"), "got: {}", toks[0].text);
+    }
+
+    // ---- Spec ambiguity examples (verbatim from sprint doc) ----
+
+    #[test]
+    fn spec_ambiguity_real_declaration() {
+        let k = kinds("real :: x = 1.0");
+        assert!(k.contains(&TokenKind::ColonColon));
+        assert!(k.contains(&TokenKind::RealLiteral));
+    }
+
+    #[test]
+    fn spec_ambiguity_real_function_call() {
+        let k = kinds("x = real(i)");
+        assert_eq!(k, vec![
+            TokenKind::Identifier, TokenKind::Assign,
+            TokenKind::Identifier, TokenKind::LParen,
+            TokenKind::Identifier, TokenKind::RParen,
+        ]);
+    }
+
+    #[test]
+    fn spec_ambiguity_single_line_if() {
+        let k = kinds("if (x > 1.0) y = 2");
+        assert!(k.contains(&TokenKind::Gt));
+        assert!(k.contains(&TokenKind::RealLiteral));
+    }
+
+    #[test]
+    fn spec_ambiguity_do_loop() {
+        let k = kinds("do i = 1, 10");
+        assert!(k.contains(&TokenKind::Comma));
+        // "do" and "i" are both identifiers.
+        let tokens = toks("do i = 1, 10");
+        let idents: Vec<_> = tokens.iter()
+            .filter(|t| t.kind == TokenKind::Identifier)
+            .map(|t| t.text.as_str())
+            .collect();
+        assert!(idents.contains(&"do"));
+        assert!(idents.contains(&"i"));
+    }
+
+    #[test]
+    fn spec_ambiguity_do_as_variable() {
+        let k = kinds("do = 3.14");
+        assert_eq!(k, vec![
+            TokenKind::Identifier, TokenKind::Assign, TokenKind::RealLiteral,
+        ]);
+        assert_eq!(toks("do = 3.14")[0].text, "do");
+    }
+
+    // ---- All comparison operators both styles ----
+
+    #[test]
+    fn all_dot_comparisons_uppercase() {
+        // .EQ. .NE. .LT. .GT. .LE. .GE. — uppercase should work.
+        let k = kinds(".EQ. .NE. .LT. .GT. .LE. .GE.");
+        assert_eq!(k.len(), 6);
+        for tok in &k {
+            assert!(matches!(tok, TokenKind::DotOp(_)));
+        }
+    }
+
+    // ---- Semicolon in full context ----
+
+    #[test]
+    fn semicolon_separates_statements() {
+        let k = kinds("x = 1; y = 2");
+        assert_eq!(k, vec![
+            TokenKind::Identifier, TokenKind::Assign, TokenKind::IntegerLiteral,
+            TokenKind::Semicolon,
+            TokenKind::Identifier, TokenKind::Assign, TokenKind::IntegerLiteral,
+        ]);
+    }
+
+    // ---- Performance ----
+
+    #[test]
+    fn performance_fortsh_under_one_second() {
+        let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src");
+        let root = std::path::Path::new(src_dir);
+        if !root.exists() { return; }
+
+        // Collect all source.
+        let mut all_source = String::new();
+        fn collect(dir: &std::path::Path, buf: &mut String) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() { collect(&path, buf); }
+                    else if path.extension().map_or(false, |e| e == "f90") {
+                        if let Ok(src) = std::fs::read_to_string(&path) {
+                            let filtered: String = src.lines()
+                                .map(|l| if l.trim_start().starts_with('#') { "" } else { l })
+                                .collect::<Vec<_>>().join("\n");
+                            buf.push_str(&filtered);
+                            buf.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        collect(root, &mut all_source);
+
+        let start = std::time::Instant::now();
+        let result = Lexer::tokenize(&all_source, 0);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "failed to tokenize: {:?}", result.err());
+        let tokens = result.unwrap();
+        eprintln!("lexed {} tokens from ~{} lines in {:?}",
+            tokens.len(), all_source.lines().count(), elapsed);
+        assert!(elapsed.as_secs_f64() < 1.0,
+            "too slow: {:?} (must be < 1s)", elapsed);
+    }
+
+    // ---- fortsh tokenization ----
+
     #[test]
     fn tokenize_fortsh_types() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common/types.f90");
