@@ -671,7 +671,7 @@ impl<'a> Lexer<'a> {
         let quote = self.advance();
         text.push(quote as char);
 
-        while !self.at_end() && self.peek() != quote as u8 {
+        while !self.at_end() && self.peek() != quote {
             if self.peek() == b'\n' {
                 return Err(self.err(start, "unterminated BOZ literal".into()));
             }
@@ -1249,5 +1249,110 @@ end program hello
         assert!(ident_count >= 8, "expected 8+ identifiers, got {}", ident_count);
         let last_non_eof = tokens.iter().rev().find(|t| t.kind != TokenKind::Eof && t.kind != TokenKind::Newline).unwrap();
         assert_eq!(last_non_eof.text, "hello");
+    }
+
+    // ---- fortsh tokenization ----
+
+    /// Try to tokenize a fortsh source file. Strips preprocessor directives first.
+    fn try_lex_fortsh_file(path: &str) -> Result<usize, String> {
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("{}: {}", path, e))?;
+
+        // Strip preprocessor directives (lexer expects preprocessed input).
+        let filtered: String = src.lines()
+            .map(|line| if line.trim_start().starts_with('#') { "" } else { line })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let tokens = Lexer::tokenize(&filtered, 0)
+            .map_err(|e| format!("{}: {}", path, e))?;
+
+        Ok(tokens.len())
+    }
+
+    #[test]
+    fn tokenize_fortsh_types() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common/types.f90");
+        if !std::path::Path::new(path).exists() {
+            // fortsh not available — skip gracefully.
+            return;
+        }
+        let count = try_lex_fortsh_file(path).unwrap();
+        assert!(count > 100, "expected 100+ tokens from types.f90, got {}", count);
+    }
+
+    #[test]
+    fn tokenize_fortsh_error_handling() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common/error_handling.f90");
+        if !std::path::Path::new(path).exists() { return; }
+        let count = try_lex_fortsh_file(path).unwrap();
+        assert!(count > 50, "expected 50+ tokens, got {}", count);
+    }
+
+    #[test]
+    fn tokenize_fortsh_all_common() {
+        let common_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common");
+        let dir = std::path::Path::new(common_dir);
+        if !dir.exists() { return; }
+
+        let mut files_tested = 0;
+        let mut total_tokens = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "f90") {
+                let path_str = path.to_string_lossy();
+                match try_lex_fortsh_file(&path_str) {
+                    Ok(count) => {
+                        total_tokens += count;
+                        files_tested += 1;
+                    }
+                    Err(e) => panic!("failed to tokenize {}: {}", path_str, e),
+                }
+            }
+        }
+        assert!(files_tested > 0, "no .f90 files found in fortsh/src/common");
+        eprintln!("tokenized {} fortsh common/ files, {} total tokens", files_tested, total_tokens);
+    }
+
+    #[test]
+    fn tokenize_fortsh_all_sources() {
+        let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src");
+        let root = std::path::Path::new(src_dir);
+        if !root.exists() { return; }
+
+        let mut files_tested = 0;
+        let mut total_tokens = 0;
+        let mut failures = Vec::new();
+
+        fn visit_dir(dir: &std::path::Path, files_tested: &mut usize, total_tokens: &mut usize, failures: &mut Vec<String>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        visit_dir(&path, files_tested, total_tokens, failures);
+                    } else if path.extension().map_or(false, |e| e == "f90") {
+                        let path_str = path.to_string_lossy().to_string();
+                        match super::tests::try_lex_fortsh_file(&path_str) {
+                            Ok(count) => {
+                                *total_tokens += count;
+                                *files_tested += 1;
+                            }
+                            Err(e) => failures.push(e),
+                        }
+                    }
+                }
+            }
+        }
+
+        visit_dir(root, &mut files_tested, &mut total_tokens, &mut failures);
+
+        if !failures.is_empty() {
+            panic!("{} of {} files failed to tokenize:\n{}", failures.len(), files_tested + failures.len(),
+                failures.join("\n"));
+        }
+
+        assert!(files_tested > 40, "expected 40+ .f90 files, found {}", files_tested);
+        eprintln!("tokenized ALL {} fortsh .f90 files, {} total tokens", files_tested, total_tokens);
     }
 }
