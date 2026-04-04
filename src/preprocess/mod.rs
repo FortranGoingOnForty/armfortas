@@ -353,7 +353,7 @@ impl Preprocessor {
 
         // Object-like macro: NAME body  or  NAME (empty body = "1")
         let (name, body) = split_first_word(args);
-        let body = if body.is_empty() { "1" } else { body };
+        // Empty #define has empty body (not "1"). #ifdef uses contains_key, not body value.
         self.defines.insert(name.into(), MacroDef::object(body));
         Ok(())
     }
@@ -851,6 +851,13 @@ mod tests {
     fn define_empty_macro() {
         let out = pp("#define ENABLED\n#ifdef ENABLED\nyes\n#endif\n");
         assert!(lines(&out).contains(&"yes"));
+    }
+
+    #[test]
+    fn define_empty_macro_expands_to_nothing() {
+        // Per cpp standard: #define GUARD with no body expands to empty, not "1".
+        let out = pp("#define GUARD\nx = GUARD end\n");
+        assert!(out.contains("x =  end"), "got: {:?}", out);
     }
 
     #[test]
