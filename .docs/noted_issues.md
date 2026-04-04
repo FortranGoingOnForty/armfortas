@@ -103,3 +103,21 @@ Minor issues accepted during audits that don't block forward progress. Fix if th
 - **`real`/`dble` intrinsic ignores KIND argument**: `real(x, kind=8)` returns `real(4)` instead of `real(8)`. The intrinsic table doesn't examine the second argument for kind. Fix when kind-specific intrinsic calls appear.
 
 - **Generic resolution uses exact type matching**: `resolve_generic` requires exact type equality between actual and dummy arguments. The standard allows TKR (type-kind-rank) matching with some flexibility. Sufficient for most generic interfaces.
+
+## Semantic Analysis — Advanced Validation (Sprint 14)
+
+- **Interface blocks in module specification section**: The parser dispatches interface blocks only at the top level or in CONTAINS. `interface operator(+)` inside a module's declaration section before CONTAINS is not parsed. Fix requires extending `parse_unit_body` to recognize interface blocks alongside type declarations.
+
+- **Statement label attachment**: The parser consumes leading numeric labels but does not attach them to statements (`Continue { label: None }`). GOTO target validation infrastructure is in place but can't run on parsed code until labels are propagated. Fix requires parser enhancement.
+
+- **Pure procedure call checking**: `validate_pure_call` is a stub — it doesn't verify that callees are pure. Full check requires tracking the pure attribute in the symbol table for resolved subprograms. Currently only catches I/O, STOP, and SAVE violations.
+
+- **Defined operator intent(in) checking**: Operator interface bodies are validated for function/subroutine and argument count, but arguments are not verified as intent(in). Requires walking the interface subprogram's declaration list.
+
+- **BLOCK construct internal declarations**: The parser's `parse_stmt_block` doesn't handle declarations inside BLOCK constructs. `block; integer :: x; end block` fails to parse. BLOCK with only executable statements works.
+
+- **Elemental return type**: Elemental functions must return scalar results. Not checked. Add when elemental functions appear in practice.
+
+- **Contiguous array checking**: The CONTIGUOUS attribute and non-contiguous array section passing are not validated. Rare in practice.
+
+- **SELECT TYPE validation**: SELECT TYPE requires type guard matching against the selector's declared type. Parser doesn't implement SELECT TYPE yet (noted in Sprint 9).
