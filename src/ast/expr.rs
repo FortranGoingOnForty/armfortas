@@ -30,6 +30,11 @@ pub enum Expr {
         value: bool,
         kind: Option<String>,
     },
+    /// Complex literal: `(1.0, 2.0)`
+    ComplexLiteral {
+        real: Box<SpannedExpr>,
+        imag: Box<SpannedExpr>,
+    },
     /// BOZ literal: `B'1010'`, `O'777'`, `Z'FF'`
     BozLiteral {
         text: String,
@@ -100,6 +105,9 @@ impl SpannedExpr {
             Expr::StringLiteral { value, .. } => format!("'{}'", value),
             Expr::LogicalLiteral { value, .. } => {
                 if *value { ".true.".into() } else { ".false.".into() }
+            }
+            Expr::ComplexLiteral { real, imag } => {
+                format!("({}, {})", real.to_sexpr(), imag.to_sexpr())
             }
             Expr::BozLiteral { text, .. } => text.clone(),
             Expr::Name { name } => name.clone(),

@@ -129,6 +129,16 @@ impl<'a> Parser<'a> {
                     return self.parse_array_constructor_slash(start);
                 }
                 let inner = self.parse_expr()?;
+                // Check for complex literal: (expr, expr)
+                if self.eat(&TokenKind::Comma) {
+                    let imag = self.parse_expr()?;
+                    self.expect(&TokenKind::RParen)?;
+                    let span = span_from_to(start, self.prev_span());
+                    return Ok(Spanned::new(Expr::ComplexLiteral {
+                        real: Box::new(inner),
+                        imag: Box::new(imag),
+                    }, span));
+                }
                 self.expect(&TokenKind::RParen)?;
                 let span = span_from_to(start, self.prev_span());
                 Ok(Spanned::new(Expr::ParenExpr {
@@ -508,6 +518,8 @@ mod tests {
     #[test] fn logical_true() { assert_eq!(sexpr(".true."), ".true."); }
     #[test] fn logical_false() { assert_eq!(sexpr(".false."), ".false."); }
     #[test] fn boz() { assert_eq!(sexpr("B'1010'"), "B'1010'"); }
+    #[test] fn complex_literal() { assert_eq!(sexpr("(1.0, 2.0)"), "(1.0, 2.0)"); }
+    #[test] fn complex_literal_exprs() { assert_eq!(sexpr("(a + b, c * d)"), "((a + b), (c * d))"); }
     #[test] fn name() { assert_eq!(sexpr("x"), "x"); }
 
     // ---- Arithmetic precedence ----
