@@ -15,13 +15,12 @@ use super::liveness::{LiveInterval, compute_liveness};
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
 /// Ordered: caller-saved first (prefer these to avoid save/restore overhead),
 /// then callee-saved.
-// x9, x10, x11 reserved as spill scratch — NOT in the allocation pool.
-const GP_ALLOC_ORDER: [u8; 25] = [
+// x8, x9, x10, x11 reserved (x8 for large-offset addressing, x9-x11 for spill scratch).
+// x16, x17 excluded (linker scratch, clobbered by dynamic dispatch stubs).
+const GP_ALLOC_ORDER: [u8; 22] = [
     // Caller-saved (temporary, no save needed)
     12, 13, 14, 15,               // x12-x15
     0, 1, 2, 3, 4, 5, 6, 7,      // x0-x7 (args, but available between calls)
-    8,                              // x8 (indirect result)
-    16, 17,                         // x16-x17 (linker scratch, usable short-term)
     // Callee-saved (must save/restore if used)
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
@@ -90,6 +89,14 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             let callee_range = if is_fp { &FP_CALLEE_SAVED } else { &GP_CALLEE_SAVED };
             let idx = free.iter().position(|r| callee_range.contains(r));
             idx.map(|i| free.remove(i))
+        } else if let Some(hint) = interval.hint {
+            // Try the hinted register first (reduces unnecessary moves).
+            let idx = free.iter().position(|&r| r == hint);
+            if let Some(i) = idx {
+                Some(free.remove(i))
+            } else {
+                free.pop() // hint unavailable, use any free
+            }
         } else {
             free.pop()
         };
@@ -234,11 +241,12 @@ pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult) {
                 }
             }
 
-            // Handle def.
+            // Handle def — use a scratch index that doesn't alias any input scratch.
+            let def_scratch_idx = gp_scratch_idx.max(fp_scratch_idx);
             let def_spill = if let Some(def_vid) = &inst.def {
                 if let Some(&offset) = result.spills.get(def_vid) {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
-                    let (scratch, _) = spill_scratch(class, 0);
+                    let (scratch, _) = spill_scratch(class, def_scratch_idx);
                     // Replace def operand with scratch.
                     if let Some(MachineOperand::VReg(vid)) = rewritten.operands.first() {
                         if vid == def_vid {
