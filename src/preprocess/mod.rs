@@ -137,11 +137,31 @@ impl Preprocessor {
     }
 
     fn process(&mut self, source: &str, filename: &str) -> Result<PreprocOutput, PreprocError> {
-        // Join backslash-continued lines before processing.
-        let joined = join_continuations(source);
-
         let mut output = String::new();
         let mut source_map = Vec::new();
+        self.process_into(source, filename, &mut output, &mut source_map)?;
+
+        // Check for unterminated conditionals (only at top level).
+        if self.include_depth == 0 && !self.cond_stack.is_empty() {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: source.lines().count() as u32,
+                msg: format!("unterminated #if/#ifdef ({} level(s) still open)", self.cond_stack.len()),
+            });
+        }
+
+        Ok(PreprocOutput { text: output, source_map })
+    }
+
+    fn process_into(
+        &mut self,
+        source: &str,
+        filename: &str,
+        output: &mut String,
+        source_map: &mut Vec<SourceLoc>,
+    ) -> Result<(), PreprocError> {
+        // Join backslash-continued lines before processing.
+        let joined = join_continuations(source);
 
         // Set dynamic macros.
         self.defines.insert("__FILE__".into(), MacroDef::object(&format!("\"{}\"", filename)));
@@ -159,7 +179,7 @@ impl Preprocessor {
             let trimmed = line.trim_start();
 
             if trimmed.starts_with('#') {
-                self.process_directive(trimmed, filename, line_1based)?;
+                self.process_directive(trimmed, filename, line_1based, output, source_map)?;
                 // Emit blank line to keep line numbers aligned.
                 output.push('\n');
                 source_map.push(SourceLoc { filename: filename.into(), line: line_1based });
@@ -174,19 +194,17 @@ impl Preprocessor {
             source_map.push(SourceLoc { filename: filename.into(), line: line_1based });
         }
 
-        // Check for unterminated conditionals.
-        if !self.cond_stack.is_empty() {
-            return Err(PreprocError {
-                filename: filename.into(),
-                line: source.lines().count() as u32,
-                msg: format!("unterminated #if/#ifdef ({} level(s) still open)", self.cond_stack.len()),
-            });
-        }
-
-        Ok(PreprocOutput { text: output, source_map })
+        Ok(())
     }
 
-    fn process_directive(&mut self, line: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn process_directive(
+        &mut self,
+        line: &str,
+        filename: &str,
+        line_num: u32,
+        output: &mut String,
+        source_map: &mut Vec<SourceLoc>,
+    ) -> Result<(), PreprocError> {
         let rest = line[1..].trim_start(); // skip '#' and whitespace
         let (directive, args) = split_first_word(rest);
 
@@ -209,7 +227,7 @@ impl Preprocessor {
         match directive {
             "define" => self.do_define(args),
             "undef" => self.do_undef(args),
-            "include" => self.do_include(args, filename, line_num),
+            "include" => self.do_include(args, filename, line_num, output, source_map),
             "error" => Err(PreprocError {
                 filename: filename.into(), line: line_num,
                 msg: format!("#error {}", args),
@@ -348,9 +366,16 @@ impl Preprocessor {
 
     // ---- #include ----
 
-    fn do_include(&mut self, args: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_include(
+        &mut self,
+        args: &str,
+        filename: &str,
+        line_num: u32,
+        output: &mut String,
+        source_map: &mut Vec<SourceLoc>,
+    ) -> Result<(), PreprocError> {
         let args = args.trim();
-        let (path_str, _search_system) = if let Some(rest) = args.strip_prefix('"') {
+        let (path_str, search_system) = if let Some(rest) = args.strip_prefix('"') {
             let end = rest.find('"').ok_or_else(|| PreprocError {
                 filename: filename.into(), line: line_num,
                 msg: "unterminated #include string".into(),
@@ -377,7 +402,7 @@ impl Preprocessor {
         }
 
         // Search for the file.
-        let resolved = self.resolve_include(path_str, filename)
+        let resolved = self.resolve_include(path_str, filename, search_system)
             .ok_or_else(|| PreprocError {
                 filename: filename.into(), line: line_num,
                 msg: format!("cannot find include file: {}", path_str),
@@ -390,24 +415,25 @@ impl Preprocessor {
             })?;
 
         self.include_depth += 1;
-        let _result = self.process(&content, &resolved.to_string_lossy())?;
+        // Process included file directly into parent's output buffers.
+        let inc_filename = resolved.to_string_lossy().into_owned();
+        self.process_into(&content, &inc_filename, output, source_map)?;
         self.include_depth -= 1;
-        // Note: included output is folded into the parent's output via the recursive call's
-        // side effects on self.defines and self.cond_stack. The text output from includes
-        // is currently discarded — for full source map support, we'd merge it.
-        // TODO: merge included text into parent output with proper source map entries.
         Ok(())
     }
 
-    fn resolve_include(&self, path: &str, current_file: &str) -> Option<PathBuf> {
-        // Try relative to current file first.
-        let current_dir = Path::new(current_file).parent().unwrap_or(Path::new("."));
-        let candidate = current_dir.join(path);
-        if candidate.exists() {
-            return Some(candidate);
+    fn resolve_include(&self, path: &str, current_file: &str, system: bool) -> Option<PathBuf> {
+        // #include "file" — search relative to current file first, then include paths.
+        // #include <file> — search include paths only (system = true).
+        if !system {
+            let current_dir = Path::new(current_file).parent().unwrap_or(Path::new("."));
+            let candidate = current_dir.join(path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
 
-        // Try include paths.
+        // Search include paths.
         for dir in &self.include_paths {
             let candidate = dir.join(path);
             if candidate.exists() {
@@ -1252,5 +1278,40 @@ deep
         // Bare # on a line is valid (null directive).
         let out = pp("#\nok\n");
         assert!(lines(&out).contains(&"ok"));
+    }
+
+    // ---- #include with actual file content ----
+
+    #[test]
+    fn include_injects_file_content() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let inc_path = dir.join("test_pp_include.inc");
+        let mut f = std::fs::File::create(&inc_path).unwrap();
+        writeln!(f, "integer :: included_var").unwrap();
+        drop(f);
+
+        let mut config = PreprocConfig::default();
+        config.include_paths.push(dir);
+        let src = "#include \"test_pp_include.inc\"\nreal :: x\n";
+        let result = preprocess(src, &config).unwrap();
+        assert!(result.text.contains("integer :: included_var"), "got: {:?}", result.text);
+        assert!(result.text.contains("real :: x"));
+    }
+
+    #[test]
+    fn include_defines_propagate() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let inc_path = dir.join("test_pp_define.inc");
+        let mut f = std::fs::File::create(&inc_path).unwrap();
+        writeln!(f, "#define INCLUDED_VAL 99").unwrap();
+        drop(f);
+
+        let mut config = PreprocConfig::default();
+        config.include_paths.push(dir);
+        let src = "#include \"test_pp_define.inc\"\nx = INCLUDED_VAL\n";
+        let result = preprocess(src, &config).unwrap();
+        assert!(result.text.contains("x = 99"), "got: {:?}", result.text);
     }
 }
