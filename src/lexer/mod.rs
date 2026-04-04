@@ -608,14 +608,29 @@ impl<'a> Lexer<'a> {
 
         // Decimal point.
         if self.peek() == b'.' {
-            // Could be a dot-operator after an integer: `1.and.2` or `1.eq.2`
-            // The dot is part of the number if followed by: digit, exponent, whitespace/EOF/operator.
-            // The dot is NOT part of the number if followed by a letter (start of dot-op).
+            // Ambiguity: `1.0` (real) vs `1.eq.2` (integer .eq. integer).
+            // The dot is part of the number ONLY if what follows is clearly numeric.
             let next = self.peek2();
-            let dot_is_numeric = next.is_ascii_digit()
-                || text.is_empty() // leading dot (.5)
-                || matches!(next, b'e' | b'E' | b'd' | b'D')
-                || !next.is_ascii_alphabetic(); // 5. followed by space/op/newline/EOF
+
+            let dot_is_numeric = if text.is_empty() {
+                // Leading dot (.5) — always numeric.
+                true
+            } else if next.is_ascii_digit() {
+                // 1.5 — digit after dot, clearly a real.
+                true
+            } else if matches!(next, b'e' | b'E' | b'd' | b'D') {
+                // Could be 1.0e5 (exponent) or 1.eq.2 (dot-operator).
+                // Lookahead past the e/d: if next is digit or +/-, it's an exponent.
+                // If it's another letter (like 'q' in 'eq'), it's a dot-operator.
+                let after_ed = if self.pos + 2 < self.src.len() { self.src[self.pos + 2] } else { 0 };
+                matches!(after_ed, b'0'..=b'9' | b'+' | b'-')
+            } else if !next.is_ascii_alphabetic() {
+                // 5. followed by space/operator/newline/EOF — trailing dot real.
+                true
+            } else {
+                // 1.and.2 — dot followed by letter that's not a valid exponent start.
+                false
+            };
 
             if dot_is_numeric {
                 is_real = true;
@@ -1209,12 +1224,65 @@ mod tests {
     }
 
     #[test]
-    fn integer_dot_and() {
-        // 1.and.2 — should be: integer, .and., integer
-        // The dot after 1 is NOT part of a real because next is 'a', not digit.
+    fn integer_dot_and_with_spaces() {
         let k = kinds("a .and. b");
         assert_eq!(k, vec![
             TokenKind::Identifier, TokenKind::DotOp("and".into()), TokenKind::Identifier,
+        ]);
+    }
+
+    #[test]
+    fn integer_dot_eq_no_spaces() {
+        // Critical ambiguity: 1.eq.2 must NOT be parsed as a real with exponent.
+        // It's: integer(1), .eq., integer(2)
+        let k = kinds("1.eq.2");
+        assert_eq!(k, vec![
+            TokenKind::IntegerLiteral, TokenKind::DotOp("eq".into()), TokenKind::IntegerLiteral,
+        ]);
+    }
+
+    #[test]
+    fn integer_dot_and_no_spaces() {
+        let k = kinds("1.and.2");
+        assert_eq!(k, vec![
+            TokenKind::IntegerLiteral, TokenKind::DotOp("and".into()), TokenKind::IntegerLiteral,
+        ]);
+    }
+
+    #[test]
+    fn integer_dot_ne_no_spaces() {
+        let k = kinds("x.ne.y");
+        assert_eq!(k, vec![
+            TokenKind::Identifier, TokenKind::DotOp("ne".into()), TokenKind::Identifier,
+        ]);
+    }
+
+    #[test]
+    fn real_with_exponent_not_dot_op() {
+        // 1.0e5 is a real, not 1 .0e5
+        assert_eq!(kinds("1.0e5"), vec![TokenKind::RealLiteral]);
+        assert_eq!(texts("1.0e5"), vec!["1.0e5"]);
+    }
+
+    #[test]
+    fn real_with_d_exponent_not_dot_op() {
+        // 1.0d0 is a double-precision real
+        assert_eq!(kinds("1.0d0"), vec![TokenKind::RealLiteral]);
+    }
+
+    #[test]
+    fn real_dot_e_plus_is_exponent() {
+        // 1.e+5 — the e is followed by + so it's an exponent
+        assert_eq!(kinds("1.e+5"), vec![TokenKind::RealLiteral]);
+        assert_eq!(texts("1.e+5"), vec!["1.e+5"]);
+    }
+
+    #[test]
+    fn five_dot_eq_three() {
+        // 5.eq.3 — integer, .eq., integer (not a real)
+        let k = kinds("5.eq.3");
+        assert_eq!(k, vec![
+            TokenKind::IntegerLiteral, TokenKind::DotOp("eq".into()), TokenKind::IntegerLiteral,
         ]);
     }
 
