@@ -296,15 +296,48 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
 
 // ---- Helpers ----
 
+/// Extract a compile-time integer kind value from a KindSelector.
+fn extract_kind(sel: &Option<decl::KindSelector>) -> Option<u8> {
+    use crate::ast::expr::Expr;
+    match sel {
+        Some(decl::KindSelector::Expr(e)) | Some(decl::KindSelector::Star(e)) => {
+            if let Expr::IntegerLiteral { text, .. } = &e.node {
+                text.parse().ok()
+            } else { None }
+        }
+        None => None,
+    }
+}
+
+/// Extract character length from a CharSelector.
+fn extract_char_len(sel: &Option<decl::CharSelector>) -> Option<i64> {
+    use crate::ast::expr::Expr;
+    match sel {
+        Some(cs) => {
+            match &cs.len {
+                Some(decl::LenSpec::Expr(e)) => {
+                    if let Expr::IntegerLiteral { text, .. } = &e.node {
+                        text.parse().ok()
+                    } else { None }
+                }
+                Some(decl::LenSpec::Star) => None, // assumed length
+                Some(decl::LenSpec::Colon) => None, // deferred length
+                None => None,
+            }
+        }
+        None => None,
+    }
+}
+
 fn type_spec_to_info(ts: &TypeSpec) -> TypeInfo {
     match ts {
-        TypeSpec::Integer(_) => TypeInfo::Integer { kind: None },
-        TypeSpec::Real(_) => TypeInfo::Real { kind: None },
+        TypeSpec::Integer(sel) => TypeInfo::Integer { kind: extract_kind(sel) },
+        TypeSpec::Real(sel) => TypeInfo::Real { kind: extract_kind(sel) },
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
-        TypeSpec::Complex(_) => TypeInfo::Complex { kind: None },
+        TypeSpec::Complex(sel) => TypeInfo::Complex { kind: extract_kind(sel) },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
-        TypeSpec::Logical(_) => TypeInfo::Logical { kind: None },
-        TypeSpec::Character(_) => TypeInfo::Character { len: None, kind: None },
+        TypeSpec::Logical(sel) => TypeInfo::Logical { kind: extract_kind(sel) },
+        TypeSpec::Character(sel) => TypeInfo::Character { len: extract_char_len(sel), kind: None },
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
         TypeSpec::ClassStar => TypeInfo::ClassStar,
