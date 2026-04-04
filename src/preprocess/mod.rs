@@ -17,6 +17,8 @@ pub struct PreprocConfig {
     pub include_paths: Vec<PathBuf>,
     /// The source filename (for __FILE__ and error messages).
     pub filename: String,
+    /// If true, source is fixed-form Fortran (C/* in column 1 = comment).
+    pub fixed_form: bool,
 }
 
 impl Default for PreprocConfig {
@@ -30,11 +32,14 @@ impl Default for PreprocConfig {
         defines.insert("__arm64__".into(), MacroDef::object("1"));
         #[cfg(target_os = "macos")]
         defines.insert("__APPLE__".into(), MacroDef::object("1"));
+        #[cfg(target_os = "linux")]
+        defines.insert("__linux__".into(), MacroDef::object("1"));
 
         Self {
             defines,
             include_paths: Vec::new(),
             filename: "<input>".into(),
+            fixed_form: false,
         }
     }
 }
@@ -120,6 +125,8 @@ struct Preprocessor {
     cond_stack: Vec<CondState>,
     /// Include depth for recursion guard.
     include_depth: u32,
+    /// Fixed-form source mode.
+    fixed_form: bool,
 }
 
 impl Preprocessor {
@@ -127,6 +134,7 @@ impl Preprocessor {
         Self {
             defines: config.defines.clone(),
             include_paths: config.include_paths.clone(),
+            fixed_form: config.fixed_form,
             cond_stack: Vec::new(),
             include_depth: 0,
         }
@@ -163,7 +171,7 @@ impl Preprocessor {
         // Set dynamic macros.
         self.defines.insert("__FILE__".into(), MacroDef::object(&format!("\"{}\"", filename)));
 
-        let now = chrono_stub();
+        let now = current_datetime();
         self.defines.insert("__DATE__".into(), MacroDef::object(&format!("\"{}\"", now.0)));
         self.defines.insert("__TIME__".into(), MacroDef::object(&format!("\"{}\"", now.1)));
 
@@ -175,7 +183,7 @@ impl Preprocessor {
             let orig_line_num = (i + 1) as u32; // 1-based, tracks original source line
             let mut logical_line = String::new();
 
-            // Join backslash-continued lines.
+            // Join backslash-continued lines (C-style).
             while i < raw_lines.len() && raw_lines[i].ends_with('\\') {
                 logical_line.push_str(&raw_lines[i][..raw_lines[i].len() - 1]);
                 i += 1;
@@ -185,11 +193,45 @@ impl Preprocessor {
                 i += 1;
             }
 
+            // Also join Fortran &-continued lines (free-form).
+            // A line ending with & (before any comment) continues on the next line.
+            if !self.fixed_form {
+                while logical_line.trim_end().ends_with('&') {
+                    // Remove the trailing &.
+                    let trimmed_len = logical_line.trim_end().len();
+                    logical_line.truncate(trimmed_len - 1);
+                    // Consume the next line, skipping leading & if present.
+                    if i < raw_lines.len() {
+                        let next = raw_lines[i].trim_start();
+                        let next = next.strip_prefix('&').unwrap_or(next);
+                        logical_line.push_str(next);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             // Update __LINE__ to the original starting line of this logical line.
             self.defines.insert("__LINE__".into(), MacroDef::object(&orig_line_num.to_string()));
 
+            // Fixed-form: C, c, or * in column 1 is a comment line.
+            if self.fixed_form {
+                let first = logical_line.as_bytes().first().copied().unwrap_or(0);
+                if first == b'C' || first == b'c' || first == b'*' {
+                    // Comment line — emit as-is without expansion.
+                    if self.is_emitting() {
+                        output.push_str(&logical_line);
+                    }
+                    output.push('\n');
+                    source_map.push(SourceLoc { filename: filename.into(), line: orig_line_num });
+                    continue;
+                }
+            }
+
             let trimmed = logical_line.trim_start();
 
+            // Preprocessor directives: # in column 1 (or after whitespace in free-form).
             if trimmed.starts_with('#') {
                 self.process_directive(trimmed, filename, orig_line_num, output, source_map)?;
                 output.push('\n');
@@ -473,6 +515,22 @@ impl Preprocessor {
         let mut chars = expr.chars().peekable();
 
         while let Some(&ch) = chars.peek() {
+            // Skip numeric literals (including hex like 0xFF) without treating as identifiers.
+            if ch.is_ascii_digit() {
+                result.push(ch);
+                chars.next();
+                // Consume the rest of the number (digits, hex chars after 0x, etc.)
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        result.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+
             if ch.is_alphabetic() || ch == '_' {
                 let mut ident = String::new();
                 while let Some(&c) = chars.peek() {
@@ -951,10 +1009,50 @@ fn join_continuations(source: &str) -> String {
     result
 }
 
-/// Stub for date/time — returns fixed values.
-/// In production, would use actual system time.
-fn chrono_stub() -> (String, String) {
-    ("Jan  1 2026".into(), "00:00:00".into())
+/// Get current date and time strings for __DATE__ and __TIME__.
+fn current_datetime() -> (String, String) {
+    use std::time::SystemTime;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Convert epoch seconds to date/time components.
+    // Simple conversion without external crates.
+    let secs_per_day = 86400u64;
+    let days = now / secs_per_day;
+    let time_of_day = now % secs_per_day;
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Days since epoch to year/month/day (simplified Gregorian).
+    let (year, month, day) = epoch_days_to_date(days);
+
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month_name = months.get(month as usize).unwrap_or(&"???");
+
+    let date = format!("{} {:2} {}", month_name, day, year);
+    let time = format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
+    (date, time)
+}
+
+fn epoch_days_to_date(mut days: u64) -> (u64, u64, u64) {
+    // Algorithm from Howard Hinnant's date library (public domain).
+    days += 719468;
+    let era = days / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m - 1, d) // month is 0-based for array indexing
 }
 
 #[cfg(test)]
@@ -1584,5 +1682,109 @@ deep
         let src = "#include \"test_pp_define.inc\"\nx = INCLUDED_VAL\n";
         let result = preprocess(src, &config).unwrap();
         assert!(result.text.contains("x = 99"), "got: {:?}", result.text);
+    }
+
+    // ---- Fixed-form awareness ----
+
+    #[test]
+    fn fixed_form_comment_not_expanded() {
+        let mut config = PreprocConfig::default();
+        config.fixed_form = true;
+        config.defines.insert("FOO".into(), MacroDef::object("BAR"));
+        let result = preprocess("C     FOO is a comment\n      x = FOO\n", &config).unwrap();
+        // C-line should not have FOO expanded.
+        assert!(result.text.contains("C     FOO is a comment"), "got: {:?}", result.text);
+        // Continuation line should expand FOO.
+        assert!(result.text.contains("x = BAR"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn fixed_form_star_comment() {
+        let mut config = PreprocConfig::default();
+        config.fixed_form = true;
+        config.defines.insert("FOO".into(), MacroDef::object("BAR"));
+        let result = preprocess("*     FOO is a comment\n", &config).unwrap();
+        assert!(result.text.contains("*     FOO is a comment"), "got: {:?}", result.text);
+    }
+
+    // ---- Fortran & continuation ----
+
+    #[test]
+    fn fortran_ampersand_continuation() {
+        let out = pp_with("x = FOO + &\n    BAR\n", &[("FOO", "1"), ("BAR", "2")]);
+        assert!(out.contains("x = 1 + 2"), "got: {:?}", out.lines().collect::<Vec<_>>());
+    }
+
+    // ---- __DATE__ and __TIME__ ----
+
+    #[test]
+    fn date_macro_not_empty() {
+        let out = pp("x = __DATE__\n");
+        // Should contain a quoted date string, not empty.
+        assert!(out.contains("\""), "got: {:?}", out);
+        assert!(!out.contains("__DATE__"), "macro not expanded: {:?}", out);
+    }
+
+    #[test]
+    fn time_macro_has_colons() {
+        let out = pp("x = __TIME__\n");
+        assert!(out.contains(":"), "got: {:?}", out);
+    }
+
+    // ---- __FILE__ ----
+
+    #[test]
+    fn file_macro() {
+        let mut config = PreprocConfig::default();
+        config.filename = "test.f90".into();
+        let result = preprocess("x = __FILE__\n", &config).unwrap();
+        assert!(result.text.contains("\"test.f90\""), "got: {:?}", result.text);
+    }
+
+    // ---- defined without parens ----
+
+    #[test]
+    fn defined_without_parens() {
+        let out = pp_with("#if defined FEAT\nyes\n#endif\n", &[("FEAT", "1")]);
+        assert!(lines(&out).contains(&"yes"));
+    }
+
+    // ---- Multi-elif chain ----
+
+    #[test]
+    fn multi_elif_chain() {
+        let out = pp_with(
+            "#if X == 1\nfirst\n#elif X == 2\nsecond\n#elif X == 3\nthird\n#else\nother\n#endif\n",
+            &[("X", "2")],
+        );
+        assert!(lines(&out).contains(&"second"));
+        assert!(!lines(&out).contains(&"first"));
+        assert!(!lines(&out).contains(&"third"));
+        assert!(!lines(&out).contains(&"other"));
+    }
+
+    // ---- #error inside #if 0 should not trigger ----
+
+    #[test]
+    fn error_inside_if_zero_does_not_trigger() {
+        let out = pp("#if 0\n#error this should not fire\n#endif\nok\n");
+        assert!(lines(&out).contains(&"ok"));
+    }
+
+    // ---- #if with hex ----
+
+    #[test]
+    fn if_hex_comparison() {
+        let out = pp("#if 0xFF > 200\nyes\n#endif\n");
+        assert!(lines(&out).contains(&"yes"));
+    }
+
+    // ---- Object macro with space before paren is not function-like ----
+
+    #[test]
+    fn define_with_space_before_paren_is_object() {
+        // #define FOO (x) should be object-like with body "(x)", not function-like.
+        let out = pp("#define FOO (x)\ny = FOO\n");
+        assert!(out.contains("y = (x)"), "got: {:?}", out);
     }
 }
