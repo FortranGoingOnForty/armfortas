@@ -118,10 +118,21 @@ pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option
     let left_kind = left.kind().unwrap_or(4);
     let right_kind = right.kind().unwrap_or(4);
 
-    // Promote to the wider type class and the larger kind.
-    // F2018 10.1.5.5: kind parameter is max of both operands' kinds.
+    // Promote to the wider type class.
+    // F2018 Table 10.2:
+    //   same type class → max(kind_a, kind_b)
+    //   integer + real/complex → real/complex kind (integer kind discarded)
+    //   real + complex → max(kind_a, kind_b)
     let result_rank = left_rank.max(right_rank);
-    let result_kind = left_kind.max(right_kind);
+    let result_kind = if left_rank == right_rank {
+        left_kind.max(right_kind)  // same type class: max kind
+    } else if left_rank == 1 {
+        right_kind  // integer + real/complex: use real/complex kind
+    } else if right_rank == 1 {
+        left_kind   // real/complex + integer: use real/complex kind
+    } else {
+        left_kind.max(right_kind)  // real + complex: max kind
+    };
 
     Some(match result_rank {
         1 => FortranType::Integer { kind: result_kind },
@@ -132,23 +143,23 @@ pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option
 }
 
 /// Compute the result type of a power operation.
-/// integer ** integer → integer; real ** integer → real (special case).
+/// integer ** integer → integer; otherwise uses arithmetic promotion.
+/// F2018 10.1.5.6: integer ** integer is integer; all other cases
+/// follow the same rules as binary arithmetic (Table 10.2).
 pub fn power_result_type(base: &FortranType, exponent: &FortranType) -> Option<FortranType> {
     if !base.is_numeric() || !exponent.is_numeric() {
         return None;
     }
-    // If both integer, result is integer.
+    // If both integer, result is integer with max kind.
     if matches!(base, FortranType::Integer { .. }) && matches!(exponent, FortranType::Integer { .. }) {
         let kind = base.kind().unwrap_or(4).max(exponent.kind().unwrap_or(4));
         return Some(FortranType::Integer { kind });
     }
-    // Otherwise, promote base to at least real, then apply normal promotion with exponent.
-    let promoted_base = if matches!(base, FortranType::Integer { .. }) {
-        FortranType::Real { kind: base.kind().unwrap_or(4) }
-    } else {
-        base.clone()
-    };
-    arithmetic_result_type(&promoted_base, exponent).or(Some(promoted_base))
+    // Otherwise, apply normal arithmetic promotion rules.
+    // For integer ** real(k): Table 10.2 gives real(k) (integer kind discarded).
+    // For real(k) ** integer: result is real(k) (integer kind discarded).
+    // For real(j) ** complex(k): complex(max(j,k)).
+    arithmetic_result_type(base, exponent)
 }
 
 /// Comparison operators always produce logical.
@@ -1592,7 +1603,7 @@ mod tests {
 
     #[test]
     fn real8_plus_complex4_promotes_kind() {
-        // real(8) + complex(4) → complex(8), not complex(4)
+        // real(8) + complex(4) → complex(8) — real+complex uses max kind
         let result = arithmetic_result_type(
             &FortranType::Real { kind: 8 },
             &FortranType::Complex { kind: 4 },
@@ -1601,23 +1612,33 @@ mod tests {
     }
 
     #[test]
-    fn int8_plus_real4_promotes_kind() {
-        // integer(8) + real(4) → real(8), not real(4)
+    fn int8_plus_real4_uses_real_kind() {
+        // integer(8) + real(4) → real(4) — integer kind discarded per F2018 Table 10.2
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 8 },
             &FortranType::Real { kind: 4 },
         ).unwrap();
-        assert_eq!(result, FortranType::Real { kind: 8 });
+        assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
     #[test]
-    fn int8_plus_complex4_promotes_kind() {
-        // integer(8) + complex(4) → complex(8)
+    fn int8_plus_complex4_uses_complex_kind() {
+        // integer(8) + complex(4) → complex(4) — integer kind discarded
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 8 },
             &FortranType::Complex { kind: 4 },
         ).unwrap();
-        assert_eq!(result, FortranType::Complex { kind: 8 });
+        assert_eq!(result, FortranType::Complex { kind: 4 });
+    }
+
+    #[test]
+    fn real4_plus_int8_uses_real_kind() {
+        // real(4) + integer(8) → real(4) — symmetric
+        let result = arithmetic_result_type(
+            &FortranType::Real { kind: 4 },
+            &FortranType::Integer { kind: 8 },
+        ).unwrap();
+        assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
     // ---- Audit fix: C3 — positional after keyword ----
