@@ -227,17 +227,36 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 def: Some(dest),
             });
         }
-        InstKind::FPow(_, _) => {
-            // FPow requires a runtime call (pow/powf). Emit BL to external.
+        InstKind::FPow(a, b) => {
+            // FPow requires a runtime call (pow/powf).
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
             let func_name = match &inst.ty {
-                IrType::Float(FloatWidth::F32) => "powf",
-                _ => "pow",
+                IrType::Float(FloatWidth::F32) => "_powf",
+                _ => "_pow",
             };
+            // Move args to d0, d1.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![MachineOperand::PhysReg(PhysReg::Fp(0)), MachineOperand::VReg(va)],
+                def: None,
+            });
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![MachineOperand::PhysReg(PhysReg::Fp(1)), MachineOperand::VReg(vb)],
+                def: None,
+            });
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::Bl,
                 operands: vec![MachineOperand::Extern(func_name.into())],
+                def: None,
+            });
+            // Result in d0.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(PhysReg::Fp(0))],
                 def: Some(dest),
             });
         }
@@ -480,29 +499,76 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
 
         // ---- Calls ----
         InstKind::Call(..) | InstKind::RuntimeCall(..) => {
-            let label = match &inst.kind {
-                InstKind::Call(FuncRef::External(name), _) => name.clone(),
-                InstKind::Call(FuncRef::Internal(idx), _) => format!("_func_{}", idx),
-                InstKind::RuntimeCall(rf, _) => runtime_func_symbol(rf),
+            let (label, args) = match &inst.kind {
+                InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice()),
+                InstKind::Call(FuncRef::Internal(idx), args) => (format!("_func_{}", idx), args.as_slice()),
+                InstKind::RuntimeCall(rf, args) => (runtime_func_symbol(rf), args.as_slice()),
                 _ => unreachable!(),
             };
-            // TODO: move args to X0-X7/D0-D7 per AAPCS64.
-            // For now, just emit the BL.
+
+            // Move arguments to physical registers per AAPCS64.
+            // Integer/pointer args → x0-x7, float args → d0-d7.
+            let mut gp_idx: u8 = 0;
+            let mut fp_idx: u8 = 0;
+            for &arg_val in args {
+                let arg_vreg = ctx.lookup_vreg(arg_val);
+                let arg_class = mf.vregs.iter().find(|v| v.id == arg_vreg).map(|v| v.class);
+                match arg_class {
+                    Some(RegClass::Fp32) | Some(RegClass::Fp64) => {
+                        if fp_idx < 8 {
+                            mf.block_mut(mb).insts.push(MachineInst {
+                                opcode: ArmOpcode::FmovReg,
+                                operands: vec![
+                                    MachineOperand::PhysReg(PhysReg::Fp(fp_idx)),
+                                    MachineOperand::VReg(arg_vreg),
+                                ],
+                                def: None,
+                            });
+                            fp_idx += 1;
+                        }
+                    }
+                    _ => {
+                        if gp_idx < 8 {
+                            mf.block_mut(mb).insts.push(MachineInst {
+                                opcode: ArmOpcode::MovReg,
+                                operands: vec![
+                                    MachineOperand::PhysReg(PhysReg::Gp(gp_idx)),
+                                    MachineOperand::VReg(arg_vreg),
+                                ],
+                                def: None,
+                            });
+                            gp_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            // Emit BL.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern(label)],
+                def: None,
+            });
+
+            // Capture return value from x0 or d0.
             if inst.ty != IrType::Void {
                 let class = type_to_reg_class(&inst.ty);
                 let dest = ctx.get_vreg(mf, inst.id, class);
+                let (src_reg, opcode) = match class {
+                    RegClass::Fp32 | RegClass::Fp64 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
+                    _ => (PhysReg::Gp(0), ArmOpcode::MovReg),
+                };
                 mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Bl,
-                    operands: vec![MachineOperand::Extern(label)],
+                    opcode,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::PhysReg(src_reg),
+                    ],
                     def: Some(dest),
                 });
             } else {
-                ctx.get_vreg(mf, inst.id, RegClass::Gp64); // allocate anyway for void
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Bl,
-                    operands: vec![MachineOperand::Extern(label)],
-                    def: None,
-                });
+                // Still allocate a vreg for void calls (keeps value_map consistent).
+                ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             }
         }
 
