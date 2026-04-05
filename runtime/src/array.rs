@@ -272,8 +272,7 @@ pub extern "C" fn afs_create_section(
     let mut byte_offset: i64 = 0;
     let mut source_multiplier: i64 = 1;
 
-    for i in 0..n_dims as usize {
-        let spec = &specs_slice[i];
+    for (i, spec) in specs_slice.iter().enumerate() {
         let src_dim = &source.dims[i];
 
         // Offset from source lower bound to section start.

@@ -1869,7 +1869,7 @@ fn lower_expr(
                     .find_map(|scope| scope.symbols.get(&key));
                 let ret_ty = callee_sym
                     .and_then(|sym| sym.type_info.as_ref())
-                    .map(|info| crate::sema::types::type_info_to_fortran_type(info))
+                    .map(crate::sema::types::type_info_to_fortran_type)
                     .map(|ft| match ft {
                         crate::sema::types::FortranType::Real { kind } => IrType::float_from_kind(kind),
                         crate::sema::types::FortranType::Integer { kind } => IrType::int_from_kind(kind),

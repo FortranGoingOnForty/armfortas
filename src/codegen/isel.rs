@@ -668,7 +668,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         // ---- Integer extend/truncate ----
-        InstKind::IntExtend(a, target_width, signed) => {
+        InstKind::IntExtend(a, _target_width, signed) => {
             let src = ctx.lookup_vreg(*a);
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);

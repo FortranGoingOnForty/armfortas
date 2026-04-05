@@ -143,7 +143,7 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
         };
 
         // Check for repeat count.
-        let repeat = parse_number(&mut chars).map(|n| if negative { n } else { n });
+        let repeat = parse_number(&mut chars);
 
         skip_spaces(&mut chars);
         if chars.peek().is_none() { break; }
@@ -336,7 +336,7 @@ fn parse_edit_descriptor(
                 'P' => { chars.next(); Some(RoundMode::ProcessorDefined) }
                 _ => None,
             };
-            mode.map(|m| FormatDesc::RoundingMode(m))
+            mode.map(FormatDesc::RoundingMode)
         }
         'B' => {
             // BN or BZ.
@@ -357,7 +357,7 @@ fn parse_real_desc(
 ) -> Option<FormatDesc> {
     let w = parse_number(chars).unwrap_or(0);
     let d = if chars.peek() == Some(&'.') { chars.next(); parse_number(chars).unwrap_or(0) } else { 0 };
-    let e = if chars.peek().map(|c| c.to_ascii_uppercase() == 'E').unwrap_or(false) {
+    let e = if chars.peek().map(|c| c.eq_ignore_ascii_case(&'E')).unwrap_or(false) {
         chars.next();
         parse_number(chars)
     } else { None };

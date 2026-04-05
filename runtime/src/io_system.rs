@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write, BufRead, BufReader, BufWriter, Seek, SeekFrom};
 use std::sync::Mutex;
-use std::ptr;
 
 // ---- Global I/O state ----
 
@@ -29,8 +28,8 @@ fn io_state() -> &'static Mutex<IoState> {
 #[derive(Debug, Clone, PartialEq)]
 enum UnitStatus {
     Open,
-    Closed,
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Access {
@@ -65,10 +64,10 @@ enum UnitStream {
 }
 
 struct Unit {
-    number: i32,
+    _number: i32,
     stream: UnitStream,
     filename: String,
-    status: UnitStatus,
+    _status: UnitStatus,
     access: Access,
     form: Form,
     action: Action,
@@ -170,10 +169,10 @@ impl IoState {
 
         // Preconnected units.
         units.insert(5, Unit {
-            number: 5,
+            _number: 5,
             stream: UnitStream::Stdin,
             filename: "stdin".into(),
-            status: UnitStatus::Open,
+            _status: UnitStatus::Open,
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Read,
@@ -181,10 +180,10 @@ impl IoState {
             read_tokens: Vec::new(),
         });
         units.insert(6, Unit {
-            number: 6,
+            _number: 6,
             stream: UnitStream::Stdout,
             filename: "stdout".into(),
-            status: UnitStatus::Open,
+            _status: UnitStatus::Open,
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
@@ -192,10 +191,10 @@ impl IoState {
             read_tokens: Vec::new(),
         });
         units.insert(0, Unit {
-            number: 0,
+            _number: 0,
             stream: UnitStream::Stderr,
             filename: "stderr".into(),
-            status: UnitStatus::Open,
+            _status: UnitStatus::Open,
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
@@ -220,7 +219,6 @@ impl IoState {
 // ---- Public C API: OPEN/CLOSE ----
 
 /// Open a file and associate it with a unit number.
-#[no_mangle]
 /// OPEN control block — packed struct for passing all OPEN specifiers in one pointer.
 #[repr(C)]
 pub struct OpenControlBlock {
@@ -357,10 +355,10 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 },
             };
             state.units.insert(actual_unit, Unit {
-                number: actual_unit,
+                _number: actual_unit,
                 stream,
                 filename: fname,
-                status: UnitStatus::Open,
+                _status: UnitStatus::Open,
                 access: file_access,
                 form: file_form,
                 action: file_action,
@@ -1094,7 +1092,7 @@ pub extern "C" fn afs_read_internal_int(
     }
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
     let s = &String::from_utf8_lossy(slice);
-    if let Some(token) = s.trim().split_whitespace().next() {
+    if let Some(token) = s.split_whitespace().next() {
         match token.replace(',', "").parse::<i32>() {
             Ok(v) => {
                 if !val.is_null() { unsafe { *val = v; } }
@@ -1122,7 +1120,7 @@ pub extern "C" fn afs_read_internal_real(
     }
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
     let s = &String::from_utf8_lossy(slice);
-    if let Some(token) = s.trim().split_whitespace().next() {
+    if let Some(token) = s.split_whitespace().next() {
         let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
         match normalized.parse::<f64>() {
             Ok(v) => {
@@ -1167,7 +1165,7 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
         match &mut u.stream {
             UnitStream::FileRaw(f) => {
                 // Simple approach: seek backwards byte-by-byte to find newline.
-                let pos = f.seek(SeekFrom::Current(0)).unwrap_or(0);
+                let pos = f.stream_position().unwrap_or(0);
                 if pos <= 1 {
                     let _ = f.seek(SeekFrom::Start(0));
                     if !iostat.is_null() { unsafe { *iostat = 0; } }
@@ -1209,12 +1207,9 @@ pub extern "C" fn afs_endfile(unit: i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.flush();
-        match &mut u.stream {
-            UnitStream::FileRaw(f) => {
-                let pos = f.seek(SeekFrom::Current(0)).unwrap_or(0);
-                let _ = f.set_len(pos); // truncate at current position
-            }
-            _ => {}
+        if let UnitStream::FileRaw(f) = &mut u.stream {
+            let pos = f.stream_position().unwrap_or(0);
+            let _ = f.set_len(pos); // truncate at current position
         }
         if !iostat.is_null() { unsafe { *iostat = 0; } }
     }
@@ -1463,7 +1458,7 @@ struct FmtContext {
 }
 
 thread_local! {
-    static FMT_CTX: RefCell<Option<FmtContext>> = RefCell::new(None);
+    static FMT_CTX: RefCell<Option<FmtContext>> = const { RefCell::new(None) };
 }
 
 /// Begin a formatted write operation. Parses the format string and prepares
