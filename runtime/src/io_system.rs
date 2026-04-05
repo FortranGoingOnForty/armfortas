@@ -70,6 +70,9 @@ struct Unit {
     access: Access,
     form: Form,
     action: Action,
+    /// Buffered tokens from the current input record for list-directed READ.
+    /// Consumed left-to-right. Refilled when empty by reading the next line.
+    read_tokens: Vec<String>,
 }
 
 impl Unit {
@@ -107,6 +110,32 @@ impl Unit {
         Ok(line)
     }
 
+    /// Get the next token for list-directed READ.
+    /// Reads a new line if the token buffer is empty.
+    fn next_read_token(&mut self) -> io::Result<Option<String>> {
+        // Consume from buffer first.
+        if !self.read_tokens.is_empty() {
+            return Ok(Some(self.read_tokens.remove(0)));
+        }
+        // Read a new line and tokenize.
+        let line = self.read_line()?;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            return Ok(None); // EOF or blank line
+        }
+        // Split on whitespace and commas.
+        let tokens: Vec<String> = trimmed
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        self.read_tokens = tokens;
+        Ok(Some(self.read_tokens.remove(0)))
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.stream {
             UnitStream::Stdout => io::stdout().flush(),
@@ -137,6 +166,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Read,
+            read_tokens: Vec::new(),
         });
         units.insert(6, Unit {
             number: 6,
@@ -146,6 +176,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
+            read_tokens: Vec::new(),
         });
         units.insert(0, Unit {
             number: 0,
@@ -155,6 +186,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
+            read_tokens: Vec::new(),
         });
 
         Self { units, next_newunit: -10 }
@@ -228,6 +260,12 @@ pub extern "C" fn afs_open(
         _ => { opts.read(true).write(true).create(true); }
     }
 
+    // Flush and close existing unit if re-opening.
+    if let Some(mut existing) = state.units.remove(&actual_unit) {
+        let _ = existing.flush();
+        // Drop closes the file handle.
+    }
+
     match opts.open(&fname) {
         Ok(file) => {
             let file_action = match effective_action {
@@ -247,6 +285,7 @@ pub extern "C" fn afs_open(
                 access: Access::Sequential,
                 form: Form::Formatted,
                 action: file_action,
+                read_tokens: Vec::new(),
             });
             if !iostat.is_null() { unsafe { *iostat = 0; } }
         }
@@ -346,73 +385,120 @@ pub extern "C" fn afs_write_newline(unit: i32) {
 
 // ---- Public C API: List-directed READ ----
 
-/// Read an integer value (list-directed) from a unit.
+/// Read an i32 value (list-directed) from a unit.
+/// Uses token buffer: multiple values on one line are consumed left-to-right.
 #[no_mangle]
 pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        match u.read_line() {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    if !iostat.is_null() { unsafe { *iostat = -1; } } // EOF
-                    return;
-                }
-                // Parse first token as integer.
-                if let Some(token) = trimmed.split_whitespace().next() {
-                    match token.replace(',', "").parse::<i32>() {
-                        Ok(v) => {
-                            if !val.is_null() { unsafe { *val = v; } }
-                            if !iostat.is_null() { unsafe { *iostat = 0; } }
-                        }
-                        Err(_) => {
-                            if !iostat.is_null() { unsafe { *iostat = 1; } }
-                            else {
-                                eprintln!("READ: cannot parse integer from '{}'", token);
-                                std::process::exit(1);
-                            }
-                        }
+        match u.next_read_token() {
+            Ok(Some(token)) => {
+                match token.parse::<i32>() {
+                    Ok(v) => {
+                        if !val.is_null() { unsafe { *val = v; } }
+                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    }
+                    Err(_) => {
+                        if !iostat.is_null() { unsafe { *iostat = 1; } }
+                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
                     }
                 }
             }
+            Ok(None) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                else { eprintln!("READ: end of file"); std::process::exit(1); }
+            }
             Err(e) => {
-                if !iostat.is_null() {
-                    unsafe { *iostat = if e.kind() == io::ErrorKind::UnexpectedEof { -1 } else { 1 }; }
-                } else {
-                    eprintln!("READ: {}", e);
-                    std::process::exit(1);
-                }
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                else { eprintln!("READ: {}", e); std::process::exit(1); }
             }
         }
     }
 }
 
-/// Read a real value (list-directed).
+/// Read an i64 value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match u.next_read_token() {
+            Ok(Some(token)) => {
+                match token.parse::<i64>() {
+                    Ok(v) => {
+                        if !val.is_null() { unsafe { *val = v; } }
+                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    }
+                    Err(_) => {
+                        if !iostat.is_null() { unsafe { *iostat = 1; } }
+                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
+                    }
+                }
+            }
+            Ok(None) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    }
+}
+
+/// Read an f32 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        match u.read_line() {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if let Some(token) = trimmed.split_whitespace().next() {
-                    match token.replace(',', "").parse::<f32>() {
-                        Ok(v) => {
-                            if !val.is_null() { unsafe { *val = v; } }
-                            if !iostat.is_null() { unsafe { *iostat = 0; } }
-                        }
-                        Err(_) => {
-                            if !iostat.is_null() { unsafe { *iostat = 1; } }
-                            else {
-                                eprintln!("READ: cannot parse real from '{}'", token);
-                                std::process::exit(1);
-                            }
-                        }
+        match u.next_read_token() {
+            Ok(Some(token)) => {
+                // Handle Fortran D-exponent: replace D with E for parsing.
+                let normalized = token.replace('d', "e").replace('D', "E");
+                match normalized.parse::<f32>() {
+                    Ok(v) => {
+                        if !val.is_null() { unsafe { *val = v; } }
+                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    }
+                    Err(_) => {
+                        if !iostat.is_null() { unsafe { *iostat = 1; } }
+                        else { eprintln!("READ: cannot parse real from '{}'", token); std::process::exit(1); }
                     }
                 }
             }
+            Ok(None) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                else { eprintln!("READ: end of file"); std::process::exit(1); }
+            }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = -1; } }
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    }
+}
+
+/// Read an f64 value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match u.next_read_token() {
+            Ok(Some(token)) => {
+                let normalized = token.replace('d', "e").replace('D', "E");
+                match normalized.parse::<f64>() {
+                    Ok(v) => {
+                        if !val.is_null() { unsafe { *val = v; } }
+                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    }
+                    Err(_) => {
+                        if !iostat.is_null() { unsafe { *iostat = 1; } }
+                        else { eprintln!("READ: cannot parse real from '{}'", token); std::process::exit(1); }
+                    }
+                }
+            }
+            Ok(None) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
             }
         }
     }
