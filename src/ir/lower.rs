@@ -1005,7 +1005,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         };
                         let ty = &info.ty;
                         let func_name = match ty {
+                            IrType::Int(IntWidth::I64) => "afs_read_int64",
                             IrType::Int(_) => "afs_read_int",
+                            IrType::Float(FloatWidth::F64) => "afs_read_real64",
                             IrType::Float(_) => "afs_read_real",
                             _ => "afs_read_int",
                         };
