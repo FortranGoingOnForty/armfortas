@@ -947,50 +947,45 @@ pub extern "C" fn afs_read_namelist(
                 } else { after_name }
             } else { "" };
 
-            // Parse var=val pairs.
+            // Parse var=val pairs. Supports:
+            //   var=val            — simple scalar assignment
+            //   var(index)=val     — array element assignment (1-based)
+            //   var=n*val          — repeat notation (set n consecutive elements)
             for pair in content.split(',') {
                 let pair = pair.trim();
                 if let Some(eq_pos) = pair.find('=') {
-                    let var_name = pair[..eq_pos].trim().to_lowercase();
+                    let lhs = pair[..eq_pos].trim().to_lowercase();
                     let val_str = pair[eq_pos+1..].trim();
+
+                    // Parse array index from "var(idx)" syntax.
+                    let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
+                        let name = lhs[..paren].trim();
+                        let idx_str = lhs[paren+1..].trim_end_matches(')').trim();
+                        let idx = idx_str.parse::<usize>().unwrap_or(1);
+                        (name.to_string(), Some(idx))
+                    } else {
+                        (lhs, None)
+                    };
+
+                    // Parse repeat notation "n*val".
+                    let (repeat_count, actual_val) = if let Some(star) = val_str.find('*') {
+                        // Make sure * is preceded by digits (not part of a number like 1.5E*).
+                        let before = val_str[..star].trim();
+                        if let Ok(n) = before.parse::<usize>() {
+                            (n, val_str[star+1..].trim())
+                        } else {
+                            (1, val_str)
+                        }
+                    } else {
+                        (1, val_str)
+                    };
 
                     // Find the matching entry.
                     for entry in entries_slice {
+                        if entry.data.is_null() { continue; }
                         let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
                         if ename == var_name {
-                            match entry.data_type {
-                                0 => { // integer
-                                    if let Ok(v) = val_str.parse::<i32>() {
-                                        unsafe { *(entry.data as *mut i32) = v; }
-                                    }
-                                }
-                                1 => { // real
-                                    let normalized = val_str.replace('d', "e").replace('D', "E");
-                                    if let Ok(v) = normalized.parse::<f64>() {
-                                        unsafe { *(entry.data as *mut f64) = v; }
-                                    }
-                                }
-                                2 => { // string
-                                    let s = val_str.trim_matches('\'').trim_matches('"');
-                                    let bytes = s.as_bytes();
-                                    let copy_len = bytes.len().min(entry.data_len as usize);
-                                    if !entry.data.is_null() && copy_len > 0 {
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
-                                            if copy_len < entry.data_len as usize {
-                                                std::ptr::write_bytes(entry.data.add(copy_len), b' ',
-                                                    entry.data_len as usize - copy_len);
-                                            }
-                                        }
-                                    }
-                                }
-                                3 => { // logical
-                                    let lower = val_str.to_lowercase();
-                                    let v = lower.starts_with(".t") || lower.starts_with("t");
-                                    unsafe { *(entry.data as *mut i32) = v as i32; }
-                                }
-                                _ => {}
-                            }
+                            namelist_assign_value(entry, actual_val, array_index, repeat_count);
                             break;
                         }
                     }
@@ -998,6 +993,57 @@ pub extern "C" fn afs_read_namelist(
             }
         }
         if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
+/// Assign a parsed NAMELIST value to an entry, handling array indexing and repeat.
+fn namelist_assign_value(entry: &NamelistEntry, val_str: &str, index: Option<usize>, repeat: usize) {
+    // For array elements, compute byte offset from 1-based index.
+    let elem_size = match entry.data_type {
+        0 => 4,  // integer (i32)
+        1 => 8,  // real (f64)
+        3 => 4,  // logical (i32)
+        _ => 1,  // string
+    };
+    let base_offset = index.map(|i| (i.saturating_sub(1)) * elem_size).unwrap_or(0);
+
+    for r in 0..repeat {
+        let offset = base_offset + r * elem_size;
+        let ptr = unsafe { entry.data.add(offset) };
+        match entry.data_type {
+            0 => { // integer
+                if let Ok(v) = val_str.parse::<i32>() {
+                    unsafe { *(ptr as *mut i32) = v; }
+                }
+            }
+            1 => { // real
+                let normalized = val_str.replace('d', "e").replace('D', "E");
+                if let Ok(v) = normalized.parse::<f64>() {
+                    unsafe { *(ptr as *mut f64) = v; }
+                }
+            }
+            2 => { // string (only first element for repeat, no array stride for strings)
+                let s = val_str.trim_matches('\'').trim_matches('"');
+                let bytes = s.as_bytes();
+                let copy_len = bytes.len().min(entry.data_len as usize);
+                if copy_len > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
+                        if copy_len < entry.data_len as usize {
+                            std::ptr::write_bytes(entry.data.add(copy_len), b' ',
+                                entry.data_len as usize - copy_len);
+                        }
+                    }
+                }
+                return; // string repeat doesn't make sense
+            }
+            3 => { // logical
+                let lower = val_str.to_lowercase();
+                let v = lower.starts_with(".t") || lower.starts_with("t");
+                unsafe { *(ptr as *mut i32) = v as i32; }
+            }
+            _ => {}
+        }
     }
 }
 
