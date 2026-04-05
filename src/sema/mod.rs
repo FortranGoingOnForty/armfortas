@@ -7,3 +7,4 @@ pub mod symtab;
 pub mod resolve;
 pub mod types;
 pub mod validate;
+pub mod intrinsic_modules;

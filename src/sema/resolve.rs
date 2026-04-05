@@ -12,6 +12,9 @@ use super::symtab::*;
 pub fn resolve_file(units: &[SpannedUnit]) -> Result<SymbolTable, SemaError> {
     let mut st = SymbolTable::new();
 
+    // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
+    super::intrinsic_modules::register_intrinsic_modules(&mut st);
+
     // First pass: create module scopes so USE can find them.
     for unit in units {
         if let ProgramUnit::Module { name, .. } = &unit.node {
@@ -482,7 +485,7 @@ end program
     #[test]
     fn derived_type_defined() {
         let st = resolve_source("module m\n  type :: mytype\n    integer :: field\n  end type\nend module\n");
-        let mod_scope = st.scopes.iter().find(|s| matches!(s.kind, ScopeKind::Module(_))).unwrap();
+        let mod_scope = st.scopes.iter().find(|s| matches!(&s.kind, ScopeKind::Module(n) if n == "m")).unwrap();
         assert!(mod_scope.symbols.contains_key("mytype"));
         assert_eq!(mod_scope.symbols["mytype"].kind, SymbolKind::DerivedType);
     }
