@@ -429,6 +429,104 @@ fn unsafe_str(ptr: *const u8, len: i64) -> String {
     }
 }
 
+// ---- IOSTAT constants (iso_fortran_env) ----
+
+/// IOSTAT_END: end-of-file encountered during input.
+pub const IOSTAT_END: i32 = -1;
+/// IOSTAT_EOR: end-of-record encountered during non-advancing input.
+pub const IOSTAT_EOR: i32 = -2;
+
+// ---- INQUIRE ----
+
+/// INQUIRE by file: check if a file exists.
+/// Sets exist to 1 (true) or 0 (false).
+#[no_mangle]
+pub extern "C" fn afs_inquire_file(
+    filename: *const u8, filename_len: i64,
+    exist: *mut i32,
+    opened: *mut i32,
+    iostat: *mut i32,
+) {
+    let fname = unsafe_str(filename, filename_len);
+
+    let file_exists = std::path::Path::new(&fname).exists();
+    if !exist.is_null() {
+        unsafe { *exist = file_exists as i32; }
+    }
+
+    if !opened.is_null() {
+        // Check if any unit has this file open.
+        let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        let is_opened = state.units.values().any(|u| u.filename == fname);
+        unsafe { *opened = is_opened as i32; }
+    }
+
+    if !iostat.is_null() {
+        unsafe { *iostat = 0; }
+    }
+}
+
+/// INQUIRE by unit: check if a unit is connected.
+#[no_mangle]
+pub extern "C" fn afs_inquire_unit(
+    unit: i32,
+    exist: *mut i32,
+    opened: *mut i32,
+    iostat: *mut i32,
+) {
+    let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let unit_exists = state.units.contains_key(&unit);
+
+    if !exist.is_null() {
+        unsafe { *exist = unit_exists as i32; }
+    }
+    if !opened.is_null() {
+        unsafe { *opened = unit_exists as i32; }
+    }
+    if !iostat.is_null() {
+        unsafe { *iostat = 0; }
+    }
+}
+
+// ---- FLUSH ----
+
+/// Flush a unit's output buffer.
+#[no_mangle]
+pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match u.flush() {
+            Ok(()) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
+            Err(e) => {
+                if !iostat.is_null() {
+                    unsafe { *iostat = e.raw_os_error().unwrap_or(1); }
+                }
+            }
+        }
+    }
+}
+
+// ---- REWIND / BACKSPACE / ENDFILE ----
+
+/// Rewind a unit to the beginning.
+#[no_mangle]
+pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match &mut u.stream {
+            UnitStream::FileRead(r) => {
+                let _ = r.seek(SeekFrom::Start(0));
+            }
+            UnitStream::FileWrite(w) => {
+                let _ = w.flush();
+                let _ = w.seek(SeekFrom::Start(0));
+            }
+            _ => {}
+        }
+        if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
 // ---- Program lifecycle integration ----
 
 /// Initialize the I/O subsystem. Called from afs_program_init.
