@@ -32,7 +32,7 @@ enum UnitStatus {
     Closed,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Access {
     Sequential,
     Direct,
@@ -238,6 +238,8 @@ pub struct OpenControlBlock {
     pub recl: i64,
     pub iostat: *mut i32,
     pub newunit: *mut i32,
+    pub position: *const u8,
+    pub position_len: i64,
 }
 
 /// Simple OPEN with the most common specifiers (fits in 8 registers).
@@ -258,6 +260,7 @@ pub extern "C" fn afs_open_simple(
         recl: 0,
         iostat: std::ptr::null_mut(),
         newunit: std::ptr::null_mut(),
+        position: std::ptr::null(), position_len: 0,
     };
     afs_open(&cb);
 }
@@ -274,6 +277,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let action_str = unsafe_str(cb.action, cb.action_len).to_lowercase();
     let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
     let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
+    let position_str = unsafe_str(cb.position, cb.position_len).to_lowercase();
     let recl = cb.recl;
     let iostat = cb.iostat;
     let newunit = cb.newunit;
@@ -361,6 +365,30 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 recl: if recl > 0 { Some(recl) } else { None },
                 read_tokens: Vec::new(),
             });
+
+            // Apply POSITION specifier.
+            // Default: REWIND for sequential, ASIS for direct/stream.
+            let pos = match position_str.trim() {
+                "append" => Some(SeekFrom::End(0)),
+                "rewind" => Some(SeekFrom::Start(0)),
+                "asis" => None,
+                "" => match file_access {
+                    Access::Sequential => Some(SeekFrom::Start(0)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(seek) = pos {
+                if let Some(u) = state.get_unit(actual_unit) {
+                    match &mut u.stream {
+                        UnitStream::FileRaw(f) => { let _ = f.seek(seek); }
+                        UnitStream::FileRead(r) => { let _ = r.seek(seek); }
+                        UnitStream::FileWrite(w) => { let _ = w.seek(seek); }
+                        _ => {}
+                    }
+                }
+            }
+
             if !iostat.is_null() { unsafe { *iostat = 0; } }
         }
         Err(e) => {
