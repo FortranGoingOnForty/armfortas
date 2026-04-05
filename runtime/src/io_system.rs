@@ -1153,14 +1153,36 @@ pub const IOSTAT_EOR: i32 = -2;
 
 // ---- INQUIRE ----
 
-/// INQUIRE by file: check if a file exists.
-/// Sets exist to 1 (true) or 0 (false).
+/// Write a Fortran-style string result into a caller-provided buffer.
+/// Pads with spaces to buf_len (Fortran CHARACTER semantics).
+fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let n = buf_len as usize;
+    let val_bytes = value.as_bytes();
+    let copy_len = val_bytes.len().min(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(val_bytes.as_ptr(), buf, copy_len);
+        // Pad remainder with spaces.
+        if copy_len < n {
+            std::ptr::write_bytes(buf.add(copy_len), b' ', n - copy_len);
+        }
+    }
+}
+
+/// INQUIRE by file: check if a file exists, report its properties.
 #[no_mangle]
 pub extern "C" fn afs_inquire_file(
     filename: *const u8, filename_len: i64,
     exist: *mut i32,
     opened: *mut i32,
     iostat: *mut i32,
+    // Extended specifiers — pass null for any not needed.
+    name_buf: *mut u8, name_buf_len: i64,
+    access_buf: *mut u8, access_buf_len: i64,
+    form_buf: *mut u8, form_buf_len: i64,
+    action_buf: *mut u8, action_buf_len: i64,
+    recl_out: *mut i64,
+    size_out: *mut i64,
 ) {
     let fname = unsafe_str(filename, filename_len);
 
@@ -1169,11 +1191,29 @@ pub extern "C" fn afs_inquire_file(
         unsafe { *exist = file_exists as i32; }
     }
 
+    // Find unit connected to this file (if any).
+    let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let connected_unit = state.units.values().find(|u| u.filename == fname);
+
     if !opened.is_null() {
-        // Check if any unit has this file open.
-        let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        let is_opened = state.units.values().any(|u| u.filename == fname);
-        unsafe { *opened = is_opened as i32; }
+        unsafe { *opened = connected_unit.is_some() as i32; }
+    }
+
+    write_inquire_string(name_buf, name_buf_len, &fname);
+
+    if let Some(u) = connected_unit {
+        write_unit_properties(u, access_buf, access_buf_len, form_buf, form_buf_len,
+                              action_buf, action_buf_len, recl_out);
+    } else {
+        write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
+        write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
+        write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+    }
+
+    // File size via metadata.
+    if !size_out.is_null() {
+        let sz = std::fs::metadata(&fname).map(|m| m.len() as i64).unwrap_or(-1);
+        unsafe { *size_out = sz; }
     }
 
     if !iostat.is_null() {
@@ -1181,25 +1221,85 @@ pub extern "C" fn afs_inquire_file(
     }
 }
 
-/// INQUIRE by unit: check if a unit is connected.
+/// INQUIRE by unit: check if a unit is connected, report its properties.
 #[no_mangle]
 pub extern "C" fn afs_inquire_unit(
     unit: i32,
     exist: *mut i32,
     opened: *mut i32,
     iostat: *mut i32,
+    // Extended specifiers.
+    name_buf: *mut u8, name_buf_len: i64,
+    access_buf: *mut u8, access_buf_len: i64,
+    form_buf: *mut u8, form_buf_len: i64,
+    action_buf: *mut u8, action_buf_len: i64,
+    recl_out: *mut i64,
+    size_out: *mut i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let unit_exists = state.units.contains_key(&unit);
+    let unit_entry = state.units.get(&unit);
 
     if !exist.is_null() {
-        unsafe { *exist = unit_exists as i32; }
+        unsafe { *exist = unit_entry.is_some() as i32; }
     }
     if !opened.is_null() {
-        unsafe { *opened = unit_exists as i32; }
+        unsafe { *opened = unit_entry.is_some() as i32; }
     }
+
+    if let Some(u) = unit_entry {
+        write_inquire_string(name_buf, name_buf_len, &u.filename);
+        write_unit_properties(u, access_buf, access_buf_len, form_buf, form_buf_len,
+                              action_buf, action_buf_len, recl_out);
+
+        if !size_out.is_null() {
+            let sz = if !u.filename.is_empty() {
+                std::fs::metadata(&u.filename).map(|m| m.len() as i64).unwrap_or(-1)
+            } else { -1 };
+            unsafe { *size_out = sz; }
+        }
+    } else {
+        write_inquire_string(name_buf, name_buf_len, "");
+        write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
+        write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
+        write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+        if !size_out.is_null() { unsafe { *size_out = -1; } }
+    }
+
     if !iostat.is_null() {
         unsafe { *iostat = 0; }
+    }
+}
+
+/// Write ACCESS, FORM, ACTION, RECL for a connected unit.
+fn write_unit_properties(
+    u: &Unit,
+    access_buf: *mut u8, access_buf_len: i64,
+    form_buf: *mut u8, form_buf_len: i64,
+    action_buf: *mut u8, action_buf_len: i64,
+    recl_out: *mut i64,
+) {
+    let access_str = match u.access {
+        Access::Sequential => "SEQUENTIAL",
+        Access::Direct => "DIRECT",
+        Access::Stream => "STREAM",
+    };
+    write_inquire_string(access_buf, access_buf_len, access_str);
+
+    let form_str = match u.form {
+        Form::Formatted => "FORMATTED",
+        Form::Unformatted => "UNFORMATTED",
+    };
+    write_inquire_string(form_buf, form_buf_len, form_str);
+
+    let action_str = match u.action {
+        Action::Read => "READ",
+        Action::Write => "WRITE",
+        Action::ReadWrite => "READWRITE",
+    };
+    write_inquire_string(action_buf, action_buf_len, action_str);
+
+    if !recl_out.is_null() {
+        unsafe { *recl_out = u.recl.unwrap_or(-1); }
     }
 }
 
