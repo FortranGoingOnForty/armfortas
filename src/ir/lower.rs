@@ -136,34 +136,43 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
-                    Some(Param {
-                        name: n.clone(),
-                        ty: IrType::Ptr(Box::new(elem_ty)),
-                        id: ValueId(i as u32),
-                    })
+                    if arg_has_value_attr(n, decls) {
+                        // VALUE: pass by value (raw type, not pointer).
+                        Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                    } else {
+                        Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                    }
                 } else { None }
             }).collect();
             let mut func = Function::new(name.clone(), params, IrType::Void);
             let mut ctx = LowerCtx::new(st, globals);
 
-            // Collect param info before borrowing func mutably.
-            let param_info: Vec<(String, ValueId, IrType)> = func.params.iter()
+            // Collect param info: (name, param_id, elem_type, is_value).
+            let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
+                    let is_ptr = matches!(&p.ty, IrType::Ptr(_));
                     let elem_ty = match &p.ty {
                         IrType::Ptr(inner) => (**inner).clone(),
                         other => other.clone(),
                     };
-                    (p.name.to_lowercase(), p.id, elem_ty)
+                    (p.name.to_lowercase(), p.id, elem_ty, !is_ptr)
                 })
                 .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
 
-                for (pname, pid, elem_ty) in &param_info {
-                    let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
-                    b.store(*pid, slot);
-                    ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                for (pname, pid, elem_ty, is_value) in &param_info {
+                    if *is_value {
+                        // VALUE param: store directly, access as local (no double deref).
+                        let slot = b.alloca(elem_ty.clone());
+                        b.store(*pid, slot);
+                        ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
+                    } else {
+                        let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
+                        b.store(*pid, slot);
+                        ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                    }
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls);
@@ -180,40 +189,46 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let ret_ty = return_type.as_ref()
                 .map(lower_type_spec)
                 .unwrap_or_else(|| {
-                    // No prefix type — infer from the result variable's declaration.
                     let result_name = result.as_deref().unwrap_or(name.as_str());
                     arg_type_from_decls(result_name, decls)
                 });
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
-                    Some(Param {
-                        name: n.clone(),
-                        ty: IrType::Ptr(Box::new(elem_ty)),
-                        id: ValueId(i as u32),
-                    })
+                    if arg_has_value_attr(n, decls) {
+                        Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                    } else {
+                        Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                    }
                 } else { None }
             }).collect();
             let mut func = Function::new(name.clone(), params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals);
 
-            let param_info: Vec<(String, ValueId, IrType)> = func.params.iter()
+            let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
+                    let is_ptr = matches!(&p.ty, IrType::Ptr(_));
                     let elem_ty = match &p.ty {
                         IrType::Ptr(inner) => (**inner).clone(),
                         other => other.clone(),
                     };
-                    (p.name.to_lowercase(), p.id, elem_ty)
+                    (p.name.to_lowercase(), p.id, elem_ty, !is_ptr)
                 })
                 .collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
 
-                for (pname, pid, elem_ty) in &param_info {
-                    let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
-                    b.store(*pid, slot);
-                    ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                for (pname, pid, elem_ty, is_value) in &param_info {
+                    if *is_value {
+                        let slot = b.alloca(elem_ty.clone());
+                        b.store(*pid, slot);
+                        ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
+                    } else {
+                        let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
+                        b.store(*pid, slot);
+                        ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                    }
                 }
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
@@ -1059,6 +1074,21 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
         }
     }
     IrType::Int(IntWidth::I32) // fallback
+}
+
+/// Check if a dummy argument has the VALUE attribute in its declaration.
+fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Value));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Lower a string expression, returning (ptr, len) as ValueIds.
