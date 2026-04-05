@@ -88,6 +88,13 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
         insert_param_val(st, m, name, TypeInfo::Integer { kind: Some(4) }, Some(kind as i64));
     }
 
+    // ---- Complex kind parameters ----
+    for (name, kind) in [
+        ("c_float_complex", 4u8), ("c_double_complex", 8), ("c_long_double_complex", 8),
+    ] {
+        insert_param_val(st, m, name, TypeInfo::Integer { kind: Some(4) }, Some(kind as i64));
+    }
+
     // ---- Character and logical kinds ----
     insert_param(st, m, "c_char", TypeInfo::Character { len: Some(1), kind: Some(1) });
     insert_param(st, m, "c_bool", TypeInfo::Logical { kind: Some(1) });

@@ -946,7 +946,12 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             if args.len() >= 2 {
                 Some(b.icmp(CmpOp::Eq, args[0], args[1]))
             } else if let Some(p) = args.first() {
-                let null = b.const_i64(0);
+                // Use type-matched zero to avoid register width mismatch.
+                let ty = b.func().value_type(*p).unwrap_or(IrType::Int(IntWidth::I64));
+                let null = match &ty {
+                    IrType::Int(IntWidth::I32) => b.const_i32(0),
+                    _ => b.const_i64(0),
+                };
                 Some(b.icmp(CmpOp::Ne, *p, null))
             } else { None }
         }
