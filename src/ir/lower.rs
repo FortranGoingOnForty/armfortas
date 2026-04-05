@@ -132,7 +132,11 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 lower_unit(module, sub, st, globals);
             }
         }
-        ProgramUnit::Subroutine { name, decls, body, args, .. } => {
+        ProgramUnit::Subroutine { name, decls, body, args, bind, .. } => {
+            // BIND(C): use specified C name, otherwise use Fortran name.
+            let func_name = bind.as_ref()
+                .map(|b| b.name.as_deref().unwrap_or(name).to_string())
+                .unwrap_or_else(|| name.clone());
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
@@ -144,7 +148,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 } else { None }
             }).collect();
-            let mut func = Function::new(name.clone(), params, IrType::Void);
+            let mut func = Function::new(func_name, params, IrType::Void);
             let mut ctx = LowerCtx::new(st, globals);
 
             // Collect param info: (name, param_id, elem_type, is_value).
@@ -185,7 +189,10 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 
             module.add_function(func);
         }
-        ProgramUnit::Function { name, decls, body, args, result, return_type, .. } => {
+        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, .. } => {
+            let func_name = bind.as_ref()
+                .map(|b| b.name.as_deref().unwrap_or(name).to_string())
+                .unwrap_or_else(|| name.clone());
             let ret_ty = return_type.as_ref()
                 .map(lower_type_spec)
                 .unwrap_or_else(|| {
@@ -202,7 +209,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 } else { None }
             }).collect();
-            let mut func = Function::new(name.clone(), params, ret_ty.clone());
+            let mut func = Function::new(func_name, params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals);
 
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
@@ -1074,6 +1081,29 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
         }
     }
     IrType::Int(IntWidth::I32) // fallback
+}
+
+/// Check if a callee has VALUE-attributed arguments via its scope in the symbol table.
+/// Returns a Vec<bool> per argument position — true if that arg is VALUE.
+/// Returns None if callee scope not found or no VALUE args.
+fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+    use crate::sema::symtab::ScopeKind;
+    let callee_scope = st.scopes.iter().find(|s| {
+        match &s.kind {
+            ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.to_lowercase() == callee_name,
+            _ => false,
+        }
+    })?;
+    if !callee_scope.symbols.values().any(|sym| sym.attrs.value) {
+        return None;
+    }
+    // Use arg_order to build a positional mask.
+    let mask: Vec<bool> = callee_scope.arg_order.iter().map(|arg_name| {
+        callee_scope.symbols.get(arg_name)
+            .map(|sym| sym.attrs.value)
+            .unwrap_or(false)
+    }).collect();
+    Some(mask)
 }
 
 /// Check if a dummy argument has the VALUE attribute in its declaration.
@@ -2465,10 +2495,20 @@ fn lower_expr(
                     return result;
                 }
 
-                // User function call: Fortran pass-by-reference — pass addresses.
-                let ref_arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                // Check if the callee has VALUE args (BIND(C) interface).
+                let callee_value_args = callee_value_arg_mask(st, &key);
+
+                // Pass args: by value for VALUE, by reference otherwise.
+                let ref_arg_vals: Vec<ValueId> = args.iter().enumerate().map(|(i, a)| {
+                    let is_value = callee_value_args.as_ref().map(|mask| i < mask.len() && mask[i]).unwrap_or(false);
                     match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => lower_arg_by_ref(b, locals, e, st),
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            if is_value {
+                                lower_expr(b, locals, e, st)
+                            } else {
+                                lower_arg_by_ref(b, locals, e, st)
+                            }
+                        }
                         _ => b.const_i32(0),
                     }
                 }).collect();

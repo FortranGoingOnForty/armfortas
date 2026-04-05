@@ -56,7 +56,11 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             }
         }
         ProgramUnit::Subroutine { name, args, prefix: _, bind: _, uses, imports: _, implicit, decls, body: _, contains } => {
-            st.push_scope(ScopeKind::Subroutine(name.clone()));
+            let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
+            // Store ordered arg names for VALUE lookup by callers.
+            st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
             // Define dummy arguments as symbols.
             for arg in args {
                 if let DummyArg::Name(arg_name) = arg {
@@ -67,6 +71,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         attrs: SymbolAttrs::default(),
                         defined_at: unit.span,
                         scope: st.current_scope(),
+                        arg_names: vec![],
                     })?;
                 }
             }
@@ -77,7 +82,10 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             st.pop_scope();
         }
         ProgramUnit::Function { name, args, result, return_type: _, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
-            st.push_scope(ScopeKind::Function(name.clone()));
+            let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
+            st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
             for arg in args {
                 if let DummyArg::Name(arg_name) = arg {
                     st.define(Symbol {
@@ -87,6 +95,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         attrs: SymbolAttrs::default(),
                         defined_at: unit.span,
                         scope: st.current_scope(),
+                        arg_names: vec![],
                     })?;
                 }
             }
@@ -99,6 +108,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                 attrs: SymbolAttrs::default(),
                 defined_at: unit.span,
                 scope: st.current_scope(),
+                arg_names: vec![],
             })?;
             process_uses(st, uses)?;
             process_implicit(st, implicit)?;
@@ -242,6 +252,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             attrs: sym_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
+                            arg_names: vec![],
                         })?;
                     }
                 }
@@ -254,6 +265,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     attrs: SymbolAttrs::default(),
                     defined_at: decl.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
                 })?;
             }
             _ => {}
@@ -276,6 +288,7 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     attrs: SymbolAttrs::default(),
                     defined_at: unit.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
                 });
             }
             ProgramUnit::Function { name, return_type, result, decls, .. } => {
@@ -302,6 +315,7 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     attrs: SymbolAttrs::default(),
                     defined_at: unit.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
                 });
             }
             _ => {}
