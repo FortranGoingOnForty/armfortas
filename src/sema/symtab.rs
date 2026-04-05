@@ -243,6 +243,8 @@ pub struct Symbol {
     pub scope: ScopeId,
     /// Ordered dummy argument names (for functions/subroutines).
     pub arg_names: Vec<String>,
+    /// Compile-time constant value (for PARAMETERs like c_int=4).
+    pub const_value: Option<i64>,
 }
 
 /// What kind of entity this symbol represents.
@@ -408,6 +410,7 @@ mod tests {
             defined_at: dummy_span(),
             scope: 0,
             arg_names: vec![],
+            const_value: None,
         }
     }
 

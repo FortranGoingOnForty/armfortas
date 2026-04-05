@@ -20,6 +20,10 @@ fn builtin_span() -> Span {
 }
 
 fn insert_param(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo) {
+    insert_param_val(st, mod_id, name, ti, None);
+}
+
+fn insert_param_val(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo, val: Option<i64>) {
     let span = builtin_span();
     st.scope_mut(mod_id).symbols.insert(name.to_lowercase(), Symbol {
         name: name.to_string(),
@@ -29,6 +33,7 @@ fn insert_param(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo)
         defined_at: span,
         scope: mod_id,
         arg_names: vec![],
+        const_value: val,
     });
 }
 
@@ -42,6 +47,7 @@ fn insert_type(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
         defined_at: span,
         scope: mod_id,
         arg_names: vec![],
+        const_value: None,
     });
 }
 
@@ -55,6 +61,7 @@ fn insert_proc(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
         defined_at: span,
         scope: mod_id,
         arg_names: vec![],
+        const_value: None,
     });
 }
 
@@ -63,22 +70,22 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     let m = st.push_scope(ScopeKind::Module("iso_c_binding".into()));
 
     // ---- Integer kind parameters (ARM64 macOS LP64) ----
+    // Each constant's VALUE is the kind number (e.g., c_int = 4 means kind=4 = 4 bytes).
     let ik = |k: u8| TypeInfo::Integer { kind: Some(k) };
     for (name, kind) in [
-        ("c_int", 4), ("c_short", 2), ("c_long", 8), ("c_long_long", 8),
+        ("c_int", 4u8), ("c_short", 2), ("c_long", 8), ("c_long_long", 8),
         ("c_signed_char", 1),
         ("c_int8_t", 1), ("c_int16_t", 2), ("c_int32_t", 4), ("c_int64_t", 8),
         ("c_size_t", 8), ("c_intptr_t", 8), ("c_ptrdiff_t", 8),
     ] {
-        insert_param(st, m, name, ik(kind));
+        insert_param_val(st, m, name, ik(4), Some(kind as i64));
     }
 
     // ---- Real kind parameters ----
-    let rk = |k: u8| TypeInfo::Real { kind: Some(k) };
     for (name, kind) in [
-        ("c_float", 4), ("c_double", 8), ("c_long_double", 8),
+        ("c_float", 4u8), ("c_double", 8), ("c_long_double", 8),
     ] {
-        insert_param(st, m, name, rk(kind));
+        insert_param_val(st, m, name, TypeInfo::Integer { kind: Some(4) }, Some(kind as i64));
     }
 
     // ---- Character and logical kinds ----
@@ -114,18 +121,26 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
 fn register_iso_fortran_env(st: &mut SymbolTable) {
     let m = st.push_scope(ScopeKind::Module("iso_fortran_env".into()));
 
-    let ik = |k: u8| TypeInfo::Integer { kind: Some(k) };
+    let ik4 = TypeInfo::Integer { kind: Some(4) };
 
-    // Standard I/O unit numbers.
-    for name in ["input_unit", "output_unit", "error_unit", "iostat_end", "iostat_eor"] {
-        insert_param(st, m, name, ik(4));
-    }
+    // Standard I/O unit numbers — actual values.
+    insert_param_val(st, m, "input_unit", ik4.clone(), Some(5));
+    insert_param_val(st, m, "output_unit", ik4.clone(), Some(6));
+    insert_param_val(st, m, "error_unit", ik4.clone(), Some(0));
+    insert_param_val(st, m, "iostat_end", ik4.clone(), Some(-1));
+    insert_param_val(st, m, "iostat_eor", ik4.clone(), Some(-2));
 
-    // Kind parameters.
-    for name in ["int8", "int16", "int32", "int64", "real32", "real64",
-                 "character_kinds", "integer_kinds", "logical_kinds", "real_kinds"] {
-        insert_param(st, m, name, ik(4));
-    }
+    // Kind parameters — values are the kind numbers themselves.
+    insert_param_val(st, m, "int8", ik4.clone(), Some(1));
+    insert_param_val(st, m, "int16", ik4.clone(), Some(2));
+    insert_param_val(st, m, "int32", ik4.clone(), Some(4));
+    insert_param_val(st, m, "int64", ik4.clone(), Some(8));
+    insert_param_val(st, m, "real32", ik4.clone(), Some(4));
+    insert_param_val(st, m, "real64", ik4.clone(), Some(8));
+    insert_param_val(st, m, "character_kinds", ik4.clone(), Some(1));
+    insert_param_val(st, m, "integer_kinds", ik4.clone(), Some(4));
+    insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));
+    insert_param_val(st, m, "real_kinds", ik4, Some(4));
 
     st.pop_scope();
 }

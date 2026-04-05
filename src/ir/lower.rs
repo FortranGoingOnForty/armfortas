@@ -922,8 +922,20 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 2,
                     IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                     IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
-                    IrType::Ptr(_) => 8,
-                    _ => 4,
+                    IrType::Ptr(_) => 8, // pointers are 8 bytes on ARM64
+                    // Arrays use element size * count, but we don't have shape info here.
+                    // For now, return element size. Proper impl needs descriptor access.
+                    IrType::Array(elem, count) => {
+                        let elem_size = match elem.as_ref() {
+                            IrType::Int(IntWidth::I8) => 1,
+                            IrType::Int(IntWidth::I16) => 2,
+                            IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+                            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                            _ => 4,
+                        };
+                        elem_size * (*count as i64)
+                    }
+                    _ => 8, // default to pointer size for unknown types
                 };
                 Some(b.const_i64(size))
             } else { None }

@@ -72,6 +72,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         defined_at: unit.span,
                         scope: st.current_scope(),
                         arg_names: vec![],
+                        const_value: None,
                     })?;
                 }
             }
@@ -96,6 +97,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         defined_at: unit.span,
                         scope: st.current_scope(),
                         arg_names: vec![],
+                        const_value: None,
                     })?;
                 }
             }
@@ -109,6 +111,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                 defined_at: unit.span,
                 scope: st.current_scope(),
                 arg_names: vec![],
+                const_value: None,
             })?;
             process_uses(st, uses)?;
             process_implicit(st, implicit)?;
@@ -253,6 +256,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             defined_at: decl.span,
                             scope: st.current_scope(),
                             arg_names: vec![],
+                            const_value: None,
                         })?;
                     }
                 }
@@ -266,6 +270,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     defined_at: decl.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
+                    const_value: None,
                 })?;
             }
             _ => {}
@@ -289,6 +294,7 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     defined_at: unit.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
+                    const_value: None,
                 });
             }
             ProgramUnit::Function { name, return_type, result, decls, .. } => {
@@ -316,6 +322,7 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     defined_at: unit.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
+                    const_value: None,
                 });
             }
             _ => {}
