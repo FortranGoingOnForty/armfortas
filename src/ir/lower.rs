@@ -50,6 +50,8 @@ struct LocalInfo {
     by_ref: bool,
     /// Character variable kind (fixed-length, deferred, or not character).
     char_kind: CharKind,
+    /// Derived type name (for component access resolution). Empty for non-derived.
+    derived_type: Option<String>,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -71,11 +73,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None, derived_type: None });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -119,7 +121,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 
             {
                 let mut b = FuncBuilder::new(&mut func);
-                alloc_decls(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals);
@@ -181,7 +183,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 }
 
-                alloc_decls(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals);
@@ -246,7 +248,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_addr = Some(result_addr);
                 ctx.result_type = Some(ret_ty.clone());
 
-                alloc_decls(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -278,7 +280,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 }
 
 /// Allocate local variables from declarations. Handles both scalars and arrays.
-fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, decls: &[crate::ast::decl::SpannedDecl]) {
+fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, decls: &[crate::ast::decl::SpannedDecl], type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     use crate::ast::decl::Attribute;
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
@@ -323,7 +325,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     locals.insert(key, LocalInfo {
                         addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         dims: vec![], allocatable: true, by_ref: false,
-                        char_kind: CharKind::Deferred,
+                        char_kind: CharKind::Deferred, derived_type: None,
                     });
                     continue;
                 } else if let Some(len) = char_len {
@@ -338,7 +340,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         locals.insert(key, LocalInfo {
                             addr, ty: IrType::Int(IntWidth::I8),
                             dims: vec![], allocatable: false, by_ref: false,
-                            char_kind: CharKind::Fixed(len),
+                            char_kind: CharKind::Fixed(len), derived_type: None,
                         });
                         continue; // skip normal path
                     }
@@ -352,7 +354,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
@@ -377,17 +379,38 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                    }
+                } else if let TypeSpec::Type(ref type_name) = type_spec {
+                    // Derived type variable: allocate struct-sized byte array.
+                    if let Some(layout) = type_layouts.get(type_name) {
+                        let struct_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
+                        let addr = b.alloca(struct_ty);
+                        // Store the derived type name in the ty field for component access lookup.
+                        // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
+                        locals.insert(key, LocalInfo {
+                            addr,
+                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            dims: vec![],
+                            allocatable: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: Some(type_name.clone()),
+                        });
+                    } else {
+                        // Unknown derived type — fall back to 8-byte alloca.
+                        let addr = b.alloca(IrType::Int(IntWidth::I64));
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
                     }
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
                 }
             }
         }
@@ -1373,7 +1396,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                             CharKind::None => {
                                 // Non-character: normal store.
-                                let val = lower_expr(b, &ctx.locals, value, ctx.st);
+                                let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                 if info.by_ref {
                                     let ptr = b.load(info.addr);
                                     b.store(val, ptr);
@@ -1396,7 +1419,26 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                 }
-                _ => {} // component access etc. deferred
+                Expr::ComponentAccess { base, component } => {
+                    // x%field = val: look up base, compute offset, GEP + store.
+                    if let Expr::Name { name } = &base.node {
+                        let key = name.to_lowercase();
+                        if let Some(info) = ctx.locals.get(&key).cloned() {
+                            if let Some(ref type_name) = info.derived_type {
+                                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    if let Some(field) = layout.field(component) {
+                                        let val = lower_expr(b, &ctx.locals, value, ctx.st);
+                                        let offset = b.const_i64(field.offset as i64);
+                                        let field_ptr = b.gep(info.addr, vec![offset],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                        b.store(val, field_ptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1674,7 +1716,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
             }
             lower_stmts(b, ctx, body);
 
@@ -1949,7 +1991,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
             addr
         });
 
@@ -2261,7 +2303,7 @@ fn lower_write_items_adv(
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
             b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
         } else {
-            let val = lower_expr(b, &ctx.locals, item, ctx.st);
+            let val = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             let func_name = match &ty {
                 IrType::Int(IntWidth::I64) => "afs_write_int64",
@@ -2393,6 +2435,26 @@ fn lower_expr(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
+) -> ValueId {
+    lower_expr_full(b, locals, expr, st, None)
+}
+
+fn lower_expr_tl(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> ValueId {
+    lower_expr_full(b, locals, expr, st, Some(tl))
+}
+
+fn lower_expr_full(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
@@ -2593,6 +2655,44 @@ fn lower_expr(
             } else {
                 b.const_i32(0)
             }
+        }
+
+        Expr::ComponentAccess { base, component } => {
+            // x%field: look up base variable's derived type, compute field offset, GEP + load.
+            if let Expr::Name { name } = &base.node {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
+                    if let Some(ref type_name) = info.derived_type {
+                        if let Some(tl) = type_layouts {
+                            if let Some(layout) = tl.get(type_name) {
+                                if let Some(field) = layout.field(component) {
+                                    let offset = b.const_i64(field.offset as i64);
+                                    let field_ptr = b.gep(info.addr, vec![offset],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                    let field_ty = crate::sema::type_layout::size_of_type(&field.type_info);
+                                    let ir_ty = match field_ty.0 {
+                                        1 => IrType::Int(IntWidth::I8),
+                                        2 => IrType::Int(IntWidth::I16),
+                                        4 => match &field.type_info {
+                                            crate::sema::symtab::TypeInfo::Real { .. } => IrType::Float(FloatWidth::F32),
+                                            crate::sema::symtab::TypeInfo::Logical { .. } => IrType::Bool,
+                                            _ => IrType::Int(IntWidth::I32),
+                                        },
+                                        8 => match &field.type_info {
+                                            crate::sema::symtab::TypeInfo::Real { .. } |
+                                            crate::sema::symtab::TypeInfo::DoublePrecision => IrType::Float(FloatWidth::F64),
+                                            _ => IrType::Int(IntWidth::I64),
+                                        },
+                                        _ => IrType::Int(IntWidth::I32),
+                                    };
+                                    return b.load_typed(field_ptr, ir_ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            b.const_i32(0) // fallback
         }
 
         _ => b.const_i32(0), // placeholder for unhandled expressions
