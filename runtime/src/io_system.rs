@@ -346,12 +346,14 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 _ => Form::Formatted,
             };
 
-            // Direct and stream access use raw file handle for seeking.
+            // Direct, stream, and readwrite access use raw file handle for seeking.
+            // ReadWrite needs FileRaw because BufWriter can't read and BufReader can't write.
             let stream = match file_access {
                 Access::Direct | Access::Stream => UnitStream::FileRaw(file),
                 Access::Sequential => match file_action {
                     Action::Read => UnitStream::FileRead(BufReader::new(file)),
-                    Action::Write | Action::ReadWrite => UnitStream::FileWrite(BufWriter::new(file)),
+                    Action::Write => UnitStream::FileWrite(BufWriter::new(file)),
+                    Action::ReadWrite => UnitStream::FileRaw(file),
                 },
             };
             state.units.insert(actual_unit, Unit {
