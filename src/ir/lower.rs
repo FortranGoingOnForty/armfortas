@@ -708,14 +708,52 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Write { controls, items } => {
-            // WRITE(unit, *) — extract unit from controls.
-            // First control spec is typically the unit number.
+            // Extract unit (first control). * means stdout (unit 6).
             let unit = if let Some(ctrl) = controls.first() {
-                lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+                if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
+                    b.const_i32(6)
+                } else {
+                    lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+                }
             } else {
-                b.const_i32(6) // default stdout
+                b.const_i32(6)
             };
-            lower_write_items(b, ctx, items, unit);
+
+            // Check for format specifier (second positional control).
+            // * means list-directed; a string literal means formatted.
+            let fmt_control = controls.iter().skip(1)
+                .find(|c| c.keyword.is_none())  // positional, not keyword=
+                .or_else(|| controls.iter().find(|c| c.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("fmt")).unwrap_or(false)));
+
+            let is_list_directed = match fmt_control {
+                None => true,
+                Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
+            };
+
+            // Check for ADVANCE='NO'.
+            let advance = controls.iter()
+                .find(|c| c.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("advance")).unwrap_or(false))
+                .map(|c| {
+                    if let Expr::StringLiteral { value, .. } = &c.value.node {
+                        !value.eq_ignore_ascii_case("no")
+                    } else { true }
+                })
+                .unwrap_or(true);
+
+            if is_list_directed {
+                lower_write_items_adv(b, ctx, items, unit, advance);
+            } else {
+                // Formatted I/O: use push-based API.
+                let (fmt_ptr, fmt_len) = lower_string_expr(b, &ctx.locals, &fmt_control.unwrap().value, ctx.st);
+                b.call(FuncRef::External("afs_fmt_begin".into()), vec![unit, fmt_ptr, fmt_len], IrType::Void);
+
+                for item in items {
+                    lower_fmt_push(b, ctx, item);
+                }
+
+                let adv = b.const_i32(if advance { 1 } else { 0 });
+                b.call(FuncRef::External("afs_fmt_end".into()), vec![adv], IrType::Void);
+            }
         }
 
         Stmt::Call { callee, args } => {
@@ -1498,6 +1536,16 @@ fn lower_write_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
 ) {
+    lower_write_items_adv(b, ctx, items, unit, true);
+}
+
+fn lower_write_items_adv(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    advance: bool,
+) {
     for item in items {
         let is_char = if let Expr::Name { name } = &item.node {
             ctx.locals.get(&name.to_lowercase())
@@ -1531,7 +1579,60 @@ fn lower_write_items(
             b.call(FuncRef::External(func_name.into()), vec![unit, val], IrType::Void);
         }
     }
-    b.call(FuncRef::External("afs_write_newline".into()), vec![unit], IrType::Void);
+    if advance {
+        b.call(FuncRef::External("afs_write_newline".into()), vec![unit], IrType::Void);
+    }
+}
+
+/// Push a single I/O item value for formatted output via afs_fmt_push_*.
+fn lower_fmt_push(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+) {
+    let is_char = if let Expr::Name { name } = &item.node {
+        ctx.locals.get(&name.to_lowercase())
+            .map(|i| i.char_kind != CharKind::None)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+        let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+        b.call(FuncRef::External("afs_fmt_push_string".into()), vec![ptr, len], IrType::Void);
+    } else {
+        let val = lower_expr(b, &ctx.locals, item, ctx.st);
+        let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        match &ty {
+            IrType::Int(IntWidth::I64) => {
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![val], IrType::Void);
+            }
+            IrType::Int(_) => {
+                // Widen i32 to i64 for the push API.
+                let widened = b.int_extend(val, IntWidth::I64, true);
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
+            }
+            IrType::Float(_) => {
+                // afs_fmt_push_real takes f64; f32 is promoted by calling convention.
+                b.call(FuncRef::External("afs_fmt_push_real".into()), vec![val], IrType::Void);
+            }
+            IrType::Bool => {
+                let int_val = b.int_extend(val, IntWidth::I32, false);
+                b.call(FuncRef::External("afs_fmt_push_logical".into()), vec![int_val], IrType::Void);
+            }
+            IrType::Ptr(_) => {
+                // Pointer type — likely a string.
+                let len = string_literal_len(item);
+                let len_val = b.const_i64(len);
+                b.call(FuncRef::External("afs_fmt_push_string".into()), vec![val, len_val], IrType::Void);
+            }
+            _ => {
+                let widened = b.int_extend(val, IntWidth::I64, true);
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
+            }
+        }
+    }
 }
 
 /// Get the data base address for an array variable.
