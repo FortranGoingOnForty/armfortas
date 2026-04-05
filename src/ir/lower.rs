@@ -1395,9 +1395,17 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::None => {
-                                // Non-character: normal store.
                                 let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                if info.by_ref {
+                                if info.derived_type.is_some() {
+                                    // Derived type assignment: memcpy from source to destination.
+                                    let size = if let Some(ref tn) = info.derived_type {
+                                        ctx.type_layouts.get(tn).map(|l| l.size).unwrap_or(8)
+                                    } else { 8 };
+                                    let size_val = b.const_i64(size as i64);
+                                    b.call(FuncRef::External("memcpy".into()),
+                                        vec![info.addr, val, size_val],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                } else if info.by_ref {
                                     let ptr = b.load(info.addr);
                                     b.store(val, ptr);
                                 } else {
@@ -2604,6 +2612,27 @@ fn lower_expr_full(
                 if let Some(info) = locals.get(&key) {
                     if !info.dims.is_empty() || info.allocatable {
                         return lower_array_element(b, locals, info, args, st);
+                    }
+                }
+
+                // Check if this is a structure constructor: type_name(val1, val2, ...).
+                if let Some(tl) = type_layouts {
+                    if let Some(layout) = tl.get(&key) {
+                        // Allocate a temporary struct on the stack.
+                        let struct_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
+                        let tmp = b.alloca(struct_ty);
+                        // Store each argument into the corresponding field.
+                        for (i, arg) in args.iter().enumerate() {
+                            if i < layout.fields.len() {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                    let val = lower_expr_full(b, locals, e, st, type_layouts);
+                                    let offset = b.const_i64(layout.fields[i].offset as i64);
+                                    let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
+                                    b.store(val, field_ptr);
+                                }
+                            }
+                        }
+                        return tmp; // return pointer to the constructed struct
                     }
                 }
 
