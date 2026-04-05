@@ -408,60 +408,259 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 Some(b.imod(args[0], args[1]))
             } else { None }
         }
-        "abs" => {
+        "abs" | "iabs" | "dabs" => {
             if let Some(arg) = args.first() {
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 match &ty {
                     IrType::Int(_) => {
-                        // abs(x) = x >= 0 ? x : -x
                         let zero = b.const_i32(0);
-                        let is_neg = b.icmp(CmpOp::Lt, *arg, zero);
+                        let is_pos = b.icmp(CmpOp::Ge, *arg, zero);
                         let neg = b.ineg(*arg);
-                        // Conditional select: for now, compute both and use subtraction trick.
-                        // TODO: proper conditional select (CSEL instruction).
-                        let _ = is_neg;
-                        Some(neg) // simplified — always negates. Needs CSEL.
+                        Some(b.select(is_pos, *arg, neg))
                     }
-                    IrType::Float(FloatWidth::F32) => Some(b.fneg(*arg)), // simplified
-                    IrType::Float(FloatWidth::F64) => Some(b.fneg(*arg)), // simplified
+                    IrType::Float(_) => Some(b.fabs(*arg)),
                     _ => None,
                 }
             } else { None }
         }
-        "int" | "nint" => {
+        "int" | "nint" | "idint" | "ifix" => {
             if let Some(arg) = args.first() {
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 if ty.is_float() {
                     Some(b.float_to_int(*arg, IntWidth::I32))
                 } else {
-                    Some(*arg) // already integer
+                    Some(*arg)
                 }
             } else { None }
         }
-        "real" | "float" => {
+        "real" | "float" | "sngl" => {
             if let Some(arg) = args.first() {
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 if ty.is_int() {
                     Some(b.int_to_float(*arg, FloatWidth::F32))
                 } else {
-                    Some(*arg) // already real
+                    Some(*arg)
                 }
             } else { None }
         }
-        "max" => {
-            if args.len() >= 2 {
-                // max(a, b) = a >= b ? a : b — simplified to compare + branch
-                // TODO: proper CSEL
-                let cmp = b.icmp(CmpOp::Ge, args[0], args[1]);
-                let _ = cmp;
-                Some(args[0]) // placeholder — needs CSEL
+        "dble" | "dfloat" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                if ty.is_int() {
+                    Some(b.int_to_float(*arg, FloatWidth::F64))
+                } else if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                    Some(b.float_extend(*arg, FloatWidth::F64))
+                } else {
+                    Some(*arg)
+                }
             } else { None }
         }
-        "min" => {
+        "max" | "max0" | "amax1" | "dmax1" => {
             if args.len() >= 2 {
-                let cmp = b.icmp(CmpOp::Le, args[0], args[1]);
-                let _ = cmp;
-                Some(args[0]) // placeholder — needs CSEL
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let cmp = if ty.is_float() {
+                    b.fcmp(CmpOp::Ge, args[0], args[1])
+                } else {
+                    b.icmp(CmpOp::Ge, args[0], args[1])
+                };
+                let mut result = b.select(cmp, args[0], args[1]);
+                // Variadic: max(a, b, c, ...) chains.
+                for arg in &args[2..] {
+                    let cmp = if ty.is_float() {
+                        b.fcmp(CmpOp::Ge, result, *arg)
+                    } else {
+                        b.icmp(CmpOp::Ge, result, *arg)
+                    };
+                    result = b.select(cmp, result, *arg);
+                }
+                Some(result)
+            } else { None }
+        }
+        "min" | "min0" | "amin1" | "dmin1" => {
+            if args.len() >= 2 {
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let cmp = if ty.is_float() {
+                    b.fcmp(CmpOp::Le, args[0], args[1])
+                } else {
+                    b.icmp(CmpOp::Le, args[0], args[1])
+                };
+                let mut result = b.select(cmp, args[0], args[1]);
+                for arg in &args[2..] {
+                    let cmp = if ty.is_float() {
+                        b.fcmp(CmpOp::Le, result, *arg)
+                    } else {
+                        b.icmp(CmpOp::Le, result, *arg)
+                    };
+                    result = b.select(cmp, result, *arg);
+                }
+                Some(result)
+            } else { None }
+        }
+        "sign" | "dsign" | "isign" => {
+            // sign(a, b) = abs(a) * sign_of(b) = b >= 0 ? abs(a) : -abs(a)
+            if args.len() >= 2 {
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let abs_a = if ty.is_float() {
+                    b.fabs(args[0])
+                } else {
+                    let zero = b.const_i32(0);
+                    let is_pos = b.icmp(CmpOp::Ge, args[0], zero);
+                    let neg = b.ineg(args[0]);
+                    b.select(is_pos, args[0], neg)
+                };
+                let neg_abs = if ty.is_float() { b.fneg(abs_a) } else { b.ineg(abs_a) };
+                let zero = if ty.is_float() {
+                    b.const_f64(0.0)
+                } else {
+                    b.const_i32(0)
+                };
+                let b_pos = if ty.is_float() {
+                    b.fcmp(CmpOp::Ge, args[1], zero)
+                } else {
+                    b.icmp(CmpOp::Ge, args[1], zero)
+                };
+                Some(b.select(b_pos, abs_a, neg_abs))
+            } else { None }
+        }
+        "sqrt" | "dsqrt" => {
+            args.first().map(|a| b.fsqrt(*a))
+        }
+        // ---- Bit manipulation (inline) ----
+        "iand" => {
+            if args.len() >= 2 { Some(b.bit_and(args[0], args[1])) } else { None }
+        }
+        "ior" => {
+            if args.len() >= 2 { Some(b.bit_or(args[0], args[1])) } else { None }
+        }
+        "ieor" => {
+            if args.len() >= 2 { Some(b.bit_xor(args[0], args[1])) } else { None }
+        }
+        "not" => {
+            args.first().map(|a| b.bit_not(*a))
+        }
+        "leadz" => {
+            args.first().map(|a| b.clz(*a))
+        }
+        "trailz" => {
+            args.first().map(|a| b.ctz(*a))
+        }
+        "popcount" | "popcnt" => {
+            args.first().map(|a| b.popcount(*a))
+        }
+        "ishft" => {
+            // ishft(a, shift): positive shift = left, negative = right.
+            // For now, only handle positive (left shift). Full impl needs Select.
+            if args.len() >= 2 {
+                let zero = b.const_i32(0);
+                let is_left = b.icmp(CmpOp::Ge, args[1], zero);
+                let neg_shift = b.ineg(args[1]);
+                let left = b.shl(args[0], args[1]);
+                let right = b.lshr(args[0], neg_shift);
+                Some(b.select(is_left, left, right))
+            } else { None }
+        }
+        "btest" => {
+            // btest(a, pos) = (a >> pos) & 1 /= 0
+            if args.len() >= 2 {
+                let shifted = b.lshr(args[0], args[1]);
+                let one = b.const_i32(1);
+                let masked = b.bit_and(shifted, one);
+                let zero = b.const_i32(0);
+                Some(b.icmp(CmpOp::Ne, masked, zero))
+            } else { None }
+        }
+        "ibset" => {
+            // ibset(a, pos) = a | (1 << pos)
+            if args.len() >= 2 {
+                let one = b.const_i32(1);
+                let mask = b.shl(one, args[1]);
+                Some(b.bit_or(args[0], mask))
+            } else { None }
+        }
+        "ibclr" => {
+            // ibclr(a, pos) = a & ~(1 << pos)
+            if args.len() >= 2 {
+                let one = b.const_i32(1);
+                let mask = b.shl(one, args[1]);
+                let inv = b.bit_not(mask);
+                Some(b.bit_and(args[0], inv))
+            } else { None }
+        }
+        // ---- Math intrinsics → libm calls ----
+        "sin" | "dsin" => {
+            args.first().map(|a| b.call(FuncRef::External("sin".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "cos" | "dcos" => {
+            args.first().map(|a| b.call(FuncRef::External("cos".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "tan" | "dtan" => {
+            args.first().map(|a| b.call(FuncRef::External("tan".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "asin" | "dasin" => {
+            args.first().map(|a| b.call(FuncRef::External("asin".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "acos" | "dacos" => {
+            args.first().map(|a| b.call(FuncRef::External("acos".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "atan" | "datan" => {
+            args.first().map(|a| b.call(FuncRef::External("atan".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "atan2" | "datan2" => {
+            if args.len() >= 2 {
+                Some(b.call(FuncRef::External("atan2".into()), vec![args[0], args[1]], IrType::Float(FloatWidth::F64)))
+            } else { None }
+        }
+        "sinh" | "dsinh" => {
+            args.first().map(|a| b.call(FuncRef::External("sinh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "cosh" | "dcosh" => {
+            args.first().map(|a| b.call(FuncRef::External("cosh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "tanh" | "dtanh" => {
+            args.first().map(|a| b.call(FuncRef::External("tanh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "exp" | "dexp" => {
+            args.first().map(|a| b.call(FuncRef::External("exp".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "log" | "dlog" | "alog" => {
+            args.first().map(|a| b.call(FuncRef::External("log".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "log10" | "dlog10" | "alog10" => {
+            args.first().map(|a| b.call(FuncRef::External("log10".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "ceiling" => {
+            args.first().map(|a| b.call(FuncRef::External("ceil".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "floor" => {
+            args.first().map(|a| b.call(FuncRef::External("floor".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "erf" | "derf" => {
+            args.first().map(|a| b.call(FuncRef::External("erf".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "erfc" | "derfc" => {
+            args.first().map(|a| b.call(FuncRef::External("erfc".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "gamma" | "dgamma" => {
+            args.first().map(|a| b.call(FuncRef::External("tgamma".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "log_gamma" => {
+            args.first().map(|a| b.call(FuncRef::External("lgamma".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "bessel_j0" => {
+            args.first().map(|a| b.call(FuncRef::External("j0".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "bessel_j1" => {
+            args.first().map(|a| b.call(FuncRef::External("j1".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "bessel_y0" => {
+            args.first().map(|a| b.call(FuncRef::External("y0".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "bessel_y1" => {
+            args.first().map(|a| b.call(FuncRef::External("y1".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        }
+        "hypot" => {
+            if args.len() >= 2 {
+                Some(b.call(FuncRef::External("hypot".into()), vec![args[0], args[1]], IrType::Float(FloatWidth::F64)))
             } else { None }
         }
         _ => None,
