@@ -1068,9 +1068,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Call { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+
+                // Check for intrinsic subroutines that map to runtime functions.
+                let runtime_name = match key.as_str() {
+                    "system_clock" => Some("afs_system_clock"),
+                    "cpu_time" => Some("afs_cpu_time"),
+                    "date_and_time" => Some("afs_date_and_time"),
+                    "random_number" => Some("afs_random_number_f64"),
+                    "random_seed" => Some("afs_random_seed"),
+                    "execute_command_line" => Some("afs_execute_command_line"),
+                    _ => None,
+                };
+
                 // Fortran default: pass by reference (pass address of each argument).
-                // If the argument is a named variable, pass its address directly.
-                // If it's an expression, evaluate it, store to a temp, pass temp address.
                 let arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
@@ -1079,7 +1090,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         _ => b.const_i32(0),
                     }
                 }).collect();
-                b.call(FuncRef::External(name.clone()), arg_vals, IrType::Void);
+
+                let func_name = runtime_name.unwrap_or(&name).to_string();
+                b.call(FuncRef::External(func_name), arg_vals, IrType::Void);
             }
         }
 
