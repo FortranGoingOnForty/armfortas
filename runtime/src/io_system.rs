@@ -1441,6 +1441,112 @@ pub extern "C" fn afs_io_finalize() {
     }
 }
 
+// ---- Formatted I/O (push-based API) ----
+//
+// The format engine (format.rs) parses format strings and applies descriptors
+// to values. This API lets compiled code push values one at a time, then flush
+// the formatted output in one call.
+//
+// Usage from codegen:
+//   afs_fmt_begin(unit, fmt_str, fmt_len)
+//   afs_fmt_push_int(val) / afs_fmt_push_real(val) / ...
+//   afs_fmt_end()
+
+use std::cell::RefCell;
+use crate::format::{parse_format, FormatEngine, IoValue};
+
+/// Thread-local state for the current formatted I/O operation.
+struct FmtContext {
+    unit: i32,
+    format_str: String,
+    values: Vec<IoValue>,
+}
+
+thread_local! {
+    static FMT_CTX: RefCell<Option<FmtContext>> = RefCell::new(None);
+}
+
+/// Begin a formatted write operation. Parses the format string and prepares
+/// to accumulate values.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin(unit: i32, fmt_str: *const u8, fmt_len: i64) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        *ctx.borrow_mut() = Some(FmtContext {
+            unit,
+            format_str: fmt,
+            values: Vec::new(),
+        });
+    });
+}
+
+/// Push an integer value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_int(val: i64) {
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            c.values.push(IoValue::Integer(val));
+        }
+    });
+}
+
+/// Push a real (f64) value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_real(val: f64) {
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            c.values.push(IoValue::Real(val));
+        }
+    });
+}
+
+/// Push a logical value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_logical(val: i32) {
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            c.values.push(IoValue::Logical(val != 0));
+        }
+    });
+}
+
+/// Push a character string value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_string(ptr: *const u8, len: i64) {
+    let bytes = if !ptr.is_null() && len > 0 {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            c.values.push(IoValue::Character(bytes));
+        }
+    });
+}
+
+/// End the formatted write: apply the format engine and write the result.
+/// If advance is true (nonzero), appends a newline. If false (zero), no newline.
+#[no_mangle]
+pub extern "C" fn afs_fmt_end(advance: i32) {
+    FMT_CTX.with(|ctx| {
+        let context = ctx.borrow_mut().take();
+        if let Some(c) = context {
+            let descriptors = parse_format(&c.format_str);
+            let mut engine = FormatEngine::new(descriptors);
+            let output = engine.format_values(&c.values);
+
+            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(u) = state.get_unit(c.unit) {
+                let _ = u.write_str(&output);
+                if advance != 0 {
+                    let _ = u.write_str("\n");
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,5 +1573,49 @@ mod tests {
         // This test just verifies no panic — output goes to test runner's stdout.
         afs_write_int(6, 42);
         afs_write_newline(6);
+    }
+
+    #[test]
+    fn formatted_write_to_file() {
+        let path = "/tmp/afs_fmt_test.dat";
+        afs_open_simple(
+            99,
+            path.as_ptr(), path.len() as i64,
+            "replace".as_ptr(), 7,
+            std::ptr::null(), 0,
+        );
+
+        afs_fmt_begin(99, "(I5, F8.2)".as_ptr(), 10);
+        afs_fmt_push_int(42);
+        afs_fmt_push_real(3.14);
+        afs_fmt_end(1); // with newline
+
+        afs_close(99, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("42"), "expected 42 in: {}", content);
+        assert!(content.contains("3.14"), "expected 3.14 in: {}", content);
+    }
+
+    #[test]
+    fn formatted_write_no_advance() {
+        let path = "/tmp/afs_fmt_noadv_test.dat";
+        afs_open_simple(
+            98,
+            path.as_ptr(), path.len() as i64,
+            "replace".as_ptr(), 7,
+            std::ptr::null(), 0,
+        );
+
+        afs_fmt_begin(98, "('hello')".as_ptr(), 9);
+        afs_fmt_end(0); // no newline
+
+        afs_fmt_begin(98, "(' world')".as_ptr(), 10);
+        afs_fmt_end(1); // with newline
+
+        afs_close(98, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.trim(), "hello world");
     }
 }
