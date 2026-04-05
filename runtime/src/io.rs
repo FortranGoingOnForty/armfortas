@@ -1,61 +1,48 @@
-//! I/O subsystem — list-directed PRINT, formatted output.
+//! Legacy I/O functions — thin wrappers around the unit-based I/O system.
 //!
-//! Fortran list-directed output rules:
-//! - Leading space before each value
-//! - Integers: right-justified in field width
-//! - Reals: E-format with full precision
-//! - Logicals: T or F
-//! - Strings: as-is (no quotes)
-//! - Newline at end of PRINT statement
+//! These functions are called by generated code via RuntimeFunc::Print*.
+//! They delegate to the unit-based afs_write_* functions on unit 6 (stdout).
 
-use std::io::{self, Write};
+use crate::io_system;
 
-/// Print a character string (list-directed).
-/// Fortran passes ptr + length (no null terminator).
+/// Print a character string (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_string(ptr: *const u8, len: i64) {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let _ = out.write_all(b" ");
-    if !ptr.is_null() && len > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let _ = out.write_all(slice);
-    }
+    io_system::afs_write_string(6, ptr, len);
 }
 
-/// Print a 32-bit integer (list-directed).
+/// Print a 32-bit integer (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_int(val: i32) {
-    print!(" {}", val);
+    io_system::afs_write_int(6, val);
 }
 
-/// Print a 64-bit integer (list-directed).
+/// Print a 64-bit integer (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_int64(val: i64) {
-    print!(" {}", val);
+    io_system::afs_write_int64(6, val);
 }
 
-/// Print a single-precision real (list-directed, E-format).
+/// Print a single-precision real (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_real(val: f32) {
-    // Fortran list-directed: processor-dependent, typically E format.
-    print!("  {:14.7E}", val);
+    io_system::afs_write_real(6, val);
 }
 
-/// Print a double-precision real (list-directed, E-format).
+/// Print a double-precision real (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_real64(val: f64) {
-    print!("  {:22.15E}", val);
+    io_system::afs_write_real64(6, val);
 }
 
-/// Print a logical value (list-directed: T or F).
+/// Print a logical value (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_logical(val: i32) {
-    print!(" {}", if val != 0 { "T" } else { "F" });
+    io_system::afs_write_logical(6, val);
 }
 
-/// End a PRINT statement (newline).
+/// End a PRINT statement (newline, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_newline() {
-    println!();
+    io_system::afs_write_newline(6);
 }
