@@ -1015,6 +1015,42 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
+        Stmt::Inquire { specs, .. } => {
+            // Simplified INQUIRE: extract UNIT or FILE, and EXIST.
+            let null = b.const_i64(0);
+            let file_spec = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("file")).unwrap_or(false));
+            let exist_spec = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("exist")).unwrap_or(false));
+
+            if let Some(fs) = file_spec {
+                let (fptr, flen) = lower_string_expr(b, &ctx.locals, &fs.value, ctx.st);
+                let exist_addr = if let Some(es) = exist_spec {
+                    if let Expr::Name { name } = &es.value.node {
+                        ctx.locals.get(&name.to_lowercase()).map(|i| i.addr).unwrap_or(null)
+                    } else { null }
+                } else { null };
+                b.call(FuncRef::External("afs_inquire_file".into()),
+                    vec![fptr, flen, exist_addr, null, null], IrType::Void);
+            }
+        }
+
+        Stmt::Flush { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_flush".into()), vec![unit, null], IrType::Void);
+        }
+
+        Stmt::Rewind { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_rewind".into()), vec![unit, null], IrType::Void);
+        }
+
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
     }
 }
