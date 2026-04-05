@@ -990,28 +990,65 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
             let null = b.const_i64(0);
 
-            // Build OpenControlBlock on the stack (avoids >8 arg limit).
-            // Layout: unit(4), filename(8), filename_len(8), status(8), status_len(8),
-            //         action(8), action_len(8), access(8), access_len(8),
-            //         form(8), form_len(8), recl(8), iostat(8), newunit(8)
-            // Total: 4 + 13*8 = 108 bytes, padded to 112.
-            let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 112);
-            let cb = b.alloca(cb_ty);
+            // Check if we have any extended specifiers beyond the basic 7-arg set.
+            let has_access = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("access")).unwrap_or(false));
+            let has_form = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("form")).unwrap_or(false));
+            let has_recl = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("recl")).unwrap_or(false));
+            let has_position = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("position")).unwrap_or(false));
 
-            // Store fields into the control block using GEP + store.
-            // For simplicity, store unit as the first 4 bytes, then pointers at known offsets.
-            // This requires field-by-field stores which is verbose in IR.
-            // Alternative: pass the specifiers individually but limit to 8 args.
-            // Simplest correct approach: pass 7 args (unit + 3 string pairs) to a simplified afs_open.
-            // The access/form/recl can use defaults.
+            if !has_access && !has_form && !has_recl && !has_position {
+                // Simple case: use 7-arg afs_open_simple (unit + 3 string pairs).
+                b.call(
+                    FuncRef::External("afs_open_simple".into()),
+                    vec![unit, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len],
+                    IrType::Void,
+                );
+            } else {
+                // Extended case: build OpenControlBlock on the stack.
+                // Find POSITION= spec.
+                let (position_ptr, position_len) = specs.iter()
+                    .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("position")).unwrap_or(false))
+                    .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                    .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
 
-            // Actually, let's keep it simple: use the old 7-arg signature for basic cases,
-            // and the control block for cases with extra specifiers.
-            b.call(
-                FuncRef::External("afs_open_simple".into()),
-                vec![unit, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len],
-                IrType::Void,
-            );
+                // Layout matches repr(C) OpenControlBlock (128 bytes):
+                //   0: unit(i32) + 4 pad, 8: filename(ptr), 16: filename_len(i64),
+                //  24: status(ptr), 32: status_len(i64), 40: action(ptr), 48: action_len(i64),
+                //  56: access(ptr), 64: access_len(i64), 72: form(ptr), 80: form_len(i64),
+                //  88: recl(i64), 96: iostat(ptr), 104: newunit(ptr),
+                // 112: position(ptr), 120: position_len(i64)
+                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 128);
+                let cb = b.alloca(cb_ty);
+
+                let store_at = |b: &mut crate::ir::builder::FuncBuilder, base, offset: i64, val| {
+                    let off = b.const_i64(offset);
+                    let ptr = b.gep(base, vec![off], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    b.store(val, ptr);
+                };
+
+                store_at(b, cb, 0, unit);
+                store_at(b, cb, 8, file_ptr);
+                store_at(b, cb, 16, file_len);
+                store_at(b, cb, 24, status_ptr);
+                store_at(b, cb, 32, status_len);
+                store_at(b, cb, 40, action_ptr);
+                store_at(b, cb, 48, action_len);
+                store_at(b, cb, 56, access_ptr);
+                store_at(b, cb, 64, access_len);
+                store_at(b, cb, 72, form_ptr);
+                store_at(b, cb, 80, form_len);
+                store_at(b, cb, 88, recl_val);
+                store_at(b, cb, 96, null);       // iostat = null
+                store_at(b, cb, 104, null);      // newunit = null
+                store_at(b, cb, 112, position_ptr);
+                store_at(b, cb, 120, position_len);
+
+                b.call(
+                    FuncRef::External("afs_open".into()),
+                    vec![cb],
+                    IrType::Void,
+                );
+            }
         }
 
         Stmt::Close { specs } => {
@@ -1818,8 +1855,8 @@ program test
   print *, x
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_print_int"));
-        assert!(ir.contains("rt_call @__afs_print_newline"));
+        assert!(ir.contains("afs_write_int"));
+        assert!(ir.contains("afs_write_newline"));
     }
 
     #[test]
@@ -2093,7 +2130,7 @@ program test
   end associate
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_print_int"));
+        assert!(ir.contains("afs_write_int"));
     }
 
     // ---- Allocatable / strings ----
@@ -2135,7 +2172,7 @@ program test
 end program
 ");
         assert!(ir.contains("const_string"), "expected string constant in:\n{}", ir);
-        assert!(ir.contains("rt_call @__afs_print"));
+        assert!(ir.contains("afs_write_string"));
     }
 
     // ---- Calls ----

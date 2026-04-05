@@ -18,7 +18,9 @@ program test_io_direct_access
     write(10, rec=2) 20
     close(10)
 
-    a = 0; b = 0; c = 0
+    a = 0
+    b = 0
+    c = 0
     open(10, file='/tmp/afs_direct.dat', access='direct', recl=4, &
          form='unformatted', status='old')
     read(10, rec=3) a
