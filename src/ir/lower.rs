@@ -403,17 +403,49 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
 /// Returns Some(ValueId) if recognized, None for external functions.
 fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<ValueId> {
     match name {
-        "mod" | "modulo" => {
+        "mod" => {
+            // MOD(a, p) = a - INT(a/p) * p  (sign of dividend)
+            // C-style remainder matches this.
             if args.len() >= 2 {
                 Some(b.imod(args[0], args[1]))
+            } else { None }
+        }
+        "modulo" => {
+            // MODULO(a, p) = a - FLOOR(a/p) * p  (sign of divisor, result in [0, |p|))
+            // For integers: if result has opposite sign to p, add p.
+            if args.len() >= 2 {
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                if ty.is_float() {
+                    // Float modulo: use fmod then adjust.
+                    let rem = b.call(FuncRef::External("fmod".into()), vec![args[0], args[1]], ty.clone());
+                    let sum = b.fadd(rem, args[1]);
+                    let rem2 = b.call(FuncRef::External("fmod".into()), vec![sum, args[1]], ty);
+                    Some(rem2)
+                } else {
+                    // Integer modulo: rem = a % p; if (rem != 0 && (rem ^ p) < 0) rem += p
+                    let rem = b.imod(args[0], args[1]);
+                    let zero = match &ty {
+                        IrType::Int(IntWidth::I64) => b.const_i64(0),
+                        _ => b.const_i32(0),
+                    };
+                    let rem_ne_zero = b.icmp(CmpOp::Ne, rem, zero);
+                    let rem_xor_p = b.bit_xor(rem, args[1]);
+                    let sign_differs = b.icmp(CmpOp::Lt, rem_xor_p, zero);
+                    let needs_adjust = b.and(rem_ne_zero, sign_differs);
+                    let adjusted = b.iadd(rem, args[1]);
+                    Some(b.select(needs_adjust, adjusted, rem))
+                }
             } else { None }
         }
         "abs" | "iabs" | "dabs" => {
             if let Some(arg) = args.first() {
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 match &ty {
-                    IrType::Int(_) => {
-                        let zero = b.const_i32(0);
+                    IrType::Int(w) => {
+                        let zero = match w {
+                            IntWidth::I64 => b.const_i64(0),
+                            _ => b.const_i32(0),
+                        };
                         let is_pos = b.icmp(CmpOp::Ge, *arg, zero);
                         let neg = b.ineg(*arg);
                         Some(b.select(is_pos, *arg, neg))
@@ -525,16 +557,20 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 let abs_a = if ty.is_float() {
                     b.fabs(args[0])
                 } else {
-                    let zero = b.const_i32(0);
+                    let zero = match &ty {
+                        IrType::Int(IntWidth::I64) => b.const_i64(0),
+                        _ => b.const_i32(0),
+                    };
                     let is_pos = b.icmp(CmpOp::Ge, args[0], zero);
                     let neg = b.ineg(args[0]);
                     b.select(is_pos, args[0], neg)
                 };
                 let neg_abs = if ty.is_float() { b.fneg(abs_a) } else { b.ineg(abs_a) };
-                let zero = if ty.is_float() {
-                    b.const_f64(0.0)
-                } else {
-                    b.const_i32(0)
+                let zero = match &ty {
+                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                    IrType::Float(_) => b.const_f64(0.0),
+                    IrType::Int(IntWidth::I64) => b.const_i64(0),
+                    _ => b.const_i32(0),
                 };
                 let b_pos = if ty.is_float() {
                     b.fcmp(CmpOp::Ge, args[1], zero)
@@ -611,6 +647,17 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 let mask = b.shl(one, args[1]);
                 let inv = b.bit_not(mask);
                 Some(b.bit_and(args[0], inv))
+            } else { None }
+        }
+        "ibits" => {
+            // ibits(i, pos, len) = (i >> pos) & ((1 << len) - 1)
+            if args.len() >= 3 {
+                let shifted = b.lshr(args[0], args[1]);
+                let one = b.const_i32(1);
+                let mask_hi = b.shl(one, args[2]);
+                let one2 = b.const_i32(1);
+                let mask = b.isub(mask_hi, one2);
+                Some(b.bit_and(shifted, mask))
             } else { None }
         }
         // ---- Math intrinsics → libm calls ----
@@ -700,7 +747,14 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         "ishftc" => {
             // ishftc(a, shift, size): circular shift of the rightmost `size` bits.
             if args.len() >= 2 {
-                let size = if args.len() >= 3 { args[2] } else { b.const_i32(32) };
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let default_size = match &ty {
+                    IrType::Int(IntWidth::I64) => 64,
+                    IrType::Int(IntWidth::I16) => 16,
+                    IrType::Int(IntWidth::I8) => 8,
+                    _ => 32,
+                };
+                let size = if args.len() >= 3 { args[2] } else { b.const_i32(default_size) };
                 let shift = args[1];
                 // left = (a << shift) | (a >> (size - shift)), masked to size bits.
                 let left = b.shl(args[0], shift);
@@ -942,6 +996,16 @@ fn lower_intrinsic_subroutine(
         "command_argument_count" => {
             // This is a function, not a subroutine — handled in lower_intrinsic.
             false
+        }
+        "get_command" => {
+            // call get_command(command, length, status)
+            let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
+            let length = nth_arg_ref(b, ctx, args, 1);
+            let status = nth_arg_ref(b, ctx, args, 2);
+            b.call(FuncRef::External("afs_get_command".into()),
+                vec![cmd_ptr, cmd_len, length, status],
+                IrType::Void);
+            true
         }
         "get_environment_variable" => {
             // call get_environment_variable(name, value, length, status)

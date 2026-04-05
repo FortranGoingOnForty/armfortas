@@ -155,6 +155,29 @@ pub extern "C" fn afs_get_command_argument(
     if !status.is_null() { unsafe { *status = 0; } }
 }
 
+/// GET_COMMAND: retrieve the full command line.
+#[no_mangle]
+pub extern "C" fn afs_get_command(
+    command: *mut u8, cmd_len: i64,
+    length: *mut i32,
+    status: *mut i32,
+) {
+    let full: String = std::env::args().collect::<Vec<_>>().join(" ");
+    let bytes = full.as_bytes();
+
+    if !length.is_null() { unsafe { *length = bytes.len() as i32; } }
+    if !command.is_null() && cmd_len > 0 {
+        let n = bytes.len().min(cmd_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), command, n);
+            if n < cmd_len as usize {
+                std::ptr::write_bytes(command.add(n), b' ', cmd_len as usize - n);
+            }
+        }
+    }
+    if !status.is_null() { unsafe { *status = 0; } }
+}
+
 /// GET_ENVIRONMENT_VARIABLE: retrieve an environment variable by name.
 #[no_mangle]
 pub extern "C" fn afs_get_environment_variable(
