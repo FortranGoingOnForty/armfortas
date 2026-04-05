@@ -907,6 +907,38 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             Some(b.call(FuncRef::External("afs_command_argument_count".into()), vec![], IrType::Int(IntWidth::I32)))
         }
 
+        // ---- iso_c_binding functions ----
+        "c_loc" => {
+            // c_loc(x) — return address of x. The arg is already passed by reference,
+            // so the arg value IS the address.
+            args.first().copied()
+        }
+        "c_sizeof" => {
+            // c_sizeof(x) — return byte size of x's C representation.
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                let size: i64 = match &ty {
+                    IrType::Int(IntWidth::I8) | IrType::Bool => 1,
+                    IrType::Int(IntWidth::I16) => 2,
+                    IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+                    IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                    IrType::Ptr(_) => 8,
+                    _ => 4,
+                };
+                Some(b.const_i64(size))
+            } else { None }
+        }
+        "c_associated" => {
+            // c_associated(p) → p /= null
+            // c_associated(p, q) → p == q
+            if args.len() >= 2 {
+                Some(b.icmp(CmpOp::Eq, args[0], args[1]))
+            } else if let Some(p) = args.first() {
+                let null = b.const_i64(0);
+                Some(b.icmp(CmpOp::Ne, *p, null))
+            } else { None }
+        }
+
         _ => None,
     }
 }
@@ -1053,9 +1085,8 @@ fn lower_intrinsic_subroutine(
             true
         }
         "execute_command_line" => {
-            // call execute_command_line(command, wait, exitstat, cmdstat)
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
-            let wait = nth_arg_val(b, ctx, args, 1, 1); // default: wait=.true.
+            let wait = nth_arg_val(b, ctx, args, 1, 1);
             let exitstat = nth_arg_ref(b, ctx, args, 2);
             let cmdstat = nth_arg_ref(b, ctx, args, 3);
             b.call(FuncRef::External("afs_execute_command_line".into()),
@@ -1063,6 +1094,18 @@ fn lower_intrinsic_subroutine(
                 IrType::Void);
             true
         }
+
+        // ---- iso_c_binding subroutines ----
+        "c_f_pointer" => {
+            // call c_f_pointer(cptr, fptr [, shape])
+            // Store the C pointer value into the Fortran pointer variable.
+            // cptr is passed by value (it's a c_ptr), fptr is passed by reference.
+            let cptr = nth_arg_val(b, ctx, args, 0, 0);
+            let fptr = nth_arg_ref(b, ctx, args, 1);
+            b.store(cptr, fptr);
+            true
+        }
+
         _ => false,
     }
 }
