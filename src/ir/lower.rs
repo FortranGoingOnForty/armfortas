@@ -25,6 +25,17 @@ struct LoopScope {
     exit: BlockId,    // EXIT target
 }
 
+/// Character variable kind: how string storage is managed.
+#[derive(Clone, PartialEq)]
+enum CharKind {
+    /// Not a character variable.
+    None,
+    /// Fixed-length character(N): addr points to N-byte stack buffer.
+    Fixed(i64),
+    /// Deferred-length character(:), allocatable: addr points to 32-byte StringDescriptor.
+    Deferred,
+}
+
 /// Info about a local variable.
 #[derive(Clone)]
 struct LocalInfo {
@@ -37,6 +48,8 @@ struct LocalInfo {
     /// Is this a pass-by-reference parameter? If true, `addr` holds a pointer
     /// to the caller's storage. Reads/writes go through the pointer.
     by_ref: bool,
+    /// Character variable kind (fixed-length, deferred, or not character).
+    char_kind: CharKind,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -57,11 +70,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -259,17 +272,98 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
-                if let Some(specs) = array_spec {
-                    // Array variable.
+                // Check for character type.
+                let char_len = match type_spec {
+                    TypeSpec::Character(Some(sel)) => {
+                        match &sel.len {
+                            Some(crate::ast::decl::LenSpec::Expr(e)) => eval_const_int(e),
+                            Some(crate::ast::decl::LenSpec::Star) => None, // assumed
+                            Some(crate::ast::decl::LenSpec::Colon) => None, // deferred
+                            None => Some(1), // default len=1
+                        }
+                    }
+                    TypeSpec::Character(None) => Some(1),
+                    _ => None,
+                };
+                let is_deferred_char = matches!(type_spec,
+                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+                );
+
+                if is_deferred_char && is_allocatable {
+                    // Deferred-length allocatable character: 32-byte StringDescriptor.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
+                    let addr = b.alloca(desc_ty);
+                    let zero = b.const_i32(0);
+                    let size32 = b.const_i64(32);
+                    b.call(FuncRef::External("memset".into()), vec![addr, zero, size32], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    locals.insert(key, LocalInfo {
+                        addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        dims: vec![], allocatable: true, by_ref: false,
+                        char_kind: CharKind::Deferred,
+                    });
+                    continue;
+                } else if let Some(len) = char_len {
+                    if !is_allocatable {
+                        // Fixed-length character(N): alloca N bytes buffer.
+                        let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), len as u64);
+                        let addr = b.alloca(buf_ty);
+                        // Initialize with spaces.
+                        let space = b.const_i32(b' ' as i32);
+                        let len_val = b.const_i64(len);
+                        b.call(FuncRef::External("memset".into()), vec![addr, space, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        locals.insert(key, LocalInfo {
+                            addr, ty: IrType::Int(IntWidth::I8),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::Fixed(len),
+                        });
+                        continue; // skip normal path
+                    }
+                }
+
+                if is_allocatable {
+                    // Allocatable variable: alloca a descriptor (384 bytes), zero-initialized.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let addr = b.alloca(desc_ty);
+                    // Zero-initialize the descriptor so flags=0 (not allocated).
+                    let zero = b.const_i32(0);
+                    let size = b.const_i64(384);
+                    b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None });
+                } else if let Some(specs) = array_spec {
+                    // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                    let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
-                    let addr = b.alloca(arr_ty);
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: is_allocatable, by_ref: false });
+                    let elem_bytes = match &elem_ty {
+                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+                        _ => 8,
+                    };
+                    let total_bytes = total_size * elem_bytes;
+                    const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
+
+                    if total_bytes >= STACK_THRESHOLD {
+                        // Large array: use descriptor + heap allocation (prevents stack overflow).
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let addr = b.alloca(desc_ty);
+                        let zero = b.const_i32(0);
+                        let size384 = b.const_i64(384);
+                        b.call(FuncRef::External("memset".into()), vec![addr, zero, size384], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        // Auto-allocate with the declared shape.
+                        let es = b.const_i64(elem_bytes);
+                        let n = b.const_i64(total_size);
+                        b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
+                        // Mark as allocatable so scope-exit dealloc fires.
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None });
+                    } else {
+                        // Small array: stack allocation.
+                        let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                        let addr = b.alloca(arr_ty);
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None });
+                    }
                 } else {
                     // Scalar variable.
                     let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
                 }
             }
         }
@@ -390,6 +484,77 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
     IrType::Int(IntWidth::I32) // fallback
 }
 
+/// Lower a string expression, returning (ptr, len) as ValueIds.
+/// String literals return (const_string_ptr, const_len).
+/// Character variables return (buffer_addr, known_len).
+/// Deferred-length variables load ptr and len from the StringDescriptor.
+fn lower_string_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> (ValueId, ValueId) {
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            let len = b.const_i64(value.len() as i64);
+            (ptr, len)
+        }
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                match &info.char_kind {
+                    CharKind::Fixed(len) => {
+                        let len_val = b.const_i64(*len);
+                        (info.addr, len_val)
+                    }
+                    CharKind::Deferred => {
+                        // Load data ptr (offset 0) and len (offset 8) from StringDescriptor.
+                        // StringDescriptor layout: [data(8), len(8), capacity(8), flags(4)]
+                        let ptr = b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        // GEP with byte offset: use Ptr<i8> result so elem_size=1.
+                        let eight = b.const_i64(8);
+                        let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I8));
+                        let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+                        (ptr, len)
+                    }
+                    CharKind::None => {
+                        // Not a character variable — shouldn't happen but fall back.
+                        let val = lower_expr(b, locals, expr, st);
+                        let zero = b.const_i64(0);
+                        (val, zero)
+                    }
+                }
+            } else {
+                let val = lower_expr(b, locals, expr, st);
+                let zero = b.const_i64(0);
+                (val, zero)
+            }
+        }
+        Expr::BinaryOp { op: BinaryOp::Concat, left, right } => {
+            // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
+            let (a_ptr, a_len) = lower_string_expr(b, locals, left, st);
+            let (b_ptr, b_len) = lower_string_expr(b, locals, right, st);
+            let total_len = b.iadd(a_len, b_len);
+            // Allocate temp buffer for the result.
+            let result_buf = b.runtime_call(RuntimeFunc::Allocate, vec![total_len], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            // Call afs_concat(result, a, a_len, b, b_len).
+            b.call(
+                FuncRef::External("afs_concat".into()),
+                vec![result_buf, a_ptr, a_len, b_ptr, b_len],
+                IrType::Void,
+            );
+            (result_buf, total_len)
+        }
+        _ => {
+            // For other expressions, evaluate as value and use literal length if available.
+            let val = lower_expr(b, locals, expr, st);
+            let len = b.const_i64(string_literal_len(expr));
+            (val, len)
+        }
+    }
+}
+
 /// Get the length of a string literal expression (for PRINT).
 fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
     match &expr.node {
@@ -399,11 +564,24 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 }
 
 /// Insert implicit deallocation calls for all local allocatable variables.
+/// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     for info in locals.values() {
-        if info.allocatable {
-            let ptr = b.load(info.addr);
-            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+        if info.char_kind == CharKind::Deferred {
+            // Deferred-length string: call afs_dealloc_string.
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![info.addr],
+                IrType::Void,
+            );
+        } else if info.allocatable {
+            // Allocatable array: call afs_deallocate_array.
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![info.addr, stat_addr],
+                IrType::Void,
+            );
         }
     }
 }
@@ -469,27 +647,52 @@ fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
 fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } => {
-            let val = lower_expr(b, &ctx.locals, value, ctx.st);
             match &target.node {
                 Expr::Name { name } => {
                     let key = name.to_lowercase();
-                    if let Some(info) = ctx.locals.get(&key) {
-                        if info.by_ref {
-                            // Write through the pointer to caller's storage.
-                            let ptr = b.load(info.addr);
-                            b.store(val, ptr);
-                        } else {
-                            b.store(val, info.addr);
+                    if let Some(info) = ctx.locals.get(&key).cloned() {
+                        match &info.char_kind {
+                            CharKind::Fixed(len) => {
+                                // Fixed-length character assignment: copy with space padding.
+                                // Get source pointer and length from the expression.
+                                let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                let dest_len = b.const_i64(*len);
+                                b.call(
+                                    FuncRef::External("afs_assign_char_fixed".into()),
+                                    vec![info.addr, dest_len, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
+                            CharKind::Deferred => {
+                                // Deferred-length: call afs_assign_char_deferred.
+                                let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                b.call(
+                                    FuncRef::External("afs_assign_char_deferred".into()),
+                                    vec![info.addr, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
+                            CharKind::None => {
+                                // Non-character: normal store.
+                                let val = lower_expr(b, &ctx.locals, value, ctx.st);
+                                if info.by_ref {
+                                    let ptr = b.load(info.addr);
+                                    b.store(val, ptr);
+                                } else {
+                                    b.store(val, info.addr);
+                                }
+                            }
                         }
                     }
                 }
                 Expr::FunctionCall { callee, args } => {
                     // Array element assignment: a(i) = val
+                    let arr_val = lower_expr(b, &ctx.locals, value, ctx.st);
                     if let Expr::Name { name } = &callee.node {
-                        let key = name.to_lowercase();
-                        if let Some(info) = ctx.locals.get(&key).cloned() {
-                            if !info.dims.is_empty() {
-                                lower_array_store(b, &ctx.locals, &info, args, val, ctx.st);
+                        let akey = name.to_lowercase();
+                        if let Some(info) = ctx.locals.get(&akey).cloned() {
+                            if !info.dims.is_empty() || info.allocatable {
+                                lower_array_store(b, &ctx.locals, &info, args, arr_val, ctx.st);
                             }
                         }
                     }
@@ -498,29 +701,59 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Print { items, .. } | Stmt::Write { items, .. } => {
-            for item in items {
-                let val = lower_expr(b, &ctx.locals, item, ctx.st);
-                let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
-                let rt_func = match &ty {
-                    IrType::Int(_) => RuntimeFunc::PrintInt,
-                    IrType::Float(_) => RuntimeFunc::PrintReal,
-                    IrType::Bool => RuntimeFunc::PrintLogical,
-                    IrType::Ptr(_) => RuntimeFunc::PrintString,
-                    _ => RuntimeFunc::PrintInt,
-                };
-                if matches!(rt_func, RuntimeFunc::PrintString) {
-                    // String print needs ptr + length. For string literals,
-                    // extract length from the ConstString instruction.
-                    // For now, pass the value and a length constant.
-                    let len = string_literal_len(item);
-                    let len_val = b.const_i64(len);
-                    b.runtime_call(RuntimeFunc::PrintString, vec![val, len_val], IrType::Void);
+        Stmt::Print { items, .. } => {
+            // PRINT * → unit 6 (stdout).
+            let unit = b.const_i32(6);
+            lower_write_items(b, ctx, items, unit);
+        }
+
+        Stmt::Write { controls, items } => {
+            // Extract unit (first control). * means stdout (unit 6).
+            let unit = if let Some(ctrl) = controls.first() {
+                if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
+                    b.const_i32(6)
                 } else {
-                    b.runtime_call(rt_func, vec![val], IrType::Void);
+                    lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
                 }
+            } else {
+                b.const_i32(6)
+            };
+
+            // Check for format specifier (second positional control).
+            // * means list-directed; a string literal means formatted.
+            let fmt_control = controls.iter().skip(1)
+                .find(|c| c.keyword.is_none())  // positional, not keyword=
+                .or_else(|| controls.iter().find(|c| c.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("fmt")).unwrap_or(false)));
+
+            let is_list_directed = match fmt_control {
+                None => true,
+                Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
+            };
+
+            // Check for ADVANCE='NO'.
+            let advance = controls.iter()
+                .find(|c| c.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("advance")).unwrap_or(false))
+                .map(|c| {
+                    if let Expr::StringLiteral { value, .. } = &c.value.node {
+                        !value.eq_ignore_ascii_case("no")
+                    } else { true }
+                })
+                .unwrap_or(true);
+
+            if is_list_directed {
+                lower_write_items_adv(b, ctx, items, unit, advance);
+            } else {
+                // Formatted I/O: use push-based API.
+                let (fmt_ptr, fmt_len) = lower_string_expr(b, &ctx.locals, &fmt_control.unwrap().value, ctx.st);
+                b.call(FuncRef::External("afs_fmt_begin".into()), vec![unit, fmt_ptr, fmt_len], IrType::Void);
+
+                for item in items {
+                    lower_fmt_push(b, ctx, item);
+                }
+
+                let adv = b.const_i32(if advance { 1 } else { 0 });
+                b.call(FuncRef::External("afs_fmt_end".into()), vec![adv], IrType::Void);
             }
-            b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
         }
 
         Stmt::Call { callee, args } => {
@@ -628,61 +861,73 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Allocate { items, .. } => {
             for item in items {
-                // allocate(a(n, m)) → extract shape from subscripts, compute byte count.
                 if let Expr::FunctionCall { callee, args } = &item.node {
                     let base_name = extract_base_name(callee);
                     if let Some(name) = base_name {
                         if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
-                            // Compute total elements from shape subscripts.
-                            let mut total: Option<ValueId> = None;
-                            for arg in args {
-                                let dim_size = match &arg.value {
-                                    crate::ast::expr::SectionSubscript::Element(e) => {
-                                        lower_expr(b, &ctx.locals, e, ctx.st)
-                                    }
-                                    _ => b.const_i32(1),
-                                };
-                                total = Some(match total {
-                                    Some(prev) => b.imul(prev, dim_size),
-                                    None => dim_size,
-                                });
-                            }
-                            let total_elems = total.unwrap_or_else(|| b.const_i32(1));
-
-                            // Compute byte count: total_elements * elem_size.
-                            let elem_size = match &info.ty {
-                                IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8i32,
+                            let elem_size_bytes: i64 = match &info.ty {
+                                IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
                                 IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                                 IrType::Bool => 4,
-                                _ => 8, // pointers, etc.
-                            };
-                            let size_val = if elem_size != 1 {
-                                let es = b.const_i32(elem_size);
-                                b.imul(total_elems, es)
-                            } else {
-                                total_elems
+                                _ => 8,
                             };
 
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size_val],
-                                IrType::Ptr(Box::new(info.ty.clone())),
-                            );
-                            b.store(ptr, info.addr);
-                        }
-                    }
-                } else {
-                    // Simple allocate(a) without shape — allocate 1 element.
-                    let base_name = extract_base_name(item);
-                    if let Some(name) = base_name {
-                        if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
-                            let size = b.const_i32(8); // default pointer size
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size],
-                                IrType::Ptr(Box::new(info.ty.clone())),
-                            );
-                            b.store(ptr, info.addr);
+                            if info.allocatable {
+                                // Allocatable: call afs_allocate_1d for 1D, afs_allocate_array for multi-D.
+                                // info.addr is the descriptor alloca.
+                                let es = b.const_i64(elem_size_bytes);
+                                if args.len() == 1 {
+                                    let n = match &args[0].value {
+                                        crate::ast::expr::SectionSubscript::Element(e) => {
+                                            lower_expr(b, &ctx.locals, e, ctx.st)
+                                        }
+                                        _ => b.const_i64(1),
+                                    };
+                                    // Widen to i64 if needed.
+                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
+                                        b.int_extend(n, IntWidth::I64, true)
+                                    } else { n };
+                                    b.call(
+                                        FuncRef::External("afs_allocate_1d".into()),
+                                        vec![info.addr, es, n64],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    // Multi-D: compute each dim and call afs_allocate_array.
+                                    // For now, fall back to computing total size and using simple allocate.
+                                    let mut total: Option<ValueId> = None;
+                                    for arg in args {
+                                        let dim_size = match &arg.value {
+                                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                                lower_expr(b, &ctx.locals, e, ctx.st)
+                                            }
+                                            _ => b.const_i32(1),
+                                        };
+                                        total = Some(match total {
+                                            Some(prev) => b.imul(prev, dim_size),
+                                            None => dim_size,
+                                        });
+                                    }
+                                    let n = total.unwrap_or_else(|| b.const_i64(1));
+                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
+                                        b.int_extend(n, IntWidth::I64, true)
+                                    } else { n };
+                                    b.call(
+                                        FuncRef::External("afs_allocate_1d".into()),
+                                        vec![info.addr, es, n64],
+                                        IrType::Void,
+                                    );
+                                }
+                            } else {
+                                // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
+                                let size_val = b.const_i32(elem_size_bytes as i32);
+                                let ptr = b.runtime_call(
+                                    RuntimeFunc::Allocate,
+                                    vec![size_val],
+                                    IrType::Ptr(Box::new(info.ty.clone())),
+                                );
+                                b.store(ptr, info.addr);
+                            }
                         }
                     }
                 }
@@ -694,8 +939,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let base_name = extract_base_name(item);
                 if let Some(name) = base_name {
                     if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
-                        let ptr = b.load(info.addr);
-                        b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                        if info.allocatable {
+                            // Pass descriptor address to runtime with null STAT.
+                            // Alloca a dummy STAT to avoid abort on already-deallocated.
+                            let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![info.addr, stat_slot],
+                                IrType::Void,
+                            );
+                        } else {
+                            let ptr = b.load(info.addr);
+                            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                        }
                     }
                 }
             }
@@ -716,7 +972,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
             }
             lower_stmts(b, ctx, body);
 
@@ -727,6 +983,186 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Continue { .. } => {} // no-op
+
+        Stmt::Open { specs } => {
+            // Extract UNIT and FILE from specs. Simplified: first spec is unit, second is file.
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+
+            // Find FILE= spec.
+            let (file_ptr, file_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("file")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find STATUS= spec.
+            let (status_ptr, status_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("status")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find ACTION= spec.
+            let (action_ptr, action_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("action")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find ACCESS= spec.
+            let (access_ptr, access_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("access")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find FORM= spec.
+            let (form_ptr, form_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("form")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find RECL= spec.
+            let recl_val = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("recl")).unwrap_or(false))
+                .map(|s| lower_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| b.const_i64(0));
+
+            let null = b.const_i64(0);
+
+            // Check if we have any extended specifiers beyond the basic 7-arg set.
+            let has_access = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("access")).unwrap_or(false));
+            let has_form = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("form")).unwrap_or(false));
+            let has_recl = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("recl")).unwrap_or(false));
+            let has_position = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("position")).unwrap_or(false));
+
+            if !has_access && !has_form && !has_recl && !has_position {
+                // Simple case: use 7-arg afs_open_simple (unit + 3 string pairs).
+                b.call(
+                    FuncRef::External("afs_open_simple".into()),
+                    vec![unit, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len],
+                    IrType::Void,
+                );
+            } else {
+                // Extended case: build OpenControlBlock on the stack.
+                // Find POSITION= spec.
+                let (position_ptr, position_len) = specs.iter()
+                    .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("position")).unwrap_or(false))
+                    .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                    .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+                // Layout matches repr(C) OpenControlBlock (128 bytes):
+                //   0: unit(i32) + 4 pad, 8: filename(ptr), 16: filename_len(i64),
+                //  24: status(ptr), 32: status_len(i64), 40: action(ptr), 48: action_len(i64),
+                //  56: access(ptr), 64: access_len(i64), 72: form(ptr), 80: form_len(i64),
+                //  88: recl(i64), 96: iostat(ptr), 104: newunit(ptr),
+                // 112: position(ptr), 120: position_len(i64)
+                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 128);
+                let cb = b.alloca(cb_ty);
+
+                let store_at = |b: &mut crate::ir::builder::FuncBuilder, base, offset: i64, val| {
+                    let off = b.const_i64(offset);
+                    let ptr = b.gep(base, vec![off], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    b.store(val, ptr);
+                };
+
+                store_at(b, cb, 0, unit);
+                store_at(b, cb, 8, file_ptr);
+                store_at(b, cb, 16, file_len);
+                store_at(b, cb, 24, status_ptr);
+                store_at(b, cb, 32, status_len);
+                store_at(b, cb, 40, action_ptr);
+                store_at(b, cb, 48, action_len);
+                store_at(b, cb, 56, access_ptr);
+                store_at(b, cb, 64, access_len);
+                store_at(b, cb, 72, form_ptr);
+                store_at(b, cb, 80, form_len);
+                store_at(b, cb, 88, recl_val);
+                store_at(b, cb, 96, null);       // iostat = null
+                store_at(b, cb, 104, null);      // newunit = null
+                store_at(b, cb, 112, position_ptr);
+                store_at(b, cb, 120, position_len);
+
+                b.call(
+                    FuncRef::External("afs_open".into()),
+                    vec![cb],
+                    IrType::Void,
+                );
+            }
+        }
+
+        Stmt::Close { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_close".into()), vec![unit, null], IrType::Void);
+        }
+
+        Stmt::Read { controls, items } => {
+            // READ(unit, *) items — simplified: first control is unit.
+            let unit = if let Some(ctrl) = controls.first() {
+                lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+            } else {
+                b.const_i32(5) // default stdin
+            };
+            let null = b.const_i64(0); // null IOSTAT
+            for item in items {
+                if let Expr::Name { name } = &item.node {
+                    let key = name.to_lowercase();
+                    if let Some(info) = ctx.locals.get(&key) {
+                        let addr = if info.by_ref {
+                            b.load(info.addr)
+                        } else {
+                            info.addr
+                        };
+                        let ty = &info.ty;
+                        let func_name = match ty {
+                            IrType::Int(IntWidth::I64) => "afs_read_int64",
+                            IrType::Int(_) => "afs_read_int",
+                            IrType::Float(FloatWidth::F64) => "afs_read_real64",
+                            IrType::Float(_) => "afs_read_real",
+                            _ => "afs_read_int",
+                        };
+                        b.call(FuncRef::External(func_name.into()), vec![unit, addr, null], IrType::Void);
+                    }
+                }
+            }
+        }
+
+        Stmt::Inquire { specs, .. } => {
+            // Simplified INQUIRE: extract UNIT or FILE, and EXIST.
+            let null = b.const_i64(0);
+            let file_spec = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("file")).unwrap_or(false));
+            let exist_spec = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("exist")).unwrap_or(false));
+
+            if let Some(fs) = file_spec {
+                let (fptr, flen) = lower_string_expr(b, &ctx.locals, &fs.value, ctx.st);
+                let exist_addr = if let Some(es) = exist_spec {
+                    if let Expr::Name { name } = &es.value.node {
+                        ctx.locals.get(&name.to_lowercase()).map(|i| i.addr).unwrap_or(null)
+                    } else { null }
+                } else { null };
+                b.call(FuncRef::External("afs_inquire_file".into()),
+                    vec![fptr, flen, exist_addr, null, null], IrType::Void);
+            }
+        }
+
+        Stmt::Flush { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_flush".into()), vec![unit, null], IrType::Void);
+        }
+
+        Stmt::Rewind { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_rewind".into()), vec![unit, null], IrType::Void);
+        }
 
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
     }
@@ -811,7 +1247,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None });
             addr
         });
 
@@ -1029,7 +1465,14 @@ fn lower_array_element(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    let base = array_base_addr(b, info);
+    // Widen index to i64 for pointer arithmetic if needed.
+    let idx64 = if info.allocatable {
+        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
+            b.int_extend(idx, IntWidth::I64, true)
+        } else { idx }
+    } else { idx };
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.load(elem_ptr)
 }
 
@@ -1076,8 +1519,133 @@ fn lower_array_store(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let elem_ptr = b.gep(info.addr, vec![idx], info.ty.clone());
+    let base = array_base_addr(b, info);
+    let idx64 = if info.allocatable {
+        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
+            b.int_extend(idx, IntWidth::I64, true)
+        } else { idx }
+    } else { idx };
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.store(value, elem_ptr);
+}
+
+/// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.
+fn lower_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+) {
+    lower_write_items_adv(b, ctx, items, unit, true);
+}
+
+fn lower_write_items_adv(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    advance: bool,
+) {
+    for item in items {
+        let is_char = if let Expr::Name { name } = &item.node {
+            ctx.locals.get(&name.to_lowercase())
+                .map(|i| i.char_kind != CharKind::None)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+            b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
+        } else {
+            let val = lower_expr(b, &ctx.locals, item, ctx.st);
+            let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+            let func_name = match &ty {
+                IrType::Int(IntWidth::I64) => "afs_write_int64",
+                IrType::Int(_) => "afs_write_int",
+                IrType::Float(FloatWidth::F64) => "afs_write_real64",
+                IrType::Float(_) => "afs_write_real",
+                IrType::Bool => "afs_write_logical",
+                IrType::Ptr(_) => {
+                    // Pointer type — likely a string. Use write_string with literal length.
+                    let len = string_literal_len(item);
+                    let len_val = b.const_i64(len);
+                    b.call(FuncRef::External("afs_write_string".into()), vec![unit, val, len_val], IrType::Void);
+                    continue;
+                }
+                _ => "afs_write_int",
+            };
+            b.call(FuncRef::External(func_name.into()), vec![unit, val], IrType::Void);
+        }
+    }
+    if advance {
+        b.call(FuncRef::External("afs_write_newline".into()), vec![unit], IrType::Void);
+    }
+}
+
+/// Push a single I/O item value for formatted output via afs_fmt_push_*.
+fn lower_fmt_push(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+) {
+    let is_char = if let Expr::Name { name } = &item.node {
+        ctx.locals.get(&name.to_lowercase())
+            .map(|i| i.char_kind != CharKind::None)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+        let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+        b.call(FuncRef::External("afs_fmt_push_string".into()), vec![ptr, len], IrType::Void);
+    } else {
+        let val = lower_expr(b, &ctx.locals, item, ctx.st);
+        let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        match &ty {
+            IrType::Int(IntWidth::I64) => {
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![val], IrType::Void);
+            }
+            IrType::Int(_) => {
+                // Widen i32 to i64 for the push API.
+                let widened = b.int_extend(val, IntWidth::I64, true);
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
+            }
+            IrType::Float(_) => {
+                // afs_fmt_push_real takes f64; f32 is promoted by calling convention.
+                b.call(FuncRef::External("afs_fmt_push_real".into()), vec![val], IrType::Void);
+            }
+            IrType::Bool => {
+                let int_val = b.int_extend(val, IntWidth::I32, false);
+                b.call(FuncRef::External("afs_fmt_push_logical".into()), vec![int_val], IrType::Void);
+            }
+            IrType::Ptr(_) => {
+                // Pointer type — likely a string.
+                let len = string_literal_len(item);
+                let len_val = b.const_i64(len);
+                b.call(FuncRef::External("afs_fmt_push_string".into()), vec![val, len_val], IrType::Void);
+            }
+            _ => {
+                let widened = b.int_extend(val, IntWidth::I64, true);
+                b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
+            }
+        }
+    }
+}
+
+/// Get the data base address for an array variable.
+/// For fixed arrays, this is the alloca address directly.
+/// For allocatable arrays, load base_addr from the descriptor (offset 0).
+fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.allocatable {
+        // Load base_addr (first 8 bytes of descriptor) as a pointer.
+        // The descriptor alloca is [i8 x 384], but the first field is a pointer.
+        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    } else {
+        info.addr
+    }
 }
 
 /// Extract base variable name from an expression.
@@ -1268,9 +1836,9 @@ fn lower_expr(
                 let key = name.to_lowercase();
 
                 // Check if this is an array element access.
+                // Fixed arrays have dims set; allocatable arrays have allocatable flag.
                 if let Some(info) = locals.get(&key) {
-                    if !info.dims.is_empty() {
-                        // Array element: compute flat offset and load.
+                    if !info.dims.is_empty() || info.allocatable {
                         return lower_array_element(b, locals, info, args, st);
                     }
                 }
@@ -1301,7 +1869,7 @@ fn lower_expr(
                     .find_map(|scope| scope.symbols.get(&key));
                 let ret_ty = callee_sym
                     .and_then(|sym| sym.type_info.as_ref())
-                    .map(|info| crate::sema::types::type_info_to_fortran_type(info))
+                    .map(crate::sema::types::type_info_to_fortran_type)
                     .map(|ft| match ft {
                         crate::sema::types::FortranType::Real { kind } => IrType::float_from_kind(kind),
                         crate::sema::types::FortranType::Integer { kind } => IrType::int_from_kind(kind),
@@ -1388,8 +1956,8 @@ program test
   print *, x
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_print_int"));
-        assert!(ir.contains("rt_call @__afs_print_newline"));
+        assert!(ir.contains("afs_write_int"));
+        assert!(ir.contains("afs_write_newline"));
     }
 
     #[test]
@@ -1663,7 +2231,7 @@ program test
   end associate
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_print_int"));
+        assert!(ir.contains("afs_write_int"));
     }
 
     // ---- Allocatable / strings ----
@@ -1678,8 +2246,8 @@ program test
   deallocate(a)
 end program
 ");
-        assert!(ir.contains("rt_call @__afs_allocate"), "expected allocate call in:\n{}", ir);
-        assert!(ir.contains("rt_call @__afs_deallocate"), "expected deallocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_allocate_1d"), "expected allocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_deallocate_array"), "expected deallocate call in:\n{}", ir);
     }
 
     #[test]
@@ -1692,7 +2260,7 @@ subroutine foo()
 end subroutine
 ");
         // Should have implicit deallocation before ret.
-        let dealloc_count = ir.matches("rt_call @__afs_deallocate").count();
+        let dealloc_count = ir.matches("call @afs_deallocate_array").count();
         assert!(dealloc_count >= 1, "expected implicit deallocation, got {} in:\n{}", dealloc_count, ir);
     }
 
@@ -1705,7 +2273,7 @@ program test
 end program
 ");
         assert!(ir.contains("const_string"), "expected string constant in:\n{}", ir);
-        assert!(ir.contains("rt_call @__afs_print"));
+        assert!(ir.contains("afs_write_string"));
     }
 
     // ---- Calls ----

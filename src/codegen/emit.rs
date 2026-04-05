@@ -178,8 +178,19 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let shift = if let MachineOperand::Shift(s) = &inst.operands[2] { *s } else { 0 };
             format!("movn {}, #{}, lsl #{}", op_str(&inst.operands[0]), imm, shift)
         }
-        ArmOpcode::MovReg => format!("mov {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::MovReg => {
+            let dest = op_str(&inst.operands[0]);
+            let src = op_str(&inst.operands[1]);
+            // Handle width mismatch: w→x extend or x→w truncate.
+            let dest_is_x = dest.starts_with('x');
+            let src_is_w = src.starts_with('w');
+            if dest_is_x && src_is_w {
+                // Zero-extend 32→64: use uxtw.
+                format!("uxtw {}, {}", dest, src)
+            } else {
+                format!("mov {}, {}", dest, src)
+            }
+        }
         ArmOpcode::FmovReg => format!("fmov {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
 
@@ -289,6 +300,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 }
             } else { "bl ???".into() }
         }
+        ArmOpcode::Sxtw => format!("sxtw {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
         ArmOpcode::Brk => {

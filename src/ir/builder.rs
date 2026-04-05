@@ -229,6 +229,12 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::Load(addr), ty)
     }
 
+    /// Load with an explicit result type (ignoring the pointer's inner type).
+    /// Used for loading fields from aggregate pointers (e.g., first 8 bytes of a descriptor).
+    pub fn load_typed(&mut self, addr: ValueId, ty: IrType) -> ValueId {
+        self.emit(InstKind::Load(addr), ty)
+    }
+
     pub fn store(&mut self, value: ValueId, addr: ValueId) -> ValueId {
         self.emit(InstKind::Store(value, addr), IrType::Void)
     }

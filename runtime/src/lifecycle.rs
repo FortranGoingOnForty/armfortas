@@ -6,17 +6,14 @@ use std::process;
 /// Sets up I/O units, signal handlers, etc.
 #[no_mangle]
 pub extern "C" fn afs_program_init() {
-    // Reserved for future: I/O unit table, default signal handlers.
+    crate::io_system::afs_io_init();
 }
 
 /// Called after the user's program body completes normally.
 /// Flushes I/O, runs finalizers.
 #[no_mangle]
 pub extern "C" fn afs_program_finalize() {
-    // Flush stdout/stderr.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    crate::io_system::afs_io_finalize();
 }
 
 /// Fortran STOP statement.

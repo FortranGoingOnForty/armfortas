@@ -94,6 +94,9 @@ pub enum ArmOpcode {
     Bl,          // BL label  (call)
     Ret,         // RET
 
+    // ---- Extend ----
+    Sxtw,        // SXTW Xd, Wn (sign-extend 32→64)
+
     // ---- Special ----
     Nop,
     Brk,         // BRK #imm16  (debug trap)

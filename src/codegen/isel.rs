@@ -667,11 +667,53 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             }
         }
 
-        // Remaining: IntExtend, IntTrunc, ExtractField, InsertField — emit MOV as placeholder.
+        // ---- Integer extend/truncate ----
+        InstKind::IntExtend(a, _target_width, signed) => {
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            if *signed {
+                // SXTW Xd, Wn — sign-extend 32-bit to 64-bit.
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::Sxtw,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: Some(dest),
+                });
+            } else {
+                // Zero-extend: MOV Xd, Wn (ARM64 implicitly zero-extends W→X).
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: Some(dest),
+                });
+            }
+        }
+
+        InstKind::IntTrunc(a, _) => {
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            // Truncate: just MOV — the 32-bit register naturally truncates.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        // Remaining: ExtractField, InsertField — placeholder.
         _ => {
             let class = type_to_reg_class(&inst.ty);
             let _dest = ctx.get_vreg(mf, inst.id, class);
-            // Placeholder NOP for unimplemented instructions.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::Nop,
                 operands: vec![],
