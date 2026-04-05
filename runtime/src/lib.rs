@@ -8,6 +8,7 @@
 pub mod descriptor;
 pub mod array;
 pub mod string;
+pub mod io_system;
 mod io;
 mod mem;
 mod lifecycle;
