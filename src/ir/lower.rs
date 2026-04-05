@@ -774,7 +774,158 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 Some(b.const_i32(kind))
             } else { None }
         }
+        // ---- System inquiry functions ----
+        "command_argument_count" => {
+            Some(b.call(FuncRef::External("afs_command_argument_count".into()), vec![], IrType::Int(IntWidth::I32)))
+        }
+
         _ => None,
+    }
+}
+
+/// Lower an intrinsic subroutine call (CALL system_clock, CALL date_and_time, etc.).
+/// Returns true if the name was recognized and lowered, false otherwise.
+fn lower_intrinsic_subroutine(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+) -> bool {
+    /// Helper: get the nth positional arg as a by-ref pointer, or null if absent.
+    fn nth_arg_ref(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[crate::ast::expr::Argument],
+        n: usize,
+    ) -> ValueId {
+        if n < args.len() {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+                return lower_arg_by_ref(b, &ctx.locals, e, ctx.st);
+            }
+        }
+        b.const_i64(0) // null pointer for missing optional arg
+    }
+
+    /// Helper: get the nth positional arg as a by-value expression, or default.
+    fn nth_arg_val(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[crate::ast::expr::Argument],
+        n: usize,
+        default: i32,
+    ) -> ValueId {
+        if n < args.len() {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+                return lower_expr(b, &ctx.locals, e, ctx.st);
+            }
+        }
+        b.const_i32(default)
+    }
+
+    /// Helper: get the nth positional arg as a (ptr, len) string pair, or (null, 0).
+    fn nth_arg_str(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[crate::ast::expr::Argument],
+        n: usize,
+    ) -> (ValueId, ValueId) {
+        if n < args.len() {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+                // Check if it's a character variable — pass ptr+len.
+                if let Expr::Name { name } = &e.node {
+                    if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
+                        if info.char_kind != CharKind::None {
+                            return lower_string_expr(b, &ctx.locals, e, ctx.st);
+                        }
+                    }
+                }
+                // Otherwise pass as ref + zero length.
+                let ptr = lower_arg_by_ref(b, &ctx.locals, e, ctx.st);
+                let zero = b.const_i64(0);
+                return (ptr, zero);
+            }
+        }
+        let z = b.const_i64(0);
+        (z, z)
+    }
+
+    match name {
+        "system_clock" => {
+            // call system_clock(count, count_rate, count_max) — all optional
+            let count = nth_arg_ref(b, ctx, args, 0);
+            let rate = nth_arg_ref(b, ctx, args, 1);
+            let max = nth_arg_ref(b, ctx, args, 2);
+            b.call(FuncRef::External("afs_system_clock".into()), vec![count, rate, max], IrType::Void);
+            true
+        }
+        "cpu_time" => {
+            let time = nth_arg_ref(b, ctx, args, 0);
+            b.call(FuncRef::External("afs_cpu_time".into()), vec![time], IrType::Void);
+            true
+        }
+        "date_and_time" => {
+            // call date_and_time(date, time, zone, values) — all optional strings/array
+            // Runtime: afs_date_and_time(date_buf, date_len, time_buf, time_len, zone_buf, zone_len, values)
+            let (date_ptr, date_len) = nth_arg_str(b, ctx, args, 0);
+            let (time_ptr, time_len) = nth_arg_str(b, ctx, args, 1);
+            let (zone_ptr, zone_len) = nth_arg_str(b, ctx, args, 2);
+            let values = nth_arg_ref(b, ctx, args, 3);
+            b.call(FuncRef::External("afs_date_and_time".into()),
+                vec![date_ptr, date_len, time_ptr, time_len, zone_ptr, zone_len, values],
+                IrType::Void);
+            true
+        }
+        "get_command_argument" => {
+            // call get_command_argument(number, value, length, status)
+            // Runtime: afs_get_command_argument(number, value, value_len, length, status)
+            let number = nth_arg_val(b, ctx, args, 0, 0);
+            let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
+            let length = nth_arg_ref(b, ctx, args, 2);
+            let status = nth_arg_ref(b, ctx, args, 3);
+            b.call(FuncRef::External("afs_get_command_argument".into()),
+                vec![number, val_ptr, val_len, length, status],
+                IrType::Void);
+            true
+        }
+        "command_argument_count" => {
+            // This is a function, not a subroutine — handled in lower_intrinsic.
+            false
+        }
+        "get_environment_variable" => {
+            // call get_environment_variable(name, value, length, status)
+            // Runtime: afs_get_environment_variable(name, name_len, value, value_len, length, status)
+            let (name_ptr, name_len) = nth_arg_str(b, ctx, args, 0);
+            let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
+            let length = nth_arg_ref(b, ctx, args, 2);
+            let status = nth_arg_ref(b, ctx, args, 3);
+            b.call(FuncRef::External("afs_get_environment_variable".into()),
+                vec![name_ptr, name_len, val_ptr, val_len, length, status],
+                IrType::Void);
+            true
+        }
+        "random_number" => {
+            let harvest = nth_arg_ref(b, ctx, args, 0);
+            b.call(FuncRef::External("afs_random_number_f64".into()), vec![harvest], IrType::Void);
+            true
+        }
+        "random_seed" => {
+            let seed = nth_arg_val(b, ctx, args, 0, 0);
+            let widened = b.int_extend(seed, IntWidth::I64, true);
+            b.call(FuncRef::External("afs_random_seed".into()), vec![widened], IrType::Void);
+            true
+        }
+        "execute_command_line" => {
+            // call execute_command_line(command, wait, exitstat, cmdstat)
+            let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
+            let wait = nth_arg_val(b, ctx, args, 1, 1); // default: wait=.true.
+            let exitstat = nth_arg_ref(b, ctx, args, 2);
+            let cmdstat = nth_arg_ref(b, ctx, args, 3);
+            b.call(FuncRef::External("afs_execute_command_line".into()),
+                vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
+                IrType::Void);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1070,29 +1221,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
 
-                // Check for intrinsic subroutines that map to runtime functions.
-                let runtime_name = match key.as_str() {
-                    "system_clock" => Some("afs_system_clock"),
-                    "cpu_time" => Some("afs_cpu_time"),
-                    "date_and_time" => Some("afs_date_and_time"),
-                    "random_number" => Some("afs_random_number_f64"),
-                    "random_seed" => Some("afs_random_seed"),
-                    "execute_command_line" => Some("afs_execute_command_line"),
-                    _ => None,
-                };
-
-                // Fortran default: pass by reference (pass address of each argument).
-                let arg_vals: Vec<ValueId> = args.iter().map(|a| {
-                    match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => {
-                            lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
+                // Try intrinsic subroutine lowering first.
+                if !lower_intrinsic_subroutine(b, ctx, &key, args) {
+                    // Not an intrinsic — general subroutine call.
+                    let arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                        match &a.value {
+                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
+                            }
+                            _ => b.const_i32(0),
                         }
-                        _ => b.const_i32(0),
-                    }
-                }).collect();
-
-                let func_name = runtime_name.unwrap_or(&name).to_string();
-                b.call(FuncRef::External(func_name), arg_vals, IrType::Void);
+                    }).collect();
+                    b.call(FuncRef::External(name.clone()), arg_vals, IrType::Void);
+                }
             }
         }
 
