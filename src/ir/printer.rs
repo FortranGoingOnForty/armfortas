@@ -131,6 +131,8 @@ pub fn print_inst(inst: &Inst) -> String {
         InstKind::FMul(a, b) => format!("fmul %{}, %{}", a.0, b.0),
         InstKind::FDiv(a, b) => format!("fdiv %{}, %{}", a.0, b.0),
         InstKind::FNeg(a) => format!("fneg %{}", a.0),
+        InstKind::FAbs(a) => format!("fabs %{}", a.0),
+        InstKind::FSqrt(a) => format!("fsqrt %{}", a.0),
         InstKind::FPow(a, b) => format!("fpow %{}, %{}", a.0, b.0),
 
         InstKind::ICmp(op, a, b) => format!("icmp {} %{}, %{}", cmp_str(*op), a.0, b.0),
@@ -140,11 +142,18 @@ pub fn print_inst(inst: &Inst) -> String {
         InstKind::Or(a, b) => format!("or %{}, %{}", a.0, b.0),
         InstKind::Not(a) => format!("not %{}", a.0),
 
+        InstKind::Select(c, t, f) => format!("select %{}, %{}, %{}", c.0, t.0, f.0),
+
         InstKind::BitAnd(a, b) => format!("bitand %{}, %{}", a.0, b.0),
         InstKind::BitOr(a, b) => format!("bitor %{}, %{}", a.0, b.0),
         InstKind::BitXor(a, b) => format!("bitxor %{}, %{}", a.0, b.0),
+        InstKind::BitNot(a) => format!("bitnot %{}", a.0),
         InstKind::Shl(a, b) => format!("shl %{}, %{}", a.0, b.0),
+        InstKind::LShr(a, b) => format!("lshr %{}, %{}", a.0, b.0),
         InstKind::AShr(a, b) => format!("ashr %{}, %{}", a.0, b.0),
+        InstKind::CountLeadingZeros(a) => format!("clz %{}", a.0),
+        InstKind::CountTrailingZeros(a) => format!("ctz %{}", a.0),
+        InstKind::PopCount(a) => format!("popcount %{}", a.0),
 
         InstKind::IntToFloat(v, w) => format!("int_to_float %{} : {}", v.0, w),
         InstKind::FloatToInt(v, w) => format!("float_to_int %{} : {}", v.0, w),
