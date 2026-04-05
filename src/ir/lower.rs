@@ -1430,7 +1430,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         let val = lower_expr(b, &ctx.locals, value, ctx.st);
                                         let offset = b.const_i64(field.offset as i64);
                                         let field_ptr = b.gep(info.addr, vec![offset],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                            IrType::Int(IntWidth::I8));
                                         b.store(val, field_ptr);
                                     }
                                 }
@@ -2668,7 +2668,7 @@ fn lower_expr_full(
                                 if let Some(field) = layout.field(component) {
                                     let offset = b.const_i64(field.offset as i64);
                                     let field_ptr = b.gep(info.addr, vec![offset],
-                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                        IrType::Int(IntWidth::I8));
                                     let field_ty = crate::sema::type_layout::size_of_type(&field.type_info);
                                     let ir_ty = match field_ty.0 {
                                         1 => IrType::Int(IntWidth::I8),
