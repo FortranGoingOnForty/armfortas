@@ -663,6 +663,117 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 Some(b.call(FuncRef::External("hypot".into()), vec![args[0], args[1]], IrType::Float(FloatWidth::F64)))
             } else { None }
         }
+
+        // ---- Numeric inquiry intrinsics (compile-time constants) ----
+        // These depend on the argument's type, which we determine from the first arg.
+        "huge" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                match &ty {
+                    IrType::Int(IntWidth::I8) => Some(b.const_i32(i8::MAX as i64 as i32)),
+                    IrType::Int(IntWidth::I16) => Some(b.const_i32(i16::MAX as i64 as i32)),
+                    IrType::Int(IntWidth::I32) => Some(b.const_i32(i32::MAX)),
+                    IrType::Int(IntWidth::I64) => Some(b.const_i64(i64::MAX)),
+                    IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::MAX)),
+                    IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::MAX)),
+                    _ => None,
+                }
+            } else { None }
+        }
+        "tiny" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F32));
+                match &ty {
+                    IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::MIN_POSITIVE)),
+                    IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::MIN_POSITIVE)),
+                    _ => None,
+                }
+            } else { None }
+        }
+        "epsilon" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F32));
+                match &ty {
+                    IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::EPSILON)),
+                    IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::EPSILON)),
+                    _ => None,
+                }
+            } else { None }
+        }
+        "precision" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F32));
+                let prec = match &ty {
+                    IrType::Float(FloatWidth::F32) => 6,  // ~7.2 decimal digits → 6
+                    IrType::Float(FloatWidth::F64) => 15, // ~15.9 decimal digits → 15
+                    _ => 0,
+                };
+                Some(b.const_i32(prec))
+            } else { None }
+        }
+        "range" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                let range = match &ty {
+                    IrType::Int(IntWidth::I8) => 2,
+                    IrType::Int(IntWidth::I16) => 4,
+                    IrType::Int(IntWidth::I32) => 9,
+                    IrType::Int(IntWidth::I64) => 18,
+                    IrType::Float(FloatWidth::F32) => 37,
+                    IrType::Float(FloatWidth::F64) => 307,
+                    _ => 0,
+                };
+                Some(b.const_i32(range))
+            } else { None }
+        }
+        "digits" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                let digits = match &ty {
+                    IrType::Int(IntWidth::I8) => 7,
+                    IrType::Int(IntWidth::I16) => 15,
+                    IrType::Int(IntWidth::I32) => 31,
+                    IrType::Int(IntWidth::I64) => 63,
+                    IrType::Float(FloatWidth::F32) => 24,  // significand bits
+                    IrType::Float(FloatWidth::F64) => 53,
+                    _ => 0,
+                };
+                Some(b.const_i32(digits))
+            } else { None }
+        }
+        "radix" => {
+            // Always 2 for binary machines.
+            Some(b.const_i32(2))
+        }
+        "bit_size" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                let bits = match &ty {
+                    IrType::Int(IntWidth::I8) => 8,
+                    IrType::Int(IntWidth::I16) => 16,
+                    IrType::Int(IntWidth::I32) => 32,
+                    IrType::Int(IntWidth::I64) => 64,
+                    _ => 0,
+                };
+                Some(b.const_i32(bits))
+            } else { None }
+        }
+        "kind" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                let kind = match &ty {
+                    IrType::Int(IntWidth::I8) => 1,
+                    IrType::Int(IntWidth::I16) => 2,
+                    IrType::Int(IntWidth::I32) => 4,
+                    IrType::Int(IntWidth::I64) => 8,
+                    IrType::Float(FloatWidth::F32) => 4,
+                    IrType::Float(FloatWidth::F64) => 8,
+                    IrType::Bool => 4,
+                    _ => 4,
+                };
+                Some(b.const_i32(kind))
+            } else { None }
+        }
         _ => None,
     }
 }
