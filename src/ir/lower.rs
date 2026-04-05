@@ -946,6 +946,75 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Continue { .. } => {} // no-op
 
+        Stmt::Open { specs } => {
+            // Extract UNIT and FILE from specs. Simplified: first spec is unit, second is file.
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+
+            // Find FILE= spec.
+            let (file_ptr, file_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("file")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find STATUS= spec.
+            let (status_ptr, status_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("status")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            // Find ACTION= spec.
+            let (action_ptr, action_len) = specs.iter()
+                .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("action")).unwrap_or(false))
+                .map(|s| lower_string_expr(b, &ctx.locals, &s.value, ctx.st))
+                .unwrap_or_else(|| { let z = b.const_i64(0); (z, z) });
+
+            let null = b.const_i64(0); // null IOSTAT and NEWUNIT
+            b.call(
+                FuncRef::External("afs_open".into()),
+                vec![unit, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len, null, null],
+                IrType::Void,
+            );
+        }
+
+        Stmt::Close { specs } => {
+            let unit = if let Some(s) = specs.first() {
+                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+            } else { b.const_i32(6) };
+            let null = b.const_i64(0);
+            b.call(FuncRef::External("afs_close".into()), vec![unit, null], IrType::Void);
+        }
+
+        Stmt::Read { controls, items } => {
+            // READ(unit, *) items — simplified: first control is unit.
+            let unit = if let Some(ctrl) = controls.first() {
+                lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+            } else {
+                b.const_i32(5) // default stdin
+            };
+            let null = b.const_i64(0); // null IOSTAT
+            for item in items {
+                if let Expr::Name { name } = &item.node {
+                    let key = name.to_lowercase();
+                    if let Some(info) = ctx.locals.get(&key) {
+                        let addr = if info.by_ref {
+                            b.load(info.addr)
+                        } else {
+                            info.addr
+                        };
+                        let ty = &info.ty;
+                        let func_name = match ty {
+                            IrType::Int(_) => "afs_read_int",
+                            IrType::Float(_) => "afs_read_real",
+                            _ => "afs_read_int",
+                        };
+                        b.call(FuncRef::External(func_name.into()), vec![unit, addr, null], IrType::Void);
+                    }
+                }
+            }
+        }
+
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
     }
 }
