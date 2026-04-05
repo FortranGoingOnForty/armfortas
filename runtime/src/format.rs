@@ -5,7 +5,6 @@
 //! Fortran standard set including repeat counts, group repeat,
 //! unlimited repeat, scale factors, and all data/control descriptors.
 
-use std::fmt::Write;
 
 /// A parsed format descriptor.
 #[derive(Debug, Clone)]
@@ -57,6 +56,12 @@ pub enum FormatDesc {
     BlankMode(BlankInterpretation),
     /// kP: scale factor.
     ScaleFactor(i32),
+    /// RU, RD, RZ, RN, RC, RP: rounding mode (F2003).
+    RoundingMode(RoundMode),
+    /// DC, DP: decimal comma or point mode (F2003).
+    DecimalMode(DecimalSep),
+    /// DT: derived type I/O (F2003). Placeholder — requires user-defined I/O procedures.
+    DerivedType { type_name: String },
 
     // ---- Character string descriptors ----
     /// Literal string in format: 'text' or "text".
@@ -87,6 +92,22 @@ pub enum BlankInterpretation {
     Zero,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum RoundMode {
+    Up,          // RU
+    Down,        // RD
+    Zero,        // RZ
+    Nearest,     // RN
+    Compatible,  // RC
+    ProcessorDefined, // RP
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DecimalSep {
+    Comma,  // DC
+    Point,  // DP
+}
+
 /// Parse a Fortran format string (the part inside parentheses) into descriptors.
 pub fn parse_format(fmt: &str) -> Vec<FormatDesc> {
     let trimmed = fmt.trim();
@@ -113,8 +134,16 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
             continue;
         }
 
+        // Check for negative sign (for scale factor: -kP).
+        let negative = if chars.peek() == Some(&'-') {
+            chars.next();
+            true
+        } else {
+            false
+        };
+
         // Check for repeat count.
-        let repeat = parse_number(&mut chars);
+        let repeat = parse_number(&mut chars).map(|n| if negative { n } else { n });
 
         skip_spaces(&mut chars);
         if chars.peek().is_none() { break; }
@@ -171,7 +200,7 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
 
             // ---- Edit descriptors ----
             _ => {
-                let desc = parse_edit_descriptor(&mut chars, repeat);
+                let desc = parse_edit_descriptor(&mut chars, repeat, negative);
                 if let Some(d) = desc {
                     if let Some(n) = repeat {
                         if n > 1 && !matches!(d, FormatDesc::Skip { .. } | FormatDesc::ScaleFactor(_)) {
@@ -194,6 +223,7 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
 fn parse_edit_descriptor(
     chars: &mut std::iter::Peekable<std::str::Chars>,
     repeat: Option<usize>,
+    negative: bool,
 ) -> Option<FormatDesc> {
     let letter = chars.next()?.to_ascii_uppercase();
 
@@ -236,9 +266,28 @@ fn parse_edit_descriptor(
             }
         }
         'D' => {
-            let w = parse_number(chars).unwrap_or(0);
-            let d = if chars.peek() == Some(&'.') { chars.next(); parse_number(chars).unwrap_or(0) } else { 0 };
-            Some(FormatDesc::RealD { width: w, decimals: d })
+            // DC/DP (decimal mode) vs DT (derived type) vs Dw.d (real format).
+            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
+            match next {
+                'C' => { chars.next(); Some(FormatDesc::DecimalMode(DecimalSep::Comma)) }
+                'P' => { chars.next(); Some(FormatDesc::DecimalMode(DecimalSep::Point)) }
+                'T' => {
+                    chars.next();
+                    // DT optionally followed by 'typename'.
+                    let name = if chars.peek() == Some(&'\'') || chars.peek() == Some(&'"') {
+                        let q = *chars.peek().unwrap();
+                        parse_string_literal(chars, q)
+                    } else {
+                        String::new()
+                    };
+                    Some(FormatDesc::DerivedType { type_name: name })
+                }
+                _ => {
+                    let w = parse_number(chars).unwrap_or(0);
+                    let d = if chars.peek() == Some(&'.') { chars.next(); parse_number(chars).unwrap_or(0) } else { 0 };
+                    Some(FormatDesc::RealD { width: w, decimals: d })
+                }
+            }
         }
         'G' => {
             parse_real_desc(chars, |w, d, e| FormatDesc::RealG { width: w, decimals: d, exp_width: e })
@@ -271,8 +320,23 @@ fn parse_edit_descriptor(
             }
         }
         'P' => {
-            // kP — repeat is the scale factor (can be negative, handled by caller).
-            Some(FormatDesc::ScaleFactor(repeat.unwrap_or(0) as i32))
+            // kP — repeat is the scale factor magnitude, sign from negative flag.
+            let k = repeat.unwrap_or(0) as i32;
+            Some(FormatDesc::ScaleFactor(if negative { -k } else { k }))
+        }
+        'R' => {
+            // Rounding modes: RU, RD, RZ, RN, RC, RP.
+            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
+            let mode = match next {
+                'U' => { chars.next(); Some(RoundMode::Up) }
+                'D' => { chars.next(); Some(RoundMode::Down) }
+                'Z' => { chars.next(); Some(RoundMode::Zero) }
+                'N' => { chars.next(); Some(RoundMode::Nearest) }
+                'C' => { chars.next(); Some(RoundMode::Compatible) }
+                'P' => { chars.next(); Some(RoundMode::ProcessorDefined) }
+                _ => None,
+            };
+            mode.map(|m| FormatDesc::RoundingMode(m))
         }
         'B' => {
             // BN or BZ.
@@ -315,11 +379,19 @@ pub struct FormatEngine {
     descriptors: Vec<FormatDesc>,
     sign_mode: SignMode,
     scale_factor: i32,
+    round_mode: RoundMode,
+    decimal_sep: DecimalSep,
 }
 
 impl FormatEngine {
     pub fn new(descriptors: Vec<FormatDesc>) -> Self {
-        Self { descriptors, sign_mode: SignMode::Default, scale_factor: 0 }
+        Self {
+            descriptors,
+            sign_mode: SignMode::Default,
+            scale_factor: 0,
+            round_mode: RoundMode::Compatible,
+            decimal_sep: DecimalSep::Point,
+        }
     }
 
     /// Format a list of values according to the descriptors, producing an output string.
@@ -350,6 +422,9 @@ impl FormatEngine {
                 FormatDesc::Sign(mode) => { self.sign_mode = *mode; }
                 FormatDesc::ScaleFactor(k) => { self.scale_factor = *k; }
                 FormatDesc::BlankMode(_) => {} // input only
+                FormatDesc::RoundingMode(mode) => { self.round_mode = *mode; }
+                FormatDesc::DecimalMode(sep) => { self.decimal_sep = *sep; }
+                FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
                 FormatDesc::TabTo { position } => {
                     let cur_col = output.lines().last().map(|l| l.len()).unwrap_or(0);
                     if *position > cur_col + 1 {
@@ -394,7 +469,6 @@ impl FormatEngine {
         match (desc, val) {
             // ---- Integer ----
             (FormatDesc::IntegerI { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format!("{}", v);
                 let s = if let Some(m) = min_digits {
                     let abs_s = format!("{}", v.unsigned_abs());
                     let padded = format!("{:0>width$}", abs_s, width = *m);
@@ -416,43 +490,48 @@ impl FormatEngine {
 
             // ---- Real ----
             (FormatDesc::RealF { width, decimals }, IoValue::Real(v)) => {
-                let s = format!("{:.*}", *decimals, v);
-                format!("{:>width$}", s, width = *width)
+                // kP scale factor: F format multiplies value by 10^k.
+                let scaled = *v * 10f64.powi(self.scale_factor);
+                let rounded = self.apply_rounding(scaled, *decimals);
+                let s = self.format_fixed(rounded, *decimals);
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
-            (FormatDesc::RealE { width, decimals, .. }, IoValue::Real(v)) => {
-                let s = format!("{:.*E}", *decimals, v);
-                format!("{:>width$}", s, width = *width)
+            (FormatDesc::RealE { width, decimals, exp_width }, IoValue::Real(v)) => {
+                let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
-            (FormatDesc::RealES { width, decimals, .. }, IoValue::Real(v)) => {
-                // Scientific: mantissa in [1.0, 10.0).
-                let s = format!("{:.*E}", *decimals, v);
-                format!("{:>width$}", s, width = *width)
+            (FormatDesc::RealES { width, decimals, exp_width }, IoValue::Real(v)) => {
+                // Scientific: mantissa in [1.0, 10.0). Equivalent to 1P,E.
+                let s = self.format_es_style(*v, *decimals, *exp_width);
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
             (FormatDesc::RealEN { width, decimals, .. }, IoValue::Real(v)) => {
                 // Engineering: exponent is multiple of 3.
                 let (mantissa, exp) = to_engineering(*v);
-                let s = format!("{:.*}E{:+03}", *decimals, mantissa, exp);
-                format!("{:>width$}", s, width = *width)
+                let rounded = self.apply_rounding(mantissa, *decimals);
+                let s = format!("{:.*}E{:+03}", *decimals, rounded, exp);
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
             (FormatDesc::RealD { width, decimals }, IoValue::Real(v)) => {
-                let s = format!("{:.*E}", *decimals, v).replace('E', "D");
-                format!("{:>width$}", s, width = *width)
+                let s = self.format_e_style(*v, *decimals, None, 'D');
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
-            (FormatDesc::RealG { width, decimals, .. }, IoValue::Real(v)) => {
+            (FormatDesc::RealG { width, decimals, exp_width }, IoValue::Real(v)) => {
                 // G format: use F if magnitude fits, else E.
                 let abs_v = v.abs();
                 if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
-                    let s = format!("{:.*}", *decimals, v);
-                    format!("{:>width$}", s, width = *width)
+                    let rounded = self.apply_rounding(*v, *decimals);
+                    let s = self.format_fixed(rounded, *decimals);
+                    self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
                 } else {
-                    let s = format!("{:.*E}", *decimals, v);
-                    format!("{:>width$}", s, width = *width)
+                    let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
+                    self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
                 }
             }
             (FormatDesc::RealEX { width, decimals, .. }, IoValue::Real(v)) => {
                 // Hex-significand: use %a-like format. Rust doesn't have this natively.
                 let s = format!("{:.*E}", *decimals, v); // fallback to E format
-                format!("{:>width$}", s, width = *width)
+                self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
 
             // ---- Logical ----
@@ -491,6 +570,92 @@ impl FormatEngine {
             }
         } else {
             format!("-{}", abs_str)
+        }
+    }
+
+    /// Apply rounding mode to a value at the given number of decimal places.
+    fn apply_rounding(&self, v: f64, decimals: usize) -> f64 {
+        let factor = 10f64.powi(decimals as i32);
+        let scaled = v * factor;
+        match self.round_mode {
+            RoundMode::Up => scaled.ceil() / factor,
+            RoundMode::Down => scaled.floor() / factor,
+            RoundMode::Zero => scaled.trunc() / factor,
+            RoundMode::Nearest => {
+                // IEEE 754 round-to-nearest-even (banker's rounding).
+                let rounded = scaled.round();
+                // Check for exact halfway: round to even.
+                if (scaled - scaled.floor() - 0.5).abs() < 1e-15 {
+                    if rounded as i64 % 2 != 0 {
+                        (rounded - scaled.signum()) / factor
+                    } else {
+                        rounded / factor
+                    }
+                } else {
+                    rounded / factor
+                }
+            }
+            RoundMode::Compatible => {
+                // Round half away from zero (standard mathematical rounding).
+                (scaled + 0.5 * scaled.signum()).trunc() / factor
+            }
+            RoundMode::ProcessorDefined => {
+                // Use Rust's default (round-half-to-even).
+                scaled.round() / factor
+            }
+        }
+    }
+
+    /// Format a fixed-point number (for F and G-as-F).
+    fn format_fixed(&self, v: f64, decimals: usize) -> String {
+        format!("{:.*}", decimals, v)
+    }
+
+    /// Format in E/D style with scale factor applied.
+    ///
+    /// Fortran kP with E format: the mantissa is multiplied by 10^k,
+    /// and the exponent is decreased by k. With 0P (default), the mantissa
+    /// is in [0.1, 1.0) — Fortran's convention, not C's.
+    fn format_e_style(&self, v: f64, decimals: usize, exp_width: Option<usize>, exp_char: char) -> String {
+        if v == 0.0 {
+            let ew = exp_width.unwrap_or(2);
+            return format!("0.{:0>d$}{}{:+0ew$}", "", exp_char, 0, d = decimals, ew = ew + 1);
+        }
+
+        let abs_v = v.abs();
+        let base_exp = abs_v.log10().floor() as i32;
+        // Fortran default (0P): mantissa in [0.1, 1.0), so exponent = base_exp + 1.
+        let fort_exp = base_exp + 1 - self.scale_factor;
+        let mantissa = abs_v / 10f64.powi(base_exp + 1 - self.scale_factor);
+        let rounded = self.apply_rounding(mantissa, decimals);
+
+        let ew = exp_width.unwrap_or(2);
+        let sign = if v < 0.0 { "-" } else if matches!(self.sign_mode, SignMode::Plus) { "+" } else { "" };
+        format!("{}{:.*}{}{:+0ew$}", sign, decimals, rounded, exp_char, fort_exp, ew = ew + 1)
+    }
+
+    /// Format in ES style (scientific): mantissa in [1.0, 10.0).
+    fn format_es_style(&self, v: f64, decimals: usize, exp_width: Option<usize>) -> String {
+        if v == 0.0 {
+            let ew = exp_width.unwrap_or(2);
+            return format!("0.{:0>d$}E{:+0ew$}", "", 0, d = decimals, ew = ew + 1);
+        }
+
+        let abs_v = v.abs();
+        let base_exp = abs_v.log10().floor() as i32;
+        let mantissa = abs_v / 10f64.powi(base_exp);
+        let rounded = self.apply_rounding(mantissa, decimals);
+
+        let ew = exp_width.unwrap_or(2);
+        let sign = if v < 0.0 { "-" } else if matches!(self.sign_mode, SignMode::Plus) { "+" } else { "" };
+        format!("{}{:.*}E{:+0ew$}", sign, decimals, rounded, base_exp, ew = ew + 1)
+    }
+
+    /// Replace '.' with ',' when decimal mode is DC (comma).
+    fn apply_decimal_sep(&self, s: &str) -> String {
+        match self.decimal_sep {
+            DecimalSep::Point => s.to_string(),
+            DecimalSep::Comma => s.replace('.', ","),
         }
     }
 }
@@ -707,5 +872,118 @@ mod tests {
             IoValue::Integer(1), IoValue::Integer(2), IoValue::Integer(3)
         ]);
         assert_eq!(out, "  1,  2,  3,");
+    }
+
+    #[test]
+    fn parse_dc_dp_decimal_mode() {
+        let descs = parse_format("(DC, F8.3, DP, F8.3)");
+        assert_eq!(descs.len(), 4);
+        assert!(matches!(descs[0], FormatDesc::DecimalMode(DecimalSep::Comma)));
+        assert!(matches!(descs[2], FormatDesc::DecimalMode(DecimalSep::Point)));
+    }
+
+    #[test]
+    fn parse_dt_derived_type() {
+        let descs = parse_format("(DT'mytype')");
+        assert_eq!(descs.len(), 1);
+        if let FormatDesc::DerivedType { ref type_name } = descs[0] {
+            assert_eq!(type_name, "mytype");
+        } else {
+            panic!("expected DerivedType, got {:?}", descs[0]);
+        }
+    }
+
+    #[test]
+    fn parse_dt_no_name() {
+        let descs = parse_format("(DT)");
+        assert_eq!(descs.len(), 1);
+        if let FormatDesc::DerivedType { ref type_name } = descs[0] {
+            assert_eq!(type_name, "");
+        } else {
+            panic!("expected DerivedType");
+        }
+    }
+
+    #[test]
+    fn parse_rounding_modes() {
+        let descs = parse_format("(RU, F8.3, RD, F8.3, RZ, F8.3, RN, F8.3, RC, F8.3, RP, F8.3)");
+        assert!(matches!(descs[0], FormatDesc::RoundingMode(RoundMode::Up)));
+        assert!(matches!(descs[2], FormatDesc::RoundingMode(RoundMode::Down)));
+        assert!(matches!(descs[4], FormatDesc::RoundingMode(RoundMode::Zero)));
+        assert!(matches!(descs[6], FormatDesc::RoundingMode(RoundMode::Nearest)));
+        assert!(matches!(descs[8], FormatDesc::RoundingMode(RoundMode::Compatible)));
+        assert!(matches!(descs[10], FormatDesc::RoundingMode(RoundMode::ProcessorDefined)));
+    }
+
+    #[test]
+    fn parse_negative_scale_factor() {
+        let descs = parse_format("(-2P, E15.8)");
+        assert!(matches!(descs[0], FormatDesc::ScaleFactor(-2)));
+    }
+
+    #[test]
+    fn parse_positive_scale_factor() {
+        let descs = parse_format("(3P, E15.8)");
+        assert!(matches!(descs[0], FormatDesc::ScaleFactor(3)));
+    }
+
+    #[test]
+    fn format_decimal_comma() {
+        let descs = parse_format("(DC, F8.3)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(3.14)]);
+        assert!(out.contains(','), "expected comma in output: {}", out);
+        assert!(!out.contains('.'), "expected no dot in output: {}", out);
+    }
+
+    #[test]
+    fn format_rounding_up() {
+        let descs = parse_format("(RU, F6.2)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(1.234)]);
+        // RU rounds 1.234 up to 1.24 at 2 decimals.
+        assert_eq!(out.trim(), "1.24");
+    }
+
+    #[test]
+    fn format_rounding_down() {
+        let descs = parse_format("(RD, F6.2)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(1.236)]);
+        // RD rounds 1.236 down to 1.23 at 2 decimals.
+        assert_eq!(out.trim(), "1.23");
+    }
+
+    #[test]
+    fn format_rounding_zero() {
+        let descs = parse_format("(RZ, F6.2)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(-1.236)]);
+        // RZ truncates toward zero: -1.236 → -1.23.
+        assert_eq!(out.trim(), "-1.23");
+    }
+
+    #[test]
+    fn format_scale_factor_f() {
+        // 2P with F: multiplies value by 10^2 before formatting.
+        let descs = parse_format("(2P, F8.2)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(1.5)]);
+        // 1.5 * 100 = 150.00
+        assert_eq!(out.trim(), "150.00");
+    }
+
+    #[test]
+    fn format_d_descriptor() {
+        let descs = parse_format("(D12.5)");
+        assert!(matches!(descs[0], FormatDesc::RealD { width: 12, decimals: 5 }));
+    }
+
+    #[test]
+    fn format_d_vs_dc() {
+        // D12.5 is a real descriptor; DC is decimal comma mode.
+        let descs = parse_format("(DC, D12.5)");
+        assert!(matches!(descs[0], FormatDesc::DecimalMode(DecimalSep::Comma)));
+        assert!(matches!(descs[1], FormatDesc::RealD { width: 12, decimals: 5 }));
     }
 }
