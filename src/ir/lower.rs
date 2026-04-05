@@ -423,7 +423,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 }
             } else { None }
         }
-        "int" | "nint" | "idint" | "ifix" => {
+        "int" | "idint" | "ifix" => {
             if let Some(arg) = args.first() {
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 if ty.is_float() {
@@ -431,6 +431,28 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 } else {
                     Some(*arg)
                 }
+            } else { None }
+        }
+        "nint" | "idnint" => {
+            // NINT: round to nearest integer (not truncate).
+            // Round via libm round(), then convert to int.
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F64));
+                if ty.is_float() {
+                    let func = if matches!(ty, IrType::Float(FloatWidth::F32)) { "roundf" } else { "round" };
+                    let rounded = b.call(FuncRef::External(func.into()), vec![*arg], ty.clone());
+                    Some(b.float_to_int(rounded, IntWidth::I32))
+                } else {
+                    Some(*arg)
+                }
+            } else { None }
+        }
+        "anint" | "dnint" => {
+            // ANINT: round to nearest whole number, return as real.
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F64));
+                let func = if matches!(ty, IrType::Float(FloatWidth::F32)) { "roundf" } else { "round" };
+                Some(b.call(FuncRef::External(func.into()), vec![*arg], ty))
             } else { None }
         }
         "real" | "float" | "sngl" => {
@@ -587,64 +609,67 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             } else { None }
         }
         // ---- Math intrinsics → libm calls ----
-        "sin" | "dsin" => {
-            args.first().map(|a| b.call(FuncRef::External("sin".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "cos" | "dcos" => {
-            args.first().map(|a| b.call(FuncRef::External("cos".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "tan" | "dtan" => {
-            args.first().map(|a| b.call(FuncRef::External("tan".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "asin" | "dasin" => {
-            args.first().map(|a| b.call(FuncRef::External("asin".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "acos" | "dacos" => {
-            args.first().map(|a| b.call(FuncRef::External("acos".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "atan" | "datan" => {
-            args.first().map(|a| b.call(FuncRef::External("atan".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+        // Dispatch to sinf/sin based on argument type for F32/F64 correctness.
+        "sin" | "dsin" | "cos" | "dcos" | "tan" | "dtan" |
+        "asin" | "dasin" | "acos" | "dacos" | "atan" | "datan" |
+        "sinh" | "dsinh" | "cosh" | "dcosh" | "tanh" | "dtanh" |
+        "exp" | "dexp" | "log" | "dlog" | "alog" |
+        "log10" | "dlog10" | "alog10" |
+        "erf" | "derf" | "erfc" | "derfc" |
+        "ceiling" | "floor" => {
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let base_name = match name {
+                    "dsin" | "sin" => "sin",
+                    "dcos" | "cos" => "cos",
+                    "dtan" | "tan" => "tan",
+                    "dasin" | "asin" => "asin",
+                    "dacos" | "acos" => "acos",
+                    "datan" | "atan" => "atan",
+                    "dsinh" | "sinh" => "sinh",
+                    "dcosh" | "cosh" => "cosh",
+                    "dtanh" | "tanh" => "tanh",
+                    "dexp" | "exp" => "exp",
+                    "dlog" | "log" | "alog" => "log",
+                    "dlog10" | "log10" | "alog10" => "log10",
+                    "derf" | "erf" => "erf",
+                    "derfc" | "erfc" => "erfc",
+                    "ceiling" => "ceil",
+                    "floor" => "floor",
+                    _ => name,
+                };
+                let func_name = if is_f32 { format!("{}f", base_name) } else { base_name.to_string() };
+                let ret_ty = if is_f32 { IrType::Float(FloatWidth::F32) } else { IrType::Float(FloatWidth::F64) };
+                Some(b.call(FuncRef::External(func_name), vec![*arg], ret_ty))
+            } else { None }
         }
         "atan2" | "datan2" => {
             if args.len() >= 2 {
-                Some(b.call(FuncRef::External("atan2".into()), vec![args[0], args[1]], IrType::Float(FloatWidth::F64)))
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let func = if is_f32 { "atan2f" } else { "atan2" };
+                let ret_ty = if is_f32 { IrType::Float(FloatWidth::F32) } else { IrType::Float(FloatWidth::F64) };
+                Some(b.call(FuncRef::External(func.into()), vec![args[0], args[1]], ret_ty))
             } else { None }
         }
-        "sinh" | "dsinh" => {
-            args.first().map(|a| b.call(FuncRef::External("sinh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "cosh" | "dcosh" => {
-            args.first().map(|a| b.call(FuncRef::External("cosh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "tanh" | "dtanh" => {
-            args.first().map(|a| b.call(FuncRef::External("tanh".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "exp" | "dexp" => {
-            args.first().map(|a| b.call(FuncRef::External("exp".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "log" | "dlog" | "alog" => {
-            args.first().map(|a| b.call(FuncRef::External("log".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "log10" | "dlog10" | "alog10" => {
-            args.first().map(|a| b.call(FuncRef::External("log10".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "ceiling" => {
-            args.first().map(|a| b.call(FuncRef::External("ceil".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "floor" => {
-            args.first().map(|a| b.call(FuncRef::External("floor".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "erf" | "derf" => {
-            args.first().map(|a| b.call(FuncRef::External("erf".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
-        "erfc" | "derfc" => {
-            args.first().map(|a| b.call(FuncRef::External("erfc".into()), vec![*a], IrType::Float(FloatWidth::F64)))
-        }
         "gamma" | "dgamma" => {
-            args.first().map(|a| b.call(FuncRef::External("tgamma".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+            args.first().map(|a| {
+                let ty = b.func().value_type(*a).unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let func = if is_f32 { "tgammaf" } else { "tgamma" };
+                let ret_ty = if is_f32 { IrType::Float(FloatWidth::F32) } else { IrType::Float(FloatWidth::F64) };
+                b.call(FuncRef::External(func.into()), vec![*a], ret_ty)
+            })
         }
         "log_gamma" => {
-            args.first().map(|a| b.call(FuncRef::External("lgamma".into()), vec![*a], IrType::Float(FloatWidth::F64)))
+            args.first().map(|a| {
+                let ty = b.func().value_type(*a).unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let func = if is_f32 { "lgammaf" } else { "lgamma" };
+                let ret_ty = if is_f32 { IrType::Float(FloatWidth::F32) } else { IrType::Float(FloatWidth::F64) };
+                b.call(FuncRef::External(func.into()), vec![*a], ret_ty)
+            })
         }
         "bessel_j0" => {
             args.first().map(|a| b.call(FuncRef::External("j0".into()), vec![*a], IrType::Float(FloatWidth::F64)))
@@ -660,7 +685,29 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "hypot" => {
             if args.len() >= 2 {
-                Some(b.call(FuncRef::External("hypot".into()), vec![args[0], args[1]], IrType::Float(FloatWidth::F64)))
+                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let func = if is_f32 { "hypotf" } else { "hypot" };
+                let ret_ty = if is_f32 { IrType::Float(FloatWidth::F32) } else { IrType::Float(FloatWidth::F64) };
+                Some(b.call(FuncRef::External(func.into()), vec![args[0], args[1]], ret_ty))
+            } else { None }
+        }
+        "ishftc" => {
+            // ishftc(a, shift, size): circular shift of the rightmost `size` bits.
+            if args.len() >= 2 {
+                let size = if args.len() >= 3 { args[2] } else { b.const_i32(32) };
+                let shift = args[1];
+                // left = (a << shift) | (a >> (size - shift)), masked to size bits.
+                let left = b.shl(args[0], shift);
+                let diff = b.isub(size, shift);
+                let right = b.lshr(args[0], diff);
+                let combined = b.bit_or(left, right);
+                // Mask to `size` bits: combined & ((1 << size) - 1).
+                let one = b.const_i32(1);
+                let shifted_one = b.shl(one, size);
+                let one2 = b.const_i32(1);
+                let mask = b.isub(shifted_one, one2);
+                Some(b.bit_and(combined, mask))
             } else { None }
         }
 
