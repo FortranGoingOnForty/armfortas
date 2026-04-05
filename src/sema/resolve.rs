@@ -9,8 +9,9 @@ use crate::ast::decl::{SpannedDecl, Decl, TypeSpec, Attribute, OnlyItem};
 use super::symtab::*;
 
 /// Walk a list of program units and build the symbol table.
-pub fn resolve_file(units: &[SpannedUnit]) -> Result<SymbolTable, SemaError> {
+pub fn resolve_file(units: &[SpannedUnit]) -> Result<(SymbolTable, super::type_layout::TypeLayoutRegistry), SemaError> {
     let mut st = SymbolTable::new();
+    let mut layouts = super::type_layout::TypeLayoutRegistry::new();
 
     // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
     super::intrinsic_modules::register_intrinsic_modules(&mut st);
@@ -28,7 +29,10 @@ pub fn resolve_file(units: &[SpannedUnit]) -> Result<SymbolTable, SemaError> {
         resolve_unit(&mut st, unit)?;
     }
 
-    Ok(st)
+    // Third pass: compute layouts for all derived types.
+    compute_all_layouts(units, &mut layouts);
+
+    Ok((st, layouts))
 }
 
 fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaError> {
@@ -198,6 +202,36 @@ fn process_uses(st: &mut SymbolTable, uses: &[SpannedDecl]) -> Result<(), SemaEr
         }
     }
     Ok(())
+}
+
+/// Walk all program units and compute layouts for derived types.
+fn compute_all_layouts(units: &[SpannedUnit], layouts: &mut super::type_layout::TypeLayoutRegistry) {
+    for unit in units {
+        collect_derived_type_layouts(&unit.node, layouts);
+    }
+}
+
+fn collect_derived_type_layouts(unit: &ProgramUnit, layouts: &mut super::type_layout::TypeLayoutRegistry) {
+    let decls = match unit {
+        ProgramUnit::Program { decls, contains, .. } |
+        ProgramUnit::Module { decls, contains, .. } => {
+            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
+            decls
+        }
+        ProgramUnit::Subroutine { decls, contains, .. } |
+        ProgramUnit::Function { decls, contains, .. } => {
+            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
+            decls
+        }
+        _ => return,
+    };
+    for decl in decls {
+        if let Decl::DerivedTypeDef { name, extends, components, .. } = &decl.node {
+            let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
+            let layout = super::type_layout::compute_layout(name, components, parent.as_ref(), layouts);
+            layouts.insert(layout);
+        }
+    }
 }
 
 fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Result<(), SemaError> {
@@ -421,7 +455,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        resolve_file(&units).unwrap()
+        resolve_file(&units).unwrap().0
     }
 
     // ---- Integration tests ----

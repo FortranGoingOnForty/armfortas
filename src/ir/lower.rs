@@ -58,6 +58,7 @@ struct LowerCtx<'a> {
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
     globals: &'a HashMap<String, (usize, IrType)>,
+    type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
     /// For functions: the return type.
@@ -65,8 +66,8 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>) -> Self {
-        Self { locals: HashMap::new(), loops: Vec::new(), st, globals, result_addr: None, result_type: None }
+    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
+        Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
@@ -99,21 +100,22 @@ impl<'a> LowerCtx<'a> {
 pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Module {
     let mut module = Module::new("main".into());
-    let globals = HashMap::new(); // populated by module lowering
+    let globals = HashMap::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals);
+        lower_unit(&mut module, unit, st, &globals, type_layouts);
     }
     module
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (usize, IrType)>) {
+fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (usize, IrType)>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let mut func = Function::new(fname, vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts);
 
             {
                 let mut b = FuncBuilder::new(&mut func);
@@ -129,7 +131,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 
             // Lower CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals);
+                lower_unit(module, sub, st, globals, type_layouts);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, .. } => {
@@ -149,7 +151,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 } else { None }
             }).collect();
             let mut func = Function::new(func_name, params, IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts);
 
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
@@ -210,7 +212,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 } else { None }
             }).collect();
             let mut func = Function::new(func_name, params, ret_ty.clone());
-            let mut ctx = LowerCtx::new(st, globals);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts);
 
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
@@ -2610,8 +2612,8 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let st = resolve::resolve_file(&units).unwrap();
-        lower_file(&units, &st)
+        let (st, layouts) = resolve::resolve_file(&units).unwrap();
+        lower_file(&units, &st, &layouts)
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {

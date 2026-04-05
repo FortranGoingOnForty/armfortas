@@ -113,7 +113,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         .map_err(|e| format!("{}:{}:{}: parse error: {}", opts.input.display(), e.span.start.line, e.span.start.col, e.msg))?;
 
     // 5. Semantic analysis.
-    let st = resolve::resolve_file(&units)
+    let (st, type_layouts) = resolve::resolve_file(&units)
         .map_err(|e| format!("{}:{}: {}", opts.input.display(), e.span.start.line, e.msg))?;
     let diags = validate::validate_file(&units, &st);
     for d in &diags {
@@ -123,7 +123,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let ir_module = lower::lower_file(&units, &st);
+    let ir_module = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
