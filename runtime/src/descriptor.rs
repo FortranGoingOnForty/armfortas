@@ -66,10 +66,10 @@ pub struct DimDescriptor {
 impl DimDescriptor {
     /// Number of elements along this dimension.
     pub fn extent(&self) -> i64 {
-        if self.upper_bound < self.lower_bound {
+        if self.stride == 0 || self.upper_bound < self.lower_bound {
             0
         } else {
-            (self.upper_bound - self.lower_bound) / self.stride + 1
+            self.upper_bound.saturating_sub(self.lower_bound) / self.stride + 1
         }
     }
 }

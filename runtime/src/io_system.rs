@@ -595,9 +595,17 @@ impl Unit {
     /// Seek to a specific record for direct access.
     /// Record numbers are 1-based. Returns Ok(()) or Err on failure.
     fn seek_to_record(&mut self, rec: i64) -> io::Result<()> {
+        if rec < 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "direct access record number must be >= 1"));
+        }
         let recl = self.recl.ok_or_else(||
             io::Error::new(io::ErrorKind::InvalidInput, "direct access requires RECL"))?;
-        let offset = (rec - 1) * recl;
+        let offset = (rec - 1).checked_mul(recl).ok_or_else(||
+            io::Error::new(io::ErrorKind::InvalidInput, "record offset overflow"))?;
+        if offset < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative record offset"));
+        }
         match &mut self.stream {
             UnitStream::FileRaw(f) => {
                 f.seek(SeekFrom::Start(offset as u64))?;
@@ -702,6 +710,11 @@ pub extern "C" fn afs_write_unformatted(
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if data_len < 0 || data_len > u32::MAX as i64 {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            else { eprintln!("WRITE unformatted: record length {} exceeds 4GB limit", data_len); std::process::exit(1); }
+            return;
+        }
         let len_bytes = (data_len as u32).to_ne_bytes();
         // Write: [len][data][len]
         let r1 = u.write_raw(&len_bytes);
@@ -1004,7 +1017,7 @@ pub extern "C" fn afs_read_internal_int(
         return;
     }
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let s = std::str::from_utf8(slice).unwrap_or("");
+    let s = &String::from_utf8_lossy(slice);
     if let Some(token) = s.trim().split_whitespace().next() {
         match token.replace(',', "").parse::<i32>() {
             Ok(v) => {
@@ -1032,7 +1045,7 @@ pub extern "C" fn afs_read_internal_real(
         return;
     }
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let s = std::str::from_utf8(slice).unwrap_or("");
+    let s = &String::from_utf8_lossy(slice);
     if let Some(token) = s.trim().split_whitespace().next() {
         let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
         match normalized.parse::<f64>() {
@@ -1080,7 +1093,10 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
                 // Simple approach: seek backwards byte-by-byte to find newline.
                 let pos = f.seek(SeekFrom::Current(0)).unwrap_or(0);
                 if pos <= 1 {
+                    let _ = f.seek(SeekFrom::Start(0));
                     if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    // Clear stale read tokens.
+                    u.read_tokens.clear();
                     return;
                 }
                 // Skip the current newline at pos-1.
@@ -1099,6 +1115,8 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
                     }
                     search_pos -= 1;
                 }
+                // Clear stale read tokens after repositioning.
+                u.read_tokens.clear();
                 if !iostat.is_null() { unsafe { *iostat = 0; } }
             }
             _ => {
@@ -1223,6 +1241,8 @@ pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
             }
             _ => {}
         }
+        // Clear stale read tokens so subsequent reads come from file start.
+        u.read_tokens.clear();
         if !iostat.is_null() { unsafe { *iostat = 0; } }
     }
 }

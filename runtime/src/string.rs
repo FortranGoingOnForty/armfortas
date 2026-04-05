@@ -67,7 +67,7 @@ pub extern "C" fn afs_assign_char_deferred(
         desc.data = ptr::null_mut();
         desc.len = 0;
         desc.capacity = 0;
-        desc.flags = STR_ALLOCATED | STR_DEFERRED;
+        desc.flags = STR_DEFERRED;
         return;
     }
 
