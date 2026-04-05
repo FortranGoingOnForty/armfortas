@@ -701,41 +701,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Print { items, .. } | Stmt::Write { items, .. } => {
-            for item in items {
-                // Check if this item is a character variable.
-                let is_char = if let Expr::Name { name } = &item.node {
-                    ctx.locals.get(&name.to_lowercase())
-                        .map(|i| i.char_kind != CharKind::None)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+        Stmt::Print { items, .. } => {
+            // PRINT * → unit 6 (stdout).
+            let unit = b.const_i32(6);
+            lower_write_items(b, ctx, items, unit);
+        }
 
-                if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-                    // Character: use lower_string_expr to get ptr + len.
-                    let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
-                    b.runtime_call(RuntimeFunc::PrintString, vec![ptr, len], IrType::Void);
-                } else {
-                    let val = lower_expr(b, &ctx.locals, item, ctx.st);
-                    let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
-                    let rt_func = match &ty {
-                        IrType::Int(_) => RuntimeFunc::PrintInt,
-                        IrType::Float(_) => RuntimeFunc::PrintReal,
-                        IrType::Bool => RuntimeFunc::PrintLogical,
-                        IrType::Ptr(_) => RuntimeFunc::PrintString,
-                        _ => RuntimeFunc::PrintInt,
-                    };
-                    if matches!(rt_func, RuntimeFunc::PrintString) {
-                        let len = string_literal_len(item);
-                        let len_val = b.const_i64(len);
-                        b.runtime_call(RuntimeFunc::PrintString, vec![val, len_val], IrType::Void);
-                    } else {
-                        b.runtime_call(rt_func, vec![val], IrType::Void);
-                    }
-                }
-            }
-            b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
+        Stmt::Write { controls, items } => {
+            // WRITE(unit, *) — extract unit from controls.
+            // First control spec is typically the unit number.
+            let unit = if let Some(ctrl) = controls.first() {
+                lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+            } else {
+                b.const_i32(6) // default stdout
+            };
+            lower_write_items(b, ctx, items, unit);
         }
 
         Stmt::Call { callee, args } => {
@@ -1329,6 +1309,49 @@ fn lower_array_store(
     } else { idx };
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.store(value, elem_ptr);
+}
+
+/// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.
+fn lower_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+) {
+    for item in items {
+        let is_char = if let Expr::Name { name } = &item.node {
+            ctx.locals.get(&name.to_lowercase())
+                .map(|i| i.char_kind != CharKind::None)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+            b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
+        } else {
+            let val = lower_expr(b, &ctx.locals, item, ctx.st);
+            let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+            let func_name = match &ty {
+                IrType::Int(IntWidth::I64) => "afs_write_int64",
+                IrType::Int(_) => "afs_write_int",
+                IrType::Float(FloatWidth::F64) => "afs_write_real64",
+                IrType::Float(_) => "afs_write_real",
+                IrType::Bool => "afs_write_logical",
+                IrType::Ptr(_) => {
+                    // Pointer type — likely a string. Use write_string with literal length.
+                    let len = string_literal_len(item);
+                    let len_val = b.const_i64(len);
+                    b.call(FuncRef::External("afs_write_string".into()), vec![unit, val, len_val], IrType::Void);
+                    continue;
+                }
+                _ => "afs_write_int",
+            };
+            b.call(FuncRef::External(func_name.into()), vec![unit, val], IrType::Void);
+        }
+    }
+    b.call(FuncRef::External("afs_write_newline".into()), vec![unit], IrType::Void);
 }
 
 /// Get the data base address for an array variable.
