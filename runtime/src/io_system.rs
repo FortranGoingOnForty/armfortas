@@ -801,6 +801,113 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
     }
 }
 
+// ---- Internal I/O (read/write to character variables) ----
+
+/// Write a formatted integer to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_int(
+    buf: *mut u8, buf_len: i64,
+    val: i32,
+    pos: *mut i64, // current write position, updated after write
+) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let s = format!(" {}", val);
+    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+}
+
+/// Write a formatted string to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_string(
+    buf: *mut u8, buf_len: i64,
+    src: *const u8, src_len: i64,
+    pos: *mut i64,
+) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    let mut data = vec![b' '];
+    if !src.is_null() && src_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
+        data.extend_from_slice(slice);
+    }
+    write_to_buffer(buf, buf_len as usize, start, &data, pos);
+}
+
+/// Read an integer from a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_read_internal_int(
+    buf: *const u8, buf_len: i64,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    if buf.is_null() || buf_len <= 0 {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let s = std::str::from_utf8(slice).unwrap_or("");
+    if let Some(token) = s.trim().split_whitespace().next() {
+        match token.replace(',', "").parse::<i32>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    } else {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+    }
+}
+
+/// Read a real from a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_read_internal_real(
+    buf: *const u8, buf_len: i64,
+    val: *mut f64,
+    iostat: *mut i32,
+) {
+    if buf.is_null() || buf_len <= 0 {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let s = std::str::from_utf8(slice).unwrap_or("");
+    if let Some(token) = s.trim().split_whitespace().next() {
+        let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
+        match normalized.parse::<f64>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    } else {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+    }
+}
+
+/// Helper: write bytes into a buffer at a given position, space-pad remainder.
+fn write_to_buffer(buf: *mut u8, buf_len: usize, start: usize, data: &[u8], pos: *mut i64) {
+    let copy_len = data.len().min(buf_len.saturating_sub(start));
+    if copy_len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(start), copy_len);
+        }
+    }
+    // Space-pad remaining buffer.
+    let end = start + copy_len;
+    if end < buf_len {
+        unsafe { std::ptr::write_bytes(buf.add(end), b' ', buf_len - end); }
+    }
+    if !pos.is_null() {
+        unsafe { *pos = end as i64; }
+    }
+}
+
 // ---- BACKSPACE / ENDFILE ----
 
 /// Backspace one record on a sequential unit.
