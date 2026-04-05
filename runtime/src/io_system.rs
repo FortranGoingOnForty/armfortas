@@ -801,6 +801,165 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
     }
 }
 
+// ---- NAMELIST I/O ----
+
+/// A NAMELIST entry describing one variable in a namelist group.
+#[repr(C)]
+pub struct NamelistEntry {
+    pub name: *const u8,
+    pub name_len: i64,
+    pub data: *mut u8,
+    pub data_type: i32,  // 0=int, 1=real, 2=string, 3=logical
+    pub data_len: i64,   // string length for type 2
+}
+
+/// Write a NAMELIST group to a unit.
+/// Format: &GROUPNAME var=val, var=val, ... /
+#[no_mangle]
+pub extern "C" fn afs_write_namelist(
+    unit: i32,
+    group_name: *const u8, group_name_len: i64,
+    entries: *const NamelistEntry, n_entries: i32,
+) {
+    let gname = unsafe_str(group_name, group_name_len);
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let _ = u.write_str(&format!(" &{}", gname.to_uppercase()));
+
+        if !entries.is_null() && n_entries > 0 {
+            let slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
+            for (i, entry) in slice.iter().enumerate() {
+                let name = unsafe_str(entry.name, entry.name_len);
+                let sep = if i > 0 { "," } else { "" };
+                let val_str = match entry.data_type {
+                    0 => { // integer
+                        let v = unsafe { *(entry.data as *const i32) };
+                        format!("{}", v)
+                    }
+                    1 => { // real
+                        let v = unsafe { *(entry.data as *const f64) };
+                        format!("{}", v)
+                    }
+                    2 => { // string
+                        let s = unsafe_str(entry.data, entry.data_len);
+                        format!("'{}'", s.trim_end())
+                    }
+                    3 => { // logical
+                        let v = unsafe { *(entry.data as *const i32) };
+                        (if v != 0 { ".TRUE." } else { ".FALSE." }).to_string()
+                    }
+                    _ => "???".to_string(),
+                };
+                let _ = u.write_str(&format!("{} {}={}", sep, name.to_uppercase(), val_str));
+            }
+        }
+        let _ = u.write_str(" /\n");
+        let _ = u.flush();
+    }
+}
+
+/// Read a NAMELIST group from a unit.
+/// Parses &GROUPNAME var=val, ... / format.
+#[no_mangle]
+pub extern "C" fn afs_read_namelist(
+    unit: i32,
+    group_name: *const u8, group_name_len: i64,
+    entries: *const NamelistEntry, n_entries: i32,
+    iostat: *mut i32,
+) {
+    let gname = unsafe_str(group_name, group_name_len).to_lowercase();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        // Read lines until we find &groupname.
+        let mut all_lines = String::new();
+        loop {
+            match u.read_line() {
+                Ok(line) => {
+                    let trimmed = line.trim().to_lowercase();
+                    if trimmed.starts_with('&') && trimmed[1..].starts_with(&gname) {
+                        all_lines.push_str(&line);
+                        // Keep reading until we find '/'.
+                        while !all_lines.contains('/') {
+                            match u.read_line() {
+                                Ok(cont) => all_lines.push_str(&cont),
+                                Err(_) => break,
+                            }
+                        }
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                    return;
+                }
+            }
+        }
+
+        // Parse assignments from the namelist text.
+        if !entries.is_null() && n_entries > 0 {
+            let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
+            // Extract the content between & and /.
+            let content = if let Some(start) = all_lines.find(&gname) {
+                let after_name = &all_lines[start + gname.len()..];
+                if let Some(end) = after_name.find('/') {
+                    &after_name[..end]
+                } else { after_name }
+            } else { "" };
+
+            // Parse var=val pairs.
+            for pair in content.split(',') {
+                let pair = pair.trim();
+                if let Some(eq_pos) = pair.find('=') {
+                    let var_name = pair[..eq_pos].trim().to_lowercase();
+                    let val_str = pair[eq_pos+1..].trim();
+
+                    // Find the matching entry.
+                    for entry in entries_slice {
+                        let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
+                        if ename == var_name {
+                            match entry.data_type {
+                                0 => { // integer
+                                    if let Ok(v) = val_str.parse::<i32>() {
+                                        unsafe { *(entry.data as *mut i32) = v; }
+                                    }
+                                }
+                                1 => { // real
+                                    let normalized = val_str.replace('d', "e").replace('D', "E");
+                                    if let Ok(v) = normalized.parse::<f64>() {
+                                        unsafe { *(entry.data as *mut f64) = v; }
+                                    }
+                                }
+                                2 => { // string
+                                    let s = val_str.trim_matches('\'').trim_matches('"');
+                                    let bytes = s.as_bytes();
+                                    let copy_len = bytes.len().min(entry.data_len as usize);
+                                    if !entry.data.is_null() && copy_len > 0 {
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
+                                            if copy_len < entry.data_len as usize {
+                                                std::ptr::write_bytes(entry.data.add(copy_len), b' ',
+                                                    entry.data_len as usize - copy_len);
+                                            }
+                                        }
+                                    }
+                                }
+                                3 => { // logical
+                                    let lower = val_str.to_lowercase();
+                                    let v = lower.starts_with(".t") || lower.starts_with("t");
+                                    unsafe { *(entry.data as *mut i32) = v as i32; }
+                                }
+                                _ => {}
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
 // ---- Internal I/O (read/write to character variables) ----
 
 /// Write a formatted integer to a character buffer (internal I/O).
