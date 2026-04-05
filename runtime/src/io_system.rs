@@ -60,6 +60,8 @@ enum UnitStream {
     Stderr,
     FileRead(BufReader<File>),
     FileWrite(BufWriter<File>),
+    /// Raw file handle for direct/stream access (supports both read and write + seeking).
+    FileRaw(File),
 }
 
 struct Unit {
@@ -70,8 +72,9 @@ struct Unit {
     access: Access,
     form: Form,
     action: Action,
+    /// Record length for direct access (in bytes). None for sequential/stream.
+    recl: Option<i64>,
     /// Buffered tokens from the current input record for list-directed READ.
-    /// Consumed left-to-right. Refilled when empty by reading the next line.
     read_tokens: Vec<String>,
 }
 
@@ -86,6 +89,9 @@ impl Unit {
             }
             UnitStream::FileWrite(w) => {
                 w.write_all(data)?;
+            }
+            UnitStream::FileRaw(f) => {
+                f.write_all(data)?;
             }
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for writing")),
         }
@@ -104,6 +110,10 @@ impl Unit {
             }
             UnitStream::FileRead(r) => {
                 r.read_line(&mut line)?;
+            }
+            UnitStream::FileRaw(f) => {
+                let mut br = BufReader::new(&mut *f);
+                br.read_line(&mut line)?;
             }
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
         }
@@ -141,6 +151,7 @@ impl Unit {
             UnitStream::Stdout => io::stdout().flush(),
             UnitStream::Stderr => io::stderr().flush(),
             UnitStream::FileWrite(w) => w.flush(),
+            UnitStream::FileRaw(f) => f.flush(),
             _ => Ok(()),
         }
     }
@@ -166,6 +177,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Read,
+            recl: None,
             read_tokens: Vec::new(),
         });
         units.insert(6, Unit {
@@ -176,6 +188,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
+            recl: None,
             read_tokens: Vec::new(),
         });
         units.insert(0, Unit {
@@ -186,6 +199,7 @@ impl IoState {
             access: Access::Sequential,
             form: Form::Formatted,
             action: Action::Write,
+            recl: None,
             read_tokens: Vec::new(),
         });
 
@@ -207,17 +221,62 @@ impl IoState {
 
 /// Open a file and associate it with a unit number.
 #[no_mangle]
-pub extern "C" fn afs_open(
+/// OPEN control block — packed struct for passing all OPEN specifiers in one pointer.
+#[repr(C)]
+pub struct OpenControlBlock {
+    pub unit: i32,
+    pub filename: *const u8,
+    pub filename_len: i64,
+    pub status: *const u8,
+    pub status_len: i64,
+    pub action: *const u8,
+    pub action_len: i64,
+    pub access: *const u8,
+    pub access_len: i64,
+    pub form: *const u8,
+    pub form_len: i64,
+    pub recl: i64,
+    pub iostat: *mut i32,
+    pub newunit: *mut i32,
+}
+
+/// Simple OPEN with the most common specifiers (fits in 8 registers).
+/// Used by the IR lowering for basic OPEN statements.
+#[no_mangle]
+pub extern "C" fn afs_open_simple(
     unit: i32,
     filename: *const u8, filename_len: i64,
     status: *const u8, status_len: i64,
     action: *const u8, action_len: i64,
-    iostat: *mut i32,
-    newunit: *mut i32,
 ) {
-    let fname = unsafe_str(filename, filename_len);
-    let status_str = unsafe_str(status, status_len).to_lowercase();
-    let action_str = unsafe_str(action, action_len).to_lowercase();
+    let cb = OpenControlBlock {
+        unit, filename, filename_len,
+        status, status_len,
+        action, action_len,
+        access: std::ptr::null(), access_len: 0,
+        form: std::ptr::null(), form_len: 0,
+        recl: 0,
+        iostat: std::ptr::null_mut(),
+        newunit: std::ptr::null_mut(),
+    };
+    afs_open(&cb);
+}
+
+/// Open a file unit. Takes a pointer to an OpenControlBlock to avoid
+/// exceeding the 8-register ARM64 calling convention limit.
+#[no_mangle]
+pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
+    if cb.is_null() { return; }
+    let cb = unsafe { &*cb };
+    let unit = cb.unit;
+    let fname = unsafe_str(cb.filename, cb.filename_len);
+    let status_str = unsafe_str(cb.status, cb.status_len).to_lowercase();
+    let action_str = unsafe_str(cb.action, cb.action_len).to_lowercase();
+    let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
+    let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
+    let recl = cb.recl;
+    let iostat = cb.iostat;
+    let newunit = cb.newunit;
 
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
 
@@ -273,18 +332,33 @@ pub extern "C" fn afs_open(
                 "write" => Action::Write,
                 _ => Action::ReadWrite,
             };
-            let stream = match file_action {
-                Action::Read => UnitStream::FileRead(BufReader::new(file)),
-                Action::Write | Action::ReadWrite => UnitStream::FileWrite(BufWriter::new(file)),
+            let file_access = match access_str.trim() {
+                "direct" => Access::Direct,
+                "stream" => Access::Stream,
+                _ => Access::Sequential,
+            };
+            let file_form = match form_str.trim() {
+                "unformatted" => Form::Unformatted,
+                _ => Form::Formatted,
+            };
+
+            // Direct and stream access use raw file handle for seeking.
+            let stream = match file_access {
+                Access::Direct | Access::Stream => UnitStream::FileRaw(file),
+                Access::Sequential => match file_action {
+                    Action::Read => UnitStream::FileRead(BufReader::new(file)),
+                    Action::Write | Action::ReadWrite => UnitStream::FileWrite(BufWriter::new(file)),
+                },
             };
             state.units.insert(actual_unit, Unit {
                 number: actual_unit,
                 stream,
                 filename: fname,
                 status: UnitStatus::Open,
-                access: Access::Sequential,
-                form: Form::Formatted,
+                access: file_access,
+                form: file_form,
                 action: file_action,
+                recl: if recl > 0 { Some(recl) } else { None },
                 read_tokens: Vec::new(),
             });
             if !iostat.is_null() { unsafe { *iostat = 0; } }
@@ -515,6 +589,277 @@ fn unsafe_str(ptr: *const u8, len: i64) -> String {
     }
 }
 
+// ---- Direct access helpers ----
+
+impl Unit {
+    /// Seek to a specific record for direct access.
+    /// Record numbers are 1-based. Returns Ok(()) or Err on failure.
+    fn seek_to_record(&mut self, rec: i64) -> io::Result<()> {
+        let recl = self.recl.ok_or_else(||
+            io::Error::new(io::ErrorKind::InvalidInput, "direct access requires RECL"))?;
+        let offset = (rec - 1) * recl;
+        match &mut self.stream {
+            UnitStream::FileRaw(f) => {
+                f.seek(SeekFrom::Start(offset as u64))?;
+                Ok(())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unit not opened for direct access")),
+        }
+    }
+
+    /// Write raw bytes at the current file position (for unformatted/stream I/O).
+    fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
+        match &mut self.stream {
+            UnitStream::FileRaw(f) => f.write_all(data),
+            UnitStream::FileWrite(w) => w.write_all(data),
+            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for writing")),
+        }
+    }
+
+    /// Read raw bytes at the current file position (for unformatted/stream I/O).
+    fn read_raw(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.stream {
+            UnitStream::FileRaw(f) => f.read(buf),
+            UnitStream::FileRead(r) => r.read(buf),
+            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
+        }
+    }
+}
+
+/// Write a direct-access record (formatted string padded to recl).
+#[no_mangle]
+pub extern "C" fn afs_write_direct(
+    unit: i32, rec: i64,
+    data: *const u8, data_len: i64,
+    iostat: *mut i32,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if let Err(e) = u.seek_to_record(rec) {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            else { eprintln!("WRITE direct: {}", e); std::process::exit(1); }
+            return;
+        }
+        let recl = u.recl.unwrap_or(0) as usize;
+        let mut record = vec![b' '; recl]; // space-padded
+        let copy_len = (data_len as usize).min(recl);
+        if !data.is_null() && copy_len > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(data, record.as_mut_ptr(), copy_len); }
+        }
+        if let Err(e) = u.write_raw(&record) {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            else { eprintln!("WRITE direct: {}", e); std::process::exit(1); }
+            return;
+        }
+        if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
+/// Read a direct-access record.
+#[no_mangle]
+pub extern "C" fn afs_read_direct(
+    unit: i32, rec: i64,
+    data: *mut u8, data_len: i64,
+    iostat: *mut i32,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if let Err(e) = u.seek_to_record(rec) {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            else { eprintln!("READ direct: {}", e); std::process::exit(1); }
+            return;
+        }
+        let recl = u.recl.unwrap_or(0) as usize;
+        let mut record = vec![0u8; recl];
+        match u.read_raw(&mut record) {
+            Ok(n) => {
+                let copy_len = n.min(data_len as usize);
+                if !data.is_null() && copy_len > 0 {
+                    unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), data, copy_len); }
+                }
+                // Pad remainder with spaces.
+                if copy_len < data_len as usize {
+                    unsafe { std::ptr::write_bytes(data.add(copy_len), b' ', data_len as usize - copy_len); }
+                }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(e) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                else { eprintln!("READ direct: {}", e); std::process::exit(1); }
+            }
+        }
+    }
+}
+
+// ---- Unformatted sequential I/O ----
+
+/// Write an unformatted record with 4-byte length markers (gfortran-compatible).
+#[no_mangle]
+pub extern "C" fn afs_write_unformatted(
+    unit: i32,
+    data: *const u8, data_len: i64,
+    iostat: *mut i32,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let len_bytes = (data_len as u32).to_ne_bytes();
+        // Write: [len][data][len]
+        let r1 = u.write_raw(&len_bytes);
+        let r2 = if !data.is_null() && data_len > 0 {
+            let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+            u.write_raw(slice)
+        } else { Ok(()) };
+        let r3 = u.write_raw(&len_bytes);
+        if r1.is_err() || r2.is_err() || r3.is_err() {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+        } else {
+            if !iostat.is_null() { unsafe { *iostat = 0; } }
+        }
+    }
+}
+
+/// Read an unformatted record with 4-byte length markers.
+#[no_mangle]
+pub extern "C" fn afs_read_unformatted(
+    unit: i32,
+    data: *mut u8, max_len: i64,
+    actual_len: *mut i64,
+    iostat: *mut i32,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        // Read leading length marker.
+        let mut len_buf = [0u8; 4];
+        match u.read_raw(&mut len_buf) {
+            Ok(4) => {}
+            Ok(0) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                return;
+            }
+            _ => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                return;
+            }
+        }
+        let record_len = u32::from_ne_bytes(len_buf) as usize;
+        if !actual_len.is_null() { unsafe { *actual_len = record_len as i64; } }
+
+        // Read record data.
+        let read_len = record_len.min(max_len as usize);
+        if !data.is_null() && read_len > 0 {
+            let slice = unsafe { std::slice::from_raw_parts_mut(data, read_len) };
+            let _ = u.read_raw(slice);
+        }
+        // Skip remaining if record is longer than buffer.
+        if record_len > max_len as usize {
+            let skip = record_len - max_len as usize;
+            let mut trash = vec![0u8; skip];
+            let _ = u.read_raw(&mut trash);
+        }
+
+        // Read trailing length marker (and discard).
+        let _ = u.read_raw(&mut len_buf);
+        if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
+// ---- Stream access helpers ----
+
+/// Write raw bytes at the current stream position.
+#[no_mangle]
+pub extern "C" fn afs_write_stream(
+    unit: i32,
+    data: *const u8, data_len: i64,
+    iostat: *mut i32,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if !data.is_null() && data_len > 0 {
+            let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+            match u.write_raw(slice) {
+                Ok(()) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
+                Err(_) => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
+            }
+        }
+    }
+}
+
+/// Seek to an absolute byte position in a stream unit.
+#[no_mangle]
+pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match &mut u.stream {
+            UnitStream::FileRaw(f) => {
+                match f.seek(SeekFrom::Start(pos as u64)) {
+                    Ok(_) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
+                    Err(_) => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
+                }
+            }
+            _ => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
+        }
+    }
+}
+
+// ---- BACKSPACE / ENDFILE ----
+
+/// Backspace one record on a sequential unit.
+/// For formatted: seek backwards past the previous newline.
+#[no_mangle]
+pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match &mut u.stream {
+            UnitStream::FileRaw(f) => {
+                // Simple approach: seek backwards byte-by-byte to find newline.
+                let pos = f.seek(SeekFrom::Current(0)).unwrap_or(0);
+                if pos <= 1 {
+                    if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    return;
+                }
+                // Skip the current newline at pos-1.
+                let mut search_pos = pos - 2;
+                loop {
+                    f.seek(SeekFrom::Start(search_pos)).ok();
+                    let mut byte = [0u8; 1];
+                    if f.read(&mut byte).unwrap_or(0) == 0 { break; }
+                    if byte[0] == b'\n' {
+                        f.seek(SeekFrom::Start(search_pos + 1)).ok();
+                        break;
+                    }
+                    if search_pos == 0 {
+                        f.seek(SeekFrom::Start(0)).ok();
+                        break;
+                    }
+                    search_pos -= 1;
+                }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            _ => {
+                // Sequential buffered files: backspace is not well-supported.
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+        }
+    }
+}
+
+/// Write an end-of-file marker and truncate.
+#[no_mangle]
+pub extern "C" fn afs_endfile(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let _ = u.flush();
+        match &mut u.stream {
+            UnitStream::FileRaw(f) => {
+                let pos = f.seek(SeekFrom::Current(0)).unwrap_or(0);
+                let _ = f.set_len(pos); // truncate at current position
+            }
+            _ => {}
+        }
+        if !iostat.is_null() { unsafe { *iostat = 0; } }
+    }
+}
+
 // ---- IOSTAT constants (iso_fortran_env) ----
 
 /// IOSTAT_END: end-of-file encountered during input.
@@ -606,6 +951,9 @@ pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
             UnitStream::FileWrite(w) => {
                 let _ = w.flush();
                 let _ = w.seek(SeekFrom::Start(0));
+            }
+            UnitStream::FileRaw(f) => {
+                let _ = f.seek(SeekFrom::Start(0));
             }
             _ => {}
         }
