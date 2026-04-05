@@ -363,6 +363,16 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Check for interface block (specification construct).
+            // Interface blocks are valid in the specification section of any
+            // program unit. Parse and discard — type information is captured
+            // by semantic analysis, no IR generation needed.
+            if text == "interface" || text == "abstract" {
+                let istart = self.current_span();
+                let _iface = self.parse_interface_block(istart)?;
+                continue;
+            }
+
             // Try as type declaration.
             if let Some(ts_result) = self.try_parse_type_spec() {
                 let ts = ts_result?;

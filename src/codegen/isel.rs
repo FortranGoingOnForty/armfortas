@@ -86,7 +86,20 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
                 fp_idx += 1;
             }
+            Some(RegClass::Gp32) if gp_idx < 8 => {
+                // 32-bit VALUE param: arrives in w-register.
+                mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(*vreg),
+                        MachineOperand::PhysReg(PhysReg::Gp32(gp_idx)),
+                    ],
+                    def: Some(*vreg),
+                });
+                gp_idx += 1;
+            }
             _ if gp_idx < 8 => {
+                // 64-bit or pointer param: arrives in x-register.
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![

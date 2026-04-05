@@ -28,6 +28,7 @@ fn insert_param(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo)
         attrs: SymbolAttrs { parameter: true, ..Default::default() },
         defined_at: span,
         scope: mod_id,
+        arg_names: vec![],
     });
 }
 
@@ -40,6 +41,7 @@ fn insert_type(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
         attrs: Default::default(),
         defined_at: span,
         scope: mod_id,
+        arg_names: vec![],
     });
 }
 
@@ -52,6 +54,7 @@ fn insert_proc(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
         attrs: SymbolAttrs { intrinsic: true, ..Default::default() },
         defined_at: span,
         scope: mod_id,
+        arg_names: vec![],
     });
 }
 

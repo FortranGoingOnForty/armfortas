@@ -135,7 +135,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
         ProgramUnit::Subroutine { name, decls, body, args, bind, .. } => {
             // BIND(C): use specified C name, otherwise use Fortran name.
             let func_name = bind.as_ref()
-                .map(|b| b.name.as_deref().unwrap_or(name).to_string())
+                .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
@@ -191,7 +191,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, .. } => {
             let func_name = bind.as_ref()
-                .map(|b| b.name.as_deref().unwrap_or(name).to_string())
+                .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
             let ret_ty = return_type.as_ref()
                 .map(lower_type_spec)
