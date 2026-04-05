@@ -60,7 +60,6 @@ enum UnitStream {
     Stderr,
     FileRead(BufReader<File>),
     FileWrite(BufWriter<File>),
-    FileReadWrite(File),
 }
 
 struct Unit {
@@ -85,9 +84,6 @@ impl Unit {
             UnitStream::FileWrite(w) => {
                 w.write_all(data)?;
             }
-            UnitStream::FileReadWrite(f) => {
-                f.write_all(data)?;
-            }
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for writing")),
         }
         Ok(())
@@ -105,10 +101,6 @@ impl Unit {
             }
             UnitStream::FileRead(r) => {
                 r.read_line(&mut line)?;
-            }
-            UnitStream::FileReadWrite(f) => {
-                let mut buf = BufReader::new(f);
-                buf.read_line(&mut line)?;
             }
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
         }
@@ -195,7 +187,7 @@ pub extern "C" fn afs_open(
     let status_str = unsafe_str(status, status_len).to_lowercase();
     let action_str = unsafe_str(action, action_len).to_lowercase();
 
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
 
     // NEWUNIT: allocate a new unit number.
     let actual_unit = if !newunit.is_null() {
@@ -216,24 +208,36 @@ pub extern "C" fn afs_open(
         _ => { opts.read(true).write(true).create(true); }
     }
 
-    match action_str.trim() {
+    // Determine action. Default depends on status:
+    // old → read, new/replace → write, scratch/unknown → readwrite.
+    let effective_action = match action_str.trim() {
+        "read" => "read",
+        "write" => "write",
+        "readwrite" => "readwrite",
+        "" => match status_str.trim() {
+            "old" => "read",
+            "new" | "replace" => "write",
+            _ => "readwrite",
+        },
+        _ => "readwrite",
+    };
+
+    match effective_action {
         "read" => { opts.read(true); }
         "write" => { opts.write(true).create(true); }
-        "readwrite" | "" => { opts.read(true).write(true).create(true); }
         _ => { opts.read(true).write(true).create(true); }
     }
 
     match opts.open(&fname) {
         Ok(file) => {
-            let file_action = match action_str.trim() {
+            let file_action = match effective_action {
                 "read" => Action::Read,
                 "write" => Action::Write,
                 _ => Action::ReadWrite,
             };
             let stream = match file_action {
                 Action::Read => UnitStream::FileRead(BufReader::new(file)),
-                Action::Write => UnitStream::FileWrite(BufWriter::new(file)),
-                Action::ReadWrite => UnitStream::FileReadWrite(file),
+                Action::Write | Action::ReadWrite => UnitStream::FileWrite(BufWriter::new(file)),
             };
             state.units.insert(actual_unit, Unit {
                 number: actual_unit,
@@ -260,7 +264,7 @@ pub extern "C" fn afs_open(
 /// Close a unit.
 #[no_mangle]
 pub extern "C" fn afs_close(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut u) = state.units.remove(&unit) {
         let _ = u.flush();
         // File is dropped here, closing the handle.
@@ -275,7 +279,7 @@ pub extern "C" fn afs_close(unit: i32, iostat: *mut i32) {
 /// Write an integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(&format!(" {}", val));
     }
@@ -284,7 +288,7 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
 /// Write a 64-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(&format!(" {}", val));
     }
@@ -293,7 +297,7 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
 /// Write a real value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(&format!("  {:14.7E}", val));
     }
@@ -302,7 +306,7 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
 /// Write a double value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(&format!("  {:22.15E}", val));
     }
@@ -311,7 +315,7 @@ pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
 /// Write a character string (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(" ");
         if !ptr.is_null() && len > 0 {
@@ -324,7 +328,7 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
 /// Write a logical value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str(if val != 0 { " T" } else { " F" });
     }
@@ -333,7 +337,7 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
 /// End a write statement (newline).
 #[no_mangle]
 pub extern "C" fn afs_write_newline(unit: i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         let _ = u.write_str("\n");
         let _ = u.flush();
@@ -345,7 +349,7 @@ pub extern "C" fn afs_write_newline(unit: i32) {
 /// Read an integer value (list-directed) from a unit.
 #[no_mangle]
 pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.read_line() {
             Ok(line) => {
@@ -386,7 +390,7 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
 /// Read a real value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.read_line() {
             Ok(line) => {
@@ -437,7 +441,7 @@ pub extern "C" fn afs_io_init() {
 /// Finalize the I/O subsystem. Flush and close all open units.
 #[no_mangle]
 pub extern "C" fn afs_io_finalize() {
-    let mut state = io_state().lock().unwrap();
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     for (_, unit) in state.units.iter_mut() {
         let _ = unit.flush();
     }
@@ -449,7 +453,7 @@ mod tests {
 
     #[test]
     fn preconnected_units() {
-        let state = io_state().lock().unwrap();
+        let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
         assert!(state.units.contains_key(&0)); // stderr
         assert!(state.units.contains_key(&5)); // stdin
         assert!(state.units.contains_key(&6)); // stdout
@@ -457,7 +461,7 @@ mod tests {
 
     #[test]
     fn newunit_allocation() {
-        let mut state = io_state().lock().unwrap();
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
         let u1 = state.alloc_newunit();
         let u2 = state.alloc_newunit();
         assert!(u1 < 0); // negative unit numbers
