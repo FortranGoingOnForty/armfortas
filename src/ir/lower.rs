@@ -567,7 +567,12 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             args.first().map(|a| b.ctz(*a))
         }
         "popcount" | "popcnt" => {
-            args.first().map(|a| b.popcount(*a))
+            // Use __builtin_popcountll via runtime call since ARM64 NEON popcount
+            // requires a complex instruction sequence.
+            args.first().map(|a| {
+                let widened = b.int_extend(*a, IntWidth::I64, false);
+                b.call(FuncRef::External("afs_popcount".into()), vec![widened], IrType::Int(IntWidth::I32))
+            })
         }
         "ishft" => {
             // ishft(a, shift): positive shift = left, negative = right.

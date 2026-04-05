@@ -252,6 +252,12 @@ pub extern "C" fn afs_random_seed(seed_val: i64) {
     RNG_SEED.with(|s| s.set(seed_val as u64));
 }
 
+/// POPCOUNT: count set bits in an integer (Hamming weight).
+#[no_mangle]
+pub extern "C" fn afs_popcount(val: u64) -> i32 {
+    val.count_ones() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
