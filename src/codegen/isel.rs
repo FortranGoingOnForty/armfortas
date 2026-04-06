@@ -35,10 +35,16 @@ pub fn select_function(func: &Function) -> MachineFunction {
 
     // Phase 2: create machine blocks corresponding to IR blocks.
     // Entry block already exists as MBlockId(0).
+    //
+    // Block labels are prefixed with the function name so two
+    // functions in the same .s file don't collide on common names
+    // like `do_check_1`. The `L` prefix turns them into local
+    // symbols on Apple's assembler.
     ctx.block_map.insert(func.entry, MBlockId(0));
     for block in &func.blocks {
         if block.id != func.entry {
-            let mb_id = mf.new_block(&block.name);
+            let label = format!("L{}_{}", mf.name, block.name);
+            let mb_id = mf.new_block(&label);
             ctx.block_map.insert(block.id, mb_id);
         }
     }
@@ -970,7 +976,10 @@ fn select_terminator(
             let true_target = if true_args.is_empty() {
                 true_mb
             } else {
-                let label = format!("L{}_true_shim", mb.0);
+                // Prefix with the function name so labels stay
+                // unique across functions in the same .s file. Two
+                // functions could otherwise both emit `L3_true_shim`.
+                let label = format!("L{}_{}_true_shim", mf.name, mb.0);
                 let shim = mf.new_block(&label);
                 emit_branch_arg_copies(mf, ctx, shim, *true_dest, true_args);
                 mf.block_mut(shim).insts.push(MachineInst {
@@ -994,7 +1003,7 @@ fn select_terminator(
             let false_target = if false_args.is_empty() {
                 false_mb
             } else {
-                let label = format!("L{}_false_shim", mb.0);
+                let label = format!("L{}_{}_false_shim", mf.name, mb.0);
                 let shim = mf.new_block(&label);
                 emit_branch_arg_copies(mf, ctx, shim, *false_dest, false_args);
                 mf.block_mut(shim).insts.push(MachineInst {
