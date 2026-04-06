@@ -11,6 +11,7 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 use crate::ir::{lower, verify, printer as ir_printer};
+use crate::opt::{OptLevel, build_pipeline};
 use crate::codegen::{isel, linearscan, emit};
 
 /// Compilation options.
@@ -21,6 +22,7 @@ pub struct Options {
     pub emit_obj: bool,        // -c
     pub emit_ir: bool,         // --emit-ir
     pub preprocess_only: bool, // -E
+    pub opt_level: OptLevel,   // -O0 .. -Ofast
 }
 
 impl Options {
@@ -31,6 +33,7 @@ impl Options {
         let mut emit_obj = false;
         let mut emit_ir = false;
         let mut preprocess_only = false;
+        let mut opt_level = OptLevel::O0;
 
         let mut i = 0;
         while i < args.len() {
@@ -47,6 +50,11 @@ impl Options {
                 "-c" => emit_obj = true,
                 "-E" => preprocess_only = true,
                 "--emit-ir" => emit_ir = true,
+                arg if arg.starts_with("-O") => {
+                    let tail = &arg[1..]; // strip leading '-' so "O3", "Ofast"
+                    opt_level = OptLevel::parse_flag(tail)
+                        .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
+                }
                 arg if !arg.starts_with('-') => {
                     input = Some(PathBuf::from(arg));
                 }
@@ -56,7 +64,7 @@ impl Options {
         }
 
         let input = input.ok_or("no input file")?;
-        Ok(Self { input, output, emit_asm, emit_obj, emit_ir, preprocess_only })
+        Ok(Self { input, output, emit_asm, emit_obj, emit_ir, preprocess_only, opt_level })
     }
 
     /// Determine the output path based on input and flags.
@@ -123,12 +131,18 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let ir_module = lower::lower_file(&units, &st, &type_layouts);
+    let mut ir_module = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
         return Err(format!("internal error: IR verification failed:\n{}", msg));
     }
+
+    // 6b. Optimize IR. The pipeline runs to fixpoint and verifies after
+    //     every pass; a verifier failure inside an opt pass is treated as
+    //     an internal compiler bug and panics with the offending pass name.
+    let pm = build_pipeline(opts.opt_level);
+    pm.run(&mut ir_module);
 
     if opts.emit_ir {
         let ir_text = ir_printer::print_module(&ir_module);
