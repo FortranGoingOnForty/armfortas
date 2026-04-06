@@ -90,11 +90,19 @@ fn find_preheader(
     preds: &HashMap<BlockId, Vec<BlockId>>,
 ) -> Option<BlockId> {
     let header_preds = preds.get(&lp.header)?;
-    let outside: Vec<BlockId> = header_preds
+    // Audit N-5: `predecessors` doesn't dedupe. A terminator that
+    // branches to the same block twice (e.g., `CondBranch { true: B,
+    // false: B }` or a `Switch` with two cases → B) lists that block
+    // twice in the preds vector. We deduplicate here so the
+    // out-of-loop count reflects distinct predecessor blocks rather
+    // than distinct predecessor *edges*.
+    let mut outside: Vec<BlockId> = header_preds
         .iter()
         .copied()
         .filter(|p| !lp.body.contains(p))
         .collect();
+    outside.sort_by_key(|b| b.0);
+    outside.dedup();
     if outside.len() != 1 { return None; }
     let ph = outside[0];
     if ph == lp.header { return None; }
@@ -127,11 +135,21 @@ struct Hoist {
 
 /// Run LICM on one function. Returns true if anything was hoisted.
 fn licm_function(func: &mut Function) -> bool {
+    // Audit N-6: drop unreachable blocks first. `compute_dominators`
+    // assigns "all blocks dominate me" to nodes with no predecessors
+    // that aren't entry, which means an unreachable block with a
+    // self-loop gets classified as a natural loop (it dominates
+    // itself via the trivial "all blocks dominate" default). LICM
+    // then wastes work trying to find a preheader for a loop that
+    // can never execute. Prune first so our loop discovery only
+    // sees the reachable CFG.
+    let pruned = super::util::prune_unreachable(func);
+
     let loops = find_natural_loops(func);
-    if loops.is_empty() { return false; }
+    if loops.is_empty() { return pruned; }
 
     let preds = predecessors(func);
-    let mut any_hoisted = false;
+    let mut any_hoisted = pruned;
 
     // Stable mapping from BlockId to vector index. LICM never adds,
     // removes, or reorders blocks (it only moves instructions between
@@ -402,16 +420,28 @@ mod tests {
     #[test]
     fn does_not_hoist_load() {
         // Load is conservatively non-hoistable.
+        //
+        // Build entry → header → exit, with a Load in the header
+        // and a conditional exit out of the loop so every block is
+        // reachable (N-6's prune-unreachable no longer has anything
+        // to do, so the pass's `changed` flag reflects only whether
+        // LICM actually hoisted something).
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
-        // Build a loop with a Load inside it.
         let addr = f.next_value_id();
         let entry = f.entry;
         f.block_mut(entry).insts.push(Inst {
             id: addr,
             kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: dummy_span(),
+        });
+        let init = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: init,
+            kind: InstKind::ConstInt(0, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
             span: dummy_span(),
         });
 
@@ -425,20 +455,35 @@ mod tests {
             ty: IrType::Int(IntWidth::I32),
             span: dummy_span(),
         });
+        let cond = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+
         let exit = f.create_block("exit");
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
-        f.block_mut(header).terminator = Some(Terminator::Branch(header, vec![i_param]));
-        let init = f.next_value_id();
-        f.block_mut(entry).insts.push(Inst {
-            id: init,
-            kind: InstKind::ConstInt(0, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32),
-            span: dummy_span(),
+
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: header,
+            true_args: vec![i_param],
+            false_dest: exit,
+            false_args: vec![],
         });
         f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![init]));
 
         m.add_function(f);
 
-        assert!(!Licm.run(&mut m), "Load should not be hoisted");
+        Licm.run(&mut m);
+
+        // The Load must still be in the header after LICM.
+        let f = &m.functions[0];
+        let header_block = f.block(header);
+        let load_in_header = header_block.insts.iter()
+            .any(|i| matches!(i.kind, InstKind::Load(_)));
+        assert!(load_in_header, "Load should not have been hoisted out of the loop");
     }
 }

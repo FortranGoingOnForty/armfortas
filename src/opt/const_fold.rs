@@ -475,17 +475,22 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
     }
 }
 
+// fold_float_bin / fold_float_un rely on the N-9 invariant:
+// `Const::from_inst` normalizes every incoming `Const::Float` via
+// `round_for_width`, so `av` / `bv` below are already exact at their
+// declared precision. This lets us operate on the raw f64 storage
+// without re-rounding per input — the N-3 defense-in-depth concern
+// raised in the third audit is satisfied at the producer side rather
+// than repeated at every use site. We DO still round the result for
+// f32 destinations because the op itself can produce a value
+// outside f32's representable range.
 fn fold_float_bin<F>(a: Option<Const>, b: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
 where F: FnOnce(f64, f64) -> f64
 {
     if let (Some(Const::Float(av, _)), Some(Const::Float(bv, _))) = (a, b) {
         if let IrType::Float(w) = ty {
             let r = op(av, bv);
-            // For f32 destinations, round through f32 to match codegen.
-            let r = match w {
-                FloatWidth::F32 => r as f32 as f64,
-                FloatWidth::F64 => r,
-            };
+            let r = round_for_width(r, *w);
             return Some(InstKind::ConstFloat(r, *w));
         }
     }
@@ -498,7 +503,7 @@ where F: FnOnce(f64) -> f64
     if let Some(Const::Float(av, _)) = a {
         if let IrType::Float(w) = ty {
             let r = op(av);
-            let r = match w { FloatWidth::F32 => r as f32 as f64, FloatWidth::F64 => r };
+            let r = round_for_width(r, *w);
             return Some(InstKind::ConstFloat(r, *w));
         }
     }

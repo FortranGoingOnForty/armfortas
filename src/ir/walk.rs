@@ -295,8 +295,20 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
         by_header.entry(hdr).or_default().push(latch);
     }
 
+    // Audit N-4: iterate the grouped back-edges in **stable** header
+    // order. `HashMap` iteration order is nondeterministic across
+    // runs, which would make downstream passes that hoist loop-by-loop
+    // (like LICM) produce different IR on repeated compiles of the
+    // same source — painful for `--emit-ir` bisection and for
+    // differential debugging. Sort by `header.0` (and latches within
+    // each loop for the same reason).
+    let mut headers: Vec<BlockId> = by_header.keys().copied().collect();
+    headers.sort_by_key(|h| h.0);
+
     let mut loops = Vec::new();
-    for (header, latches) in by_header {
+    for header in headers {
+        let mut latches = by_header.remove(&header).unwrap();
+        latches.sort_by_key(|l| l.0);
         // Body = {header} ∪ all nodes that can reach any latch without
         // going through the header.
         let mut body: HashSet<BlockId> = HashSet::new();
