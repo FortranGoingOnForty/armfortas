@@ -1445,12 +1445,21 @@ fn audit_const_fold_imul_i8_overflow_wraps() {
 }
 
 // =============================================================
-// FINDING: Const fold visit order across non-RPO blocks
+// FINDING N-8 (re-audit strengthened): const_fold must converge
+// on non-RPO block orders too, via the pass-manager fixpoint.
 // =============================================================
 //
-// When func.blocks vec is not in reverse-postorder, const_fold may
-// miss folds in a single pass. Pass manager fixpoint covers this.
-// Just verify it doesn't crash or produce invalid IR.
+// `const_fold` walks `func.blocks` in vector order, not in
+// reverse-postorder. If a fold in an early-vec block needs a
+// constant defined by a later-vec block (that still dominates it
+// in the CFG), one pass misses the fold. The pass-manager
+// fixpoint re-runs const_fold until it converges.
+//
+// Audit N-8: the previous version of this test explicitly said
+// "we don't fail if the fold didn't happen" — it only tested
+// that the IR was still valid, not that the fold actually
+// converged. This version asserts the sum is folded to `3` so a
+// regression that stops the fixpoint from rescuing us would fail.
 #[test]
 fn audit_const_fold_non_rpo_block_order() {
     use crate::opt::{build_pipeline, OptLevel};
@@ -1458,9 +1467,6 @@ fn audit_const_fold_non_rpo_block_order() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
-    // Build entry → A → B with B's first use depending on A's const.
-    // Then deliberately swap A and B in func.blocks so B comes before A
-    // in vec order (but A still dominates B in the CFG).
     let a_block = f.create_block("a");
     let b_block = f.create_block("b");
     let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
@@ -1489,8 +1495,6 @@ fn audit_const_fold_non_rpo_block_order() {
     f.blocks.swap(1, 2);
     m.add_function(f);
 
-    // Should still produce valid IR through the full pipeline (and the
-    // fixpoint should converge to fold sum_id to const(3)).
     let pre = verify_module(&m);
     assert!(pre.is_empty(), "test setup invalid: {:?}", pre);
 
@@ -1500,17 +1504,30 @@ fn audit_const_fold_non_rpo_block_order() {
     let post = verify_module(&m);
     assert!(post.is_empty(), "non-RPO block order broke optimization: {:?}", post);
 
-    // Verify the fold actually happened — sum_id should now be const(3).
+    // The fold MUST have converged: the IAdd's defining instruction
+    // (still carrying `sum_id`) should now be the constant `3`, or
+    // the entire dead chain should have been DCE'd and the terminator
+    // should reference a const(3) directly.
     let f = &m.functions[0];
-    let sum_kind = f.blocks.iter()
+    let terminator_val = f.blocks.iter()
+        .find_map(|b| match &b.terminator {
+            Some(Terminator::Return(Some(v))) => Some(*v),
+            _ => None,
+        })
+        .expect("no Return terminator");
+    let term_kind = f.blocks.iter()
         .flat_map(|b| b.insts.iter())
-        .find(|i| i.id == sum_id)
-        .map(|i| i.kind.clone());
-    if let Some(InstKind::ConstInt(v, IntWidth::I32)) = sum_kind {
-        assert_eq!(v, 3, "expected sum folded to const(3), got {}", v);
+        .find(|i| i.id == terminator_val)
+        .map(|i| i.kind.clone())
+        .expect("terminator value has no defining inst");
+    match term_kind {
+        InstKind::ConstInt(3, IntWidth::I32) => { /* good — fold converged */ }
+        ref other => panic!(
+            "audit N-8: the non-RPO block order broke const_fold convergence. \
+             Expected the return value to be ConstInt(3, I32), got {:?}",
+            other
+        ),
     }
-    // (We don't fail the test if the fold didn't happen — just verify
-    // the IR is still valid.)
 }
 
 // =============================================================

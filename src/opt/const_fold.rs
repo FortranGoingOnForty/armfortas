@@ -530,22 +530,47 @@ impl Pass for ConstFold {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            // Map of value-id → constant. Built and updated in lockstep
-            // with the walk so that a fold can feed later folds in the
-            // same block (SSA gives us the no-forward-refs guarantee).
+            // Audit N-8: we walk `func.blocks` in vec order, which
+            // is NOT guaranteed to be reverse-postorder. If a fold
+            // in an early-vec block needs a constant defined by a
+            // later-vec block (that still dominates it in the CFG),
+            // the earlier version would miss the fold — and the
+            // outer pass-manager fixpoint would NOT rescue us when
+            // no other pass in the pipeline produced a change.
+            //
+            // Fix: two phases.
+            //
+            //  1. Pre-collect every `Const*` instruction's value so
+            //     the map is fully populated before any fold runs.
+            //  2. Iterate the fold walk to a local fixpoint. A fold
+            //     that creates a new constant is added to the map
+            //     on the fly, unlocking downstream folds in the
+            //     next iteration. Each iteration is monotonic (the
+            //     consts map only grows), so the inner loop is
+            //     bounded by O(number of foldable instructions).
             let mut consts: HashMap<ValueId, Const> = HashMap::new();
-            for block in &mut func.blocks {
-                for inst in &mut block.insts {
+            for block in &func.blocks {
+                for inst in &block.insts {
                     if let Some(c) = Const::from_inst(&inst.kind) {
                         consts.insert(inst.id, c);
-                        continue;
                     }
-                    if let Some(new_kind) = try_fold(&inst.kind, &inst.ty, &consts) {
-                        if let Some(c) = Const::from_inst(&new_kind) {
-                            consts.insert(inst.id, c);
+                }
+            }
+
+            let mut inner_changed = true;
+            while inner_changed {
+                inner_changed = false;
+                for block in &mut func.blocks {
+                    for inst in &mut block.insts {
+                        if consts.contains_key(&inst.id) { continue; }
+                        if let Some(new_kind) = try_fold(&inst.kind, &inst.ty, &consts) {
+                            if let Some(c) = Const::from_inst(&new_kind) {
+                                consts.insert(inst.id, c);
+                            }
+                            inst.kind = new_kind;
+                            changed = true;
+                            inner_changed = true;
                         }
-                        inst.kind = new_kind;
-                        changed = true;
                     }
                 }
             }

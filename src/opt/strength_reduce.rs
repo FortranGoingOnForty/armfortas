@@ -359,14 +359,27 @@ impl Pass for StrengthReduce {
             // Chase pointer chains so each entry maps directly to its
             // terminal target — strength_reduce can produce chains
             // like `((x*1)*1)+0` where each Identity points to the
-            // result of an earlier Identity. The chase strictly
-            // shrinks the operand graph, so it always terminates.
+            // result of an earlier Identity.
+            //
+            // Audit N-7: termination is guaranteed today by the SSA
+            // invariant that every Identity rewrite points to a
+            // value with a strictly smaller `ValueId` (operands are
+            // defined before their uses). But that invariant isn't
+            // enforced anywhere — a future pass could in principle
+            // produce a cycle. We defend with a `HashSet<ValueId>`
+            // visited guard that breaks the chase on the second
+            // visit of any node, so a bug-introduced cycle becomes
+            // "this rewrite is skipped" rather than "compiler hangs
+            // in an infinite loop."
             if !identity_rewrites.is_empty() {
                 let keys: Vec<ValueId> = identity_rewrites.keys().copied().collect();
                 for k in keys {
                     let mut cur = identity_rewrites[&k];
+                    let mut visited: std::collections::HashSet<ValueId> =
+                        std::collections::HashSet::new();
+                    visited.insert(k);
                     while let Some(&next) = identity_rewrites.get(&cur) {
-                        if next == cur { break; }
+                        if !visited.insert(next) { break; }
                         cur = next;
                     }
                     identity_rewrites.insert(k, cur);
