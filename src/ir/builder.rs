@@ -159,6 +159,16 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::FNeg(val), ty)
     }
 
+    pub fn fabs(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Float(FloatWidth::F64));
+        self.emit(InstKind::FAbs(val), ty)
+    }
+
+    pub fn fsqrt(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Float(FloatWidth::F64));
+        self.emit(InstKind::FSqrt(val), ty)
+    }
+
     pub fn fpow(&mut self, base: ValueId, exp: ValueId) -> ValueId {
         let ty = self.func.value_type(base).unwrap_or(IrType::Float(FloatWidth::F64));
         self.emit(InstKind::FPow(base, exp), ty)
@@ -174,6 +184,14 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::FCmp(op, lhs, rhs), IrType::Bool)
     }
 
+    // ---- Select ----
+
+    /// Conditional select: cond ? true_val : false_val
+    pub fn select(&mut self, cond: ValueId, true_val: ValueId, false_val: ValueId) -> ValueId {
+        let ty = self.func.value_type(true_val).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::Select(cond, true_val, false_val), ty)
+    }
+
     // ---- Logic ----
 
     pub fn and(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
@@ -186,6 +204,53 @@ impl<'a> FuncBuilder<'a> {
 
     pub fn not(&mut self, val: ValueId) -> ValueId {
         self.emit(InstKind::Not(val), IrType::Bool)
+    }
+
+    // ---- Bitwise ----
+
+    pub fn bit_and(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::BitAnd(lhs, rhs), ty)
+    }
+
+    pub fn bit_or(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::BitOr(lhs, rhs), ty)
+    }
+
+    pub fn bit_xor(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::BitXor(lhs, rhs), ty)
+    }
+
+    pub fn shl(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::Shl(lhs, rhs), ty)
+    }
+
+    pub fn bit_not(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::BitNot(val), ty)
+    }
+
+    pub fn lshr(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::LShr(lhs, rhs), ty)
+    }
+
+    pub fn clz(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::CountLeadingZeros(val), ty)
+    }
+
+    pub fn ctz(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::CountTrailingZeros(val), ty)
+    }
+
+    pub fn popcount(&mut self, val: ValueId) -> ValueId {
+        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        self.emit(InstKind::PopCount(val), ty)
     }
 
     // ---- Conversions ----

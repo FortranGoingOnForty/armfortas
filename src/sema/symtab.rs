@@ -27,6 +27,7 @@ impl SymbolTable {
             implicit_rules: ImplicitRules::default_fortran(),
             use_associations: Vec::new(),
             default_access: Access::Public,
+            arg_order: Vec::new(),
         };
         Self { scopes: vec![global], current: 0 }
     }
@@ -43,6 +44,7 @@ impl SymbolTable {
             implicit_rules: parent_implicit, // inherit from parent, may be overridden
             use_associations: Vec::new(),
             default_access: Access::Public,
+            arg_order: Vec::new(),
         };
         self.scopes.push(scope);
         self.current = id;
@@ -209,6 +211,8 @@ pub struct Scope {
     pub implicit_rules: ImplicitRules,
     pub use_associations: Vec<UseAssociation>,
     pub default_access: Access,
+    /// Ordered dummy argument names (for function/subroutine scopes).
+    pub arg_order: Vec<String>,
 }
 
 /// What kind of scope this is.
@@ -237,6 +241,10 @@ pub struct Symbol {
     pub attrs: SymbolAttrs,
     pub defined_at: Span,
     pub scope: ScopeId,
+    /// Ordered dummy argument names (for functions/subroutines).
+    pub arg_names: Vec<String>,
+    /// Compile-time constant value (for PARAMETERs like c_int=4).
+    pub const_value: Option<i64>,
 }
 
 /// What kind of entity this symbol represents.
@@ -401,6 +409,8 @@ mod tests {
             attrs: SymbolAttrs::default(),
             defined_at: dummy_span(),
             scope: 0,
+            arg_names: vec![],
+            const_value: None,
         }
     }
 

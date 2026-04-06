@@ -305,16 +305,20 @@ fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
         InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
         InstKind::FPow(a, b) => vec![*a, *b],
-        InstKind::FNeg(a) => vec![*a],
+        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => vec![*a],
 
         InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => vec![*a, *b],
 
         InstKind::And(a, b) | InstKind::Or(a, b) => vec![*a, *b],
         InstKind::Not(a) => vec![*a],
 
+        InstKind::Select(c, t, f) => vec![*c, *t, *f],
+
         InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
         InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
-        InstKind::AShr(a, b) => vec![*a, *b],
+        InstKind::LShr(a, b) | InstKind::AShr(a, b) => vec![*a, *b],
+        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
+        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => vec![*a],
 
         InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
         InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |

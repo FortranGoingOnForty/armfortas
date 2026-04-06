@@ -48,14 +48,22 @@ pub enum ArmOpcode {
 
     // ---- Shifts ----
     LslReg,
+    LsrReg,
     AsrReg,
 
-    // ---- Comparison ----
+    // ---- Bit manipulation ----
+    Mvn,         // MVN Xd, Xm  (bitwise NOT, alias: ORN Xd, XZR, Xm)
+    Clz,         // CLZ Xd, Xn  (count leading zeros)
+    Rbit,        // RBIT Xd, Xn (reverse bits)
+
+    // ---- Comparison & select ----
     CmpReg,      // CMP Xn, Xm  (alias: SUBS XZR, Xn, Xm)
     CmpImm,      // CMP Xn, #imm
     Cset,        // CSET Xd, cond
+    CselReg,     // CSEL Xd, Xn, Xm, cond
     FCmpReg,     // FCMP Dn, Dm
     FCset,       // CSET Xd, cond  (after FCMP)
+    FcselReg,    // FCSEL Dd, Dn, Dm, cond
 
     // ---- Float arithmetic ----
     FaddS, FaddD,
@@ -63,6 +71,8 @@ pub enum ArmOpcode {
     FmulS, FmulD,
     FdivS, FdivD,
     FnegS, FnegD,
+    FabsS, FabsD,
+    FsqrtS, FsqrtD,
 
     // ---- Conversions ----
     ScvtfSW, ScvtfDW,   // signed int32 → float

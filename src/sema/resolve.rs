@@ -9,8 +9,12 @@ use crate::ast::decl::{SpannedDecl, Decl, TypeSpec, Attribute, OnlyItem};
 use super::symtab::*;
 
 /// Walk a list of program units and build the symbol table.
-pub fn resolve_file(units: &[SpannedUnit]) -> Result<SymbolTable, SemaError> {
+pub fn resolve_file(units: &[SpannedUnit]) -> Result<(SymbolTable, super::type_layout::TypeLayoutRegistry), SemaError> {
     let mut st = SymbolTable::new();
+    let mut layouts = super::type_layout::TypeLayoutRegistry::new();
+
+    // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
+    super::intrinsic_modules::register_intrinsic_modules(&mut st);
 
     // First pass: create module scopes so USE can find them.
     for unit in units {
@@ -25,7 +29,10 @@ pub fn resolve_file(units: &[SpannedUnit]) -> Result<SymbolTable, SemaError> {
         resolve_unit(&mut st, unit)?;
     }
 
-    Ok(st)
+    // Third pass: compute layouts for all derived types.
+    compute_all_layouts(units, &mut layouts);
+
+    Ok((st, layouts))
 }
 
 fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaError> {
@@ -53,7 +60,11 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             }
         }
         ProgramUnit::Subroutine { name, args, prefix: _, bind: _, uses, imports: _, implicit, decls, body: _, contains } => {
-            st.push_scope(ScopeKind::Subroutine(name.clone()));
+            let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
+            // Store ordered arg names for VALUE lookup by callers.
+            st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
             // Define dummy arguments as symbols.
             for arg in args {
                 if let DummyArg::Name(arg_name) = arg {
@@ -64,6 +75,8 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         attrs: SymbolAttrs::default(),
                         defined_at: unit.span,
                         scope: st.current_scope(),
+                        arg_names: vec![],
+                        const_value: None,
                     })?;
                 }
             }
@@ -74,7 +87,10 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             st.pop_scope();
         }
         ProgramUnit::Function { name, args, result, return_type: _, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
-            st.push_scope(ScopeKind::Function(name.clone()));
+            let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
+            st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
             for arg in args {
                 if let DummyArg::Name(arg_name) = arg {
                     st.define(Symbol {
@@ -84,6 +100,8 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                         attrs: SymbolAttrs::default(),
                         defined_at: unit.span,
                         scope: st.current_scope(),
+                        arg_names: vec![],
+                        const_value: None,
                     })?;
                 }
             }
@@ -96,6 +114,8 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
                 attrs: SymbolAttrs::default(),
                 defined_at: unit.span,
                 scope: st.current_scope(),
+                arg_names: vec![],
+                const_value: None,
             })?;
             process_uses(st, uses)?;
             process_implicit(st, implicit)?;
@@ -184,6 +204,47 @@ fn process_uses(st: &mut SymbolTable, uses: &[SpannedDecl]) -> Result<(), SemaEr
     Ok(())
 }
 
+/// Walk all program units and compute layouts for derived types.
+fn compute_all_layouts(units: &[SpannedUnit], layouts: &mut super::type_layout::TypeLayoutRegistry) {
+    for unit in units {
+        collect_derived_type_layouts(&unit.node, layouts);
+    }
+}
+
+fn collect_derived_type_layouts(unit: &ProgramUnit, layouts: &mut super::type_layout::TypeLayoutRegistry) {
+    let decls = match unit {
+        ProgramUnit::Program { decls, contains, .. } |
+        ProgramUnit::Module { decls, contains, .. } => {
+            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
+            decls
+        }
+        ProgramUnit::Subroutine { decls, contains, .. } |
+        ProgramUnit::Function { decls, contains, .. } => {
+            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
+            decls
+        }
+        _ => return,
+    };
+    for decl in decls {
+        if let Decl::DerivedTypeDef { name, extends, components, type_bound_procs, final_procs, .. } = &decl.node {
+            let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
+            let layout = super::type_layout::compute_layout(name, type_bound_procs, final_procs, components, parent.as_ref(), layouts);
+            // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
+            // This handles the case where a subroutine redefines a type without CONTAINS.
+            let dominated = layouts.get(&name.to_lowercase())
+                .map(|existing| {
+                    let existing_has = !existing.bound_procs.is_empty() || !existing.final_procs.is_empty();
+                    let new_has = !layout.bound_procs.is_empty() || !layout.final_procs.is_empty();
+                    existing_has && !new_has
+                })
+                .unwrap_or(false);
+            if !dominated {
+                layouts.insert(layout);
+            }
+        }
+    }
+}
+
 fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Result<(), SemaError> {
     for stmt in implicit_stmts {
         match &stmt.node {
@@ -239,6 +300,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             attrs: sym_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
+                            arg_names: vec![],
+                            const_value: None,
                         })?;
                     }
                 }
@@ -251,6 +314,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     attrs: SymbolAttrs::default(),
                     defined_at: decl.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
+                    const_value: None,
                 })?;
             }
             _ => {}
@@ -273,6 +338,8 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     attrs: SymbolAttrs::default(),
                     defined_at: unit.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
+                    const_value: None,
                 });
             }
             ProgramUnit::Function { name, return_type, result, decls, .. } => {
@@ -299,6 +366,8 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                     attrs: SymbolAttrs::default(),
                     defined_at: unit.span,
                     scope: st.current_scope(),
+                    arg_names: vec![],
+                    const_value: None,
                 });
             }
             _ => {}
@@ -397,7 +466,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        resolve_file(&units).unwrap()
+        resolve_file(&units).unwrap().0
     }
 
     // ---- Integration tests ----
@@ -482,7 +551,7 @@ end program
     #[test]
     fn derived_type_defined() {
         let st = resolve_source("module m\n  type :: mytype\n    integer :: field\n  end type\nend module\n");
-        let mod_scope = st.scopes.iter().find(|s| matches!(s.kind, ScopeKind::Module(_))).unwrap();
+        let mod_scope = st.scopes.iter().find(|s| matches!(&s.kind, ScopeKind::Module(n) if n == "m")).unwrap();
         assert!(mod_scope.symbols.contains_key("mytype"));
         assert_eq!(mod_scope.symbols["mytype"].kind, SymbolKind::DerivedType);
     }

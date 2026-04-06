@@ -124,8 +124,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::LslReg => format!("lsl {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::LsrReg => format!("lsr {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::AsrReg => format!("asr {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+
+        ArmOpcode::Mvn => format!("mvn {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::Clz => format!("clz {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::Rbit => format!("rbit {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
 
         ArmOpcode::CmpReg => format!("cmp {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
@@ -136,8 +145,18 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let cond = if let MachineOperand::Cond(c) = &inst.operands[1] { cond_str(*c) } else { "eq" };
             format!("cset {}, {}", op_str(&inst.operands[0]), cond)
         }
+        ArmOpcode::CselReg => {
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] { cond_str(*c) } else { "eq" };
+            format!("csel {}, {}, {}, {}", op_str(&inst.operands[0]),
+                op_str(&inst.operands[1]), op_str(&inst.operands[2]), cond)
+        }
         ArmOpcode::FCmpReg => format!("fcmp {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FcselReg => {
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] { cond_str(*c) } else { "eq" };
+            format!("fcsel {}, {}, {}, {}", op_str(&inst.operands[0]),
+                op_str(&inst.operands[1]), op_str(&inst.operands[2]), cond)
+        }
 
         ArmOpcode::FaddS | ArmOpcode::FaddD => format!("fadd {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
@@ -148,6 +167,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::FdivS | ArmOpcode::FdivD => format!("fdiv {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::FnegS | ArmOpcode::FnegD => format!("fneg {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FabsS | ArmOpcode::FabsD => format!("fabs {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FsqrtS | ArmOpcode::FsqrtD => format!("fsqrt {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
 
         ArmOpcode::ScvtfSW | ArmOpcode::ScvtfDW |

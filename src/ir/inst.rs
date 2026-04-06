@@ -84,6 +84,8 @@ pub enum InstKind {
     FMul(ValueId, ValueId),
     FDiv(ValueId, ValueId),
     FNeg(ValueId),
+    FAbs(ValueId),
+    FSqrt(ValueId),
     FPow(ValueId, ValueId),
 
     // ---- Comparison ----
@@ -95,12 +97,21 @@ pub enum InstKind {
     Or(ValueId, ValueId),
     Not(ValueId),
 
+    // ---- Select (conditional) ----
+    /// Select(cond, true_val, false_val) → cond ? true_val : false_val
+    Select(ValueId, ValueId, ValueId),
+
     // ---- Bitwise ----
     BitAnd(ValueId, ValueId),
     BitOr(ValueId, ValueId),
     BitXor(ValueId, ValueId),
+    BitNot(ValueId),
     Shl(ValueId, ValueId),
+    LShr(ValueId, ValueId),
     AShr(ValueId, ValueId),
+    CountLeadingZeros(ValueId),
+    CountTrailingZeros(ValueId),
+    PopCount(ValueId),
 
     // ---- Conversions ----
     IntToFloat(ValueId, FloatWidth),

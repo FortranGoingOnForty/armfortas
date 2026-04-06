@@ -56,6 +56,14 @@ pub enum Stmt {
         cases: Vec<CaseBlock>,
     },
 
+    // ---- SELECT TYPE ----
+    SelectType {
+        name: Option<String>,
+        selector: SpannedExpr,
+        assoc_name: Option<String>, // SELECT TYPE (assoc => expr)
+        guards: Vec<TypeGuard>,
+    },
+
     // ---- WHERE / FORALL ----
     WhereConstruct {
         name: Option<String>,
@@ -123,6 +131,17 @@ pub struct IoControl {
 }
 
 // ---- Supporting types ----
+
+/// A type guard in SELECT TYPE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeGuard {
+    /// TYPE IS (type_name) — exact type match.
+    TypeIs { type_name: String, body: Vec<SpannedStmt> },
+    /// CLASS IS (type_name) — matches type or any extension.
+    ClassIs { type_name: String, body: Vec<SpannedStmt> },
+    /// CLASS DEFAULT — fallback.
+    ClassDefault { body: Vec<SpannedStmt> },
+}
 
 /// A CASE block: case selector + body.
 #[derive(Debug, Clone, PartialEq)]

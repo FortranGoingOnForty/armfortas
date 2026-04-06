@@ -785,7 +785,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let st = resolve::resolve_file(&units).unwrap();
+        let (st, _layouts) = resolve::resolve_file(&units).unwrap();
         validate_file(&units, &st)
     }
 
@@ -800,7 +800,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let st = resolve::resolve_file(&units).unwrap();
+        let (st, _layouts) = resolve::resolve_file(&units).unwrap();
         validate_file_with_std(&units, &st, Some(std))
             .iter()
             .filter(|d| d.kind == DiagKind::Error)

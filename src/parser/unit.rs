@@ -103,8 +103,9 @@ impl<'a> Parser<'a> {
         } else { None };
         self.skip_newlines();
 
-        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["program"])?;
-        let contains = self.parse_contains_section()?;
+        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces); // Interface blocks resolved by sema, ignored by lowering.
         self.consume_end("program")?;
 
         let span = span_from_to(start, self.prev_span());
@@ -113,11 +114,11 @@ impl<'a> Parser<'a> {
 
     fn parse_implicit_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         // No PROGRAM keyword — implicit main program.
-        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["program"])?;
+        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Program {
-            name: None, uses, imports, implicit, decls, body, contains: Vec::new(),
+            name: None, uses, imports, implicit, decls, body, contains: ifaces,
         }, span))
     }
 
@@ -126,8 +127,9 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, imports, implicit, decls, _body) = self.parse_unit_body(&["module"])?;
-        let contains = self.parse_contains_section()?;
+        let (uses, imports, implicit, decls, _body, ifaces) = self.parse_unit_body(&["module"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces);
         self.consume_end("module")?;
 
         let span = span_from_to(start, self.prev_span());
@@ -145,7 +147,7 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body) = self.parse_unit_body(&["submodule"])?;
+        let (uses, _imports, _implicit, decls, _body, _ifaces) = self.parse_unit_body(&["submodule"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("submodule")?;
 
@@ -166,8 +168,9 @@ impl<'a> Parser<'a> {
         let bind = self.try_parse_bind()?;
         self.skip_newlines();
 
-        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["subroutine"])?;
-        let contains = self.parse_contains_section()?;
+        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["subroutine"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces);
         self.consume_end("subroutine")?;
 
         let span = span_from_to(start, self.prev_span());
@@ -201,8 +204,9 @@ impl<'a> Parser<'a> {
         let bind = self.try_parse_bind()?;
         self.skip_newlines();
 
-        let (uses, imports, implicit, decls, body) = self.parse_unit_body(&["function"])?;
-        let contains = self.parse_contains_section()?;
+        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["function"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces);
         self.consume_end("function")?;
 
         let span = span_from_to(start, self.prev_span());
@@ -219,7 +223,7 @@ impl<'a> Parser<'a> {
         } else { None };
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body) = self.parse_unit_body(&["blockdata", "block"])?;
+        let (uses, _imports, _implicit, decls, _body, _ifaces) = self.parse_unit_body(&["blockdata", "block"])?;
         // End block data.
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
@@ -294,13 +298,13 @@ impl<'a> Parser<'a> {
 
     /// Parse the body of a program unit: uses, implicit, declarations, then executable statements.
     #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
-    fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>), ParseError> {
+    fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>, Vec<SpannedUnit>), ParseError> {
         let mut uses = Vec::new();
         let mut imports = Vec::new();
         let mut implicit = Vec::new();
         let mut decls = Vec::new();
         let mut body = Vec::new();
+        let mut interfaces = Vec::new();
 
         // Phase 1: USE statements.
         loop {
@@ -363,6 +367,17 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Check for interface block (specification construct).
+            // Interface blocks are valid in the specification section of any
+            // program unit. Parse and discard — type information is captured
+            // by semantic analysis, no IR generation needed.
+            if text == "interface" || text == "abstract" {
+                let istart = self.current_span();
+                let iface = self.parse_interface_block(istart)?;
+                interfaces.push(iface);
+                continue;
+            }
+
             // Try as type declaration.
             if let Some(ts_result) = self.try_parse_type_spec() {
                 let ts = ts_result?;
@@ -374,7 +389,7 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
 
-        Ok((uses, imports, implicit, decls, body))
+        Ok((uses, imports, implicit, decls, body, interfaces))
     }
 
     fn parse_contains_section(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {

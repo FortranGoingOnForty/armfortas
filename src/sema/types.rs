@@ -1221,6 +1221,8 @@ mod tests {
             attrs: SymbolAttrs::default(),
             defined_at: span,
             scope: 0,
+            arg_names: vec![],
+            const_value: None,
         }).unwrap();
 
         let expr = Spanned::new(Expr::Name { name: "x".into() }, span);
@@ -1318,6 +1320,8 @@ mod tests {
             attrs: SymbolAttrs::default(),
             defined_at: span,
             scope: 0,
+            arg_names: vec![],
+            const_value: None,
         }).unwrap();
 
         let callee = Box::new(Spanned::new(Expr::Name { name: "arr".into() }, span));
@@ -1349,6 +1353,8 @@ mod tests {
             attrs: SymbolAttrs::default(),
             defined_at: span,
             scope: 0,
+            arg_names: vec![],
+            const_value: None,
         }).unwrap();
 
         let callee = Box::new(Spanned::new(Expr::Name { name: "s".into() }, span));
