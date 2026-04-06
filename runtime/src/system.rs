@@ -102,13 +102,13 @@ pub extern "C" fn afs_date_and_time(
     // VALUES(8): year, month, day, tz_minutes, hour, minute, second, milliseconds
     if !values.is_null() {
         unsafe {
-            *values.add(0) = year as i32;
-            *values.add(1) = month as i32;
-            *values.add(2) = day as i32;
+            *values.add(0) = year;
+            *values.add(1) = month;
+            *values.add(2) = day;
             *values.add(3) = tz_offset_min as i32;
-            *values.add(4) = hour as i32;
-            *values.add(5) = minute as i32;
-            *values.add(6) = second as i32;
+            *values.add(4) = hour;
+            *values.add(5) = minute;
+            *values.add(6) = second;
             *values.add(7) = millis;
         }
     }

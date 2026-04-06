@@ -1634,7 +1634,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_select_case(b, ctx, selector, cases);
         }
 
-        Stmt::SelectType { selector, guards, assoc_name, .. } => {
+        Stmt::SelectType { selector, guards, assoc_name: _, .. } => {
             // SELECT TYPE: compare the type tag of a polymorphic variable.
             // For now, support basic pattern where selector is a local derived type
             // variable and TYPE IS guards match by type tag.
