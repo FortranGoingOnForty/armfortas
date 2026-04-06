@@ -30,9 +30,10 @@
 //! original `CondBranch`.
 
 use super::pass::Pass;
+use super::util::prune_unreachable;
 use crate::ir::inst::*;
 use crate::ir::types::IntWidth;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 
 /// What we know about a value at compile time.
 #[derive(Debug, Clone, Copy)]
@@ -91,43 +92,6 @@ impl Pass for ConstProp {
             }
         }
         changed
-    }
-}
-
-/// Remove blocks that are no longer reachable from the function entry.
-/// Returns `true` if any block was removed.
-fn prune_unreachable(func: &mut Function) -> bool {
-    let mut reachable: HashSet<BlockId> = HashSet::new();
-    let mut queue: VecDeque<BlockId> = VecDeque::new();
-    queue.push_back(func.entry);
-    reachable.insert(func.entry);
-
-    while let Some(bid) = queue.pop_front() {
-        let block = func.block(bid);
-        if let Some(term) = &block.terminator {
-            for tgt in terminator_targets(term) {
-                if reachable.insert(tgt) {
-                    queue.push_back(tgt);
-                }
-            }
-        }
-    }
-
-    let before = func.blocks.len();
-    func.blocks.retain(|b| reachable.contains(&b.id));
-    func.blocks.len() != before
-}
-
-fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
-    match term {
-        Terminator::Return(_) | Terminator::Unreachable => vec![],
-        Terminator::Branch(d, _) => vec![*d],
-        Terminator::CondBranch { true_dest, false_dest, .. } => vec![*true_dest, *false_dest],
-        Terminator::Switch { cases, default, .. } => {
-            let mut t: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
-            t.push(*default);
-            t
-        }
     }
 }
 

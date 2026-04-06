@@ -31,6 +31,7 @@
 //! `Eq`/`Ne` are also commutative; `Lt`/`Le`/`Gt`/`Ge` are not.
 
 use super::pass::Pass;
+use super::util::{for_each_operand_mut, for_each_terminator_operand_mut};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use std::collections::HashMap;
@@ -156,69 +157,6 @@ fn key_of(inst: &Inst) -> Option<Key> {
     }
 }
 
-fn substitute_in_inst(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)) {
-    match kind {
-        InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
-        InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) => {}
-
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
-        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
-        InstKind::IMod(a, b) => { r(a); r(b); }
-        InstKind::INeg(a) => r(a),
-
-        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
-        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
-        InstKind::FPow(a, b) => { r(a); r(b); }
-        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => r(a),
-
-        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => { r(a); r(b); }
-
-        InstKind::And(a, b) | InstKind::Or(a, b) => { r(a); r(b); }
-        InstKind::Not(a) => r(a),
-
-        InstKind::Select(c, t, f) => { r(c); r(t); r(f); }
-
-        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
-        InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
-        InstKind::LShr(a, b) | InstKind::AShr(a, b) => { r(a); r(b); }
-        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
-        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => r(a),
-
-        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
-        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => r(v),
-
-        InstKind::Load(a) => r(a),
-        InstKind::Store(v, a) => { r(v); r(a); }
-        InstKind::GetElementPtr(base, idxs) => {
-            r(base);
-            for i in idxs { r(i); }
-        }
-
-        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-            for a in args { r(a); }
-        }
-
-        InstKind::ExtractField(agg, _) => r(agg),
-        InstKind::InsertField(agg, _, val) => { r(agg); r(val); }
-    }
-}
-
-fn substitute_in_terminator(term: &mut Terminator, mut r: impl FnMut(&mut ValueId)) {
-    match term {
-        Terminator::Return(None) | Terminator::Unreachable => {}
-        Terminator::Return(Some(v)) => r(v),
-        Terminator::Branch(_, args) => for a in args { r(a); },
-        Terminator::CondBranch { cond, true_args, false_args, .. } => {
-            r(cond);
-            for a in true_args { r(a); }
-            for a in false_args { r(a); }
-        }
-        Terminator::Switch { selector, .. } => r(selector),
-    }
-}
-
 /// The local CSE pass.
 pub struct LocalCse;
 
@@ -271,6 +209,9 @@ impl Pass for LocalCse {
 /// Replace every operand `old` with `rewrite_map[old]` (if any) in a
 /// single walk over the function. Pairs with `Min-1`: avoids the
 /// O(N · size) cost of calling `substitute_uses` once per rename.
+/// Audit B-6: now delegates to `util::for_each_*_operand_mut`,
+/// removing the duplicate operand-walk machinery that previously
+/// lived in this file.
 fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
     let r = |v: &mut ValueId| {
         if let Some(&new) = rewrites.get(v) {
@@ -279,10 +220,10 @@ fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueI
     };
     for block in &mut func.blocks {
         for inst in &mut block.insts {
-            substitute_in_inst(&mut inst.kind, r);
+            for_each_operand_mut(&mut inst.kind, r);
         }
         if let Some(term) = &mut block.terminator {
-            substitute_in_terminator(term, r);
+            for_each_terminator_operand_mut(term, r);
         }
     }
 }

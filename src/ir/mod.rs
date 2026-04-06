@@ -9,4 +9,5 @@ pub mod inst;
 pub mod builder;
 pub mod printer;
 pub mod verify;
+pub mod walk;
 pub mod lower;

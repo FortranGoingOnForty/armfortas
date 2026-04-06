@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use super::inst::*;
+use super::walk::{inst_uses, terminator_uses, terminator_targets, compute_dominators};
 
 /// Verification error.
 #[derive(Debug, Clone)]
@@ -136,63 +137,6 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     errors
 }
 
-/// Compute the dominator set for each block using iterative dataflow.
-/// Returns a map from BlockId to the set of BlockIds that dominate it.
-fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
-    let all_blocks: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
-    let mut doms: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
-
-    // Entry block is dominated only by itself.
-    let mut entry_set = HashSet::new();
-    entry_set.insert(func.entry);
-    doms.insert(func.entry, entry_set);
-
-    // All other blocks start dominated by every block.
-    for block in &func.blocks {
-        if block.id != func.entry {
-            doms.insert(block.id, all_blocks.clone());
-        }
-    }
-
-    // Build predecessor map.
-    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for block in &func.blocks {
-        preds.entry(block.id).or_default();
-        if let Some(term) = &block.terminator {
-            for target in terminator_targets(term) {
-                preds.entry(target).or_default().push(block.id);
-            }
-        }
-    }
-
-    // Iterate until fixed point.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &func.blocks {
-            if block.id == func.entry { continue; }
-            let pred_list = preds.get(&block.id).cloned().unwrap_or_default();
-            if pred_list.is_empty() { continue; }
-
-            // dom(B) = {B} ∪ ∩{dom(P) for P in preds(B)}
-            let mut new_dom = all_blocks.clone();
-            for pred in &pred_list {
-                if let Some(pred_doms) = doms.get(pred) {
-                    new_dom = new_dom.intersection(pred_doms).copied().collect();
-                }
-            }
-            new_dom.insert(block.id);
-
-            if doms.get(&block.id) != Some(&new_dom) {
-                doms.insert(block.id, new_dom);
-                changed = true;
-            }
-        }
-    }
-
-    doms
-}
-
 /// Map each ValueId to the block where it's defined.
 fn value_def_block(func: &Function) -> HashMap<ValueId, BlockId> {
     let mut map = HashMap::new();
@@ -288,85 +232,6 @@ fn collect_defined_values(func: &Function) -> HashSet<ValueId> {
         }
     }
     defined
-}
-
-/// Get all ValueIds used by an instruction.
-fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
-    match kind {
-        InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
-        InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) => vec![],
-
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
-        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
-        InstKind::IMod(a, b) => vec![*a, *b],
-        InstKind::INeg(a) => vec![*a],
-
-        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
-        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
-        InstKind::FPow(a, b) => vec![*a, *b],
-        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => vec![*a],
-
-        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => vec![*a, *b],
-
-        InstKind::And(a, b) | InstKind::Or(a, b) => vec![*a, *b],
-        InstKind::Not(a) => vec![*a],
-
-        InstKind::Select(c, t, f) => vec![*c, *t, *f],
-
-        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
-        InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
-        InstKind::LShr(a, b) | InstKind::AShr(a, b) => vec![*a, *b],
-        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
-        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => vec![*a],
-
-        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
-        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => vec![*v],
-
-        InstKind::Load(a) => vec![*a],
-        InstKind::Store(v, a) => vec![*v, *a],
-        InstKind::GetElementPtr(base, idxs) => {
-            let mut uses = vec![*base];
-            uses.extend(idxs);
-            uses
-        }
-
-        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => args.clone(),
-
-        InstKind::ExtractField(agg, _) => vec![*agg],
-        InstKind::InsertField(agg, _, val) => vec![*agg, *val],
-    }
-}
-
-/// Get all ValueIds used by a terminator.
-fn terminator_uses(term: &Terminator) -> Vec<ValueId> {
-    match term {
-        Terminator::Return(None) | Terminator::Unreachable => vec![],
-        Terminator::Return(Some(v)) => vec![*v],
-        Terminator::Branch(_, args) => args.clone(),
-        Terminator::CondBranch { cond, true_args, false_args, .. } => {
-            let mut uses = vec![*cond];
-            uses.extend(true_args);
-            uses.extend(false_args);
-            uses
-        }
-        Terminator::Switch { selector, .. } => vec![*selector],
-    }
-}
-
-/// Get all branch target BlockIds from a terminator.
-fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
-    match term {
-        Terminator::Return(_) | Terminator::Unreachable => vec![],
-        Terminator::Branch(dest, _) => vec![*dest],
-        Terminator::CondBranch { true_dest, false_dest, .. } => vec![*true_dest, *false_dest],
-        Terminator::Switch { cases, default, .. } => {
-            let mut targets: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
-            targets.push(*default);
-            targets
-        }
-    }
 }
 
 /// Check that branch arguments match block parameters in count and type.
