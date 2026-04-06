@@ -1436,9 +1436,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::None => {
-                                let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                if info.derived_type.is_some() {
-                                    // Derived type assignment: memcpy from source to destination.
+                                if (!info.dims.is_empty() || info.allocatable) && !matches!(&value.node, Expr::FunctionCall { .. }) {
+                                    // Whole-array assignment: a = b or a = scalar.
+                                    lower_array_assign(b, ctx, &info, value);
+                                } else if info.derived_type.is_some() {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let size = if let Some(ref tn) = info.derived_type {
                                         ctx.type_layouts.get(tn).map(|l| l.size).unwrap_or(8)
                                     } else { 8 };
@@ -1447,9 +1449,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         vec![info.addr, val, size_val],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                 } else if info.by_ref {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let ptr = b.load(info.addr);
                                     b.store(val, ptr);
                                 } else {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     b.store(val, info.addr);
                                 }
                             }
@@ -2676,6 +2680,86 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
+fn lower_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) {
+    // Check if RHS is also an array variable → element-wise copy via memcpy.
+    let rhs_is_array = if let Expr::Name { name } = &value.node {
+        ctx.locals.get(&name.to_lowercase())
+            .map(|i| !i.dims.is_empty() || i.allocatable)
+            .unwrap_or(false)
+    } else { false };
+
+    if rhs_is_array {
+        // a = b: memcpy from b's data to a's data.
+        // For allocatable arrays, load base_addr from both descriptors.
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+
+        if let Expr::Name { name } = &value.node {
+            let key = name.to_lowercase();
+            if let Some(src_info) = ctx.locals.get(&key) {
+                let src_base = if src_info.allocatable {
+                    b.load_typed(src_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else { src_info.addr };
+
+                // Compute byte count: size(a) * elem_size.
+                let n = b.call(FuncRef::External("afs_array_size".into()),
+                    vec![dest_info.addr], IrType::Int(IntWidth::I64));
+                let elem_bytes = match &dest_info.ty {
+                    IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+                    _ => b.const_i64(4),
+                };
+                let byte_count = b.imul(n, elem_bytes);
+                b.call(FuncRef::External("memcpy".into()),
+                    vec![dest_base, src_base, byte_count],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            }
+        }
+    } else {
+        // a = scalar: broadcast scalar to all elements.
+        // Generate a loop with stack-allocated counter.
+        let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+
+        let n = b.call(FuncRef::External("afs_array_size".into()),
+            vec![dest_info.addr], IrType::Int(IntWidth::I64));
+
+        // Stack-allocated loop counter.
+        let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero = b.const_i64(0);
+        b.store(zero, i_addr);
+
+        let bb_check = b.create_block("broadcast_check");
+        let bb_body = b.create_block("broadcast_body");
+        let bb_exit = b.create_block("broadcast_exit");
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_check);
+        let i = b.load(i_addr);
+        let done = b.icmp(CmpOp::Ge, i, n);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+        b.set_block(bb_body);
+        let i_val = b.load(i_addr);
+        let elem_ptr = b.gep(dest_base, vec![i_val], dest_info.ty.clone());
+        b.store(scalar, elem_ptr);
+        let one = b.const_i64(1);
+        let next_i = b.iadd(i_val, one);
+        b.store(next_i, i_addr);
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_exit);
+    }
+}
+
 /// Lower array intrinsics that need descriptor addresses (SIZE, SUM, etc.).
 fn lower_array_intrinsic(
     b: &mut FuncBuilder,
@@ -3090,10 +3174,16 @@ fn lower_expr_full(
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
 
-                // Check if this is an array element access.
-                // Fixed arrays have dims set; allocatable arrays have allocatable flag.
+                // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
                     if !info.dims.is_empty() || info.allocatable {
+                        // Check for range subscripts (array section).
+                        let has_range = args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
+                        if has_range {
+                            // Array section: create section descriptor via runtime.
+                            // For now, return the base address (full section support deferred).
+                            return info.addr;
+                        }
                         return lower_array_element(b, locals, info, args, st);
                     }
                 }
