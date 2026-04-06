@@ -1,0 +1,330 @@
+//! Dead-code elimination pass.
+//!
+//! Removes instructions whose result has no observable effect:
+//!
+//!  * The result `ValueId` is unused by any other instruction or
+//!    terminator in the function.
+//!  * The instruction has no side effects of its own (a `Store`,
+//!    `Call`, or `RuntimeCall` is always live, even if its return is
+//!    unused, because it can write memory or perform I/O).
+//!
+//! The pass uses mark-and-sweep:
+//!
+//! 1. Walk every block, every instruction, every terminator and mark
+//!    each `ValueId` they consume as "live".
+//! 2. Walk every instruction in every block; instructions whose result
+//!    is unused **and** which are pure are dropped.
+//!
+//! Constant-folding plus constant-propagation can leave behind a lot
+//! of pure dead computation (e.g., the `Const*` values that defined a
+//! folded conditional). DCE cleans those up. We also remove blocks
+//! that became unreachable for any reason (defensive — `ConstProp`
+//! already prunes after itself, but other future passes may not).
+//!
+//! ### Side-effect classification
+//!
+//! In Fortran, the following are observable:
+//!  * `Store` — writes user memory
+//!  * `Call` / `RuntimeCall` — print, allocate, free, etc.
+//!  * `Return` / branches / `Unreachable` — terminators are *always*
+//!    live; we never remove them.
+//!
+//! `Load` is conservatively pure here. That is technically incorrect
+//! when the same address is later stored to (the load could be
+//! observing volatile memory), but for SSA-form Fortran loads of
+//! locals it's a safe approximation. A future alias-analysis pass can
+//! refine this.
+
+use super::pass::Pass;
+use crate::ir::inst::*;
+use std::collections::{HashSet, VecDeque};
+
+/// True if the instruction has any side effect that prevents removal,
+/// regardless of whether its result is used.
+fn has_side_effect(kind: &InstKind) -> bool {
+    matches!(
+        kind,
+        InstKind::Store(..)
+            | InstKind::Call(..)
+            | InstKind::RuntimeCall(..)
+            // Alloca produces a stack slot whose identity matters even
+            // if no one reads from it (the address may escape via a
+            // future store/call). Treat as side-effecting for safety.
+            | InstKind::Alloca(..)
+    )
+}
+
+/// Collect every `ValueId` referenced as an operand of any instruction
+/// or terminator in the function. The result is the "live use" set.
+fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
+    let mut live = HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            for v in inst_uses(&inst.kind) {
+                live.insert(v);
+            }
+        }
+        if let Some(term) = &block.terminator {
+            for v in terminator_uses(term) {
+                live.insert(v);
+            }
+        }
+    }
+    live
+}
+
+fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
+    match kind {
+        InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
+        InstKind::ConstBool(..) | InstKind::ConstString(..) |
+        InstKind::Undef(..) | InstKind::Alloca(..) => vec![],
+
+        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
+        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
+        InstKind::IMod(a, b) => vec![*a, *b],
+        InstKind::INeg(a) => vec![*a],
+
+        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
+        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
+        InstKind::FPow(a, b) => vec![*a, *b],
+        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => vec![*a],
+
+        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => vec![*a, *b],
+
+        InstKind::And(a, b) | InstKind::Or(a, b) => vec![*a, *b],
+        InstKind::Not(a) => vec![*a],
+
+        InstKind::Select(c, t, f) => vec![*c, *t, *f],
+
+        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
+        InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
+        InstKind::LShr(a, b) | InstKind::AShr(a, b) => vec![*a, *b],
+        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
+        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => vec![*a],
+
+        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
+        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
+        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => vec![*v],
+
+        InstKind::Load(a) => vec![*a],
+        InstKind::Store(v, a) => vec![*v, *a],
+        InstKind::GetElementPtr(base, idxs) => {
+            let mut uses = vec![*base];
+            uses.extend(idxs);
+            uses
+        }
+
+        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => args.clone(),
+
+        InstKind::ExtractField(agg, _) => vec![*agg],
+        InstKind::InsertField(agg, _, val) => vec![*agg, *val],
+    }
+}
+
+fn terminator_uses(term: &Terminator) -> Vec<ValueId> {
+    match term {
+        Terminator::Return(None) | Terminator::Unreachable => vec![],
+        Terminator::Return(Some(v)) => vec![*v],
+        Terminator::Branch(_, args) => args.clone(),
+        Terminator::CondBranch { cond, true_args, false_args, .. } => {
+            let mut uses = vec![*cond];
+            uses.extend(true_args);
+            uses.extend(false_args);
+            uses
+        }
+        Terminator::Switch { selector, .. } => vec![*selector],
+    }
+}
+
+fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
+    match term {
+        Terminator::Return(_) | Terminator::Unreachable => vec![],
+        Terminator::Branch(d, _) => vec![*d],
+        Terminator::CondBranch { true_dest, false_dest, .. } => vec![*true_dest, *false_dest],
+        Terminator::Switch { cases, default, .. } => {
+            let mut t: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+            t.push(*default);
+            t
+        }
+    }
+}
+
+/// Remove blocks unreachable from the entry block. Returns true if any
+/// blocks were removed.
+fn prune_unreachable(func: &mut Function) -> bool {
+    let mut reachable: HashSet<BlockId> = HashSet::new();
+    let mut queue: VecDeque<BlockId> = VecDeque::new();
+    queue.push_back(func.entry);
+    reachable.insert(func.entry);
+    while let Some(bid) = queue.pop_front() {
+        let block = func.block(bid);
+        if let Some(term) = &block.terminator {
+            for tgt in terminator_targets(term) {
+                if reachable.insert(tgt) {
+                    queue.push_back(tgt);
+                }
+            }
+        }
+    }
+    let before = func.blocks.len();
+    func.blocks.retain(|b| reachable.contains(&b.id));
+    func.blocks.len() != before
+}
+
+/// Run DCE over a single function. Returns true if anything changed.
+///
+/// We iterate to a local fixpoint inside the function: removing one
+/// dead instruction can free another (its operands lose a use), so we
+/// keep going until a full sweep removes nothing. The outer pass
+/// manager will run us again if other passes also produce dead code.
+fn dce_function(func: &mut Function) -> bool {
+    let mut any_change = false;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let live = collect_live_uses(func);
+        for block in &mut func.blocks {
+            let before = block.insts.len();
+            block.insts.retain(|inst| {
+                if has_side_effect(&inst.kind) { return true; }
+                if live.contains(&inst.id) { return true; }
+                false
+            });
+            if block.insts.len() != before {
+                changed = true;
+                any_change = true;
+            }
+        }
+    }
+    if prune_unreachable(func) { any_change = true; }
+    any_change
+}
+
+pub struct Dce;
+
+impl Pass for Dce {
+    fn name(&self) -> &'static str { "dce" }
+    fn run(&self, module: &mut Module) -> bool {
+        let mut changed = false;
+        for func in &mut module.functions {
+            if dce_function(func) { changed = true; }
+        }
+        changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{IrType, IntWidth, FloatWidth};
+    use crate::lexer::{Span, Position};
+
+    fn dummy_span() -> Span {
+        let p = Position { line: 1, col: 1 };
+        Span { start: p, end: p, file_id: 0 }
+    }
+
+    fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
+        let id = f.next_value_id();
+        let entry = f.entry;
+        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        id
+    }
+
+    #[test]
+    fn removes_unused_const() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Dce.run(&mut m));
+        assert!(m.functions[0].blocks[0].insts.is_empty());
+    }
+
+    #[test]
+    fn keeps_const_used_by_return() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let v = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(v)));
+        m.add_function(f);
+
+        assert!(!Dce.run(&mut m));
+        assert_eq!(m.functions[0].blocks[0].insts.len(), 1);
+    }
+
+    #[test]
+    fn keeps_store_even_if_address_unused() {
+        // Alloca + Store should both stay even though no one loads.
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let addr = push(&mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v, addr), IrType::Void);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dce.run(&mut m));
+        assert_eq!(m.functions[0].blocks[0].insts.len(), 3);
+    }
+
+    #[test]
+    fn cascades_through_chain() {
+        // %1 = const 3
+        // %2 = const 4
+        // %3 = iadd %1, %2     ; unused
+        // %4 = fmul ...        ; uses %3 transitively?  No — distinct chain
+        // After DCE: only the terminator remains.
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let a = push(&mut f, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let b = push(&mut f, InstKind::ConstInt(4, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I32));
+        let _d = push(&mut f, InstKind::INeg(c), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Dce.run(&mut m));
+        assert!(m.functions[0].blocks[0].insts.is_empty());
+    }
+
+    #[test]
+    fn keeps_call_even_if_result_unused() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        push(&mut f,
+            InstKind::RuntimeCall(RuntimeFunc::PrintNewline, vec![]),
+            IrType::Void,
+        );
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dce.run(&mut m));
+        assert_eq!(m.functions[0].blocks[0].insts.len(), 1);
+    }
+
+    #[test]
+    fn float_chain_is_dead() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let a = push(&mut f, InstKind::ConstFloat(1.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
+        let b = push(&mut f, InstKind::ConstFloat(2.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
+        let _ = push(&mut f, InstKind::FAdd(a, b), IrType::Float(FloatWidth::F64));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Dce.run(&mut m));
+        assert!(m.functions[0].blocks[0].insts.is_empty());
+    }
+}

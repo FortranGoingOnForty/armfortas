@@ -7,6 +7,7 @@
 use super::pass::PassManager;
 use super::const_fold::ConstFold;
 use super::const_prop::ConstProp;
+use super::dce::Dce;
 
 /// Compiler optimization levels.
 ///
@@ -87,6 +88,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // Cheap, always-correct cleanup.
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dce));
         }
         OptLevel::O2 | OptLevel::Os => {
             // O1 plus LICM, small inlining, strength reduction,
@@ -94,6 +96,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // FMA fusion. Os trims unrolling/inlining heuristics.
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
             // O2 plus vectorization, aggressive inlining, IPO,
@@ -101,6 +104,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // Ofast additionally enables fast-math reassociation.
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dce));
         }
     }
     pm
