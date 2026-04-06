@@ -208,6 +208,10 @@ impl<'a> Parser<'a> {
 
     fn parse_select(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'select'
+        let keyword = self.peek_text().to_lowercase();
+        if keyword == "type" {
+            return self.parse_select_type(start);
+        }
         self.eat_ident("case");
         self.expect(&TokenKind::LParen)?;
         let selector = self.parse_expr()?;
@@ -229,6 +233,84 @@ impl<'a> Parser<'a> {
         self.consume_end("select")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::SelectCase { name: None, selector, cases }, span))
+    }
+
+    fn parse_select_type(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.advance(); // consume 'type'
+        self.expect(&TokenKind::LParen)?;
+
+        // Check for association: SELECT TYPE (assoc => expr)
+        let (assoc_name, selector) = {
+            let expr = self.parse_expr()?;
+            if self.eat(&TokenKind::Arrow) {
+                // assoc => expr
+                let assoc = if let Expr::Name { name } = &expr.node {
+                    Some(name.clone())
+                } else { None };
+                let sel = self.parse_expr()?;
+                (assoc, sel)
+            } else {
+                (None, expr)
+            }
+        };
+        self.expect(&TokenKind::RParen)?;
+
+        let mut guards = Vec::new();
+        loop {
+            self.skip_newlines();
+            let text = self.peek_text().to_lowercase();
+            if text == "type" {
+                self.advance(); // consume 'type'
+                self.eat_ident("is");
+                self.expect(&TokenKind::LParen)?;
+                let type_name = self.advance().clone().text;
+                self.expect(&TokenKind::RParen)?;
+                let body = self.parse_select_type_body()?;
+                guards.push(TypeGuard::TypeIs { type_name, body });
+            } else if text == "class" {
+                self.advance(); // consume 'class'
+                let next = self.peek_text().to_lowercase();
+                if next == "is" {
+                    self.advance(); // consume 'is'
+                    self.expect(&TokenKind::LParen)?;
+                    let type_name = self.advance().clone().text;
+                    self.expect(&TokenKind::RParen)?;
+                    let body = self.parse_select_type_body()?;
+                    guards.push(TypeGuard::ClassIs { type_name, body });
+                } else if next == "default" {
+                    self.advance(); // consume 'default'
+                    let body = self.parse_select_type_body()?;
+                    guards.push(TypeGuard::ClassDefault { body });
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        self.consume_end("select")?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::SelectType { name: None, selector, assoc_name, guards }, span))
+    }
+
+    /// Parse the body of a SELECT TYPE guard — stops at TYPE IS, CLASS IS, CLASS DEFAULT, or END SELECT.
+    fn parse_select_type_body(&mut self) -> Result<Vec<SpannedStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek() == &TokenKind::Eof { break; }
+            let text = self.peek_text().to_lowercase();
+            // Break on guard keywords or end.
+            if text == "type" || text == "class" || text == "endselect" { break; }
+            if text == "end" {
+                let next = if self.pos + 1 < self.tokens.len() {
+                    self.tokens[self.pos + 1].text.to_lowercase()
+                } else { String::new() };
+                if next == "select" || next.is_empty() { break; }
+            }
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
     }
 
     fn parse_case_selectors(&mut self) -> Result<Vec<CaseSelector>, ParseError> {
