@@ -94,6 +94,19 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(D)** No I128 for integer(16). Exotic.
 - **(D)** `value_type()` is O(n) linear scan. Performance only.
 
+## IR — Parameter Constants
+
+- **(D)** `parameter` (named constant) declarations are lowered as
+  `alloca + load` with **no intervening store** of the parameter's
+  value. At `-O0` the load returns uninitialized stack bytes; at
+  `-O1`/`-O2` mem2reg promotes the alloca to `Undef`. Surfaced by the
+  mem2reg work — the original `test_programs/const_prop.f90` was
+  passing only because the uninitialized stack happened to be
+  non-zero. Fix: in the lowerer, when a `Symbol` has
+  `kind == SymbolKind::Parameter`, inline the constant value at
+  every use site (or, equivalently, emit an `Alloca + Store(const, slot)`
+  in entry). Tracked for the parameter-lowering cleanup pass.
+
 ## IR — Complex Lowering (Sprint 16)
 
 - **[FIXED]** ~~ALLOCATE ignores shape arguments~~ → Sprint 21.5
