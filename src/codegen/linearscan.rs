@@ -58,8 +58,16 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
 
     let mut assignments: HashMap<VRegId, PhysReg> = HashMap::new();
     let mut spills: HashMap<VRegId, i32> = HashMap::new();
-    let mut active_gp: Vec<(u8, u32)> = Vec::new(); // (reg_num, interval_end)
-    let mut active_fp: Vec<(u8, u32)> = Vec::new();
+    // Active intervals: (reg_num, interval_end, current_vreg). The
+    // vreg is tracked here so spill victim selection can identify
+    // the *current* holder of a physical register without iterating
+    // the `assignments` HashMap (which accumulates stale historical
+    // entries when registers are reused after expiry, and whose
+    // iteration order is non-deterministic). Audit fix surfaced by
+    // mem2reg work — produced flaky `select_type.f90` failures and
+    // non-reproducible builds across compiles.
+    let mut active_gp: Vec<(u8, u32, VRegId)> = Vec::new();
+    let mut active_fp: Vec<(u8, u32, VRegId)> = Vec::new();
     let mut free_gp: Vec<u8> = GP_ALLOC_ORDER.to_vec();
     let mut free_fp: Vec<u8> = FP_ALLOC_ORDER.to_vec();
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
@@ -114,8 +122,8 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 }
             };
             assignments.insert(interval.vreg, phys);
-            active.push((reg, interval.end));
-            active.sort_by_key(|&(_, end)| end);
+            active.push((reg, interval.end, interval.vreg));
+            active.sort_by_key(|&(_, end, _)| end);
 
             // Track callee-saved usage.
             if !is_fp && GP_CALLEE_SAVED.contains(&reg) {
@@ -125,38 +133,34 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 callee_saved_used.insert(PhysReg::Fp(reg));
             }
         } else {
-            // No register available — spill.
-            // Find the active interval ending furthest.
-            if let Some(last_idx) = active.iter().position(|&(_, end)| end == active.last().map(|a| a.1).unwrap_or(0)) {
-                let (spill_reg, spill_end) = active[last_idx];
+            // No register available — spill. Find the active
+            // interval ending furthest. The active list now carries
+            // the current vreg directly so we don't have to scan
+            // the (non-deterministic, stale-entry-laden) assignments
+            // map for the victim.
+            if let Some(last_idx) = active.iter().position(|&(_, end, _)| end == active.last().map(|a| a.1).unwrap_or(0)) {
+                let (spill_reg, spill_end, victim) = active[last_idx];
                 if spill_end > interval.end {
                     // Spill the furthest active interval, give its register to us.
-                    let victim_vreg = find_vreg_with_reg(&assignments, spill_reg, is_fp);
-                    if let Some(victim) = victim_vreg {
-                        let offset = mf.alloc_local(8);
-                        spills.insert(victim, offset);
-                        assignments.remove(&victim);
+                    let offset = mf.alloc_local(8);
+                    spills.insert(victim, offset);
+                    assignments.remove(&victim);
 
-                        let phys = if is_fp {
-                            match interval.class {
-                                RegClass::Fp32 => PhysReg::Fp32(spill_reg),
-                                _ => PhysReg::Fp(spill_reg),
-                            }
-                        } else {
-                            match interval.class {
-                                RegClass::Gp32 => PhysReg::Gp32(spill_reg),
-                                _ => PhysReg::Gp(spill_reg),
-                            }
-                        };
-                        assignments.insert(interval.vreg, phys);
-                        active.remove(last_idx);
-                        active.push((spill_reg, interval.end));
-                        active.sort_by_key(|&(_, end)| end);
+                    let phys = if is_fp {
+                        match interval.class {
+                            RegClass::Fp32 => PhysReg::Fp32(spill_reg),
+                            _ => PhysReg::Fp(spill_reg),
+                        }
                     } else {
-                        // Can't find victim — spill current.
-                        let offset = mf.alloc_local(8);
-                        spills.insert(interval.vreg, offset);
-                    }
+                        match interval.class {
+                            RegClass::Gp32 => PhysReg::Gp32(spill_reg),
+                            _ => PhysReg::Gp(spill_reg),
+                        }
+                    };
+                    assignments.insert(interval.vreg, phys);
+                    active.remove(last_idx);
+                    active.push((spill_reg, interval.end, interval.vreg));
+                    active.sort_by_key(|&(_, end, _)| end);
                 } else {
                     // Current interval ends later — spill it.
                     let offset = mf.alloc_local(8);
@@ -215,10 +219,20 @@ pub fn apply_allocation(mf: &mut MachineFunction, result: &AllocResult, liveness
 
             // Find GP registers NOT occupied by any live interval at this position.
             // These are safe to use as temporary spill registers.
+            //
+            // Iterate `result.assignments` in **deterministic vreg
+            // order**, not raw HashMap iteration order — the latter
+            // varies between runs and produces different temp-reg
+            // assignments and therefore non-reproducible builds. The
+            // resulting `gp_temps`/`fp_temps` lists are consumed by
+            // index, so their order is load-bearing.
             let mut gp_temps: Vec<u8> = Vec::new();
             let mut fp_temps: Vec<u8> = Vec::new();
-            for (&vreg, phys) in &result.assignments {
-                if let Some(&(start, end)) = intervals.get(&vreg) {
+            let mut sorted_assignments: Vec<(VRegId, PhysReg)> = result.assignments
+                .iter().map(|(&v, &p)| (v, p)).collect();
+            sorted_assignments.sort_by_key(|(v, _)| v.0);
+            for (vreg, phys) in &sorted_assignments {
+                if let Some(&(start, end)) = intervals.get(vreg) {
                     if cur_pos < start || cur_pos > end {
                         // This vreg's register is free at this point.
                         match phys {
@@ -423,27 +437,16 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
 
 // ---- Helpers ----
 
-fn expire_intervals(active: &mut Vec<(u8, u32)>, free: &mut Vec<u8>, pos: u32) {
+fn expire_intervals(active: &mut Vec<(u8, u32, VRegId)>, free: &mut Vec<u8>, pos: u32) {
     let mut i = 0;
     while i < active.len() {
         if active[i].1 < pos {
-            let (reg, _) = active.remove(i);
+            let (reg, _, _) = active.remove(i);
             free.push(reg);
         } else {
             i += 1;
         }
     }
-}
-
-fn find_vreg_with_reg(assignments: &HashMap<VRegId, PhysReg>, reg_num: u8, is_fp: bool) -> Option<VRegId> {
-    assignments.iter().find_map(|(&vreg, phys)| {
-        let num = match phys {
-            PhysReg::Gp(n) | PhysReg::Gp32(n) => { if !is_fp { Some(*n) } else { None } }
-            PhysReg::Fp(n) | PhysReg::Fp32(n) => { if is_fp { Some(*n) } else { None } }
-            _ => None,
-        };
-        if num == Some(reg_num) { Some(vreg) } else { None }
-    })
 }
 
 /// Scratch registers for spill code. Multiple scratches needed when an

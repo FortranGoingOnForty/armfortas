@@ -199,8 +199,16 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         })
         .collect();
 
-    // Sort by start position.
-    intervals.sort_by_key(|i| i.start);
+    // Sort by start position, breaking ties on the vreg ID. The
+    // tie-break is critical: linear-scan register allocation
+    // processes intervals in vector order, and `starts` is a
+    // HashMap whose iteration order varies between runs. Without
+    // a deterministic tie-break, two compiles of the same source
+    // could pick different registers and produce different
+    // assembly — surfaced as the long-standing select_type.f90
+    // intermittent failure during the optimizer audit rounds and
+    // exposed clearly when mem2reg started perturbing vreg counts.
+    intervals.sort_by_key(|i| (i.start, i.vreg.0));
 
     LivenessResult { intervals, num_positions }
 }
