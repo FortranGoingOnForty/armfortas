@@ -1651,6 +1651,120 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_select_case(b, ctx, selector, cases);
         }
 
+        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+            // WHERE(mask) body [ELSEWHERE body] END WHERE
+            // For scalar-level lowering: evaluate mask, branch, execute body.
+            // Full array-level WHERE requires element-wise iteration, which
+            // needs array shape info. For now, lower as scalar IF-THEN-ELSE.
+            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+            let bb_then = b.create_block("where_then");
+            let bb_else = if !elsewhere.is_empty() {
+                Some(b.create_block("where_else"))
+            } else { None };
+            let bb_end = b.create_block("where_end");
+
+            b.cond_branch(cond, bb_then, vec![],
+                bb_else.unwrap_or(bb_end), vec![]);
+
+            b.set_block(bb_then);
+            lower_stmts(b, ctx, body);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_end, vec![]);
+            }
+
+            if let Some(bb_e) = bb_else {
+                b.set_block(bb_e);
+                // Process ELSEWHERE clauses (first one only for now).
+                if let Some((_else_mask, else_body)) = elsewhere.first() {
+                    lower_stmts(b, ctx, else_body);
+                }
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_end, vec![]);
+                }
+            }
+
+            b.set_block(bb_end);
+        }
+
+        Stmt::WhereStmt { mask, stmt } => {
+            // Single-line WHERE: where (cond) assignment
+            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+            let bb_then = b.create_block("where_stmt");
+            let bb_end = b.create_block("where_stmt_end");
+            b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
+            b.set_block(bb_then);
+            lower_stmt(b, ctx, stmt);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_end, vec![]);
+            }
+            b.set_block(bb_end);
+        }
+
+        Stmt::ForallConstruct { specs, mask, body, .. } => {
+            // FORALL: lower as nested loops with optional mask.
+            // For each spec (i=start:end:step), create a DO-style loop.
+            // Apply mask inside the innermost loop.
+            for spec in specs {
+                let var_opt = Some(spec.var.clone());
+                let start_opt = Some(spec.start.clone());
+                let end_opt = Some(spec.end.clone());
+                lower_do_loop(b, ctx, DoLoopFields {
+                    name: &None,
+                    var: &var_opt,
+                    start: &start_opt,
+                    end: &end_opt,
+                    step: &spec.step,
+                    body: &[], // empty — we handle body after all loops
+                });
+            }
+            // Now in the innermost loop body, apply mask and execute body.
+            if let Some(mask_expr) = mask {
+                let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
+                let bb_body = b.create_block("forall_body");
+                let bb_skip = b.create_block("forall_skip");
+                b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
+                b.set_block(bb_body);
+                lower_stmts(b, ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_skip, vec![]);
+                }
+                b.set_block(bb_skip);
+            } else {
+                lower_stmts(b, ctx, body);
+            }
+        }
+
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            // Single-line FORALL: same approach.
+            for spec in specs {
+                let var_opt = Some(spec.var.clone());
+                let start_opt = Some(spec.start.clone());
+                let end_opt = Some(spec.end.clone());
+                lower_do_loop(b, ctx, DoLoopFields {
+                    name: &None,
+                    var: &var_opt,
+                    start: &start_opt,
+                    end: &end_opt,
+                    step: &spec.step,
+                    body: &[],
+                });
+            }
+            if let Some(mask_expr) = mask {
+                let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
+                let bb_body = b.create_block("forall_stmt_body");
+                let bb_skip = b.create_block("forall_stmt_skip");
+                b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
+                b.set_block(bb_body);
+                lower_stmt(b, ctx, stmt);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_skip, vec![]);
+                }
+                b.set_block(bb_skip);
+            } else {
+                lower_stmt(b, ctx, stmt);
+            }
+        }
+
         Stmt::SelectType { selector, guards, assoc_name: _, .. } => {
             // SELECT TYPE: compare the type tag of a polymorphic variable.
             // For now, support basic pattern where selector is a local derived type

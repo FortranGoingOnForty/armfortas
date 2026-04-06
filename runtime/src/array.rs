@@ -555,6 +555,79 @@ pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
     min
 }
 
+/// TRANSPOSE(source, result) — matrix transpose (real(8) version).
+/// source is (m x n), result is (n x m). Both descriptors must be allocated.
+#[no_mangle]
+pub extern "C" fn afs_transpose_real8(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() { return; }
+    let src = unsafe { &*source };
+    if src.rank < 2 || src.base_addr.is_null() { return; }
+
+    let m = src.dims[0].extent() as usize;
+    let n = src.dims[1].extent() as usize;
+    let sp = src.base_addr as *const f64;
+
+    // Allocate result as (n x m).
+    afs_allocate_1d(result, 8, (n * m) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    let rp = res.base_addr as *mut f64;
+
+    for i in 0..m {
+        for j in 0..n {
+            unsafe { *rp.add(j * m + i) = *sp.add(i * n + j); }
+        }
+    }
+}
+
+/// MATMUL(a, b, result) — matrix multiplication (real(8) version).
+/// a is (m x k), b is (k x n), result is (m x n).
+#[no_mangle]
+pub extern "C" fn afs_matmul_real8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if a.is_null() || b.is_null() || result.is_null() { return; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return; }
+
+    let m = da.dims[0].extent() as usize;
+    let k = if da.rank >= 2 { da.dims[1].extent() as usize } else { 1 };
+    let n = if db.rank >= 2 { db.dims[1].extent() as usize } else { db.dims[0].extent() as usize };
+
+    // For vector * matrix or matrix * vector, adjust dimensions.
+    let ap = da.base_addr as *const f64;
+    let bp = db.base_addr as *const f64;
+
+    // Allocate result.
+    afs_allocate_1d(result, 8, (m * n) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    let rp = res.base_addr as *mut f64;
+
+    // Triple loop: C(i,j) = sum_l A(i,l) * B(l,j)
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for l in 0..k {
+                let a_val = unsafe { *ap.add(i * k + l) };
+                let b_val = unsafe { *bp.add(l * n + j) };
+                sum += a_val * b_val;
+            }
+            unsafe { *rp.add(i * n + j) = sum; }
+        }
+    }
+}
+
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
 #[no_mangle]
 pub extern "C" fn afs_dot_product_real8(
