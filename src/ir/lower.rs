@@ -1315,9 +1315,17 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
+///
+/// Iterates locals in alphabetical order by name to make the emitted
+/// IR (and therefore the assembly) deterministic across runs. The
+/// previous version walked `locals.values()` directly, picking up the
+/// HashMap's randomized iteration order — surfaced as non-reproducible
+/// builds for any function with multiple allocatable locals.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
-    for info in locals.values() {
+    let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (_name, info) in sorted {
         if info.char_kind == CharKind::Deferred {
             b.call(
                 FuncRef::External("afs_dealloc_string".into()),
