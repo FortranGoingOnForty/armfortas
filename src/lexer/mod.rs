@@ -773,9 +773,15 @@ impl<'a> Lexer<'a> {
         }
 
         if name.is_empty() {
-            // Bare dot — could be part of number already handled, or an error.
-            // In practice, could be a component separator in derived types
-            // but Fortran uses % for that. Return as a period for now.
+            // Check for '..' (assumed rank).
+            if self.peek() == b'.' {
+                self.advance(); // consume second '.'
+                return Ok(Token {
+                    kind: TokenKind::Identifier,
+                    text: "..".into(),
+                    span: Span { start, end: self.pos(), file_id: self.file_id },
+                });
+            }
             return Err(self.err(start, "unexpected '.'".into()));
         }
 
