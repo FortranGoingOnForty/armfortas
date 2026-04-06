@@ -5,6 +5,7 @@
 //! change here, which keeps the dispatch logic in one place.
 
 use super::pass::PassManager;
+use super::const_fold::ConstFold;
 
 /// Compiler optimization levels.
 ///
@@ -76,7 +77,6 @@ impl OptLevel {
 /// in one function makes it trivial to audit which passes run at which
 /// level.
 pub fn build_pipeline(level: OptLevel) -> PassManager {
-    #[allow(unused_mut)]
     let mut pm = PassManager::new();
     match level {
         OptLevel::O0 => {
@@ -84,17 +84,19 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O1 => {
             // Cheap, always-correct cleanup.
-            // (Pass implementations land in subsequent commits.)
+            pm.add(Box::new(ConstFold));
         }
         OptLevel::O2 | OptLevel::Os => {
-            // Cleanup + LICM + small inlining + strength reduction +
-            // bounds-check elim + GVN + SROA + DSE + small loop unroll +
+            // O1 plus LICM, small inlining, strength reduction,
+            // bounds-check elim, GVN, SROA, DSE, small loop unroll,
             // FMA fusion. Os trims unrolling/inlining heuristics.
+            pm.add(Box::new(ConstFold));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // Everything in O2 plus vectorization + aggressive inlining
-            // + IPO + devirtualization + speculative optimizations.
+            // O2 plus vectorization, aggressive inlining, IPO,
+            // devirtualization, speculative optimizations.
             // Ofast additionally enables fast-math reassociation.
+            pm.add(Box::new(ConstFold));
         }
     }
     pm
@@ -123,19 +125,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_pipelines_build() {
-        // Even with no passes registered yet, the pipeline must build
-        // and run cleanly on a trivial module.
-        for lvl in [
-            OptLevel::O0,
-            OptLevel::O1,
-            OptLevel::O2,
-            OptLevel::O3,
-            OptLevel::Os,
-            OptLevel::Ofast,
-        ] {
+    fn pipelines_build() {
+        // O0 has no passes; every other level has at least one.
+        assert!(build_pipeline(OptLevel::O0).is_empty());
+        for lvl in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
             let pm = build_pipeline(lvl);
-            assert_eq!(pm.is_empty(), true, "pipeline {:?} should be empty", lvl);
+            assert!(!pm.is_empty(), "pipeline {:?} should have at least one pass", lvl);
         }
     }
 }
