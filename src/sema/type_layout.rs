@@ -163,9 +163,14 @@ pub fn compute_layout(
 
     // Process component declarations.
     for decl in components {
-        if let crate::ast::decl::Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+        if let crate::ast::decl::Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
+            let is_allocatable = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
+            let is_pointer = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Pointer));
+
             let ti = type_spec_to_type_info(type_spec);
-            let (elem_size, elem_align) = if let TypeInfo::Derived(ref dname) = ti {
+            let (elem_size, elem_align) = if is_allocatable || is_pointer {
+                (384, 8) // ArrayDescriptor size for allocatable/pointer components
+            } else if let TypeInfo::Derived(ref dname) = ti {
                 registry.get(dname)
                     .map(|l| (l.size, l.align))
                     .unwrap_or((8, 8))
