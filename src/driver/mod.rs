@@ -3,15 +3,58 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::codegen::{emit, isel, linearscan};
+use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
-use crate::ir::{lower, verify, printer as ir_printer};
-use crate::codegen::{isel, linearscan, emit};
+
+/// Optimization level requested at the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    Ofast,
+}
+
+impl OptLevel {
+    pub fn parse_flag(flag: &str) -> Option<Self> {
+        match flag.to_ascii_lowercase().as_str() {
+            "o0" => Some(Self::O0),
+            "o1" => Some(Self::O1),
+            "o2" => Some(Self::O2),
+            "o3" => Some(Self::O3),
+            "ofast" => Some(Self::Ofast),
+            _ => None,
+        }
+    }
+
+    pub fn as_flag(&self) -> &'static str {
+        match self {
+            Self::O0 => "-O0",
+            Self::O1 => "-O1",
+            Self::O2 => "-O2",
+            Self::O3 => "-O3",
+            Self::Ofast => "-Ofast",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::O0 => "O0",
+            Self::O1 => "O1",
+            Self::O2 => "O2",
+            Self::O3 => "O3",
+            Self::Ofast => "Ofast",
+        }
+    }
+}
 
 /// Compilation options.
 pub struct Options {
@@ -21,6 +64,7 @@ pub struct Options {
     pub emit_obj: bool,        // -c
     pub emit_ir: bool,         // --emit-ir
     pub preprocess_only: bool, // -E
+    pub opt_level: OptLevel,   // -O0 .. -Ofast
 }
 
 impl Options {
@@ -31,6 +75,7 @@ impl Options {
         let mut emit_obj = false;
         let mut emit_ir = false;
         let mut preprocess_only = false;
+        let mut opt_level = OptLevel::O0;
 
         let mut i = 0;
         while i < args.len() {
@@ -47,6 +92,11 @@ impl Options {
                 "-c" => emit_obj = true,
                 "-E" => preprocess_only = true,
                 "--emit-ir" => emit_ir = true,
+                arg if arg.starts_with("-O") => {
+                    let tail = &arg[1..];
+                    opt_level = OptLevel::parse_flag(tail)
+                        .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
+                }
                 arg if !arg.starts_with('-') => {
                     input = Some(PathBuf::from(arg));
                 }
@@ -56,7 +106,15 @@ impl Options {
         }
 
         let input = input.ok_or("no input file")?;
-        Ok(Self { input, output, emit_asm, emit_obj, emit_ir, preprocess_only })
+        Ok(Self {
+            input,
+            output,
+            emit_asm,
+            emit_obj,
+            emit_ir,
+            preprocess_only,
+            opt_level,
+        })
     }
 
     /// Determine the output path based on input and flags.
@@ -64,7 +122,12 @@ impl Options {
         if let Some(ref o) = self.output {
             return o.clone();
         }
-        let stem = self.input.file_stem().unwrap_or_default().to_str().unwrap_or("a");
+        let stem = self
+            .input
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("a");
         if self.emit_asm {
             PathBuf::from(format!("{}.s", stem))
         } else if self.emit_obj {
@@ -88,8 +151,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
         ..crate::preprocess::PreprocConfig::default()
     };
-    let pp_result = crate::preprocess::preprocess(&source, &pp_config)
-        .map_err(|e| format!("{}", e))?;
+    let pp_result =
+        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
@@ -104,13 +167,26 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 3. Lex.
-    let tokens = Lexer::tokenize(&preprocessed, 0)
-        .map_err(|e| format!("{}:{}: lexer error: {}", opts.input.display(), e.span.start.line, e.msg))?;
+    let tokens = Lexer::tokenize(&preprocessed, 0).map_err(|e| {
+        format!(
+            "{}:{}: lexer error: {}",
+            opts.input.display(),
+            e.span.start.line,
+            e.msg
+        )
+    })?;
 
     // 4. Parse.
     let mut parser = Parser::new(&tokens);
-    let units = parser.parse_file()
-        .map_err(|e| format!("{}:{}:{}: parse error: {}", opts.input.display(), e.span.start.line, e.span.start.col, e.msg))?;
+    let units = parser.parse_file().map_err(|e| {
+        format!(
+            "{}:{}:{}: parse error: {}",
+            opts.input.display(),
+            e.span.start.line,
+            e.span.start.col,
+            e.msg
+        )
+    })?;
 
     // 5. Semantic analysis.
     let (st, type_layouts) = resolve::resolve_file(&units)
@@ -118,7 +194,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let diags = validate::validate_file(&units, &st);
     for d in &diags {
         if d.kind == validate::DiagKind::Error {
-            return Err(format!("{}:{}: error: {}", opts.input.display(), d.span.start.line, d.msg));
+            return Err(format!(
+                "{}:{}: error: {}",
+                opts.input.display(),
+                d.span.start.line,
+                d.msg
+            ));
         }
     }
 
@@ -126,7 +207,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let ir_module = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
-        let msg = ir_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        let msg = ir_errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(format!("internal error: IR verification failed:\n{}", msg));
     }
 
@@ -165,7 +250,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // Emit _main entry point (must be in __TEXT section).
     if let Some(user_func) = allocated.first() {
         asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
-        asm_text.push_str(&format!("\
+        asm_text.push_str(&format!(
+            "\
 .globl _main
 .p2align 2
 _main:
@@ -177,7 +263,9 @@ _main:
     mov x0, #0
     ldp x29, x30, [sp], #16
     ret
-", user_func.name));
+",
+            user_func.name
+        ));
     }
 
     if opts.emit_asm {
@@ -196,8 +284,7 @@ _main:
         std::env::temp_dir().join(format!("armfortas_{}.o", pid))
     };
 
-    fs::write(&asm_path, &asm_text)
-        .map_err(|e| format!("cannot write temp assembly: {}", e))?;
+    fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
     let as_result = Command::new("as")
         .args(["-o", obj_path.to_str().unwrap(), asm_path.to_str().unwrap()])
@@ -243,8 +330,10 @@ fn link(obj: &Path, output: &Path) -> Result<(), String> {
             "-lSystem",
             "-syslibroot",
             &sysroot,
-            "-e", "_main",
-            "-o", output.to_str().unwrap(),
+            "-e",
+            "_main",
+            "-o",
+            output.to_str().unwrap(),
         ])
         .output()
         .map_err(|e| format!("cannot run linker: {}", e))?;

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "afs-as", "runtime"]
+members = [".", "afs-as", "runtime", "tests/bench"]
 resolver = "2"
 
 [package]
@@ -7,6 +7,10 @@ name = "armfortas"
 version = "0.1.0"
 edition = "2021"
 description = "Bespoke ARM64 Fortran compiler"
+
+[lib]
+name = "armfortas"
+path = "src/lib.rs"
 
 [[bin]]
 name = "armfortas"
