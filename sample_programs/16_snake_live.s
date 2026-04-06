@@ -66,34 +66,25 @@ _main:
 
     adrp x0, _lose_fmt@PAGE
     add x0, x0, _lose_fmt@PAGEOFF
-    mov x1, #25
-    bl write_stdout
-    mov x0, x21
-    bl print_u64
-    mov x0, #10
-    bl _putchar
+    mov x1, #24
+    mov x2, x21
+    bl write_message_with_score
     b .Lexit_clean
 
 .Lprint_win:
     adrp x0, _win_fmt@PAGE
     add x0, x0, _win_fmt@PAGEOFF
-    mov x1, #45
-    bl write_stdout
-    mov x0, x21
-    bl print_u64
-    mov x0, #10
-    bl _putchar
+    mov x1, #44
+    mov x2, x21
+    bl write_message_with_score
     b .Lexit_clean
 
 .Lprint_quit:
     adrp x0, _quit_fmt@PAGE
     add x0, x0, _quit_fmt@PAGEOFF
-    mov x1, #20
-    bl write_stdout
-    mov x0, x21
-    bl print_u64
-    mov x0, #10
-    bl _putchar
+    mov x1, #19
+    mov x2, x21
+    bl write_message_with_score
 
 .Lexit_clean:
     mov x0, #0
@@ -153,6 +144,11 @@ setup_terminal:
 
     mov x0, x20
     bl _cfmakeraw
+
+    ldr x0, [x20, #48]
+    movn x1, #0xffff
+    and x0, x0, x1
+    str x0, [x20, #48]
 
     mov x0, #0
     mov x1, #0
@@ -252,24 +248,36 @@ write_stdout:
     ldp x29, x30, [sp], #16
     ret
 
-print_u64:
+write_char_stdout:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+
+    str x0, [sp, #16]
+    add x0, sp, #16
+    mov x1, #1
+    bl write_stdout
+
+    ldp x29, x30, [sp], #32
+    ret
+
+write_u64_stdout:
     stp x29, x30, [sp, #-208]!
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     mov x29, sp
 
     mov x19, x0
-    cbnz x19, .Lprint_u64_loop_setup
+    cbnz x19, .Lwrite_u64_loop_setup
 
     mov x0, #48
-    bl _putchar
-    b .Lprint_u64_done
+    bl write_char_stdout
+    b .Lwrite_u64_done
 
-.Lprint_u64_loop_setup:
+.Lwrite_u64_loop_setup:
     add x20, sp, #48
     mov x21, #0
 
-.Lprint_u64_div_loop:
+.Lwrite_u64_div_loop:
     mov x22, #10
     udiv x9, x19, x22
     mul x10, x9, x22
@@ -278,18 +286,50 @@ print_u64:
     str x10, [x20, x21, lsl #3]
     mov x19, x9
     add x21, x21, #1
-    cbnz x19, .Lprint_u64_div_loop
+    cbnz x19, .Lwrite_u64_div_loop
 
-.Lprint_u64_emit_loop:
+.Lwrite_u64_emit_loop:
     sub x21, x21, #1
     ldr x0, [x20, x21, lsl #3]
-    bl _putchar
-    cbnz x21, .Lprint_u64_emit_loop
+    bl write_char_stdout
+    cbnz x21, .Lwrite_u64_emit_loop
 
-.Lprint_u64_done:
+.Lwrite_u64_done:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #208
+    ret
+
+write_message_with_score:
+    stp x29, x30, [sp, #-48]!
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x29, sp
+
+    mov x19, x0
+    mov x20, x1
+    mov x21, x2
+
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
+
+    mov x0, x19
+    mov x1, x20
+    bl write_stdout
+
+    mov x0, x21
+    bl write_u64_stdout
+
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 
 init_game:
@@ -420,7 +460,7 @@ poll_input:
     cmp x20, #68
     b.eq .Lgo_right
 
-    b .Lpoll_loop
+    b .Lpoll_done
 
 .Lset_quit:
     adrp x9, _game_state@PAGE
@@ -434,7 +474,7 @@ poll_input:
     add x9, x9, _snake_dir_y@PAGEOFF
     ldr x10, [x9]
     cmp x10, #1
-    b.eq .Lpoll_loop
+    b.eq .Lpoll_done
 
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
@@ -445,7 +485,7 @@ poll_input:
     add x9, x9, _snake_dir_y@PAGEOFF
     mov x10, #-1
     str x10, [x9]
-    b .Lpoll_loop
+    b .Lpoll_done
 
 .Lgo_down:
     adrp x9, _snake_dir_y@PAGE
@@ -453,7 +493,7 @@ poll_input:
     ldr x10, [x9]
     mov x11, #-1
     cmp x10, x11
-    b.eq .Lpoll_loop
+    b.eq .Lpoll_done
 
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
@@ -464,14 +504,14 @@ poll_input:
     add x9, x9, _snake_dir_y@PAGEOFF
     mov x10, #1
     str x10, [x9]
-    b .Lpoll_loop
+    b .Lpoll_done
 
 .Lgo_left:
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
     ldr x10, [x9]
     cmp x10, #1
-    b.eq .Lpoll_loop
+    b.eq .Lpoll_done
 
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
@@ -482,7 +522,7 @@ poll_input:
     add x9, x9, _snake_dir_y@PAGEOFF
     mov x10, #0
     str x10, [x9]
-    b .Lpoll_loop
+    b .Lpoll_done
 
 .Lgo_right:
     adrp x9, _snake_dir_x@PAGE
@@ -490,7 +530,7 @@ poll_input:
     ldr x10, [x9]
     mov x11, #-1
     cmp x10, x11
-    b.eq .Lpoll_loop
+    b.eq .Lpoll_done
 
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
@@ -501,7 +541,7 @@ poll_input:
     add x9, x9, _snake_dir_y@PAGEOFF
     mov x10, #0
     str x10, [x9]
-    b .Lpoll_loop
+    b .Lpoll_done
 
 .Lpoll_done:
     ldp x19, x20, [sp, #16]
@@ -676,7 +716,7 @@ draw_frame:
     adrp x9, _score_value@PAGE
     add x9, x9, _score_value@PAGEOFF
     ldr x0, [x9]
-    bl print_u64
+    bl write_u64_stdout
 
     adrp x0, _status_mid@PAGE
     add x0, x0, _status_mid@PAGEOFF
@@ -686,14 +726,22 @@ draw_frame:
     adrp x9, _snake_length@PAGE
     add x9, x9, _snake_length@PAGEOFF
     ldr x0, [x9]
-    bl print_u64
+    bl write_u64_stdout
 
-    mov x0, #10
-    bl _putchar
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
 
     adrp x0, _border_line@PAGE
     add x0, x0, _border_line@PAGEOFF
-    bl _puts
+    mov x1, #20
+    bl write_stdout
+
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
 
     mov x19, #0
 
@@ -702,7 +750,7 @@ draw_frame:
     b.ge .Lrows_done
 
     mov x0, #124
-    bl _putchar
+    bl write_char_stdout
 
     mov x20, #0
 
@@ -713,16 +761,19 @@ draw_frame:
     mov x0, x20
     mov x1, x19
     bl cell_char
-    bl _putchar
+    bl write_char_stdout
 
     add x20, x20, #1
     b .Lcol_loop
 
 .Lrow_end:
     mov x0, #124
-    bl _putchar
-    mov x0, #10
-    bl _putchar
+    bl write_char_stdout
+
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
 
     add x19, x19, #1
     b .Lrow_loop
@@ -730,14 +781,23 @@ draw_frame:
 .Lrows_done:
     adrp x0, _border_line@PAGE
     add x0, x0, _border_line@PAGEOFF
-    bl _puts
+    mov x1, #20
+    bl write_stdout
+
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
 
     adrp x0, _controls_line@PAGE
     add x0, x0, _controls_line@PAGEOFF
-    bl _puts
+    mov x1, #31
+    bl write_stdout
 
-    mov x0, #0
-    bl _fflush
+    adrp x0, _crlf@PAGE
+    add x0, x0, _crlf@PAGEOFF
+    mov x1, #2
+    bl write_stdout
 
     ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
@@ -824,13 +884,13 @@ _status_mid:
     .asciz "   Length: "
 
 _lose_fmt:
-    .asciz "\nGame over. Final score: "
+    .asciz "Game over. Final score: "
 
 _win_fmt:
-    .asciz "\nYou cleared every food pickup. Final score: "
+    .asciz "You cleared every food pickup. Final score: "
 
 _quit_fmt:
-    .asciz "\nQuit. Final score: "
+    .asciz "Quit. Final score: "
 
 _border_line:
     .asciz "+------------------+"
@@ -861,6 +921,10 @@ _restore_seq:
     .ascii "[?25h"
     .byte 27
     .ascii "[0m\n"
+
+_crlf:
+    .byte 13
+    .byte 10
 
 _food_table:
     .quad 12, 5
