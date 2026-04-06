@@ -1529,4 +1529,206 @@ mod tests {
         });
         assert!(has_mov_zr, "const 0 should use MOV from XZR or WZR");
     }
+
+    // ---- Parallel-copy / branch arg copy tests ----
+    //
+    // The branch arg copy resolver in `emit_branch_arg_copies` handles
+    // cross-edge moves into block params. When the source/destination
+    // graph contains a cycle, the resolver routes one copy through a
+    // scratch vreg. These tests construct minimal IR functions that
+    // exercise each topology, run isel, and inspect the resulting move
+    // count in the source machine block.
+
+    /// Helper: count vreg→vreg moves of the given opcode in a block,
+    /// excluding moves that target a physical register (those are
+    /// epilogue/return marshaling, not parallel copies).
+    fn count_vreg_moves(block: &MachineBlock, opcode: ArmOpcode) -> usize {
+        block.insts.iter()
+            .filter(|i| i.opcode == opcode)
+            .filter(|i| {
+                // True parallel copies are VReg → VReg.
+                matches!(i.operands.first(), Some(MachineOperand::VReg(_)))
+                    && matches!(i.operands.get(1), Some(MachineOperand::VReg(_)))
+            })
+            .count()
+    }
+
+    fn find_block<'a>(mf: &'a MachineFunction, contains: &str) -> &'a MachineBlock {
+        mf.blocks.iter()
+            .find(|b| b.label.contains(contains))
+            .unwrap_or_else(|| panic!(
+                "no machine block containing '{}' (have: {:?})",
+                contains,
+                mf.blocks.iter().map(|b| &b.label).collect::<Vec<_>>(),
+            ))
+    }
+
+    #[test]
+    fn branch_arg_2_cycle_routes_through_scratch() {
+        // body branches to header swapping the two int params:
+        //   br header(pb, pa)
+        // pending = [(pa,pb), (pb,pa)] — pure 2-cycle, requires:
+        //   tmp = pb;  pb = pa;  pa = tmp     (3 moves)
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            b.branch(header, vec![v0, v1]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            b.branch(header, vec![pb, pa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 3,
+            "2-cycle should emit 3 vreg→vreg moves (scratch + 2 swaps), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_3_cycle_routes_through_scratch() {
+        // br header(pb, pc, pa) — rotate three params left.
+        // pending = [(pa,pb),(pb,pc),(pc,pa)]
+        // Resolution: tmp = pb;  pb = pc;  pc = pa;  pa = tmp   (4 moves)
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pc = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let v2 = b.const_i32(3);
+            b.branch(header, vec![v0, v1, v2]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            b.branch(header, vec![pb, pc, pa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 4,
+            "3-cycle should emit 4 vreg→vreg moves (scratch + 3 rotates), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_cycle_plus_independent_tail() {
+        // 2-cycle on (pa,pb) plus an independent (pc <- v_extra) tail.
+        // br header(pb, pa, v_extra)
+        // The tail (pc, v_extra) is always safe and emits as a single
+        // move; the 2-cycle adds 3 moves for a total of 4.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let _pc = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let v2 = b.const_i32(3);
+            b.branch(header, vec![v0, v1, v2]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            // Body needs a fresh value for pc so it's not part of the
+            // cycle and so it can't degenerate into pa/pb.
+            let v3 = b.const_i32(99);
+            b.branch(header, vec![pb, pa, v3]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 4,
+            "cycle+tail should emit 4 vreg→vreg moves (3 for cycle + 1 for tail), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_mixed_gp_fp_classes() {
+        // Two int params and two float params, all swapped pairwise.
+        // pending splits into a GP 2-cycle and an FP 2-cycle, each of
+        // which independently needs a scratch.
+        // Expected: 3 GP MovReg + 3 FP FmovReg = 6 total moves.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let ia = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let ib = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let fa = b.add_block_param(header, IrType::Float(FloatWidth::F64));
+            let fb = b.add_block_param(header, IrType::Float(FloatWidth::F64));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let f0 = b.const_f64(1.0);
+            let f1 = b.const_f64(2.0);
+            b.branch(header, vec![v0, v1, f0, f1]);
+
+            b.set_block(header);
+            b.cond_branch(ia, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            // Swap both pairs: ints (ib, ia) and floats (fb, fa).
+            b.branch(header, vec![ib, ia, fb, fa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let gp_moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        let fp_moves = count_vreg_moves(body_mb, ArmOpcode::FmovReg);
+        assert_eq!(
+            gp_moves, 3,
+            "GP 2-cycle should emit 3 MovReg, got {}: {:#?}",
+            gp_moves, body_mb.insts,
+        );
+        assert_eq!(
+            fp_moves, 3,
+            "FP 2-cycle should emit 3 FmovReg, got {}: {:#?}",
+            fp_moves, body_mb.insts,
+        );
+    }
 }
