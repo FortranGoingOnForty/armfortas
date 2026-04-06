@@ -2760,6 +2760,83 @@ fn lower_array_assign(
     }
 }
 
+/// Lower an array section expression: a(1:10:2) → create section descriptor.
+fn lower_array_section(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> ValueId {
+    let n_dims = args.len();
+
+    // Allocate SectionSpec array on stack: each spec is 24 bytes (3 x i64).
+    let spec_array_size = (n_dims * 24) as u64;
+    let specs = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), spec_array_size));
+
+    // Fill in each SectionSpec from the subscript ranges.
+    for (i, arg) in args.iter().enumerate() {
+        let base_offset = (i * 24) as i64;
+        match &arg.value {
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                let start_val = start.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| b.const_i64(1)); // default start = 1
+                let end_val = end.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| {
+                        // Default end = upper bound of this dimension.
+                        let dim = b.const_i32((i + 1) as i32);
+                        b.call(FuncRef::External("afs_array_ubound".into()),
+                            vec![info.addr, dim], IrType::Int(IntWidth::I64))
+                    });
+                let stride_val = stride.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| b.const_i64(1)); // default stride = 1
+
+                // Store start at offset+0, end at offset+8, stride at offset+16.
+                let off0 = b.const_i64(base_offset);
+                let off8 = b.const_i64(base_offset + 8);
+                let off16 = b.const_i64(base_offset + 16);
+                let p0 = b.gep(specs, vec![off0], IrType::Int(IntWidth::I8));
+                let p8 = b.gep(specs, vec![off8], IrType::Int(IntWidth::I8));
+                let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
+                b.store(start_val, p0);
+                b.store(end_val, p8);
+                b.store(stride_val, p16);
+            }
+            crate::ast::expr::SectionSubscript::Element(e) => {
+                // Single element subscript in a section context — treat as start=end=val, stride=1.
+                let val = lower_expr(b, locals, e, st);
+                let off0 = b.const_i64(base_offset);
+                let off8 = b.const_i64(base_offset + 8);
+                let off16 = b.const_i64(base_offset + 16);
+                let p0 = b.gep(specs, vec![off0], IrType::Int(IntWidth::I8));
+                let p8 = b.gep(specs, vec![off8], IrType::Int(IntWidth::I8));
+                let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
+                b.store(val, p0);
+                b.store(val, p8);
+                let one = b.const_i64(1);
+                b.store(one, p16);
+            }
+        }
+    }
+
+    // Allocate result descriptor on stack (384 bytes).
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+    // Call afs_create_section(source, result, specs, n_dims).
+    let ndims = b.const_i32(n_dims as i32);
+    b.call(FuncRef::External("afs_create_section".into()),
+        vec![info.addr, result_desc, specs, ndims], IrType::Void);
+
+    result_desc
+}
+
 /// Lower array intrinsics that need descriptor addresses (SIZE, SUM, etc.).
 fn lower_array_intrinsic(
     b: &mut FuncBuilder,
@@ -2847,6 +2924,37 @@ fn lower_array_intrinsic(
             })?;
             Some(b.call(FuncRef::External("afs_dot_product_real8".into()),
                 vec![desc, second_desc], IrType::Float(FloatWidth::F64)))
+        }
+        "matmul" => {
+            // MATMUL(a, b) → allocate result descriptor, call afs_matmul_real8, return descriptor.
+            let second_desc = args.get(1).and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase())
+                            .filter(|i| i.allocatable || !i.dims.is_empty())
+                            .map(|i| i.addr)
+                    } else { None }
+                } else { None }
+            })?;
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.call(FuncRef::External("afs_matmul_real8".into()),
+                vec![desc, second_desc, result_desc], IrType::Void);
+            Some(result_desc)
+        }
+        "transpose" => {
+            // TRANSPOSE(source) → allocate result descriptor, call afs_transpose_real8.
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.call(FuncRef::External("afs_transpose_real8".into()),
+                vec![desc, result_desc], IrType::Void);
+            Some(result_desc)
         }
         _ => None,
     }
@@ -3177,12 +3285,9 @@ fn lower_expr_full(
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
                     if !info.dims.is_empty() || info.allocatable {
-                        // Check for range subscripts (array section).
                         let has_range = args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
                         if has_range {
-                            // Array section: create section descriptor via runtime.
-                            // For now, return the base address (full section support deferred).
-                            return info.addr;
+                            return lower_array_section(b, locals, info, args, st);
                         }
                         return lower_array_element(b, locals, info, args, st);
                     }
