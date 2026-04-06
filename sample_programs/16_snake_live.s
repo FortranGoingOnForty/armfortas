@@ -42,6 +42,15 @@ _main:
     ldr x10, [x9]
     cbnz x10, .Lfinish
 
+    adrp x9, _snake_dir_x@PAGE
+    add x9, x9, _snake_dir_x@PAGEOFF
+    ldr x10, [x9]
+    adrp x9, _snake_dir_y@PAGE
+    add x9, x9, _snake_dir_y@PAGEOFF
+    ldr x11, [x9]
+    orr x10, x10, x11
+    cbz x10, .Lgame_loop
+
     bl advance_game
     bl draw_frame
 
@@ -343,7 +352,7 @@ init_game:
 
     adrp x9, _snake_dir_x@PAGE
     add x9, x9, _snake_dir_x@PAGEOFF
-    mov x10, #1
+    mov x10, #0
     str x10, [x9]
 
     adrp x9, _snake_dir_y@PAGE
@@ -573,6 +582,9 @@ advance_game:
     add x9, x9, _snake_dir_y@PAGEOFF
     ldr x24, [x9]
 
+    orr x9, x23, x24
+    cbz x9, .Ladvance_done
+
     add x25, x21, x23
     add x26, x22, x24
 
@@ -791,7 +803,7 @@ draw_frame:
 
     adrp x0, _controls_line@PAGE
     add x0, x0, _controls_line@PAGEOFF
-    mov x1, #31
+    mov x1, #37
     bl write_stdout
 
     adrp x0, _crlf@PAGE
@@ -896,7 +908,7 @@ _border_line:
     .asciz "+------------------+"
 
 _controls_line:
-    .asciz "Controls: W A S D move, q quits"
+    .asciz "Controls: W A S D start/move, q quits"
 
 _not_tty_msg:
     .asciz "16_snake_live.s needs a real terminal (TTY)."
