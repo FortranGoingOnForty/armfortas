@@ -44,10 +44,31 @@
 //! original operand and let DCE clean up the now-dead instruction.
 
 use super::pass::Pass;
-use super::util::substitute_uses;
+use super::util::{for_each_operand_mut, for_each_terminator_operand_mut};
 use crate::ir::inst::*;
 use crate::ir::types::{IrType, IntWidth};
 use std::collections::HashMap;
+
+/// Apply `rewrites` to every operand slot in the function in a
+/// single walk. Audit B-2: replaces the previous per-Identity
+/// `substitute_uses` calls (which each walked the function in
+/// O(function_size)) with a single O(function_size) walk for any
+/// number of rewrites.
+fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
+    let r = |v: &mut ValueId| {
+        if let Some(&new) = rewrites.get(v) {
+            *v = new;
+        }
+    };
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            for_each_operand_mut(&mut inst.kind, r);
+        }
+        if let Some(term) = &mut block.terminator {
+            for_each_terminator_operand_mut(term, r);
+        }
+    }
+}
 
 /// Look up the constant integer value behind a `ValueId`, if any.
 fn const_int(consts: &HashMap<ValueId, (i64, IntWidth)>, id: ValueId) -> Option<(i64, IntWidth)> {
@@ -284,6 +305,15 @@ impl Pass for StrengthReduce {
             // const instruction at index `ii` doesn't shift the
             // indices of any earlier rewrite still pending.
             rewrites.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+
+            // Audit B-2: collect all Identity rewrites into a single
+            // rename map and apply them in one function walk at the
+            // end, instead of calling `substitute_uses` once per
+            // Identity rewrite (which would re-walk the function for
+            // each rewrite). The CSE pass got the same treatment in
+            // the Min-1 fix; this finally closes the parallel.
+            let mut identity_rewrites: HashMap<ValueId, ValueId> = HashMap::new();
+
             for (bi, ii, rw, old_id, ty) in rewrites {
                 match rw {
                     Rewrite::ShlByConst { var, k } => {
@@ -303,29 +333,42 @@ impl Pass for StrengthReduce {
                         func.blocks[bi].insts[ii].kind = new_kind;
                     }
                     Rewrite::Identity { pass_through } => {
-                        // Rewire every consumer of this instruction's
-                        // result to read the pass-through value
-                        // instead. The original defining instruction
-                        // is now dead — we leave its kind alone (so
-                        // any future dominance check still sees a
-                        // valid definition for `old_id`) and rely on
-                        // DCE to remove it on the next sweep.
+                        // Defer the substitution. Record the
+                        // (old_id → pass_through) pair and apply all
+                        // such pairs in one walk after this loop.
+                        // The orphan instruction is left alone so
+                        // dominance still holds; DCE removes it on
+                        // the next sweep.
                         //
-                        // Audit M-A1 / C-A: an earlier version turned
-                        // the original instruction into a placeholder
-                        // `Const(0)` here, with a `_ => continue`
-                        // fallthrough for non-int/bool result types.
-                        // The fallthrough swallowed `changed = true`
-                        // *after* `substitute_uses` had already
-                        // mutated the function — silently dropping
-                        // the change flag and skipping the next DCE
-                        // round. Removing the placeholder machinery
-                        // also removes the type-mismatch hazard.
-                        substitute_uses(func, old_id, pass_through);
+                        // Audit M-A1 / C-A: the original code wrote a
+                        // placeholder `Const(0)` here, then `continue`d
+                        // for non-int/bool types — silently swallowing
+                        // `changed = true` after mutating the function.
+                        // The structural fix removed the placeholder.
+                        identity_rewrites.insert(old_id, pass_through);
                         let _ = ty; // intentionally unused
                     }
                 }
                 changed = true;
+            }
+
+            // Apply all Identity rewrites in a single function walk.
+            // Chase pointer chains so each entry maps directly to its
+            // terminal target — strength_reduce can produce chains
+            // like `((x*1)*1)+0` where each Identity points to the
+            // result of an earlier Identity. The chase strictly
+            // shrinks the operand graph, so it always terminates.
+            if !identity_rewrites.is_empty() {
+                let keys: Vec<ValueId> = identity_rewrites.keys().copied().collect();
+                for k in keys {
+                    let mut cur = identity_rewrites[&k];
+                    while let Some(&next) = identity_rewrites.get(&cur) {
+                        if next == cur { break; }
+                        cur = next;
+                    }
+                    identity_rewrites.insert(k, cur);
+                }
+                substitute_uses_batch(func, &identity_rewrites);
             }
         }
         changed

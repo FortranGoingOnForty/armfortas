@@ -288,6 +288,131 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
 }
 
 // =============================================================
+// FINDING Med-5 (cascading): removing a block param can expose
+// a second param as dead, requiring multiple outer iterations.
+// =============================================================
+//
+// target(p0:i32, p1:i32):
+//     ret ; p0 and p1 both unused
+// entry: br target(c0, c1)
+//
+// Both params are dead. Removing p0 (first iteration) shifts p1
+// to index 0; the next outer iteration must still find p1 dead
+// and remove it.
+#[test]
+fn audit_dce_removes_two_dead_params_cascading() {
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Void);
+    let target = f.create_block("target");
+    let p0 = f.next_value_id();
+    let p1 = f.next_value_id();
+    f.block_mut(target).params.push(BlockParam { id: p0, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(target).params.push(BlockParam { id: p1, ty: IrType::Int(IntWidth::I32) });
+    let c0 = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let c1 = push(&mut f, InstKind::ConstInt(8, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![c0, c1]));
+    f.block_mut(target).terminator = Some(Terminator::Return(None));
+    m.add_function(f);
+
+    Dce.run(&mut m);
+
+    let f = &m.functions[0];
+    let target_block = f.block(target);
+    assert_eq!(target_block.params.len(), 0, "both dead params must be removed");
+
+    // The branch arg list must also be empty after both removals.
+    let entry_term = f.block(f.entry).terminator.as_ref().unwrap();
+    match entry_term {
+        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
+            "all branch args must drop in lockstep"),
+        _ => panic!(),
+    }
+
+    // c0 and c1 are now dead — DCE should have removed them too.
+    let any_const = f.blocks.iter()
+        .flat_map(|b| b.insts.iter())
+        .any(|i| matches!(i.kind, InstKind::ConstInt(7, _) | InstKind::ConstInt(8, _)));
+    assert!(!any_const, "dead constant args should be DCE'd after their consumers vanish");
+}
+
+// =============================================================
+// FINDING M-7 (multi-latch): a loop with both a self-loop on
+// the header AND a separate distinct latch.
+// =============================================================
+//
+// CFG:
+//     entry → header
+//     header → header (self-loop, true_dest = header itself)
+//     header → other
+//     other → header (back-edge from a separate latch)
+//     header → exit (one of the cond branches)
+//
+// Both latches map to the same header. The body should include
+// {header, other}, NOT entry. find_preheader should still pick
+// entry as the preheader.
+#[test]
+fn audit_licm_multi_latch_with_self_loop() {
+    use crate::opt::util::find_natural_loops;
+
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Void);
+    let header = f.create_block("header");
+    let other = f.create_block("other");
+    let exit = f.create_block("exit");
+    let entry = f.entry;
+
+    // entry → header
+    f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![]));
+    // header → header (true) or other (false), with cond
+    let cond = f.next_value_id();
+    f.block_mut(header).insts.push(Inst {
+        id: cond,
+        kind: InstKind::ConstBool(true),
+        ty: IrType::Bool,
+        span: dummy_span(),
+    });
+    f.block_mut(header).terminator = Some(Terminator::CondBranch {
+        cond,
+        true_dest: header,
+        true_args: vec![],
+        false_dest: other,
+        false_args: vec![],
+    });
+    // other → header (back edge) or exit
+    let cond2 = f.next_value_id();
+    f.block_mut(other).insts.push(Inst {
+        id: cond2,
+        kind: InstKind::ConstBool(false),
+        ty: IrType::Bool,
+        span: dummy_span(),
+    });
+    f.block_mut(other).terminator = Some(Terminator::CondBranch {
+        cond: cond2,
+        true_dest: header,
+        true_args: vec![],
+        false_dest: exit,
+        false_args: vec![],
+    });
+    f.block_mut(exit).terminator = Some(Terminator::Return(None));
+    m.add_function(f);
+
+    let loops = find_natural_loops(&m.functions[0]);
+    assert_eq!(loops.len(), 1, "expected exactly one natural loop");
+    let lp = &loops[0];
+    assert_eq!(lp.header, header);
+    // Body must include header and other, NOT entry.
+    assert!(lp.body.contains(&header), "body must include header");
+    assert!(lp.body.contains(&other),  "body must include other");
+    assert!(!lp.body.contains(&entry), "body must NOT include the preheader (entry)");
+    assert!(!lp.body.contains(&exit),  "body must NOT include the exit block");
+    // Latches: both header (self-loop) and other (back edge).
+    assert_eq!(lp.latches.len(), 2, "expected two latches");
+    assert!(lp.latches.contains(&header));
+    assert!(lp.latches.contains(&other));
+}
+
+// =============================================================
 // FINDING C-2: LICM is dormant when locals stay in alloca slots
 // =============================================================
 //
@@ -620,6 +745,27 @@ fn audit_const_fold_lshr_negative_count_bails() {
 }
 
 // =============================================================
+// FINDING M-C: same for AShr (was missing from first round)
+// =============================================================
+#[test]
+fn audit_const_fold_ashr_negative_count_bails() {
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let v = push(&mut f, InstKind::ConstInt(-128, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let cnt = push(&mut f, InstKind::ConstInt(-3, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let s = push(&mut f, InstKind::AShr(v, cnt), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    if let InstKind::ConstInt(0, _) = folded.kind {
+        panic!("audit M-C: ashr with negative count folded to 0 — wrong on AArch64");
+    }
+}
+
+// =============================================================
 // FINDING Med-6: LICM must not hoist trap-prone IDiv
 // =============================================================
 #[test]
@@ -697,16 +843,11 @@ fn audit_licm_does_not_hoist_idiv() {
 // FINDING C-C: const_fold Select must use the Select's declared
 // type, not the chosen branch's source width.
 // =============================================================
+//
+// Happy-path test: same widths everywhere. Pinned for regression
+// against the simple form of the bug.
 #[test]
 fn audit_const_fold_select_uses_declared_type() {
-    // Build: %0 = const_int 1 : i32
-    //        %1 = const_int 99 : i32
-    //        %2 = const_bool true
-    //        %3 = select %2, %0, %1 : i32     ← declared i32
-    // After fold, %3 should be ConstInt(1, I32) — same width.
-    // The bug pattern (chosen branch with mismatched width) is hard
-    // to construct without violating verifier invariants, but we
-    // can at least pin the "destination width drives output" rule.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
@@ -723,8 +864,107 @@ fn audit_const_fold_select_uses_declared_type() {
         InstKind::ConstInt(1, IntWidth::I32) => { /* good */ }
         ref other => panic!("expected ConstInt(1, I32), got {:?}", other),
     }
-    // The instruction's ty should still be I32.
     assert_eq!(folded.ty, IrType::Int(IntWidth::I32));
+}
+
+// =============================================================
+// FINDING B-1 (re-audit): C-C fix is incomplete for width-drift
+// within `IrType::Int(_)`. Pin the bug with an adversarial test
+// that would have failed BEFORE the B-1 fix.
+// =============================================================
+//
+// Build a Select declared `i64` whose chosen branch is a
+// `ConstInt(255, I8)` — that's `-1` at i8 precision. Without
+// source-width sign extension, the fold produces `ConstInt(255,
+// I64)` instead of `ConstInt(-1, I64)`.
+//
+// We construct the IR by manually inserting a ConstInt with a
+// declared `inst.ty` of `Int(I8)` AND a Select whose `inst.ty` is
+// `Int(I64)`. The verifier wouldn't normally allow this (operand
+// types should match the Select's type), but the verifier only
+// checks `is_int()`, not bit width — exactly the gap C-C was
+// trying to defend against.
+#[test]
+fn audit_const_fold_select_width_drift_int() {
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I64));
+
+    // Manually emit a ConstInt(255, I8). The stored value is 255.
+    // At i8 precision the "true" value is -1 (sign bit set).
+    let a = f.next_value_id();
+    let entry = f.entry;
+    f.block_mut(entry).insts.push(Inst {
+        id: a,
+        kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
+    });
+    let b = push(&mut f, InstKind::ConstInt(99, IntWidth::I64), IrType::Int(IntWidth::I64));
+    let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
+
+    // Select declared as i64, chosen branch is i8 (255 → -1).
+    let sel = f.next_value_id();
+    f.block_mut(entry).insts.push(Inst {
+        id: sel,
+        kind: InstKind::Select(cond, a, b),
+        ty: IrType::Int(IntWidth::I64),
+        span: dummy_span(),
+    });
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(sel)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == sel).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(-1, IntWidth::I64) => { /* good — i8 -1 sign-extended to i64 */ }
+        InstKind::ConstInt(v, w) => panic!(
+            "audit B-1: expected ConstInt(-1, I64), got ConstInt({}, {:?}). \
+             Source width was discarded — width drift slipped through.",
+            v, w
+        ),
+        ref other => panic!("expected ConstInt fold, got {:?}", other),
+    }
+}
+
+// =============================================================
+// FINDING C-A (structural pin): strength_reduce must NOT replace
+// the orphan instruction's kind with a placeholder Const(0).
+// =============================================================
+//
+// The original C-A bug was inside a `_ => continue` branch that
+// silently dropped `changed = true` after writing a Const(0)
+// placeholder for non-int/non-bool result types. The structural
+// fix removes the placeholder machinery entirely. Pin the fix by
+// asserting the orphan instruction's kind is *unchanged* after a
+// run of strength_reduce, then DCE removes it cleanly.
+//
+// Before the structural fix, the orphan would have its kind
+// rewritten to `ConstInt(0, _)`. After the fix, it stays as
+// `IMul(_, _)` until DCE removes it.
+#[test]
+fn audit_strength_reduce_identity_does_not_write_placeholder() {
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let mul = push(&mut f, InstKind::IMul(x, one), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul)));
+    m.add_function(f);
+
+    StrengthReduce.run(&mut m);
+    // The orphan instruction at `mul`'s ID must still exist and
+    // have its original kind. The earlier (broken) version would
+    // have replaced its kind with ConstInt(0, _).
+    let orphan = m.functions[0].blocks[0].insts.iter().find(|i| i.id == mul).unwrap();
+    match orphan.kind {
+        InstKind::IMul(_, _) => { /* good — original kind preserved */ }
+        InstKind::ConstInt(0, _) => panic!(
+            "audit C-A: orphan was rewritten to placeholder Const(0). \
+             The structural fix should leave the original kind alone."
+        ),
+        ref other => panic!("unexpected orphan kind: {:?}", other),
+    }
 }
 
 // =============================================================

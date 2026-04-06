@@ -387,8 +387,22 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                     // produce a `kind` whose embedded width disagrees
                     // with `inst.ty`. Audit C-C.
                     return match (ty, *k) {
-                        (IrType::Int(w), Const::Int(v, _)) => {
-                            Some(InstKind::ConstInt(norm(v, *w), *w))
+                        (IrType::Int(w), Const::Int(v, src_w)) => {
+                            // Audit B-1: sign-extend the chosen
+                            // value at its **source** width before
+                            // re-norming at the destination. The
+                            // earlier version discarded `src_w` and
+                            // treated the raw stored bits as already
+                            // sign-extended at the destination width,
+                            // silently producing a wrong-signed value
+                            // when widths differed. Example:
+                            // chosen = ConstInt(255, I8) (i.e. -1
+                            // at i8 precision); destination = I64.
+                            // Without source-width sext, we'd emit
+                            // ConstInt(255, I64) instead of
+                            // ConstInt(-1, I64).
+                            let signed = sext(v, src_w.bits());
+                            Some(InstKind::ConstInt(norm(signed, *w), *w))
                         }
                         (IrType::Float(FloatWidth::F32), Const::Float(v, _)) => {
                             Some(InstKind::ConstFloat(v as f32 as f64, FloatWidth::F32))
