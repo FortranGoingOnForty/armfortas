@@ -384,6 +384,116 @@ fn audit_dce_cascading_across_outer_iterations() {
 }
 
 // =============================================================
+// FINDING M-4 (nested loops): natural-loop discovery must not
+// inflate an outer loop's body by following back-edges of an
+// inner loop into paths that only reach the outer header
+// through the inner loop.
+// =============================================================
+//
+// CFG:
+//   entry → outer_header → inner_header → inner_latch → inner_header
+//                          ↑                                      ↓
+//                          outer_latch ←───────────────────────── ↓
+//                          ↓
+//                          exit
+//
+// Two loops:
+//   - Inner: header=inner_header, latch=inner_latch.
+//     Body = {inner_header, inner_latch}.
+//   - Outer: header=outer_header, latch=outer_latch.
+//     Body = {outer_header, inner_header, inner_latch, outer_latch}.
+//
+// The concern is that when computing the outer loop's body by
+// walking preds(outer_latch) backwards, the BFS must correctly
+// walk THROUGH the inner loop body. It must NOT absorb blocks
+// outside both loops, and it MUST stop at the outer header.
+#[test]
+fn audit_licm_nested_loop_body_computation() {
+    use crate::opt::util::find_natural_loops;
+
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+    let outer_header = f.create_block("outer_header");
+    let inner_header = f.create_block("inner_header");
+    let inner_latch = f.create_block("inner_latch");
+    let outer_latch = f.create_block("outer_latch");
+    let exit = f.create_block("exit");
+    let entry = f.entry;
+
+    // entry → outer_header
+    f.block_mut(entry).terminator = Some(Terminator::Branch(outer_header, vec![]));
+
+    // outer_header: cond_br → inner_header / exit
+    let c1 = f.next_value_id();
+    f.block_mut(outer_header).insts.push(Inst {
+        id: c1,
+        kind: InstKind::ConstBool(true),
+        ty: IrType::Bool,
+        span: dummy_span(),
+    });
+    f.block_mut(outer_header).terminator = Some(Terminator::CondBranch {
+        cond: c1,
+        true_dest: inner_header,
+        true_args: vec![],
+        false_dest: exit,
+        false_args: vec![],
+    });
+
+    // inner_header: cond_br → inner_latch / outer_latch
+    let c2 = f.next_value_id();
+    f.block_mut(inner_header).insts.push(Inst {
+        id: c2,
+        kind: InstKind::ConstBool(true),
+        ty: IrType::Bool,
+        span: dummy_span(),
+    });
+    f.block_mut(inner_header).terminator = Some(Terminator::CondBranch {
+        cond: c2,
+        true_dest: inner_latch,
+        true_args: vec![],
+        false_dest: outer_latch,
+        false_args: vec![],
+    });
+
+    // inner_latch → inner_header (back-edge)
+    f.block_mut(inner_latch).terminator = Some(Terminator::Branch(inner_header, vec![]));
+
+    // outer_latch → outer_header (back-edge)
+    f.block_mut(outer_latch).terminator = Some(Terminator::Branch(outer_header, vec![]));
+
+    // exit: return
+    f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+    m.add_function(f);
+
+    let loops = find_natural_loops(&m.functions[0]);
+    assert_eq!(loops.len(), 2, "expected exactly two natural loops");
+
+    // Find the inner and outer loops by their headers.
+    let inner = loops.iter().find(|l| l.header == inner_header).expect("inner loop not found");
+    let outer = loops.iter().find(|l| l.header == outer_header).expect("outer loop not found");
+
+    // Inner loop body: {inner_header, inner_latch}.
+    assert_eq!(inner.body.len(), 2,
+        "inner body should be {{inner_header, inner_latch}}, got {:?}", inner.body);
+    assert!(inner.body.contains(&inner_header));
+    assert!(inner.body.contains(&inner_latch));
+
+    // Outer loop body: {outer_header, inner_header, inner_latch, outer_latch}.
+    // MUST NOT contain entry or exit.
+    assert_eq!(outer.body.len(), 4,
+        "outer body should be {{outer_header, inner_header, inner_latch, outer_latch}}, got {:?}",
+        outer.body);
+    assert!(outer.body.contains(&outer_header));
+    assert!(outer.body.contains(&inner_header));
+    assert!(outer.body.contains(&inner_latch));
+    assert!(outer.body.contains(&outer_latch));
+    assert!(!outer.body.contains(&entry), "outer body must not include entry");
+    assert!(!outer.body.contains(&exit), "outer body must not include exit");
+}
+
+// =============================================================
 // FINDING M-7 (multi-latch): a loop with both a self-loop on
 // the header AND a separate distinct latch.
 // =============================================================
