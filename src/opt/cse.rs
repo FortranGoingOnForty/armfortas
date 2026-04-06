@@ -65,14 +65,24 @@ fn key_of(inst: &Inst) -> Option<Key> {
 
     match &inst.kind {
         // Constants ------------------------------------------------------
-        // Audit Min-4: the previous encoding mixed `w.bits()` into
-        // the aux value, which was both convoluted (the `1i128 << 70`
-        // shift truncated to 0 in the i64 cast) and redundant — the
-        // `ty` field on `Key` already disambiguates widths. The
-        // simple aux is the literal value / bit pattern; differing
-        // widths for the same numeric value still produce distinct
-        // keys via the `ty` field.
-        InstKind::ConstInt(v, _)   => mk(1, vec![], *v),
+        // Audit Min-4: width is carried by the `ty` field, so the
+        // aux can just be the literal value / bit pattern.
+        // Audit B-8: normalize the int value at its declared width
+        // before keying so that semantically-equal constants stored
+        // at different bit patterns dedupe. Example: `ConstInt(255, I8)`
+        // and `ConstInt(-1, I8)` both represent -1 in i8 — keying on
+        // the raw `*v` fails to dedupe them.
+        InstKind::ConstInt(v, w)   => {
+            let bits = w.bits();
+            // Sign-extend at width: low `bits` bits → i64 sign-extended.
+            let signed = if bits >= 64 {
+                *v
+            } else {
+                let shift = 64 - bits;
+                (*v << shift) >> shift
+            };
+            mk(1, vec![], signed)
+        }
         InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i64),
         InstKind::ConstBool(b)     => mk(3, vec![], if *b { 1 } else { 0 }),
 
@@ -186,19 +196,15 @@ impl Pass for LocalCse {
             }
             if rewrite_map.is_empty() { continue; }
 
-            // Chase pointer chains so each entry maps directly to the
-            // canonical (final) value. CSE never produces cycles —
-            // every duplicate is rewritten to an *earlier* definition
-            // in dominance order — so the chase always terminates.
-            let keys: Vec<ValueId> = rewrite_map.keys().copied().collect();
-            for k in keys {
-                let mut cur = rewrite_map[&k];
-                while let Some(&next) = rewrite_map.get(&cur) {
-                    cur = next;
-                }
-                rewrite_map.insert(k, cur);
-            }
-
+            // Audit B-7: in **local** CSE, every entry maps a later
+            // duplicate to its block's *first* occurrence — and that
+            // first occurrence is, by construction, never itself a
+            // key in the map. So pointer chains never form, and the
+            // chase loop the first version had would always exit
+            // after zero iterations. Removed. If a future global
+            // CSE / GVN pass reuses this map shape and CAN produce
+            // chains, the chase logic will need to come back —
+            // strict-decrease in ValueId guarantees termination.
             substitute_uses_batch(func, &rewrite_map);
             changed = true;
         }
@@ -207,11 +213,18 @@ impl Pass for LocalCse {
 }
 
 /// Replace every operand `old` with `rewrite_map[old]` (if any) in a
-/// single walk over the function. Pairs with `Min-1`: avoids the
+/// single walk over the function. Pairs with Min-1: avoids the
 /// O(N · size) cost of calling `substitute_uses` once per rename.
-/// Audit B-6: now delegates to `util::for_each_*_operand_mut`,
-/// removing the duplicate operand-walk machinery that previously
-/// lived in this file.
+/// Audit B-6: delegates to `walk::for_each_*_operand_mut`.
+///
+/// Audit B-9: the closure `r` captures `rewrites` by shared
+/// reference and is therefore `Copy`. This is what lets us pass
+/// `r` by value into multiple `for_each_operand_mut` calls inside
+/// the per-block loop. If the closure ever needs mutable state
+/// (e.g., to count rewrites), it stops being `Copy` and the loop
+/// must shift to `&mut r` — at which point the helper signatures
+/// in `walk.rs` would need to take `&mut impl FnMut(...)` instead
+/// of `mut r: impl FnMut(...)`.
 fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
     let r = |v: &mut ValueId| {
         if let Some(&new) = rewrites.get(v) {

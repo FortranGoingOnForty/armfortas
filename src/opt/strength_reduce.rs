@@ -54,6 +54,9 @@ use std::collections::HashMap;
 /// `substitute_uses` calls (which each walked the function in
 /// O(function_size)) with a single O(function_size) walk for any
 /// number of rewrites.
+///
+/// Audit B-9: see `cse::substitute_uses_batch` for the closure
+/// `Copy`-by-capture contract — same constraint applies here.
 fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
     let r = |v: &mut ValueId| {
         if let Some(&new) = rewrites.get(v) {

@@ -745,6 +745,44 @@ fn audit_const_fold_lshr_negative_count_bails() {
 }
 
 // =============================================================
+// FINDING B-8: CSE must dedupe semantically-equal ConstInts
+// stored at different bit patterns at the same width.
+// =============================================================
+//
+// `ConstInt(255, I8)` and `ConstInt(-1, I8)` both encode -1 at i8
+// precision. After the B-8 fix, CSE keys on the sign-extended
+// value, so the two should collapse to a single SSA name.
+#[test]
+fn audit_cse_dedupes_const_int_bit_pattern() {
+    use crate::opt::LocalCse;
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
+    let a = push(&mut f, InstKind::ConstInt(255, IntWidth::I8), IrType::Int(IntWidth::I8));
+    let b = push(&mut f, InstKind::ConstInt(-1,  IntWidth::I8), IrType::Int(IntWidth::I8));
+    // Use a in some op and b in another so neither is dead.
+    let neg_a = push(&mut f, InstKind::INeg(a), IrType::Int(IntWidth::I8));
+    let neg_b = push(&mut f, InstKind::INeg(b), IrType::Int(IntWidth::I8));
+    // Add them so both are live to the terminator.
+    let sum = push(&mut f, InstKind::IAdd(neg_a, neg_b), IrType::Int(IntWidth::I8));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
+    m.add_function(f);
+
+    LocalCse.run(&mut m);
+
+    // After CSE, one of {a, b} has been rewritten to point at the
+    // other. The two INegs should now reference the same value.
+    let f = &m.functions[0];
+    let neg_a_inst = f.blocks[0].insts.iter().find(|i| i.id == neg_a).unwrap();
+    let neg_b_inst = f.blocks[0].insts.iter().find(|i| i.id == neg_b).unwrap();
+    let neg_a_op = match &neg_a_inst.kind { InstKind::INeg(v) => *v, _ => panic!() };
+    let neg_b_op = match &neg_b_inst.kind { InstKind::INeg(v) => *v, _ => panic!() };
+    assert_eq!(neg_a_op, neg_b_op,
+        "audit B-8: ConstInt(255, I8) and ConstInt(-1, I8) should CSE-dedupe \
+         (both represent -1 at i8 precision), but the INeg operands differ");
+}
+
+// =============================================================
 // FINDING M-C: same for AShr (was missing from first round)
 // =============================================================
 #[test]
