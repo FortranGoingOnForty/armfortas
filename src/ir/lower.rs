@@ -1460,25 +1460,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                 }
                 Expr::ComponentAccess { base, component } => {
-                    // x%field = val: look up base, compute offset, GEP + store.
-                    if let Expr::Name { name } = &base.node {
-                        let key = name.to_lowercase();
-                        if let Some(info) = ctx.locals.get(&key).cloned() {
-                            if let Some(ref type_name) = info.derived_type {
-                                if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    if let Some(field) = layout.field(component) {
-                                        let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                        let base_addr = if info.by_ref {
-                                            b.load(info.addr)
-                                        } else {
-                                            info.addr
-                                        };
-                                        let offset = b.const_i64(field.offset as i64);
-                                        let field_ptr = b.gep(base_addr, vec![offset],
-                                            IrType::Int(IntWidth::I8));
-                                        b.store(val, field_ptr);
-                                    }
-                                }
+                    // x%field = val (supports chained: x%a%b = val).
+                    if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                        if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                            if let Some(field) = layout.field(component) {
+                                let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                let offset = b.const_i64(field.offset as i64);
+                                let field_ptr = b.gep(base_addr, vec![offset],
+                                    IrType::Int(IntWidth::I8));
+                                b.store(val, field_ptr);
                             }
                         }
                     }
@@ -2449,6 +2439,60 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Convert TypeInfo to IR type for field loads.
+fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
+    use crate::sema::symtab::TypeInfo;
+    let (size, _) = crate::sema::type_layout::size_of_type(ti);
+    match size {
+        1 => IrType::Int(IntWidth::I8),
+        2 => IrType::Int(IntWidth::I16),
+        4 => match ti {
+            TypeInfo::Real { .. } => IrType::Float(FloatWidth::F32),
+            TypeInfo::Logical { .. } => IrType::Bool,
+            _ => IrType::Int(IntWidth::I32),
+        },
+        8 => match ti {
+            TypeInfo::Real { .. } | TypeInfo::DoublePrecision => IrType::Float(FloatWidth::F64),
+            _ => IrType::Int(IntWidth::I64),
+        },
+        _ => IrType::Int(IntWidth::I32),
+    }
+}
+
+/// Resolve a component access base expression to (struct_address, type_name).
+/// Handles both direct names (x%field) and chained access (x%inner%field).
+fn resolve_component_base(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base: &crate::ast::expr::SpannedExpr,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, String)> {
+    match &base.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?;
+            let type_name = info.derived_type.as_ref()?.clone();
+            let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+            Some((addr, type_name))
+        }
+        Expr::ComponentAccess { base: inner_base, component } => {
+            // Recursive: resolve the inner base first.
+            let (inner_addr, inner_type) = resolve_component_base(b, locals, inner_base, tl)?;
+            let layout = tl.get(&inner_type)?;
+            let field = layout.field(component)?;
+            let offset = b.const_i64(field.offset as i64);
+            let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
+            // The field must be a derived type for chaining to continue.
+            if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
+                Some((field_ptr, nested_type.clone()))
+            } else {
+                None // Terminal field — caller should load, not chain further.
+            }
+        }
+        _ => None,
+    }
+}
+
 fn lower_arg_by_ref(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -2724,47 +2768,27 @@ fn lower_expr_full(
         }
 
         Expr::ComponentAccess { base, component } => {
-            // x%field: look up base variable's derived type, compute field offset, GEP + load.
-            if let Expr::Name { name } = &base.node {
-                let key = name.to_lowercase();
-                if let Some(info) = locals.get(&key) {
-                    if let Some(ref type_name) = info.derived_type {
-                        if let Some(tl) = type_layouts {
-                            if let Some(layout) = tl.get(type_name) {
-                                if let Some(field) = layout.field(component) {
-                                    // For by-ref params, load the actual struct address first.
-                                    let base_addr = if info.by_ref {
-                                        b.load(info.addr)
-                                    } else {
-                                        info.addr
-                                    };
-                                    let offset = b.const_i64(field.offset as i64);
-                                    let field_ptr = b.gep(base_addr, vec![offset],
-                                        IrType::Int(IntWidth::I8));
-                                    let field_ty = crate::sema::type_layout::size_of_type(&field.type_info);
-                                    let ir_ty = match field_ty.0 {
-                                        1 => IrType::Int(IntWidth::I8),
-                                        2 => IrType::Int(IntWidth::I16),
-                                        4 => match &field.type_info {
-                                            crate::sema::symtab::TypeInfo::Real { .. } => IrType::Float(FloatWidth::F32),
-                                            crate::sema::symtab::TypeInfo::Logical { .. } => IrType::Bool,
-                                            _ => IrType::Int(IntWidth::I32),
-                                        },
-                                        8 => match &field.type_info {
-                                            crate::sema::symtab::TypeInfo::Real { .. } |
-                                            crate::sema::symtab::TypeInfo::DoublePrecision => IrType::Float(FloatWidth::F64),
-                                            _ => IrType::Int(IntWidth::I64),
-                                        },
-                                        _ => IrType::Int(IntWidth::I32),
-                                    };
-                                    return b.load_typed(field_ptr, ir_ty);
-                                }
+            // Resolve the base to (struct_address, type_name), then access the component.
+            if let Some(tl) = type_layouts {
+                if let Some((base_addr, type_name)) = resolve_component_base(b, locals, base, tl) {
+                    if let Some(layout) = tl.get(&type_name) {
+                        if let Some(field) = layout.field(component) {
+                            let offset = b.const_i64(field.offset as i64);
+                            let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+
+                            // If the field is itself a derived type, DON'T load — return the pointer
+                            // (for chained access like x%inner%field).
+                            if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
+                                return field_ptr;
                             }
+
+                            let ir_ty = type_info_to_ir_type(&field.type_info);
+                            return b.load_typed(field_ptr, ir_ty);
                         }
                     }
                 }
             }
-            b.const_i32(0) // fallback
+            b.const_i32(0)
         }
 
         _ => b.const_i32(0), // placeholder for unhandled expressions
