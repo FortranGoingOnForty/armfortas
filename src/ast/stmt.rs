@@ -46,6 +46,7 @@ pub enum Stmt {
         name: Option<String>,
         controls: Vec<ConcurrentControl>,
         mask: Option<SpannedExpr>,
+        locality: Vec<LocalitySpec>,
         body: Vec<SpannedStmt>,
     },
 
@@ -156,6 +157,21 @@ pub enum CaseSelector {
     Value(SpannedExpr),
     Range { low: Option<SpannedExpr>, high: Option<SpannedExpr> },
     Default,
+}
+
+/// DO CONCURRENT locality specification (F2018).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalitySpec {
+    /// LOCAL(var_list) — private to each iteration.
+    Local(Vec<String>),
+    /// LOCAL_INIT(var_list) — private, initialized from outer scope.
+    LocalInit(Vec<String>),
+    /// SHARED(var_list) — shared across iterations.
+    Shared(Vec<String>),
+    /// DEFAULT(NONE) — all variables must be explicitly specified.
+    DefaultNone,
+    /// REDUCE(op: var_list) — reduction variable.
+    Reduce { op: String, vars: Vec<String> },
 }
 
 /// DO CONCURRENT control: `i = 1:n`
