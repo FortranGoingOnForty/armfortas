@@ -203,4 +203,60 @@ mod tests {
         assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(4) }), (8, 4));
         assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(8) }), (16, 8));
     }
+
+    #[test]
+    fn layout_field_lookup() {
+        let layout = TypeLayout {
+            name: "point".into(),
+            size: 8,
+            align: 4,
+            fields: vec![
+                FieldLayout { name: "x".into(), offset: 0, size: 4, type_info: TypeInfo::Real { kind: Some(4) } },
+                FieldLayout { name: "y".into(), offset: 4, size: 4, type_info: TypeInfo::Real { kind: Some(4) } },
+            ],
+        };
+        assert_eq!(layout.field("x").unwrap().offset, 0);
+        assert_eq!(layout.field("y").unwrap().offset, 4);
+        assert_eq!(layout.field("X").unwrap().offset, 0); // case insensitive
+        assert!(layout.field("z").is_none());
+    }
+
+    #[test]
+    fn layout_mixed_types_padding() {
+        // type :: mixed
+        //   integer(1) :: a   ! 1 byte, offset 0
+        //   real(8)    :: b   ! 8 bytes, offset 8 (padded to 8-byte alignment)
+        //   integer(4) :: c   ! 4 bytes, offset 16
+        // end type            ! total: 24 bytes (padded to 8-byte alignment)
+        let layout = TypeLayout {
+            name: "mixed".into(),
+            size: 24,
+            align: 8,
+            fields: vec![
+                FieldLayout { name: "a".into(), offset: 0, size: 1, type_info: TypeInfo::Integer { kind: Some(1) } },
+                FieldLayout { name: "b".into(), offset: 8, size: 8, type_info: TypeInfo::Real { kind: Some(8) } },
+                FieldLayout { name: "c".into(), offset: 16, size: 4, type_info: TypeInfo::Integer { kind: Some(4) } },
+            ],
+        };
+        // Verify padding: a(1) + 7 pad + b(8) + c(4) + 4 pad = 24
+        assert_eq!(layout.size, 24);
+        assert_eq!(layout.align, 8);
+        assert_eq!(layout.field("a").unwrap().offset, 0);
+        assert_eq!(layout.field("b").unwrap().offset, 8);
+        assert_eq!(layout.field("c").unwrap().offset, 16);
+    }
+
+    #[test]
+    fn registry_lookup() {
+        let mut reg = TypeLayoutRegistry::new();
+        reg.insert(TypeLayout {
+            name: "MyType".into(),
+            size: 16,
+            align: 8,
+            fields: vec![],
+        });
+        assert!(reg.get("mytype").is_some()); // case insensitive
+        assert!(reg.get("MYTYPE").is_some());
+        assert!(reg.get("other").is_none());
+    }
 }

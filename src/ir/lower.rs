@@ -172,14 +172,20 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 
                 for (pname, pid, elem_ty, is_value) in &param_info {
                     if *is_value {
-                        // VALUE param: store directly, access as local (no double deref).
                         let slot = b.alloca(elem_ty.clone());
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
                         let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
                         b.store(*pid, slot);
-                        ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                        // Check if this is a derived type parameter.
+                        let dt_name = arg_derived_type_name(pname, decls);
+                        let mut info = LocalInfo {
+                            addr: slot, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: true,
+                            char_kind: CharKind::None, derived_type: dt_name,
+                        };
+                        ctx.locals.insert(pname.clone(), info);
                     }
                 }
 
@@ -238,7 +244,12 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     } else {
                         let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
                         b.store(*pid, slot);
-                        ctx.insert_param_by_ref(pname.clone(), slot, elem_ty.clone());
+                        let dt_name = arg_derived_type_name(pname, decls);
+                        ctx.locals.insert(pname.clone(), LocalInfo {
+                            addr: slot, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: true,
+                            char_kind: CharKind::None, derived_type: dt_name,
+                        });
                     }
                 }
 
@@ -1168,6 +1179,23 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
     IrType::Int(IntWidth::I32) // fallback
 }
 
+/// Check if a dummy argument is a derived type, returning the type name if so.
+fn arg_derived_type_name(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> Option<String> {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    if let TypeSpec::Type(ref name) = type_spec {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check if a callee has VALUE-attributed arguments via its scope in the symbol table.
 /// Returns a Vec<bool> per argument position — true if that arg is VALUE.
 /// Returns None if callee scope not found or no VALUE args.
@@ -1350,7 +1378,11 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
         TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
         TypeSpec::Logical(_) => IrType::Bool,
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        _ => IrType::Int(IntWidth::I32), // fallback for derived types etc.
+        TypeSpec::Type(_) | TypeSpec::Class(_) => {
+            // Derived types are passed as byte pointers (struct layout resolved elsewhere).
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+        }
+        _ => IrType::Int(IntWidth::I32), // fallback
     }
 }
 
@@ -1435,9 +1467,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             if let Some(ref type_name) = info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
                                     if let Some(field) = layout.field(component) {
-                                        let val = lower_expr(b, &ctx.locals, value, ctx.st);
+                                        let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                        let base_addr = if info.by_ref {
+                                            b.load(info.addr)
+                                        } else {
+                                            info.addr
+                                        };
                                         let offset = b.const_i64(field.offset as i64);
-                                        let field_ptr = b.gep(info.addr, vec![offset],
+                                        let field_ptr = b.gep(base_addr, vec![offset],
                                             IrType::Int(IntWidth::I8));
                                         b.store(val, field_ptr);
                                     }
@@ -2695,8 +2732,14 @@ fn lower_expr_full(
                         if let Some(tl) = type_layouts {
                             if let Some(layout) = tl.get(type_name) {
                                 if let Some(field) = layout.field(component) {
+                                    // For by-ref params, load the actual struct address first.
+                                    let base_addr = if info.by_ref {
+                                        b.load(info.addr)
+                                    } else {
+                                        info.addr
+                                    };
                                     let offset = b.const_i64(field.offset as i64);
-                                    let field_ptr = b.gep(info.addr, vec![offset],
+                                    let field_ptr = b.gep(base_addr, vec![offset],
                                         IrType::Int(IntWidth::I8));
                                     let field_ty = crate::sema::type_layout::size_of_type(&field.type_info);
                                     let ir_ty = match field_ty.0 {
