@@ -1442,10 +1442,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         // The function returns a temp descriptor pointer.
                                         // Use afs_assign_allocatable to copy data and handle reallocation.
                                         let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
                                         b.call(FuncRef::External("afs_assign_allocatable".into()),
-                                            vec![info.addr, src_desc, stat], IrType::Void);
+                                            vec![info.addr, src_desc], IrType::Void);
                                         // Deallocate the temporary result descriptor's heap data.
+                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
                                         b.call(FuncRef::External("afs_deallocate_array".into()),
                                             vec![src_desc, stat], IrType::Void);
                                     } else {
@@ -1669,86 +1669,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
             // WHERE(mask) body [ELSEWHERE body] END WHERE
-            // Detect if mask references an array — if so, element-wise loop.
-            let mask_array = find_array_in_expr(mask, &ctx.locals);
+            // Collect ALL array names referenced in mask or body.
+            let mut array_names: Vec<String> = Vec::new();
+            collect_array_names(mask, &ctx.locals, &mut array_names);
+            for s in body {
+                collect_array_names_stmt(s, &ctx.locals, &mut array_names);
+            }
 
-            if let Some(arr_info) = mask_array {
-                // Array-level WHERE: iterate over elements.
-                let n = b.call(FuncRef::External("afs_array_size".into()),
-                    vec![arr_info.addr], IrType::Int(IntWidth::I64));
-                let base = if arr_info.allocatable {
-                    b.load_typed(arr_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                } else { arr_info.addr };
-
-                let i_addr = b.alloca(IrType::Int(IntWidth::I64));
-                let zero = b.const_i64(0);
-                b.store(zero, i_addr);
-
-                let bb_check = b.create_block("where_check");
-                let bb_body = b.create_block("where_body");
-                let bb_exit = b.create_block("where_exit");
-                b.branch(bb_check, vec![]);
-
-                b.set_block(bb_check);
-                let i = b.load(i_addr);
-                let done = b.icmp(CmpOp::Ge, i, n);
-                b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
-
-                b.set_block(bb_body);
-                let i_val = b.load(i_addr);
-                // Load mask element: base_addr[i] for the mask array.
-                let mask_elem_ptr = b.gep(base, vec![i_val], arr_info.ty.clone());
-                let mask_elem = b.load(mask_elem_ptr);
-                // Evaluate mask condition per-element.
-                let elem_zero = match &arr_info.ty {
-                    IrType::Float(_) => b.const_f64(0.0),
-                    _ => b.const_i32(0),
-                };
-                let cond = if arr_info.ty.is_float() {
-                    b.fcmp(CmpOp::Gt, mask_elem, elem_zero)
-                } else {
-                    b.icmp(CmpOp::Gt, mask_elem, elem_zero)
-                };
-
-                let bb_then = b.create_block("where_then");
-                let bb_else_or_incr = if !elsewhere.is_empty() {
-                    b.create_block("where_else")
-                } else {
-                    b.create_block("where_incr")
-                };
-                b.cond_branch(cond, bb_then, vec![], bb_else_or_incr, vec![]);
-
-                b.set_block(bb_then);
-                // Execute body assignments at index i.
-                // For simplicity, lower body statements as-is.
-                // This works for scalar statements; array assignments
-                // in the body would need per-element rewriting.
-                lower_stmts(b, ctx, body);
-                let bb_incr = b.create_block("where_incr2");
-                if b.func().block(b.current_block()).terminator.is_none() {
-                    b.branch(bb_incr, vec![]);
-                }
-
-                if !elsewhere.is_empty() {
-                    b.set_block(bb_else_or_incr);
-                    if let Some((_else_mask, else_body)) = elsewhere.first() {
-                        lower_stmts(b, ctx, else_body);
-                    }
-                    if b.func().block(b.current_block()).terminator.is_none() {
-                        b.branch(bb_incr, vec![]);
-                    }
-                }
-
-                b.set_block(if elsewhere.is_empty() { bb_else_or_incr } else { bb_incr });
-                let i_cur = b.load(i_addr);
-                let one = b.const_i64(1);
-                let next = b.iadd(i_cur, one);
-                b.store(next, i_addr);
-                b.branch(bb_check, vec![]);
-
-                b.set_block(bb_exit);
-            } else {
-                // Scalar WHERE: simple IF-THEN-ELSE.
+            if array_names.is_empty() {
+                // No arrays — fall back to scalar IF-THEN-ELSE.
                 let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
                 let bb_then = b.create_block("where_then");
                 let bb_else = if !elsewhere.is_empty() {
@@ -1762,10 +1691,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
-
                 if let Some(bb_e) = bb_else {
                     b.set_block(bb_e);
-                    if let Some((_else_mask, else_body)) = elsewhere.first() {
+                    if let Some((_m, else_body)) = elsewhere.first() {
                         lower_stmts(b, ctx, else_body);
                     }
                     if b.func().block(b.current_block()).terminator.is_none() {
@@ -1773,7 +1701,112 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                 }
                 b.set_block(bb_end);
+                return;
             }
+
+            // Array-level WHERE: iterate over elements.
+            // Use the first array to determine the iteration count.
+            let first_arr_name = &array_names[0];
+            let first_arr = ctx.locals.get(first_arr_name).cloned().expect("array must exist");
+            let n = b.call(FuncRef::External("afs_array_size".into()),
+                vec![first_arr.addr], IrType::Int(IntWidth::I64));
+
+            // Get base addresses for all arrays (loaded once outside the loop).
+            let mut array_bases: HashMap<String, ValueId> = HashMap::new();
+            for arr_name in &array_names {
+                if let Some(info) = ctx.locals.get(arr_name) {
+                    let base = if info.allocatable {
+                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    } else { info.addr };
+                    array_bases.insert(arr_name.clone(), base);
+                }
+            }
+
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let i_zero = b.const_i64(0);
+            b.store(i_zero, i_addr);
+
+            let bb_check = b.create_block("where_check");
+            let bb_body = b.create_block("where_body");
+            let bb_exit = b.create_block("where_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+
+            // Substitute each array variable with a scalar local bound to element i.
+            // Save original locals for restoration.
+            let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+            for arr_name in &array_names {
+                saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+                if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+                    let base = *array_bases.get(arr_name).unwrap();
+                    // Compute element address: base + i * elem_bytes.
+                    let elem_bytes_val = match &orig_info.ty {
+                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+                        IrType::Int(IntWidth::I16) => b.const_i64(2),
+                        IrType::Int(IntWidth::I8) => b.const_i64(1),
+                        _ => b.const_i64(4),
+                    };
+                    let byte_off = b.imul(i_val, elem_bytes_val);
+                    let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+                    // Replace the local with a scalar pointing to this element.
+                    ctx.locals.insert(arr_name.clone(), LocalInfo {
+                        addr: elem_ptr,
+                        ty: orig_info.ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                    });
+                }
+            }
+
+            // Evaluate mask with element-level bindings.
+            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+
+            let bb_then = b.create_block("where_then");
+            let bb_else = b.create_block("where_else");
+            let bb_incr = b.create_block("where_incr");
+            b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            lower_stmts(b, ctx, body);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_incr, vec![]);
+            }
+
+            b.set_block(bb_else);
+            if let Some((_else_mask, else_body)) = elsewhere.first() {
+                lower_stmts(b, ctx, else_body);
+            }
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_incr, vec![]);
+            }
+
+            b.set_block(bb_incr);
+            // Restore original locals.
+            for (name, orig) in saved_locals {
+                if let Some(info) = orig {
+                    ctx.locals.insert(name, info);
+                } else {
+                    ctx.locals.remove(&name);
+                }
+            }
+
+            let i_cur = b.load(i_addr);
+            let one = b.const_i64(1);
+            let next = b.iadd(i_cur, one);
+            b.store(next, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
         }
 
         Stmt::WhereStmt { mask, stmt } => {
@@ -2772,7 +2805,12 @@ fn lower_forall_nested(
 
         b.set_block(bb_check);
         let cur = b.load(var_addr);
-        let done = b.icmp(CmpOp::Gt, cur, end_val);
+        // Handle both positive and negative steps: done = (step >= 0 && cur > end) || (step < 0 && cur < end)
+        let zero_const = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero_const);
+        let gt_end = b.icmp(CmpOp::Gt, cur, end_val);
+        let lt_end = b.icmp(CmpOp::Lt, cur, end_val);
+        let done = b.select(step_neg, lt_end, gt_end);
         b.cond_branch(done, bb_exit, vec![], bb_loop, vec![]);
 
         b.set_block(bb_loop);
@@ -2877,6 +2915,42 @@ fn lower_array_assign(
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+    }
+}
+
+/// Collect all array variable names referenced in an expression.
+fn collect_array_names(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<String, LocalInfo>, out: &mut Vec<String>) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                if (!info.dims.is_empty() || info.allocatable) && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_array_names(left, locals, out);
+            collect_array_names(right, locals, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_array_names(operand, locals, out),
+        Expr::ParenExpr { inner } => collect_array_names(inner, locals, out),
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    collect_array_names(e, locals, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect array names referenced in a statement (for WHERE body analysis).
+fn collect_array_names_stmt(stmt: &SpannedStmt, locals: &HashMap<String, LocalInfo>, out: &mut Vec<String>) {
+    if let Stmt::Assignment { target, value } = &stmt.node {
+        collect_array_names(target, locals, out);
+        collect_array_names(value, locals, out);
     }
 }
 
