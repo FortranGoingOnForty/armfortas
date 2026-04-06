@@ -32,6 +32,10 @@ pub struct TypeLayout {
     pub fields: Vec<FieldLayout>,
     pub bound_procs: Vec<BoundProc>,
     pub final_procs: Vec<String>,
+    /// Unique type tag for polymorphic dispatch. Assigned sequentially.
+    pub type_tag: u64,
+    /// Parent type name (from EXTENDS). None for base types.
+    pub parent: Option<String>,
 }
 
 impl TypeLayout {
@@ -52,18 +56,26 @@ impl TypeLayout {
 #[derive(Debug, Default)]
 pub struct TypeLayoutRegistry {
     pub layouts: HashMap<String, TypeLayout>,
+    next_tag: u64,
 }
 
 impl TypeLayoutRegistry {
     pub fn new() -> Self {
-        Self { layouts: HashMap::new() }
+        Self { layouts: HashMap::new(), next_tag: 1 }
+    }
+
+    pub fn alloc_tag(&mut self) -> u64 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        tag
     }
 
     pub fn get(&self, type_name: &str) -> Option<&TypeLayout> {
         self.layouts.get(&type_name.to_lowercase())
     }
 
-    pub fn insert(&mut self, layout: TypeLayout) {
+    pub fn insert(&mut self, mut layout: TypeLayout) {
+        layout.type_tag = self.alloc_tag();
         self.layouts.insert(layout.name.to_lowercase(), layout);
     }
 }
@@ -221,6 +233,8 @@ pub fn compute_layout(
         fields,
         bound_procs,
         final_procs: final_proc_names.to_vec(),
+        type_tag: 0, // assigned by registry after insertion
+        parent: parent_layout.map(|p| p.name.clone()),
     }
 }
 
@@ -252,6 +266,8 @@ mod tests {
             ],
             bound_procs: vec![],
             final_procs: vec![],
+            type_tag: 0,
+            parent: None,
         };
         assert_eq!(layout.field("x").unwrap().offset, 0);
         assert_eq!(layout.field("y").unwrap().offset, 4);
@@ -277,6 +293,8 @@ mod tests {
             ],
             bound_procs: vec![],
             final_procs: vec![],
+            type_tag: 0,
+            parent: None,
         };
         // Verify padding: a(1) + 7 pad + b(8) + c(4) + 4 pad = 24
         assert_eq!(layout.size, 24);
@@ -296,6 +314,8 @@ mod tests {
             fields: vec![],
             bound_procs: vec![],
             final_procs: vec![],
+            type_tag: 0,
+            parent: None,
         });
         assert!(reg.get("mytype").is_some()); // case insensitive
         assert!(reg.get("MYTYPE").is_some());
