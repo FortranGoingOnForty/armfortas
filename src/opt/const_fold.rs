@@ -147,9 +147,17 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
 
         // Comparisons -----------------------------------------------------
         InstKind::ICmp(op, a, b) => {
-            if let (Some(Const::Int(av, w)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
-                let av = sext(av, w.bits());
-                let bv = sext(bv, w.bits());
+            if let (Some(Const::Int(av, aw)), Some(Const::Int(bv, bw))) = (get(a), get(b)) {
+                // Audit M-D: each operand must be sign-extended at
+                // its OWN declared width. The earlier version reused
+                // `a`'s width for both operands, which is correct
+                // only when the verifier guarantees both operands
+                // have the same width — and the verifier currently
+                // only checks `is_int()`, not bit width. After a
+                // future GVN-style pass introduces width drift this
+                // becomes a wrong-result hazard.
+                let av = sext(av, aw.bits());
+                let bv = sext(bv, bw.bits());
                 let r = match op {
                     CmpOp::Eq => av == bv,
                     CmpOp::Ne => av != bv,
@@ -258,33 +266,39 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             }
             None
         }
+        // Audit Med-3: the count uses the *source* operand's width
+        // for the bit-mask but emits the result tagged with `inst.ty`'s
+        // width (taken from the IR declaration), not the source's.
+        // Today they always match because the lowerer keeps them in
+        // sync, but a future change that makes popcount return i32
+        // unconditionally (matching C intrinsics) would silently
+        // produce a wrong-width constant if we kept reading from `w`.
         InstKind::PopCount(a) => {
-            if let Some(Const::Int(av, w)) = get(a) {
-                let val = mask(av, w.bits()) as u64;
-                return Some(InstKind::ConstInt(val.count_ones() as i64, w));
+            if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
+                let val = mask(av, src_w.bits()) as u64;
+                return Some(InstKind::ConstInt(norm(val.count_ones() as i64, *out_w), *out_w));
             }
             None
         }
         InstKind::CountLeadingZeros(a) => {
-            if let Some(Const::Int(av, w)) = get(a) {
-                let bits = w.bits();
+            if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
+                let bits = src_w.bits();
                 let val = mask(av, bits) as u64;
                 let lz = if val == 0 {
                     bits as i64
                 } else {
-                    // Leading-zeros within `bits` width.
                     (val.leading_zeros() as i64) - (64 - bits as i64)
                 };
-                return Some(InstKind::ConstInt(lz, w));
+                return Some(InstKind::ConstInt(norm(lz, *out_w), *out_w));
             }
             None
         }
         InstKind::CountTrailingZeros(a) => {
-            if let Some(Const::Int(av, w)) = get(a) {
-                let bits = w.bits();
+            if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
+                let bits = src_w.bits();
                 let val = mask(av, bits) as u64;
                 let tz = if val == 0 { bits as i64 } else { val.trailing_zeros() as i64 };
-                return Some(InstKind::ConstInt(tz, w));
+                return Some(InstKind::ConstInt(norm(tz, *out_w), *out_w));
             }
             None
         }

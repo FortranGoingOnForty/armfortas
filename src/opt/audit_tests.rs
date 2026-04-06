@@ -680,6 +680,121 @@ fn audit_strength_reduce_identity_reports_changed() {
 }
 
 // =============================================================
+// FINDING M-D: ICmp must sign-extend each operand at its OWN width
+// =============================================================
+//
+// Construct a synthetic ICmp where the two ConstInt operands have
+// different declared widths and the same low-bits-as-stored value.
+// Per M-D, before the fix the fold uses operand a's width for both,
+// silently producing a wrong answer when widths differ.
+#[test]
+fn audit_const_fold_icmp_uses_each_operand_width() {
+    // We can't easily produce mismatched widths through normal
+    // lowering because the verifier would catch operand types in
+    // most cases. Construct directly: a is i32 holding 255, b is i8
+    // holding 255 (which represents -1 at i8 precision). Eq should
+    // be FALSE: 255 != -1.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Bool);
+    let a = push(&mut f, InstKind::ConstInt(255, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let b = push(&mut f, InstKind::ConstInt(255, IntWidth::I8),  IrType::Int(IntWidth::I8));
+    let eq = push(&mut f, InstKind::ICmp(CmpOp::Eq, a, b), IrType::Bool);
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(eq)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == eq).unwrap();
+    match folded.kind {
+        // After the M-D fix: bv sign-extended at i8 → -1; av at i32 → 255.
+        // 255 == -1 → false.
+        InstKind::ConstBool(false) => { /* good */ }
+        // Before the fix: both sign-extended at i32 → 255 == 255 → true.
+        InstKind::ConstBool(true) => panic!(
+            "audit M-D: ICmp folded as if both operands were i32-width \
+             (lost b's i8 width). Expected ConstBool(false)."
+        ),
+        ref other => panic!("expected ConstBool, got {:?}", other),
+    }
+}
+
+// =============================================================
+// FINDING M-E (auto-fixed by M-1): FCmp on f32 ConstFloats agrees
+// with runtime f32 precision
+// =============================================================
+#[test]
+fn audit_const_fold_fcmp_f32_after_m1_fix() {
+    // After M-1, IntToFloat(16777217:i32, F32) folds to ConstFloat
+    // with the f32-rounded value (16777216.0). FCmp Eq against
+    // ConstFloat(16777216.0, F32) should now return true.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Bool);
+    let i = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let fv_a = push(&mut f, InstKind::IntToFloat(i, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let fv_b = push(&mut f, InstKind::ConstFloat(16_777_216.0, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let eq = push(&mut f, InstKind::FCmp(CmpOp::Eq, fv_a, fv_b), IrType::Bool);
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(eq)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == eq).unwrap();
+    assert!(matches!(folded.kind, InstKind::ConstBool(true)),
+        "audit M-E: FCmp on f32-rounded values should return true, got {:?}", folded.kind);
+}
+
+// =============================================================
+// FINDING M-F (auto-fixed by M-1): FloatToInt of an f32 ConstFloat
+// rounds correctly through f32
+// =============================================================
+#[test]
+fn audit_const_fold_floattoint_from_f32_after_m1_fix() {
+    // IntToFloat(16777217, F32) → ConstFloat(16777216.0, F32) after M-1.
+    // FloatToInt(_, I32) should produce 16777216, not 16777217.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let i = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let fv = push(&mut f, InstKind::IntToFloat(i, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let back = push(&mut f, InstKind::FloatToInt(fv, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(back)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == back).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(16_777_216, IntWidth::I32) => { /* good */ }
+        ref other => panic!("audit M-F: expected ConstInt(16777216, I32), got {:?}", other),
+    }
+}
+
+// =============================================================
+// FINDING Med-3: PopCount/CLZ/CTZ should respect inst.ty for output
+// =============================================================
+#[test]
+fn audit_const_fold_popcount_uses_inst_ty() {
+    // Build PopCount whose source is i32 but whose declared result
+    // type is also i32 (the common case). After the fix, the fold
+    // result must be tagged with inst.ty (i32), even if a future
+    // change makes the source carry a different width.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let v = push(&mut f, InstKind::ConstInt(0xFF, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let pc = push(&mut f, InstKind::PopCount(v), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(pc)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == pc).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(8, IntWidth::I32) => { /* good */ }
+        ref other => panic!("expected ConstInt(8, I32), got {:?}", other),
+    }
+    assert_eq!(folded.ty, IrType::Int(IntWidth::I32));
+}
+
+// =============================================================
 // FINDING M-1 (latent): IntToFloat→FSub gives the wrong answer
 // =============================================================
 //
