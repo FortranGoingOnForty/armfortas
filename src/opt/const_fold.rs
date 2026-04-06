@@ -72,6 +72,18 @@ fn norm(v: i64, w: IntWidth) -> i64 {
     sext(mask(v, w.bits()), w.bits())
 }
 
+/// Round an `f64`-stored value to the precision of its declared
+/// `FloatWidth`. Audit B-3: used as defense in depth in `FCmp` and
+/// `FloatToInt` so that those folds don't silently miscompute when
+/// (some hypothetical future) producer breaks the M-1 invariant
+/// (every `Const::Float(_, F32)` value is already f32-rounded).
+fn round_for_width(v: f64, w: FloatWidth) -> f64 {
+    match w {
+        FloatWidth::F32 => v as f32 as f64,
+        FloatWidth::F64 => v,
+    }
+}
+
 /// Try to evaluate a single instruction given a map of known
 /// constants. Returns `Some(new_kind)` if the instruction can be
 /// replaced with a `Const*`.
@@ -171,7 +183,15 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             None
         }
         InstKind::FCmp(op, a, b) => {
-            if let (Some(Const::Float(av, _)), Some(Const::Float(bv, _))) = (get(a), get(b)) {
+            if let (Some(Const::Float(av, aw)), Some(Const::Float(bv, bw))) = (get(a), get(b)) {
+                // Audit B-3 (defense in depth): explicitly round each
+                // operand at its declared width before comparing.
+                // Today every Const::Float producer respects the
+                // M-1 invariant that f32-tagged values are already
+                // f32-rounded — but doing the rounding here protects
+                // future folds from a bug that breaks the invariant.
+                let av = round_for_width(av, aw);
+                let bv = round_for_width(bv, bw);
                 let r = match op {
                     CmpOp::Eq => av == bv,
                     CmpOp::Ne => av != bv,
@@ -328,8 +348,15 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             None
         }
         InstKind::FloatToInt(a, w) => {
-            if let Some(Const::Float(av, _)) = get(a) {
+            if let Some(Const::Float(av, src_fw)) = get(a) {
                 if av.is_nan() || av.is_infinite() { return None; }
+                // Audit B-3 (defense in depth): re-round at the
+                // source float width before truncating. The M-1
+                // invariant says any f32-tagged Const::Float is
+                // already f32-rounded, but doing it explicitly here
+                // means a future invariant break can't silently
+                // produce a wrong int.
+                let av = round_for_width(av, src_fw);
                 // Fortran INT() truncates toward zero. Match.
                 let truncd = av.trunc();
                 let lo = match w {

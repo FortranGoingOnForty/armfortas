@@ -228,12 +228,14 @@ fn dce_function(func: &mut Function) -> bool {
 /// parameters anyway).
 ///
 /// Returns `true` if at least one parameter was removed.
+///
+/// Audit B-5: the previous implementation walked `func.blocks` once
+/// per `(target, idx)` pair via linear `find` — O(N²·K) for N blocks
+/// and K dead params. The new version builds a `BlockId → vec_index`
+/// map upfront so the per-pair work is O(N).
 fn remove_dead_block_params(func: &mut Function) -> bool {
     let live = collect_live_uses(func);
 
-    // Collect (block_id, param_index) pairs to remove. We process
-    // them grouped by block in *descending* index order so that
-    // earlier removals don't shift the indices we still owe.
     let mut by_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
     for block in func.blocks.iter() {
         if block.id == func.entry { continue; }
@@ -245,17 +247,27 @@ fn remove_dead_block_params(func: &mut Function) -> bool {
     }
     if by_block.is_empty() { return false; }
 
+    // Map BlockId → vec index. LICM/DCE never structurally reorder
+    // `func.blocks`; only the inst vectors change. So this stays
+    // valid for the lifetime of this call.
+    let block_index: HashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
     for (target_block, mut idxs) in by_block {
-        idxs.sort_by(|a, b| b.cmp(a)); // descending
+        idxs.sort_by(|a, b| b.cmp(a)); // descending — high indices first so removals don't shift later ones
+        let target_idx = block_index[&target_block];
         for idx in idxs {
             // Remove the parameter at `idx` from `target_block`.
-            if let Some(blk) = func.blocks.iter_mut().find(|b| b.id == target_block) {
-                if idx < blk.params.len() {
-                    blk.params.remove(idx);
-                }
+            let blk = &mut func.blocks[target_idx];
+            if idx < blk.params.len() {
+                blk.params.remove(idx);
             }
             // Drop the corresponding arg slot from every predecessor's
-            // terminator that branches into `target_block`.
+            // terminator that branches into `target_block`. We still
+            // walk every block here because we don't keep an explicit
+            // pred map (build one if profiling shows this dominates).
             for src in func.blocks.iter_mut() {
                 if let Some(term) = &mut src.terminator {
                     drop_branch_arg(term, target_block, idx);
@@ -267,24 +279,46 @@ fn remove_dead_block_params(func: &mut Function) -> bool {
 }
 
 /// In-place: if `term` branches to `target`, remove the arg at `idx`
-/// from the corresponding arg vector. No-op if the indices don't fit
-/// (defensive — shouldn't happen if the IR is well-formed, but a
-/// truncated arg list is still locally valid IR).
+/// from the corresponding arg vector.
+///
+/// Audit B-10: the previous version silently no-op'd when the index
+/// was out of range. A mismatch between target params and predecessor
+/// args is a real IR validity violation, so we now `debug_assert!` on
+/// it instead. The release build still degrades gracefully (we don't
+/// want to crash production compiles on a stale arg list — the
+/// verifier will reject the resulting IR anyway), but a debug build
+/// will surface the bug at the source.
 fn drop_branch_arg(term: &mut Terminator, target: BlockId, idx: usize) {
     match term {
         Terminator::Branch(d, args) if *d == target => {
+            debug_assert!(idx < args.len(),
+                "drop_branch_arg: branch arg list out of sync with target params");
             if idx < args.len() { args.remove(idx); }
         }
         Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
-            if *true_dest == target && idx < true_args.len() {
-                true_args.remove(idx);
+            if *true_dest == target {
+                debug_assert!(idx < true_args.len(),
+                    "drop_branch_arg: cond_branch true_args out of sync");
+                if idx < true_args.len() { true_args.remove(idx); }
             }
-            if *false_dest == target && idx < false_args.len() {
-                false_args.remove(idx);
+            if *false_dest == target {
+                debug_assert!(idx < false_args.len(),
+                    "drop_branch_arg: cond_branch false_args out of sync");
+                if idx < false_args.len() { false_args.remove(idx); }
             }
         }
-        // Switch targets cannot have block params per the verifier;
-        // nothing to update.
+        Terminator::Switch { cases, default, .. } => {
+            // Switch targets cannot have block params per the
+            // verifier (`check_branch_args` rejects them). Audit
+            // M-6: if we ever see a Switch that branches into a
+            // block we're stripping params from, that's a real IR
+            // validity bug. Assert instead of silently skipping.
+            let touches_target = cases.iter().any(|(_, b)| *b == target)
+                || *default == target;
+            debug_assert!(!touches_target,
+                "drop_branch_arg: Switch terminator branches to a block with params \
+                 — verifier should reject this construction");
+        }
         _ => {}
     }
 }
