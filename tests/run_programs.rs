@@ -215,3 +215,10 @@ fn test_programs_end_to_end_o1() {
         panic!("Test failures at -O1:\n\n{}", msg);
     }
 }
+
+#[test]
+fn test_programs_end_to_end_o2() {
+    if let Err(msg) = run_all_at("-O2") {
+        panic!("Test failures at -O2:\n\n{}", msg);
+    }
+}

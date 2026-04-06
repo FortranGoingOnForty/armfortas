@@ -9,10 +9,12 @@
 
 pub mod pass;
 pub mod pipeline;
+pub mod util;
 pub mod const_fold;
 pub mod const_prop;
 pub mod dce;
 pub mod cse;
+pub mod strength_reduce;
 
 #[allow(unused_imports)]
 pub use pass::{Pass, PassManager, PassRunResult};
@@ -25,3 +27,5 @@ pub use const_prop::ConstProp;
 pub use dce::Dce;
 #[allow(unused_imports)]
 pub use cse::LocalCse;
+#[allow(unused_imports)]
+pub use strength_reduce::StrengthReduce;
