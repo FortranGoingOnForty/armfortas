@@ -679,6 +679,7 @@ pub extern "C" fn afs_matmul_real8(
 }
 
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
+/// Respects strides for non-contiguous array sections.
 #[no_mangle]
 pub extern "C" fn afs_dot_product_real8(
     a: *const ArrayDescriptor,
@@ -687,12 +688,15 @@ pub extern "C" fn afs_dot_product_real8(
     if a.is_null() || b.is_null() { return 0.0; }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    let n = da.total_elements().min(db.total_elements()) as usize;
+    if da.base_addr.is_null() || db.base_addr.is_null() { return 0.0; }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride as usize;
+    let stride_b = db.dims[0].stride as usize;
     let pa = da.base_addr as *const f64;
     let pb = db.base_addr as *const f64;
     let mut dot = 0.0;
     for i in 0..n {
-        dot += unsafe { *pa.add(i) * *pb.add(i) };
+        dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
     }
     dot
 }

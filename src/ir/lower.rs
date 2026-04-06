@@ -1436,9 +1436,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::None => {
-                                if (!info.dims.is_empty() || info.allocatable) && !matches!(&value.node, Expr::FunctionCall { .. }) {
-                                    // Whole-array assignment: a = b or a = scalar.
-                                    lower_array_assign(b, ctx, &info, value);
+                                if !info.dims.is_empty() || info.allocatable {
+                                    if matches!(&value.node, Expr::FunctionCall { .. }) {
+                                        // Array = func_returning_array (e.g., c = matmul(a,b)).
+                                        // The function returns a temp descriptor pointer.
+                                        // Use afs_assign_allocatable to copy data and handle reallocation.
+                                        let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                        b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                            vec![info.addr, src_desc, stat], IrType::Void);
+                                        // Deallocate the temporary result descriptor's heap data.
+                                        b.call(FuncRef::External("afs_deallocate_array".into()),
+                                            vec![src_desc, stat], IrType::Void);
+                                    } else {
+                                        lower_array_assign(b, ctx, &info, value);
+                                    }
                                 } else if info.derived_type.is_some() {
                                     let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let size = if let Some(ref tn) = info.derived_type {
@@ -1657,37 +1669,111 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
             // WHERE(mask) body [ELSEWHERE body] END WHERE
-            // For scalar-level lowering: evaluate mask, branch, execute body.
-            // Full array-level WHERE requires element-wise iteration, which
-            // needs array shape info. For now, lower as scalar IF-THEN-ELSE.
-            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
-            let bb_then = b.create_block("where_then");
-            let bb_else = if !elsewhere.is_empty() {
-                Some(b.create_block("where_else"))
-            } else { None };
-            let bb_end = b.create_block("where_end");
+            // Detect if mask references an array — if so, element-wise loop.
+            let mask_array = find_array_in_expr(mask, &ctx.locals);
 
-            b.cond_branch(cond, bb_then, vec![],
-                bb_else.unwrap_or(bb_end), vec![]);
+            if let Some(arr_info) = mask_array {
+                // Array-level WHERE: iterate over elements.
+                let n = b.call(FuncRef::External("afs_array_size".into()),
+                    vec![arr_info.addr], IrType::Int(IntWidth::I64));
+                let base = if arr_info.allocatable {
+                    b.load_typed(arr_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else { arr_info.addr };
 
-            b.set_block(bb_then);
-            lower_stmts(b, ctx, body);
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_end, vec![]);
-            }
+                let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+                let zero = b.const_i64(0);
+                b.store(zero, i_addr);
 
-            if let Some(bb_e) = bb_else {
-                b.set_block(bb_e);
-                // Process ELSEWHERE clauses (first one only for now).
-                if let Some((_else_mask, else_body)) = elsewhere.first() {
-                    lower_stmts(b, ctx, else_body);
+                let bb_check = b.create_block("where_check");
+                let bb_body = b.create_block("where_body");
+                let bb_exit = b.create_block("where_exit");
+                b.branch(bb_check, vec![]);
+
+                b.set_block(bb_check);
+                let i = b.load(i_addr);
+                let done = b.icmp(CmpOp::Ge, i, n);
+                b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+                b.set_block(bb_body);
+                let i_val = b.load(i_addr);
+                // Load mask element: base_addr[i] for the mask array.
+                let mask_elem_ptr = b.gep(base, vec![i_val], arr_info.ty.clone());
+                let mask_elem = b.load(mask_elem_ptr);
+                // Evaluate mask condition per-element.
+                let elem_zero = match &arr_info.ty {
+                    IrType::Float(_) => b.const_f64(0.0),
+                    _ => b.const_i32(0),
+                };
+                let cond = if arr_info.ty.is_float() {
+                    b.fcmp(CmpOp::Gt, mask_elem, elem_zero)
+                } else {
+                    b.icmp(CmpOp::Gt, mask_elem, elem_zero)
+                };
+
+                let bb_then = b.create_block("where_then");
+                let bb_else_or_incr = if !elsewhere.is_empty() {
+                    b.create_block("where_else")
+                } else {
+                    b.create_block("where_incr")
+                };
+                b.cond_branch(cond, bb_then, vec![], bb_else_or_incr, vec![]);
+
+                b.set_block(bb_then);
+                // Execute body assignments at index i.
+                // For simplicity, lower body statements as-is.
+                // This works for scalar statements; array assignments
+                // in the body would need per-element rewriting.
+                lower_stmts(b, ctx, body);
+                let bb_incr = b.create_block("where_incr2");
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_incr, vec![]);
                 }
+
+                if !elsewhere.is_empty() {
+                    b.set_block(bb_else_or_incr);
+                    if let Some((_else_mask, else_body)) = elsewhere.first() {
+                        lower_stmts(b, ctx, else_body);
+                    }
+                    if b.func().block(b.current_block()).terminator.is_none() {
+                        b.branch(bb_incr, vec![]);
+                    }
+                }
+
+                b.set_block(if elsewhere.is_empty() { bb_else_or_incr } else { bb_incr });
+                let i_cur = b.load(i_addr);
+                let one = b.const_i64(1);
+                let next = b.iadd(i_cur, one);
+                b.store(next, i_addr);
+                b.branch(bb_check, vec![]);
+
+                b.set_block(bb_exit);
+            } else {
+                // Scalar WHERE: simple IF-THEN-ELSE.
+                let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+                let bb_then = b.create_block("where_then");
+                let bb_else = if !elsewhere.is_empty() {
+                    Some(b.create_block("where_else"))
+                } else { None };
+                let bb_end = b.create_block("where_end");
+                b.cond_branch(cond, bb_then, vec![], bb_else.unwrap_or(bb_end), vec![]);
+
+                b.set_block(bb_then);
+                lower_stmts(b, ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
-            }
 
-            b.set_block(bb_end);
+                if let Some(bb_e) = bb_else {
+                    b.set_block(bb_e);
+                    if let Some((_else_mask, else_body)) = elsewhere.first() {
+                        lower_stmts(b, ctx, else_body);
+                    }
+                    if b.func().block(b.current_block()).terminator.is_none() {
+                        b.branch(bb_end, vec![]);
+                    }
+                }
+                b.set_block(bb_end);
+            }
         }
 
         Stmt::WhereStmt { mask, stmt } => {
@@ -2775,7 +2861,15 @@ fn lower_array_assign(
 
         b.set_block(bb_body);
         let i_val = b.load(i_addr);
-        let elem_ptr = b.gep(dest_base, vec![i_val], dest_info.ty.clone());
+        // Compute byte offset: i * elem_size. Use byte-level GEP to avoid double multiplication.
+        let elem_bytes = match &dest_info.ty {
+            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+            IrType::Int(IntWidth::I16) => b.const_i64(2),
+            IrType::Int(IntWidth::I8) => b.const_i64(1),
+            _ => b.const_i64(4),
+        };
+        let byte_offset = b.imul(i_val, elem_bytes);
+        let elem_ptr = b.gep(dest_base, vec![byte_offset], IrType::Int(IntWidth::I8));
         b.store(scalar, elem_ptr);
         let one = b.const_i64(1);
         let next_i = b.iadd(i_val, one);
@@ -2783,6 +2877,29 @@ fn lower_array_assign(
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+    }
+}
+
+/// Find the first array variable referenced in an expression (for WHERE mask detection).
+fn find_array_in_expr<'a>(expr: &crate::ast::expr::SpannedExpr, locals: &'a HashMap<String, LocalInfo>) -> Option<LocalInfo> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            locals.get(&key).filter(|i| !i.dims.is_empty() || i.allocatable).cloned()
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            find_array_in_expr(left, locals).or_else(|| find_array_in_expr(right, locals))
+        }
+        Expr::UnaryOp { operand, .. } => find_array_in_expr(operand, locals),
+        Expr::ParenExpr { inner } => find_array_in_expr(inner, locals),
+        Expr::FunctionCall { args, .. } => {
+            args.iter().find_map(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    find_array_in_expr(e, locals)
+                } else { None }
+            })
+        }
+        _ => None,
     }
 }
 
