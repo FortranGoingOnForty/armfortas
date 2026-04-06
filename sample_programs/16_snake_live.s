@@ -32,8 +32,8 @@ _main:
     bl draw_frame
 
 .Lgame_loop:
-    movz x0, #29, lsl #12
-    add x0, x0, #1216
+    movz x0, #61, lsl #12
+    add x0, x0, #144
     bl _usleep
 
     bl poll_input
