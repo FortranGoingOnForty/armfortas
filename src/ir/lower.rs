@@ -1608,6 +1608,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_do_loop(b, ctx, DoLoopFields { name, var, start, end, step, body });
         }
 
+        Stmt::DoConcurrent { controls, body, locality: _, .. } => {
+            // Lower DO CONCURRENT as sequential loop (parallel optimization deferred).
+            if let Some(ctrl) = controls.first() {
+                let var_opt = Some(ctrl.var.clone());
+                let start_opt = Some(ctrl.start.clone());
+                let end_opt = Some(ctrl.end.clone());
+                lower_do_loop(b, ctx, DoLoopFields {
+                    name: &None,
+                    var: &var_opt,
+                    start: &start_opt,
+                    end: &end_opt,
+                    step: &ctrl.step,
+                    body,
+                });
+            }
+        }
+
         Stmt::DoWhile { name, condition, body } => {
             let bb_header = b.create_block("do_while_header");
             let bb_body = b.create_block("do_while_body");

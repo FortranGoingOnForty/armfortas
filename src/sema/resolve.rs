@@ -166,7 +166,6 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             }
             st.pop_scope();
         }
-        _ => {}
     }
     Ok(())
 }
