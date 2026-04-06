@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::codegen::mir::MachineFunction;
+use crate::codegen::mir::{
+    ArmCond, ConstPoolEntry, MachineFunction, MachineInst, MachineOperand, MBlockId, PhysReg,
+    RegClass,
+};
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
@@ -357,7 +360,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     if wants(Stage::Mir) {
         stages.insert(
             Stage::Mir,
-            CapturedStage::Text(format!("{:#?}", machine_funcs)),
+            CapturedStage::Text(format_machine_functions(&machine_funcs)),
         );
     }
 
@@ -372,7 +375,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     if wants(Stage::Regalloc) {
         stages.insert(
             Stage::Regalloc,
-            CapturedStage::Text(format!("{:#?}", allocated)),
+            CapturedStage::Text(format_machine_functions(&allocated)),
         );
     }
 
@@ -508,6 +511,175 @@ fn format_diagnostics(path: &Path, diags: &[&validate::Diagnostic]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_machine_functions(machine_funcs: &[MachineFunction]) -> String {
+    let mut out = String::new();
+    for (index, mf) in machine_funcs.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+
+        let _ = writeln!(out, "function {}:", mf.name);
+        let _ = writeln!(out, "  frame_size: {}", mf.frame.size);
+
+        if mf.frame.locals.is_empty() {
+            let _ = writeln!(out, "  locals: none");
+        } else {
+            let locals = mf
+                .frame
+                .locals
+                .iter()
+                .map(|slot| format!("[fp{:+}]:{}", slot.offset, slot.size))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(out, "  locals: {}", locals);
+        }
+
+        if mf.vregs.is_empty() {
+            let _ = writeln!(out, "  vregs: none");
+        } else {
+            let vregs = mf
+                .vregs
+                .iter()
+                .map(|vreg| format!("v{}:{}", vreg.id.0, format_reg_class(vreg.class)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(out, "  vregs: {}", vregs);
+        }
+
+        for block in &mf.blocks {
+            let _ = writeln!(out, "  block {}:", block.label);
+            if block.insts.is_empty() {
+                let _ = writeln!(out, "    <empty>");
+            } else {
+                for inst in &block.insts {
+                    let _ = writeln!(out, "    {}", format_machine_inst(mf, inst));
+                }
+            }
+        }
+
+        if mf.const_pool.is_empty() {
+            let _ = writeln!(out, "  const_pool: none");
+        } else {
+            let _ = writeln!(out, "  const_pool:");
+            for (pool_index, entry) in mf.const_pool.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "    [{}] {}",
+                    pool_index,
+                    format_const_pool_entry(entry)
+                );
+            }
+        }
+    }
+    out
+}
+
+fn format_machine_inst(mf: &MachineFunction, inst: &MachineInst) -> String {
+    let opcode = format!("{:?}", inst.opcode).to_ascii_lowercase();
+    let operands = inst
+        .operands
+        .iter()
+        .map(|operand| format_machine_operand(mf, operand))
+        .collect::<Vec<_>>();
+    if operands.is_empty() {
+        opcode
+    } else {
+        format!("{} {}", opcode, operands.join(", "))
+    }
+}
+
+fn format_machine_operand(mf: &MachineFunction, operand: &MachineOperand) -> String {
+    match operand {
+        MachineOperand::VReg(vreg) => format!("v{}", vreg.0),
+        MachineOperand::PhysReg(reg) => format_phys_reg(*reg),
+        MachineOperand::Imm(value) => {
+            if *value == -1 {
+                "#frame-16".to_string()
+            } else {
+                format!("#{}", value)
+            }
+        }
+        MachineOperand::FrameSlot(offset) => format!("[fp{:+}]", offset),
+        MachineOperand::Cond(cond) => format_cond(*cond).to_string(),
+        MachineOperand::BlockRef(block_id) => block_label(mf, *block_id),
+        MachineOperand::Extern(name) => format!("extern {}", name),
+        MachineOperand::ConstPool(index) => format!("constpool[{}]", index),
+        MachineOperand::Shift(bits) => format!("lsl #{}", bits),
+    }
+}
+
+fn format_phys_reg(reg: PhysReg) -> String {
+    match reg {
+        PhysReg::Gp(num) => format!("x{}", num),
+        PhysReg::Gp32(num) => format!("w{}", num),
+        PhysReg::Fp(num) => format!("d{}", num),
+        PhysReg::Fp32(num) => format!("s{}", num),
+        PhysReg::Sp => "sp".to_string(),
+        PhysReg::Xzr => "xzr".to_string(),
+        PhysReg::Wzr => "wzr".to_string(),
+    }
+}
+
+fn format_reg_class(class: RegClass) -> &'static str {
+    match class {
+        RegClass::Gp64 => "gp64",
+        RegClass::Gp32 => "gp32",
+        RegClass::Fp64 => "fp64",
+        RegClass::Fp32 => "fp32",
+    }
+}
+
+fn format_cond(cond: ArmCond) -> &'static str {
+    match cond {
+        ArmCond::Eq => "eq",
+        ArmCond::Ne => "ne",
+        ArmCond::Hs => "hs",
+        ArmCond::Lo => "lo",
+        ArmCond::Mi => "mi",
+        ArmCond::Pl => "pl",
+        ArmCond::Hi => "hi",
+        ArmCond::Ls => "ls",
+        ArmCond::Ge => "ge",
+        ArmCond::Lt => "lt",
+        ArmCond::Gt => "gt",
+        ArmCond::Le => "le",
+    }
+}
+
+fn block_label(mf: &MachineFunction, block_id: MBlockId) -> String {
+    mf.blocks
+        .iter()
+        .find(|block| block.id == block_id)
+        .map(|block| block.label.clone())
+        .unwrap_or_else(|| format!("block#{}", block_id.0))
+}
+
+fn format_const_pool_entry(entry: &ConstPoolEntry) -> String {
+    match entry {
+        ConstPoolEntry::F32(value) => format!("f32 {}", value),
+        ConstPoolEntry::F64(value) => format!("f64 {}", value),
+        ConstPoolEntry::I64(value) => format!("i64 {}", value),
+        ConstPoolEntry::Bytes(bytes) => format!("bytes {:?}", escape_const_bytes(bytes)),
+    }
+}
+
+fn escape_const_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b if b.is_ascii_graphic() || b == b' ' => out.push(b as char),
+            other => {
+                let _ = write!(out, "\\x{:02x}", other);
+            }
+        }
+    }
+    out
 }
 
 fn emit_module_asm(allocated: &[MachineFunction]) -> String {
