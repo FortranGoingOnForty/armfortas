@@ -10,9 +10,12 @@
 pub mod pass;
 pub mod pipeline;
 pub mod const_fold;
+pub mod const_prop;
 
 #[allow(unused_imports)]
 pub use pass::{Pass, PassManager, PassRunResult};
 pub use pipeline::{OptLevel, build_pipeline};
 #[allow(unused_imports)]
 pub use const_fold::ConstFold;
+#[allow(unused_imports)]
+pub use const_prop::ConstProp;
