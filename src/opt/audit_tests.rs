@@ -1670,8 +1670,6 @@ fn audit_const_fold_non_rpo_block_order() {
 // other pass changes anything here.
 #[test]
 fn audit_const_fold_inner_fixpoint_across_vec_order() {
-    use crate::opt::{build_pipeline, OptLevel};
-
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
@@ -1744,13 +1742,21 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
 
     assert!(verify_module(&m).is_empty(), "test setup invalid");
 
-    let pm = build_pipeline(OptLevel::O2);
-    pm.run(&mut m);
+    // Audit F1: call `ConstFold.run()` DIRECTLY, not through the
+    // pass manager. The pass manager's outer fixpoint would rescue
+    // a regression in the inner fixpoint loop (because a second
+    // `ConstFold.run()` invocation would see `a_sum` already
+    // folded and then fold `b_sum`), so running through the
+    // manager does NOT pin the inner fixpoint behavior. A direct
+    // single invocation forces convergence to happen inside
+    // `ConstFold::run` itself.
+    ConstFold.run(&mut m);
 
     let post = verify_module(&m);
-    assert!(post.is_empty(), "pipeline left invalid IR: {:?}", post);
+    assert!(post.is_empty(), "const_fold left invalid IR: {:?}", post);
 
-    // The fold MUST converge — b_sum should reach const(37) (= 10+20+7).
+    // The fold MUST converge in a single `ConstFold.run()` call —
+    // the terminator's value should now define ConstInt(37) (= 10+20+7).
     let f = &m.functions[0];
     let terminator_val = f.blocks.iter()
         .find_map(|blk| match &blk.terminator {
@@ -1764,10 +1770,11 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
         .map(|i| i.kind.clone())
         .expect("terminator value has no defining inst");
     match term_kind {
-        InstKind::ConstInt(37, IntWidth::I32) => { /* good — chain converged */ }
+        InstKind::ConstInt(37, IntWidth::I32) => { /* good — chain converged in one run() */ }
         ref other => panic!(
-            "audit M4-1: const_fold inner fixpoint failed to fold chain across \
-             non-RPO vec order. Expected ConstInt(37, I32), got {:?}",
+            "audit M4-1 / F1: const_fold inner fixpoint failed to fold chain \
+             across non-RPO vec order in a single `ConstFold.run()` invocation. \
+             Expected ConstInt(37, I32), got {:?}",
             other
         ),
     }

@@ -135,14 +135,16 @@ struct Hoist {
 
 /// Run LICM on one function. Returns true if anything was hoisted.
 fn licm_function(func: &mut Function) -> bool {
-    // Audit N-6: drop unreachable blocks first. `compute_dominators`
-    // assigns "all blocks dominate me" to nodes with no predecessors
-    // that aren't entry, which means an unreachable block with a
-    // self-loop gets classified as a natural loop (it dominates
-    // itself via the trivial "all blocks dominate" default). LICM
-    // then wastes work trying to find a preheader for a loop that
-    // can never execute. Prune first so our loop discovery only
-    // sees the reachable CFG.
+    // Audit N-6 (originally load-bearing, now defensive): drop
+    // unreachable blocks before running loop analysis. Earlier
+    // versions of `compute_dominators` assigned "all blocks dominate
+    // me" to nodes with no predecessors, which made unreachable
+    // components produce phantom natural loops. That bug was later
+    // fixed at the source in `ir::walk::compute_dominators` (audit
+    // M4-3), so the pre-prune is no longer *required* for
+    // correctness — it's kept as cheap defense-in-depth so LICM
+    // never touches code that can't execute, and so follow-up
+    // passes see a tidy CFG.
     let pruned = super::util::prune_unreachable(func);
 
     let loops = find_natural_loops(func);
