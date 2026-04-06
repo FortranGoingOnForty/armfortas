@@ -1533,7 +1533,29 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Call { callee, args } => {
-            if let Expr::Name { name } = &callee.node {
+            // Handle type-bound procedure calls: call obj%method(args)
+            if let Expr::ComponentAccess { base, component } = &callee.node {
+                if let Some((obj_addr, type_name)) = resolve_component_base_for_method(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(bp) = layout.bound_proc(component) {
+                            let target = bp.target_name.clone();
+                            let nopass = bp.nopass;
+
+                            // Build argument list: obj as first arg (PASS), then explicit args.
+                            let mut call_args = Vec::new();
+                            if !nopass {
+                                call_args.push(obj_addr); // PASS: object address
+                            }
+                            for a in args {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                    call_args.push(lower_arg_by_ref(b, &ctx.locals, e, ctx.st));
+                                }
+                            }
+                            b.call(FuncRef::External(target), call_args, IrType::Void);
+                        }
+                    }
+                }
+            } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
 
                 // Try intrinsic subroutine lowering first.
@@ -2487,6 +2509,41 @@ fn resolve_component_base(
                 Some((field_ptr, nested_type.clone()))
             } else {
                 None // Terminal field — caller should load, not chain further.
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a base expression for a type-bound procedure call.
+/// Returns (object_address, type_name) — the address of the base object.
+/// For simple `obj%method()`, base is `obj` → returns (obj.addr, obj.type).
+/// For `obj%inner%method()`, base is `obj%inner` → returns (inner.addr, inner.type).
+fn resolve_component_base_for_method(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base: &crate::ast::expr::SpannedExpr,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, String)> {
+    match &base.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?;
+            let type_name = info.derived_type.as_ref()?.clone();
+            let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+            Some((addr, type_name))
+        }
+        Expr::ComponentAccess { base: inner_base, component } => {
+            // Resolve the inner base, then GEP to the component field.
+            let (inner_addr, inner_type) = resolve_component_base_for_method(b, locals, inner_base, tl)?;
+            let layout = tl.get(&inner_type)?;
+            let field = layout.field(component)?;
+            let offset = b.const_i64(field.offset as i64);
+            let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
+            if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
+                Some((field_ptr, nested_type.clone()))
+            } else {
+                None
             }
         }
         _ => None,

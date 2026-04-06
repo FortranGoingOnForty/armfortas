@@ -226,10 +226,17 @@ fn collect_derived_type_layouts(unit: &ProgramUnit, layouts: &mut super::type_la
         _ => return,
     };
     for decl in decls {
-        if let Decl::DerivedTypeDef { name, extends, components, .. } = &decl.node {
+        if let Decl::DerivedTypeDef { name, extends, components, type_bound_procs, .. } = &decl.node {
             let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
-            let layout = super::type_layout::compute_layout(name, components, parent.as_ref(), layouts);
-            layouts.insert(layout);
+            let layout = super::type_layout::compute_layout(name, type_bound_procs, components, parent.as_ref(), layouts);
+            // Don't overwrite a layout that has bound_procs with one that doesn't.
+            // This handles the case where a subroutine redefines a type without CONTAINS.
+            let dominated = layouts.get(&name.to_lowercase())
+                .map(|existing| !existing.bound_procs.is_empty() && layout.bound_procs.is_empty())
+                .unwrap_or(false);
+            if !dominated {
+                layouts.insert(layout);
+            }
         }
     }
 }
