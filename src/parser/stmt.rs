@@ -376,14 +376,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stop(&mut self, start: crate::lexer::Span, is_error: bool) -> Result<SpannedStmt, ParseError> {
-        let code = if !self.at_stmt_end() {
+        let code = if !self.at_stmt_end() && !self.peek_text().eq_ignore_ascii_case("quiet") {
             Some(self.parse_expr()?)
         } else { None };
+
+        // Check for QUIET= specifier.
+        let mut quiet = false;
+        if self.eat(&TokenKind::Comma) || self.peek_text().eq_ignore_ascii_case("quiet") {
+            if self.peek_text().eq_ignore_ascii_case("quiet") {
+                self.advance();
+                self.expect(&TokenKind::Assign)?;
+                let val_text = self.peek_text().to_lowercase();
+                if val_text == ".true." || val_text == ".t." {
+                    quiet = true;
+                    self.advance();
+                } else {
+                    self.advance(); // consume .false. or whatever
+                }
+            }
+        }
+
         let span = span_from_to(start, self.prev_span());
         if is_error {
-            Ok(Spanned::new(Stmt::ErrorStop { code, quiet: false }, span))
+            Ok(Spanned::new(Stmt::ErrorStop { code, quiet }, span))
         } else {
-            Ok(Spanned::new(Stmt::Stop { code, quiet: false }, span))
+            Ok(Spanned::new(Stmt::Stop { code, quiet }, span))
         }
     }
 
