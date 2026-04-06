@@ -94,8 +94,9 @@ fn find_test_programs() -> PathBuf {
     panic!("cannot find test_programs/ directory");
 }
 
-/// Run a single test program: compile, execute, check output.
-fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
+/// Run a single test program: compile at the given optimization level,
+/// execute, check output.
+fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> Result<(), String> {
     let filename = source.file_name().unwrap().to_str().unwrap();
     let source_text = fs::read_to_string(source)
         .map_err(|e| format!("{}: cannot read: {}", filename, e))?;
@@ -105,14 +106,17 @@ fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
         return Err(format!("{}: no CHECK annotations found", filename));
     }
 
-    // Compile.
+    // Compile. Use a per-(file,level) binary path so concurrent jobs
+    // and successive runs at different levels don't stomp each other.
     let binary = std::env::temp_dir().join(format!(
-        "afs_test_{}",
-        source.file_stem().unwrap().to_str().unwrap()
+        "afs_test_{}_{}",
+        source.file_stem().unwrap().to_str().unwrap(),
+        opt_flag.trim_start_matches('-'),
     ));
     let compile = Command::new(compiler)
         .args([
             source.to_str().unwrap(),
+            opt_flag,
             "-o",
             binary.to_str().unwrap(),
         ])
@@ -121,7 +125,7 @@ fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
 
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr);
-        return Err(format!("{}: compilation failed:\n{}", filename, stderr));
+        return Err(format!("{} [{}]: compilation failed:\n{}", filename, opt_flag, stderr));
     }
 
     // Execute.
@@ -132,8 +136,9 @@ fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
     if !run.status.success() {
         let stderr = String::from_utf8_lossy(&run.stderr);
         return Err(format!(
-            "{}: execution failed (exit {}): {}",
+            "{} [{}]: execution failed (exit {}): {}",
             filename,
+            opt_flag,
             run.status.code().unwrap_or(-1),
             stderr
         ));
@@ -141,8 +146,10 @@ fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
 
     let stdout = String::from_utf8_lossy(&run.stdout);
 
-    // Check output.
-    match_checks(&checks, &stdout, filename)?;
+    // Check output. Same CHECK annotations are enforced at every opt
+    // level — this is the correctness invariant.
+    let label = format!("{} [{}]", filename, opt_flag);
+    match_checks(&checks, &stdout, &label)?;
 
     // Cleanup.
     let _ = fs::remove_file(&binary);
@@ -150,8 +157,10 @@ fn run_test(compiler: &Path, source: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn test_programs_end_to_end() {
+/// Discover the test programs and run each at every supported opt level.
+/// This enforces the correctness invariant: same source must produce
+/// the same output regardless of optimization level.
+fn run_all_at(opt_flag: &str) -> Result<(), String> {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
 
@@ -169,23 +178,47 @@ fn test_programs_end_to_end() {
     let mut passed = 0;
 
     for source in &sources {
-        match run_test(&compiler, source) {
+        match run_test(&compiler, source, opt_flag) {
             Ok(()) => {
                 passed += 1;
-                eprintln!("  PASS: {}", source.file_name().unwrap().to_str().unwrap());
+                eprintln!("  PASS [{}]: {}", opt_flag,
+                    source.file_name().unwrap().to_str().unwrap());
             }
             Err(msg) => {
-                eprintln!("  FAIL: {}", source.file_name().unwrap().to_str().unwrap());
+                eprintln!("  FAIL [{}]: {}", opt_flag,
+                    source.file_name().unwrap().to_str().unwrap());
                 failures.push(msg);
             }
         }
     }
 
-    eprintln!("\n{} passed, {} failed out of {} test programs",
-        passed, failures.len(), sources.len());
+    eprintln!("\n[{}] {} passed, {} failed out of {} test programs",
+        opt_flag, passed, failures.len(), sources.len());
 
-    if !failures.is_empty() {
-        let msg = failures.join("\n\n");
-        panic!("Test failures:\n\n{}", msg);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n\n"))
+    }
+}
+
+#[test]
+fn test_programs_end_to_end() {
+    if let Err(msg) = run_all_at("-O0") {
+        panic!("Test failures at -O0:\n\n{}", msg);
+    }
+}
+
+#[test]
+fn test_programs_end_to_end_o1() {
+    if let Err(msg) = run_all_at("-O1") {
+        panic!("Test failures at -O1:\n\n{}", msg);
+    }
+}
+
+#[test]
+fn test_programs_end_to_end_o2() {
+    if let Err(msg) = run_all_at("-O2") {
+        panic!("Test failures at -O2:\n\n{}", msg);
     }
 }

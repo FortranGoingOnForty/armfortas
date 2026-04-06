@@ -91,6 +91,14 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 - **(D)** No I128 for integer(16). Exotic.
 - **(D)** `value_type()` is O(n) linear scan. Performance only.
+- **(D)** Verifier does not check operand-width == result-type width on
+  binary integer ops (IAdd/ISub/IMul/IDiv/IMod/ICmp/BitAnd/...). Audit
+  pass 5, finding F2. Today's lowering never produces mismatches, but
+  every optimizer pass (const_fold, const_prop, cse, strength_reduce)
+  now embeds an implicit "operand source width wins" policy that only
+  holds because the mismatch never arises. Tighten the verifier to
+  enforce width-equality before mem2reg lands a new pass that could
+  plausibly produce mixed-width binops.
 
 ## IR — Complex Lowering (Sprint 16)
 

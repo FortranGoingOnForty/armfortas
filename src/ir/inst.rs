@@ -243,14 +243,26 @@ impl Function {
         id
     }
 
-    /// Get a block by ID.
+    /// Get a block by ID. Panics if the ID is not present — use
+    /// `try_block` for graceful degradation.
     pub fn block(&self, id: BlockId) -> &BasicBlock {
         self.blocks.iter().find(|b| b.id == id).expect("block not found")
     }
 
-    /// Get a mutable block by ID.
+    /// Get a mutable block by ID. Panics if the ID is not present.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
         self.blocks.iter_mut().find(|b| b.id == id).expect("block not found")
+    }
+
+    /// Get a block by ID, returning `None` if the ID is not
+    /// present. Audit N-10: used by CFG walks that may follow a
+    /// terminator to a target that was just pruned mid-pass. The
+    /// verifier rejects dangling targets, so on valid IR this
+    /// behaves like `block`, but optimizer passes that intentionally
+    /// run before block pruning (or that mutate the CFG) can use
+    /// this to degrade gracefully instead of panicking.
+    pub fn try_block(&self, id: BlockId) -> Option<&BasicBlock> {
+        self.blocks.iter().find(|b| b.id == id)
     }
 
     /// Get the type of a value by ID.
