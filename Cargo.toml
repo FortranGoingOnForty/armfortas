@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "afs-as", "runtime", "tests/bench"]
+members = [".", "afs-as", "runtime", "bencch/bench"]
 resolver = "2"
 
 [package]
