@@ -210,8 +210,37 @@ pub fn predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {
 /// Compute the dominator set for each block via iterative dataflow.
 /// Result: `dom[B]` is the set of blocks that dominate `B` (including
 /// `B` itself).
+///
+/// Audit M4-3: blocks that are **not reachable from the entry** are
+/// assigned the empty set (they dominate nothing and nothing dominates
+/// them). The earlier version left unreachable blocks at the initial
+/// `{all_blocks}` default, which made every edge inside an unreachable
+/// component look like a back-edge (because the source "dominated"
+/// the target by default). That in turn let `find_natural_loops`
+/// fabricate phantom loops in unreachable code. LICM was shielded by
+/// the N-6 pre-prune, but any future consumer of `compute_dominators`
+/// would trip over the latent bug.
 pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
     let all_blocks: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+
+    // First, compute the set of blocks reachable from the entry via
+    // a forward BFS over terminator targets.
+    let mut reachable: HashSet<BlockId> = HashSet::new();
+    let mut queue: VecDeque<BlockId> = VecDeque::new();
+    queue.push_back(func.entry);
+    reachable.insert(func.entry);
+    while let Some(bid) = queue.pop_front() {
+        if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
+            if let Some(term) = &block.terminator {
+                for tgt in terminator_targets(term) {
+                    if reachable.insert(tgt) {
+                        queue.push_back(tgt);
+                    }
+                }
+            }
+        }
+    }
+
     let mut doms: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
 
     // Entry is dominated only by itself.
@@ -219,10 +248,17 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
     entry_set.insert(func.entry);
     doms.insert(func.entry, entry_set);
 
-    // Everyone else starts dominated by the universe.
+    // Reachable non-entry blocks: initialize to the universe of
+    // reachable blocks (so the intersection converges).
+    // Unreachable blocks: initialize to the empty set and never
+    // update them — they participate in no meaningful dominance
+    // relationship.
     for block in &func.blocks {
-        if block.id != func.entry {
-            doms.insert(block.id, all_blocks.clone());
+        if block.id == func.entry { continue; }
+        if reachable.contains(&block.id) {
+            doms.insert(block.id, reachable.clone());
+        } else {
+            doms.insert(block.id, HashSet::new());
         }
     }
 
@@ -232,10 +268,16 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
         changed = false;
         for block in &func.blocks {
             if block.id == func.entry { continue; }
+            if !reachable.contains(&block.id) { continue; }
             let plist = preds.get(&block.id).cloned().unwrap_or_default();
-            if plist.is_empty() { continue; }
-            let mut new_dom = all_blocks.clone();
-            for p in &plist {
+            // Reachable-only predecessors — an edge from an
+            // unreachable block doesn't contribute to dominance.
+            let reachable_preds: Vec<BlockId> = plist.into_iter()
+                .filter(|p| reachable.contains(p))
+                .collect();
+            if reachable_preds.is_empty() { continue; }
+            let mut new_dom = reachable.clone();
+            for p in &reachable_preds {
                 if let Some(pd) = doms.get(p) {
                     new_dom = new_dom.intersection(pd).copied().collect();
                 }
@@ -247,6 +289,10 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
             }
         }
     }
+    // Silence unused-var lint for `all_blocks` — kept for potential
+    // future needs (and because removing it would break callers that
+    // expect every block to have an entry in the map).
+    let _ = all_blocks;
     doms
 }
 
@@ -343,13 +389,19 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
 
 /// Remove blocks unreachable from the function entry. Returns true if
 /// any blocks were dropped.
+///
+/// Audit M4-2 / m4-3: uses `try_block` instead of `block` so a stale
+/// terminator target (pointing at a block that was already pruned,
+/// e.g., mid-pass state) degrades gracefully to "skip that edge"
+/// instead of panicking. On valid IR this behaves identically to the
+/// old version because the verifier rejects dangling targets.
 pub fn prune_unreachable(func: &mut Function) -> bool {
     let mut reachable: HashSet<BlockId> = HashSet::new();
     let mut queue: VecDeque<BlockId> = VecDeque::new();
     queue.push_back(func.entry);
     reachable.insert(func.entry);
     while let Some(bid) = queue.pop_front() {
-        let block = func.block(bid);
+        let Some(block) = func.try_block(bid) else { continue };
         if let Some(term) = &block.terminator {
             for tgt in terminator_targets(term) {
                 if reachable.insert(tgt) {

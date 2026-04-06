@@ -1641,6 +1641,139 @@ fn audit_const_fold_non_rpo_block_order() {
 }
 
 // =============================================================
+// FINDING M4-1 (fourth audit): const_fold inner fixpoint must
+// handle fold CHAINS that cross non-RPO vec order — not just
+// the simple "operands pre-collected" case.
+// =============================================================
+//
+// The strengthened non-RPO test from round 3 only pinned the
+// pre-collection phase of the N-8 fix — every operand was already
+// a leaf constant, so a single inner-loop iteration was enough.
+// This test builds a FOLD CHAIN where block B (vec position 1)
+// holds an IAdd that becomes constant only after block A (vec
+// position 2) produces a derived constant, AND A's derived
+// constant comes from folding another IAdd whose operands are
+// in blocks C (vec position 3) and D (vec position 4).
+//
+// Required order after the vec swap (pre-collection captures
+// only leaf constants from C and D):
+//
+//   Iter 1: fold A's IAdd → const(3). Inserts into consts map.
+//           B's IAdd still uses the (now-folded) A result, so
+//           it may or may not fold depending on walk order.
+//   Iter 2: if iter-1 didn't already fold B, iter-2 catches it.
+//   Iter 3: stable.
+//
+// A version of const_fold without the inner fixpoint would stop
+// after iter 1 and leave B's IAdd in place — a missed fold that
+// the pass manager's outer fixpoint would NOT rescue because no
+// other pass changes anything here.
+#[test]
+fn audit_const_fold_inner_fixpoint_across_vec_order() {
+    use crate::opt::{build_pipeline, OptLevel};
+
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+
+    // Four blocks, chained: entry → b → a → c → d → return.
+    // After vec swap, b comes *before* a in func.blocks.
+    let a_block = f.create_block("a");
+    let b_block = f.create_block("b");
+    let c_block = f.create_block("c");
+    let d_block = f.create_block("d");
+
+    // Leaves in c and d (so pre-collection picks them up).
+    let c1 = f.next_value_id();
+    f.block_mut(c_block).insts.push(Inst {
+        id: c1,
+        kind: InstKind::ConstInt(10, IntWidth::I32),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
+    });
+    let c2 = f.next_value_id();
+    f.block_mut(c_block).insts.push(Inst {
+        id: c2,
+        kind: InstKind::ConstInt(20, IntWidth::I32),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
+    });
+
+    // A holds a derived IAdd whose operands are the c constants.
+    // Pre-collection does NOT capture this (it's not a Const*).
+    let a_sum = f.next_value_id();
+    f.block_mut(a_block).insts.push(Inst {
+        id: a_sum,
+        kind: InstKind::IAdd(c1, c2),    // folds to const(30)
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
+    });
+
+    // B holds ANOTHER derived IAdd that uses a's result.
+    // This can only fold AFTER a_sum has been folded.
+    let b_sum = f.next_value_id();
+    let seven = f.next_value_id();
+    f.block_mut(d_block).insts.push(Inst {
+        id: seven,
+        kind: InstKind::ConstInt(7, IntWidth::I32),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
+    });
+    f.block_mut(b_block).insts.push(Inst {
+        id: b_sum,
+        kind: InstKind::IAdd(a_sum, seven),  // folds to const(37)
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
+    });
+
+    // Wire: entry → c → d → a → b → return(b_sum)
+    // (but we SWAP the vec positions of a and b so a comes AFTER b).
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Branch(c_block, vec![]));
+    f.block_mut(c_block).terminator = Some(Terminator::Branch(d_block, vec![]));
+    f.block_mut(d_block).terminator = Some(Terminator::Branch(a_block, vec![]));
+    f.block_mut(a_block).terminator = Some(Terminator::Branch(b_block, vec![]));
+    f.block_mut(b_block).terminator = Some(Terminator::Return(Some(b_sum)));
+
+    // Swap a and b in func.blocks so b comes before a in vec order.
+    // func.blocks is [entry, a, b, c, d] after create_block calls.
+    let a_idx = f.blocks.iter().position(|blk| blk.id == a_block).unwrap();
+    let b_idx = f.blocks.iter().position(|blk| blk.id == b_block).unwrap();
+    f.blocks.swap(a_idx, b_idx);
+
+    m.add_function(f);
+
+    assert!(verify_module(&m).is_empty(), "test setup invalid");
+
+    let pm = build_pipeline(OptLevel::O2);
+    pm.run(&mut m);
+
+    let post = verify_module(&m);
+    assert!(post.is_empty(), "pipeline left invalid IR: {:?}", post);
+
+    // The fold MUST converge — b_sum should reach const(37) (= 10+20+7).
+    let f = &m.functions[0];
+    let terminator_val = f.blocks.iter()
+        .find_map(|blk| match &blk.terminator {
+            Some(Terminator::Return(Some(v))) => Some(*v),
+            _ => None,
+        })
+        .expect("no Return terminator");
+    let term_kind = f.blocks.iter()
+        .flat_map(|b| b.insts.iter())
+        .find(|i| i.id == terminator_val)
+        .map(|i| i.kind.clone())
+        .expect("terminator value has no defining inst");
+    match term_kind {
+        InstKind::ConstInt(37, IntWidth::I32) => { /* good — chain converged */ }
+        ref other => panic!(
+            "audit M4-1: const_fold inner fixpoint failed to fold chain across \
+             non-RPO vec order. Expected ConstInt(37, I32), got {:?}",
+            other
+        ),
+    }
+}
+
+// =============================================================
 // FINDING M-9: const_fold large negative i64 left shift
 // =============================================================
 //

@@ -43,10 +43,26 @@ enum Const {
 }
 
 impl Const {
+    /// Build a `Const` from a constant-producing instruction,
+    /// sign-extending integer values at their declared width so the
+    /// stored value is canonical. Audit M4-4: matches the N-9
+    /// normalization in `const_fold::Const::from_inst`. The Switch
+    /// fold at line 119 already sexts at use site, but relying on
+    /// every use site to remember that is fragile — canonicalizing
+    /// here closes the consistency gap with `const_fold`.
     fn from_inst(kind: &InstKind) -> Option<Self> {
         match kind {
             InstKind::ConstBool(b) => Some(Const::Bool(*b)),
-            InstKind::ConstInt(v, w) => Some(Const::Int(*v, *w)),
+            InstKind::ConstInt(v, w) => {
+                let bits = w.bits();
+                let signed = if bits >= 64 {
+                    *v
+                } else {
+                    let shift = 64 - bits;
+                    (*v << shift) >> shift
+                };
+                Some(Const::Int(signed, *w))
+            }
             _ => None,
         }
     }
@@ -114,9 +130,12 @@ fn simplify_terminator(
             }
         }
         Terminator::Switch { selector, cases, default } => {
-            if let Some(Const::Int(v, w)) = consts.get(&selector).copied() {
-                // Sign-extend stored i64 to true value at the operand width.
-                let sv = sext(v, w.bits());
+            if let Some(Const::Int(sv, w)) = consts.get(&selector).copied() {
+                // `sv` is already canonical (sign-extended at width)
+                // thanks to the M4-4 normalization in `Const::from_inst`.
+                // Case keys come from the IR and aren't guaranteed
+                // canonical, so we still normalize them before
+                // comparing.
                 *changed = true;
                 let target = cases.iter().find(|(k, _)| sext(*k, w.bits()) == sv)
                     .map(|(_, b)| *b)

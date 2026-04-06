@@ -78,12 +78,18 @@ fn const_int(consts: &HashMap<ValueId, (i64, IntWidth)>, id: ValueId) -> Option<
     consts.get(&id).copied()
 }
 
+/// Collect integer constants in canonical form (sign-extended at
+/// their declared width). Audit m4-1: this mirrors the N-9 / M4-4
+/// normalization in `const_fold` and `const_prop`. The previous
+/// version stored raw bit patterns, so `rewrite_for` had to re-sext
+/// at use-site — and did so using the *result* type's width, not the
+/// operand's, producing conservative no-ops on width-drifted inputs.
 fn collect_int_consts(func: &Function) -> HashMap<ValueId, (i64, IntWidth)> {
     let mut consts = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
             if let InstKind::ConstInt(v, w) = inst.kind {
-                consts.insert(inst.id, (v, w));
+                consts.insert(inst.id, (sext(v, w.bits()), w));
             }
         }
     }
@@ -135,31 +141,37 @@ fn rewrite_for(
     consts: &HashMap<ValueId, (i64, IntWidth)>,
 ) -> Option<Rewrite> {
     let int_w = if let IrType::Int(w) = inst.ty { w } else { return None; };
+    // Audit m4-1: after the M4-4 normalization in `collect_int_consts`,
+    // every `kv` returned from `const_int` is already sign-extended
+    // at its source width. The earlier code re-sext'd at `int_w` (the
+    // *result* width), which was redundant at best and actively
+    // harmful when an operand's source width differed from the result
+    // width (the re-sext would truncate a wider value to a narrower
+    // signed range, making e.g. `imul x, 2000000000` at result-type
+    // i8 look like `imul x, 0` and spuriously rewrite to const(0)).
+    // Now we just compare against the canonical i64-stored value.
 
     match &inst.kind {
         // ---- imul -------------------------------------------------------
         InstKind::IMul(a, b) => {
-            // Try `b` constant first; if not, try `a` constant (commutative).
-            let (var, k_id) = if let Some((kv, _)) = const_int(consts, *b) {
-                (Some((*a, kv)), Some(*b))
+            let var = if let Some((kv, _)) = const_int(consts, *b) {
+                Some((*a, kv))
             } else if let Some((kv, _)) = const_int(consts, *a) {
-                (Some((*b, kv)), Some(*a))
+                Some((*b, kv))
             } else {
-                (None, None)
+                None
             };
-            let _ = k_id;
             if let Some((var_id, kv)) = var {
-                let kv_signed = sext(kv, int_w.bits());
-                if kv_signed == 0 {
+                if kv == 0 {
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(0, int_w)));
                 }
-                if kv_signed == 1 {
+                if kv == 1 {
                     return Some(Rewrite::Identity { pass_through: var_id });
                 }
-                if kv_signed == -1 {
+                if kv == -1 {
                     return Some(Rewrite::KindOnly(InstKind::INeg(var_id)));
                 }
-                if let Some(k) = pow2_exponent(kv_signed) {
+                if let Some(k) = pow2_exponent(kv) {
                     return Some(Rewrite::ShlByConst { var: var_id, k });
                 }
             }
@@ -167,40 +179,31 @@ fn rewrite_for(
         }
         // ---- iadd -------------------------------------------------------
         InstKind::IAdd(a, b) => {
-            if let Some((kv, _)) = const_int(consts, *b) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::Identity { pass_through: *a });
-                }
+            if let Some((0, _)) = const_int(consts, *b) {
+                return Some(Rewrite::Identity { pass_through: *a });
             }
-            if let Some((kv, _)) = const_int(consts, *a) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::Identity { pass_through: *b });
-                }
+            if let Some((0, _)) = const_int(consts, *a) {
+                return Some(Rewrite::Identity { pass_through: *b });
             }
             None
         }
         // ---- isub -------------------------------------------------------
         InstKind::ISub(a, b) => {
-            if let Some((kv, _)) = const_int(consts, *b) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::Identity { pass_through: *a });
-                }
+            if let Some((0, _)) = const_int(consts, *b) {
+                return Some(Rewrite::Identity { pass_through: *a });
             }
-            if let Some((kv, _)) = const_int(consts, *a) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::KindOnly(InstKind::INeg(*b)));
-                }
+            if let Some((0, _)) = const_int(consts, *a) {
+                return Some(Rewrite::KindOnly(InstKind::INeg(*b)));
             }
             None
         }
         // ---- idiv -------------------------------------------------------
         InstKind::IDiv(a, b) => {
             if let Some((kv, _)) = const_int(consts, *b) {
-                let s = sext(kv, int_w.bits());
-                if s == 1 {
+                if kv == 1 {
                     return Some(Rewrite::Identity { pass_through: *a });
                 }
-                if s == -1 {
+                if kv == -1 {
                     return Some(Rewrite::KindOnly(InstKind::INeg(*a)));
                 }
                 // Power-of-two signed division skipped (see module doc).
@@ -210,20 +213,18 @@ fn rewrite_for(
         // ---- bit_and ---------------------------------------------------
         InstKind::BitAnd(a, b) => {
             if let Some((kv, _)) = const_int(consts, *b) {
-                let s = sext(kv, int_w.bits());
-                if s == 0 {
+                if kv == 0 {
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(0, int_w)));
                 }
-                if s == -1 {
+                if kv == -1 {
                     return Some(Rewrite::Identity { pass_through: *a });
                 }
             }
             if let Some((kv, _)) = const_int(consts, *a) {
-                let s = sext(kv, int_w.bits());
-                if s == 0 {
+                if kv == 0 {
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(0, int_w)));
                 }
-                if s == -1 {
+                if kv == -1 {
                     return Some(Rewrite::Identity { pass_through: *b });
                 }
             }
@@ -232,20 +233,18 @@ fn rewrite_for(
         // ---- bit_or ----------------------------------------------------
         InstKind::BitOr(a, b) => {
             if let Some((kv, _)) = const_int(consts, *b) {
-                let s = sext(kv, int_w.bits());
-                if s == 0 {
+                if kv == 0 {
                     return Some(Rewrite::Identity { pass_through: *a });
                 }
-                if s == -1 {
+                if kv == -1 {
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(-1, int_w)));
                 }
             }
             if let Some((kv, _)) = const_int(consts, *a) {
-                let s = sext(kv, int_w.bits());
-                if s == 0 {
+                if kv == 0 {
                     return Some(Rewrite::Identity { pass_through: *b });
                 }
-                if s == -1 {
+                if kv == -1 {
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(-1, int_w)));
                 }
             }
@@ -253,15 +252,11 @@ fn rewrite_for(
         }
         // ---- bit_xor ---------------------------------------------------
         InstKind::BitXor(a, b) => {
-            if let Some((kv, _)) = const_int(consts, *b) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::Identity { pass_through: *a });
-                }
+            if let Some((0, _)) = const_int(consts, *b) {
+                return Some(Rewrite::Identity { pass_through: *a });
             }
-            if let Some((kv, _)) = const_int(consts, *a) {
-                if sext(kv, int_w.bits()) == 0 {
-                    return Some(Rewrite::Identity { pass_through: *b });
-                }
+            if let Some((0, _)) = const_int(consts, *a) {
+                return Some(Rewrite::Identity { pass_through: *b });
             }
             None
         }
