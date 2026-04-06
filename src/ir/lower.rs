@@ -1705,68 +1705,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::ForallConstruct { specs, mask, body, .. } => {
-            // FORALL: lower as nested loops with optional mask.
-            // For each spec (i=start:end:step), create a DO-style loop.
-            // Apply mask inside the innermost loop.
-            for spec in specs {
-                let var_opt = Some(spec.var.clone());
-                let start_opt = Some(spec.start.clone());
-                let end_opt = Some(spec.end.clone());
-                lower_do_loop(b, ctx, DoLoopFields {
-                    name: &None,
-                    var: &var_opt,
-                    start: &start_opt,
-                    end: &end_opt,
-                    step: &spec.step,
-                    body: &[], // empty — we handle body after all loops
-                });
-            }
-            // Now in the innermost loop body, apply mask and execute body.
-            if let Some(mask_expr) = mask {
-                let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
-                let bb_body = b.create_block("forall_body");
-                let bb_skip = b.create_block("forall_skip");
-                b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
-                b.set_block(bb_body);
-                lower_stmts(b, ctx, body);
-                if b.func().block(b.current_block()).terminator.is_none() {
-                    b.branch(bb_skip, vec![]);
-                }
-                b.set_block(bb_skip);
-            } else {
-                lower_stmts(b, ctx, body);
-            }
+            // FORALL: nest loops. The body goes inside the innermost loop.
+            // Build the body statements including optional mask as a closure-like pattern.
+            // The innermost loop gets the real body; outer loops wrap it.
+            lower_forall_nested(b, ctx, specs, mask.as_ref(), body);
         }
 
         Stmt::ForallStmt { specs, mask, stmt } => {
-            // Single-line FORALL: same approach.
-            for spec in specs {
-                let var_opt = Some(spec.var.clone());
-                let start_opt = Some(spec.start.clone());
-                let end_opt = Some(spec.end.clone());
-                lower_do_loop(b, ctx, DoLoopFields {
-                    name: &None,
-                    var: &var_opt,
-                    start: &start_opt,
-                    end: &end_opt,
-                    step: &spec.step,
-                    body: &[],
-                });
-            }
-            if let Some(mask_expr) = mask {
-                let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
-                let bb_body = b.create_block("forall_stmt_body");
-                let bb_skip = b.create_block("forall_stmt_skip");
-                b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
-                b.set_block(bb_body);
-                lower_stmt(b, ctx, stmt);
-                if b.func().block(b.current_block()).terminator.is_none() {
-                    b.branch(bb_skip, vec![]);
-                }
-                b.set_block(bb_skip);
-            } else {
-                lower_stmt(b, ctx, stmt);
-            }
+            let body_vec = vec![(**stmt).clone()];
+            lower_forall_nested(b, ctx, specs, mask.as_ref(), &body_vec);
         }
 
         Stmt::SelectType { selector, guards, assoc_name: _, .. } => {
@@ -2680,6 +2627,85 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Lower FORALL by nesting loops recursively. The body executes inside the innermost loop.
+fn lower_forall_nested(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[crate::ast::stmt::ForallSpec],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    body: &[SpannedStmt],
+) {
+    if specs.is_empty() {
+        // Innermost level: apply mask and execute body.
+        if let Some(mask_expr) = mask {
+            let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
+            let bb_body = b.create_block("forall_body");
+            let bb_skip = b.create_block("forall_skip");
+            b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
+            b.set_block(bb_body);
+            lower_stmts(b, ctx, body);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_skip, vec![]);
+            }
+            b.set_block(bb_skip);
+        } else {
+            lower_stmts(b, ctx, body);
+        }
+    } else {
+        // Wrap remaining specs in a DO loop. The loop body recurses to handle inner specs.
+        let spec = &specs[0];
+        let remaining = &specs[1..];
+
+        // Build the inner body as a FORALL of remaining specs + body.
+        // We use lower_do_loop with the body being the recursive FORALL.
+        // But lower_do_loop takes &[SpannedStmt], not a closure.
+        // Instead, manually build the loop structure.
+        let key = spec.var.to_lowercase();
+        let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
+            let addr = b.alloca(IrType::Int(IntWidth::I32));
+            ctx.locals.insert(key.clone(), LocalInfo {
+                addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
+                allocatable: false, by_ref: false, char_kind: CharKind::None,
+                derived_type: None,
+            });
+            addr
+        });
+
+        let init_val = lower_expr(b, &ctx.locals, &spec.start, ctx.st);
+        b.store(init_val, var_addr);
+        let end_val = lower_expr(b, &ctx.locals, &spec.end, ctx.st);
+        let step_val = spec.step.as_ref()
+            .map(|s| lower_expr(b, &ctx.locals, s, ctx.st))
+            .unwrap_or_else(|| b.const_i32(1));
+
+        let bb_check = b.create_block("forall_check");
+        let bb_loop = b.create_block("forall_loop");
+        let bb_incr = b.create_block("forall_incr");
+        let bb_exit = b.create_block("forall_exit");
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_check);
+        let cur = b.load(var_addr);
+        let done = b.icmp(CmpOp::Gt, cur, end_val);
+        b.cond_branch(done, bb_exit, vec![], bb_loop, vec![]);
+
+        b.set_block(bb_loop);
+        // Recurse: lower remaining specs + body inside this loop.
+        lower_forall_nested(b, ctx, remaining, mask, body);
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(bb_incr, vec![]);
+        }
+
+        b.set_block(bb_incr);
+        let cur2 = b.load(var_addr);
+        let next = b.iadd(cur2, step_val);
+        b.store(next, var_addr);
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_exit);
+    }
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -2758,6 +2784,17 @@ fn lower_array_assign(
 
         b.set_block(bb_exit);
     }
+}
+
+/// Check if the first argument refers to a REAL array (for type dispatch).
+fn first_arg_is_real(args: &[crate::ast::expr::Argument], locals: &HashMap<String, LocalInfo>) -> bool {
+    args.first().and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            if let Expr::Name { name } = &e.node {
+                locals.get(&name.to_lowercase()).map(|i| i.ty.is_float())
+            } else { None }
+        } else { None }
+    }).unwrap_or(false)
 }
 
 /// Lower an array section expression: a(1:10:2) → create section descriptor.
@@ -2896,21 +2933,44 @@ fn lower_array_intrinsic(
                 vec![desc], IrType::Int(IntWidth::I32)))
         }
         "sum" => {
-            // Dispatch based on element type. Default to integer sum.
-            Some(b.call(FuncRef::External("afs_array_sum_int".into()),
-                vec![desc], IrType::Int(IntWidth::I64)))
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_sum_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_sum_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
         }
         "product" => {
-            Some(b.call(FuncRef::External("afs_array_product_real8".into()),
-                vec![desc], IrType::Float(FloatWidth::F64)))
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_product_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_product_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
         }
         "maxval" => {
-            Some(b.call(FuncRef::External("afs_array_maxval_int".into()),
-                vec![desc], IrType::Int(IntWidth::I32)))
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_maxval_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_maxval_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I32)))
+            }
         }
         "minval" => {
-            Some(b.call(FuncRef::External("afs_array_minval_int".into()),
-                vec![desc], IrType::Int(IntWidth::I32)))
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_minval_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_minval_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I32)))
+            }
         }
         "dot_product" => {
             let second_desc = args.get(1).and_then(|a| {

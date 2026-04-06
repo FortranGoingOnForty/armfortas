@@ -521,6 +521,56 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     prod
 }
 
+/// PRODUCT(array) — product of all elements (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 1; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 1; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return 1; }
+    let ptr = d.base_addr as *const i32;
+    let mut prod: i64 = 1;
+    for i in 0..n {
+        prod *= unsafe { *ptr.add(i) } as i64;
+    }
+    prod
+}
+
+/// MAXVAL(array) — maximum element (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return f64::NEG_INFINITY; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return f64::NEG_INFINITY; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return f64::NEG_INFINITY; }
+    let ptr = d.base_addr as *const f64;
+    let mut max = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i) };
+        if v > max { max = v; }
+    }
+    max
+}
+
+/// MINVAL(array) — minimum element (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return f64::INFINITY; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return f64::INFINITY; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return f64::INFINITY; }
+    let ptr = d.base_addr as *const f64;
+    let mut min = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i) };
+        if v < min { min = v; }
+    }
+    min
+}
+
 /// MAXVAL(array) — maximum element (integer(4) version).
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
