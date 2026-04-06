@@ -8,6 +8,7 @@ use super::pass::PassManager;
 use super::const_fold::ConstFold;
 use super::const_prop::ConstProp;
 use super::dce::Dce;
+use super::cse::LocalCse;
 
 /// Compiler optimization levels.
 ///
@@ -87,6 +88,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         OptLevel::O1 => {
             // Cheap, always-correct cleanup.
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
@@ -95,6 +97,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // bounds-check elim, GVN, SROA, DSE, small loop unroll,
             // FMA fusion. Os trims unrolling/inlining heuristics.
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
@@ -103,6 +106,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // devirtualization, speculative optimizations.
             // Ofast additionally enables fast-math reassociation.
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }

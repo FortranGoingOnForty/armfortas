@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod const_fold;
 pub mod const_prop;
 pub mod dce;
+pub mod cse;
 
 #[allow(unused_imports)]
 pub use pass::{Pass, PassManager, PassRunResult};
@@ -22,3 +23,5 @@ pub use const_fold::ConstFold;
 pub use const_prop::ConstProp;
 #[allow(unused_imports)]
 pub use dce::Dce;
+#[allow(unused_imports)]
+pub use cse::LocalCse;
