@@ -3173,11 +3173,28 @@ fn lower_array_intrinsic(
                     } else { None }
                 } else { None }
             })?;
-            Some(b.call(FuncRef::External("afs_dot_product_real8".into()),
-                vec![desc, second_desc], IrType::Float(FloatWidth::F64)))
+            // Get the first arg's element type for dispatch.
+            let elem_ty = args.first().and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase()).map(|i| i.ty.clone())
+                    } else { None }
+                } else { None }
+            }).unwrap_or(IrType::Float(FloatWidth::F64));
+            match &elem_ty {
+                IrType::Float(FloatWidth::F64) => Some(b.call(
+                    FuncRef::External("afs_dot_product_real8".into()),
+                    vec![desc, second_desc], IrType::Float(FloatWidth::F64))),
+                IrType::Float(FloatWidth::F32) => Some(b.call(
+                    FuncRef::External("afs_dot_product_real4".into()),
+                    vec![desc, second_desc], IrType::Float(FloatWidth::F32))),
+                _ => Some(b.call(
+                    FuncRef::External("afs_dot_product_int".into()),
+                    vec![desc, second_desc], IrType::Int(IntWidth::I64))),
+            }
         }
         "matmul" => {
-            // MATMUL(a, b) → allocate result descriptor, call afs_matmul_real8, return descriptor.
+            // MATMUL(a, b) → allocate result descriptor, dispatch by type.
             let second_desc = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                     if let Expr::Name { name } = &e.node {
@@ -3187,23 +3204,27 @@ fn lower_array_intrinsic(
                     } else { None }
                 } else { None }
             })?;
+            let is_real = first_arg_is_real(args, locals);
             let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero = b.const_i32(0);
             let sz384 = b.const_i64(384);
             b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            b.call(FuncRef::External("afs_matmul_real8".into()),
+            let func = if is_real { "afs_matmul_real8" } else { "afs_matmul_int" };
+            b.call(FuncRef::External(func.into()),
                 vec![desc, second_desc, result_desc], IrType::Void);
             Some(result_desc)
         }
         "transpose" => {
-            // TRANSPOSE(source) → allocate result descriptor, call afs_transpose_real8.
+            // TRANSPOSE(source) → allocate result descriptor, dispatch by type.
+            let is_real = first_arg_is_real(args, locals);
             let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero = b.const_i32(0);
             let sz384 = b.const_i64(384);
             b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            b.call(FuncRef::External("afs_transpose_real8".into()),
+            let func = if is_real { "afs_transpose_real8" } else { "afs_transpose_int" };
+            b.call(FuncRef::External(func.into()),
                 vec![desc, result_desc], IrType::Void);
             Some(result_desc)
         }
@@ -3426,12 +3447,15 @@ fn lower_expr_full(
                 } else if info.by_ref {
                     // Pass-by-reference param: load the pointer, then load through it.
                     let ptr = b.load(info.addr);
-                    b.load(ptr)
+                    b.load_typed(ptr, info.ty.clone())
                 } else {
-                    b.load(info.addr)
+                    // Use load_typed with the local's declared type to handle cases
+                    // where the address pointer type doesn't exactly match (e.g.,
+                    // WHERE substitution using byte-level GEP).
+                    b.load_typed(info.addr, info.ty.clone())
                 }
             } else {
-                b.const_i32(0) // implicit or unknown
+                b.const_i32(0)
             }
         }
 
