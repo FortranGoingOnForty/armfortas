@@ -39,10 +39,29 @@ enum Const {
 }
 
 impl Const {
+    /// Build a `Const` from a constant-producing instruction, putting
+    /// the stored value into its **canonical** form for the declared
+    /// width. Audit N-9 (root-cause fix for N-1/M-1/M-2/M-5):
+    ///
+    ///  * Integer values are sign-extended at their width. After this
+    ///    call, `Const::Int(-1, I8)` and `Const::Int(255, I8)` both
+    ///    land at the same stored value (`-1`), so downstream folds
+    ///    can destructure `Const::Int(av, _)` without needing to
+    ///    re-sext at the source width. This retires 12+ width-drift
+    ///    hazards across IAdd/ISub/IMul/IDiv/IMod/BitAnd/... in one
+    ///    move.
+    ///  * Float values are rounded through their declared precision
+    ///    (f32 values become exactly representable in f32 after
+    ///    `v as f32 as f64`). This is belt-and-suspenders on top of
+    ///    the producer-side guarantee from M-1.
     fn from_inst(kind: &InstKind) -> Option<Self> {
         match kind {
-            InstKind::ConstInt(v, w) => Some(Const::Int(*v, *w)),
-            InstKind::ConstFloat(v, w) => Some(Const::Float(*v, *w)),
+            InstKind::ConstInt(v, w) => {
+                Some(Const::Int(sext(*v, w.bits()), *w))
+            }
+            InstKind::ConstFloat(v, w) => {
+                Some(Const::Float(round_for_width(*v, *w), *w))
+            }
             InstKind::ConstBool(b) => Some(Const::Bool(*b)),
             _ => None,
         }

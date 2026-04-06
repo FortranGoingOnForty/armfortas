@@ -745,6 +745,200 @@ fn audit_const_fold_lshr_negative_count_bails() {
 }
 
 // =============================================================
+// FINDING N-1 / N-9 (re-re-audit): width drift in integer
+// arithmetic folds. The B-1 Select fix was applied only to
+// Select; the same shape exists in every binary int op. The N-9
+// root-cause fix normalizes at `Const::from_inst`, so every
+// downstream fold now operates on canonical (sign-extended)
+// values regardless of how the source ConstInt is stored.
+// =============================================================
+//
+// Each test builds a synthetic i32 operation whose operands are
+// ConstInt(_, I8) with raw values that represent different signed
+// values. Without N-9, the folds would compute on the raw i64
+// storage and produce wrong results. With N-9, the stored values
+// are canonicalized at insert, so the fold gets the correct
+// signed interpretation.
+
+#[test]
+fn audit_const_fold_width_drift_iadd() {
+    // a: ConstInt(255, I8)  = -1 at i8
+    // b: ConstInt(2,   I8)  = 2  at i8
+    // declared IAdd type: i32
+    // Expected: -1 + 2 = 1
+    // Pre-fix: 255 + 2 = 257 (wrong)
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let a = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let b = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: b, kind: InstKind::ConstInt(2, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let sum = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: sum, kind: InstKind::IAdd(a, b),
+        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+    });
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == sum).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(1, IntWidth::I32) => { /* good */ }
+        InstKind::ConstInt(v, w) => panic!(
+            "audit N-1 IAdd: expected ConstInt(1, I32), got ConstInt({}, {:?}) — width drift",
+            v, w
+        ),
+        ref other => panic!("expected ConstInt fold, got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_const_fold_width_drift_isub() {
+    // a: ConstInt(250, I8)  = -6
+    // b: ConstInt(1,   I8)  =  1
+    // Expected: -6 - 1 = -7
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let a = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: a, kind: InstKind::ConstInt(250, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let b = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: b, kind: InstKind::ConstInt(1, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let diff = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: diff, kind: InstKind::ISub(a, b),
+        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+    });
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(diff)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == diff).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(-7, IntWidth::I32) => { /* good */ }
+        ref other => panic!("audit N-1 ISub: expected ConstInt(-7, I32), got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_const_fold_width_drift_imul() {
+    // a: ConstInt(255, I8)  = -1
+    // b: ConstInt(3,   I8)  =  3
+    // Expected: -1 * 3 = -3
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let a = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let b = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: b, kind: InstKind::ConstInt(3, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let prod = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: prod, kind: InstKind::IMul(a, b),
+        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+    });
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(prod)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == prod).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(-3, IntWidth::I32) => { /* good */ }
+        ref other => panic!("audit N-1 IMul: expected ConstInt(-3, I32), got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_const_fold_width_drift_idiv() {
+    // a: ConstInt(255, I8)  = -1
+    // b: ConstInt(2,   I8)  =  2
+    // Expected: -1 / 2 = 0 (toward zero)
+    // Pre-fix: 255 / 2 = 127 (very wrong)
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let a = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let b = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: b, kind: InstKind::ConstInt(2, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let q = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: q, kind: InstKind::IDiv(a, b),
+        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+    });
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(q)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == q).unwrap();
+    match folded.kind {
+        InstKind::ConstInt(0, IntWidth::I32) => { /* good */ }
+        ref other => panic!("audit N-1 IDiv: expected ConstInt(0, I32), got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_const_fold_width_drift_icmp() {
+    // a: ConstInt(255, I8)  = -1
+    // b: ConstInt(0,   I8)  =  0
+    // ICmp Lt: -1 < 0 → true
+    // Pre-fix (if ICmp also discarded widths): 255 < 0 → false
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Bool);
+    let a = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let b = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: b, kind: InstKind::ConstInt(0, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+    });
+    let lt = f.next_value_id();
+    f.block_mut(f.entry).insts.push(Inst {
+        id: lt, kind: InstKind::ICmp(CmpOp::Lt, a, b),
+        ty: IrType::Bool, span: dummy_span(),
+    });
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Return(Some(lt)));
+    m.add_function(f);
+
+    ConstFold.run(&mut m);
+    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == lt).unwrap();
+    match folded.kind {
+        InstKind::ConstBool(true) => { /* good */ }
+        ref other => panic!("audit N-1 ICmp: expected ConstBool(true), got {:?}", other),
+    }
+}
+
+// =============================================================
 // FINDING B-8: CSE must dedupe semantically-equal ConstInts
 // stored at different bit patterns at the same width.
 // =============================================================
