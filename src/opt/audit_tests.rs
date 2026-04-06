@@ -288,52 +288,99 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
 }
 
 // =============================================================
-// FINDING Med-5 (cascading): removing a block param can expose
-// a second param as dead, requiring multiple outer iterations.
+// FINDING Med-5 / N-2 (cascading): DCE must iterate its outer
+// loop until a fixpoint — removing one block param in round 1
+// can expose a *different* block param as dead in round 2.
 // =============================================================
 //
-// target(p0:i32, p1:i32):
-//     ret ; p0 and p1 both unused
-// entry: br target(c0, c1)
+// Shape (audit N-2 — the previous version of this test had both
+// params dead from the start and could be satisfied in a single
+// outer iteration, so it didn't actually pin cascading):
 //
-// Both params are dead. Removing p0 (first iteration) shifts p1
-// to index 0; the next outer iteration must still find p1 dead
-// and remove it.
+//   entry:
+//     %c = const 5
+//     br other(%c)              ; passes %c → p_other
+//
+//   other(p_other):
+//     %u = ineg p_other         ; ONLY use of p_other
+//     br target(%u)              ; passes %u → p_target
+//
+//   target(p_target):            ; p_target is dead
+//     ret
+//
+// Required rounds:
+//   R1: remove p_target, drop branch arg %u from other.
+//   R1 inner DCE: %u is now dead, remove it.  Now p_other is
+//                 unreferenced.
+//   R2: remove p_other, drop branch arg %c from entry.
+//   R2 inner DCE: %c is now dead, remove it.
+//   R3: no more params to remove, exit.
+//
+// If the outer loop were stuck at 1 iteration, p_other would
+// survive.
 #[test]
-fn audit_dce_removes_two_dead_params_cascading() {
+fn audit_dce_cascading_across_outer_iterations() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+    // entry: computes %c, branches to other
+    let c = push(&mut f, InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32));
+
+    // other: has param p_other, computes %u = ineg p_other, branches to target
+    let other = f.create_block("other");
+    let p_other = f.next_value_id();
+    f.block_mut(other).params.push(BlockParam {
+        id: p_other, ty: IrType::Int(IntWidth::I32),
+    });
+    let u = f.next_value_id();
+    f.block_mut(other).insts.push(Inst {
+        id: u, kind: InstKind::INeg(p_other),
+        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+    });
+
+    // target: has param p_target, returns (p_target never used).
     let target = f.create_block("target");
-    let p0 = f.next_value_id();
-    let p1 = f.next_value_id();
-    f.block_mut(target).params.push(BlockParam { id: p0, ty: IrType::Int(IntWidth::I32) });
-    f.block_mut(target).params.push(BlockParam { id: p1, ty: IrType::Int(IntWidth::I32) });
-    let c0 = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let c1 = push(&mut f, InstKind::ConstInt(8, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let entry = f.entry;
-    f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![c0, c1]));
+    let p_target = f.next_value_id();
+    f.block_mut(target).params.push(BlockParam {
+        id: p_target, ty: IrType::Int(IntWidth::I32),
+    });
     f.block_mut(target).terminator = Some(Terminator::Return(None));
+
+    // Wire: entry → other(%c), other → target(%u)
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Branch(other, vec![c]));
+    f.block_mut(other).terminator = Some(Terminator::Branch(target, vec![u]));
     m.add_function(f);
 
     Dce.run(&mut m);
 
     let f = &m.functions[0];
-    let target_block = f.block(target);
-    assert_eq!(target_block.params.len(), 0, "both dead params must be removed");
 
-    // The branch arg list must also be empty after both removals.
-    let entry_term = f.block(f.entry).terminator.as_ref().unwrap();
-    match entry_term {
+    // Both block params must be gone.
+    assert_eq!(f.block(target).params.len(), 0,
+        "p_target should be removed in round 1");
+    assert_eq!(f.block(other).params.len(), 0,
+        "p_other should be removed in round 2 (cascading)");
+
+    // Entry's branch arg list must be empty.
+    match f.block(f.entry).terminator.as_ref().unwrap() {
         Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
-            "all branch args must drop in lockstep"),
+            "entry's branch to other should have no args after cascade"),
+        _ => panic!(),
+    }
+    // other's branch to target must also have no args.
+    match f.block(other).terminator.as_ref().unwrap() {
+        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
+            "other's branch to target should have no args"),
         _ => panic!(),
     }
 
-    // c0 and c1 are now dead — DCE should have removed them too.
-    let any_const = f.blocks.iter()
+    // All formerly-live values should be DCE'd: %c, %u.
+    let any_inst = f.blocks.iter()
         .flat_map(|b| b.insts.iter())
-        .any(|i| matches!(i.kind, InstKind::ConstInt(7, _) | InstKind::ConstInt(8, _)));
-    assert!(!any_const, "dead constant args should be DCE'd after their consumers vanish");
+        .any(|i| i.id == c || i.id == u);
+    assert!(!any_inst,
+        "dead instructions %c (const) and %u (ineg) should be DCE'd after the cascade");
 }
 
 // =============================================================
