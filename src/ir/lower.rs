@@ -1634,6 +1634,81 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_select_case(b, ctx, selector, cases);
         }
 
+        Stmt::SelectType { selector, guards, assoc_name, .. } => {
+            // SELECT TYPE: compare the type tag of a polymorphic variable.
+            // For now, support basic pattern where selector is a local derived type
+            // variable and TYPE IS guards match by type tag.
+            let bb_end = b.create_block("select_type_end");
+
+            // Get the selector's type tag. For non-polymorphic variables,
+            // we know the static type and can match directly.
+            let static_type = if let Expr::Name { name } = &selector.node {
+                let key = name.to_lowercase();
+                ctx.locals.get(&key).and_then(|info| info.derived_type.clone())
+            } else { None };
+
+            if let Some(ref type_name) = static_type {
+                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                    let tag_val = b.const_i64(layout.type_tag as i64);
+
+                    for guard in guards {
+                        match guard {
+                            crate::ast::stmt::TypeGuard::TypeIs { type_name: guard_type, body } => {
+                                if let Some(guard_layout) = ctx.type_layouts.get(guard_type) {
+                                    let guard_tag = b.const_i64(guard_layout.type_tag as i64);
+                                    let matches = b.icmp(CmpOp::Eq, tag_val, guard_tag);
+                                    let bb_match = b.create_block("type_is_match");
+                                    let bb_next = b.create_block("type_is_next");
+                                    b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
+
+                                    b.set_block(bb_match);
+                                    lower_stmts(b, ctx, body);
+                                    if b.func().block(b.current_block()).terminator.is_none() {
+                                        b.branch(bb_end, vec![]);
+                                    }
+
+                                    b.set_block(bb_next);
+                                } else {
+                                    // Unknown guard type — skip.
+                                    let tag_matches = type_name.eq_ignore_ascii_case(guard_type);
+                                    if tag_matches {
+                                        lower_stmts(b, ctx, body);
+                                        if b.func().block(b.current_block()).terminator.is_none() {
+                                            b.branch(bb_end, vec![]);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            crate::ast::stmt::TypeGuard::ClassIs { type_name: guard_type, body } => {
+                                // CLASS IS matches the type or any extension.
+                                // Check if static type is or extends the guard type.
+                                let is_match = is_type_or_extends(type_name, guard_type, ctx.type_layouts);
+                                if is_match {
+                                    lower_stmts(b, ctx, body);
+                                    if b.func().block(b.current_block()).terminator.is_none() {
+                                        b.branch(bb_end, vec![]);
+                                    }
+                                    break; // CLASS IS matched, skip remaining guards.
+                                }
+                            }
+                            crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                                lower_stmts(b, ctx, body);
+                                if b.func().block(b.current_block()).terminator.is_none() {
+                                    b.branch(bb_end, vec![]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_end, vec![]);
+            }
+            b.set_block(bb_end);
+        }
+
         Stmt::Exit { name } => {
             if let Some(lp) = ctx.find_loop(name) {
                 let exit = lp.exit;
@@ -2470,6 +2545,24 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Check if `actual_type` is or extends `target_type` (for CLASS IS matching).
+fn is_type_or_extends(actual_type: &str, target_type: &str, tl: &crate::sema::type_layout::TypeLayoutRegistry) -> bool {
+    if actual_type.eq_ignore_ascii_case(target_type) { return true; }
+    // Walk the parent chain.
+    let mut current = actual_type.to_lowercase();
+    loop {
+        let layout = match tl.get(&current) {
+            Some(l) => l,
+            None => return false,
+        };
+        match &layout.parent {
+            Some(parent) if parent.eq_ignore_ascii_case(target_type) => return true,
+            Some(parent) => current = parent.to_lowercase(),
+            None => return false,
+        }
+    }
+}
+
 /// Convert TypeInfo to IR type for field loads.
 fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     use crate::sema::symtab::TypeInfo;
