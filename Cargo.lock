@@ -7,6 +7,13 @@ name = "afs-as"
 version = "0.1.0"
 
 [[package]]
+name = "afs-tests"
+version = "0.1.0"
+dependencies = [
+ "armfortas",
+]
+
+[[package]]
 name = "armfortas"
 version = "0.1.0"
 dependencies = [
