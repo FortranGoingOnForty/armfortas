@@ -301,4 +301,82 @@ mod tests {
         assert!(reg.get("MYTYPE").is_some());
         assert!(reg.get("other").is_none());
     }
+
+    /// Helper: build a component declaration for testing compute_layout.
+    fn make_component(name: &str, ts: crate::ast::decl::TypeSpec) -> crate::ast::decl::SpannedDecl {
+        use crate::ast::decl::*;
+        use crate::ast::Spanned;
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span { start: pos, end: pos, file_id: 0 };
+        Spanned::new(Decl::TypeDecl {
+            type_spec: ts,
+            attrs: vec![],
+            entities: vec![EntityDecl {
+                name: name.to_string(),
+                array_spec: None,
+                char_len: None,
+                init: None,
+                ptr_init: None,
+            }],
+        }, span)
+    }
+
+    #[test]
+    fn compute_layout_simple_struct() {
+        // type :: pair; integer :: x; real :: y; end type
+        let reg = TypeLayoutRegistry::new();
+        let components = vec![
+            make_component("x", crate::ast::decl::TypeSpec::Integer(None)),
+            make_component("y", crate::ast::decl::TypeSpec::Real(None)),
+        ];
+        let layout = compute_layout("pair", &[], &[], &components, None, &reg);
+        assert_eq!(layout.name, "pair");
+        assert_eq!(layout.size, 8); // 4 + 4, no padding needed
+        assert_eq!(layout.align, 4);
+        assert_eq!(layout.fields.len(), 2);
+        assert_eq!(layout.field("x").unwrap().offset, 0);
+        assert_eq!(layout.field("y").unwrap().offset, 4);
+    }
+
+    #[test]
+    fn compute_layout_with_padding() {
+        // type :: padded; integer(1) :: a; real(8) :: b; end type
+        // a(1) + 7pad + b(8) = 16
+        let reg = TypeLayoutRegistry::new();
+        let components = vec![
+            make_component("a", crate::ast::decl::TypeSpec::Integer(
+                Some(crate::ast::decl::KindSelector::Expr(
+                    crate::ast::Spanned::new(
+                        crate::ast::expr::Expr::IntegerLiteral { text: "1".into(), kind: None },
+                        crate::lexer::Span { start: crate::lexer::Position { line: 0, col: 0 }, end: crate::lexer::Position { line: 0, col: 0 }, file_id: 0 },
+                    )
+                ))
+            )),
+            make_component("b", crate::ast::decl::TypeSpec::DoublePrecision),
+        ];
+        let layout = compute_layout("padded", &[], &[], &components, None, &reg);
+        assert_eq!(layout.field("a").unwrap().offset, 0);
+        assert_eq!(layout.field("a").unwrap().size, 1);
+        assert_eq!(layout.field("b").unwrap().offset, 8); // padded to 8-byte alignment
+        assert_eq!(layout.field("b").unwrap().size, 8);
+        assert_eq!(layout.size, 16);
+        assert_eq!(layout.align, 8);
+    }
+
+    #[test]
+    fn compute_layout_with_extends() {
+        // type :: base; integer :: x; end type
+        // type, extends(base) :: child; real :: y; end type
+        let reg = TypeLayoutRegistry::new();
+        let base_comps = vec![make_component("x", crate::ast::decl::TypeSpec::Integer(None))];
+        let base_layout = compute_layout("base", &[], &[], &base_comps, None, &reg);
+        assert_eq!(base_layout.size, 4);
+
+        let child_comps = vec![make_component("y", crate::ast::decl::TypeSpec::Real(None))];
+        let child_layout = compute_layout("child", &[], &[], &child_comps, Some(&base_layout), &reg);
+        assert_eq!(child_layout.fields.len(), 2); // x + y
+        assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
+        assert_eq!(child_layout.field("y").unwrap().offset, 4); // appended
+        assert_eq!(child_layout.size, 8);
+    }
 }

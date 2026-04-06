@@ -180,7 +180,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                         b.store(*pid, slot);
                         // Check if this is a derived type parameter.
                         let dt_name = arg_derived_type_name(pname, decls);
-                        let mut info = LocalInfo {
+                        let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name,
@@ -2765,9 +2765,19 @@ fn lower_expr_full(
                 // Check if this is a structure constructor: type_name(val1, val2, ...).
                 if let Some(tl) = type_layouts {
                     if let Some(layout) = tl.get(&key) {
-                        // Allocate a temporary struct on the stack.
+                        // Allocate a temporary struct on the stack and zero-initialize.
                         let struct_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let tmp = b.alloca(struct_ty);
+                        let zero = b.const_i32(0);
+                        let sz = b.const_i64(layout.size as i64);
+                        b.call(FuncRef::External("memset".into()), vec![tmp, zero, sz],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+                        if args.len() != layout.fields.len() {
+                            eprintln!("warning: structure constructor for '{}' has {} args but type has {} fields",
+                                key, args.len(), layout.fields.len());
+                        }
+
                         // Store each argument into the corresponding field.
                         for (i, arg) in args.iter().enumerate() {
                             if i < layout.fields.len() {
@@ -2779,7 +2789,7 @@ fn lower_expr_full(
                                 }
                             }
                         }
-                        return tmp; // return pointer to the constructed struct
+                        return tmp;
                     }
                 }
 
@@ -2834,7 +2844,6 @@ fn lower_expr_full(
         }
 
         Expr::ComponentAccess { base, component } => {
-            // Resolve the base to (struct_address, type_name), then access the component.
             if let Some(tl) = type_layouts {
                 if let Some((base_addr, type_name)) = resolve_component_base(b, locals, base, tl) {
                     if let Some(layout) = tl.get(&type_name) {
@@ -2851,10 +2860,12 @@ fn lower_expr_full(
                             let ir_ty = type_info_to_ir_type(&field.type_info);
                             return b.load_typed(field_ptr, ir_ty);
                         }
+                    } else {
+                        eprintln!("warning: no field '{}' in type '{}'", component, type_name);
                     }
                 }
             }
-            b.const_i32(0)
+            b.const_i32(0) // fallback for unresolved component access
         }
 
         _ => b.const_i32(0), // placeholder for unhandled expressions
