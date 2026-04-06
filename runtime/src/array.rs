@@ -427,7 +427,150 @@ mod tests {
         afs_allocate_1d(&mut desc, 4, 0);
         assert!(desc.is_allocated());
         assert_eq!(desc.total_elements(), 0);
-        // base_addr may be null for zero-size.
         afs_deallocate_array(&mut desc, ptr::null_mut());
     }
 }
+
+// ---- Array query intrinsics ----
+
+/// SIZE(array) — total number of elements.
+#[no_mangle]
+pub extern "C" fn afs_array_size(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 0; }
+    unsafe { (*desc).total_elements() }
+}
+
+/// SIZE(array, dim) — number of elements along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 0; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize {
+        d.dims[idx].extent()
+    } else { 0 }
+}
+
+/// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 1; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize { d.dims[idx].lower_bound } else { 1 }
+}
+
+/// UBOUND(array, dim) — upper bound along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_ubound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 0; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize { d.dims[idx].upper_bound } else { 0 }
+}
+
+/// ALLOCATED(array) — check if array is allocated (returns 1 or 0).
+#[no_mangle]
+pub extern "C" fn afs_array_allocated(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return 0; }
+    unsafe { (*desc).is_allocated() as i32 }
+}
+
+/// SUM(array) — sum all elements (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return 0.0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 0.0; }
+    let n = d.total_elements() as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut sum = 0.0;
+    for i in 0..n {
+        sum += unsafe { *ptr.add(i) };
+    }
+    sum
+}
+
+/// SUM(array) — sum all elements (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 0; }
+    let n = d.total_elements() as usize;
+    let ptr = d.base_addr as *const i32;
+    let mut sum: i64 = 0;
+    for i in 0..n {
+        sum += unsafe { *ptr.add(i) } as i64;
+    }
+    sum
+}
+
+/// PRODUCT(array) — product of all elements (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return 1.0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 1.0; }
+    let n = d.total_elements() as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut prod = 1.0;
+    for i in 0..n {
+        prod *= unsafe { *ptr.add(i) };
+    }
+    prod
+}
+
+/// MAXVAL(array) — maximum element (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return i32::MIN; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return i32::MIN; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return i32::MIN; }
+    let ptr = d.base_addr as *const i32;
+    let mut max = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i) };
+        if v > max { max = v; }
+    }
+    max
+}
+
+/// MINVAL(array) — minimum element (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return i32::MAX; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return i32::MAX; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return i32::MAX; }
+    let ptr = d.base_addr as *const i32;
+    let mut min = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i) };
+        if v < min { min = v; }
+    }
+    min
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_dot_product_real8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+) -> f64 {
+    if a.is_null() || b.is_null() { return 0.0; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    let n = da.total_elements().min(db.total_elements()) as usize;
+    let pa = da.base_addr as *const f64;
+    let pb = db.base_addr as *const f64;
+    let mut dot = 0.0;
+    for i in 0..n {
+        dot += unsafe { *pa.add(i) * *pb.add(i) };
+    }
+    dot
+}
+

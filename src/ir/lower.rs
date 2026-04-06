@@ -2562,6 +2562,98 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Lower array intrinsics that need descriptor addresses (SIZE, SUM, etc.).
+fn lower_array_intrinsic(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> Option<ValueId> {
+    // Get the first argument as a descriptor address (for array variables).
+    let first_arg_desc = args.first().and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            if let Expr::Name { name } = &e.node {
+                let key = name.to_lowercase();
+                locals.get(&key).filter(|i| i.allocatable || !i.dims.is_empty())
+                    .map(|i| i.addr)
+            } else { None }
+        } else { None }
+    });
+
+    let desc = first_arg_desc?;
+
+    match name {
+        "size" => {
+            if args.len() >= 2 {
+                // SIZE(array, dim)
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_size_dim".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else {
+                // SIZE(array)
+                Some(b.call(FuncRef::External("afs_array_size".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
+        }
+        "lbound" => {
+            if args.len() >= 2 {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_lbound".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else { None }
+        }
+        "ubound" => {
+            if args.len() >= 2 {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_ubound".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else { None }
+        }
+        "allocated" => {
+            Some(b.call(FuncRef::External("afs_array_allocated".into()),
+                vec![desc], IrType::Int(IntWidth::I32)))
+        }
+        "sum" => {
+            // Dispatch based on element type. Default to integer sum.
+            Some(b.call(FuncRef::External("afs_array_sum_int".into()),
+                vec![desc], IrType::Int(IntWidth::I64)))
+        }
+        "product" => {
+            Some(b.call(FuncRef::External("afs_array_product_real8".into()),
+                vec![desc], IrType::Float(FloatWidth::F64)))
+        }
+        "maxval" => {
+            Some(b.call(FuncRef::External("afs_array_maxval_int".into()),
+                vec![desc], IrType::Int(IntWidth::I32)))
+        }
+        "minval" => {
+            Some(b.call(FuncRef::External("afs_array_minval_int".into()),
+                vec![desc], IrType::Int(IntWidth::I32)))
+        }
+        "dot_product" => {
+            let second_desc = args.get(1).and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase())
+                            .filter(|i| i.allocatable || !i.dims.is_empty())
+                            .map(|i| i.addr)
+                    } else { None }
+                } else { None }
+            })?;
+            Some(b.call(FuncRef::External("afs_dot_product_real8".into()),
+                vec![desc, second_desc], IrType::Float(FloatWidth::F64)))
+        }
+        _ => None,
+    }
+}
+
 /// Check if `actual_type` is or extends `target_type` (for CLASS IS matching).
 fn is_type_or_extends(actual_type: &str, target_type: &str, tl: &crate::sema::type_layout::TypeLayoutRegistry) -> bool {
     if actual_type.eq_ignore_ascii_case(target_type) { return true; }
@@ -2890,6 +2982,11 @@ fn lower_expr_full(
                     if !info.dims.is_empty() || info.allocatable {
                         return lower_array_element(b, locals, info, args, st);
                     }
+                }
+
+                // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
+                if let Some(result) = lower_array_intrinsic(b, locals, &key, args, st) {
+                    return result;
                 }
 
                 // Check if this is a structure constructor: type_name(val1, val2, ...).
