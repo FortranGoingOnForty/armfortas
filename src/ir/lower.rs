@@ -122,6 +122,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             {
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
@@ -190,6 +191,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
@@ -260,6 +262,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_type = Some(ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -425,6 +428,99 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                 }
             }
         }
+    }
+}
+
+/// Lower initializer expressions for declared variables.
+///
+/// Handles three forms:
+///   1. `integer :: x = 42`              — TypeDecl entity with init
+///   2. `integer, parameter :: pi = 3.14` — TypeDecl entity with init + Parameter attr
+///   3. `parameter (pi = 3.14159)`       — standalone ParameterStmt referring to an
+///       already-allocated local
+///
+/// Must run *after* `alloc_decls` so that all locals exist. Only stores into
+/// scalar slots — array, character, derived-type, and allocatable initializers
+/// are not handled here (they have their own paths).
+fn init_decls(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) {
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for entity in entities {
+                    let Some(init_expr) = &entity.init else { continue; };
+                    let key = entity.name.to_lowercase();
+                    let Some(info) = locals.get(&key) else { continue; };
+                    // Only initialize plain scalar slots; arrays, characters,
+                    // allocatables, and derived types are handled elsewhere.
+                    if !info.dims.is_empty()
+                        || info.allocatable
+                        || info.by_ref
+                        || !matches!(info.char_kind, CharKind::None)
+                        || info.derived_type.is_some()
+                    {
+                        continue;
+                    }
+                    let val = lower_expr(b, locals, init_expr, st);
+                    let coerced = coerce_to_type(b, val, &info.ty);
+                    b.store(coerced, info.addr);
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    let key = name.to_lowercase();
+                    let Some(info) = locals.get(&key) else { continue; };
+                    if !info.dims.is_empty()
+                        || info.allocatable
+                        || info.by_ref
+                        || !matches!(info.char_kind, CharKind::None)
+                        || info.derived_type.is_some()
+                    {
+                        continue;
+                    }
+                    let val = lower_expr(b, locals, expr, st);
+                    let coerced = coerce_to_type(b, val, &info.ty);
+                    b.store(coerced, info.addr);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Coerce a scalar value to a target type for initializer storage.
+/// Handles int↔int width changes and int→float promotion that show up in
+/// initializers (e.g. `real :: x = 1` where the literal is i32).
+fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId {
+    let src = match b.func().value_type(val) {
+        Some(t) => t,
+        None => return val,
+    };
+    if src == *target {
+        return val;
+    }
+    match (&src, target) {
+        (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
+        (IrType::Float(FloatWidth::F32), IrType::Float(FloatWidth::F64)) => {
+            b.float_extend(val, FloatWidth::F64)
+        }
+        (IrType::Float(FloatWidth::F64), IrType::Float(FloatWidth::F32)) => {
+            b.float_trunc(val, FloatWidth::F32)
+        }
+        (IrType::Int(src_w), IrType::Int(dst_w)) => {
+            if dst_w.bits() > src_w.bits() {
+                b.int_extend(val, *dst_w, true)
+            } else if dst_w.bits() < src_w.bits() {
+                b.int_trunc(val, *dst_w)
+            } else {
+                val
+            }
+        }
+        _ => val,
     }
 }
 

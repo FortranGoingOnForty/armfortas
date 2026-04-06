@@ -96,16 +96,14 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 ## IR — Parameter Constants
 
-- **(D)** `parameter` (named constant) declarations are lowered as
-  `alloca + load` with **no intervening store** of the parameter's
-  value. At `-O0` the load returns uninitialized stack bytes; at
-  `-O1`/`-O2` mem2reg promotes the alloca to `Undef`. Surfaced by the
-  mem2reg work — the original `test_programs/const_prop.f90` was
-  passing only because the uninitialized stack happened to be
-  non-zero. Fix: in the lowerer, when a `Symbol` has
-  `kind == SymbolKind::Parameter`, inline the constant value at
-  every use site (or, equivalently, emit an `Alloca + Store(const, slot)`
-  in entry). Tracked for the parameter-lowering cleanup pass.
+- **[FIXED]** ~~`parameter` (named constant) declarations were lowered
+  as `alloca + load` with no intervening store~~. Resolved by the
+  `init_decls` pass in `src/ir/lower.rs`: after `alloc_decls` runs, a
+  second pass walks declarations and emits `store(lower(init), addr)`
+  for any scalar entity with `init`, plus standalone `parameter (...)`
+  statement pairs. Type coercion (int↔float, width changes) happens at
+  the store site. Verified at -O0/-O1/-O2/-O3 against
+  `test_programs/const_prop.f90`.
 
 ## IR — Complex Lowering (Sprint 16)
 
