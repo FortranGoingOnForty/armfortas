@@ -2730,6 +2730,26 @@ fn lower_expr_full(
         Expr::StringLiteral { value, .. } => {
             b.const_string(value.as_bytes())
         }
+        Expr::BozLiteral { text, base } => {
+            // BOZ literals: strip prefix letter and quotes, parse digit string.
+            let radix = match base {
+                crate::ast::expr::BozBase::Binary => 2,
+                crate::ast::expr::BozBase::Octal => 8,
+                crate::ast::expr::BozBase::Hex => 16,
+            };
+            // Token text is like Z'FF' or B'1010' — extract the digits between quotes.
+            let digits: String = text.chars()
+                .skip_while(|c| !matches!(c, '\'' | '"'))
+                .skip(1) // skip opening quote
+                .take_while(|c| !matches!(c, '\'' | '"'))
+                .collect();
+            let val = i64::from_str_radix(&digits, radix).unwrap_or(0);
+            if val > i32::MAX as i64 || val < i32::MIN as i64 {
+                b.const_i64(val)
+            } else {
+                b.const_i32(val as i32)
+            }
+        }
 
         Expr::Name { name } => {
             let key = name.to_lowercase();
