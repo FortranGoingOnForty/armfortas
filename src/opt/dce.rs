@@ -37,7 +37,7 @@
 
 use super::pass::Pass;
 use crate::ir::inst::*;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// True if the instruction has any side effect that prevents removal,
 /// regardless of whether its result is used.
@@ -173,31 +173,120 @@ fn prune_unreachable(func: &mut Function) -> bool {
 
 /// Run DCE over a single function. Returns true if anything changed.
 ///
-/// We iterate to a local fixpoint inside the function: removing one
-/// dead instruction can free another (its operands lose a use), so we
-/// keep going until a full sweep removes nothing. The outer pass
-/// manager will run us again if other passes also produce dead code.
+/// Two interleaved fixpoints:
+///
+/// 1. **Inner**: instruction-level mark-and-sweep. We rebuild the
+///    live set every round and drop any pure instruction whose
+///    result has no uses. Removing one instruction can make another
+///    dead (its operands lose a use), so we iterate.
+///
+/// 2. **Outer**: block-parameter cleanup. After the instructions
+///    settle, we look for block parameters whose `ValueId` no
+///    longer appears in the live-use set, drop them, and rewrite
+///    every predecessor's branch arg list to remove the
+///    corresponding slot. Removing an arg can free its defining
+///    instruction, so we re-run the inner loop afterwards. Audit
+///    finding Med-5 / C-1.
 fn dce_function(func: &mut Function) -> bool {
     let mut any_change = false;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let live = collect_live_uses(func);
-        for block in &mut func.blocks {
-            let before = block.insts.len();
-            block.insts.retain(|inst| {
-                if has_side_effect(&inst.kind) { return true; }
-                if live.contains(&inst.id) { return true; }
-                false
-            });
-            if block.insts.len() != before {
-                changed = true;
-                any_change = true;
+    let mut outer_changed = true;
+    while outer_changed {
+        outer_changed = false;
+
+        // Inner: instruction-level mark-and-sweep.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let live = collect_live_uses(func);
+            for block in &mut func.blocks {
+                let before = block.insts.len();
+                block.insts.retain(|inst| {
+                    if has_side_effect(&inst.kind) { return true; }
+                    if live.contains(&inst.id) { return true; }
+                    false
+                });
+                if block.insts.len() != before {
+                    changed = true;
+                    any_change = true;
+                }
             }
+        }
+
+        // Outer: block-parameter cleanup.
+        if remove_dead_block_params(func) {
+            any_change = true;
+            outer_changed = true;
         }
     }
     if prune_unreachable(func) { any_change = true; }
     any_change
+}
+
+/// Drop block parameters whose `ValueId` is unused, and rewrite every
+/// predecessor's branch arg list to delete the matching slot. The
+/// entry block is exempt (entry blocks aren't allowed to have
+/// parameters anyway).
+///
+/// Returns `true` if at least one parameter was removed.
+fn remove_dead_block_params(func: &mut Function) -> bool {
+    let live = collect_live_uses(func);
+
+    // Collect (block_id, param_index) pairs to remove. We process
+    // them grouped by block in *descending* index order so that
+    // earlier removals don't shift the indices we still owe.
+    let mut by_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
+    for block in func.blocks.iter() {
+        if block.id == func.entry { continue; }
+        for (idx, p) in block.params.iter().enumerate() {
+            if !live.contains(&p.id) {
+                by_block.entry(block.id).or_default().push(idx);
+            }
+        }
+    }
+    if by_block.is_empty() { return false; }
+
+    for (target_block, mut idxs) in by_block {
+        idxs.sort_by(|a, b| b.cmp(a)); // descending
+        for idx in idxs {
+            // Remove the parameter at `idx` from `target_block`.
+            if let Some(blk) = func.blocks.iter_mut().find(|b| b.id == target_block) {
+                if idx < blk.params.len() {
+                    blk.params.remove(idx);
+                }
+            }
+            // Drop the corresponding arg slot from every predecessor's
+            // terminator that branches into `target_block`.
+            for src in func.blocks.iter_mut() {
+                if let Some(term) = &mut src.terminator {
+                    drop_branch_arg(term, target_block, idx);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// In-place: if `term` branches to `target`, remove the arg at `idx`
+/// from the corresponding arg vector. No-op if the indices don't fit
+/// (defensive — shouldn't happen if the IR is well-formed, but a
+/// truncated arg list is still locally valid IR).
+fn drop_branch_arg(term: &mut Terminator, target: BlockId, idx: usize) {
+    match term {
+        Terminator::Branch(d, args) if *d == target => {
+            if idx < args.len() { args.remove(idx); }
+        }
+        Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
+            if *true_dest == target && idx < true_args.len() {
+                true_args.remove(idx);
+            }
+            if *false_dest == target && idx < false_args.len() {
+                false_args.remove(idx);
+            }
+        }
+        // Switch targets cannot have block params per the verifier;
+        // nothing to update.
+        _ => {}
+    }
 }
 
 pub struct Dce;

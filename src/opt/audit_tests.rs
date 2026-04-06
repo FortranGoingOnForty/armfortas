@@ -185,14 +185,11 @@ fn audit_const_fold_idiv_i8_min_neg_one() {
 }
 
 // =============================================================
-// FINDING C-1: DCE leaves dead block parameters in place
+// FINDING C-1 / Med-5: DCE removes dead block parameters and
+// rewrites predecessor branch args in lockstep
 // =============================================================
-//
-// A block parameter that no instruction in the function consumes
-// should be removable. Currently DCE doesn't touch block params.
-// This test pins the current behavior so we know to revisit it.
 #[test]
-fn audit_dce_does_not_remove_dead_block_param() {
+fn audit_dce_removes_dead_block_param() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let target = f.create_block("target");
@@ -207,10 +204,87 @@ fn audit_dce_does_not_remove_dead_block_param() {
     f.block_mut(target).terminator = Some(Terminator::Return(None));
     m.add_function(f);
 
+    assert!(Dce.run(&mut m), "DCE should report change");
+    let f = &m.functions[0];
+    assert_eq!(f.block(target).params.len(), 0, "dead block param must be removed");
+    // The predecessor's branch arg list must shrink in lockstep.
+    let entry_term = f.block(f.entry).terminator.as_ref().unwrap();
+    match entry_term {
+        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
+            "predecessor branch arg must be dropped alongside the dead param"),
+        _ => panic!(),
+    }
+    // The const(0) inst is now unreferenced and should also be DCE'd.
+    let const_remains = f.blocks.iter()
+        .flat_map(|b| b.insts.iter())
+        .any(|i| matches!(i.kind, InstKind::ConstInt(0, _)));
+    assert!(!const_remains, "const(0) should also be DCE'd after its only use disappears");
+}
+
+#[test]
+fn audit_dce_keeps_live_block_param() {
+    // A block param that IS used inside the block must NOT be removed.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let target = f.create_block("target");
+    let param_id = f.next_value_id();
+    f.block_mut(target).params.push(BlockParam {
+        id: param_id,
+        ty: IrType::Int(IntWidth::I32),
+    });
+    let init = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![init]));
+    f.block_mut(target).terminator = Some(Terminator::Return(Some(param_id)));
+    m.add_function(f);
+
     Dce.run(&mut m);
-    // Currently the param survives — assert and document.
-    assert_eq!(m.functions[0].block(target).params.len(), 1,
-        "DCE currently does NOT remove dead block params (audit finding C-1)");
+    let f = &m.functions[0];
+    assert_eq!(f.block(target).params.len(), 1, "live block param must survive");
+}
+
+#[test]
+fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
+    // target(p0:i32, p1:i32): ret p1
+    // entry: br target(c0, c1)
+    // p0 is dead, p1 is live. Removing p0 must drop the matching
+    // arg slot but keep p1 → c1.
+    let mut m = Module::new("t".into());
+    let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    let target = f.create_block("target");
+    let p0 = f.next_value_id();
+    let p1 = f.next_value_id();
+    f.block_mut(target).params.push(BlockParam { id: p0, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(target).params.push(BlockParam { id: p1, ty: IrType::Int(IntWidth::I32) });
+    let c0 = push(&mut f, InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let c1 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let entry = f.entry;
+    f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![c0, c1]));
+    f.block_mut(target).terminator = Some(Terminator::Return(Some(p1)));
+    m.add_function(f);
+
+    Dce.run(&mut m);
+
+    let f = &m.functions[0];
+    let target_block = f.block(target);
+    assert_eq!(target_block.params.len(), 1, "p0 should be removed");
+    assert_eq!(target_block.params[0].id, p1, "p1 should remain at index 0");
+
+    let entry_term = f.block(f.entry).terminator.as_ref().unwrap();
+    match entry_term {
+        Terminator::Branch(_, args) => {
+            assert_eq!(args.len(), 1);
+            assert_eq!(args[0], c1, "the surviving arg must be c1, not c0");
+        }
+        _ => panic!(),
+    }
+
+    // Now const(10) is dead — should also be gone after the
+    // outer-loop re-runs the inner DCE.
+    let c0_remains = f.blocks.iter()
+        .flat_map(|b| b.insts.iter())
+        .any(|i| i.id == c0);
+    assert!(!c0_remains, "const(10) should be DCE'd after its arg slot is gone");
 }
 
 // =============================================================
