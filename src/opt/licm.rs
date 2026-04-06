@@ -50,7 +50,14 @@ use crate::ir::inst::*;
 use std::collections::{HashMap, HashSet};
 
 /// True if an instruction is a candidate for LICM (pure, no aliasing
-/// concerns, no side effects).
+/// concerns, no side effects, **and safe to speculate**).
+///
+/// Audit Med-6: trap-prone arithmetic must not be hoisted out of a
+/// guarding conditional. The classic case is `if (b /= 0) c = a / b`
+/// inside a loop — once mem2reg lets LICM see real invariants, the
+/// `idiv a, b` looks invariant and pure, but hoisting it past the
+/// guard turns a safe program into a SIGFPE. We exclude every
+/// integer/float op that can trap or produce a domain error.
 fn is_hoist_candidate(kind: &InstKind) -> bool {
     !matches!(
         kind,
@@ -61,6 +68,12 @@ fn is_hoist_candidate(kind: &InstKind) -> bool {
             | InstKind::RuntimeCall(..)
             | InstKind::ConstString(..)
             | InstKind::Undef(..)
+            // Trap-prone pure operations — never speculate.
+            | InstKind::IDiv(..)
+            | InstKind::IMod(..)
+            | InstKind::FDiv(..)
+            | InstKind::FSqrt(..)
+            | InstKind::FPow(..)
     )
 }
 

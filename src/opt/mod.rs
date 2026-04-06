@@ -17,6 +17,9 @@ pub mod cse;
 pub mod strength_reduce;
 pub mod licm;
 
+#[cfg(test)]
+mod audit_tests;
+
 #[allow(unused_imports)]
 pub use pass::{Pass, PassManager, PassRunResult};
 pub use pipeline::{OptLevel, build_pipeline};

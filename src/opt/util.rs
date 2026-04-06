@@ -285,7 +285,16 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
         for &latch in &latches {
             body.insert(latch);
         }
-        let mut stack: Vec<BlockId> = latches.clone();
+        // Audit M-7: filter out latches that *are* the header
+        // (self-loops). If we walk preds(header) the BFS will
+        // enumerate the preheader as a "body" node and absorb
+        // everything reachable from the entry, which both inflates
+        // the body and makes `find_preheader` see no out-of-loop
+        // predecessor for the header.
+        let mut stack: Vec<BlockId> = latches.iter()
+            .filter(|&&l| l != header)
+            .copied()
+            .collect();
         while let Some(b) = stack.pop() {
             if let Some(plist) = preds.get(&b) {
                 for &p in plist {

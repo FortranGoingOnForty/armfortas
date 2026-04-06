@@ -303,17 +303,26 @@ impl Pass for StrengthReduce {
                         func.blocks[bi].insts[ii].kind = new_kind;
                     }
                     Rewrite::Identity { pass_through } => {
+                        // Rewire every consumer of this instruction's
+                        // result to read the pass-through value
+                        // instead. The original defining instruction
+                        // is now dead — we leave its kind alone (so
+                        // any future dominance check still sees a
+                        // valid definition for `old_id`) and rely on
+                        // DCE to remove it on the next sweep.
+                        //
+                        // Audit M-A1 / C-A: an earlier version turned
+                        // the original instruction into a placeholder
+                        // `Const(0)` here, with a `_ => continue`
+                        // fallthrough for non-int/bool result types.
+                        // The fallthrough swallowed `changed = true`
+                        // *after* `substitute_uses` had already
+                        // mutated the function — silently dropping
+                        // the change flag and skipping the next DCE
+                        // round. Removing the placeholder machinery
+                        // also removes the type-mismatch hazard.
                         substitute_uses(func, old_id, pass_through);
-                        // The defining instruction is now unused. Turn
-                        // it into a trivial `Const*` so the verifier
-                        // still sees a definition for `old_id` and DCE
-                        // can drop it on the next sweep.
-                        let placeholder = match ty {
-                            IrType::Int(w) => InstKind::ConstInt(0, w),
-                            IrType::Bool   => InstKind::ConstBool(false),
-                            _ => continue,
-                        };
-                        func.blocks[bi].insts[ii].kind = placeholder;
+                        let _ = ty; // intentionally unused
                     }
                 }
                 changed = true;

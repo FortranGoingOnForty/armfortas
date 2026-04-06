@@ -209,6 +209,14 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             }
             None
         }
+        // Audit M-B / M-C: shift counts that are negative or ≥ the
+        // operand width are *implementation-defined* in the IR. We
+        // deliberately bail (return None) so the runtime / codegen
+        // path is the single source of truth. AArch64 LSL/LSR/ASR
+        // mask the count to the low log2(width) bits — emulating
+        // that here is risky because Fortran ISHFT lowering computes
+        // both branches and selects, and a bogus folded value could
+        // leak through CSE / strength_reduce / other passes.
         InstKind::Shl(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
@@ -219,9 +227,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                             *w,
                         ));
                     }
-                    // Shift count >= width is implementation-defined
-                    // in C; AArch64 returns 0. Match that.
-                    return Some(InstKind::ConstInt(0, *w));
+                    return None;
                 }
             }
             None
@@ -229,13 +235,12 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::LShr(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    let bits = w.bits();
-                    let bv64 = bv as u32;
-                    if bv64 < bits {
-                        let unsigned = (mask(av, bits) as u64) >> bv64;
+                    let bits = w.bits() as i64;
+                    if (0..bits).contains(&bv) {
+                        let unsigned = (mask(av, w.bits()) as u64) >> (bv as u32);
                         return Some(InstKind::ConstInt(norm(unsigned as i64, *w), *w));
                     }
-                    return Some(InstKind::ConstInt(0, *w));
+                    return None;
                 }
             }
             None
@@ -243,15 +248,12 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::AShr(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    let bits = w.bits();
-                    let bv32 = bv as u32;
-                    if bv32 < bits {
-                        let signed = sext(av, bits) >> bv32;
+                    let bits = w.bits() as i64;
+                    if (0..bits).contains(&bv) {
+                        let signed = sext(av, w.bits()) >> (bv as u32);
                         return Some(InstKind::ConstInt(norm(signed, *w), *w));
                     }
-                    // Arithmetic shift past the width: replicate sign bit.
-                    let signed = sext(av, bits) >> (bits - 1);
-                    return Some(InstKind::ConstInt(norm(signed, *w), *w));
+                    return None;
                 }
             }
             None
@@ -362,12 +364,34 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             if let Some(Const::Bool(cv)) = get(c) {
                 let chosen = if cv { *t } else { *f };
                 if let Some(k) = consts.get(&chosen) {
-                    // Re-emit as the corresponding constant kind.
-                    return Some(match *k {
-                        Const::Int(v, w) => InstKind::ConstInt(v, w),
-                        Const::Float(v, w) => InstKind::ConstFloat(v, w),
-                        Const::Bool(b) => InstKind::ConstBool(b),
-                    });
+                    // Re-emit using the **destination** type carried
+                    // by the Select instruction itself, NOT the
+                    // chosen branch's source type. After IntExtend /
+                    // FloatTrunc / similar fold chains the chosen
+                    // operand can carry a narrower width than the
+                    // Select declares; reusing it would silently
+                    // produce a `kind` whose embedded width disagrees
+                    // with `inst.ty`. Audit C-C.
+                    return match (ty, *k) {
+                        (IrType::Int(w), Const::Int(v, _)) => {
+                            Some(InstKind::ConstInt(norm(v, *w), *w))
+                        }
+                        (IrType::Float(FloatWidth::F32), Const::Float(v, _)) => {
+                            Some(InstKind::ConstFloat(v as f32 as f64, FloatWidth::F32))
+                        }
+                        (IrType::Float(FloatWidth::F64), Const::Float(v, _)) => {
+                            Some(InstKind::ConstFloat(v, FloatWidth::F64))
+                        }
+                        (IrType::Bool, Const::Bool(b)) => {
+                            Some(InstKind::ConstBool(b))
+                        }
+                        // Type categories disagree — bail rather than
+                        // type-pun. The verifier doesn't catch the
+                        // mismatch (it only checks `is_int`/`is_float`
+                        // not specific widths), so being conservative
+                        // here is the correctness floor.
+                        _ => None,
+                    };
                 }
             }
             None
