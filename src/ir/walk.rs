@@ -502,16 +502,39 @@ pub fn compute_dominance_frontiers(func: &Function)
 {
     let idoms = compute_immediate_dominators(func);
     let preds = predecessors(func);
+
+    // Audit D2: build the set of reachable blocks (= keys present
+    // in `idoms`, plus the entry block itself). Unreachable blocks
+    // have no idom, so the runner walk would `match idoms.get(&runner)`
+    // → `None` → `break`, but only AFTER inserting `x` into
+    // `df[runner]` — populating `df` with phantom entries for
+    // unreachable predecessors that downstream consumers (mem2reg's
+    // iterated-DF closure in particular) must then defensively
+    // ignore. Filtering at the source keeps the DF map clean.
+    let reachable: HashSet<BlockId> = idoms.keys().copied()
+        .chain(std::iter::once(func.entry))
+        .collect();
+
     let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
-    // Initialize empty frontiers for every block so callers can
-    // index without checking for `Some`.
+    // Initialize empty frontiers for every reachable block so
+    // callers can index without checking for `Some`. Unreachable
+    // blocks are excluded entirely from the map.
     for block in &func.blocks {
-        df.insert(block.id, HashSet::new());
+        if reachable.contains(&block.id) {
+            df.insert(block.id, HashSet::new());
+        }
     }
 
     for block in &func.blocks {
         let x = block.id;
+        if !reachable.contains(&x) { continue; }
         let plist = preds.get(&x).cloned().unwrap_or_default();
+        // Drop unreachable predecessors before counting toward
+        // "join point" status. An unreachable predecessor adds no
+        // runtime control flow into x.
+        let plist: Vec<BlockId> = plist.into_iter()
+            .filter(|p| reachable.contains(p))
+            .collect();
         if plist.len() < 2 { continue; }
 
         // `x` is a join point. Walk each predecessor upward.

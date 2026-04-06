@@ -65,6 +65,7 @@ use super::util::{
     compute_dominance_frontiers,
     compute_immediate_dominators,
     dominator_tree_children,
+    prune_unreachable,
     substitute_uses,
 };
 use crate::ir::inst::*;
@@ -97,9 +98,31 @@ struct Promotable {
 }
 
 fn promote_function(func: &mut Function) -> bool {
+    // ---- Phase 0: drop unreachable blocks ------------------------
+    //
+    // Audit M1: every later phase walks `func.blocks` and assumes
+    // that any block it visits is reachable from entry. Without
+    // this prune:
+    //
+    //  * Phase 2 (`store_blocks`) collects stores from unreachable
+    //    blocks, which causes the iterated-DF closure to insert
+    //    phi params even though no rename walk will visit those
+    //    blocks (the rename walk uses the dom-tree, which itself
+    //    excludes unreachable nodes).
+    //
+    //  * Phase 4 (rename walk) never visits unreachable blocks, so
+    //    their `Load`/`Store` instructions never make it into
+    //    `dead_loads` / `dead_stores`. Phase 5 then deletes the
+    //    underlying alloca but leaves the dangling load/store
+    //    referencing it — invalid IR that the verifier rejects.
+    //
+    // Pruning first makes "every block we look at is reachable" a
+    // structural invariant of the rest of the pass.
+    let pruned = prune_unreachable(func);
+
     // ---- Phase 1: find promotable allocas -------------------------
     let promotable = find_promotable_allocas(func);
-    if promotable.is_empty() { return false; }
+    if promotable.is_empty() { return pruned; }
 
     // Map from alloca ValueId → index into `promotable`. We use the
     // index as a compact key throughout the rest of the pass.
@@ -343,9 +366,18 @@ fn promote_function(func: &mut Function) -> bool {
         // We need to know the successors and mutate their terminator
         // arg lists. `func.block_mut` gives us a single-borrow view,
         // so we collect successor IDs first.
+        //
+        // Audit M2: dedupe successors before iterating. A
+        // `CondBranch { true: B, false: B, .. }` (or a `Switch`
+        // whose default and a case both branch to the same block)
+        // would otherwise visit `B` twice. Each visit appends a
+        // copy of the new args to BOTH the true_args and
+        // false_args slots inside `append_branch_args_for`,
+        // doubling the arg lists. The verifier then rejects the
+        // resulting function for branch-arg / param count mismatch.
         let successors: Vec<BlockId> = {
             let block = func.block(block_id);
-            match &block.terminator {
+            let raw: Vec<BlockId> = match &block.terminator {
                 Some(Terminator::Return(_)) | Some(Terminator::Unreachable) | None => vec![],
                 Some(Terminator::Branch(d, _)) => vec![*d],
                 Some(Terminator::CondBranch { true_dest, false_dest, .. }) => {
@@ -356,7 +388,9 @@ fn promote_function(func: &mut Function) -> bool {
                     v.push(*default);
                     v
                 }
-            }
+            };
+            let mut seen: HashSet<BlockId> = HashSet::new();
+            raw.into_iter().filter(|b| seen.insert(*b)).collect()
         };
         for succ in successors {
             if let Some(order) = block_phi_order.get(&succ) {
@@ -501,9 +535,16 @@ fn find_promotable_allocas(func: &Function) -> Vec<Promotable> {
 }
 
 /// Append `new_args` to the argument slot(s) in `term` that branch
-/// to `target`. A terminator may branch to the same target twice
-/// (e.g., `CondBranch { true: B, false: B }`), in which case both
-/// slots receive the same append.
+/// to `target`.
+///
+/// A `CondBranch` whose `true_dest == false_dest == target` has TWO
+/// arg slots that branch to `target` (one per arm), and both arms
+/// must receive the same append: the new value of the alloca at the
+/// source block doesn't depend on which arm is taken at runtime, so
+/// both arg lists end up identical for the new param. The caller
+/// must ensure this function is invoked **once per unique successor**
+/// (not once per edge), otherwise the arg lists double up. The
+/// rename walk in `rename_block` enforces this via successor dedup.
 fn append_branch_args_for(term: &mut Terminator, target: BlockId, new_args: &[ValueId]) {
     match term {
         Terminator::Branch(d, args) if *d == target => {
@@ -878,6 +919,179 @@ mod tests {
         match f.blocks[0].terminator.as_ref().unwrap() {
             Terminator::Return(Some(v)) => assert_eq!(*v, undef_id),
             _ => panic!(),
+        }
+    }
+
+    // =============================================================
+    // Audit M1 — unreachable block storing to a promoted alloca
+    // must not corrupt the IR. mem2reg's Phase 0 pre-prune should
+    // drop the unreachable block before it influences the
+    // dominance frontier or leaves dangling load/store insts.
+    // =============================================================
+    #[test]
+    fn unreachable_block_with_store_does_not_corrupt_ir() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c1 = push_inst(&mut f, entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, entry, InstKind::Store(c1, slot), IrType::Void);
+        let loaded = push_inst(&mut f, entry,
+            InstKind::Load(slot),
+            IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(loaded)));
+
+        // Build an UNREACHABLE block that also stores to `slot`.
+        // Nothing branches to it from entry, so prune_unreachable
+        // should remove it before the rename walk.
+        let dead = f.create_block("dead");
+        let c99 = push_inst(&mut f, dead,
+            InstKind::ConstInt(99, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, dead, InstKind::Store(c99, slot), IrType::Void);
+        f.block_mut(dead).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(),
+            "post-mem2reg IR invalid (unreachable store regression): {:?}", errs);
+
+        let f = &m.functions[0];
+        // The dead block must be gone (pruned by Phase 0).
+        assert!(!f.blocks.iter().any(|b| b.id == dead),
+            "unreachable block should be pruned by mem2reg Phase 0");
+        // The promoted alloca and its load/store should be gone.
+        let entry_block = f.block(f.entry);
+        assert!(!entry_block.insts.iter().any(|i| matches!(i.kind, InstKind::Alloca(_))));
+        assert!(!entry_block.insts.iter().any(|i| matches!(i.kind, InstKind::Load(_))));
+        assert!(!entry_block.insts.iter().any(|i| matches!(i.kind, InstKind::Store(..))));
+        // Return must reference c1 (the live store value).
+        match entry_block.terminator.as_ref().unwrap() {
+            Terminator::Return(Some(v)) => assert_eq!(*v, c1,
+                "return should reach c1 directly, not the dead block's c99"),
+            _ => panic!(),
+        }
+    }
+
+    // =============================================================
+    // Audit M2 — a CondBranch with the same target on both arms
+    // must not double-append branch args during the rename walk.
+    // =============================================================
+    #[test]
+    fn same_target_cond_branch_does_not_double_append() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c1 = push_inst(&mut f, entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, entry, InstKind::Store(c1, slot), IrType::Void);
+
+        let then_b = f.create_block("then");
+        let merge = f.create_block("merge");
+
+        // Conditional branch where both arms target `then_b`. The
+        // pre-fix mem2reg would visit `then_b` twice via the
+        // successor list and double-append the new branch args.
+        let cond = push_inst(&mut f, entry,
+            InstKind::ConstBool(true), IrType::Bool,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: then_b,
+            true_args: vec![],
+            false_dest: then_b,
+            false_args: vec![],
+        });
+
+        // `then_b` stores a different value, then branches to merge.
+        let c2 = push_inst(&mut f, then_b,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, then_b, InstKind::Store(c2, slot), IrType::Void);
+        f.block_mut(then_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        // `merge` loads from slot and returns it.
+        let loaded = push_inst(&mut f, merge,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(loaded)));
+
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(),
+            "post-mem2reg IR invalid (same-target CondBranch regression): {:?}", errs);
+
+        // Verify the entry's CondBranch has at most ONE arg per arm
+        // (the new phi-arg added for the promoted slot). Pre-fix it
+        // would have TWO per arm.
+        let f = &m.functions[0];
+        let entry_block = f.block(f.entry);
+        match entry_block.terminator.as_ref().unwrap() {
+            Terminator::CondBranch { true_args, false_args, .. } => {
+                assert!(true_args.len() <= 1,
+                    "true_args double-appended: {:?}", true_args);
+                assert!(false_args.len() <= 1,
+                    "false_args double-appended: {:?}", false_args);
+            }
+            // mem2reg may have collapsed the cond_branch to a
+            // direct branch if the cond was constant; that's
+            // fine — verifier-clean is what we care about.
+            _ => {}
+        }
+    }
+
+    // =============================================================
+    // Audit D2 — `compute_dominance_frontiers` must not populate
+    // entries for unreachable predecessors. mem2reg shouldn't see
+    // phantom DF entries from dead code.
+    // =============================================================
+    #[test]
+    fn dominance_frontier_excludes_unreachable_preds() {
+        use crate::ir::walk::compute_dominance_frontiers;
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let merge = f.create_block("merge");
+        let dead = f.create_block("dead");
+
+        // entry → merge (reachable)
+        // dead → merge (unreachable, but emits an edge into merge)
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Branch(merge, vec![]));
+        f.block_mut(dead).terminator = Some(Terminator::Branch(merge, vec![]));
+        f.block_mut(merge).terminator = Some(Terminator::Return(None));
+
+        let df = compute_dominance_frontiers(&f);
+
+        // The dead block is unreachable; it should not appear in
+        // the DF map at all.
+        assert!(!df.contains_key(&dead),
+            "DF map should not contain unreachable block, got {:?}", df);
+        // The merge block has only ONE reachable predecessor
+        // (entry), so it isn't a true join point and merge ∉ any
+        // DF set.
+        for (b, frontier) in &df {
+            assert!(!frontier.contains(&merge),
+                "merge should not be in DF[{:?}]: only one reachable pred", b);
         }
     }
 }
