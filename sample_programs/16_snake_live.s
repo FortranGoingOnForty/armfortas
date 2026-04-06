@@ -377,18 +377,18 @@ init_game:
 
     adrp x11, _snake_x@PAGE
     add x11, x11, _snake_x@PAGEOFF
-    mov x10, #39
+    mov x10, #20
     str x10, [x11, #0]
-    mov x10, #38
+    mov x10, #19
     str x10, [x11, #8]
-    mov x10, #37
+    mov x10, #18
     str x10, [x11, #16]
-    mov x10, #36
+    mov x10, #17
     str x10, [x11, #24]
 
     adrp x12, _snake_y@PAGE
     add x12, x12, _snake_y@PAGEOFF
-    mov x10, #18
+    mov x10, #8
     str x10, [x12, #0]
     str x10, [x12, #8]
     str x10, [x12, #16]
@@ -590,11 +590,11 @@ advance_game:
 
     cmp x25, #0
     b.lt .Llose_now
-    cmp x25, #78
+    cmp x25, #40
     b.ge .Llose_now
     cmp x26, #0
     b.lt .Llose_now
-    cmp x26, #36
+    cmp x26, #16
     b.ge .Llose_now
 
     mov x27, #0
@@ -747,7 +747,7 @@ draw_frame:
 
     adrp x0, _border_line@PAGE
     add x0, x0, _border_line@PAGEOFF
-    mov x1, #80
+    mov x1, #42
     bl write_stdout
 
     adrp x0, _crlf@PAGE
@@ -758,7 +758,7 @@ draw_frame:
     mov x19, #0
 
 .Lrow_loop:
-    cmp x19, #36
+    cmp x19, #16
     b.ge .Lrows_done
 
     mov x0, #124
@@ -767,7 +767,7 @@ draw_frame:
     mov x20, #0
 
 .Lcol_loop:
-    cmp x20, #78
+    cmp x20, #40
     b.ge .Lrow_end
 
     mov x0, x20
@@ -793,7 +793,7 @@ draw_frame:
 .Lrows_done:
     adrp x0, _border_line@PAGE
     add x0, x0, _border_line@PAGEOFF
-    mov x1, #80
+    mov x1, #42
     bl write_stdout
 
     adrp x0, _crlf@PAGE
@@ -905,7 +905,7 @@ _quit_fmt:
     .asciz "Quit. Final score: "
 
 _border_line:
-    .asciz "+------------------------------------------------------------------------------+"
+    .asciz "+----------------------------------------+"
 
 _controls_line:
     .asciz "Controls: W A S D start/move, q quits"
@@ -939,14 +939,14 @@ _crlf:
     .byte 10
 
 _food_table:
-    .quad 58, 18
-    .quad 58, 26
-    .quad 20, 26
-    .quad 20, 6
-    .quad 70, 6
-    .quad 70, 31
-    .quad 8, 31
-    .quad 8, 10
+    .quad 30, 8
+    .quad 30, 11
+    .quad 12, 11
+    .quad 12, 3
+    .quad 35, 3
+    .quad 35, 13
+    .quad 6, 13
+    .quad 6, 5
 
 .section __DATA,__bss
 .p2align 3
