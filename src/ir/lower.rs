@@ -124,7 +124,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
                 }
                 ensure_termination(&mut b, None);
             }
@@ -192,7 +192,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
                 }
                 ensure_termination(&mut b, None);
             }
@@ -263,7 +263,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
                     let rv = b.load(result_addr);
                     b.ret(Some(rv));
                 }
@@ -1315,23 +1315,32 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
-fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>) {
+fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     for info in locals.values() {
         if info.char_kind == CharKind::Deferred {
-            // Deferred-length string: call afs_dealloc_string.
             b.call(
                 FuncRef::External("afs_dealloc_string".into()),
                 vec![info.addr],
                 IrType::Void,
             );
         } else if info.allocatable {
-            // Allocatable array: call afs_deallocate_array.
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
                 vec![info.addr, stat_addr],
                 IrType::Void,
             );
+        }
+        // Finalization: call FINAL procedures for locally-owned derived type variables.
+        // Skip by-ref params (they're owned by the caller, not the callee).
+        if !info.by_ref {
+            if let Some(ref type_name) = info.derived_type {
+                if let Some(layout) = type_layouts.get(type_name) {
+                    for final_proc in &layout.final_procs {
+                        b.call(FuncRef::External(final_proc.clone()), vec![info.addr], IrType::Void);
+                    }
+                }
+            }
         }
     }
 }
@@ -1640,7 +1649,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Return { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals);
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
             if let Some(addr) = ctx.result_addr {
                 let rv = b.load(addr);
                 b.ret(Some(rv));
@@ -1650,12 +1659,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Stop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals);
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
         Stmt::ErrorStop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals);
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
             b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
             b.unreachable();
         }

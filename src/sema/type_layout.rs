@@ -31,6 +31,7 @@ pub struct TypeLayout {
     pub align: usize,
     pub fields: Vec<FieldLayout>,
     pub bound_procs: Vec<BoundProc>,
+    pub final_procs: Vec<String>,
 }
 
 impl TypeLayout {
@@ -144,6 +145,7 @@ fn type_spec_to_type_info(ts: &crate::ast::decl::TypeSpec) -> TypeInfo {
 pub fn compute_layout(
     type_name: &str,
     type_bound_procs: &[crate::ast::decl::TypeBoundProc],
+    final_proc_names: &[String],
     components: &[crate::ast::decl::SpannedDecl],
     parent_layout: Option<&TypeLayout>,
     registry: &TypeLayoutRegistry,
@@ -218,6 +220,7 @@ pub fn compute_layout(
         align: max_align,
         fields,
         bound_procs,
+        final_procs: final_proc_names.to_vec(),
     }
 }
 
@@ -248,6 +251,7 @@ mod tests {
                 FieldLayout { name: "y".into(), offset: 4, size: 4, type_info: TypeInfo::Real { kind: Some(4) } },
             ],
             bound_procs: vec![],
+            final_procs: vec![],
         };
         assert_eq!(layout.field("x").unwrap().offset, 0);
         assert_eq!(layout.field("y").unwrap().offset, 4);
@@ -272,6 +276,7 @@ mod tests {
                 FieldLayout { name: "c".into(), offset: 16, size: 4, type_info: TypeInfo::Integer { kind: Some(4) } },
             ],
             bound_procs: vec![],
+            final_procs: vec![],
         };
         // Verify padding: a(1) + 7 pad + b(8) + c(4) + 4 pad = 24
         assert_eq!(layout.size, 24);
@@ -290,6 +295,7 @@ mod tests {
             align: 8,
             fields: vec![],
             bound_procs: vec![],
+            final_procs: vec![],
         });
         assert!(reg.get("mytype").is_some()); // case insensitive
         assert!(reg.get("MYTYPE").is_some());
