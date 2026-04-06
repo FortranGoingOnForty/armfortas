@@ -414,3 +414,345 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
     func.blocks.retain(|b| reachable.contains(&b.id));
     func.blocks.len() != before
 }
+
+// =====================================================================
+//                Dominator tree + dominance frontiers
+// =====================================================================
+
+/// Compute the immediate dominator of every reachable block.
+///
+/// The immediate dominator `idom(B)` is the unique closest dominator
+/// of `B` other than `B` itself. The entry block has no idom; every
+/// other reachable block does.
+///
+/// Returns a map keyed only by reachable non-entry blocks.
+/// Unreachable blocks have an empty dominator set (per
+/// [`compute_dominators`]) and therefore no idom.
+pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId> {
+    let doms = compute_dominators(func);
+    let mut idoms: HashMap<BlockId, BlockId> = HashMap::new();
+
+    for block in &func.blocks {
+        if block.id == func.entry { continue; }
+        let Some(my_doms) = doms.get(&block.id) else { continue };
+        if my_doms.is_empty() { continue; } // unreachable
+
+        // The immediate dominator is the dominator (other than
+        // self) that is dominated by every other dominator (other
+        // than self). Equivalently: the dominator that has the
+        // largest dominator set — all other dominators of `block`
+        // also dominate the idom.
+        let candidates: Vec<BlockId> = my_doms.iter()
+            .copied()
+            .filter(|&d| d != block.id)
+            .collect();
+
+        let idom = candidates.iter().copied().find(|&cand| {
+            // cand is idom iff no other candidate strictly
+            // dominates it (only cand itself and cand's own
+            // dominators do).
+            let cand_doms = doms.get(&cand).cloned().unwrap_or_default();
+            candidates.iter().all(|&other| {
+                other == cand || cand_doms.contains(&other)
+            })
+        });
+
+        if let Some(idom) = idom {
+            idoms.insert(block.id, idom);
+        }
+    }
+
+    idoms
+}
+
+/// Compute the **children** of each block in the dominator tree —
+/// the inverse of the idom map.
+///
+/// `children[B]` is the set of blocks whose immediate dominator is
+/// `B`. A dominator-tree traversal visits `B` then recurses into
+/// `children[B]` in some order.
+pub fn dominator_tree_children(idoms: &HashMap<BlockId, BlockId>)
+    -> HashMap<BlockId, Vec<BlockId>>
+{
+    let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for (&child, &parent) in idoms {
+        children.entry(parent).or_default().push(child);
+    }
+    // Sort each child list by BlockId.0 for deterministic iteration.
+    for list in children.values_mut() {
+        list.sort_by_key(|b| b.0);
+    }
+    children
+}
+
+/// Compute the dominance frontier of every reachable block.
+///
+/// The dominance frontier `DF(B)` is the set of blocks `X` such that
+/// `B` dominates a predecessor of `X` but does **not** strictly
+/// dominate `X` itself. Dominance frontiers are where phi nodes
+/// (block parameters in our IR) must be inserted when promoting an
+/// alloca that is stored to in `B`.
+///
+/// Uses the Cytron-Ferrante-Rosen-Wegman-Zadeck formulation:
+/// for every join point `X` (block with ≥ 2 predecessors), walk
+/// each predecessor `P` upward in the dominator tree, adding `X`
+/// to `DF(runner)` until `runner == idom(X)`.
+pub fn compute_dominance_frontiers(func: &Function)
+    -> HashMap<BlockId, HashSet<BlockId>>
+{
+    let idoms = compute_immediate_dominators(func);
+    let preds = predecessors(func);
+    let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+    // Initialize empty frontiers for every block so callers can
+    // index without checking for `Some`.
+    for block in &func.blocks {
+        df.insert(block.id, HashSet::new());
+    }
+
+    for block in &func.blocks {
+        let x = block.id;
+        let plist = preds.get(&x).cloned().unwrap_or_default();
+        if plist.len() < 2 { continue; }
+
+        // `x` is a join point. Walk each predecessor upward.
+        let idom_x = idoms.get(&x).copied();
+        for p in plist {
+            let mut runner = p;
+            // Stop when runner reaches idom(x) — at that point
+            // `runner` strictly dominates `x`, so `x` is no longer
+            // in `DF(runner)`.
+            while Some(runner) != idom_x {
+                df.entry(runner).or_default().insert(x);
+                match idoms.get(&runner) {
+                    Some(&parent) => runner = parent,
+                    None => break, // runner is entry (no idom)
+                }
+            }
+        }
+    }
+
+    df
+}
+
+/// Compute a **preorder** traversal of the dominator tree starting
+/// at the entry block. This is the correct visit order for mem2reg's
+/// renaming walk: a block's dominator's values are installed on the
+/// current-value stack before we enter the block.
+///
+/// Returns a deterministic ordering (children are iterated in
+/// ascending `BlockId.0` order courtesy of `dominator_tree_children`).
+pub fn dominator_tree_preorder(func: &Function) -> Vec<BlockId> {
+    let idoms = compute_immediate_dominators(func);
+    let children = dominator_tree_children(&idoms);
+
+    let mut order = Vec::new();
+    let mut stack: Vec<BlockId> = vec![func.entry];
+    while let Some(b) = stack.pop() {
+        order.push(b);
+        if let Some(kids) = children.get(&b) {
+            // Push in reverse so that smaller BlockId.0 is visited first.
+            for &k in kids.iter().rev() {
+                stack.push(k);
+            }
+        }
+    }
+    order
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use super::super::types::{IrType, IntWidth};
+    use crate::lexer::{Span, Position};
+
+    fn dummy_span() -> Span {
+        let p = Position { line: 1, col: 1 };
+        Span { start: p, end: p, file_id: 0 }
+    }
+
+    /// Build a diamond CFG:
+    ///      entry
+    ///      /   \
+    ///     a     b
+    ///      \   /
+    ///      merge
+    /// Used by dom-tree and dominance-frontier tests.
+    fn diamond_function() -> (Function, BlockId, BlockId, BlockId) {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let a = f.create_block("a");
+        let b = f.create_block("b");
+        let merge = f.create_block("merge");
+
+        let entry = f.entry;
+        let cond = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: a,
+            true_args: vec![],
+            false_dest: b,
+            false_args: vec![],
+        });
+        f.block_mut(a).terminator = Some(Terminator::Branch(merge, vec![]));
+        f.block_mut(b).terminator = Some(Terminator::Branch(merge, vec![]));
+        f.block_mut(merge).terminator = Some(Terminator::Return(None));
+
+        (f, a, b, merge)
+    }
+
+    #[test]
+    fn immediate_dominators_diamond() {
+        let (f, a, b, merge) = diamond_function();
+        let idoms = compute_immediate_dominators(&f);
+        // entry has no idom.
+        assert!(!idoms.contains_key(&f.entry));
+        // a, b, merge all have entry as their idom.
+        assert_eq!(idoms[&a], f.entry);
+        assert_eq!(idoms[&b], f.entry);
+        assert_eq!(idoms[&merge], f.entry);
+    }
+
+    #[test]
+    fn dominance_frontier_diamond() {
+        let (f, a, b, merge) = diamond_function();
+        let df = compute_dominance_frontiers(&f);
+        // a's frontier is {merge} — a dominates itself (a pred of
+        // merge) but doesn't dominate merge.
+        assert_eq!(df[&a], HashSet::from([merge]));
+        // b's frontier is also {merge}.
+        assert_eq!(df[&b], HashSet::from([merge]));
+        // merge's frontier is empty (it's a join point itself, but
+        // has no successors that are join points of anything else
+        // in this CFG).
+        assert!(df[&merge].is_empty());
+        // entry's frontier is empty.
+        assert!(df[&f.entry].is_empty());
+    }
+
+    #[test]
+    fn dominator_tree_preorder_visits_entry_first() {
+        let (f, _a, _b, _merge) = diamond_function();
+        let order = dominator_tree_preorder(&f);
+        assert_eq!(order[0], f.entry);
+        assert_eq!(order.len(), 4);
+    }
+
+    /// A simple loop:
+    ///   entry → header → body → header
+    ///                  → exit
+    /// Body dominates nothing below header; header dominates body,
+    /// exit, and the back-edge doesn't change dominance.
+    #[test]
+    fn dominance_frontier_loop() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![]));
+
+        let cond = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        let df = compute_dominance_frontiers(&f);
+        // `body`'s frontier is {header} — body is a pred of header
+        // via the back edge, but doesn't dominate header.
+        assert_eq!(df[&body], HashSet::from([header]));
+        // `header`'s frontier is {header} too — header is a join
+        // point (entry + body both branch into it), and though
+        // header dominates itself, it does NOT *strictly* dominate
+        // itself, so header is in its own frontier.
+        assert_eq!(df[&header], HashSet::from([header]));
+    }
+
+    /// `find_promotable-style` usage: verify the idom map is what
+    /// mem2reg would read. Nested if: both branches store to %a;
+    /// both merge blocks need a block param. `iterated_dominance_frontier`
+    /// is effectively DF applied transitively over the store set.
+    #[test]
+    fn iterated_dominance_frontier_via_repeated_df() {
+        // Build:
+        //    entry
+        //     / \
+        //    a   b
+        //    |  / \
+        //    | c   d
+        //    |  \ /
+        //    |   m1
+        //    \  /
+        //     m2
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let a = f.create_block("a");
+        let b = f.create_block("b");
+        let c = f.create_block("c");
+        let d = f.create_block("d");
+        let m1 = f.create_block("m1");
+        let m2 = f.create_block("m2");
+
+        let entry = f.entry;
+        let c0 = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: c0, kind: InstKind::ConstBool(true),
+            ty: IrType::Bool, span: dummy_span(),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond: c0, true_dest: a, true_args: vec![],
+            false_dest: b, false_args: vec![],
+        });
+        let c1 = f.next_value_id();
+        f.block_mut(b).insts.push(Inst {
+            id: c1, kind: InstKind::ConstBool(true),
+            ty: IrType::Bool, span: dummy_span(),
+        });
+        f.block_mut(b).terminator = Some(Terminator::CondBranch {
+            cond: c1, true_dest: c, true_args: vec![],
+            false_dest: d, false_args: vec![],
+        });
+        f.block_mut(c).terminator = Some(Terminator::Branch(m1, vec![]));
+        f.block_mut(d).terminator = Some(Terminator::Branch(m1, vec![]));
+        f.block_mut(m1).terminator = Some(Terminator::Branch(m2, vec![]));
+        f.block_mut(a).terminator = Some(Terminator::Branch(m2, vec![]));
+        f.block_mut(m2).terminator = Some(Terminator::Return(None));
+
+        let df = compute_dominance_frontiers(&f);
+        // c and d both flow into m1; DF(c) = DF(d) = {m1}
+        assert_eq!(df[&c], HashSet::from([m1]));
+        assert_eq!(df[&d], HashSet::from([m1]));
+        // a and m1 both flow into m2; DF(a) = DF(m1) = {m2}
+        assert_eq!(df[&a], HashSet::from([m2]));
+        assert_eq!(df[&m1], HashSet::from([m2]));
+        // b dominates c, d, m1 but not m2 — b is in df of m2 because
+        // it dominates a predecessor of m2 (m1) but not m2 itself.
+        assert_eq!(df[&b], HashSet::from([m2]));
+        // The dominator tree looks like:
+        //   entry → {a, b, m2}
+        //   b     → {c, d, m1}
+        let idoms = compute_immediate_dominators(&f);
+        assert_eq!(idoms[&a], entry);
+        assert_eq!(idoms[&b], entry);
+        assert_eq!(idoms[&m2], entry);
+        assert_eq!(idoms[&c], b);
+        assert_eq!(idoms[&d], b);
+        assert_eq!(idoms[&m1], b);
+    }
+}
