@@ -1,6 +1,6 @@
 # sample_programs
 
-Fifteen small ARM64 assembly programs for `afs-as`, collected in one root-level directory so it is easy to poke at the assembler without hunting through test fixtures.
+Sixteen ARM64 assembly programs for `afs-as`, collected in one root-level directory so it is easy to poke at the assembler without hunting through test fixtures.
 
 ## Build `afs-as`
 
@@ -40,6 +40,8 @@ ld "/tmp/$NAME.o" -o "/tmp/$NAME" -lSystem -syslibroot "$SDKROOT" -e _main
 echo $?
 ```
 
+`16_snake_live.s` is a live terminal program, so run it directly in an interactive terminal instead of expecting a useful exit-code script.
+
 ## Assemble Everything
 
 ```bash
@@ -67,6 +69,22 @@ for src in sample_programs/*.s; do
 done
 ```
 
+## Live Snake
+
+```bash
+SDKROOT=$(xcrun --show-sdk-path)
+target/debug/afs-as sample_programs/16_snake_live.s -o /tmp/16_snake_live.o
+ld /tmp/16_snake_live.o -o /tmp/16_snake_live -lSystem -syslibroot "$SDKROOT" -e _main
+/tmp/16_snake_live
+```
+
+Controls:
+
+```text
+W A S D move
+q quits
+```
+
 ## Sample Index
 
 | File | What It Shows | Expected Result |
@@ -86,3 +104,4 @@ done
 | `13_helper_function.s` | Internal `bl`, stack frame, and `ret` | exit `21` |
 | `14_literal_pool.s` | `ldr` literal load from an inline `.quad` | exit `77` |
 | `15_fp_sqrt.s` | `scvtf`, `fadd`, `fsqrt`, and `fcvtzs` | exit `5` |
+| `16_snake_live.s` | Bonus live snake with raw terminal input, redraws, and nonblocking reads | interactive game in a real terminal |
