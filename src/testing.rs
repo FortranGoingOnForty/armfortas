@@ -15,7 +15,7 @@ use crate::codegen::mir::MachineFunction;
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{Lexer, Token};
+use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 
@@ -86,6 +86,45 @@ impl Stage {
     }
 }
 
+/// Failure point while trying to capture compiler stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureStage {
+    Preprocess,
+    Lexer,
+    Parser,
+    Sema,
+    Ir,
+    Obj,
+    Run,
+}
+
+impl FailureStage {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "preprocess" => Some(Self::Preprocess),
+            "lexer" | "tokens" => Some(Self::Lexer),
+            "parser" | "parse" | "ast" => Some(Self::Parser),
+            "sema" => Some(Self::Sema),
+            "ir" | "optir" => Some(Self::Ir),
+            "obj" | "asm" => Some(Self::Obj),
+            "run" => Some(Self::Run),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Preprocess => "preprocess",
+            Self::Lexer => "lexer",
+            Self::Parser => "parser",
+            Self::Sema => "sema",
+            Self::Ir => "ir",
+            Self::Obj => "obj",
+            Self::Run => "run",
+        }
+    }
+}
+
 /// A stage capture request for one input source file.
 #[derive(Debug, Clone)]
 pub struct CaptureRequest {
@@ -133,6 +172,34 @@ impl CaptureResult {
     }
 }
 
+/// Failed stage capture with partial artifacts preserved.
+#[derive(Debug, Clone)]
+pub struct CaptureFailure {
+    pub input: PathBuf,
+    pub opt_level: OptLevel,
+    pub stage: FailureStage,
+    pub detail: String,
+    pub stages: BTreeMap<Stage, CapturedStage>,
+}
+
+impl CaptureFailure {
+    pub fn partial_result(&self) -> CaptureResult {
+        CaptureResult {
+            input: self.input.clone(),
+            opt_level: self.opt_level,
+            stages: self.stages.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for CaptureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage.as_str(), self.detail)
+    }
+}
+
+impl std::error::Error for CaptureFailure {}
+
 /// Captured artifact content.
 #[derive(Debug, Clone)]
 pub enum CapturedStage {
@@ -165,53 +232,79 @@ pub struct RunCapture {
 }
 
 /// Capture the requested stages for one source file.
-pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, String> {
+pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, CaptureFailure> {
     let mut stages = BTreeMap::new();
     let wants = |stage| request.requested.contains(&stage);
     let input = request.input.clone();
+    let source_form = detect_source_form(&input.to_string_lossy());
 
-    let source = fs::read_to_string(&input)
-        .map_err(|e| format!("cannot read '{}': {}", input.display(), e))?;
+    let source = fs::read_to_string(&input).map_err(|e| CaptureFailure {
+        input: input.clone(),
+        opt_level: request.opt_level,
+        stage: FailureStage::Preprocess,
+        detail: format!("cannot read '{}': {}", input.display(), e),
+        stages: stages.clone(),
+    })?;
 
     let pp_config = crate::preprocess::PreprocConfig {
         filename: input.to_string_lossy().into_owned(),
+        fixed_form: matches!(source_form, SourceForm::FixedForm),
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
-        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| e.to_string())?;
+        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Preprocess,
+            detail: e.to_string(),
+            stages: stages.clone(),
+        })?;
     let preprocessed = pp_result.text;
     if wants(Stage::Preprocess) {
         stages.insert(Stage::Preprocess, CapturedStage::Text(preprocessed.clone()));
     }
 
-    let tokens = Lexer::tokenize(&preprocessed, 0).map_err(|e| {
-        format!(
+    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| CaptureFailure {
+        input: input.clone(),
+        opt_level: request.opt_level,
+        stage: FailureStage::Lexer,
+        detail: format!(
             "{}:{}: lexer error: {}",
             input.display(),
             e.span.start.line,
             e.msg
-        )
+        ),
+        stages: stages.clone(),
     })?;
     if wants(Stage::Tokens) {
         stages.insert(Stage::Tokens, CapturedStage::Text(format_tokens(&tokens)));
     }
 
     let mut parser = Parser::new(&tokens);
-    let units = parser.parse_file().map_err(|e| {
-        format!(
+    let units = parser.parse_file().map_err(|e| CaptureFailure {
+        input: input.clone(),
+        opt_level: request.opt_level,
+        stage: FailureStage::Parser,
+        detail: format!(
             "{}:{}:{}: parse error: {}",
             input.display(),
             e.span.start.line,
             e.span.start.col,
             e.msg
-        )
+        ),
+        stages: stages.clone(),
     })?;
     if wants(Stage::Ast) {
         stages.insert(Stage::Ast, CapturedStage::Text(format!("{:#?}", units)));
     }
 
-    let (st, type_layouts) = resolve::resolve_file(&units)
-        .map_err(|e| format!("{}:{}: {}", input.display(), e.span.start.line, e.msg))?;
+    let (st, type_layouts) = resolve::resolve_file(&units).map_err(|e| CaptureFailure {
+        input: input.clone(),
+        opt_level: request.opt_level,
+        stage: FailureStage::Sema,
+        detail: format!("{}:{}: {}", input.display(), e.span.start.line, e.msg),
+        stages: stages.clone(),
+    })?;
     let diags = validate::validate_file(&units, &st);
     if wants(Stage::Sema) {
         stages.insert(
@@ -224,7 +317,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Stri
         .filter(|d| d.kind == validate::DiagKind::Error)
         .collect();
     if !sema_errors.is_empty() {
-        return Err(format_diagnostics(&input, &sema_errors));
+        return Err(CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Sema,
+            detail: format_diagnostics(&input, &sema_errors),
+            stages,
+        });
     }
 
     let ir_module = lower::lower_file(&units, &st, &type_layouts);
@@ -235,7 +334,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Stri
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(format!("internal error: IR verification failed:\n{}", msg));
+        return Err(CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Ir,
+            detail: format!("internal error: IR verification failed:\n{}", msg),
+            stages,
+        });
     }
 
     let ir_text = ir_printer::print_module(&ir_module);
@@ -282,22 +387,57 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Stri
         let obj_path = temp_root.join("output.o");
         let bin_path = temp_root.join("output");
 
-        fs::create_dir_all(&temp_root)
-            .map_err(|e| format!("cannot create temp dir '{}': {}", temp_root.display(), e))?;
-        fs::write(&asm_path, &asm_text)
-            .map_err(|e| format!("cannot write temp assembly '{}': {}", asm_path.display(), e))?;
+        fs::create_dir_all(&temp_root).map_err(|e| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Obj,
+            detail: format!("cannot create temp dir '{}': {}", temp_root.display(), e),
+            stages: stages.clone(),
+        })?;
+        fs::write(&asm_path, &asm_text).map_err(|e| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Obj,
+            detail: format!("cannot write temp assembly '{}': {}", asm_path.display(), e),
+            stages: stages.clone(),
+        })?;
 
-        assemble_with_system(&asm_path, &obj_path)?;
+        assemble_with_system(&asm_path, &obj_path).map_err(|detail| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Obj,
+            detail,
+            stages: stages.clone(),
+        })?;
 
         if wants(Stage::Obj) {
-            stages.insert(Stage::Obj, CapturedStage::Text(object_snapshot(&obj_path)?));
+            let snapshot = object_snapshot(&obj_path).map_err(|detail| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Obj,
+                detail,
+                stages: stages.clone(),
+            })?;
+            stages.insert(Stage::Obj, CapturedStage::Text(snapshot));
         }
 
         if wants(Stage::Run) {
-            link_with_runtime(&obj_path, &bin_path)?;
+            link_with_runtime(&obj_path, &bin_path).map_err(|detail| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Run,
+                detail,
+                stages: stages.clone(),
+            })?;
             let output = Command::new(&bin_path)
                 .output()
-                .map_err(|e| format!("cannot run '{}': {}", bin_path.display(), e))?;
+                .map_err(|e| CaptureFailure {
+                    input: input.clone(),
+                    opt_level: request.opt_level,
+                    stage: FailureStage::Run,
+                    detail: format!("cannot run '{}': {}", bin_path.display(), e),
+                    stages: stages.clone(),
+                })?;
             stages.insert(
                 Stage::Run,
                 CapturedStage::Run(RunCapture {
@@ -380,9 +520,10 @@ fn emit_module_asm(allocated: &[MachineFunction]) -> String {
     }
 
     if let Some(user_func) = allocated.first() {
-        let _ = write!(
-            asm_text,
-            "\n.section __TEXT,__text,regular,pure_instructions\n\
+        if user_func.name != "main" {
+            let _ = write!(
+                asm_text,
+                "\n.section __TEXT,__text,regular,pure_instructions\n\
 .globl _main\n\
 .p2align 2\n\
 _main:\n\
@@ -394,8 +535,9 @@ _main:\n\
     mov x0, #0\n\
     ldp x29, x30, [sp], #16\n\
     ret\n",
-            user_func.name
-        );
+                user_func.name
+            );
+        }
     }
 
     asm_text

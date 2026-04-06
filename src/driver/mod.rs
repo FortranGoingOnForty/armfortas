@@ -9,7 +9,7 @@ use std::process::Command;
 
 use crate::codegen::{emit, isel, linearscan};
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::Lexer;
+use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 
@@ -147,8 +147,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
 
     // 2. Preprocess.
+    let source_form = detect_source_form(&opts.input.to_string_lossy());
     let pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
+        fixed_form: matches!(source_form, SourceForm::FixedForm),
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
@@ -167,7 +169,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 3. Lex.
-    let tokens = Lexer::tokenize(&preprocessed, 0).map_err(|e| {
+    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| {
         format!(
             "{}:{}: lexer error: {}",
             opts.input.display(),
@@ -249,9 +251,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // Emit _main entry point (must be in __TEXT section).
     if let Some(user_func) = allocated.first() {
-        asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
-        asm_text.push_str(&format!(
-            "\
+        if user_func.name != "main" {
+            asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
+            asm_text.push_str(&format!(
+                "\
 .globl _main
 .p2align 2
 _main:
@@ -264,8 +267,9 @@ _main:
     ldp x29, x30, [sp], #16
     ret
 ",
-            user_func.name
-        ));
+                user_func.name
+            ));
+        }
     }
 
     if opts.emit_asm {
