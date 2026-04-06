@@ -61,6 +61,11 @@ impl OptLevel {
     }
 
     /// Does this level enable inlining?
+    ///
+    /// Audit Min-6: this predicate is currently consulted only by the
+    /// pipeline test harness. Once `Inline` lands as a pass, the
+    /// builder below will gate registration on this. Same for the
+    /// other two predicates.
     pub fn inlining(self) -> bool {
         matches!(self, Self::O2 | Self::O3 | Self::Os | Self::Ofast)
     }
@@ -70,7 +75,9 @@ impl OptLevel {
         matches!(self, Self::O3 | Self::Ofast)
     }
 
-    /// Does this level allow value-changing fast-math reassociation?
+    /// Does this level allow value-changing fast-math reassociation
+    /// (`-Ofast`-only — relaxes IEEE 754 strictness for FAdd/FMul
+    /// reordering, signed-zero collapse, etc.)?
     pub fn fast_math(self) -> bool {
         matches!(self, Self::Ofast)
     }

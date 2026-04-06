@@ -133,13 +133,17 @@ fn licm_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
     let mut any_hoisted = false;
 
-    // Stable mapping from BlockId to current vector index — needed
-    // because once we move instructions between blocks, indices shift.
-    // We rebuild this map at the start of each loop iteration.
-    let mut block_index: HashMap<BlockId, usize> = HashMap::new();
-    for (i, b) in func.blocks.iter().enumerate() {
-        block_index.insert(b.id, i);
-    }
+    // Stable mapping from BlockId to vector index. LICM never adds,
+    // removes, or reorders blocks (it only moves instructions between
+    // existing blocks), so this map is built once and remains valid
+    // for the entire pass. Audit Min-2: an earlier comment claimed
+    // we'd "rebuild per iteration" — that was always aspirational
+    // and would only matter if a future variant of LICM started
+    // mutating the block vector.
+    let block_index: HashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
 
     for lp in &loops {
         // Need a preheader to hoist into.
@@ -151,8 +155,6 @@ fn licm_function(func: &mut Function) -> bool {
         // candidates can become eligible.
         let mut loop_defs = loop_defined_values(func, lp);
 
-        // Per-iteration: rebuild the block index map (instruction
-        // moves don't change BlockIds, but they're stable anyway).
         loop {
             let mut hoists: Vec<Hoist> = Vec::new();
             for (bi, block) in func.blocks.iter().enumerate() {

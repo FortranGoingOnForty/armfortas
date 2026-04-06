@@ -64,8 +64,15 @@ fn key_of(inst: &Inst) -> Option<Key> {
 
     match &inst.kind {
         // Constants ------------------------------------------------------
-        InstKind::ConstInt(v, w)   => mk(1, vec![], (*v as i128 + (w.bits() as i128) * (1i128 << 70)) as i64),
-        InstKind::ConstFloat(v, w) => mk(2, vec![], (v.to_bits() as i64) ^ (w.bits() as i64)),
+        // Audit Min-4: the previous encoding mixed `w.bits()` into
+        // the aux value, which was both convoluted (the `1i128 << 70`
+        // shift truncated to 0 in the i64 cast) and redundant — the
+        // `ty` field on `Key` already disambiguates widths. The
+        // simple aux is the literal value / bit pattern; differing
+        // widths for the same numeric value still produce distinct
+        // keys via the `ty` field.
+        InstKind::ConstInt(v, _)   => mk(1, vec![], *v),
+        InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i64),
         InstKind::ConstBool(b)     => mk(3, vec![], if *b { 1 } else { 0 }),
 
         // Integer arithmetic --------------------------------------------
@@ -149,21 +156,7 @@ fn key_of(inst: &Inst) -> Option<Key> {
     }
 }
 
-/// Substitute every use of `old` with `new` across a function. Used to
-/// rewire downstream consumers of a CSE-eliminated value.
-fn substitute_uses(func: &mut Function, old: ValueId, new: ValueId) {
-    let r = |v: &mut ValueId| if *v == old { *v = new; };
-    for block in &mut func.blocks {
-        for inst in &mut block.insts {
-            substitute_in_inst(&mut inst.kind, r);
-        }
-        if let Some(term) = &mut block.terminator {
-            substitute_in_terminator(term, r);
-        }
-    }
-}
-
-fn substitute_in_inst(kind: &mut InstKind, r: impl Fn(&mut ValueId) + Copy) {
+fn substitute_in_inst(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)) {
     match kind {
         InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
         InstKind::ConstBool(..) | InstKind::ConstString(..) |
@@ -212,7 +205,7 @@ fn substitute_in_inst(kind: &mut InstKind, r: impl Fn(&mut ValueId) + Copy) {
     }
 }
 
-fn substitute_in_terminator(term: &mut Terminator, r: impl Fn(&mut ValueId) + Copy) {
+fn substitute_in_terminator(term: &mut Terminator, mut r: impl FnMut(&mut ValueId)) {
     match term {
         Terminator::Return(None) | Terminator::Unreachable => {}
         Terminator::Return(Some(v)) => r(v),
@@ -236,30 +229,61 @@ impl Pass for LocalCse {
         let mut changed = false;
         for func in &mut module.functions {
             // Collect all (old, new) rewrites first, then apply them
-            // outside the block-borrow so we can rewrite across blocks.
-            let mut rewrites: Vec<(ValueId, ValueId)> = Vec::new();
+            // in a *single* function walk. Audit Min-1: the previous
+            // version called `substitute_uses` once per rewrite, so a
+            // function with N CSE candidates ran N full walks for an
+            // overall O(N · function_size). The batched form is one
+            // walk with HashMap-driven renaming.
+            let mut rewrite_map: HashMap<ValueId, ValueId> = HashMap::new();
             for block in &func.blocks {
                 let mut seen: HashMap<Key, ValueId> = HashMap::new();
                 for inst in &block.insts {
                     let Some(k) = key_of(inst) else { continue };
                     if let Some(&first) = seen.get(&k) {
-                        rewrites.push((inst.id, first));
+                        rewrite_map.insert(inst.id, first);
                     } else {
                         seen.insert(k, inst.id);
                     }
                 }
             }
-            if rewrites.is_empty() { continue; }
-            // Apply rewrites in order. Each rewrite walks the whole
-            // function once, which is fine for the test sizes we
-            // currently see; if profiling later flags this we can
-            // batch into a single pass with a HashMap.
-            for (old, new) in rewrites {
-                substitute_uses(func, old, new);
+            if rewrite_map.is_empty() { continue; }
+
+            // Chase pointer chains so each entry maps directly to the
+            // canonical (final) value. CSE never produces cycles —
+            // every duplicate is rewritten to an *earlier* definition
+            // in dominance order — so the chase always terminates.
+            let keys: Vec<ValueId> = rewrite_map.keys().copied().collect();
+            for k in keys {
+                let mut cur = rewrite_map[&k];
+                while let Some(&next) = rewrite_map.get(&cur) {
+                    cur = next;
+                }
+                rewrite_map.insert(k, cur);
             }
+
+            substitute_uses_batch(func, &rewrite_map);
             changed = true;
         }
         changed
+    }
+}
+
+/// Replace every operand `old` with `rewrite_map[old]` (if any) in a
+/// single walk over the function. Pairs with `Min-1`: avoids the
+/// O(N · size) cost of calling `substitute_uses` once per rename.
+fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
+    let r = |v: &mut ValueId| {
+        if let Some(&new) = rewrites.get(v) {
+            *v = new;
+        }
+    };
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            substitute_in_inst(&mut inst.kind, r);
+        }
+        if let Some(term) = &mut block.terminator {
+            substitute_in_terminator(term, r);
+        }
     }
 }
 
