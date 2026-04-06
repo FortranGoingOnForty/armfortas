@@ -16,6 +16,7 @@ pub mod dce;
 pub mod cse;
 pub mod strength_reduce;
 pub mod licm;
+pub mod mem2reg;
 
 #[cfg(test)]
 mod audit_tests;
@@ -35,3 +36,5 @@ pub use cse::LocalCse;
 pub use strength_reduce::StrengthReduce;
 #[allow(unused_imports)]
 pub use licm::Licm;
+#[allow(unused_imports)]
+pub use mem2reg::Mem2Reg;
