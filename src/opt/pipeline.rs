@@ -10,6 +10,7 @@ use super::const_prop::ConstProp;
 use super::dce::Dce;
 use super::cse::LocalCse;
 use super::strength_reduce::StrengthReduce;
+use super::licm::Licm;
 
 /// Compiler optimization levels.
 ///
@@ -100,6 +101,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
@@ -110,6 +112,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }

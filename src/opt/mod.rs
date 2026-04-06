@@ -15,6 +15,7 @@ pub mod const_prop;
 pub mod dce;
 pub mod cse;
 pub mod strength_reduce;
+pub mod licm;
 
 #[allow(unused_imports)]
 pub use pass::{Pass, PassManager, PassRunResult};
@@ -29,3 +30,5 @@ pub use dce::Dce;
 pub use cse::LocalCse;
 #[allow(unused_imports)]
 pub use strength_reduce::StrengthReduce;
+#[allow(unused_imports)]
+pub use licm::Licm;
