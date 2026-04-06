@@ -130,6 +130,30 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             process_decls(st, decls)?;
             st.pop_scope();
         }
+        ProgramUnit::Submodule { parent, ancestor: _, name, uses, decls, contains } => {
+            // Find the parent module scope and inherit its symbols.
+            let parent_scope = st.find_module_scope(parent);
+            st.push_scope(ScopeKind::Submodule(name.clone()));
+            // Import all parent module symbols into the submodule scope.
+            if let Some(pid) = parent_scope {
+                let parent_syms: Vec<(String, String)> = st.scope(pid).symbols.iter()
+                    .filter(|(_, sym)| sym.attrs.access != Access::Private)
+                    .map(|(key, sym)| (sym.name.clone(), key.clone()))
+                    .collect();
+                for (sym_name, _key) in &parent_syms {
+                    st.add_use_association(UseAssociation {
+                        local_name: sym_name.clone(),
+                        original_name: sym_name.clone(),
+                        source_scope: pid,
+                        is_submodule_access: true,
+                    });
+                }
+            }
+            process_uses(st, uses)?;
+            process_decls(st, decls)?;
+            process_contains(st, contains)?;
+            st.pop_scope();
+        }
         ProgramUnit::InterfaceBlock { name: _, is_abstract: _, bodies } => {
             st.push_scope(ScopeKind::Interface);
             for body in bodies {
