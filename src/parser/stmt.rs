@@ -313,6 +313,18 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    /// Parse a comma-separated list of names (identifiers).
+    fn parse_name_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut names = Vec::new();
+        loop {
+            if self.peek() == &TokenKind::Identifier {
+                names.push(self.advance().clone().text);
+            } else { break; }
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        Ok(names)
+    }
+
     fn parse_case_selectors(&mut self) -> Result<Vec<CaseSelector>, ParseError> {
         if self.peek_text().eq_ignore_ascii_case("default") {
             self.advance();
@@ -364,14 +376,28 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stop(&mut self, start: crate::lexer::Span, is_error: bool) -> Result<SpannedStmt, ParseError> {
-        let code = if !self.at_stmt_end() {
+        let code = if !self.at_stmt_end() && !self.peek_text().eq_ignore_ascii_case("quiet") {
             Some(self.parse_expr()?)
         } else { None };
+
+        // Check for QUIET= specifier.
+        let mut quiet = false;
+        let _ = self.eat(&TokenKind::Comma); // optional comma before QUIET=
+        if self.peek_text().eq_ignore_ascii_case("quiet") {
+            self.advance();
+            self.expect(&TokenKind::Assign)?;
+            let val_text = self.peek_text().to_lowercase();
+            if val_text == ".true." || val_text == ".t." {
+                quiet = true;
+            }
+            self.advance(); // consume the logical literal
+        }
+
         let span = span_from_to(start, self.prev_span());
         if is_error {
-            Ok(Spanned::new(Stmt::ErrorStop { code, quiet: false }, span))
+            Ok(Spanned::new(Stmt::ErrorStop { code, quiet }, span))
         } else {
-            Ok(Spanned::new(Stmt::Stop { code, quiet: false }, span))
+            Ok(Spanned::new(Stmt::Stop { code, quiet }, span))
         }
     }
 
@@ -667,10 +693,70 @@ impl<'a> Parser<'a> {
             }
             let mask = if self.peek() != &TokenKind::RParen { Some(self.parse_expr()?) } else { None };
             self.expect(&TokenKind::RParen)?;
+
+            // Parse optional locality specs: LOCAL(...), SHARED(...), DEFAULT(NONE), REDUCE(op:...)
+            let mut locality = Vec::new();
+            loop {
+                let kw = self.peek_text().to_lowercase();
+                match kw.as_str() {
+                    "local" => {
+                        self.advance();
+                        if self.peek_text().eq_ignore_ascii_case("_init") || self.peek_text().eq_ignore_ascii_case("init") {
+                            // Check for LOCAL_INIT — might be lexed as LOCAL followed by _INIT
+                            // or as LOCAL_INIT as one token.
+                            let next = self.peek_text().to_lowercase();
+                            if next == "_init" {
+                                self.advance();
+                                self.expect(&TokenKind::LParen)?;
+                                let vars = self.parse_name_list()?;
+                                self.expect(&TokenKind::RParen)?;
+                                locality.push(LocalitySpec::LocalInit(vars));
+                                continue;
+                            }
+                        }
+                        self.expect(&TokenKind::LParen)?;
+                        let vars = self.parse_name_list()?;
+                        self.expect(&TokenKind::RParen)?;
+                        locality.push(LocalitySpec::Local(vars));
+                    }
+                    "local_init" => {
+                        self.advance();
+                        self.expect(&TokenKind::LParen)?;
+                        let vars = self.parse_name_list()?;
+                        self.expect(&TokenKind::RParen)?;
+                        locality.push(LocalitySpec::LocalInit(vars));
+                    }
+                    "shared" => {
+                        self.advance();
+                        self.expect(&TokenKind::LParen)?;
+                        let vars = self.parse_name_list()?;
+                        self.expect(&TokenKind::RParen)?;
+                        locality.push(LocalitySpec::Shared(vars));
+                    }
+                    "default" => {
+                        self.advance();
+                        self.expect(&TokenKind::LParen)?;
+                        self.eat_ident("none");
+                        self.expect(&TokenKind::RParen)?;
+                        locality.push(LocalitySpec::DefaultNone);
+                    }
+                    "reduce" => {
+                        self.advance();
+                        self.expect(&TokenKind::LParen)?;
+                        let op = self.advance().clone().text;
+                        self.expect(&TokenKind::Colon)?;
+                        let vars = self.parse_name_list()?;
+                        self.expect(&TokenKind::RParen)?;
+                        locality.push(LocalitySpec::Reduce { op, vars });
+                    }
+                    _ => break,
+                }
+            }
+
             let body = self.parse_stmt_block(&["do"])?;
             self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, body }, span));
+            return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, locality, body }, span));
         }
 
         // Infinite DO

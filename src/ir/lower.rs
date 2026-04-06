@@ -1436,9 +1436,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::None => {
-                                let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                if info.derived_type.is_some() {
-                                    // Derived type assignment: memcpy from source to destination.
+                                if !info.dims.is_empty() || info.allocatable {
+                                    if matches!(&value.node, Expr::FunctionCall { .. }) {
+                                        // Array = func_returning_array (e.g., c = matmul(a,b)).
+                                        // The function returns a temp descriptor pointer.
+                                        // Use afs_assign_allocatable to copy data and handle reallocation.
+                                        let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                        b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                            vec![info.addr, src_desc], IrType::Void);
+                                        // Deallocate the temporary result descriptor's heap data.
+                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                        b.call(FuncRef::External("afs_deallocate_array".into()),
+                                            vec![src_desc, stat], IrType::Void);
+                                    } else {
+                                        lower_array_assign(b, ctx, &info, value);
+                                    }
+                                } else if info.derived_type.is_some() {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let size = if let Some(ref tn) = info.derived_type {
                                         ctx.type_layouts.get(tn).map(|l| l.size).unwrap_or(8)
                                     } else { 8 };
@@ -1447,9 +1461,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         vec![info.addr, val, size_val],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                 } else if info.by_ref {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let ptr = b.load(info.addr);
                                     b.store(val, ptr);
                                 } else {
+                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     b.store(val, info.addr);
                                 }
                             }
@@ -1608,6 +1624,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_do_loop(b, ctx, DoLoopFields { name, var, start, end, step, body });
         }
 
+        Stmt::DoConcurrent { controls, body, locality: _, .. } => {
+            // Lower DO CONCURRENT as sequential loop (parallel optimization deferred).
+            if let Some(ctrl) = controls.first() {
+                let var_opt = Some(ctrl.var.clone());
+                let start_opt = Some(ctrl.start.clone());
+                let end_opt = Some(ctrl.end.clone());
+                lower_do_loop(b, ctx, DoLoopFields {
+                    name: &None,
+                    var: &var_opt,
+                    start: &start_opt,
+                    end: &end_opt,
+                    step: &ctrl.step,
+                    body,
+                });
+            }
+        }
+
         Stmt::DoWhile { name, condition, body } => {
             let bb_header = b.create_block("do_while_header");
             let bb_body = b.create_block("do_while_body");
@@ -1632,6 +1665,174 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::SelectCase { selector, cases, .. } => {
             lower_select_case(b, ctx, selector, cases);
+        }
+
+        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+            // WHERE(mask) body [ELSEWHERE body] END WHERE
+            // Collect ALL array names referenced in mask or body.
+            let mut array_names: Vec<String> = Vec::new();
+            collect_array_names(mask, &ctx.locals, &mut array_names);
+            for s in body {
+                collect_array_names_stmt(s, &ctx.locals, &mut array_names);
+            }
+
+            if array_names.is_empty() {
+                // No arrays — fall back to scalar IF-THEN-ELSE.
+                let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+                let bb_then = b.create_block("where_then");
+                let bb_else = if !elsewhere.is_empty() {
+                    Some(b.create_block("where_else"))
+                } else { None };
+                let bb_end = b.create_block("where_end");
+                b.cond_branch(cond, bb_then, vec![], bb_else.unwrap_or(bb_end), vec![]);
+
+                b.set_block(bb_then);
+                lower_stmts(b, ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_end, vec![]);
+                }
+                if let Some(bb_e) = bb_else {
+                    b.set_block(bb_e);
+                    if let Some((_m, else_body)) = elsewhere.first() {
+                        lower_stmts(b, ctx, else_body);
+                    }
+                    if b.func().block(b.current_block()).terminator.is_none() {
+                        b.branch(bb_end, vec![]);
+                    }
+                }
+                b.set_block(bb_end);
+                return;
+            }
+
+            // Array-level WHERE: iterate over elements.
+            // Use the first array to determine the iteration count.
+            let first_arr_name = &array_names[0];
+            let first_arr = ctx.locals.get(first_arr_name).cloned().expect("array must exist");
+            let n = b.call(FuncRef::External("afs_array_size".into()),
+                vec![first_arr.addr], IrType::Int(IntWidth::I64));
+
+            // Get base addresses for all arrays (loaded once outside the loop).
+            let mut array_bases: HashMap<String, ValueId> = HashMap::new();
+            for arr_name in &array_names {
+                if let Some(info) = ctx.locals.get(arr_name) {
+                    let base = if info.allocatable {
+                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    } else { info.addr };
+                    array_bases.insert(arr_name.clone(), base);
+                }
+            }
+
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let i_zero = b.const_i64(0);
+            b.store(i_zero, i_addr);
+
+            let bb_check = b.create_block("where_check");
+            let bb_body = b.create_block("where_body");
+            let bb_exit = b.create_block("where_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+
+            // Substitute each array variable with a scalar local bound to element i.
+            // Save original locals for restoration.
+            let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+            for arr_name in &array_names {
+                saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+                if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+                    let base = *array_bases.get(arr_name).unwrap();
+                    // Compute element address: base + i * elem_bytes.
+                    let elem_bytes_val = match &orig_info.ty {
+                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+                        IrType::Int(IntWidth::I16) => b.const_i64(2),
+                        IrType::Int(IntWidth::I8) => b.const_i64(1),
+                        _ => b.const_i64(4),
+                    };
+                    let byte_off = b.imul(i_val, elem_bytes_val);
+                    let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+                    // Replace the local with a scalar pointing to this element.
+                    ctx.locals.insert(arr_name.clone(), LocalInfo {
+                        addr: elem_ptr,
+                        ty: orig_info.ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                    });
+                }
+            }
+
+            // Evaluate mask with element-level bindings.
+            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+
+            let bb_then = b.create_block("where_then");
+            let bb_else = b.create_block("where_else");
+            let bb_incr = b.create_block("where_incr");
+            b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            lower_stmts(b, ctx, body);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_incr, vec![]);
+            }
+
+            b.set_block(bb_else);
+            if let Some((_else_mask, else_body)) = elsewhere.first() {
+                lower_stmts(b, ctx, else_body);
+            }
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_incr, vec![]);
+            }
+
+            b.set_block(bb_incr);
+            // Restore original locals.
+            for (name, orig) in saved_locals {
+                if let Some(info) = orig {
+                    ctx.locals.insert(name, info);
+                } else {
+                    ctx.locals.remove(&name);
+                }
+            }
+
+            let i_cur = b.load(i_addr);
+            let one = b.const_i64(1);
+            let next = b.iadd(i_cur, one);
+            b.store(next, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
+        }
+
+        Stmt::WhereStmt { mask, stmt } => {
+            // Single-line WHERE: where (cond) assignment
+            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+            let bb_then = b.create_block("where_stmt");
+            let bb_end = b.create_block("where_stmt_end");
+            b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
+            b.set_block(bb_then);
+            lower_stmt(b, ctx, stmt);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_end, vec![]);
+            }
+            b.set_block(bb_end);
+        }
+
+        Stmt::ForallConstruct { specs, mask, body, .. } => {
+            // FORALL: nest loops. The body goes inside the innermost loop.
+            // Build the body statements including optional mask as a closure-like pattern.
+            // The innermost loop gets the real body; outer loops wrap it.
+            lower_forall_nested(b, ctx, specs, mask.as_ref(), body);
+        }
+
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            let body_vec = vec![(**stmt).clone()];
+            lower_forall_nested(b, ctx, specs, mask.as_ref(), &body_vec);
         }
 
         Stmt::SelectType { selector, guards, assoc_name: _, .. } => {
@@ -2545,6 +2746,492 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 /// Lower an argument for pass-by-reference: return the address of the value.
 /// If the argument is a named variable, return its alloca address.
 /// If it's an expression (literal, computation), store to a temp and return the temp address.
+/// Lower FORALL by nesting loops recursively. The body executes inside the innermost loop.
+fn lower_forall_nested(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[crate::ast::stmt::ForallSpec],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    body: &[SpannedStmt],
+) {
+    if specs.is_empty() {
+        // Innermost level: apply mask and execute body.
+        if let Some(mask_expr) = mask {
+            let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
+            let bb_body = b.create_block("forall_body");
+            let bb_skip = b.create_block("forall_skip");
+            b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
+            b.set_block(bb_body);
+            lower_stmts(b, ctx, body);
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_skip, vec![]);
+            }
+            b.set_block(bb_skip);
+        } else {
+            lower_stmts(b, ctx, body);
+        }
+    } else {
+        // Wrap remaining specs in a DO loop. The loop body recurses to handle inner specs.
+        let spec = &specs[0];
+        let remaining = &specs[1..];
+
+        // Build the inner body as a FORALL of remaining specs + body.
+        // We use lower_do_loop with the body being the recursive FORALL.
+        // But lower_do_loop takes &[SpannedStmt], not a closure.
+        // Instead, manually build the loop structure.
+        let key = spec.var.to_lowercase();
+        let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
+            let addr = b.alloca(IrType::Int(IntWidth::I32));
+            ctx.locals.insert(key.clone(), LocalInfo {
+                addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
+                allocatable: false, by_ref: false, char_kind: CharKind::None,
+                derived_type: None,
+            });
+            addr
+        });
+
+        let init_val = lower_expr(b, &ctx.locals, &spec.start, ctx.st);
+        b.store(init_val, var_addr);
+        let end_val = lower_expr(b, &ctx.locals, &spec.end, ctx.st);
+        let step_val = spec.step.as_ref()
+            .map(|s| lower_expr(b, &ctx.locals, s, ctx.st))
+            .unwrap_or_else(|| b.const_i32(1));
+
+        let bb_check = b.create_block("forall_check");
+        let bb_loop = b.create_block("forall_loop");
+        let bb_incr = b.create_block("forall_incr");
+        let bb_exit = b.create_block("forall_exit");
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_check);
+        let cur = b.load(var_addr);
+        // Handle both positive and negative steps: done = (step >= 0 && cur > end) || (step < 0 && cur < end)
+        let zero_const = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero_const);
+        let gt_end = b.icmp(CmpOp::Gt, cur, end_val);
+        let lt_end = b.icmp(CmpOp::Lt, cur, end_val);
+        let done = b.select(step_neg, lt_end, gt_end);
+        b.cond_branch(done, bb_exit, vec![], bb_loop, vec![]);
+
+        b.set_block(bb_loop);
+        // Recurse: lower remaining specs + body inside this loop.
+        lower_forall_nested(b, ctx, remaining, mask, body);
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(bb_incr, vec![]);
+        }
+
+        b.set_block(bb_incr);
+        let cur2 = b.load(var_addr);
+        let next = b.iadd(cur2, step_val);
+        b.store(next, var_addr);
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_exit);
+    }
+}
+
+/// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
+fn lower_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) {
+    // Check if RHS is also an array variable → element-wise copy via memcpy.
+    let rhs_is_array = if let Expr::Name { name } = &value.node {
+        ctx.locals.get(&name.to_lowercase())
+            .map(|i| !i.dims.is_empty() || i.allocatable)
+            .unwrap_or(false)
+    } else { false };
+
+    if rhs_is_array {
+        // a = b: memcpy from b's data to a's data.
+        // For allocatable arrays, load base_addr from both descriptors.
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+
+        if let Expr::Name { name } = &value.node {
+            let key = name.to_lowercase();
+            if let Some(src_info) = ctx.locals.get(&key) {
+                let src_base = if src_info.allocatable {
+                    b.load_typed(src_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else { src_info.addr };
+
+                // Compute byte count: size(a) * elem_size.
+                let n = b.call(FuncRef::External("afs_array_size".into()),
+                    vec![dest_info.addr], IrType::Int(IntWidth::I64));
+                let elem_bytes = match &dest_info.ty {
+                    IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+                    _ => b.const_i64(4),
+                };
+                let byte_count = b.imul(n, elem_bytes);
+                b.call(FuncRef::External("memcpy".into()),
+                    vec![dest_base, src_base, byte_count],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            }
+        }
+    } else {
+        // a = scalar: broadcast scalar to all elements.
+        // Generate a loop with stack-allocated counter.
+        let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+
+        let n = b.call(FuncRef::External("afs_array_size".into()),
+            vec![dest_info.addr], IrType::Int(IntWidth::I64));
+
+        // Stack-allocated loop counter.
+        let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero = b.const_i64(0);
+        b.store(zero, i_addr);
+
+        let bb_check = b.create_block("broadcast_check");
+        let bb_body = b.create_block("broadcast_body");
+        let bb_exit = b.create_block("broadcast_exit");
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_check);
+        let i = b.load(i_addr);
+        let done = b.icmp(CmpOp::Ge, i, n);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+        b.set_block(bb_body);
+        let i_val = b.load(i_addr);
+        // Compute byte offset: i * elem_size. Use byte-level GEP to avoid double multiplication.
+        let elem_bytes = match &dest_info.ty {
+            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
+            IrType::Int(IntWidth::I16) => b.const_i64(2),
+            IrType::Int(IntWidth::I8) => b.const_i64(1),
+            _ => b.const_i64(4),
+        };
+        let byte_offset = b.imul(i_val, elem_bytes);
+        let elem_ptr = b.gep(dest_base, vec![byte_offset], IrType::Int(IntWidth::I8));
+        b.store(scalar, elem_ptr);
+        let one = b.const_i64(1);
+        let next_i = b.iadd(i_val, one);
+        b.store(next_i, i_addr);
+        b.branch(bb_check, vec![]);
+
+        b.set_block(bb_exit);
+    }
+}
+
+/// Collect all array variable names referenced in an expression.
+fn collect_array_names(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<String, LocalInfo>, out: &mut Vec<String>) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                if (!info.dims.is_empty() || info.allocatable) && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_array_names(left, locals, out);
+            collect_array_names(right, locals, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_array_names(operand, locals, out),
+        Expr::ParenExpr { inner } => collect_array_names(inner, locals, out),
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    collect_array_names(e, locals, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect array names referenced in a statement (for WHERE body analysis).
+fn collect_array_names_stmt(stmt: &SpannedStmt, locals: &HashMap<String, LocalInfo>, out: &mut Vec<String>) {
+    if let Stmt::Assignment { target, value } = &stmt.node {
+        collect_array_names(target, locals, out);
+        collect_array_names(value, locals, out);
+    }
+}
+
+/// Find the first array variable referenced in an expression (for WHERE mask detection).
+fn find_array_in_expr(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<String, LocalInfo>) -> Option<LocalInfo> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            locals.get(&key).filter(|i| !i.dims.is_empty() || i.allocatable).cloned()
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            find_array_in_expr(left, locals).or_else(|| find_array_in_expr(right, locals))
+        }
+        Expr::UnaryOp { operand, .. } => find_array_in_expr(operand, locals),
+        Expr::ParenExpr { inner } => find_array_in_expr(inner, locals),
+        Expr::FunctionCall { args, .. } => {
+            args.iter().find_map(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    find_array_in_expr(e, locals)
+                } else { None }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Check if the first argument refers to a REAL array (for type dispatch).
+fn first_arg_is_real(args: &[crate::ast::expr::Argument], locals: &HashMap<String, LocalInfo>) -> bool {
+    args.first().and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            if let Expr::Name { name } = &e.node {
+                locals.get(&name.to_lowercase()).map(|i| i.ty.is_float())
+            } else { None }
+        } else { None }
+    }).unwrap_or(false)
+}
+
+/// Lower an array section expression: a(1:10:2) → create section descriptor.
+fn lower_array_section(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> ValueId {
+    let n_dims = args.len();
+
+    // Allocate SectionSpec array on stack: each spec is 24 bytes (3 x i64).
+    let spec_array_size = (n_dims * 24) as u64;
+    let specs = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), spec_array_size));
+
+    // Fill in each SectionSpec from the subscript ranges.
+    for (i, arg) in args.iter().enumerate() {
+        let base_offset = (i * 24) as i64;
+        match &arg.value {
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                let start_val = start.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| b.const_i64(1)); // default start = 1
+                let end_val = end.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| {
+                        // Default end = upper bound of this dimension.
+                        let dim = b.const_i32((i + 1) as i32);
+                        b.call(FuncRef::External("afs_array_ubound".into()),
+                            vec![info.addr, dim], IrType::Int(IntWidth::I64))
+                    });
+                let stride_val = stride.as_ref()
+                    .map(|e| lower_expr(b, locals, e, st))
+                    .unwrap_or_else(|| b.const_i64(1)); // default stride = 1
+
+                // Store start at offset+0, end at offset+8, stride at offset+16.
+                let off0 = b.const_i64(base_offset);
+                let off8 = b.const_i64(base_offset + 8);
+                let off16 = b.const_i64(base_offset + 16);
+                let p0 = b.gep(specs, vec![off0], IrType::Int(IntWidth::I8));
+                let p8 = b.gep(specs, vec![off8], IrType::Int(IntWidth::I8));
+                let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
+                b.store(start_val, p0);
+                b.store(end_val, p8);
+                b.store(stride_val, p16);
+            }
+            crate::ast::expr::SectionSubscript::Element(e) => {
+                // Single element subscript in a section context — treat as start=end=val, stride=1.
+                let val = lower_expr(b, locals, e, st);
+                let off0 = b.const_i64(base_offset);
+                let off8 = b.const_i64(base_offset + 8);
+                let off16 = b.const_i64(base_offset + 16);
+                let p0 = b.gep(specs, vec![off0], IrType::Int(IntWidth::I8));
+                let p8 = b.gep(specs, vec![off8], IrType::Int(IntWidth::I8));
+                let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
+                b.store(val, p0);
+                b.store(val, p8);
+                let one = b.const_i64(1);
+                b.store(one, p16);
+            }
+        }
+    }
+
+    // Allocate result descriptor on stack (384 bytes).
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+    // Call afs_create_section(source, result, specs, n_dims).
+    let ndims = b.const_i32(n_dims as i32);
+    b.call(FuncRef::External("afs_create_section".into()),
+        vec![info.addr, result_desc, specs, ndims], IrType::Void);
+
+    result_desc
+}
+
+/// Lower array intrinsics that need descriptor addresses (SIZE, SUM, etc.).
+fn lower_array_intrinsic(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> Option<ValueId> {
+    // Get the first argument as a descriptor address (for array variables).
+    let first_arg_desc = args.first().and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            if let Expr::Name { name } = &e.node {
+                let key = name.to_lowercase();
+                locals.get(&key).filter(|i| i.allocatable || !i.dims.is_empty())
+                    .map(|i| i.addr)
+            } else { None }
+        } else { None }
+    });
+
+    let desc = first_arg_desc?;
+
+    match name {
+        "size" => {
+            if args.len() >= 2 {
+                // SIZE(array, dim)
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_size_dim".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else {
+                // SIZE(array)
+                Some(b.call(FuncRef::External("afs_array_size".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
+        }
+        "lbound" => {
+            if args.len() >= 2 {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_lbound".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else { None }
+        }
+        "ubound" => {
+            if args.len() >= 2 {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                    let dim = lower_expr(b, locals, e, st);
+                    Some(b.call(FuncRef::External("afs_array_ubound".into()),
+                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                } else { None }
+            } else { None }
+        }
+        "allocated" => {
+            Some(b.call(FuncRef::External("afs_array_allocated".into()),
+                vec![desc], IrType::Int(IntWidth::I32)))
+        }
+        "sum" => {
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_sum_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_sum_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
+        }
+        "product" => {
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_product_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_product_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I64)))
+            }
+        }
+        "maxval" => {
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_maxval_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_maxval_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I32)))
+            }
+        }
+        "minval" => {
+            let is_real = first_arg_is_real(args, locals);
+            if is_real {
+                Some(b.call(FuncRef::External("afs_array_minval_real8".into()),
+                    vec![desc], IrType::Float(FloatWidth::F64)))
+            } else {
+                Some(b.call(FuncRef::External("afs_array_minval_int".into()),
+                    vec![desc], IrType::Int(IntWidth::I32)))
+            }
+        }
+        "dot_product" => {
+            let second_desc = args.get(1).and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase())
+                            .filter(|i| i.allocatable || !i.dims.is_empty())
+                            .map(|i| i.addr)
+                    } else { None }
+                } else { None }
+            })?;
+            // Get the first arg's element type for dispatch.
+            let elem_ty = args.first().and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase()).map(|i| i.ty.clone())
+                    } else { None }
+                } else { None }
+            }).unwrap_or(IrType::Float(FloatWidth::F64));
+            match &elem_ty {
+                IrType::Float(FloatWidth::F64) => Some(b.call(
+                    FuncRef::External("afs_dot_product_real8".into()),
+                    vec![desc, second_desc], IrType::Float(FloatWidth::F64))),
+                IrType::Float(FloatWidth::F32) => Some(b.call(
+                    FuncRef::External("afs_dot_product_real4".into()),
+                    vec![desc, second_desc], IrType::Float(FloatWidth::F32))),
+                _ => Some(b.call(
+                    FuncRef::External("afs_dot_product_int".into()),
+                    vec![desc, second_desc], IrType::Int(IntWidth::I64))),
+            }
+        }
+        "matmul" => {
+            // MATMUL(a, b) → allocate result descriptor, dispatch by type.
+            let second_desc = args.get(1).and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name } = &e.node {
+                        locals.get(&name.to_lowercase())
+                            .filter(|i| i.allocatable || !i.dims.is_empty())
+                            .map(|i| i.addr)
+                    } else { None }
+                } else { None }
+            })?;
+            let is_real = first_arg_is_real(args, locals);
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let func = if is_real { "afs_matmul_real8" } else { "afs_matmul_int" };
+            b.call(FuncRef::External(func.into()),
+                vec![desc, second_desc, result_desc], IrType::Void);
+            Some(result_desc)
+        }
+        "transpose" => {
+            // TRANSPOSE(source) → allocate result descriptor, dispatch by type.
+            let is_real = first_arg_is_real(args, locals);
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(FuncRef::External("memset".into()), vec![result_desc, zero, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let func = if is_real { "afs_transpose_real8" } else { "afs_transpose_int" };
+            b.call(FuncRef::External(func.into()),
+                vec![desc, result_desc], IrType::Void);
+            Some(result_desc)
+        }
+        _ => None,
+    }
+}
+
 /// Check if `actual_type` is or extends `target_type` (for CLASS IS matching).
 fn is_type_or_extends(actual_type: &str, target_type: &str, tl: &crate::sema::type_layout::TypeLayoutRegistry) -> bool {
     if actual_type.eq_ignore_ascii_case(target_type) { return true; }
@@ -2730,6 +3417,26 @@ fn lower_expr_full(
         Expr::StringLiteral { value, .. } => {
             b.const_string(value.as_bytes())
         }
+        Expr::BozLiteral { text, base } => {
+            // BOZ literals: strip prefix letter and quotes, parse digit string.
+            let radix = match base {
+                crate::ast::expr::BozBase::Binary => 2,
+                crate::ast::expr::BozBase::Octal => 8,
+                crate::ast::expr::BozBase::Hex => 16,
+            };
+            // Token text is like Z'FF' or B'1010' — extract the digits between quotes.
+            let digits: String = text.chars()
+                .skip_while(|c| !matches!(c, '\'' | '"'))
+                .skip(1) // skip opening quote
+                .take_while(|c| !matches!(c, '\'' | '"'))
+                .collect();
+            let val = i64::from_str_radix(&digits, radix).unwrap_or(0);
+            if val > i32::MAX as i64 || val < i32::MIN as i64 {
+                b.const_i64(val)
+            } else {
+                b.const_i32(val as i32)
+            }
+        }
 
         Expr::Name { name } => {
             let key = name.to_lowercase();
@@ -2740,12 +3447,15 @@ fn lower_expr_full(
                 } else if info.by_ref {
                     // Pass-by-reference param: load the pointer, then load through it.
                     let ptr = b.load(info.addr);
-                    b.load(ptr)
+                    b.load_typed(ptr, info.ty.clone())
                 } else {
-                    b.load(info.addr)
+                    // Use load_typed with the local's declared type to handle cases
+                    // where the address pointer type doesn't exactly match (e.g.,
+                    // WHERE substitution using byte-level GEP).
+                    b.load_typed(info.addr, info.ty.clone())
                 }
             } else {
-                b.const_i32(0) // implicit or unknown
+                b.const_i32(0)
             }
         }
 
@@ -2847,12 +3557,20 @@ fn lower_expr_full(
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
 
-                // Check if this is an array element access.
-                // Fixed arrays have dims set; allocatable arrays have allocatable flag.
+                // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
                     if !info.dims.is_empty() || info.allocatable {
+                        let has_range = args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
+                        if has_range {
+                            return lower_array_section(b, locals, info, args, st);
+                        }
                         return lower_array_element(b, locals, info, args, st);
                     }
+                }
+
+                // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
+                if let Some(result) = lower_array_intrinsic(b, locals, &key, args, st) {
+                    return result;
                 }
 
                 // Check if this is a structure constructor: type_name(val1, val2, ...).

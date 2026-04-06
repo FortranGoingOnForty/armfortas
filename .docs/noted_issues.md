@@ -109,6 +109,21 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(B)** Stack-passed arguments (>8 args): silently dropped. Rare for Fortran scalars.
 - **(B)** Register hint population: infrastructure present, not wired to isel.
 - **(C)** Callee-saved frame growth ordering undocumented (works by late-binding sentinel).
+- **(C)** Register width mismatch in array index GEP: `mul x24, w23, x26` mixes 32-bit and 64-bit registers. The GEP index needs width promotion before multiplication. Surfaces when passing arrays to subroutines with assumed-shape/assumed-rank args.
+- **(C)** Array intrinsic return type width: SIZE/SUM return i64 but assigning to integer(4) variable stores 8 bytes into 4-byte slot. Needs truncation at assignment site when intrinsic result is wider than target. Direct printing via PRINT works correctly.
+
+## Derived Types & OOP (Sprint 28)
+
+- **[FIXED]** Component access read/write including chained (x%a%b) and by-ref params.
+- **[FIXED]** Structure constructors with zero-init and arg count warnings.
+- **[FIXED]** Type extension (EXTENDS) with inherited field access.
+- **[FIXED]** Type-bound procedures with PASS/NOPASS semantics.
+- **[FIXED]** FINAL procedures at scope exit (the gfortran ARM64 crash).
+- **[FIXED]** SELECT TYPE with TYPE IS and CLASS IS guards.
+- **[FIXED]** Allocatable component layout (384-byte descriptor slots).
+- **(D)** Vtable-based virtual dispatch — requires CLASS variable descriptor infrastructure (polymorphic ALLOCATE, indirect calls through vtable function pointers). Foundation in place: type tags, parent tracking. Needed for true polymorphic dispatch.
+- **(D)** Allocatable component ALLOCATE/DEALLOCATE — layout correct but no codegen to route ALLOCATE to embedded descriptor.
+- **(D)** Type mismatch validation in component assignment — needs sema validation pass.
 
 ---
 
@@ -116,7 +131,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| **[FIXED]** | 14 | Resolved in Sprint 21.5 |
-| **(B)** Naturally resolved | 11 | Covered by Sprints 22-30 |
+| **[FIXED]** | 38 | Sprint 21.5 (14), Sprint 25/25.5 (11), Sprint 26 (8), Sprint 27 (5) |
+| **(B)** Naturally resolved | 13 | Covered by Sprints 26.5, 28.7, and remaining plan |
 | **(C)** fortsh-blocking | 14 | Defer to integration (Sprints 33-35) |
-| **(D)** Exotic/rare | 17 | Keep noted, no planned work |
+| **(D)** Exotic/rare | 19 | Keep noted, no planned work |

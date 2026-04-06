@@ -279,12 +279,20 @@ pub extern "C" fn afs_create_section(
         let start_idx = spec.start - src_dim.lower_bound;
         byte_offset += start_idx * source_multiplier * src_dim.stride * source.elem_size;
 
-        // New dimension bounds.
+        // New dimension bounds. Extent = max(0, (end - start) / stride + 1).
+        // For negative strides, start > end and (end-start)/stride is positive.
+        // For a positive stride where start > end, result is empty (extent 0).
+        let extent = if spec.stride == 0 {
+            1
+        } else if (spec.stride > 0 && spec.start > spec.end)
+            || (spec.stride < 0 && spec.start < spec.end) {
+            0 // empty section
+        } else {
+            (spec.end - spec.start) / spec.stride + 1
+        };
         result.dims[i] = DimDescriptor {
             lower_bound: 1, // sections are always 1-based
-            upper_bound: if spec.stride == 0 { 1 } else {
-                (spec.end - spec.start) / spec.stride + 1
-            },
+            upper_bound: extent,
             stride: src_dim.stride * spec.stride,
         };
 
@@ -427,7 +435,398 @@ mod tests {
         afs_allocate_1d(&mut desc, 4, 0);
         assert!(desc.is_allocated());
         assert_eq!(desc.total_elements(), 0);
-        // base_addr may be null for zero-size.
         afs_deallocate_array(&mut desc, ptr::null_mut());
     }
 }
+
+// ---- Array query intrinsics ----
+
+/// SIZE(array) — total number of elements.
+#[no_mangle]
+pub extern "C" fn afs_array_size(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 0; }
+    unsafe { (*desc).total_elements() }
+}
+
+/// SIZE(array, dim) — number of elements along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 0; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize {
+        d.dims[idx].extent()
+    } else { 0 }
+}
+
+/// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 1; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize { d.dims[idx].lower_bound } else { 1 }
+}
+
+/// UBOUND(array, dim) — upper bound along dimension `dim` (1-based).
+#[no_mangle]
+pub extern "C" fn afs_array_ubound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
+    if desc.is_null() || dim < 1 { return 0; }
+    let d = unsafe { &*desc };
+    let idx = (dim - 1) as usize;
+    if idx < d.rank as usize { d.dims[idx].upper_bound } else { 0 }
+}
+
+/// ALLOCATED(array) — check if array is allocated (returns 1 or 0).
+#[no_mangle]
+pub extern "C" fn afs_array_allocated(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return 0; }
+    unsafe { (*desc).is_allocated() as i32 }
+}
+
+/// SUM(array) — sum all elements (real(8) version).
+/// Respects strides for non-contiguous sections.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return 0.0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 0.0; }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut sum = 0.0;
+    for i in 0..n {
+        sum += unsafe { *ptr.add(i * stride) };
+    }
+    sum
+}
+
+/// SUM(array) — sum all elements (integer(4) version).
+/// Respects strides for non-contiguous sections.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 0; }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const i32;
+    let mut sum: i64 = 0;
+    for i in 0..n {
+        sum += unsafe { *ptr.add(i * stride) } as i64;
+    }
+    sum
+}
+
+/// PRODUCT(array) — product of all elements (real(8) version).
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return 1.0; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 1.0; }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut prod = 1.0;
+    for i in 0..n {
+        prod *= unsafe { *ptr.add(i * stride) };
+    }
+    prod
+}
+
+/// PRODUCT(array) — product of all elements (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() { return 1; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return 1; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return 1; }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const i32;
+    let mut prod: i64 = 1;
+    for i in 0..n {
+        prod *= unsafe { *ptr.add(i * stride) } as i64;
+    }
+    prod
+}
+
+/// MAXVAL(array) — maximum element (real(8) version). Respects strides.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return f64::NEG_INFINITY; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return f64::NEG_INFINITY; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return f64::NEG_INFINITY; }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut max = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v > max { max = v; }
+    }
+    max
+}
+
+/// MINVAL(array) — minimum element (real(8) version). Respects strides.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() { return f64::INFINITY; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return f64::INFINITY; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return f64::INFINITY; }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut min = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v < min { min = v; }
+    }
+    min
+}
+
+/// MAXVAL(array) — maximum element (integer(4) version). Respects strides.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return i32::MIN; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return i32::MIN; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return i32::MIN; }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const i32;
+    let mut max = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v > max { max = v; }
+    }
+    max
+}
+
+/// MINVAL(array) — minimum element (integer(4) version). Respects strides.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() { return i32::MAX; }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() { return i32::MAX; }
+    let n = d.total_elements() as usize;
+    if n == 0 { return i32::MAX; }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const i32;
+    let mut min = unsafe { *ptr };
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v < min { min = v; }
+    }
+    min
+}
+
+/// TRANSPOSE(source, result) — matrix transpose (real(8) version).
+/// source is (m x n), result is (n x m). Both descriptors must be allocated.
+#[no_mangle]
+pub extern "C" fn afs_transpose_real8(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() { return; }
+    let src = unsafe { &*source };
+    if src.rank < 2 || src.base_addr.is_null() { return; }
+
+    let m = src.dims[0].extent() as usize;
+    let n = src.dims[1].extent() as usize;
+    let sp = src.base_addr as *const f64;
+
+    // Allocate result as (n x m).
+    afs_allocate_1d(result, 8, (n * m) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    let rp = res.base_addr as *mut f64;
+
+    for i in 0..m {
+        for j in 0..n {
+            unsafe { *rp.add(j * m + i) = *sp.add(i * n + j); }
+        }
+    }
+}
+
+/// MATMUL(a, b, result) — matrix multiplication (real(8) version).
+/// a is (m x k), b is (k x n), result is (m x n).
+#[no_mangle]
+pub extern "C" fn afs_matmul_real8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if a.is_null() || b.is_null() || result.is_null() { return; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return; }
+
+    let m = da.dims[0].extent() as usize;
+    let k = if da.rank >= 2 { da.dims[1].extent() as usize } else { 1 };
+    let n = if db.rank >= 2 { db.dims[1].extent() as usize } else { db.dims[0].extent() as usize };
+
+    // For vector * matrix or matrix * vector, adjust dimensions.
+    let ap = da.base_addr as *const f64;
+    let bp = db.base_addr as *const f64;
+
+    // Allocate result.
+    afs_allocate_1d(result, 8, (m * n) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    let rp = res.base_addr as *mut f64;
+
+    // Triple loop: C(i,j) = sum_l A(i,l) * B(l,j)
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for l in 0..k {
+                let a_val = unsafe { *ap.add(i * k + l) };
+                let b_val = unsafe { *bp.add(l * n + j) };
+                sum += a_val * b_val;
+            }
+            unsafe { *rp.add(i * n + j) = sum; }
+        }
+    }
+}
+
+/// MATMUL(a, b, result) — matrix multiplication (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_matmul_int(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if a.is_null() || b.is_null() || result.is_null() { return; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return; }
+
+    let m = da.dims[0].extent() as usize;
+    let k = if da.rank >= 2 { da.dims[1].extent() as usize } else { 1 };
+    let n = if db.rank >= 2 { db.dims[1].extent() as usize } else { db.dims[0].extent() as usize };
+
+    let ap = da.base_addr as *const i32;
+    let bp = db.base_addr as *const i32;
+
+    afs_allocate_1d(result, 4, (m * n) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    let rp = res.base_addr as *mut i32;
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum: i64 = 0;
+            for l in 0..k {
+                let a_val = unsafe { *ap.add(i * k + l) as i64 };
+                let b_val = unsafe { *bp.add(l * n + j) as i64 };
+                sum += a_val * b_val;
+            }
+            unsafe { *rp.add(i * n + j) = sum as i32; }
+        }
+    }
+}
+
+/// TRANSPOSE(source, result) — matrix transpose (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_transpose_int(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() { return; }
+    let src = unsafe { &*source };
+    if src.rank < 2 || src.base_addr.is_null() { return; }
+
+    let m = src.dims[0].extent() as usize;
+    let n = src.dims[1].extent() as usize;
+    let sp = src.base_addr as *const i32;
+
+    afs_allocate_1d(result, 4, (n * m) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    let rp = res.base_addr as *mut i32;
+
+    for i in 0..m {
+        for j in 0..n {
+            unsafe { *rp.add(j * m + i) = *sp.add(i * n + j); }
+        }
+    }
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
+/// Respects strides for non-contiguous array sections.
+#[no_mangle]
+pub extern "C" fn afs_dot_product_real8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+) -> f64 {
+    if a.is_null() || b.is_null() { return 0.0; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return 0.0; }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let pa = da.base_addr as *const f64;
+    let pb = db.base_addr as *const f64;
+    let mut dot = 0.0;
+    for i in 0..n {
+        dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
+    }
+    dot
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (real(4) version).
+#[no_mangle]
+pub extern "C" fn afs_dot_product_real4(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+) -> f32 {
+    if a.is_null() || b.is_null() { return 0.0; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return 0.0; }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let pa = da.base_addr as *const f32;
+    let pb = db.base_addr as *const f32;
+    let mut dot = 0.0;
+    for i in 0..n {
+        dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
+    }
+    dot
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (integer(4) version).
+#[no_mangle]
+pub extern "C" fn afs_dot_product_int(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+) -> i64 {
+    if a.is_null() || b.is_null() { return 0; }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() { return 0; }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let pa = da.base_addr as *const i32;
+    let pb = db.base_addr as *const i32;
+    let mut dot: i64 = 0;
+    for i in 0..n {
+        dot += unsafe { (*pa.add(i * stride_a) as i64) * (*pb.add(i * stride_b) as i64) };
+    }
+    dot
+}
+
