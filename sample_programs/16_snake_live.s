@@ -388,7 +388,7 @@ init_game:
 
     adrp x12, _snake_y@PAGE
     add x12, x12, _snake_y@PAGEOFF
-    mov x10, #10
+    mov x10, #18
     str x10, [x12, #0]
     str x10, [x12, #8]
     str x10, [x12, #16]
@@ -594,7 +594,7 @@ advance_game:
     b.ge .Llose_now
     cmp x26, #0
     b.lt .Llose_now
-    cmp x26, #20
+    cmp x26, #36
     b.ge .Llose_now
 
     mov x27, #0
@@ -758,7 +758,7 @@ draw_frame:
     mov x19, #0
 
 .Lrow_loop:
-    cmp x19, #20
+    cmp x19, #36
     b.ge .Lrows_done
 
     mov x0, #124
@@ -939,14 +939,14 @@ _crlf:
     .byte 10
 
 _food_table:
-    .quad 58, 10
-    .quad 58, 15
-    .quad 20, 15
-    .quad 20, 3
-    .quad 70, 3
-    .quad 70, 17
-    .quad 8, 17
-    .quad 8, 5
+    .quad 58, 18
+    .quad 58, 26
+    .quad 20, 26
+    .quad 20, 6
+    .quad 70, 6
+    .quad 70, 31
+    .quad 8, 31
+    .quad 8, 10
 
 .section __DATA,__bss
 .p2align 3
