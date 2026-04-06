@@ -2955,7 +2955,7 @@ fn collect_array_names_stmt(stmt: &SpannedStmt, locals: &HashMap<String, LocalIn
 }
 
 /// Find the first array variable referenced in an expression (for WHERE mask detection).
-fn find_array_in_expr<'a>(expr: &crate::ast::expr::SpannedExpr, locals: &'a HashMap<String, LocalInfo>) -> Option<LocalInfo> {
+fn find_array_in_expr(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<String, LocalInfo>) -> Option<LocalInfo> {
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
