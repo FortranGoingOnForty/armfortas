@@ -291,7 +291,23 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::IntToFloat(a, fw) => {
             if let Some(Const::Int(av, w)) = get(a) {
                 let signed = sext(av, w.bits());
-                return Some(InstKind::ConstFloat(signed as f64, *fw));
+                // Round through the destination precision so that
+                // downstream `const_fold` operations see the exact
+                // value the runtime would observe. AArch64 `SCVTF`
+                // produces an f32 directly for f32 destinations; we
+                // approximate that by going through `f32` then back
+                // to `f64` for IR storage. The double-rounding from
+                // `i64 → f64 → f32` differs from a hypothetical
+                // direct `i64 → f32` by at most one ULP near
+                // round-tie boundaries — acceptable for now;
+                // codegen always does the direct conversion at
+                // runtime, so the only divergence is in IR-level
+                // operations chained off of this constant.
+                let v = match fw {
+                    FloatWidth::F32 => signed as f32 as f64,
+                    FloatWidth::F64 => signed as f64,
+                };
+                return Some(InstKind::ConstFloat(v, *fw));
             }
             None
         }
