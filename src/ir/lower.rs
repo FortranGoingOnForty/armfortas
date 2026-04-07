@@ -2656,14 +2656,24 @@ fn lower_array_element(
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
     let base = array_base_addr(b, info);
-    // Widen index to i64 for pointer arithmetic if needed.
-    let idx64 = if info.allocatable {
-        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
-            b.int_extend(idx, IntWidth::I64, true)
-        } else { idx }
-    } else { idx };
+    // Widen index to i64 for pointer arithmetic. ARM64 GEP lowering
+    // needs an i64 subscript so the codegen `mul` lands as
+    // `mul x, x, x` instead of `mul x, w, x` (which the assembler
+    // rejects). Applies to BOTH stack and allocatable arrays —
+    // gating on `info.allocatable` was the audit's CRITICAL-1.
+    let idx64 = widen_idx_to_i64(b, idx);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.load(elem_ptr)
+}
+
+/// Widen an i32 (or smaller) index value to i64 for pointer
+/// arithmetic. Pass through for values already i64 or larger.
+fn widen_idx_to_i64(b: &mut FuncBuilder, idx: ValueId) -> ValueId {
+    match b.func().value_type(idx) {
+        Some(IrType::Int(IntWidth::I64)) => idx,
+        Some(IrType::Int(_)) => b.int_extend(idx, IntWidth::I64, true),
+        _ => idx,
+    }
 }
 
 /// Lower an array element store: compute flat offset, GEP, store.
@@ -2710,11 +2720,7 @@ fn lower_array_store(
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
     let base = array_base_addr(b, info);
-    let idx64 = if info.allocatable {
-        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
-            b.int_extend(idx, IntWidth::I64, true)
-        } else { idx }
-    } else { idx };
+    let idx64 = widen_idx_to_i64(b, idx);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     b.store(value, elem_ptr);
 }
