@@ -25,7 +25,8 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
         InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) => vec![],
+        InstKind::Undef(..) | InstKind::Alloca(..) |
+        InstKind::GlobalAddr(..) => vec![],
 
         InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
         InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
@@ -108,7 +109,8 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
     match kind {
         InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
         InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) => {}
+        InstKind::Undef(..) | InstKind::Alloca(..) |
+        InstKind::GlobalAddr(..) => {}
 
         InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
         InstKind::IMul(a, b) | InstKind::IDiv(a, b) |

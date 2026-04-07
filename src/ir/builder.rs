@@ -286,6 +286,15 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::Alloca(ty), ptr_ty)
     }
 
+    /// Take the address of a module-level global. The result is
+    /// `Ptr<elem_ty>` and can flow into Load/Store/GEP just like
+    /// any other pointer. The global itself must be added to the
+    /// containing Module by the caller (typically lower.rs).
+    pub fn global_addr(&mut self, name: &str, elem_ty: IrType) -> ValueId {
+        let ptr_ty = IrType::Ptr(Box::new(elem_ty));
+        self.emit(InstKind::GlobalAddr(name.into()), ptr_ty)
+    }
+
     pub fn load(&mut self, addr: ValueId) -> ValueId {
         let ty = match self.func.value_type(addr) {
             Some(IrType::Ptr(inner)) => *inner,

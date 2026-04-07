@@ -5,6 +5,53 @@
 use std::fmt::Write;
 use super::mir::*;
 
+/// Emit module-level globals as a `.section __DATA,__data` block.
+/// Each global gets a `_name:` label and a directive matching its
+/// type (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
+/// initializer value. Zero-initialized globals still emit an
+/// explicit zero so the symbol resolves at link time.
+pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
+    use crate::ir::inst::GlobalInit;
+    use crate::ir::types::{IrType, IntWidth, FloatWidth};
+
+    let mut out = String::new();
+    if globals.is_empty() {
+        return out;
+    }
+
+    writeln!(out, ".section __DATA,__data").unwrap();
+    for g in globals {
+        let symbol = if g.name.starts_with('_') {
+            g.name.clone()
+        } else {
+            format!("_{}", g.name)
+        };
+        // Pick alignment + storage directive for the type.
+        let (align, directive, default_zero) = match &g.ty {
+            IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte",   "0"),
+            IrType::Int(IntWidth::I16)               => (1, ".short",  "0"),
+            IrType::Int(IntWidth::I32)               => (2, ".long",   "0"),
+            IrType::Int(IntWidth::I64)               => (3, ".quad",   "0"),
+            IrType::Float(FloatWidth::F32)           => (2, ".single", "0.0"),
+            IrType::Float(FloatWidth::F64)           => (3, ".double", "0.0"),
+            _ => (3, ".quad", "0"), // pointers and aggregates: 8-byte slot
+        };
+        writeln!(out, ".globl {}", symbol).unwrap();
+        if align > 0 {
+            writeln!(out, ".p2align {}", align).unwrap();
+        }
+        writeln!(out, "{}:", symbol).unwrap();
+        let value = match &g.initializer {
+            Some(GlobalInit::Int(v))    => v.to_string(),
+            Some(GlobalInit::Float(v))  => format!("{}", v),
+            Some(GlobalInit::Zero) | None => default_zero.into(),
+            Some(GlobalInit::String(_)) => default_zero.into(), // strings TBD
+        };
+        writeln!(out, "    {} {}", directive, value).unwrap();
+    }
+    out
+}
+
 /// Emit a machine function as ARM64 assembly text.
 pub fn emit_function(mf: &MachineFunction) -> String {
     let mut out = String::new();
@@ -292,12 +339,24 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             }
         }
         ArmOpcode::AdrpAdd => {
-            if let MachineOperand::ConstPool(idx) = &inst.operands[1] {
-                let label = const_pool_label(&mf.name, *idx);
-                format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
-                    op_str(&inst.operands[0]), label)
-            } else {
-                "nop ; bad adrp+add".into()
+            let dest = op_str(&inst.operands[0]);
+            match &inst.operands[1] {
+                MachineOperand::ConstPool(idx) => {
+                    let label = const_pool_label(&mf.name, *idx);
+                    format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
+                        dest, label)
+                }
+                MachineOperand::GlobalLabel(name) => {
+                    // Mach-O convention: globals get an underscore prefix.
+                    let sym = if name.starts_with('_') {
+                        name.clone()
+                    } else {
+                        format!("_{}", name)
+                    };
+                    format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
+                        dest, sym)
+                }
+                _ => "nop ; bad adrp+add".into(),
             }
         }
 
@@ -350,6 +409,9 @@ fn op_str(op: &MachineOperand) -> String {
         MachineOperand::Cond(c) => cond_str(*c).into(),
         MachineOperand::BlockRef(id) => format!("bb{}", id.0),
         MachineOperand::Extern(name) => name.clone(),
+        MachineOperand::GlobalLabel(name) => {
+            if name.starts_with('_') { name.clone() } else { format!("_{}", name) }
+        }
         MachineOperand::ConstPool(idx) => format!("cp{}", idx),
         MachineOperand::Shift(s) => format!("lsl #{}", s),
     }

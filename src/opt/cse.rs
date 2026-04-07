@@ -163,7 +163,8 @@ fn key_of(inst: &Inst) -> Option<Key> {
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)
         | InstKind::ConstString(..)
-        | InstKind::Undef(..) => None,
+        | InstKind::Undef(..)
+        | InstKind::GlobalAddr(..) => None,
     }
 }
 

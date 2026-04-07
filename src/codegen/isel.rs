@@ -685,6 +685,22 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         // ---- Memory ----
+        InstKind::GlobalAddr(name) => {
+            // Materialize the address of a module-level global into
+            // a Gp64 vreg via ADRP+ADD against `_globalname`. Loads
+            // and stores then operate on this pointer the same way
+            // they operate on an alloca address.
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::AdrpAdd,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::GlobalLabel(name.clone()),
+                ],
+                def: Some(dest),
+            });
+        }
+
         InstKind::Alloca(_) => {
             // Alloca is handled in Phase 1 (stack slot allocation).
             // The "address" is a frame slot offset. Map the ValueId to the offset.

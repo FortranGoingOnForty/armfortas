@@ -116,12 +116,13 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
-            let mut func = Function::new(fname, vec![], IrType::Void);
+            let mut func = Function::new(fname.clone(), vec![], IrType::Void);
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -131,6 +132,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
 
             // Lower CONTAINS subprograms.
             for sub in contains {
@@ -153,8 +157,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 } else { None }
             }).collect();
-            let mut func = Function::new(func_name, params, IrType::Void);
+            let mut func = Function::new(func_name.clone(), params, IrType::Void);
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
@@ -190,7 +195,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 }
 
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -200,6 +205,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, .. } => {
             let func_name = bind.as_ref()
@@ -221,8 +229,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 } else { None }
             }).collect();
-            let mut func = Function::new(func_name, params, ret_ty.clone());
+            let mut func = Function::new(func_name.clone(), params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
@@ -261,7 +270,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_addr = Some(result_addr);
                 ctx.result_type = Some(ret_ty.clone());
 
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -273,6 +282,9 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
         }
         ProgramUnit::Module { name, decls, .. } => {
             // Module variables become globals.
@@ -293,8 +305,68 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
     }
 }
 
+/// Try to evaluate a scalar initializer expression at compile time
+/// to a `GlobalInit`. Used by SAVE-promotion in `alloc_decls`. The
+/// helper handles the literal forms a Fortran `parameter` or
+/// initializer typically uses; complex constexpr arithmetic falls
+/// through to `None` and the caller should fall back to a stack
+/// alloca + runtime store (which silently breaks SAVE — track as
+/// future work).
+fn eval_const_global_init(e: &crate::ast::expr::SpannedExpr) -> Option<GlobalInit> {
+    use crate::ast::expr::UnaryOp;
+    match &e.node {
+        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(GlobalInit::Int),
+        Expr::RealLiteral { text, .. } => {
+            text.replace('d', "e").replace('D', "E").parse::<f64>().ok().map(GlobalInit::Float)
+        }
+        Expr::LogicalLiteral { value, .. } => Some(GlobalInit::Int(if *value { 1 } else { 0 })),
+        Expr::UnaryOp { op: UnaryOp::Minus, operand } => {
+            match eval_const_global_init(operand)? {
+                GlobalInit::Int(v) => Some(GlobalInit::Int(-v)),
+                GlobalInit::Float(v) => Some(GlobalInit::Float(-v)),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_global_init(inner),
+        _ => None,
+    }
+}
+
+/// A pending global variable produced by the lowerer for a SAVE'd
+/// scalar local. Flushed into the IR Module after the containing
+/// function finishes lowering.
+struct PendingGlobal {
+    global: Global,
+}
+
+/// Synthesize a unique global symbol name for a SAVE'd local.
+fn save_global_name(func_name: &str, local_name: &str) -> String {
+    format!("__save_{}_{}", func_name.to_lowercase(), local_name.to_lowercase())
+}
+
+/// Inspect a value's defining instruction to see if it's a
+/// `GlobalAddr`. Used by `init_decls` to skip re-initializing
+/// SAVE-promoted locals on every function call.
+fn is_global_addr(b: &FuncBuilder, val: ValueId) -> bool {
+    for block in &b.func().blocks {
+        for inst in &block.insts {
+            if inst.id == val {
+                return matches!(inst.kind, InstKind::GlobalAddr(_));
+            }
+        }
+    }
+    false
+}
+
 /// Allocate local variables from declarations. Handles both scalars and arrays.
-fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, decls: &[crate::ast::decl::SpannedDecl], type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+fn alloc_decls(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+) {
     use crate::ast::decl::Attribute;
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
@@ -422,9 +494,37 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
                     }
                 } else {
-                    // Scalar variable.
-                    let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                    // Scalar variable. If it has an initializer that
+                    // const-evaluates, promote it to a SAVE'd module
+                    // global instead of a stack alloca — per
+                    // F2018 §8.5.16, locals with initializers in
+                    // subprograms have implicit SAVE attribute and
+                    // must persist across calls.
+                    if let Some(init) = entity.init.as_ref()
+                        .and_then(eval_const_global_init)
+                    {
+                        let global_name = save_global_name(func_name, &key);
+                        pending_globals.push(PendingGlobal {
+                            global: Global {
+                                name: global_name.clone(),
+                                ty: elem_ty.clone(),
+                                initializer: Some(init),
+                            },
+                        });
+                        let addr = b.global_addr(&global_name, elem_ty.clone());
+                        locals.insert(key, LocalInfo {
+                            addr, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::None, derived_type: None,
+                        });
+                    } else {
+                        let addr = b.alloca(elem_ty.clone());
+                        locals.insert(key, LocalInfo {
+                            addr, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::None, derived_type: None,
+                        });
+                    }
                 }
             }
         }
@@ -484,6 +584,13 @@ fn init_decls(
                         || !matches!(info.char_kind, CharKind::None)
                         || info.derived_type.is_some()
                     {
+                        continue;
+                    }
+                    // SAVE-promoted locals are backed by a module
+                    // global already initialized at link time. Don't
+                    // re-store on every call — that would defeat
+                    // the SAVE semantics (audit MAJOR-1).
+                    if is_global_addr(b, info.addr) {
                         continue;
                     }
                     let val = lower_expr(b, locals, init_expr, st);

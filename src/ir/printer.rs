@@ -169,6 +169,7 @@ pub fn print_inst(inst: &Inst) -> String {
             let idx_str: Vec<String> = idxs.iter().map(|i| format!("%{}", i.0)).collect();
             format!("gep %{}, [{}]", base.0, idx_str.join(", "))
         }
+        InstKind::GlobalAddr(name) => format!("global_addr @{}", name),
 
         InstKind::Call(fref, args) => {
             let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();

@@ -126,6 +126,11 @@ pub enum InstKind {
     Load(ValueId),
     Store(ValueId, ValueId),              // store(value, addr)
     GetElementPtr(ValueId, Vec<ValueId>), // base, indices
+    /// Address of a module-level global. Returns `Ptr<T>` where T
+    /// is the global's declared type. Used by SAVE'd locals (those
+    /// with initializers in subprograms) and module variables —
+    /// any storage that must persist across function calls.
+    GlobalAddr(String),
 
     // ---- Calls ----
     Call(FuncRef, Vec<ValueId>),

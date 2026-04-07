@@ -140,6 +140,10 @@ pub enum MachineOperand {
     BlockRef(MBlockId),
     /// External symbol name (for BL to functions).
     Extern(String),
+    /// Module-level global by name. Used by ADRP+ADD for SAVE'd
+    /// locals and module variables, where the operand resolves to
+    /// `_globalname@PAGE` / `_globalname@PAGEOFF` at emit time.
+    GlobalLabel(String),
     /// Constant pool entry index.
     ConstPool(u32),
     /// Shift amount for MOVZ/MOVK (0, 16, 32, 48).
