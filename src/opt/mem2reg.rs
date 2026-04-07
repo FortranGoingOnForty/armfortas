@@ -243,11 +243,20 @@ fn promote_function(func: &mut Function) -> bool {
         blocks.sort_by_key(|b| b.0);
         for bid in blocks {
             if bid == func.entry {
-                // The entry block shouldn't receive phi params —
-                // if an alloca's frontier ever includes entry, the
-                // initial Undef value already handles the "before
-                // any store" case. Skip to stay consistent with
-                // the verifier's "entry block has no params" rule.
+                // CFRWZ never places entry in any block's dominance
+                // frontier — entry has no predecessors, so it can't
+                // be a join point. If we ever see entry in
+                // `phi_blocks` it means the DF computation is buggy.
+                // Skip in release for safety; assert loudly in debug
+                // so the bug surfaces during development. The
+                // initial Undef value already handles the
+                // "before-any-store" case at entry.
+                debug_assert!(
+                    false,
+                    "mem2reg: entry block appeared in phi placement set for alloca {} \
+                     — DF should never include entry (entry has no preds)",
+                    idx,
+                );
                 continue;
             }
             let pid = func.next_value_id();

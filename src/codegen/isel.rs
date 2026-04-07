@@ -156,11 +156,13 @@ pub fn select_function(func: &Function) -> MachineFunction {
         }
     }
 
-    // Snapshot the IR blocks into ctx so `select_terminator` can
-    // look up a target's params even when iterating with a
-    // separate &mut MachineFunction borrow.
+    // Snapshot just each IR block's params into ctx so
+    // `select_terminator` can look them up while we hold a separate
+    // &mut MachineFunction borrow. We don't need a full BasicBlock
+    // clone — only the param list — so this avoids cloning every
+    // instruction in the function for each terminator we visit.
     for block in &func.blocks {
-        ctx.func_blocks.insert(block.id, block.clone());
+        ctx.block_params.insert(block.id, block.params.clone());
     }
 
     // Phase 4b: select instructions and terminators for each block.
@@ -187,12 +189,13 @@ struct ISelCtx {
     block_map: HashMap<BlockId, MBlockId>,
     /// IR alloca ValueId → stack frame offset.
     alloca_offsets: HashMap<ValueId, i32>,
-    /// IR BlockId → IR `BasicBlock` (for looking up block params
-    /// when emitting branch arg copies). This is a snapshot of the
-    /// IR function's blocks taken before phase 4b begins, so we
-    /// can read each target's params without re-borrowing the
-    /// function while we're mutating the machine module.
-    func_blocks: HashMap<BlockId, BasicBlock>,
+    /// IR BlockId → its block params. Snapshotted before phase 4b
+    /// so terminator selection can read each target's params
+    /// without re-borrowing the function while &mut MachineFunction
+    /// is held. Cloning just the param vec is dramatically cheaper
+    /// than cloning the whole BasicBlock — instructions can be in
+    /// the thousands, params are typically 0-3.
+    block_params: HashMap<BlockId, Vec<BlockParam>>,
 }
 
 impl ISelCtx {
@@ -201,13 +204,24 @@ impl ISelCtx {
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             alloca_offsets: HashMap::new(),
-            func_blocks: HashMap::new(),
+            block_params: HashMap::new(),
         }
     }
 
     /// Get the vreg for an IR value, or create one if needed.
+    /// In debug builds, asserts that an existing mapping has the
+    /// same register class as requested — a class mismatch means
+    /// Phase 4a (vreg pre-allocation) and Phase 4b (instruction
+    /// selection) disagree about a value's type, which would
+    /// silently corrupt code.
     fn get_vreg(&mut self, mf: &mut MachineFunction, val: ValueId, class: RegClass) -> VRegId {
         if let Some(&vreg) = self.value_map.get(&val) {
+            debug_assert!(
+                mf.vregs.iter().find(|v| v.id == vreg).map(|v| v.class) == Some(class),
+                "isel: vreg class mismatch for IR value %{} (existing class \
+                 differs from requested {:?}) — phase 4a/4b disagreement",
+                val.0, class,
+            );
             return vreg;
         }
         let vreg = mf.new_vreg(class);
@@ -217,8 +231,16 @@ impl ISelCtx {
 
     /// Get the vreg for an IR value, assuming it was already mapped.
     fn lookup_vreg(&self, val: ValueId) -> VRegId {
-        *self.value_map.get(&val)
-            .unwrap_or_else(|| panic!("isel: unmapped IR value %{}", val.0))
+        *self.value_map.get(&val).unwrap_or_else(|| {
+            panic!(
+                "isel: unmapped IR value %{} — phase 4a should have allocated \
+                 a vreg for every IR value before phase 4b runs. {} values are \
+                 currently mapped. This usually means a forward reference, \
+                 a missing block param, or a value defined in an unreachable \
+                 block.",
+                val.0, self.value_map.len(),
+            )
+        })
     }
 
     /// Get machine block for an IR block.
@@ -1092,20 +1114,20 @@ fn emit_branch_arg_copies(
     // they appear in the IR (which is also the order they were
     // allocated in Phase 4a, so the i-th arg corresponds to the
     // i-th param).
-    let target_func_block = ctx.func_blocks.get(&target_block)
-        .expect("isel: branch target not in func block map");
-    if target_func_block.params.len() != args.len() {
+    let target_params = ctx.block_params.get(&target_block)
+        .expect("isel: branch target not in block_params snapshot");
+    if target_params.len() != args.len() {
         // Verifier should reject this — but if it leaks through
         // we want a clear panic, not silent corruption.
         panic!(
             "isel: branch arg count {} ≠ target block param count {}",
-            args.len(), target_func_block.params.len()
+            args.len(), target_params.len()
         );
     }
 
     // Build the list of (dst_vreg, src_vreg) pairs.
     let mut pending: Vec<(VRegId, VRegId)> = Vec::with_capacity(args.len());
-    for (arg, bp) in args.iter().zip(target_func_block.params.iter()) {
+    for (arg, bp) in args.iter().zip(target_params.iter()) {
         let dst = ctx.lookup_vreg(bp.id);
         let src = ctx.lookup_vreg(*arg);
         if dst != src {
