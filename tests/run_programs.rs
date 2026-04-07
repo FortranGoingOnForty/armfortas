@@ -5,6 +5,25 @@
 //!
 //! Each `! CHECK:` line specifies a substring that must appear in the output,
 //! in order. Whitespace is trimmed for comparison.
+//!
+//! ## XFAIL annotations
+//!
+//! A program may carry one or more `! XFAIL: <reason>` lines anywhere in
+//! the source. An XFAIL'd program is *expected* to fail at compile or
+//! runtime (or to mismatch its CHECKs) — it's tracking a known bug. The
+//! harness reports:
+//!
+//!   * `XFAIL`  — the program failed as expected. Counted as a pass.
+//!   * `XPASS`  — the program unexpectedly succeeded. Counted as a
+//!     failure so we get loud notification that the bug is now fixed
+//!     and the XFAIL annotation should be removed.
+//!
+//! XFAIL'd programs are how we capture audit findings as living
+//! regression tests *before* the underlying bug is fixed. Each finding
+//! gets a program in `test_programs/` whose annotation references the
+//! audit ID (`! XFAIL: audit BLOCKING-1 (implied-do negative step)`),
+//! so a future audit can grep `test_programs/` for the finding ID and
+//! immediately see whether the bug class is covered.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +52,20 @@ fn extract_checks(source: &str) -> Vec<Check> {
             }
         })
         .collect()
+}
+
+/// Extract `! XFAIL:` reason text. Returns the first reason found, or
+/// `None` if the program has no XFAIL annotation. Multiple XFAIL lines
+/// are allowed (only the first is reported); a typical pattern is one
+/// audit ID per line for findings of the same class.
+fn extract_xfail(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("! XFAIL:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 /// Match checks against actual output lines. Checks must appear in order
@@ -94,76 +127,115 @@ fn find_test_programs() -> PathBuf {
     panic!("cannot find test_programs/ directory");
 }
 
+/// What happened when we ran a test program.
+#[derive(Debug)]
+enum TestOutcome {
+    /// Compiled, ran, all CHECKs matched. No XFAIL annotation present.
+    Pass,
+    /// Marked XFAIL and failed somewhere — this is the expected
+    /// outcome for an open audit finding. The reason is the XFAIL
+    /// annotation text plus the underlying failure detail.
+    Xfail(String),
+    /// Marked XFAIL but unexpectedly succeeded. Loud failure: the
+    /// underlying bug is fixed and the XFAIL annotation should be
+    /// removed so the program becomes a regular regression test.
+    Xpass(String),
+    /// No XFAIL annotation, and the program failed somewhere.
+    Fail(String),
+}
+
 /// Run a single test program: compile at the given optimization level,
-/// execute, check output.
-fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> Result<(), String> {
+/// execute, check output. Honors `! XFAIL:` annotations.
+fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let filename = source.file_name().unwrap().to_str().unwrap();
-    let source_text = fs::read_to_string(source)
-        .map_err(|e| format!("{}: cannot read: {}", filename, e))?;
+    let source_text = match fs::read_to_string(source) {
+        Ok(s) => s,
+        Err(e) => return TestOutcome::Fail(format!("{}: cannot read: {}", filename, e)),
+    };
 
+    let xfail_reason = extract_xfail(&source_text);
     let checks = extract_checks(&source_text);
-    if checks.is_empty() {
-        return Err(format!("{}: no CHECK annotations found", filename));
+    if checks.is_empty() && xfail_reason.is_none() {
+        // Programs with no CHECKs and no XFAIL marker are
+        // mis-configured tests, not test failures.
+        return TestOutcome::Fail(
+            format!("{}: no CHECK annotations and not marked XFAIL", filename),
+        );
     }
 
-    // Compile. Use a per-(file,level) binary path so concurrent jobs
-    // and successive runs at different levels don't stomp each other.
-    let stem = source.file_stem().unwrap().to_str().unwrap();
-    let level = opt_flag.trim_start_matches('-');
-    let binary = std::env::temp_dir().join(format!("afs_test_{}_{}", stem, level));
-    let compile = Command::new(compiler)
-        .args([
-            source.to_str().unwrap(),
-            opt_flag,
-            "-o",
-            binary.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+    // Try the compile/run/check pipeline. Any failure path returns
+    // an Err with a message; success returns Ok.
+    let inner = || -> Result<(), String> {
+        // Use a per-(file,level) binary path so concurrent jobs
+        // and successive runs at different levels don't stomp each other.
+        let stem = source.file_stem().unwrap().to_str().unwrap();
+        let level = opt_flag.trim_start_matches('-');
+        let binary = std::env::temp_dir().join(format!("afs_test_{}_{}", stem, level));
 
-    if !compile.status.success() {
-        let stderr = String::from_utf8_lossy(&compile.stderr);
-        return Err(format!("{} [{}]: compilation failed:\n{}", filename, opt_flag, stderr));
+        let compile = Command::new(compiler)
+            .args([
+                source.to_str().unwrap(),
+                opt_flag,
+                "-o",
+                binary.to_str().unwrap(),
+            ])
+            .output()
+            .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+
+        if !compile.status.success() {
+            let stderr = String::from_utf8_lossy(&compile.stderr);
+            return Err(format!(
+                "{} [{}]: compilation failed:\n{}",
+                filename, opt_flag, stderr,
+            ));
+        }
+
+        // Per-(file,level) sandbox directory. Test programs that touch the
+        // filesystem (open(file=...)) write into this directory via relative
+        // paths, which keeps the parallel test_programs_end_to_end_o*
+        // threads from racing on shared paths.
+        let sandbox = std::env::temp_dir().join(format!("afs_test_sandbox_{}_{}", stem, level));
+        let _ = fs::remove_dir_all(&sandbox);
+        fs::create_dir_all(&sandbox)
+            .map_err(|e| format!("{}: cannot create sandbox dir {}: {}", filename, sandbox.display(), e))?;
+
+        let run = Command::new(&binary)
+            .current_dir(&sandbox)
+            .output()
+            .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
+
+        if !run.status.success() {
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
+            return Err(format!(
+                "{} [{}]: execution failed (exit {}): {}",
+                filename,
+                opt_flag,
+                run.status.code().unwrap_or(-1),
+                stderr,
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let label = format!("{} [{}]", filename, opt_flag);
+        let res = match_checks(&checks, &stdout, &label);
+        let _ = fs::remove_file(&binary);
+        let _ = fs::remove_dir_all(&sandbox);
+        res
+    };
+
+    let result = inner();
+    match (xfail_reason, result) {
+        (None, Ok(())) => TestOutcome::Pass,
+        (None, Err(e)) => TestOutcome::Fail(e),
+        (Some(reason), Err(e)) => TestOutcome::Xfail(format!("{}: {}", reason, e)),
+        (Some(reason), Ok(())) => TestOutcome::Xpass(format!(
+            "{} [{}]: marked XFAIL ({}) but unexpectedly passed — \
+             remove the XFAIL annotation",
+            filename, opt_flag, reason,
+        )),
     }
-
-    // Per-(file,level) sandbox directory. Test programs that touch the
-    // filesystem (open(file=...)) write into this directory via relative
-    // paths, which keeps the three parallel test_programs_end_to_end_o*
-    // threads from racing on shared paths.
-    let sandbox = std::env::temp_dir().join(format!("afs_test_sandbox_{}_{}", stem, level));
-    let _ = fs::remove_dir_all(&sandbox);
-    fs::create_dir_all(&sandbox)
-        .map_err(|e| format!("{}: cannot create sandbox dir {}: {}", filename, sandbox.display(), e))?;
-
-    // Execute.
-    let run = Command::new(&binary)
-        .current_dir(&sandbox)
-        .output()
-        .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
-
-    if !run.status.success() {
-        let stderr = String::from_utf8_lossy(&run.stderr);
-        return Err(format!(
-            "{} [{}]: execution failed (exit {}): {}",
-            filename,
-            opt_flag,
-            run.status.code().unwrap_or(-1),
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&run.stdout);
-
-    // Check output. Same CHECK annotations are enforced at every opt
-    // level — this is the correctness invariant.
-    let label = format!("{} [{}]", filename, opt_flag);
-    match_checks(&checks, &stdout, &label)?;
-
-    // Cleanup.
-    let _ = fs::remove_file(&binary);
-    let _ = fs::remove_dir_all(&sandbox);
-
-    Ok(())
 }
 
 /// Discover the test programs and run each at every supported opt level.
@@ -185,24 +257,38 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
 
     let mut failures = Vec::new();
     let mut passed = 0;
+    let mut xfailed = 0;
 
     for source in &sources {
+        let name = source.file_name().unwrap().to_str().unwrap();
         match run_test(&compiler, source, opt_flag) {
-            Ok(()) => {
+            TestOutcome::Pass => {
                 passed += 1;
-                eprintln!("  PASS [{}]: {}", opt_flag,
-                    source.file_name().unwrap().to_str().unwrap());
+                eprintln!("  PASS  [{}]: {}", opt_flag, name);
             }
-            Err(msg) => {
-                eprintln!("  FAIL [{}]: {}", opt_flag,
-                    source.file_name().unwrap().to_str().unwrap());
+            TestOutcome::Xfail(detail) => {
+                xfailed += 1;
+                // Print the first line of the detail so we know what
+                // the underlying failure looked like, in case the bug
+                // class shifts.
+                let one_line = detail.lines().next().unwrap_or("");
+                eprintln!("  XFAIL [{}]: {} — {}", opt_flag, name, one_line);
+            }
+            TestOutcome::Xpass(msg) => {
+                eprintln!("  XPASS [{}]: {}", opt_flag, name);
+                failures.push(msg);
+            }
+            TestOutcome::Fail(msg) => {
+                eprintln!("  FAIL  [{}]: {}", opt_flag, name);
                 failures.push(msg);
             }
         }
     }
 
-    eprintln!("\n[{}] {} passed, {} failed out of {} test programs",
-        opt_flag, passed, failures.len(), sources.len());
+    eprintln!(
+        "\n[{}] {} passed, {} xfailed, {} failed out of {} test programs",
+        opt_flag, passed, xfailed, failures.len(), sources.len(),
+    );
 
     if failures.is_empty() {
         Ok(())
