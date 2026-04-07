@@ -327,6 +327,22 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         msg: format!("integer op %{} has non-integer operand %{} : {}", inst.id.0, b.0, tb),
                     });
                 }
+                // Audit MAJOR-4: enforce exact width agreement.
+                // Mixing widths like IMul(i32, i64) would silently
+                // miscompile because codegen has no implicit
+                // promotion — every binary op picks one operand's
+                // width and the other operand reads stale upper
+                // bits. Lowering today never produces a width
+                // mismatch, but the verifier is the last line of
+                // defense for future passes.
+                if ta.is_int() && tb.is_int() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer op %{}: operand width mismatch %{} : {} vs %{} : {}",
+                            inst.id.0, a.0, ta, b.0, tb,
+                        ),
+                    });
+                }
             }
         }
         InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
@@ -343,6 +359,18 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 if !tb.is_float() {
                     errors.push(VerifyError {
                         msg: format!("float op %{} has non-float operand %{} : {}", inst.id.0, b.0, tb),
+                    });
+                }
+                // Same width-agreement rule for floats. Mixing
+                // f32 and f64 in a single binary op is illegal —
+                // lowering inserts FloatExtend/FloatTrunc to align
+                // operands, and a missing widening would land here.
+                if ta.is_float() && tb.is_float() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float op %{}: operand width mismatch %{} : {} vs %{} : {}",
+                            inst.id.0, a.0, ta, b.0, tb,
+                        ),
                     });
                 }
             }
@@ -470,6 +498,27 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("non-integer operand")));
+    }
+
+    #[test]
+    fn int_op_width_mismatch_errors() {
+        // IMul(i32, i64) should be rejected — codegen has no
+        // implicit width promotion and the verifier is the last
+        // line of defense before mismatched widths reach isel.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let a = b.const_i32(1);
+            let c = b.const_i64(2);
+            b.emit_bogus_iadd(a, c);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("width mismatch")),
+            "expected width mismatch, got: {:?}",
+            errs,
+        );
     }
 
     #[test]
