@@ -12,11 +12,11 @@
 program test_file_io
     implicit none
     integer :: x
-    open(10, file='/tmp/afs_io_test.dat', status='replace')
+    open(10, file='afs_io_test.dat', status='replace')
     write(10, *) 42
     close(10)
     x = 0
-    open(10, file='/tmp/afs_io_test.dat', status='old')
+    open(10, file='afs_io_test.dat', status='old')
     read(10, *) x
     close(10)
     print *, x

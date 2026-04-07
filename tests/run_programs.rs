@@ -108,11 +108,9 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> Result<(), String
 
     // Compile. Use a per-(file,level) binary path so concurrent jobs
     // and successive runs at different levels don't stomp each other.
-    let binary = std::env::temp_dir().join(format!(
-        "afs_test_{}_{}",
-        source.file_stem().unwrap().to_str().unwrap(),
-        opt_flag.trim_start_matches('-'),
-    ));
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+    let level = opt_flag.trim_start_matches('-');
+    let binary = std::env::temp_dir().join(format!("afs_test_{}_{}", stem, level));
     let compile = Command::new(compiler)
         .args([
             source.to_str().unwrap(),
@@ -128,8 +126,18 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> Result<(), String
         return Err(format!("{} [{}]: compilation failed:\n{}", filename, opt_flag, stderr));
     }
 
+    // Per-(file,level) sandbox directory. Test programs that touch the
+    // filesystem (open(file=...)) write into this directory via relative
+    // paths, which keeps the three parallel test_programs_end_to_end_o*
+    // threads from racing on shared paths.
+    let sandbox = std::env::temp_dir().join(format!("afs_test_sandbox_{}_{}", stem, level));
+    let _ = fs::remove_dir_all(&sandbox);
+    fs::create_dir_all(&sandbox)
+        .map_err(|e| format!("{}: cannot create sandbox dir {}: {}", filename, sandbox.display(), e))?;
+
     // Execute.
     let run = Command::new(&binary)
+        .current_dir(&sandbox)
         .output()
         .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
 
@@ -153,6 +161,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> Result<(), String
 
     // Cleanup.
     let _ = fs::remove_file(&binary);
+    let _ = fs::remove_dir_all(&sandbox);
 
     Ok(())
 }
