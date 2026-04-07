@@ -2834,6 +2834,23 @@ fn lower_write_items_adv(
             false
         };
 
+        // Whole-array print: a plain Name reference whose local
+        // has array dims. Iterate elements and call the per-element
+        // write helper. Without this, the Ptr<_> the item lowers to
+        // would fall into the IrType::Ptr arm below and dispatch to
+        // afs_write_string with a bogus length.
+        if !is_char {
+            if let Expr::Name { name } = &item.node {
+                let key = name.to_lowercase();
+                if let Some(info) = ctx.locals.get(&key).cloned() {
+                    if !info.dims.is_empty() || info.allocatable {
+                        lower_whole_array_write(b, ctx, &info, unit);
+                        continue;
+                    }
+                }
+            }
+        }
+
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
             b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
@@ -2912,6 +2929,68 @@ fn lower_fmt_push(
             }
         }
     }
+}
+
+/// Lower a whole-array write item: iterate every element of the
+/// array and call the per-element write helper. Used by `print *,
+/// arr` and equivalent forms. Without this the array's base
+/// pointer leaks into the Ptr<_> arm of the scalar write
+/// dispatcher and gets mis-routed to afs_write_string.
+fn lower_whole_array_write(
+    b: &mut FuncBuilder,
+    _ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    unit: ValueId,
+) {
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // Compile-time-known size for stack arrays; runtime descriptor
+    // call for allocatables.
+    let n = if info.allocatable {
+        b.call(FuncRef::External("afs_array_size".into()),
+               vec![info.addr], IrType::Int(IntWidth::I64))
+    } else {
+        let total: i64 = info.dims.iter().map(|(_, ext)| *ext).product();
+        b.const_i64(total.max(0))
+    };
+
+    // Stack-allocated loop counter, like lower_array_assign.
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("write_arr_check");
+    let bb_body  = b.create_block("write_arr_body");
+    let bb_exit  = b.create_block("write_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    let byte_off = b.imul(i_val, elem_bytes_v);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let elem = b.load_typed(ptr, info.ty.clone());
+    b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
 }
 
 /// Get the data base address for an array variable.
