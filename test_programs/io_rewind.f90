@@ -7,7 +7,7 @@ program test_io_rewind
     implicit none
     integer :: x
 
-    open(10, file='/tmp/afs_rewind.dat', status='replace', action='readwrite')
+    open(10, file='afs_rewind.dat', status='replace', action='readwrite')
     write(10, *) 99
     rewind(10)
 

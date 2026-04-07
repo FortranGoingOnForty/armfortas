@@ -6,12 +6,12 @@ program test_write_to_unit
     implicit none
     integer :: val
 
-    open(20, file='/tmp/afs_unit_test.dat', status='replace')
+    open(20, file='afs_unit_test.dat', status='replace')
     write(20, *) 100
     close(20)
 
     val = 0
-    open(20, file='/tmp/afs_unit_test.dat', status='old')
+    open(20, file='afs_unit_test.dat', status='old')
     read(20, *) val
     close(20)
 

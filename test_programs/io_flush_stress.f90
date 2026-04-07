@@ -9,7 +9,7 @@ program test_io_flush_stress
     implicit none
     integer :: i, val, total
 
-    open(10, file='/tmp/afs_flush_stress.dat', status='replace')
+    open(10, file='afs_flush_stress.dat', status='replace')
     do i = 1, 1000
         write(10, *) i
         flush(10)
@@ -17,7 +17,7 @@ program test_io_flush_stress
     close(10)
 
     total = 0
-    open(10, file='/tmp/afs_flush_stress.dat', status='old')
+    open(10, file='afs_flush_stress.dat', status='old')
     do i = 1, 1000
         read(10, *) val
         total = total + val
