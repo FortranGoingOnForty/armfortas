@@ -305,6 +305,14 @@ pub enum GlobalInit {
     Int(i64),
     Float(f64),
     String(Vec<u8>),
+    /// Array literal: a sequence of per-element initializers of
+    /// the same homogeneous element type. Used by module array
+    /// variables with `[v0, v1, ...]` or `(/ v0, v1, ... /)`
+    /// constructors. The Vec's length is the array's total element
+    /// count (product of dims); shorter initializers are padded
+    /// with Zero at lowering time.
+    IntArray(Vec<i64>),
+    FloatArray(Vec<f64>),
 }
 
 /// The top-level IR module.

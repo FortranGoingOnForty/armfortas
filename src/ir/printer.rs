@@ -27,6 +27,14 @@ pub fn print_module(module: &Module) -> String {
                 GlobalInit::Int(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::Float(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::String(s) => write!(out, " = {:?}", String::from_utf8_lossy(s)).unwrap(),
+                GlobalInit::IntArray(vs) => {
+                    let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+                    write!(out, " = [{}]", s.join(", ")).unwrap();
+                }
+                GlobalInit::FloatArray(vs) => {
+                    let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+                    write!(out, " = [{}]", s.join(", ")).unwrap();
+                }
             }
         }
         writeln!(out).unwrap();

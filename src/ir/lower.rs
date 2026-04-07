@@ -64,7 +64,7 @@ struct LowerCtx<'a> {
     /// the lower_file pre-pass over `ProgramUnit::Module` units so
     /// any subsequent function that USE-imports the module can
     /// resolve the name to a `GlobalAddr`.
-    globals: &'a HashMap<String, (String, IrType)>,
+    globals: &'a HashMap<String, ModuleGlobalInfo>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
@@ -73,7 +73,7 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (String, IrType)>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
+    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, ModuleGlobalInfo>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
         Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
     }
 
@@ -120,7 +120,7 @@ pub fn lower_file(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Module {
     let mut module = Module::new("main".into());
-    let mut globals: HashMap<String, (String, IrType)> = HashMap::new();
+    let mut globals: HashMap<String, ModuleGlobalInfo> = HashMap::new();
 
     // Pass 1: collect module-level variables.
     for unit in units {
@@ -137,39 +137,140 @@ pub fn lower_file(
     module
 }
 
-/// Walk a module's declarations and emit a global per scalar
-/// variable. Resolves the initializer at compile time when
-/// possible (literals via `eval_const_global_init`); otherwise
-/// the global is zero-initialized and the program-startup
-/// initializer is responsible for filling it in (TBD: M3 follow-up
-/// for non-literal init expressions).
+/// Information about a module-level global, tracked in
+/// `lower_file`'s globals map so `install_globals_as_locals` can
+/// reconstruct a `LocalInfo` for it inside each function that
+/// USE-imports the module.
+#[derive(Clone)]
+struct ModuleGlobalInfo {
+    /// Mach-O symbol name (already prefixed with `__mod_<mod>_`).
+    symbol: String,
+    /// Element type (for scalars) or array element type (for arrays).
+    ty: IrType,
+    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars.
+    dims: Vec<(i64, i64)>,
+}
+
+/// Walk a module's declarations and emit a global per variable.
+/// Handles scalars (with literal initializers) and fixed-size
+/// arrays (with array-constructor initializers). Resolves the
+/// initializer at compile time where possible; otherwise falls
+/// through to zero-init.
+///
+/// Array variables with non-literal initializers or dynamic dims
+/// are currently rejected by falling through to scalar emission —
+/// that's a known gap tracked for follow-up.
 fn collect_module_globals(
     module: &mut Module,
-    globals: &mut HashMap<String, (String, IrType)>,
+    globals: &mut HashMap<String, ModuleGlobalInfo>,
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
 ) {
+    use crate::ast::decl::Attribute;
     for decl in decls {
-        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+        if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let ir_ty = lower_type_spec(type_spec);
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
+            });
             for entity in entities {
                 let symbol = format!("__mod_{}_{}",
                     mod_name.to_lowercase(),
                     entity.name.to_lowercase());
-                let init = entity.init.as_ref()
-                    .and_then(eval_const_global_init);
-                module.add_global(Global {
-                    name: symbol.clone(),
-                    ty: ir_ty.clone(),
-                    initializer: init.or(Some(GlobalInit::Zero)),
-                });
-                globals.insert(entity.name.to_lowercase(), (symbol, ir_ty.clone()));
+
+                let array_spec = entity.array_spec.as_ref().or(attr_dims);
+
+                if let Some(specs) = array_spec {
+                    // Array module variable. Compute dims and
+                    // build an array-typed global with a matching
+                    // IntArray/FloatArray initializer when the
+                    // entity.init is an array constructor of
+                    // literal values.
+                    let dims = extract_array_dims(specs);
+                    let total: i64 = dims.iter().map(|(_, e)| *e).product();
+                    if total <= 0 {
+                        continue; // assumed/deferred shape — skip
+                    }
+                    let global_ty = IrType::Array(
+                        Box::new(ir_ty.clone()),
+                        total as u64,
+                    );
+
+                    let init = entity.init.as_ref()
+                        .and_then(|e| eval_const_array_init(e, &ir_ty, total));
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: global_ty,
+                        initializer: Some(init.unwrap_or(GlobalInit::Zero)),
+                    });
+                    globals.insert(entity.name.to_lowercase(), ModuleGlobalInfo {
+                        symbol,
+                        ty: ir_ty.clone(),
+                        dims,
+                    });
+                } else {
+                    // Scalar module variable.
+                    let init = entity.init.as_ref()
+                        .and_then(eval_const_global_init);
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: ir_ty.clone(),
+                        initializer: Some(init.unwrap_or(GlobalInit::Zero)),
+                    });
+                    globals.insert(entity.name.to_lowercase(), ModuleGlobalInfo {
+                        symbol,
+                        ty: ir_ty.clone(),
+                        dims: vec![],
+                    });
+                }
             }
         }
     }
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (String, IrType)>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+/// Try to evaluate an array constructor as a `GlobalInit`. Only
+/// handles literal elements (integer and real). Returns `None`
+/// if the constructor contains implied-do, variables, or other
+/// non-literal forms.
+fn eval_const_array_init(
+    expr: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    total: i64,
+) -> Option<GlobalInit> {
+    use crate::ast::expr::AcValue;
+    let values = match &expr.node {
+        Expr::ArrayConstructor { values, .. } => values,
+        _ => return None,
+    };
+
+    let is_float = matches!(elem_ty, IrType::Float(_));
+    if is_float {
+        let mut out: Vec<f64> = Vec::with_capacity(values.len());
+        for v in values {
+            let AcValue::Expr(e) = v else { return None; };
+            match eval_const_global_init(e)? {
+                GlobalInit::Float(f) => out.push(f),
+                GlobalInit::Int(i) => out.push(i as f64),
+                _ => return None,
+            }
+        }
+        while (out.len() as i64) < total { out.push(0.0); }
+        Some(GlobalInit::FloatArray(out))
+    } else {
+        let mut out: Vec<i64> = Vec::with_capacity(values.len());
+        for v in values {
+            let AcValue::Expr(e) = v else { return None; };
+            match eval_const_global_init(e)? {
+                GlobalInit::Int(i) => out.push(i),
+                _ => return None,
+            }
+        }
+        while (out.len() as i64) < total { out.push(0); }
+        Some(GlobalInit::IntArray(out))
+    }
+}
+
+fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, ModuleGlobalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -416,23 +517,24 @@ fn is_global_addr(b: &FuncBuilder, val: ValueId) -> bool {
 fn install_globals_as_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
-    globals: &HashMap<String, (String, IrType)>,
+    globals: &HashMap<String, ModuleGlobalInfo>,
 ) {
     // Audit B-3: iterate globals in sorted key order so the emitted
     // `global_addr` instructions land in deterministic positions.
     // HashMap iteration is order-randomized per-process, which
     // percolates through liveness and register allocation and
     // produces different .s output across compilations of the same
-    // source. One-line fix; the determinism regression test is
-    // extended to cover this case (see tests/run_programs.rs).
-    let mut sorted: Vec<(&String, &(String, IrType))> = globals.iter().collect();
+    // source.
+    let mut sorted: Vec<(&String, &ModuleGlobalInfo)> = globals.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, (symbol, ty)) in sorted {
+    for (name, info) in sorted {
         if locals.contains_key(name) { continue; }
-        let addr = b.global_addr(symbol, ty.clone());
+        let addr = b.global_addr(&info.symbol, info.ty.clone());
         locals.insert(name.clone(), LocalInfo {
-            addr, ty: ty.clone(),
-            dims: vec![], allocatable: false, by_ref: false,
+            addr,
+            ty: info.ty.clone(),
+            dims: info.dims.clone(),
+            allocatable: false, by_ref: false,
             char_kind: CharKind::None, derived_type: None,
         });
     }

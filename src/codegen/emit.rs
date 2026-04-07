@@ -6,10 +6,19 @@ use std::fmt::Write;
 use super::mir::*;
 
 /// Emit module-level globals as a `.section __DATA,__data` block.
-/// Each global gets a `_name:` label and a directive matching its
-/// type (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
+/// Each global gets a label and a directive matching its type
+/// (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
 /// initializer value. Zero-initialized globals still emit an
 /// explicit zero so the symbol resolves at link time.
+///
+/// Array-typed globals: the IR type is `Array<i8, byte_size>` so
+/// the element count isn't directly recoverable from the type.
+/// The caller must use `IntArray`/`FloatArray` initializers that
+/// carry the element count explicitly. Zero-initialized arrays
+/// fall back to `.space byte_size`.
+///
+/// Symbols are emitted as `.private_extern` (not `.globl`) per
+/// audit Maj-1 so they can't collide across translation units.
 pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
     use crate::ir::inst::GlobalInit;
     use crate::ir::types::{IrType, IntWidth, FloatWidth};
@@ -26,7 +35,45 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         } else {
             format!("_{}", g.name)
         };
-        // Pick alignment + storage directive for the type.
+        writeln!(out, ".private_extern {}", symbol).unwrap();
+
+        // Array globals carry `Array<elem_ty, count>`.  Pick the
+        // directive from the element type so `.long` / `.quad` /
+        // `.single` / `.double` all work correctly.
+        if let IrType::Array(elem_ty, count) = &g.ty {
+            let (align, directive, elem_bytes, is_float) = match elem_ty.as_ref() {
+                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte",   1, false),
+                IrType::Int(IntWidth::I16)               => (1, ".short",  2, false),
+                IrType::Int(IntWidth::I32)               => (2, ".long",   4, false),
+                IrType::Int(IntWidth::I64)               => (3, ".quad",   8, false),
+                IrType::Float(FloatWidth::F32)           => (2, ".single", 4, true),
+                IrType::Float(FloatWidth::F64)           => (3, ".double", 8, true),
+                _ => (3, ".quad", 8, false),
+            };
+            if align > 0 {
+                writeln!(out, ".p2align {}", align).unwrap();
+            }
+            writeln!(out, "{}:", symbol).unwrap();
+            match &g.initializer {
+                Some(GlobalInit::IntArray(vs)) if !is_float => {
+                    for v in vs {
+                        writeln!(out, "    {} {}", directive, v).unwrap();
+                    }
+                }
+                Some(GlobalInit::FloatArray(vs)) if is_float => {
+                    for v in vs {
+                        writeln!(out, "    {} {}", directive, v).unwrap();
+                    }
+                }
+                _ => {
+                    let byte_size = count * (elem_bytes as u64);
+                    writeln!(out, "    .space {}", byte_size).unwrap();
+                }
+            }
+            continue;
+        }
+
+        // Scalar globals: pick alignment + storage directive.
         let (align, directive, default_zero) = match &g.ty {
             IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte",   "0"),
             IrType::Int(IntWidth::I16)               => (1, ".short",  "0"),
@@ -36,7 +83,6 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             IrType::Float(FloatWidth::F64)           => (3, ".double", "0.0"),
             _ => (3, ".quad", "0"), // pointers and aggregates: 8-byte slot
         };
-        writeln!(out, ".globl {}", symbol).unwrap();
         if align > 0 {
             writeln!(out, ".p2align {}", align).unwrap();
         }
@@ -46,6 +92,11 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             Some(GlobalInit::Float(v))  => format!("{}", v),
             Some(GlobalInit::Zero) | None => default_zero.into(),
             Some(GlobalInit::String(_)) => default_zero.into(), // strings TBD
+            Some(GlobalInit::IntArray(_)) | Some(GlobalInit::FloatArray(_)) => {
+                // Array initializer on a scalar-typed global —
+                // shouldn't happen, but emit zero as a safe fallback.
+                default_zero.into()
+            }
         };
         writeln!(out, "    {} {}", directive, value).unwrap();
     }
