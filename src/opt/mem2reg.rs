@@ -1094,4 +1094,505 @@ mod tests {
                 "merge should not be in DF[{:?}]: only one reachable pred", b);
         }
     }
+
+    // =============================================================
+    // Coverage: only-loaded alloca. An alloca that has loads but
+    // no stores anywhere should still be promotable — every load
+    // becomes Undef. Catches accidental "must have at least one
+    // store" assumptions in the algorithm.
+    // =============================================================
+    #[test]
+    fn only_loaded_alloca_promotes_to_undef() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        // Two loads with no intervening store.
+        let l1 = push_inst(&mut f, entry,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32),
+        );
+        let _ = push_inst(&mut f, entry,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(l1)));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m), "no-store alloca should still be promotable");
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let block = &m.functions[0].blocks[0];
+        assert!(!block.insts.iter().any(|i| matches!(i.kind, InstKind::Alloca(_))),
+            "alloca should be gone");
+        assert!(!block.insts.iter().any(|i| matches!(i.kind, InstKind::Load(_))),
+            "loads should be gone");
+        // Both loads should be replaced by an Undef sentinel.
+        assert!(block.insts.iter().any(|i| matches!(i.kind, InstKind::Undef(_))),
+            "Undef sentinel should be inserted");
+    }
+
+    // =============================================================
+    // Coverage: address-escape via store of the alloca pointer
+    // into another memory location. The alloca whose address is
+    // stored must be considered escaped (the writer could keep the
+    // pointer for later) and must NOT be promoted.
+    // =============================================================
+    #[test]
+    fn address_escape_via_store_blocks_promotion() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let entry = f.entry;
+
+        // bag: a Ptr<Ptr<i32>> slot that we'll write the escape into.
+        let bag = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+            IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))))),
+        );
+        // escapee: the alloca whose address we leak.
+        let escapee = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        // Store the escapee POINTER into bag — escapee escapes.
+        push_inst(&mut f, entry,
+            InstKind::Store(escapee, bag), IrType::Void,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        // Either the pass returns false (nothing promoted) or it
+        // promotes only `bag` and leaves `escapee` standing. What
+        // it MUST NOT do is promote `escapee` away.
+        let _ = Mem2Reg.run(&mut m);
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let block = &m.functions[0].blocks[0];
+        let surviving_allocas = block.insts.iter()
+            .filter(|i| matches!(i.kind, InstKind::Alloca(_)))
+            .count();
+        assert!(
+            surviving_allocas >= 1,
+            "the address-escaped alloca must survive promotion, got {} allocas",
+            surviving_allocas,
+        );
+    }
+
+    // =============================================================
+    // Coverage: idempotency. Running mem2reg twice on the same IR
+    // must be a no-op the second time around.
+    // =============================================================
+    #[test]
+    fn second_mem2reg_run_is_a_noop() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let cond = push_inst(&mut f, entry, InstKind::ConstBool(true), IrType::Bool);
+        let then_b = f.create_block("then");
+        let else_b = f.create_block("else");
+        let merge = f.create_block("merge");
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond, true_dest: then_b, true_args: vec![],
+            false_dest: else_b, false_args: vec![],
+        });
+
+        let c1 = push_inst(&mut f, then_b,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, then_b, InstKind::Store(c1, slot), IrType::Void);
+        f.block_mut(then_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        let c2 = push_inst(&mut f, else_b,
+            InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, else_b, InstKind::Store(c2, slot), IrType::Void);
+        f.block_mut(else_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        let loaded = push_inst(&mut f, merge,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(loaded)));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m), "first run should promote");
+        // Second run must be a no-op: nothing left to promote.
+        assert!(!Mem2Reg.run(&mut m), "second run on already-promoted IR should be a no-op");
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+    }
+
+    // =============================================================
+    // Coverage: two promotable allocas joining at the same merge.
+    // After promotion the merge block should have TWO block params,
+    // and each predecessor should pass two args in the right order.
+    // =============================================================
+    #[test]
+    fn two_allocas_same_merge_inserts_two_params() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+
+        let slot_a = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let slot_b = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let cond = push_inst(&mut f, entry, InstKind::ConstBool(true), IrType::Bool);
+        let then_b = f.create_block("then");
+        let else_b = f.create_block("else");
+        let merge = f.create_block("merge");
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond, true_dest: then_b, true_args: vec![],
+            false_dest: else_b, false_args: vec![],
+        });
+
+        // then: a=1, b=10
+        let c1 = push_inst(&mut f, then_b,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c10 = push_inst(&mut f, then_b,
+            InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, then_b, InstKind::Store(c1, slot_a), IrType::Void);
+        push_inst(&mut f, then_b, InstKind::Store(c10, slot_b), IrType::Void);
+        f.block_mut(then_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        // else: a=2, b=20
+        let c2 = push_inst(&mut f, else_b,
+            InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c20 = push_inst(&mut f, else_b,
+            InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, else_b, InstKind::Store(c2, slot_a), IrType::Void);
+        push_inst(&mut f, else_b, InstKind::Store(c20, slot_b), IrType::Void);
+        f.block_mut(else_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        // merge: result = a + b
+        let la = push_inst(&mut f, merge,
+            InstKind::Load(slot_a), IrType::Int(IntWidth::I32));
+        let lb = push_inst(&mut f, merge,
+            InstKind::Load(slot_b), IrType::Int(IntWidth::I32));
+        let sum = push_inst(&mut f, merge,
+            InstKind::IAdd(la, lb), IrType::Int(IntWidth::I32));
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(sum)));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let f = &m.functions[0];
+        let merge_block = f.block(merge);
+        assert_eq!(merge_block.params.len(), 2,
+            "merge should have 2 block params, one per promoted alloca");
+        // Each predecessor must now carry 2 branch args.
+        for pred in [then_b, else_b] {
+            let term = f.block(pred).terminator.as_ref().unwrap();
+            match term {
+                Terminator::Branch(_, args) => assert_eq!(args.len(), 2,
+                    "predecessor {:?} should pass 2 args to merge", pred),
+                _ => panic!("predecessor terminator should be Branch"),
+            }
+        }
+    }
+
+    // =============================================================
+    // Coverage: multi-store-per-iteration. A loop body that stores
+    // to the same alloca twice in one iteration must end up with
+    // the LAST store flowing back to the header.
+    // =============================================================
+    #[test]
+    fn multi_store_per_iteration_uses_last_store() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let entry = f.entry;
+
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c0 = push_inst(&mut f, entry,
+            InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, entry, InstKind::Store(c0, slot), IrType::Void);
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![]));
+
+        // header: i = load slot; cmp i < 5
+        let cur = push_inst(&mut f, header,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32));
+        let c5 = push_inst(&mut f, header,
+            InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cmp = push_inst(&mut f, header,
+            InstKind::ICmp(CmpOp::Lt, cur, c5), IrType::Bool);
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: cmp, true_dest: body, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+
+        // body: store cur+1 to slot, then store (cur+1)+10 to slot.
+        // The SECOND store is the one that should flow to header.
+        let c1 = push_inst(&mut f, body,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cur2 = push_inst(&mut f, body,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32));
+        let plus1 = push_inst(&mut f, body,
+            InstKind::IAdd(cur2, c1), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, body, InstKind::Store(plus1, slot), IrType::Void);
+        let c10 = push_inst(&mut f, body,
+            InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let plus10 = push_inst(&mut f, body,
+            InstKind::IAdd(plus1, c10), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, body, InstKind::Store(plus10, slot), IrType::Void);
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![]));
+
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let f = &m.functions[0];
+        // No loads/stores/allocas anywhere.
+        for b in &f.blocks {
+            for i in &b.insts {
+                assert!(!matches!(i.kind, InstKind::Load(_) | InstKind::Store(..) | InstKind::Alloca(_)),
+                    "should be promoted away: {:?}", i.kind);
+            }
+        }
+        // body's branch back to header should pass `plus10` (the
+        // last-store value), not `plus1`.
+        let body_term = f.block(body).terminator.as_ref().unwrap();
+        match body_term {
+            Terminator::Branch(_, args) => {
+                assert_eq!(args.len(), 1, "body should pass 1 arg to header");
+                assert_eq!(args[0], plus10,
+                    "header arg should be the LAST store value, not the first");
+            }
+            _ => panic!("body terminator should be Branch"),
+        }
+    }
+
+    // =============================================================
+    // Coverage: multi-latch loop. Two latch blocks both branch back
+    // to the same header. Each latch must contribute its own arg
+    // to the header's promoted block param.
+    // =============================================================
+    #[test]
+    fn multi_latch_loop_each_latch_contributes_arg() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let entry = f.entry;
+
+        let slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c0 = push_inst(&mut f, entry,
+            InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, entry, InstKind::Store(c0, slot), IrType::Void);
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let latch_a = f.create_block("latch_a");
+        let latch_b = f.create_block("latch_b");
+        let exit = f.create_block("exit");
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![]));
+
+        // header: i = load; cmp i < 100; cond br body / exit
+        let cur = push_inst(&mut f, header,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32));
+        let c100 = push_inst(&mut f, header,
+            InstKind::ConstInt(100, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cmp_top = push_inst(&mut f, header,
+            InstKind::ICmp(CmpOp::Lt, cur, c100), IrType::Bool);
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: cmp_top, true_dest: body, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+
+        // body: branch to latch_a or latch_b based on cur.
+        let c50 = push_inst(&mut f, body,
+            InstKind::ConstInt(50, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cmp_mid = push_inst(&mut f, body,
+            InstKind::ICmp(CmpOp::Lt, cur, c50), IrType::Bool);
+        f.block_mut(body).terminator = Some(Terminator::CondBranch {
+            cond: cmp_mid, true_dest: latch_a, true_args: vec![],
+            false_dest: latch_b, false_args: vec![],
+        });
+
+        // latch_a: store cur+1; jump header
+        let c1a = push_inst(&mut f, latch_a,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let curla = push_inst(&mut f, latch_a,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32));
+        let nexta = push_inst(&mut f, latch_a,
+            InstKind::IAdd(curla, c1a), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, latch_a, InstKind::Store(nexta, slot), IrType::Void);
+        f.block_mut(latch_a).terminator = Some(Terminator::Branch(header, vec![]));
+
+        // latch_b: store cur+2; jump header
+        let c2b = push_inst(&mut f, latch_b,
+            InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let curlb = push_inst(&mut f, latch_b,
+            InstKind::Load(slot), IrType::Int(IntWidth::I32));
+        let nextb = push_inst(&mut f, latch_b,
+            InstKind::IAdd(curlb, c2b), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, latch_b, InstKind::Store(nextb, slot), IrType::Void);
+        f.block_mut(latch_b).terminator = Some(Terminator::Branch(header, vec![]));
+
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let f = &m.functions[0];
+        let header_block = f.block(header);
+        assert_eq!(header_block.params.len(), 1,
+            "header should have 1 block param for the counter");
+
+        // Each latch's branch to header should pass exactly one arg
+        // (its computed `next` value).
+        let la_term = f.block(latch_a).terminator.as_ref().unwrap();
+        match la_term {
+            Terminator::Branch(_, args) => {
+                assert_eq!(args.len(), 1, "latch_a passes 1 arg to header");
+                assert_eq!(args[0], nexta);
+            }
+            _ => panic!("latch_a should branch to header"),
+        }
+        let lb_term = f.block(latch_b).terminator.as_ref().unwrap();
+        match lb_term {
+            Terminator::Branch(_, args) => {
+                assert_eq!(args.len(), 1, "latch_b passes 1 arg to header");
+                assert_eq!(args[0], nextb);
+            }
+            _ => panic!("latch_b should branch to header"),
+        }
+    }
+
+    // =============================================================
+    // Coverage: nested loops. An inner loop nested inside an outer
+    // loop, both promoting their own counter. Both headers should
+    // get a block param.
+    // =============================================================
+    #[test]
+    fn nested_loops_promote_both_counters() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let entry = f.entry;
+
+        let outer_slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let inner_slot = push_inst(&mut f, entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c0 = push_inst(&mut f, entry,
+            InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, entry, InstKind::Store(c0, outer_slot), IrType::Void);
+
+        let outer_header = f.create_block("outer_header");
+        let inner_init  = f.create_block("inner_init");
+        let inner_header = f.create_block("inner_header");
+        let inner_body  = f.create_block("inner_body");
+        let outer_latch = f.create_block("outer_latch");
+        let exit = f.create_block("exit");
+
+        f.block_mut(entry).terminator = Some(Terminator::Branch(outer_header, vec![]));
+
+        // outer_header: i = load outer; cmp i<3; br inner_init / exit
+        let i = push_inst(&mut f, outer_header,
+            InstKind::Load(outer_slot), IrType::Int(IntWidth::I32));
+        let c3 = push_inst(&mut f, outer_header,
+            InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cmpo = push_inst(&mut f, outer_header,
+            InstKind::ICmp(CmpOp::Lt, i, c3), IrType::Bool);
+        f.block_mut(outer_header).terminator = Some(Terminator::CondBranch {
+            cond: cmpo, true_dest: inner_init, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+
+        // inner_init: store 0 to inner; br inner_header
+        let c0i = push_inst(&mut f, inner_init,
+            InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, inner_init, InstKind::Store(c0i, inner_slot), IrType::Void);
+        f.block_mut(inner_init).terminator = Some(Terminator::Branch(inner_header, vec![]));
+
+        // inner_header: j = load inner; cmp j<5; br inner_body / outer_latch
+        let j = push_inst(&mut f, inner_header,
+            InstKind::Load(inner_slot), IrType::Int(IntWidth::I32));
+        let c5 = push_inst(&mut f, inner_header,
+            InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let cmpi = push_inst(&mut f, inner_header,
+            InstKind::ICmp(CmpOp::Lt, j, c5), IrType::Bool);
+        f.block_mut(inner_header).terminator = Some(Terminator::CondBranch {
+            cond: cmpi, true_dest: inner_body, true_args: vec![],
+            false_dest: outer_latch, false_args: vec![],
+        });
+
+        // inner_body: j = j + 1; store inner; br inner_header
+        let c1i = push_inst(&mut f, inner_body,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let jcur = push_inst(&mut f, inner_body,
+            InstKind::Load(inner_slot), IrType::Int(IntWidth::I32));
+        let jnext = push_inst(&mut f, inner_body,
+            InstKind::IAdd(jcur, c1i), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, inner_body, InstKind::Store(jnext, inner_slot), IrType::Void);
+        f.block_mut(inner_body).terminator = Some(Terminator::Branch(inner_header, vec![]));
+
+        // outer_latch: i = i + 1; store outer; br outer_header
+        let c1o = push_inst(&mut f, outer_latch,
+            InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let icur = push_inst(&mut f, outer_latch,
+            InstKind::Load(outer_slot), IrType::Int(IntWidth::I32));
+        let inext = push_inst(&mut f, outer_latch,
+            InstKind::IAdd(icur, c1o), IrType::Int(IntWidth::I32));
+        push_inst(&mut f, outer_latch, InstKind::Store(inext, outer_slot), IrType::Void);
+        f.block_mut(outer_latch).terminator = Some(Terminator::Branch(outer_header, vec![]));
+
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m));
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
+
+        let f = &m.functions[0];
+        // Both headers should have at least one block param. The
+        // CFRWZ algorithm conservatively inserts phi at every block
+        // in the iterated dominance frontier of any store, so the
+        // outer header may end up with TWO params (one for the
+        // outer counter, one for the inner counter that is live-in
+        // along the back edge through outer_latch). A later DCE
+        // pass cleans up the unused one — that's not mem2reg's job.
+        assert!(f.block(outer_header).params.len() >= 1,
+            "outer_header should have ≥1 block param for outer counter, got {}",
+            f.block(outer_header).params.len());
+        assert!(f.block(inner_header).params.len() >= 1,
+            "inner_header should have ≥1 block param for inner counter, got {}",
+            f.block(inner_header).params.len());
+        // No loads/stores/allocas anywhere — both slots fully promoted.
+        for b in &f.blocks {
+            for i in &b.insts {
+                assert!(!matches!(i.kind, InstKind::Load(_) | InstKind::Store(..) | InstKind::Alloca(_)),
+                    "{:?}: kind {:?} should be promoted away", b.id, i.kind);
+            }
+        }
+    }
 }
