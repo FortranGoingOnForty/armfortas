@@ -65,6 +65,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(C)** Standalone PARAMETER/COMMON/AttributeStmt processing missing.
 - **(C)** Ambiguous USE detection missing.
 - **(B)** Module default/private access is not enforced in authored `USE` graphs → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use visible_values, only: hidden` compiling successfully even when the module declares `private` default access and only marks `shown` as public.
+- **(B)** Renamed re-export graphs still leak the original name at import sites → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use bridge_aliases, only: payload` compiling successfully even though the intermediate module only imports the upstream entity as `lifted`.
 - **(C)** Default access not applied to CONTAINS subprograms.
 
 ## Semantic Analysis — Type System (Sprint 13)
