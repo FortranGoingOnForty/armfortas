@@ -455,11 +455,32 @@ fn init_decls(
                     let Some(init_expr) = &entity.init else { continue; };
                     let key = entity.name.to_lowercase();
                     let Some(info) = locals.get(&key) else { continue; };
-                    // Only initialize plain scalar slots; arrays, characters,
-                    // allocatables, and derived types are handled elsewhere.
+                    // Dummy arguments cannot have initializers per the
+                    // standard; defensive skip in case sema lets one
+                    // through.
+                    if info.by_ref { continue; }
+
+                    // Array entity with an array constructor init:
+                    // store each literal element into the slot.
+                    // Only stack/non-allocatable arrays are handled
+                    // here; allocatable arrays would need their
+                    // descriptor allocated first.
+                    if !info.dims.is_empty()
+                        && !info.allocatable
+                        && matches!(info.char_kind, CharKind::None)
+                        && info.derived_type.is_none()
+                    {
+                        if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
+                            store_ac_values_into(b, locals, info.addr, &info.ty, values, st);
+                        }
+                        continue;
+                    }
+
+                    // Only initialize plain scalar slots; characters,
+                    // allocatables, and derived types are handled
+                    // elsewhere.
                     if !info.dims.is_empty()
                         || info.allocatable
-                        || info.by_ref
                         || !matches!(info.char_kind, CharKind::None)
                         || info.derived_type.is_some()
                     {
@@ -2676,6 +2697,68 @@ fn widen_idx_to_i64(b: &mut FuncBuilder, idx: ValueId) -> ValueId {
     }
 }
 
+/// Element-byte size for an IR scalar type. Used by array
+/// constructor lowering to compute byte offsets into a destination
+/// buffer. Defaults to 8 for unknown/wide types so we never
+/// under-step (a wrong-direction error would silently scribble
+/// over adjacent elements).
+fn ir_scalar_byte_size(ty: &IrType) -> i64 {
+    match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+        _ => 8,
+    }
+}
+
+/// Store the literal values of an array constructor into a
+/// destination buffer, one element at a time via byte-level GEP.
+///
+/// `dest_base` is a byte pointer to the start of the buffer
+/// (already loaded from a descriptor if the dest is allocatable).
+/// `elem_ty` is the element type used to coerce/size each value.
+///
+/// Only `AcValue::Expr` literal forms are handled here. Implied-do
+/// loops (`(i, i = 1, n)`) require a real loop and are not yet
+/// supported — they fall through silently and are flagged in tests
+/// as future work.
+fn store_ac_values_into(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_ty: &IrType,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+) {
+    let elem_bytes = ir_scalar_byte_size(elem_ty);
+    let mut idx: i64 = 0;
+    for v in values {
+        match v {
+            crate::ast::expr::AcValue::Expr(e) => {
+                let raw = lower_expr(b, locals, e, st);
+                let coerced = coerce_to_type(b, raw, elem_ty);
+                if idx == 0 {
+                    // First element: store directly into dest_base.
+                    b.store(coerced, dest_base);
+                } else {
+                    let off = b.const_i64(idx * elem_bytes);
+                    let p = b.gep(dest_base, vec![off], IrType::Int(IntWidth::I8));
+                    b.store(coerced, p);
+                }
+                idx += 1;
+            }
+            crate::ast::expr::AcValue::ImpliedDo { .. } => {
+                // Not yet supported. Skipping the value would
+                // silently produce a too-short array, so leave
+                // the slot zeroed (caller's alloca starts at zero
+                // bytes) and advance the index.
+                idx += 1;
+            }
+        }
+    }
+}
+
 /// Lower an array element store: compute flat offset, GEP, store.
 fn lower_array_store(
     b: &mut FuncBuilder,
@@ -2947,6 +3030,17 @@ fn lower_array_assign(
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) {
+    // a = [v0, v1, v2, ...] — element-wise store of an array
+    // constructor's literal values into the destination.
+    if let Expr::ArrayConstructor { values, .. } = &value.node {
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr,
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+        store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        return;
+    }
+
     // Check if RHS is also an array variable → element-wise copy via memcpy.
     let rhs_is_array = if let Expr::Name { name } = &value.node {
         ctx.locals.get(&name.to_lowercase())
@@ -3789,7 +3883,67 @@ fn lower_expr_full(
             b.const_i32(0) // fallback for unresolved component access
         }
 
+        Expr::ArrayConstructor { values, .. } => {
+            // Allocate a temporary stack array, store each literal
+            // element into it, return the base pointer. Element
+            // type is inferred from the first element's IR type
+            // (or defaults to i32 for an empty constructor — rare
+            // but legal). Implied-do values are slot-skipped by
+            // store_ac_values_into; see the helper for details.
+            //
+            // The expression form is needed when an array literal
+            // appears as a function argument or print item; the
+            // assignment form (`a = [1,2,3]`) bypasses this and
+            // routes through lower_array_assign for direct stores.
+            let elem_ty = values.iter()
+                .find_map(|v| match v {
+                    crate::ast::expr::AcValue::Expr(e) => {
+                        // Peek at the first element's type by
+                        // lowering it on a scratch path. Rather
+                        // than actually lower (and have to undo),
+                        // approximate from the AST: integer
+                        // literals → i32, real → f64, etc.
+                        Some(infer_const_expr_ty(&e.node))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(IrType::Int(IntWidth::I32));
+            let n = values.len() as u64;
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1));
+            let buf = b.alloca(arr_ty);
+            store_ac_values_into(b, locals, buf, &elem_ty, values, st);
+            buf
+        }
+
         _ => b.const_i32(0), // placeholder for unhandled expressions
+    }
+}
+
+/// Approximate the IR type of a constant-or-near-constant
+/// expression by inspecting the AST. Used by ArrayConstructor
+/// lowering to pick an element type without actually emitting IR.
+/// Conservative — falls back to i32 for anything it can't
+/// classify.
+fn infer_const_expr_ty(e: &Expr) -> IrType {
+    match e {
+        Expr::IntegerLiteral { kind, .. } => {
+            if kind.as_deref() == Some("8") {
+                IrType::Int(IntWidth::I64)
+            } else {
+                IrType::Int(IntWidth::I32)
+            }
+        }
+        Expr::RealLiteral { text, .. } => {
+            if text.to_lowercase().contains('d') {
+                IrType::Float(FloatWidth::F64)
+            } else {
+                IrType::Float(FloatWidth::F32)
+            }
+        }
+        Expr::LogicalLiteral { .. } => IrType::Bool,
+        Expr::UnaryOp { operand, .. } => infer_const_expr_ty(&operand.node),
+        Expr::ParenExpr { inner } => infer_const_expr_ty(&inner.node),
+        _ => IrType::Int(IntWidth::I32),
     }
 }
 
