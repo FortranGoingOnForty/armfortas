@@ -585,7 +585,7 @@ pub fn dominator_tree_preorder(func: &Function) -> Vec<BlockId> {
 #[cfg(test)]
 mod walk_tests {
     use super::*;
-    use super::super::types::{IrType, IntWidth};
+    use super::super::types::IrType;
     use crate::lexer::{Span, Position};
 
     fn dummy_span() -> Span {
@@ -777,5 +777,170 @@ mod walk_tests {
         assert_eq!(idoms[&c], b);
         assert_eq!(idoms[&d], b);
         assert_eq!(idoms[&m1], b);
+    }
+
+    // ----- Edge case: single-block function -----
+    //
+    // A function whose entry block is also its only block must
+    // produce an empty idom map (entry has no idom) and a single
+    // empty dominance frontier entry.
+    #[test]
+    fn single_block_function_has_no_idom() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        let idoms = compute_immediate_dominators(&f);
+        assert!(idoms.is_empty(), "single-block function should have no idoms");
+
+        let df = compute_dominance_frontiers(&f);
+        // Entry is reachable, so it has an entry in the DF map, but
+        // its frontier is empty (no successors, no join points).
+        assert_eq!(df.len(), 1);
+        assert!(df[&f.entry].is_empty());
+
+        let order = dominator_tree_preorder(&f);
+        assert_eq!(order, vec![f.entry]);
+    }
+
+    // ----- Edge case: self-loop on entry -----
+    //
+    // The entry block has itself as a successor. Entry still has no
+    // idom (it's the root), and entry is its own join point (1 pred,
+    // itself), so it should NOT appear in any DF set.
+    #[test]
+    fn self_loop_on_entry() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        // entry → entry (always loops, no exit). Verifier doesn't run
+        // here so an unreachable terminator is fine for the dom math.
+        let cond = f.next_value_id();
+        f.block_mut(f.entry).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        let exit = f.create_block("exit");
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: f.entry, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        let idoms = compute_immediate_dominators(&f);
+        assert!(!idoms.contains_key(&f.entry), "entry has no idom even with a self-edge");
+        assert_eq!(idoms[&exit], f.entry);
+
+        let df = compute_dominance_frontiers(&f);
+        // The self-edge gives entry one in-edge (from itself); plus
+        // the implicit "function entry edge" doesn't count, so entry
+        // has 1 reachable pred. Not a join point — entry ∉ any DF.
+        for (b, frontier) in &df {
+            assert!(!frontier.contains(&f.entry),
+                "entry should not appear in DF[{:?}]", b);
+        }
+    }
+
+    // ----- Edge case: self-loop on a non-entry block -----
+    //
+    // entry → b → b   (b has both an entry edge and a self-edge,
+    //                  so 2 reachable preds → join point.)
+    // CFRWZ says b ∈ DF(b) here: b dominates itself (a pred of
+    // itself) but does not strictly dominate itself.
+    #[test]
+    fn self_loop_on_non_entry_block_is_in_own_df() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let b = f.create_block("b");
+        let exit = f.create_block("exit");
+
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(b, vec![]));
+
+        let cond = f.next_value_id();
+        f.block_mut(b).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(b).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: b, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        let df = compute_dominance_frontiers(&f);
+        assert_eq!(df[&b], HashSet::from([b]),
+            "b's self-edge puts b in its own dominance frontier");
+        let idoms = compute_immediate_dominators(&f);
+        assert_eq!(idoms[&b], f.entry);
+        assert_eq!(idoms[&exit], b);
+    }
+
+    // ----- Edge case: irreducible CFG -----
+    //
+    //   entry → a → b → a   (cross-edge into the loop)
+    //   entry → b
+    //
+    // Both `a` and `b` have 2 preds, neither dominates the other,
+    // and the loop has no single header. The dom math should still
+    // produce a sensible answer: entry idom both, and each is in
+    // the other's dominance frontier.
+    #[test]
+    fn irreducible_cfg_has_consistent_doms() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let a = f.create_block("a");
+        let b = f.create_block("b");
+        let exit = f.create_block("exit");
+
+        // entry → cond ? a : b
+        let c0 = f.next_value_id();
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c0, kind: InstKind::ConstBool(true),
+            ty: IrType::Bool, span: dummy_span(),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond: c0,
+            true_dest: a, true_args: vec![],
+            false_dest: b, false_args: vec![],
+        });
+
+        // a → b
+        f.block_mut(a).terminator = Some(Terminator::Branch(b, vec![]));
+
+        // b → cond ? a : exit (so b → a is a back edge into a, but
+        //                      a is not the only header — entry → b
+        //                      bypasses it).
+        let c1 = f.next_value_id();
+        f.block_mut(b).insts.push(Inst {
+            id: c1, kind: InstKind::ConstBool(true),
+            ty: IrType::Bool, span: dummy_span(),
+        });
+        f.block_mut(b).terminator = Some(Terminator::CondBranch {
+            cond: c1,
+            true_dest: a, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        let idoms = compute_immediate_dominators(&f);
+        // Neither a nor b dominates the other; entry idoms both.
+        assert_eq!(idoms[&a], f.entry);
+        assert_eq!(idoms[&b], f.entry);
+        assert_eq!(idoms[&exit], b);
+
+        let df = compute_dominance_frontiers(&f);
+        // a dominates a (a pred of b) → b ∈ DF(a) because a doesn't
+        // strictly dominate b.
+        assert!(df[&a].contains(&b), "b should be in DF(a)");
+        // b dominates b (a pred of a) → a ∈ DF(b).
+        assert!(df[&b].contains(&a), "a should be in DF(b)");
+
+        // dominator_tree_preorder must terminate and visit every
+        // reachable block once (no infinite loop on the irreducible
+        // back edge).
+        let order = dominator_tree_preorder(&f);
+        assert_eq!(order.len(), 4); // entry, a, b, exit
+        assert_eq!(order[0], f.entry);
     }
 }
