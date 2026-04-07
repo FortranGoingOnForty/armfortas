@@ -59,7 +59,12 @@ struct LowerCtx<'a> {
     locals: HashMap<String, LocalInfo>,
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
-    globals: &'a HashMap<String, (usize, IrType)>,
+    /// Module-scoped globals visible by lowercase variable name.
+    /// Value is `(global symbol name, element type)`. Populated by
+    /// the lower_file pre-pass over `ProgramUnit::Module` units so
+    /// any subsequent function that USE-imports the module can
+    /// resolve the name to a `GlobalAddr`.
+    globals: &'a HashMap<String, (String, IrType)>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
@@ -68,7 +73,7 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
+    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (String, IrType)>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
         Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
     }
 
@@ -99,20 +104,72 @@ impl<'a> LowerCtx<'a> {
 }
 
 /// Lower a file of program units to an IR module.
+///
+/// Two passes:
+///   1. Walk every `ProgramUnit::Module`, register its globals into
+///      `module.globals` (with const-evaluated initializers where
+///      possible) and into a `globals` resolution map keyed by
+///      lowercase variable name. This map is what `Expr::Name`
+///      lowering consults when a name isn't a local.
+///   2. Walk every unit again to lower its functions; module units
+///      are skipped on this pass since their globals are already
+///      installed.
 pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Module {
     let mut module = Module::new("main".into());
-    let globals = HashMap::new();
+    let mut globals: HashMap<String, (String, IrType)> = HashMap::new();
+
+    // Pass 1: collect module-level variables.
+    for unit in units {
+        if let ProgramUnit::Module { name, decls, .. } = &unit.node {
+            collect_module_globals(&mut module, &mut globals, name, decls);
+        }
+    }
+
+    // Pass 2: lower each unit. Modules already had their globals
+    // installed in pass 1; lower_unit's Module arm is a no-op.
     for unit in units {
         lower_unit(&mut module, unit, st, &globals, type_layouts);
     }
     module
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (usize, IrType)>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+/// Walk a module's declarations and emit a global per scalar
+/// variable. Resolves the initializer at compile time when
+/// possible (literals via `eval_const_global_init`); otherwise
+/// the global is zero-initialized and the program-startup
+/// initializer is responsible for filling it in (TBD: M3 follow-up
+/// for non-literal init expressions).
+fn collect_module_globals(
+    module: &mut Module,
+    globals: &mut HashMap<String, (String, IrType)>,
+    mod_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+            let ir_ty = lower_type_spec(type_spec);
+            for entity in entities {
+                let symbol = format!("__mod_{}_{}",
+                    mod_name.to_lowercase(),
+                    entity.name.to_lowercase());
+                let init = entity.init.as_ref()
+                    .and_then(eval_const_global_init);
+                module.add_global(Global {
+                    name: symbol.clone(),
+                    ty: ir_ty.clone(),
+                    initializer: init.or(Some(GlobalInit::Zero)),
+                });
+                globals.insert(entity.name.to_lowercase(), (symbol, ir_ty.clone()));
+            }
+        }
+    }
+}
+
+fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (String, IrType)>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -123,6 +180,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             {
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -196,6 +254,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -271,6 +330,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_type = Some(ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -286,20 +346,10 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 module.add_global(pg.global);
             }
         }
-        ProgramUnit::Module { name, decls, .. } => {
-            // Module variables become globals.
-            for decl in decls {
-                if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
-                    let ir_ty = lower_type_spec(type_spec);
-                    for entity in entities {
-                        module.add_global(Global {
-                            name: format!("{}::{}", name, entity.name),
-                            ty: ir_ty.clone(),
-                            initializer: Some(GlobalInit::Zero),
-                        });
-                    }
-                }
-            }
+        ProgramUnit::Module { .. } => {
+            // Module globals are installed in pass 1
+            // (collect_module_globals). Pass 2 has nothing to do
+            // for modules — they have no executable body.
         }
         _ => {}
     }
@@ -356,6 +406,27 @@ fn is_global_addr(b: &FuncBuilder, val: ValueId) -> bool {
         }
     }
     false
+}
+
+/// Install module-level globals as `LocalInfo` entries in the
+/// function-local map so `Expr::Name` lookups can resolve them
+/// uniformly with stack locals. Must run *after* `alloc_decls` so
+/// that any same-named local declared in this subprogram shadows
+/// the global per Fortran scoping rules.
+fn install_globals_as_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<String, (String, IrType)>,
+) {
+    for (name, (symbol, ty)) in globals {
+        if locals.contains_key(name) { continue; }
+        let addr = b.global_addr(symbol, ty.clone());
+        locals.insert(name.clone(), LocalInfo {
+            addr, ty: ty.clone(),
+            dims: vec![], allocatable: false, by_ref: false,
+            char_kind: CharKind::None, derived_type: None,
+        });
+    }
 }
 
 /// Allocate local variables from declarations. Handles both scalars and arrays.
