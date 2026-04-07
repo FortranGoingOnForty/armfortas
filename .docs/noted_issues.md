@@ -100,7 +100,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **[FIXED]** ~~Runtime-variable negative DO step~~ → Sprint 21.5 (runtime sign check)
 - **[FIXED]** ~~ASSOCIATE leaks bindings into outer scope~~ → Sprint 21.5
 - **[FIXED]** ~~Integer literal truncation~~ → Sprint 21.5 (kind-aware emission)
-- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System).
+- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System). `bencch` Sprint 7 multi-file graph suites now show this directly on executable module/use cases too: imported module values in authored graphs like `module_chain` and `rename_only` lower to zero-initialized globals in IR and print `0` at runtime instead of the expected imported values.
 - **(B)** No derived type lowering → Sprint 28 (Derived Types & OOP).
 - **(B)** DoConcurrent silently dropped → fortsh doesn't use (D). PointerAssignment → Sprint 28. Read/I/O → Sprint 24-25.
 
