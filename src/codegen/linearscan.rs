@@ -134,12 +134,14 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             }
         } else {
             // No register available — spill. Find the active
-            // interval ending furthest. The active list now carries
-            // the current vreg directly so we don't have to scan
-            // the (non-deterministic, stale-entry-laden) assignments
-            // map for the victim.
-            if let Some(last_idx) = active.iter().position(|&(_, end, _)| end == active.last().map(|a| a.1).unwrap_or(0)) {
-                let (spill_reg, spill_end, victim) = active[last_idx];
+            // interval ending furthest. `active` is kept sorted by
+            // end (see the `active.sort_by_key(...)` calls above
+            // and below), so the last entry is always the furthest.
+            // The active list carries the current vreg directly so
+            // we don't have to scan the (non-deterministic,
+            // stale-entry-laden) assignments map for the victim.
+            if let Some(&(spill_reg, spill_end, victim)) = active.last() {
+                let last_idx = active.len() - 1;
                 if spill_end > interval.end {
                     // Spill the furthest active interval, give its register to us.
                     let offset = mf.alloc_local(8);

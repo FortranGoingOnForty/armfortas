@@ -297,9 +297,65 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         InstKind::Undef(_) => {
+            // Emit a deterministic zero instead of leaving the vreg
+            // undefined. A truly undefined vreg lets the register
+            // allocator hand us whatever physical register is free,
+            // and that register's stale contents leak into reads —
+            // which makes optimization-level diffs nondeterministic
+            // and turns "undef ⇒ anything" into "undef ⇒ whatever
+            // happened to be in x14 at this point in the program."
+            //
+            // mem2reg synthesizes Undef as the initial value of a
+            // promoted slot before any store. The Fortran semantics
+            // for reading uninitialized storage are undefined, but
+            // a hard zero is at least reproducible across opt
+            // levels and friendly to debuggers.
             let class = type_to_reg_class(&inst.ty);
-            let _dest = ctx.get_vreg(mf, inst.id, class);
-            // Undef: just allocate the vreg, no instruction needed.
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            match class {
+                RegClass::Gp32 => {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::MovReg,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::PhysReg(PhysReg::Wzr),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Gp64 => {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::MovReg,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::PhysReg(PhysReg::Xzr),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Fp32 => {
+                    let cp_idx = mf.add_const(ConstPoolEntry::F32(0.0));
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AdrpLdr,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::ConstPool(cp_idx),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Fp64 => {
+                    let cp_idx = mf.add_const(ConstPoolEntry::F64(0.0));
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AdrpLdr,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::ConstPool(cp_idx),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+            }
         }
 
         // ---- Integer arithmetic ----
