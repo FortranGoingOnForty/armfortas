@@ -622,15 +622,25 @@ fn alloc_decls(
 
 /// Lower initializer expressions for declared variables.
 ///
-/// Handles three forms:
-///   1. `integer :: x = 42`              — TypeDecl entity with init
-///   2. `integer, parameter :: pi = 3.14` — TypeDecl entity with init + Parameter attr
-///   3. `parameter (pi = 3.14159)`       — standalone ParameterStmt referring to an
-///       already-allocated local
+/// Handles two AST shapes:
+///   1. `Decl::TypeDecl` entities with `entity.init` set. This
+///      covers BOTH `integer :: x = 42` and
+///      `integer, parameter :: pi = 3.14` — the parameter
+///      attribute doesn't change the lowering, only sema's
+///      classification of the symbol.
+///   2. Standalone `Decl::ParameterStmt { pairs }`, where each
+///      pair refers to an already-allocated local declared
+///      elsewhere in the same decl list.
 ///
-/// Must run *after* `alloc_decls` so that all locals exist. Only stores into
-/// scalar slots — array, character, derived-type, and allocatable initializers
-/// are not handled here (they have their own paths).
+/// Most scalar locals with const-evaluable initializers are
+/// SAVE-promoted to module globals back in `alloc_decls`; for
+/// those, `is_global_addr` returns true and this pass leaves the
+/// initialization to the .data section. The remaining cases this
+/// pass handles are non-const initializers (rare).
+///
+/// Must run *after* `alloc_decls` so that all locals exist. Only
+/// stores into scalar slots — array, character, derived-type, and
+/// allocatable initializers have their own paths in alloc_decls.
 fn init_decls(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -644,9 +654,17 @@ fn init_decls(
                     let Some(init_expr) = &entity.init else { continue; };
                     let key = entity.name.to_lowercase();
                     let Some(info) = locals.get(&key) else { continue; };
-                    // Dummy arguments cannot have initializers per the
-                    // standard; defensive skip in case sema lets one
-                    // through.
+                    // Dummy arguments (by_ref locals) cannot have
+                    // initializers per the Fortran standard — they
+                    // bind to caller storage. If sema lets one
+                    // through it would be a bug; the debug_assert
+                    // catches it in development without crashing
+                    // release builds. Audit Min-4.
+                    debug_assert!(
+                        !info.by_ref,
+                        "init_decls: dummy argument {:?} should not have an initializer",
+                        key,
+                    );
                     if info.by_ref { continue; }
 
                     // Array entity with an array constructor init:
@@ -717,8 +735,22 @@ fn init_decls(
 }
 
 /// Coerce a scalar value to a target type for initializer storage.
-/// Handles int↔int width changes and int→float promotion that show up in
-/// initializers (e.g. `real :: x = 1` where the literal is i32).
+///
+/// Covers every Fortran scalar coercion that can show up at an
+/// initializer-store site:
+///   * Int → Int width change (sign-extend or truncate). Audit
+///     Min-3: Fortran integers are always signed, so the int_extend
+///     `signed` flag is hardcoded to `true`.
+///   * Int ↔ Float (round to nearest for Float→Int).
+///   * F32 ↔ F64 (extend / truncate).
+///   * Bool ↔ Int (round-trip via int_extend; Fortran logicals
+///     occupy a full kind so this is rare but legal).
+///
+/// Anything that doesn't match one of those cases falls into the
+/// `_ => val` arm and a `debug_assert!` fires — silently passing
+/// the wrong-typed value would let a future caller wire mismatched
+/// types into a Store, which the verifier (after MAJOR-4) would
+/// then catch much later. Better to fail loudly at the source.
 fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId {
     let src = match b.func().value_type(val) {
         Some(t) => t,
@@ -728,13 +760,18 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
         return val;
     }
     match (&src, target) {
+        // Int → Float
         (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
+        // Float → Int
+        (IrType::Float(_), IrType::Int(iw)) => b.float_to_int(val, *iw),
+        // F32 ↔ F64
         (IrType::Float(FloatWidth::F32), IrType::Float(FloatWidth::F64)) => {
             b.float_extend(val, FloatWidth::F64)
         }
         (IrType::Float(FloatWidth::F64), IrType::Float(FloatWidth::F32)) => {
             b.float_trunc(val, FloatWidth::F32)
         }
+        // Int width change. Audit Min-3: Fortran integers are signed.
         (IrType::Int(src_w), IrType::Int(dst_w)) => {
             if dst_w.bits() > src_w.bits() {
                 b.int_extend(val, *dst_w, true)
@@ -744,7 +781,16 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
                 val
             }
         }
-        _ => val,
+        // Bool ↔ Int via int_extend. Bool is i1 in our model.
+        (IrType::Bool, IrType::Int(iw)) => b.int_extend(val, *iw, false),
+        (IrType::Int(_), IrType::Bool) => b.int_trunc(val, IntWidth::I8),
+        _ => {
+            debug_assert!(
+                false,
+                "coerce_to_type: unhandled coercion {:?} → {:?}", src, target,
+            );
+            val
+        }
     }
 }
 
@@ -1642,7 +1688,28 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 /// HashMap's randomized iteration order — surfaced as non-reproducible
 /// builds for any function with multiple allocatable locals.
 fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
-    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+    // Audit Med-2: only allocate the stat_addr scratch slot if we
+    // actually need it for an `afs_deallocate_array` call. Without
+    // this guard every function (even one with no allocatables)
+    // got a zombie i32 alloca right before its ret, bloating the
+    // frame and the IR — and DCE couldn't drop it because allocas
+    // are classified as side-effecting.
+    let needs_dealloc = locals.values()
+        .any(|info| info.allocatable || info.char_kind == CharKind::Deferred);
+    let needs_stat = locals.values().any(|info| info.allocatable);
+    if !needs_dealloc && !locals.values().any(|info|
+        !info.by_ref && info.derived_type.as_ref()
+            .and_then(|tn| type_layouts.get(tn))
+            .is_some_and(|l| !l.final_procs.is_empty()))
+    {
+        return;
+    }
+
+    let stat_addr = if needs_stat {
+        Some(b.alloca(IrType::Int(IntWidth::I32)))
+    } else {
+        None
+    };
     let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (_name, info) in sorted {
@@ -1655,7 +1722,7 @@ fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalIn
         } else if info.allocatable {
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
-                vec![info.addr, stat_addr],
+                vec![info.addr, stat_addr.unwrap()],
                 IrType::Void,
             );
         }

@@ -207,22 +207,26 @@ fn promote_function(func: &mut Function) -> bool {
             file_id: 0,
         });
 
+    // Insert each Undef sentinel at the very front of the entry
+    // block so it dominates every use. Audit Med-3: the previous
+    // version computed `pos = undef_values.len() - 1` which only
+    // worked because nothing else lived at the front of entry —
+    // a future pass adding prologue insts would break it. The
+    // unconditional `insert(0, ...)` is robust regardless of what
+    // sits below it. We insert in REVERSE order so promotable[0]
+    // ends up at insts[0] after all inserts complete.
+    let entry = func.entry;
+    let mut new_undefs: Vec<(ValueId, IrType)> = Vec::with_capacity(promotable.len());
     for p in &promotable {
         let id = func.next_value_id();
         undef_values.push(id);
-        // Insert Undef at the *start* of the entry block so it
-        // dominates every use. We push these in order so that the
-        // undef for promotable[i] ends up at entry.insts[i].
-        let entry = func.entry;
-        let pos = {
-            // Skip over existing Undef insts we just inserted so
-            // the new ones line up. In practice this is `i`.
-            undef_values.len() - 1
-        };
-        func.block_mut(entry).insts.insert(pos, Inst {
-            id,
-            kind: InstKind::Undef(p.pointee_ty.clone()),
-            ty: p.pointee_ty.clone(),
+        new_undefs.push((id, p.pointee_ty.clone()));
+    }
+    for (id, ty) in new_undefs.iter().rev() {
+        func.block_mut(entry).insts.insert(0, Inst {
+            id: *id,
+            kind: InstKind::Undef(ty.clone()),
+            ty: ty.clone(),
             span,
         });
     }
@@ -1583,18 +1587,24 @@ mod tests {
         assert!(errs.is_empty(), "post-mem2reg IR invalid: {:?}", errs);
 
         let f = &m.functions[0];
-        // Both headers should have at least one block param. The
-        // CFRWZ algorithm conservatively inserts phi at every block
-        // in the iterated dominance frontier of any store, so the
-        // outer header may end up with TWO params (one for the
-        // outer counter, one for the inner counter that is live-in
-        // along the back edge through outer_latch). A later DCE
-        // pass cleans up the unused one — that's not mem2reg's job.
-        assert!(f.block(outer_header).params.len() >= 1,
-            "outer_header should have ≥1 block param for outer counter, got {}",
+        // Audit Min-2: pin the exact param counts. Hand-traced
+        // CFRWZ for this CFG produces:
+        //   * outer_slot stores at {entry, outer_latch}, with
+        //     DF(outer_latch) = {outer_header}, so the IDF is
+        //     {outer_header}. → outer_header gets 1 param.
+        //   * inner_slot stores at {inner_init, inner_body}, with
+        //     DF(inner_init) = DF(inner_body) = {outer_header,
+        //     inner_header} after IDF closure (the back-edge from
+        //     outer_latch and the back-edge from inner_body both
+        //     promote outer_header / inner_header into the
+        //     frontier). → outer_header AND inner_header each
+        //     get 1 param for inner_slot.
+        // Totals: outer_header has 2, inner_header has 1.
+        assert_eq!(f.block(outer_header).params.len(), 2,
+            "outer_header should have exactly 2 params (outer + inner counter via back-edge IDF), got {}",
             f.block(outer_header).params.len());
-        assert!(f.block(inner_header).params.len() >= 1,
-            "inner_header should have ≥1 block param for inner counter, got {}",
+        assert_eq!(f.block(inner_header).params.len(), 1,
+            "inner_header should have exactly 1 param for inner counter, got {}",
             f.block(inner_header).params.len());
         // No loads/stores/allocas anywhere — both slots fully promoted.
         for b in &f.blocks {
