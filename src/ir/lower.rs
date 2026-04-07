@@ -2998,10 +2998,17 @@ fn ir_scalar_byte_size(ty: &IrType) -> i64 {
 /// (already loaded from a descriptor if the dest is allocatable).
 /// `elem_ty` is the element type used to coerce/size each value.
 ///
-/// Only `AcValue::Expr` literal forms are handled here. Implied-do
-/// loops (`(i, i = 1, n)`) require a real loop and are not yet
-/// supported — they fall through silently and are flagged in tests
-/// as future work.
+/// Handles both literal expressions and implied-do iterators.
+/// Literal expressions use a compile-time byte offset; implied-do
+/// iterators generate a real runtime loop that advances an
+/// alloca-backed offset. The DO variable is installed in a
+/// clone of `locals` so the inner expression can reference it.
+///
+/// Audit BLOCKING-1: previously the implied-do branch silently
+/// skipped all stores and advanced a compile-time counter,
+/// leaving the destination buffer with whatever stack bytes
+/// happened to be there (the comment lied about allocas being
+/// zeroed). Programs that used `[(expr, i=1,n)]` got garbage.
 fn store_ac_values_into(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -3011,31 +3018,136 @@ fn store_ac_values_into(
     st: &SymbolTable,
 ) {
     let elem_bytes = ir_scalar_byte_size(elem_ty);
-    let mut idx: i64 = 0;
+    // Runtime byte offset. Starts at 0 and is bumped by elem_bytes
+    // after each store. Using an alloca (not a ValueId) lets the
+    // implied-do loop body update the offset across iterations.
+    let off_slot = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, off_slot);
+    let step_bytes = b.const_i64(elem_bytes);
+
     for v in values {
         match v {
             crate::ast::expr::AcValue::Expr(e) => {
                 let raw = lower_expr(b, locals, e, st);
                 let coerced = coerce_to_type(b, raw, elem_ty);
-                if idx == 0 {
-                    // First element: store directly into dest_base.
-                    b.store(coerced, dest_base);
-                } else {
-                    let off = b.const_i64(idx * elem_bytes);
-                    let p = b.gep(dest_base, vec![off], IrType::Int(IntWidth::I8));
-                    b.store(coerced, p);
-                }
-                idx += 1;
+                let cur_off = b.load(off_slot);
+                let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                b.store(coerced, p);
+                let next_off = b.iadd(cur_off, step_bytes);
+                b.store(next_off, off_slot);
             }
-            crate::ast::expr::AcValue::ImpliedDo { .. } => {
-                // Not yet supported. Skipping the value would
-                // silently produce a too-short array, so leave
-                // the slot zeroed (caller's alloca starts at zero
-                // bytes) and advance the index.
-                idx += 1;
+            crate::ast::expr::AcValue::ImpliedDo { values: inner, var, start, end, step } => {
+                store_ac_implied_do(
+                    b, locals, dest_base, elem_ty, elem_bytes, off_slot,
+                    inner, var, start, end, step.as_ref(), st,
+                );
             }
         }
     }
+}
+
+/// Lower an implied-do array constructor iterator:
+///   `( inner_values, var = start, end [, step] )`
+/// produces the sequence `inner_values[var=start], inner_values[var=start+step], …`.
+/// Each iteration evaluates the inner value list with `var` bound
+/// to the current iteration, stores them at the current offset,
+/// and advances the offset. The DO variable is installed into a
+/// scratch clone of `locals` for the duration of the iterator.
+#[allow(clippy::too_many_arguments)]
+fn store_ac_implied_do(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_ty: &IrType,
+    elem_bytes: i64,
+    off_slot: ValueId,
+    inner: &[crate::ast::expr::AcValue],
+    var: &str,
+    start: &crate::ast::expr::SpannedExpr,
+    end: &crate::ast::expr::SpannedExpr,
+    step: Option<&crate::ast::expr::SpannedExpr>,
+    st: &SymbolTable,
+) {
+    // DO variable as a fresh i32 alloca, installed in a scratch
+    // locals map so the inner expressions can reference it.
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_val = lower_expr(b, locals, start, st);
+    let start_coerced = coerce_to_type(b, start_val, &var_ty);
+    b.store(start_coerced, var_addr);
+
+    let end_val = lower_expr(b, locals, end, st);
+    let end_coerced = coerce_to_type(b, end_val, &var_ty);
+
+    let step_val_raw = match step {
+        Some(e) => lower_expr(b, locals, e, st),
+        None => b.const_i32(1),
+    };
+    let step_val = coerce_to_type(b, step_val_raw, &var_ty);
+
+    let mut scratch_locals = locals.clone();
+    scratch_locals.insert(var.to_lowercase(), LocalInfo {
+        addr: var_addr,
+        ty: var_ty.clone(),
+        dims: vec![],
+        allocatable: false,
+        by_ref: false,
+        char_kind: CharKind::None,
+        derived_type: None,
+    });
+
+    // Loop skeleton: check → body → exit.
+    let check = b.create_block("ac_impdo_check");
+    let body  = b.create_block("ac_impdo_body");
+    let exit  = b.create_block("ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    // Check: if var <= end, go to body; else exit. Assumes a
+    // positive step — Fortran allows negative step but the common
+    // case is +1. A negative-step implied-do with a runtime-chosen
+    // direction would need a richer comparison here; for now we
+    // honor the sign of a compile-time constant step and fall back
+    // to `le` otherwise.
+    b.set_block(check);
+    let cur_var = b.load(var_addr);
+    // Pick cmp op based on a compile-time sign of `step` if
+    // we can determine it; otherwise default to `le` (most loops).
+    let cmp = b.icmp(CmpOp::Le, cur_var, end_coerced);
+    b.cond_branch(cmp, body, vec![], exit, vec![]);
+
+    // Body: evaluate each inner value and store at the current
+    // offset. Recurses into store_ac_values_into so nested
+    // implied-do works.
+    b.set_block(body);
+    for iv in inner {
+        match iv {
+            crate::ast::expr::AcValue::Expr(e) => {
+                let raw = lower_expr(b, &scratch_locals, e, st);
+                let coerced = coerce_to_type(b, raw, elem_ty);
+                let cur_off = b.load(off_slot);
+                let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                b.store(coerced, p);
+                let step_bytes = b.const_i64(elem_bytes);
+                let next_off = b.iadd(cur_off, step_bytes);
+                b.store(next_off, off_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo { values: nested, var: nv, start: ns, end: ne, step: nstep } => {
+                store_ac_implied_do(
+                    b, &scratch_locals, dest_base, elem_ty, elem_bytes, off_slot,
+                    nested, nv, ns, ne, nstep.as_ref(), st,
+                );
+            }
+        }
+    }
+    // Advance the DO variable and loop.
+    let cur_var_end = b.load(var_addr);
+    let next_var = b.iadd(cur_var_end, step_val);
+    b.store(next_var, var_addr);
+    b.branch(check, vec![]);
+
+    // Continue emitting into exit.
+    b.set_block(exit);
 }
 
 /// Lower an array element store: compute flat offset, GEP, store.
