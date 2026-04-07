@@ -63,7 +63,9 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(D)** Submodule resolution missing. fortsh has zero submodules.
 - **(B)** Named interface registration → Sprint 28 (Derived Types & OOP).
 - **(C)** Standalone PARAMETER/COMMON/AttributeStmt processing missing.
-- **(C)** Ambiguous USE detection missing.
+- **(C)** Ambiguous USE detection missing. `bencch` Sprint 7 graph suites now show `use collision_left_values, only: payload` together with `use collision_right_values, only: payload` compiling successfully in the same program instead of being rejected as ambiguous.
+- **(B)** Module default/private access is not enforced in authored `USE` graphs → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use visible_values, only: hidden` compiling successfully even when the module declares `private` default access and only marks `shown` as public.
+- **(B)** Renamed re-export graphs still leak the original name at import sites → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use bridge_aliases, only: payload` compiling successfully even though the intermediate module only imports the upstream entity as `lifted`, and the same leak appears in mixed `ONLY` graphs where a renamed import (`kept`) is still reachable later as `alpha`.
 - **(C)** Default access not applied to CONTAINS subprograms.
 
 ## Semantic Analysis — Type System (Sprint 13)
@@ -91,14 +93,6 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 - **(D)** No I128 for integer(16). Exotic.
 - **(D)** `value_type()` is O(n) linear scan. Performance only.
-- **(D)** Verifier does not check operand-width == result-type width on
-  binary integer ops (IAdd/ISub/IMul/IDiv/IMod/ICmp/BitAnd/...). Audit
-  pass 5, finding F2. Today's lowering never produces mismatches, but
-  every optimizer pass (const_fold, const_prop, cse, strength_reduce)
-  now embeds an implicit "operand source width wins" policy that only
-  holds because the mismatch never arises. Tighten the verifier to
-  enforce width-equality before mem2reg lands a new pass that could
-  plausibly produce mixed-width binops.
 
 ## IR — Complex Lowering (Sprint 16)
 
@@ -108,7 +102,8 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **[FIXED]** ~~Runtime-variable negative DO step~~ → Sprint 21.5 (runtime sign check)
 - **[FIXED]** ~~ASSOCIATE leaks bindings into outer scope~~ → Sprint 21.5
 - **[FIXED]** ~~Integer literal truncation~~ → Sprint 21.5 (kind-aware emission)
-- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System).
+- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System). `bencch` Sprint 7 multi-file graph suites now show this directly on executable module/use cases too: imported module values in authored graphs like `module_chain`, `rename_only`, `visibility`, `fanin`, `reexport_chain`, `diamond_merge`, `mixed_only`, `collision_shadow`, and `layered_leaves` lower to zero-initialized globals in IR and print `0` at runtime instead of the expected imported values, including multi-hop, shared-dependency, mixed-import, and larger layered multi-leaf graphs.
+- **(B)** Module procedures in authored graphs are called but not lowered/emitted → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show IR calls like `call @add_one(...)` without a matching `func @add_one`, backend artifacts that branch to `_add_one` without ever emitting it, and final link failures from the missing symbol.
 - **(B)** No derived type lowering → Sprint 28 (Derived Types & OOP).
 - **(B)** DoConcurrent silently dropped → fortsh doesn't use (D). PointerAssignment → Sprint 28. Read/I/O → Sprint 24-25.
 
@@ -117,6 +112,8 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(B)** Stack-passed arguments (>8 args): silently dropped. Rare for Fortran scalars.
 - **(B)** Register hint population: infrastructure present, not wired to isel.
 - **(C)** Callee-saved frame growth ordering undocumented (works by late-binding sentinel).
+- **(C)** Non-deterministic backend/codegen output across identical builds: repeated `-S`, repeated `-c`, repeated `armfortas::testing` `asm` capture, and repeated `armfortas::testing` `obj` capture on the same source and opt level can all emit different register choices and text bytes. `bencch` consistency suites also show repeated capture-vs-CLI mismatches for both `asm` and `obj`; on the current backend fixtures the capture path often stays `0/3` aligned with repeated CLI rebuilds across the sampled matrix. `-S | as` vs `-c` mismatches remain text-only, and relocations/load commands/symbols stay stable while text changes. Runtime consistency coverage in `bencch` is green on bench-owned backend fixtures and across an expanding real-program corpus covering numerics, arrays/control flow, derived types, fixed and deferred strings, repeated string reassignment, file I/O, `rewind`, flush-heavy I/O, and `bind(c)` interop, so the observed nondeterminism is currently below the sampled runtime-behavior surface rather than showing up as output or exit-code drift there. Blocks reproducible builds and “binary is exactly what we expect” confidence.
+- **(C)** `SELECT TYPE` runtime consistency is currently volatile even when observable output is supposed to be simple and deterministic. In `bencch`, repeated full CLI builds, captured `run` behavior, and capture-vs-CLI comparisons for `test_programs/select_type.f90` can disagree across `O0` through `Ofast`, with observed variants including missing `CLASS IS` output, alternate first lines, empty output, and occasional nonzero CLI exits during repeat-based sampling. The current standalone test source is also rejected by `gfortran` because the selector is not polymorphic, so this is armfortas-local consistency coverage rather than a clean differential case today. Blocks high-confidence runtime-level assertions for this source until SELECT TYPE lowering/codegen/runtime interaction is stabilized.
 - **(C)** Register width mismatch in array index GEP: `mul x24, w23, x26` mixes 32-bit and 64-bit registers. The GEP index needs width promotion before multiplication. Surfaces when passing arrays to subroutines with assumed-shape/assumed-rank args.
 - **(C)** Array intrinsic return type width: SIZE/SUM return i64 but assigning to integer(4) variable stores 8 bytes into 4-byte slot. Needs truncation at assignment site when intrinsic result is wider than target. Direct printing via PRINT works correctly.
 

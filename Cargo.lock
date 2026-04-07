@@ -7,6 +7,14 @@ name = "afs-as"
 version = "0.1.0"
 
 [[package]]
+name = "afs-tests"
+version = "0.1.0"
+dependencies = [
+ "armfortas",
+ "bencch-core",
+]
+
+[[package]]
 name = "armfortas"
 version = "0.1.0"
 dependencies = [
@@ -15,4 +23,8 @@ dependencies = [
 
 [[package]]
 name = "armfortas-rt"
+version = "0.1.0"
+
+[[package]]
+name = "bencch-core"
 version = "0.1.0"

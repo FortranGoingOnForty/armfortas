@@ -1,3 +1,7 @@
 [submodule "afs-as"]
 	path = afs-as
 	url = git@github.com:FortranGoingOnForty/afs-as.git
+[submodule "bencch"]
+	path = bencch
+	url = https://github.com/tenseleyFlow/bencch.git
+	branch = trunk

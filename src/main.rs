@@ -1,19 +1,7 @@
-// Modules under active development — suppress dead_code warnings until wired up.
-#![allow(dead_code)]
-
 use std::env;
 use std::process;
 
-mod preprocess;
-mod lexer;
-mod parser;
-mod ast;
-mod sema;
-mod ir;
-mod opt;
-mod codegen;
-mod driver;
-mod runtime;
+use armfortas::driver;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -27,6 +15,8 @@ fn main() {
         eprintln!("  -c           compile to object file");
         eprintln!("  -E           preprocess only");
         eprintln!("  --emit-ir    emit IR");
+        eprintln!("  -O0..-O3     optimization level");
+        eprintln!("  -Ofast       maximum optimization");
         process::exit(1);
     }
 
