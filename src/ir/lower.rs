@@ -368,6 +368,21 @@ fn alloc_decls(
     func_name: &str,
 ) {
     use crate::ast::decl::Attribute;
+
+    // Pre-scan standalone PARAMETER statements so a TypeDecl entity
+    // whose value comes from a separate `parameter (name = expr)`
+    // statement still triggers SAVE-promotion at alloc time. Without
+    // this pre-scan, the standalone form would silently fall back to
+    // the alloca + per-call store path.
+    let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    for d in decls {
+        if let Decl::ParameterStmt { pairs } = &d.node {
+            for (name, expr) in pairs {
+                parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+    }
+
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let elem_ty = lower_type_spec(type_spec);
@@ -499,10 +514,13 @@ fn alloc_decls(
                     // global instead of a stack alloca — per
                     // F2018 §8.5.16, locals with initializers in
                     // subprograms have implicit SAVE attribute and
-                    // must persist across calls.
-                    if let Some(init) = entity.init.as_ref()
-                        .and_then(eval_const_global_init)
-                    {
+                    // must persist across calls. The initializer
+                    // may come from either `entity.init` (the =expr
+                    // form) or a standalone `PARAMETER (x = expr)`
+                    // statement elsewhere in the same decl list.
+                    let init_expr: Option<&crate::ast::expr::SpannedExpr> =
+                        entity.init.as_ref().or_else(|| parameter_inits.get(&key).copied());
+                    if let Some(init) = init_expr.and_then(eval_const_global_init) {
                         let global_name = save_global_name(func_name, &key);
                         pending_globals.push(PendingGlobal {
                             global: Global {
@@ -608,6 +626,13 @@ fn init_decls(
                         || !matches!(info.char_kind, CharKind::None)
                         || info.derived_type.is_some()
                     {
+                        continue;
+                    }
+                    // SAVE-promoted locals are backed by a module
+                    // global; the initial value is already baked
+                    // into .data at link time, so skip the runtime
+                    // store. Audit MAJOR-1 interaction.
+                    if is_global_addr(b, info.addr) {
                         continue;
                     }
                     let val = lower_expr(b, locals, expr, st);

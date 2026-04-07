@@ -385,6 +385,27 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // Standalone declaration statements that introduce no
+            // new type. Audit MAJOR-2: prior to this dispatch the
+            // PARAMETER/COMMON/DATA parsers existed but were never
+            // called, so `parameter (x = 42)` at statement-start was
+            // silently dropped and the program ran with x=0.
+            if text == "parameter" {
+                self.advance(); // consume 'parameter'
+                decls.push(self.parse_parameter_stmt()?);
+                continue;
+            }
+            if text == "common" {
+                self.advance(); // consume 'common'
+                decls.push(self.parse_common_block()?);
+                continue;
+            }
+            if text == "data" {
+                self.advance(); // consume 'data'
+                decls.push(self.parse_data_stmt()?);
+                continue;
+            }
+
             // Try as executable statement.
             body.push(self.parse_stmt()?);
         }
