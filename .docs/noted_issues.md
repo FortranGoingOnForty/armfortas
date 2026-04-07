@@ -64,6 +64,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(B)** Named interface registration → Sprint 28 (Derived Types & OOP).
 - **(C)** Standalone PARAMETER/COMMON/AttributeStmt processing missing.
 - **(C)** Ambiguous USE detection missing.
+- **(B)** Module default/private access is not enforced in authored `USE` graphs → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use visible_values, only: hidden` compiling successfully even when the module declares `private` default access and only marks `shown` as public.
 - **(C)** Default access not applied to CONTAINS subprograms.
 
 ## Semantic Analysis — Type System (Sprint 13)
