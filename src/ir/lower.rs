@@ -13,7 +13,7 @@ use super::inst::*;
 use super::builder::FuncBuilder;
 
 use crate::ast::decl::ArraySpec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
@@ -174,7 +174,7 @@ fn collect_module_globals(
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
             for entity in entities {
-                let symbol = format!("__mod_{}_{}",
+                let symbol = format!("afs_mod_{}_{}",
                     mod_name.to_lowercase(),
                     entity.name.to_lowercase());
 
@@ -457,28 +457,100 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
 }
 
 /// Try to evaluate a scalar initializer expression at compile time
-/// to a `GlobalInit`. Used by SAVE-promotion in `alloc_decls`. The
-/// helper handles the literal forms a Fortran `parameter` or
-/// initializer typically uses; complex constexpr arithmetic falls
-/// through to `None` and the caller should fall back to a stack
-/// alloca + runtime store (which silently breaks SAVE — track as
-/// future work).
+/// to a `GlobalInit`. Used by SAVE-promotion in `alloc_decls`.
+///
+/// Handles literals, unary minus, parenthesization, and binary
+/// arithmetic (`+`, `-`, `*`, `/`, `**`) on any combination of
+/// integer and real operands. Mixed int/real promotes to real per
+/// Fortran's usual arithmetic rules. Anything that can't be
+/// folded (variable references, function calls, derived types,
+/// strings) returns `None` and the caller falls back to
+/// alloca+runtime-store. That fallback DOES break SAVE semantics
+/// — any new non-foldable case is a silent off-spec wrong-result,
+/// so the folder should cover as much as possible.
 fn eval_const_global_init(e: &crate::ast::expr::SpannedExpr) -> Option<GlobalInit> {
-    use crate::ast::expr::UnaryOp;
+    eval_const_scalar(e).map(|v| match v {
+        ConstScalar::Int(i) => GlobalInit::Int(i),
+        ConstScalar::Float(f) => GlobalInit::Float(f),
+    })
+}
+
+/// Internal const-folding result for initializer expressions.
+/// Int is used for integer kinds AND logical (0/1). Float is
+/// used for real/double precision.
+#[derive(Debug, Clone, Copy)]
+enum ConstScalar {
+    Int(i64),
+    Float(f64),
+}
+
+impl ConstScalar {
+    fn to_float(self) -> f64 {
+        match self { ConstScalar::Int(i) => i as f64, ConstScalar::Float(f) => f }
+    }
+}
+
+fn eval_const_scalar(e: &crate::ast::expr::SpannedExpr) -> Option<ConstScalar> {
+    use crate::ast::expr::{UnaryOp, BinaryOp};
     match &e.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(GlobalInit::Int),
+        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(ConstScalar::Int),
         Expr::RealLiteral { text, .. } => {
-            text.replace('d', "e").replace('D', "E").parse::<f64>().ok().map(GlobalInit::Float)
+            text.replace('d', "e").replace('D', "E").parse::<f64>().ok().map(ConstScalar::Float)
         }
-        Expr::LogicalLiteral { value, .. } => Some(GlobalInit::Int(if *value { 1 } else { 0 })),
-        Expr::UnaryOp { op: UnaryOp::Minus, operand } => {
-            match eval_const_global_init(operand)? {
-                GlobalInit::Int(v) => Some(GlobalInit::Int(-v)),
-                GlobalInit::Float(v) => Some(GlobalInit::Float(-v)),
+        Expr::LogicalLiteral { value, .. } => {
+            Some(ConstScalar::Int(if *value { 1 } else { 0 }))
+        }
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_const_scalar(operand)?;
+            match op {
+                UnaryOp::Minus => Some(match v {
+                    ConstScalar::Int(i) => ConstScalar::Int(-i),
+                    ConstScalar::Float(f) => ConstScalar::Float(-f),
+                }),
+                UnaryOp::Plus => Some(v),
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_global_init(inner),
+        Expr::BinaryOp { op, left, right } => {
+            let lv = eval_const_scalar(left)?;
+            let rv = eval_const_scalar(right)?;
+            // Promote to float when either operand is float.
+            let any_float = matches!(lv, ConstScalar::Float(_))
+                || matches!(rv, ConstScalar::Float(_));
+            if any_float {
+                let l = lv.to_float();
+                let r = rv.to_float();
+                match op {
+                    BinaryOp::Add => Some(ConstScalar::Float(l + r)),
+                    BinaryOp::Sub => Some(ConstScalar::Float(l - r)),
+                    BinaryOp::Mul => Some(ConstScalar::Float(l * r)),
+                    BinaryOp::Div => {
+                        if r == 0.0 { None } else { Some(ConstScalar::Float(l / r)) }
+                    }
+                    BinaryOp::Pow => Some(ConstScalar::Float(l.powf(r))),
+                    _ => None,
+                }
+            } else {
+                let (ConstScalar::Int(l), ConstScalar::Int(r)) = (lv, rv) else { return None };
+                match op {
+                    BinaryOp::Add => Some(ConstScalar::Int(l.wrapping_add(r))),
+                    BinaryOp::Sub => Some(ConstScalar::Int(l.wrapping_sub(r))),
+                    BinaryOp::Mul => Some(ConstScalar::Int(l.wrapping_mul(r))),
+                    BinaryOp::Div => {
+                        if r == 0 { None } else { Some(ConstScalar::Int(l / r)) }
+                    }
+                    BinaryOp::Pow => {
+                        // Integer power with non-negative exponent.
+                        if r < 0 || r > i32::MAX as i64 { return None; }
+                        let mut acc: i64 = 1;
+                        for _ in 0..r { acc = acc.wrapping_mul(l); }
+                        Some(ConstScalar::Int(acc))
+                    }
+                    _ => None,
+                }
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_scalar(inner),
         _ => None,
     }
 }
@@ -491,22 +563,29 @@ struct PendingGlobal {
 }
 
 /// Synthesize a unique global symbol name for a SAVE'd local.
+/// Audit Min-2: previously used `__save_` but the leading double
+/// underscore is reserved for implementation symbols by Mach-O
+/// (and by POSIX). Switched to `afs_save_` which makes the
+/// provenance obvious and avoids the reserved-prefix footgun.
 fn save_global_name(func_name: &str, local_name: &str) -> String {
-    format!("__save_{}_{}", func_name.to_lowercase(), local_name.to_lowercase())
+    format!("afs_save_{}_{}", func_name.to_lowercase(), local_name.to_lowercase())
 }
 
-/// Inspect a value's defining instruction to see if it's a
+/// Collect the set of ValueIds whose defining instruction is a
 /// `GlobalAddr`. Used by `init_decls` to skip re-initializing
-/// SAVE-promoted locals on every function call.
-fn is_global_addr(b: &FuncBuilder, val: ValueId) -> bool {
+/// SAVE-promoted locals on every function call. One pre-pass over
+/// the function beats the O(N²) per-local scan the original
+/// implementation did (Audit Maj-3).
+fn collect_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
+    let mut set = HashSet::new();
     for block in &b.func().blocks {
         for inst in &block.insts {
-            if inst.id == val {
-                return matches!(inst.kind, InstKind::GlobalAddr(_));
+            if matches!(inst.kind, InstKind::GlobalAddr(_)) {
+                set.insert(inst.id);
             }
         }
     }
-    false
+    set
 }
 
 /// Install module-level globals as `LocalInfo` entries in the
@@ -758,6 +837,9 @@ fn init_decls(
     decls: &[crate::ast::decl::SpannedDecl],
     st: &SymbolTable,
 ) {
+    // Pre-collect the set of GlobalAddr-defining ValueIds so the
+    // inner skip check is O(1). Audit Maj-3.
+    let global_addr_ids = collect_global_addr_values(b);
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl { entities, .. } => {
@@ -808,7 +890,7 @@ fn init_decls(
                     // global already initialized at link time. Don't
                     // re-store on every call — that would defeat
                     // the SAVE semantics (audit MAJOR-1).
-                    if is_global_addr(b, info.addr) {
+                    if global_addr_ids.contains(&info.addr) {
                         continue;
                     }
                     let val = lower_expr(b, locals, init_expr, st);
@@ -832,7 +914,7 @@ fn init_decls(
                     // global; the initial value is already baked
                     // into .data at link time, so skip the runtime
                     // store. Audit MAJOR-1 interaction.
-                    if is_global_addr(b, info.addr) {
+                    if global_addr_ids.contains(&info.addr) {
                         continue;
                     }
                     let val = lower_expr(b, locals, expr, st);

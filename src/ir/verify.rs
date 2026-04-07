@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use super::inst::*;
+use super::types::{IrType, IntWidth};
 use super::walk::{inst_uses, terminator_uses, terminator_targets, compute_dominators};
 
 /// Verification error.
@@ -375,11 +376,34 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::Store(_, addr) => {
-            if let Some(ty) = func.value_type(*addr) {
+        InstKind::Store(val, addr) => {
+            let addr_ty = func.value_type(*addr);
+            if let Some(ty) = &addr_ty {
                 if !ty.is_ptr() {
                     errors.push(VerifyError {
                         msg: format!("store %{} to non-pointer %{} : {}", inst.id.0, addr.0, ty),
+                    });
+                }
+            }
+            // Audit Maj-2: enforce value/pointee type agreement.
+            // A Store(i64_val, ptr<i32>) would silently truncate
+            // at codegen because isel picks the str width from
+            // the value's reg class, not the pointer's pointee.
+            if let (Some(IrType::Ptr(pointee)), Some(vty)) =
+                (&addr_ty, func.value_type(*val))
+            {
+                let inner: &IrType = pointee.as_ref();
+                // Byte-level GEPs into derived-type layouts use
+                // `ptr<i8>` as a marker with arbitrary pointee on
+                // the real access path. Skip the check in that
+                // specific case to avoid spurious errors.
+                let pointee_is_byte = matches!(inner, IrType::Int(IntWidth::I8));
+                if !pointee_is_byte && vty != *inner {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "store %{}: value type {} doesn't match pointee type {}",
+                            inst.id.0, vty, inner,
+                        ),
                     });
                 }
             }
@@ -393,6 +417,49 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
+
+        // Bitwise binary ops: both operands must be integers of
+        // the same width. Audit Med-1.
+        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) | InstKind::BitXor(a, b)
+        | InstKind::Shl(a, b) | InstKind::LShr(a, b) | InstKind::AShr(a, b) => {
+            let ta = func.value_type(*a);
+            let tb = func.value_type(*b);
+            if let (Some(ta), Some(tb)) = (&ta, &tb) {
+                if !ta.is_int() || !tb.is_int() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "bitwise op %{}: operand must be integer ({} / {})",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+                if ta.is_int() && tb.is_int() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "bitwise op %{}: operand width mismatch {} vs {}",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Logical And/Or: both operands must be Bool.
+        InstKind::And(a, b) | InstKind::Or(a, b) => {
+            let ta = func.value_type(*a);
+            let tb = func.value_type(*b);
+            if let (Some(ta), Some(tb)) = (&ta, &tb) {
+                if !matches!(ta, IrType::Bool) || !matches!(tb, IrType::Bool) {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "logical op %{}: operands must be Bool ({} / {})",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
         _ => {} // other instructions checked as needed
     }
 }

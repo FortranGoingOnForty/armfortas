@@ -64,6 +64,21 @@ fn key_of(inst: &Inst) -> Option<Key> {
     };
 
     match &inst.kind {
+        // Pure address-of-global — no operands, pure function of
+        // the symbol name. Two ADRP+ADD pairs to the same global
+        // inside the same block should fold. Audit Med-3.
+        InstKind::GlobalAddr(name) => {
+            // Hash the name into the aux slot. Using a raw index
+            // would be ideal, but the CSE key currently only
+            // supports `Vec<ValueId>` + scalar aux. Encoding the
+            // name as the aux value via a stable hash gets us the
+            // dedupe we want without restructuring Key.
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut h);
+            mk(90, vec![], h.finish() as i64)
+        }
+
         // Constants ------------------------------------------------------
         // Audit Min-4: width is carried by the `ty` field, so the
         // aux can just be the literal value / bit pattern.
@@ -163,8 +178,7 @@ fn key_of(inst: &Inst) -> Option<Key> {
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)
         | InstKind::ConstString(..)
-        | InstKind::Undef(..)
-        | InstKind::GlobalAddr(..) => None,
+        | InstKind::Undef(..) => None,
     }
 }
 
