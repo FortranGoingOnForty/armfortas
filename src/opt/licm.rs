@@ -488,4 +488,115 @@ mod tests {
             .any(|i| matches!(i.kind, InstKind::Load(_)));
         assert!(load_in_header, "Load should not have been hoisted out of the loop");
     }
+
+    /// A stronger hoist test: an IMul whose operands are both
+    /// defined in the entry block (so the multiply itself is loop
+    /// invariant). This exercises the operand-dependency walk in
+    /// LICM, not just the trivial "constant in header" case.
+    #[test]
+    fn hoists_invariant_imul_with_operands_from_entry() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+        // Entry: build two const operands a=3, b=4 and an init value 0.
+        let a = f.next_value_id();
+        let bv = f.next_value_id();
+        let init = f.next_value_id();
+        let entry = f.entry;
+        f.block_mut(entry).insts.push(Inst {
+            id: a, kind: InstKind::ConstInt(3, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(entry).insts.push(Inst {
+            id: bv, kind: InstKind::ConstInt(4, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(entry).insts.push(Inst {
+            id: init, kind: InstKind::ConstInt(0, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+
+        // Header: i_param, then `prod = a * b` (invariant), then
+        // `tmp = i_param + prod` (loop-dependent), then a < 10 cmp.
+        let header = f.create_block("header");
+        let i_param = f.next_value_id();
+        f.block_mut(header).params.push(BlockParam {
+            id: i_param, ty: IrType::Int(IntWidth::I32),
+        });
+        let prod = f.next_value_id();
+        let tmp = f.next_value_id();
+        let limit = f.next_value_id();
+        let done = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: prod, kind: InstKind::IMul(a, bv),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(header).insts.push(Inst {
+            id: tmp, kind: InstKind::IAdd(i_param, prod),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(header).insts.push(Inst {
+            id: limit, kind: InstKind::ConstInt(10, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(header).insts.push(Inst {
+            id: done, kind: InstKind::ICmp(CmpOp::Ge, i_param, limit),
+            ty: IrType::Bool, span: dummy_span(),
+        });
+
+        // Latch: increment i and loop back.
+        let latch = f.create_block("latch");
+        let i_in = f.next_value_id();
+        f.block_mut(latch).params.push(BlockParam {
+            id: i_in, ty: IrType::Int(IntWidth::I32),
+        });
+        let one = f.next_value_id();
+        let next = f.next_value_id();
+        f.block_mut(latch).insts.push(Inst {
+            id: one, kind: InstKind::ConstInt(1, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(latch).insts.push(Inst {
+            id: next, kind: InstKind::IAdd(i_in, one),
+            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![next]));
+
+        let exit = f.create_block("exit");
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![init]));
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: done,
+            true_dest: exit, true_args: vec![],
+            false_dest: latch, false_args: vec![i_param],
+        });
+
+        m.add_function(f);
+
+        assert!(Licm.run(&mut m), "LICM should report it changed something");
+        let f = &m.functions[0];
+
+        // The IMul must have moved out of the header into the entry
+        // (the natural preheader).
+        let header_block = f.block(header);
+        let imul_in_header = header_block.insts.iter()
+            .any(|i| matches!(i.kind, InstKind::IMul(..)));
+        assert!(!imul_in_header,
+            "invariant IMul should be hoisted out of the header: {:?}",
+            header_block.insts);
+
+        let entry_block = f.block(f.entry);
+        let imul_in_entry = entry_block.insts.iter()
+            .any(|i| matches!(i.kind, InstKind::IMul(..)));
+        assert!(imul_in_entry,
+            "invariant IMul should land in entry/preheader after hoist: {:?}",
+            entry_block.insts);
+
+        // The loop-dependent IAdd must NOT have moved.
+        let iadd_in_header = header_block.insts.iter()
+            .any(|i| matches!(i.kind, InstKind::IAdd(_, _)));
+        assert!(iadd_in_header,
+            "loop-dependent IAdd(i_param, prod) should still be in the header");
+    }
 }

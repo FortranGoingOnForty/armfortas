@@ -789,7 +789,6 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::ast::decl::*;
 
     fn parse_decl(src: &str) -> SpannedDecl {
         let tokens = Lexer::tokenize(src, 0).unwrap();
