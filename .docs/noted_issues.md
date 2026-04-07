@@ -63,9 +63,9 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(D)** Submodule resolution missing. fortsh has zero submodules.
 - **(B)** Named interface registration → Sprint 28 (Derived Types & OOP).
 - **(C)** Standalone PARAMETER/COMMON/AttributeStmt processing missing.
-- **(C)** Ambiguous USE detection missing.
+- **(C)** Ambiguous USE detection missing. `bencch` Sprint 7 graph suites now show `use collision_left_values, only: payload` together with `use collision_right_values, only: payload` compiling successfully in the same program instead of being rejected as ambiguous.
 - **(B)** Module default/private access is not enforced in authored `USE` graphs → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use visible_values, only: hidden` compiling successfully even when the module declares `private` default access and only marks `shown` as public.
-- **(B)** Renamed re-export graphs still leak the original name at import sites → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use bridge_aliases, only: payload` compiling successfully even though the intermediate module only imports the upstream entity as `lifted`.
+- **(B)** Renamed re-export graphs still leak the original name at import sites → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use bridge_aliases, only: payload` compiling successfully even though the intermediate module only imports the upstream entity as `lifted`, and the same leak appears in mixed `ONLY` graphs where a renamed import (`kept`) is still reachable later as `alpha`.
 - **(C)** Default access not applied to CONTAINS subprograms.
 
 ## Semantic Analysis — Type System (Sprint 13)
@@ -102,7 +102,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **[FIXED]** ~~Runtime-variable negative DO step~~ → Sprint 21.5 (runtime sign check)
 - **[FIXED]** ~~ASSOCIATE leaks bindings into outer scope~~ → Sprint 21.5
 - **[FIXED]** ~~Integer literal truncation~~ → Sprint 21.5 (kind-aware emission)
-- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System). `bencch` Sprint 7 multi-file graph suites now show this directly on executable module/use cases too: imported module values in authored graphs like `module_chain`, `rename_only`, `visibility`, `fanin`, `reexport_chain`, and `diamond_merge` lower to zero-initialized globals in IR and print `0` at runtime instead of the expected imported values, including multi-hop and shared-dependency graphs.
+- **(B)** Module globals never referenced at use-site → Sprint 30 (Module System). `bencch` Sprint 7 multi-file graph suites now show this directly on executable module/use cases too: imported module values in authored graphs like `module_chain`, `rename_only`, `visibility`, `fanin`, `reexport_chain`, `diamond_merge`, `mixed_only`, and `collision_shadow` lower to zero-initialized globals in IR and print `0` at runtime instead of the expected imported values, including multi-hop, shared-dependency, and mixed-import graphs.
 - **(B)** Module procedures in authored graphs are called but not lowered/emitted → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show IR calls like `call @add_one(...)` without a matching `func @add_one`, backend artifacts that branch to `_add_one` without ever emitting it, and final link failures from the missing symbol.
 - **(B)** No derived type lowering → Sprint 28 (Derived Types & OOP).
 - **(B)** DoConcurrent silently dropped → fortsh doesn't use (D). PointerAssignment → Sprint 28. Read/I/O → Sprint 24-25.
