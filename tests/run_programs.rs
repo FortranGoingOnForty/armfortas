@@ -252,6 +252,29 @@ fn test_programs_end_to_end_ofast() {
 /// tie-breaking) caused this to flake during the mem2reg work; the
 /// test pins the invariant going forward so any future regression
 /// trips immediately instead of intermittently.
+fn compile_to_asm(compiler: &Path, source: &Path, opt: &str) -> Vec<u8> {
+    let asm_path = std::env::temp_dir().join(format!(
+        "afs_det_{}_{}_{}.s",
+        std::process::id(),
+        source.file_stem().unwrap().to_str().unwrap(),
+        opt.trim_start_matches('-'),
+    ));
+    let status = Command::new(compiler)
+        .args([
+            source.to_str().unwrap(),
+            opt,
+            "-S",
+            "-o",
+            asm_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compiler launch failed");
+    assert!(status.success(), "-S compile failed");
+    let bytes = fs::read(&asm_path).expect("cannot read emitted .s");
+    let _ = fs::remove_file(&asm_path);
+    bytes
+}
+
 #[test]
 fn codegen_is_deterministic_at_o2() {
     let compiler = find_compiler();
@@ -259,33 +282,38 @@ fn codegen_is_deterministic_at_o2() {
     let source = test_dir.join("two_loops.f90");
     assert!(source.exists(), "two_loops.f90 missing — needed for determinism check");
 
-    fn compile_to_asm(compiler: &Path, source: &Path) -> Vec<u8> {
-        let asm_path = std::env::temp_dir().join(format!(
-            "afs_det_{}.s",
-            std::process::id(),
-        ));
-        let status = Command::new(compiler)
-            .args([
-                source.to_str().unwrap(),
-                "-O2",
-                "-S",
-                "-o",
-                asm_path.to_str().unwrap(),
-            ])
-            .status()
-            .expect("compiler launch failed");
-        assert!(status.success(), "-S compile failed");
-        let bytes = fs::read(&asm_path).expect("cannot read emitted .s");
-        let _ = fs::remove_file(&asm_path);
-        bytes
-    }
-
-    let first = compile_to_asm(&compiler, &source);
-    let second = compile_to_asm(&compiler, &source);
+    let first = compile_to_asm(&compiler, &source, "-O2");
+    let second = compile_to_asm(&compiler, &source, "-O2");
     assert_eq!(
         first, second,
         "two compilations of the same source produced different assembly — \
          determinism regression. This usually means a HashMap iteration \
          order leak in codegen."
     );
+}
+
+/// Determinism regression for programs that import module globals.
+/// Audit B-3: `install_globals_as_locals` iterated a HashMap, so
+/// the emitted `global_addr` instructions landed in non-deterministic
+/// positions — liveness and regalloc then produced different .s
+/// output. This test pins the fix for every opt level that runs a
+/// register allocator.
+#[test]
+fn codegen_is_deterministic_with_module_globals() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("module_init.f90");
+    assert!(source.exists(), "module_init.f90 missing — needed for determinism check");
+
+    for opt in ["-O0", "-O1", "-O2", "-O3"] {
+        let first = compile_to_asm(&compiler, &source, opt);
+        let second = compile_to_asm(&compiler, &source, opt);
+        assert_eq!(
+            first, second,
+            "two compilations of module_init.f90 produced different assembly at {} — \
+             this usually means install_globals_as_locals is iterating a HashMap \
+             in non-deterministic order.",
+            opt,
+        );
+    }
 }

@@ -418,7 +418,16 @@ fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<String, (String, IrType)>,
 ) {
-    for (name, (symbol, ty)) in globals {
+    // Audit B-3: iterate globals in sorted key order so the emitted
+    // `global_addr` instructions land in deterministic positions.
+    // HashMap iteration is order-randomized per-process, which
+    // percolates through liveness and register allocation and
+    // produces different .s output across compilations of the same
+    // source. One-line fix; the determinism regression test is
+    // extended to cover this case (see tests/run_programs.rs).
+    let mut sorted: Vec<(&String, &(String, IrType))> = globals.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, (symbol, ty)) in sorted {
         if locals.contains_key(name) { continue; }
         let addr = b.global_addr(symbol, ty.clone());
         locals.insert(name.clone(), LocalInfo {
