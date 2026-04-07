@@ -42,13 +42,32 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
-    // 2. Entry block has no predecessors (no branch targets it as a phi/param source).
-    //    More precisely: entry block should have no block parameters.
-    let entry = func.block(func.entry);
-    if !entry.params.is_empty() {
+    // 2. Entry block has no predecessors. The block params on entry
+    //    represent function parameters and are reserved for the
+    //    function ABI; nothing inside the function body should be
+    //    able to branch back to entry. The check splits into:
+    //      a) entry has no block params, AND
+    //      b) no other block's terminator targets entry.
+    //    Both halves must hold for SSA construction to be sound —
+    //    a back-edge into entry would let cross-block phi flow
+    //    overwrite the function's incoming params.
+    let entry_block = func.block(func.entry);
+    if !entry_block.params.is_empty() {
         errors.push(VerifyError {
             msg: "entry block must not have block parameters".into(),
         });
+    }
+    for block in &func.blocks {
+        let Some(term) = &block.terminator else { continue; };
+        if terminator_targets(term).contains(&func.entry) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "block '{}' branches back into the entry block — \
+                     entry must have no predecessors",
+                    block.name,
+                ),
+            });
+        }
     }
 
     // 3. All ValueIds used must be defined.
@@ -405,6 +424,20 @@ mod tests {
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("entry block")));
+    }
+
+    #[test]
+    fn back_edge_into_entry_errors() {
+        // entry → body → entry  (illegal back-edge into entry).
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let body = func.create_block("body");
+        func.block_mut(func.entry).terminator = Some(Terminator::Branch(body, vec![]));
+        func.block_mut(body).terminator = Some(Terminator::Branch(func.entry, vec![]));
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("entry block")),
+            "expected entry-back-edge error, got: {:?}", errs,
+        );
     }
 
     #[test]

@@ -231,3 +231,61 @@ fn test_programs_end_to_end_o2() {
         panic!("Test failures at -O2:\n\n{}", msg);
     }
 }
+
+#[test]
+fn test_programs_end_to_end_o3() {
+    if let Err(msg) = run_all_at("-O3") {
+        panic!("Test failures at -O3:\n\n{}", msg);
+    }
+}
+
+#[test]
+fn test_programs_end_to_end_ofast() {
+    if let Err(msg) = run_all_at("-Ofast") {
+        panic!("Test failures at -Ofast:\n\n{}", msg);
+    }
+}
+
+/// Determinism regression: compile a program twice at -O2 and
+/// require byte-identical machine code. Codegen non-determinism
+/// (HashMap iteration order, stale spill-victim entries, sort
+/// tie-breaking) caused this to flake during the mem2reg work; the
+/// test pins the invariant going forward so any future regression
+/// trips immediately instead of intermittently.
+#[test]
+fn codegen_is_deterministic_at_o2() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("two_loops.f90");
+    assert!(source.exists(), "two_loops.f90 missing — needed for determinism check");
+
+    fn compile_to_asm(compiler: &Path, source: &Path) -> Vec<u8> {
+        let asm_path = std::env::temp_dir().join(format!(
+            "afs_det_{}.s",
+            std::process::id(),
+        ));
+        let status = Command::new(compiler)
+            .args([
+                source.to_str().unwrap(),
+                "-O2",
+                "-S",
+                "-o",
+                asm_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("compiler launch failed");
+        assert!(status.success(), "-S compile failed");
+        let bytes = fs::read(&asm_path).expect("cannot read emitted .s");
+        let _ = fs::remove_file(&asm_path);
+        bytes
+    }
+
+    let first = compile_to_asm(&compiler, &source);
+    let second = compile_to_asm(&compiler, &source);
+    assert_eq!(
+        first, second,
+        "two compilations of the same source produced different assembly — \
+         determinism regression. This usually means a HashMap iteration \
+         order leak in codegen."
+    );
+}

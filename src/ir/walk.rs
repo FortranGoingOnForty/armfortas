@@ -428,6 +428,18 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
 /// Returns a map keyed only by reachable non-entry blocks.
 /// Unreachable blocks have an empty dominator set (per
 /// [`compute_dominators`]) and therefore no idom.
+///
+/// **Performance**: this is the naïve O(N³) construction — for each
+/// block we filter its dominator set, then for each candidate scan
+/// every other candidate's dominator set looking for the unique
+/// "smallest". `compute_dominators` itself is O(N²·E) iterative
+/// data-flow on top, so the asymptotic ceiling for the dominator
+/// pipeline is roughly O(N³ + N²·E). That is fine for the
+/// kilo-block functions today's frontend produces, but if we ever
+/// start lowering huge SSA graphs (autovec spillovers, inlining
+/// across modules) the right replacement is Lengauer–Tarjan, which
+/// is O((N+E)·α(N)) in practice. Track separately as an
+/// optimization-tier replacement, not a correctness fix.
 pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId> {
     let doms = compute_dominators(func);
     let mut idoms: HashMap<BlockId, BlockId> = HashMap::new();
