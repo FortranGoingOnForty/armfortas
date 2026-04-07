@@ -3512,6 +3512,13 @@ fn lower_write_items_adv(
         // write helper. Without this, the Ptr<_> the item lowers to
         // would fall into the IrType::Ptr arm below and dispatch to
         // afs_write_string with a bogus length.
+        //
+        // Also handles 1-D array slices `a(lo:hi)` and `a(lo:hi:step)`
+        // by detecting a FunctionCall with a Range subscript on an
+        // array name. Slices bypass the section-descriptor code
+        // path (which crashes in afs_create_section for a bare
+        // write item) and instead lower directly into a bounded
+        // loop over the underlying base.
         if !is_char {
             if let Expr::Name { name } = &item.node {
                 let key = name.to_lowercase();
@@ -3519,6 +3526,21 @@ fn lower_write_items_adv(
                     if !info.dims.is_empty() || info.allocatable {
                         lower_whole_array_write(b, ctx, &info, unit);
                         continue;
+                    }
+                }
+            }
+            if let Expr::FunctionCall { callee, args } = &item.node {
+                if let Expr::Name { name } = &callee.node {
+                    let key = name.to_lowercase();
+                    if let Some(info) = ctx.locals.get(&key).cloned() {
+                        if !info.dims.is_empty() || info.allocatable {
+                            let has_range = args.iter().any(|a|
+                                matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
+                            if has_range && args.len() == 1 {
+                                lower_1d_slice_write(b, ctx, &info, &args[0], unit);
+                                continue;
+                            }
+                        }
                     }
                 }
             }
@@ -3602,6 +3624,91 @@ fn lower_fmt_push(
             }
         }
     }
+}
+
+/// Lower a 1-D slice write item: `print *, a(lo:hi[:step])`.
+/// Iterates the declared range and calls the per-element write
+/// helper. Sections with a rank > 1 and non-lower-dim subscripts
+/// are not yet supported and fall through to the existing
+/// section-descriptor path, which may not format nicely.
+///
+/// Missing bounds default to the array's declared extents:
+///   `a(:)`   → full range
+///   `a(lo:)` → lo to end
+///   `a(:hi)` → start to hi
+fn lower_1d_slice_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    arg: &crate::ast::expr::Argument,
+    unit: ValueId,
+) {
+    let (start_e, end_e, stride_e) = match &arg.value {
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            (start.as_ref(), end.as_ref(), stride.as_ref())
+        }
+        _ => return,
+    };
+
+    // Default to the declared bounds of dimension 0.
+    let (decl_lo, decl_ext) = info.dims.first().copied().unwrap_or((1, 0));
+    let decl_hi = decl_lo + decl_ext - 1;
+
+    let start_val = match start_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_lo as i32),
+    };
+    let end_val = match end_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_hi as i32),
+    };
+    let stride_val = match stride_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(1),
+    };
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // `i` counter, starts at the slice's first index.
+    let i_addr = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(start_val, i_addr);
+
+    let bb_check = b.create_block("slice_write_check");
+    let bb_body  = b.create_block("slice_write_body");
+    let bb_exit  = b.create_block("slice_write_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Gt, i, end_val);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    // Translate declared-index `i` → byte offset into base:
+    //   (i - decl_lo) * elem_bytes
+    let lo_const = b.const_i32(decl_lo as i32);
+    let zero_based = b.isub(i_val, lo_const);
+    let zero_based64 = widen_idx_to_i64(b, zero_based);
+    let step = b.const_i64(elem_bytes);
+    let byte_off = b.imul(zero_based64, step);
+    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let elem = b.load_typed(p, info.ty.clone());
+    b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let next = b.iadd(i_val, stride_val);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
 }
 
 /// Lower a whole-array write item: iterate every element of the

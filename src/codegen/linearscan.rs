@@ -15,23 +15,34 @@ use super::liveness::compute_liveness;
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
 /// Ordered: caller-saved first (prefer these to avoid save/restore overhead),
 /// then callee-saved.
-// x8 reserved for large-offset addressing in emit.
-// x16, x17 excluded (linker scratch, clobbered by dynamic dispatch stubs).
-// x9-x11 available — spill code borrows temporarily-free allocated registers,
-// falling back to GP_SPILL_SCRATCH only when no allocated register is available.
-const GP_ALLOC_ORDER: [u8; 25] = [
+///
+/// x8 is reserved for large-offset addressing during emission.
+/// x16, x17 are the linker scratch registers (clobbered by dynamic
+/// dispatch stubs).
+///
+/// x9, x10, x11 are reserved **exclusively** for spill reloads
+/// (see GP_SPILL_SCRATCH). They used to be in the allocation pool
+/// under the theory that spill code could "borrow" them when
+/// they're temporarily free, but that assumption is only valid
+/// when the reload is inserted at a point where the borrowed
+/// register is dead — and the spill code had no reliable way to
+/// determine that. The result was a reload clobbering a
+/// freshly-computed live value (the slice-print crash at -O1+).
+/// Pinning x9-x11 out of the allocation pool costs 3 vregs worth
+/// of pressure and guarantees reloads never clash.
+const GP_ALLOC_ORDER: [u8; 22] = [
     // Caller-saved (temporary, no save needed)
-    9, 10, 11, 12, 13, 14, 15,   // x9-x15
+    12, 13, 14, 15,              // x12-x15
     0, 1, 2, 3, 4, 5, 6, 7,      // x0-x7 (args, but available between calls)
     // Callee-saved (must save/restore if used)
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
 
-// All 32 FP registers available. Spill code borrows temporarily-free registers,
-// falling back to FP_SPILL_SCRATCH when no allocated register is available.
-const FP_ALLOC_ORDER: [u8; 32] = [
+/// FP registers available for allocation. Same rationale as GP:
+/// d29, d30, d31 are reserved exclusively as spill reload scratch.
+const FP_ALLOC_ORDER: [u8; 29] = [
     // Caller-saved
-    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
     0, 1, 2, 3, 4, 5, 6, 7,
     // Callee-saved
     8, 9, 10, 11, 12, 13, 14, 15,
