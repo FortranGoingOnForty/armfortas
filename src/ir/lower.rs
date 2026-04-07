@@ -59,12 +59,14 @@ struct LowerCtx<'a> {
     locals: HashMap<String, LocalInfo>,
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
-    /// Module-scoped globals visible by lowercase variable name.
-    /// Value is `(global symbol name, element type)`. Populated by
-    /// the lower_file pre-pass over `ProgramUnit::Module` units so
-    /// any subsequent function that USE-imports the module can
-    /// resolve the name to a `GlobalAddr`.
-    globals: &'a HashMap<String, ModuleGlobalInfo>,
+    /// Module-scoped globals visible by (lowercase module name,
+    /// lowercase variable name). Populated by the lower_file
+    /// pre-pass over `ProgramUnit::Module` units so any subsequent
+    /// function that USE-imports the module can resolve the name
+    /// to a `GlobalAddr`. Keying by (module, var) is what lets
+    /// install_globals_as_locals filter by the current function's
+    /// USE statements, honor ONLY lists, and apply renames.
+    globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
@@ -73,7 +75,7 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, ModuleGlobalInfo>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
+    fn new(st: &'a SymbolTable, globals: &'a HashMap<(String, String), ModuleGlobalInfo>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
         Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
     }
 
@@ -120,7 +122,7 @@ pub fn lower_file(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Module {
     let mut module = Module::new("main".into());
-    let mut globals: HashMap<String, ModuleGlobalInfo> = HashMap::new();
+    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
 
     // Pass 1: collect module-level variables.
     for unit in units {
@@ -162,7 +164,7 @@ struct ModuleGlobalInfo {
 /// that's a known gap tracked for follow-up.
 fn collect_module_globals(
     module: &mut Module,
-    globals: &mut HashMap<String, ModuleGlobalInfo>,
+    globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
 ) {
@@ -203,11 +205,14 @@ fn collect_module_globals(
                         ty: global_ty,
                         initializer: Some(init.unwrap_or(GlobalInit::Zero)),
                     });
-                    globals.insert(entity.name.to_lowercase(), ModuleGlobalInfo {
-                        symbol,
-                        ty: ir_ty.clone(),
-                        dims,
-                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims,
+                        },
+                    );
                 } else {
                     // Scalar module variable.
                     let init = entity.init.as_ref()
@@ -217,11 +222,14 @@ fn collect_module_globals(
                         ty: ir_ty.clone(),
                         initializer: Some(init.unwrap_or(GlobalInit::Zero)),
                     });
-                    globals.insert(entity.name.to_lowercase(), ModuleGlobalInfo {
-                        symbol,
-                        ty: ir_ty.clone(),
-                        dims: vec![],
-                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims: vec![],
+                        },
+                    );
                 }
             }
         }
@@ -270,9 +278,9 @@ fn eval_const_array_init(
     }
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, ModuleGlobalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<(String, String), ModuleGlobalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
     match &unit.node {
-        ProgramUnit::Program { name, decls, body, contains, .. } => {
+        ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let mut func = Function::new(fname.clone(), vec![], IrType::Void);
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
@@ -281,7 +289,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             {
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -300,7 +308,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 lower_unit(module, sub, st, globals, type_layouts);
             }
         }
-        ProgramUnit::Subroutine { name, decls, body, args, bind, .. } => {
+        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, .. } => {
             // BIND(C): use specified C name, otherwise use Fortran name.
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
@@ -355,7 +363,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -369,7 +377,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 module.add_global(pg.global);
             }
         }
-        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, .. } => {
+        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
@@ -431,7 +439,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_type = Some(ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -593,29 +601,119 @@ fn collect_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
 /// uniformly with stack locals. Must run *after* `alloc_decls` so
 /// that any same-named local declared in this subprogram shadows
 /// the global per Fortran scoping rules.
+/// Install a module-level global as a `LocalInfo` entry under the
+/// given local key. Shared helper so all install paths build a
+/// consistent LocalInfo shape.
+fn install_one_global(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    info: &ModuleGlobalInfo,
+) {
+    if locals.contains_key(&local_key) { return; }
+    let addr = b.global_addr(&info.symbol, info.ty.clone());
+    locals.insert(local_key, LocalInfo {
+        addr,
+        ty: info.ty.clone(),
+        dims: info.dims.clone(),
+        allocatable: false, by_ref: false,
+        char_kind: CharKind::None, derived_type: None,
+    });
+}
+
+/// Install module globals imported by this function's USE
+/// statements as `LocalInfo` entries. Honors:
+///   * USE ONLY filtering — only names in the only-list are installed
+///   * Renames — both forms, `use m, only: y => x` and
+///     `use m, x => y` (non-only rename)
+///   * Cross-module collision detection — if two modules bring in
+///     the same local key through their use list, the emitted IR
+///     would resolve ambiguously; we skip the second one and note
+///     the collision in an eprintln (sema doesn't yet diagnose).
+///
+/// Audit C2/C3/C4: previously this function installed every
+/// global regardless of any USE statement, ignored ONLY filtering,
+/// silently dropped USE renames, and let two same-named variables
+/// from different modules silently overwrite each other.
 fn install_globals_as_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
-    globals: &HashMap<String, ModuleGlobalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
 ) {
-    // Audit B-3: iterate globals in sorted key order so the emitted
-    // `global_addr` instructions land in deterministic positions.
-    // HashMap iteration is order-randomized per-process, which
-    // percolates through liveness and register allocation and
-    // produces different .s output across compilations of the same
-    // source.
-    let mut sorted: Vec<(&String, &ModuleGlobalInfo)> = globals.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, info) in sorted {
-        if locals.contains_key(name) { continue; }
-        let addr = b.global_addr(&info.symbol, info.ty.clone());
-        locals.insert(name.clone(), LocalInfo {
-            addr,
-            ty: info.ty.clone(),
-            dims: info.dims.clone(),
-            allocatable: false, by_ref: false,
-            char_kind: CharKind::None, derived_type: None,
-        });
+    use crate::ast::decl::OnlyItem;
+
+    // Sorted per-use iteration so the emitted global_addr
+    // instructions land in deterministic order. Audit B-3 holds
+    // across this path too.
+    //
+    // The two-pass pattern:
+    //   1. Enumerate the (use statement, key-in-local-scope, module_key)
+    //      triples this function imports.
+    //   2. Sort by local-scope key.
+    //   3. Install in order, checking for collision before inserting.
+    let mut pending: Vec<(String, (String, String))> = Vec::new();
+
+    for decl in uses {
+        let Decl::UseStmt { module, nature: _, renames, only } = &decl.node else { continue; };
+        let mod_key = module.to_lowercase();
+        if let Some(only_list) = only {
+            for item in only_list {
+                match item {
+                    OnlyItem::Name(n) => {
+                        let n_lc = n.to_lowercase();
+                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
+                    }
+                    OnlyItem::Rename(rn) => {
+                        pending.push((
+                            rn.local.to_lowercase(),
+                            (mod_key.clone(), rn.remote.to_lowercase()),
+                        ));
+                    }
+                }
+            }
+        } else {
+            // No ONLY list: import every name from the module,
+            // minus any rename targets (which are substituted).
+            let rename_targets: std::collections::HashSet<String> =
+                renames.iter().map(|r| r.remote.to_lowercase()).collect();
+            for ((mk, var), _info) in globals {
+                if *mk != mod_key { continue; }
+                if rename_targets.contains(var) { continue; }
+                pending.push((var.clone(), (mod_key.clone(), var.clone())));
+            }
+            for rn in renames {
+                pending.push((
+                    rn.local.to_lowercase(),
+                    (mod_key.clone(), rn.remote.to_lowercase()),
+                ));
+            }
+        }
+    }
+
+    pending.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut installed_from: HashMap<String, String> = HashMap::new();
+    for (local_key, (mod_key, var_key)) in pending {
+        let Some(info) = globals.get(&(mod_key.clone(), var_key.clone())) else {
+            // USE referenced a name the module doesn't actually
+            // export. Sema should diagnose this; for now skip
+            // silently so lowering doesn't crash.
+            continue;
+        };
+        // Collision check: two modules exporting the same local key.
+        if let Some(prev_mod) = installed_from.get(&local_key) {
+            if *prev_mod != mod_key {
+                eprintln!(
+                    "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
+                     keeping the first",
+                    local_key, prev_mod, mod_key,
+                );
+                continue;
+            }
+        }
+        installed_from.insert(local_key.clone(), mod_key);
+        install_one_global(b, locals, local_key, info);
     }
 }
 
