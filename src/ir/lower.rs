@@ -3671,8 +3671,18 @@ fn lower_write_items_adv(
                         if !info.dims.is_empty() || info.allocatable {
                             let has_range = args.iter().any(|a|
                                 matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
-                            if has_range && args.len() == 1 {
-                                lower_1d_slice_write(b, ctx, &info, &args[0], unit);
+                            if has_range {
+                                if args.len() == 1 {
+                                    lower_1d_slice_write(b, ctx, &info, &args[0], unit);
+                                } else {
+                                    // Audit CRITICAL-3: multi-dim
+                                    // slice prints used to fall
+                                    // through to afs_create_section
+                                    // on a bare stack pointer and
+                                    // crash. Now lowered as nested
+                                    // column-major loops directly.
+                                    lower_section_write_nd(b, ctx, &info, args, unit);
+                                }
                                 continue;
                             }
                         }
@@ -3868,6 +3878,205 @@ fn lower_1d_slice_write(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+}
+
+/// Lower an N-dimensional array section write item, e.g.
+/// `print *, m(:, 1)` or `print *, m(2:3, 1:2)`. Generates one
+/// nested loop per dimension, innermost = dim 0 (Fortran column-
+/// major iteration order), and at the leaf computes the flat
+/// byte offset into the array's base.
+///
+/// Element subscripts (`m(:, 1)`) collapse to a single iteration
+/// at the fixed value. Range subscripts iterate from start to
+/// end with the given stride (defaults: declared bounds, stride
+/// 1). Stride sign is honored both at compile time and at runtime.
+///
+/// Audit CRITICAL-3: multi-dim slice prints used to mis-dispatch
+/// through afs_create_section on a bare stack pointer and crash
+/// at runtime reading 384 bytes of garbage as a descriptor.
+fn lower_section_write_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    unit: ValueId,
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // For each dimension we need: a runtime counter alloca plus
+    // its start/end/stride values, the declared lower bound (for
+    // base-relative offset arithmetic), and the cumulative stride
+    // for column-major flat-offset computation. start_val is
+    // saved so non-innermost loop bodies can RE-init the inner
+    // counter on each outer iteration.
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        decl_lo: i64,
+        cum_stride: i64,
+    }
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_stride: i64 = 1;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let (decl_lo, decl_ext) = info.dims.get(dim_idx).copied().unwrap_or((1, 0));
+        let decl_hi = decl_lo + decl_ext - 1;
+
+        let counter = b.alloca(IrType::Int(IntWidth::I32));
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_lo as i32),
+                };
+                let end_v = match end {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_hi as i32),
+                };
+                let stride_v = match stride {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(1),
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let v = lower_expr(b, &ctx.locals, e, ctx.st);
+                // Single-element dimension: start == end, stride 1.
+                (v, v, b.const_i32(1), Some(1))
+            }
+        };
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter, start_val, end_val, stride_val, const_stride,
+            decl_lo, cum_stride,
+        });
+        cum_stride *= decl_ext.max(1);
+    }
+
+    // Build nested check/body/exit blocks, OUTERMOST first (last
+    // dim) — we want innermost = dim 0 for column-major iteration.
+    // Layout per dimension d (counting from outermost):
+    //   check_d → body_d? exit_d
+    //   body_d:
+    //     [if d > 0] init counter[d-1] = start[d-1]; branch check_{d-1}
+    //     [if d == 0] compute offset, GEP, write, branch incr_0
+    //   incr_d: counter[d] += stride[d]; branch check_d
+    //   exit_d
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("sec_check_d{}", d)));
+        bodies.push(b.create_block(&format!("sec_body_d{}", d)));
+        incrs.push(b.create_block(&format!("sec_incr_d{}", d)));
+        exits.push(b.create_block(&format!("sec_exit_d{}", d)));
+    }
+
+    // Enter the outermost loop. Walking from outermost (n-1) to
+    // innermost (0) means index n-1 is the LAST in the dims vec.
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    // Emit each dimension's check/incr/exit. Body chains down to
+    // the next inner dim (or to the leaf computation at d == 0).
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev; // outermost first
+
+        // Check block: load counter, compare against end with the
+        // appropriate cmp op (sign of stride).
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let zero = b.const_i32(0);
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero);
+            let bb_neg = b.create_block(&format!("sec_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("sec_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        // Body block. If we're at the innermost dim, compute the
+        // offset and emit the load+write. Otherwise, init the
+        // next-inner dim's counter and branch to its check.
+        b.set_block(bodies[d]);
+        if d == 0 {
+            // Innermost: compute flat offset = sum over all dims of
+            // (counter - decl_lo) * cum_stride * elem_bytes.
+            let mut byte_offset: Option<ValueId> = None;
+            for dd in 0..n {
+                let cnt = b.load(dims[dd].counter);
+                let lo_const = b.const_i32(dims[dd].decl_lo as i32);
+                let zero_based = b.isub(cnt, lo_const);
+                let zero_based64 = widen_idx_to_i64(b, zero_based);
+                let stride_const = b.const_i64(dims[dd].cum_stride * elem_bytes);
+                let term = b.imul(zero_based64, stride_const);
+                byte_offset = Some(match byte_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
+            let p = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
+            let elem = b.load_typed(p, info.ty.clone());
+            b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+            b.branch(incrs[0], vec![]);
+        } else {
+            // Not innermost: re-init the next-inner dim's counter
+            // to its start value (RESET on each outer iteration),
+            // then branch to its check block.
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        // Increment block: counter += stride; branch back to check.
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        // Exit block: continue out to next-outer increment, or
+        // fall through past everything if this was the outermost.
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+        // If d == n-1 (outermost exit), the caller of this helper
+        // continues emitting after exits[outer]. We leave the
+        // current block set to exits[outer] below.
+    }
+
+    // The final current block must be exits[outer] so subsequent
+    // statement lowering continues after the section loop.
+    b.set_block(exits[outer]);
 }
 
 /// Lower a whole-array write item: iterate every element of the
