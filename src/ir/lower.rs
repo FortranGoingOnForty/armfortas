@@ -3379,24 +3379,42 @@ fn store_ac_implied_do(
         derived_type: None,
     });
 
-    // Loop skeleton: check → body → exit.
+    // Loop skeleton: check → body → exit. Mirrors the regular DO
+    // lowerer's sign-of-step handling: if `step` is a compile-time
+    // constant, pick `Le` for positive and `Ge` for negative; if
+    // it's a runtime value, branch on the sign and emit two check
+    // arms. Audit BLOCKING-1: the previous version hardcoded `Le`
+    // and `[(i, i=5,1,-1)]` skipped the body entirely.
     let check = b.create_block("ac_impdo_check");
     let body  = b.create_block("ac_impdo_body");
     let exit  = b.create_block("ac_impdo_exit");
     b.branch(check, vec![]);
 
-    // Check: if var <= end, go to body; else exit. Assumes a
-    // positive step — Fortran allows negative step but the common
-    // case is +1. A negative-step implied-do with a runtime-chosen
-    // direction would need a richer comparison here; for now we
-    // honor the sign of a compile-time constant step and fall back
-    // to `le` otherwise.
     b.set_block(check);
     let cur_var = b.load(var_addr);
-    // Pick cmp op based on a compile-time sign of `step` if
-    // we can determine it; otherwise default to `le` (most loops).
-    let cmp = b.icmp(CmpOp::Le, cur_var, end_coerced);
-    b.cond_branch(cmp, body, vec![], exit, vec![]);
+    let const_step = step.and_then(eval_const_int);
+    if let Some(sv) = const_step {
+        let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let cond = b.icmp(cmp_op, cur_var, end_coerced);
+        b.cond_branch(cond, body, vec![], exit, vec![]);
+    } else {
+        // Runtime step: branch on sign at the check site so we
+        // pick the correct comparison without recomputing on each
+        // iteration. Two check sub-blocks, one per direction.
+        let zero = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+        let bb_neg = b.create_block("ac_impdo_neg_check");
+        let bb_pos = b.create_block("ac_impdo_pos_check");
+        b.cond_branch(step_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let cond_neg = b.icmp(CmpOp::Ge, cur_var, end_coerced);
+        b.cond_branch(cond_neg, body, vec![], exit, vec![]);
+
+        b.set_block(bb_pos);
+        let cond_pos = b.icmp(CmpOp::Le, cur_var, end_coerced);
+        b.cond_branch(cond_pos, body, vec![], exit, vec![]);
+    }
 
     // Body: evaluate each inner value and store at the current
     // offset. Recurses into store_ac_values_into so nested
