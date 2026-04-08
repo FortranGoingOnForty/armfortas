@@ -1,20 +1,16 @@
-! Audit #4 CRITICAL-1 — SAVE silently lost when initializer
-! references a named PARAMETER.
+! Audit #4 CRITICAL-1 — SAVE init that references a named
+! PARAMETER now folds correctly and preserves SAVE semantics.
 !
-! eval_const_scalar handles literals + binary arithmetic but has
-! no Expr::Name case. `integer :: x = k * 2` where k is a parameter
-! falls through to the alloca+per-call-store path because the
-! folder can't resolve `k`. The local then re-initializes on every
-! call, defeating SAVE.
+! Fixed: eval_const_scalar takes a `param_consts` map and
+! resolves Expr::Name references against it. alloc_decls (and
+! collect_module_globals) build the map by walking the decls
+! list incrementally so a later parameter declaration can
+! reference earlier ones (`tau = 2 * pi`).
 !
-! The fix needs eval_const_scalar to look up parameter names in a
-! const-table threaded through LowerCtx (which would also fix
-! MAJOR-4: parameter-attributed locals are currently SAVE-promoted
-! to .data instead of being inlined at use sites).
+! `integer :: x = k * 2` (k a parameter) now folds to 20,
+! SAVE-promotes to .data, and the counter advances correctly
+! across calls instead of resetting to 21 every time.
 !
-! Three calls of `s` should print 21, 22, 23.
-!
-! XFAIL: audit CRITICAL-1 (SAVE init referencing parameter loses semantics)
 ! CHECK: 21
 ! CHECK: 22
 ! CHECK: 23

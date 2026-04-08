@@ -171,6 +171,29 @@ fn collect_module_globals(
     decls: &[crate::ast::decl::SpannedDecl],
 ) {
     use crate::ast::decl::Attribute;
+    // Module-level parameter table built incrementally so a later
+    // parameter declaration can reference earlier ones.
+    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec: _, attrs, entities } = &decl.node {
+            let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+            if !is_param { continue; }
+            for entity in entities {
+                if let Some(init) = &entity.init {
+                    if let Some(val) = eval_const_scalar(init, &param_consts) {
+                        param_consts.insert(entity.name.to_lowercase(), val);
+                    }
+                }
+            }
+        }
+        if let Decl::ParameterStmt { pairs } = &decl.node {
+            for (name, expr) in pairs {
+                if let Some(val) = eval_const_scalar(expr, &param_consts) {
+                    param_consts.insert(name.to_lowercase(), val);
+                }
+            }
+        }
+    }
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let ir_ty = lower_type_spec(type_spec);
@@ -201,7 +224,7 @@ fn collect_module_globals(
                     );
 
                     let init = entity.init.as_ref()
-                        .and_then(|e| eval_const_array_init(e, &ir_ty, total));
+                        .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts));
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: global_ty,
@@ -218,7 +241,7 @@ fn collect_module_globals(
                 } else {
                     // Scalar module variable.
                     let init = entity.init.as_ref()
-                        .and_then(eval_const_global_init);
+                        .and_then(|e| eval_const_global_init(e, &param_consts));
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -246,6 +269,7 @@ fn eval_const_array_init(
     expr: &crate::ast::expr::SpannedExpr,
     elem_ty: &IrType,
     total: i64,
+    param_consts: &HashMap<String, ConstScalar>,
 ) -> Option<GlobalInit> {
     use crate::ast::expr::AcValue;
     let values = match &expr.node {
@@ -258,7 +282,7 @@ fn eval_const_array_init(
         let mut out: Vec<f64> = Vec::with_capacity(values.len());
         for v in values {
             let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e)? {
+            match eval_const_global_init(e, param_consts)? {
                 GlobalInit::Float(f) => out.push(f),
                 GlobalInit::Int(i) => out.push(i as f64),
                 _ => return None,
@@ -270,7 +294,7 @@ fn eval_const_array_init(
         let mut out: Vec<i64> = Vec::with_capacity(values.len());
         for v in values {
             let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e)? {
+            match eval_const_global_init(e, param_consts)? {
                 GlobalInit::Int(i) => out.push(i),
                 _ => return None,
             }
@@ -512,15 +536,20 @@ fn lower_unit(
 ///
 /// Handles literals, unary minus, parenthesization, and binary
 /// arithmetic (`+`, `-`, `*`, `/`, `**`) on any combination of
-/// integer and real operands. Mixed int/real promotes to real per
-/// Fortran's usual arithmetic rules. Anything that can't be
-/// folded (variable references, function calls, derived types,
-/// strings) returns `None` and the caller falls back to
-/// alloca+runtime-store. That fallback DOES break SAVE semantics
-/// — any new non-foldable case is a silent off-spec wrong-result,
-/// so the folder should cover as much as possible.
-fn eval_const_global_init(e: &crate::ast::expr::SpannedExpr) -> Option<GlobalInit> {
-    eval_const_scalar(e).map(|v| match v {
+/// integer and real operands, plus references to named PARAMETERs
+/// declared earlier in the same scope (looked up via `param_consts`).
+/// Mixed int/real promotes to real per Fortran's usual arithmetic
+/// rules. Anything that can't be folded (function calls, derived
+/// types, strings, names that aren't compile-time parameters)
+/// returns `None`. The caller then falls back to alloca + runtime
+/// store, which DOES break SAVE semantics — every new non-foldable
+/// case is a silent off-spec wrong-result, so the folder should
+/// cover as much as possible.
+fn eval_const_global_init(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<GlobalInit> {
+    eval_const_scalar(e, param_consts).map(|v| match v {
         ConstScalar::Int(i) => GlobalInit::Int(i),
         ConstScalar::Float(f) => GlobalInit::Float(f),
     })
@@ -541,7 +570,10 @@ impl ConstScalar {
     }
 }
 
-fn eval_const_scalar(e: &crate::ast::expr::SpannedExpr) -> Option<ConstScalar> {
+fn eval_const_scalar(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<ConstScalar> {
     use crate::ast::expr::{UnaryOp, BinaryOp};
     match &e.node {
         Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(ConstScalar::Int),
@@ -551,8 +583,16 @@ fn eval_const_scalar(e: &crate::ast::expr::SpannedExpr) -> Option<ConstScalar> {
         Expr::LogicalLiteral { value, .. } => {
             Some(ConstScalar::Int(if *value { 1 } else { 0 }))
         }
+        // Audit CRITICAL-1: a name reference resolves only if it's
+        // a compile-time parameter declared earlier in the same
+        // scope. Anything else (regular local, dummy arg, module
+        // global) is not a compile-time constant and the folder
+        // gives up — the caller falls back to runtime evaluation.
+        Expr::Name { name } => {
+            param_consts.get(&name.to_lowercase()).copied()
+        }
         Expr::UnaryOp { op, operand } => {
-            let v = eval_const_scalar(operand)?;
+            let v = eval_const_scalar(operand, param_consts)?;
             match op {
                 UnaryOp::Minus => Some(match v {
                     ConstScalar::Int(i) => ConstScalar::Int(-i),
@@ -563,8 +603,8 @@ fn eval_const_scalar(e: &crate::ast::expr::SpannedExpr) -> Option<ConstScalar> {
             }
         }
         Expr::BinaryOp { op, left, right } => {
-            let lv = eval_const_scalar(left)?;
-            let rv = eval_const_scalar(right)?;
+            let lv = eval_const_scalar(left, param_consts)?;
+            let rv = eval_const_scalar(right, param_consts)?;
             // Promote to float when either operand is float.
             let any_float = matches!(lv, ConstScalar::Float(_))
                 || matches!(rv, ConstScalar::Float(_));
@@ -601,7 +641,7 @@ fn eval_const_scalar(e: &crate::ast::expr::SpannedExpr) -> Option<ConstScalar> {
                 }
             }
         }
-        Expr::ParenExpr { inner } => eval_const_scalar(inner),
+        Expr::ParenExpr { inner } => eval_const_scalar(inner, param_consts),
         _ => None,
     }
 }
@@ -785,6 +825,40 @@ fn alloc_decls(
         }
     }
 
+    // Audit CRITICAL-1: build the per-scope parameter constants
+    // table so SAVE-promotion's eval_const_global_init can resolve
+    // `Expr::Name` references against compile-time-known parameters
+    // declared earlier in the same scope. Without this, an init
+    // like `integer :: x = k * 2` (k a parameter) silently falls
+    // back to alloca + per-call store and breaks SAVE semantics.
+    //
+    // Parameters can reference earlier parameters (`tau = 2 * pi`),
+    // so we walk decls in order and build the map incrementally.
+    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    for d in decls {
+        match &d.node {
+            Decl::TypeDecl { attrs, entities, .. } => {
+                let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+                if !is_param { continue; }
+                for entity in entities {
+                    if let Some(init) = &entity.init {
+                        if let Some(val) = eval_const_scalar(init, &param_consts) {
+                            param_consts.insert(entity.name.to_lowercase(), val);
+                        }
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    if let Some(val) = eval_const_scalar(expr, &param_consts) {
+                        param_consts.insert(name.to_lowercase(), val);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let elem_ty = lower_type_spec(type_spec);
@@ -922,7 +996,7 @@ fn alloc_decls(
                     // statement elsewhere in the same decl list.
                     let init_expr: Option<&crate::ast::expr::SpannedExpr> =
                         entity.init.as_ref().or_else(|| parameter_inits.get(&key).copied());
-                    if let Some(init) = init_expr.and_then(eval_const_global_init) {
+                    if let Some(init) = init_expr.and_then(|e| eval_const_global_init(e, &param_consts)) {
                         let global_name = save_global_name(func_name, &key);
                         pending_globals.push(PendingGlobal {
                             global: Global {
