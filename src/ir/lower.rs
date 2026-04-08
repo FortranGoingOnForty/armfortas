@@ -170,7 +170,7 @@ pub fn lower_file(
 /// USE-imports the module.
 #[derive(Clone)]
 struct ModuleGlobalInfo {
-    /// Mach-O symbol name (already prefixed with `__mod_<mod>_`).
+    /// Mach-O symbol name (already prefixed with `afs_mod_<mod>_`).
     symbol: String,
     /// Element type (for scalars) or array element type (for arrays).
     ty: IrType,
@@ -853,9 +853,13 @@ fn eval_const_scalar(
                     BinaryOp::Add => Some(ConstScalar::Float(l + r)),
                     BinaryOp::Sub => Some(ConstScalar::Float(l - r)),
                     BinaryOp::Mul => Some(ConstScalar::Float(l * r)),
-                    BinaryOp::Div => {
-                        if r == 0.0 { None } else { Some(ConstScalar::Float(l / r)) }
-                    }
+                    // Audit Min-5: fold all IEEE 754 cases. Float
+                    // division by zero now folds to ±Inf or NaN
+                    // (matching `f64::powf`, which already folds
+                    // negative-base fractional powers to NaN).
+                    // Consistent with gfortran's `parameter ::
+                    // x = 1.0/0.0 → +inf` behavior.
+                    BinaryOp::Div => Some(ConstScalar::Float(l / r)),
                     BinaryOp::Pow => Some(ConstScalar::Float(l.powf(r))),
                     _ => None,
                 }
@@ -1044,7 +1048,7 @@ fn compute_filtered_names(
         // collect_module_globals registered — module functions and
         // derived types are tracked elsewhere and remain visible).
         let mut exports: HashSet<String> = HashSet::new();
-        for ((mk, var), _info) in globals {
+        for (mk, var) in globals.keys() {
             if *mk == mod_key {
                 exports.insert(var.clone());
             }
@@ -1155,7 +1159,7 @@ fn install_globals_as_locals(
             // minus any rename targets (which are substituted).
             let rename_targets: std::collections::HashSet<String> =
                 renames.iter().map(|r| r.remote.to_lowercase()).collect();
-            for ((mk, var), _info) in globals {
+            for (mk, var) in globals.keys() {
                 if *mk != mod_key { continue; }
                 if rename_targets.contains(var) { continue; }
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
@@ -1558,6 +1562,41 @@ fn init_decls(
                     let val = lower_expr(b, locals, expr, st);
                     let coerced = coerce_to_type(b, val, &info.ty);
                     b.store(coerced, info.addr);
+                }
+            }
+            // Audit MEDIUM-3: DATA statements. Each set pairs
+            // target objects with values. For the simple form
+            // `data x /42/, y /3.14/`, walk objects + values
+            // pairwise and emit a store per scalar Name target.
+            // Implied-do object lists and value-side repetition
+            // (`r*v`) are not yet supported — they fall through
+            // silently and are tracked as future work.
+            Decl::DataStmt { sets } => {
+                for set in sets {
+                    let n = set.objects.len().min(set.values.len());
+                    for (target, value) in
+                        set.objects.iter().zip(set.values.iter()).take(n)
+                    {
+                        let Expr::Name { name } = &target.node else { continue; };
+                        let key = name.to_lowercase();
+                        let Some(info) = locals.get(&key) else { continue; };
+                        if !info.dims.is_empty()
+                            || info.allocatable
+                            || info.by_ref
+                            || !matches!(info.char_kind, CharKind::None)
+                            || info.derived_type.is_some()
+                        {
+                            continue;
+                        }
+                        // Don't shadow a SAVE-promoted global —
+                        // its initial value is in .data already.
+                        if global_addr_ids.contains(&info.addr) {
+                            continue;
+                        }
+                        let val = lower_expr(b, locals, value, st);
+                        let coerced = coerce_to_type(b, val, &info.ty);
+                        b.store(coerced, info.addr);
+                    }
                 }
             }
             _ => {}
@@ -4454,12 +4493,18 @@ fn lower_section_write_nd(
             // Innermost: compute flat offset = sum over all dims of
             // (counter - decl_lo) * cum_stride * elem_bytes.
             let mut byte_offset: Option<ValueId> = None;
-            for dd in 0..n {
-                let cnt = b.load(dims[dd].counter);
-                let lo_const = b.const_i32(dims[dd].decl_lo as i32);
+            // Borrow `dims` immutably while iterating it; the loop
+            // body needs &mut b so we collect the per-dim values
+            // first, then emit the IR for the sum afterwards.
+            let dim_data: Vec<(ValueId, i64, i64)> = dims.iter()
+                .map(|d| (d.counter, d.decl_lo, d.cum_stride))
+                .collect();
+            for (counter, decl_lo, cum_stride_d) in dim_data {
+                let cnt = b.load(counter);
+                let lo_const = b.const_i32(decl_lo as i32);
                 let zero_based = b.isub(cnt, lo_const);
                 let zero_based64 = widen_idx_to_i64(b, zero_based);
-                let stride_const = b.const_i64(dims[dd].cum_stride * elem_bytes);
+                let stride_const = b.const_i64(cum_stride_d * elem_bytes);
                 let term = b.imul(zero_based64, stride_const);
                 byte_offset = Some(match byte_offset {
                     Some(prev) => b.iadd(prev, term),

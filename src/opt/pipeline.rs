@@ -123,9 +123,15 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // O2 plus vectorization, aggressive inlining, IPO,
-            // devirtualization, speculative optimizations.
-            // Ofast additionally enables fast-math reassociation.
+            // Audit Cos-1: O3/Ofast currently runs the same pass
+            // pipeline as O2. The aspirational additions —
+            // vectorization, aggressive inlining, IPO,
+            // devirtualization, speculative optimizations,
+            // Ofast fast-math reassociation — are deferred to a
+            // later sprint (NEON vectorization is the natural
+            // next milestone). The arms are kept distinct so the
+            // -O3/-Ofast flags continue to be accepted and the
+            // future additions land in the obvious place.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));

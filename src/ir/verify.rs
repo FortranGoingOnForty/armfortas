@@ -568,6 +568,27 @@ mod tests {
     }
 
     #[test]
+    fn store_value_pointee_mismatch_errors() {
+        // Audit Min-1: Store(i64_val, ptr<i32>) must be rejected
+        // by the verifier — codegen has no implicit narrowing
+        // and would silently truncate.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let val = b.const_i64(123);
+            let addr = b.alloca(IrType::Int(IntWidth::I32));
+            b.store(val, addr);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("doesn't match pointee type")),
+            "expected pointee type mismatch error, got: {:?}",
+            errs,
+        );
+    }
+
+    #[test]
     fn int_op_width_mismatch_errors() {
         // IMul(i32, i64) should be rejected — codegen has no
         // implicit width promotion and the verifier is the last

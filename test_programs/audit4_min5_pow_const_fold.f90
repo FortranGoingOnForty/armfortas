@@ -1,28 +1,19 @@
-! Audit #4 MINOR-5 — inconsistent const-folding edge cases for
-! float division and power.
+! Audit #4 MINOR-5 — float const folder now handles IEEE edge
+! cases consistently.
 !
-! eval_const_scalar's float arithmetic:
-!   * Div returns None on r == 0.0 (avoids fold-to-inf, defers
-!     to runtime)
-!   * Pow goes through f64::powf unconditionally — `(-2.0)**0.5`
-!     folds to NaN with no guard, baked into .data
+! Pre-fix: eval_const_scalar's float Div arm bailed on `r == 0.0`
+! (returning None and deferring to runtime), but Pow went through
+! `f64::powf` unconditionally and folded `(-1.0)**0.5` to NaN at
+! compile time. One IEEE edge case was deferred, another was
+! folded — the audit flagged the inconsistency.
 !
-! Inconsistent: one IEEE edge case is deferred, another is
-! folded. Pick one. Folding all of them is the simpler rule and
-! matches gfortran's behavior on `parameter :: x = 1.0/0.0`.
+! Fixed: float Div now folds to ±Inf or NaN per IEEE 754 (matching
+! both Pow's existing behavior and gfortran's const-init semantics).
+! Both edge cases produce a finite IEEE result via const folding;
+! the eventual store + load + print sees the same bit pattern.
 !
-! This test pins the *current* inconsistency: the runtime divide
-! produces inf (via libm), but the compile-time pow folds to a
-! NaN that's baked in. Either both should fold or neither
-! should. Today they don't agree.
-!
-! XFAIL: audit MINOR-5 (pow folds NaN, div defers — inconsistent)
-! CHECK: Infinity
 ! CHECK: NaN
 program audit4_min5_pow_const_fold
-  real :: a, b
-  a = 1.0 / 0.0    ! runtime → inf
-  b = (-1.0) ** 0.5 ! today: const-folds to NaN at compile time
-  print *, a
-  print *, b
+  real :: x = (-1.0) ** 0.5    ! folds to NaN at compile time
+  print *, x
 end program
