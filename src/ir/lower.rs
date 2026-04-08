@@ -3705,10 +3705,34 @@ fn lower_1d_slice_write(
     let bb_exit  = b.create_block("slice_write_exit");
     b.branch(bb_check, vec![]);
 
+    // Sign-of-stride handling, mirroring the regular DO lowerer.
+    // For ascending stride, exit when `i > end`; for descending,
+    // exit when `i < end`. Audit BLOCKING-2: the previous version
+    // hardcoded `Gt`, so `print *, a(5:1:-1)` exited on the very
+    // first iteration with no elements written.
     b.set_block(bb_check);
     let i = b.load(i_addr);
-    let done = b.icmp(CmpOp::Gt, i, end_val);
-    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    let const_stride = stride_e.and_then(eval_const_int);
+    if let Some(sv) = const_stride {
+        let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+        let done = b.icmp(done_op, i, end_val);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    } else {
+        // Runtime stride: branch on sign at the check site.
+        let zero = b.const_i32(0);
+        let stride_neg = b.icmp(CmpOp::Lt, stride_val, zero);
+        let bb_neg = b.create_block("slice_write_neg_check");
+        let bb_pos = b.create_block("slice_write_pos_check");
+        b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let done_neg = b.icmp(CmpOp::Lt, i, end_val);
+        b.cond_branch(done_neg, bb_exit, vec![], bb_body, vec![]);
+
+        b.set_block(bb_pos);
+        let done_pos = b.icmp(CmpOp::Gt, i, end_val);
+        b.cond_branch(done_pos, bb_exit, vec![], bb_body, vec![]);
+    }
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
