@@ -24,6 +24,28 @@
 //! audit ID (`! XFAIL: audit BLOCKING-1 (implied-do negative step)`),
 //! so a future audit can grep `test_programs/` for the finding ID and
 //! immediately see whether the bug class is covered.
+//!
+//! ## ERROR_EXPECTED annotations
+//!
+//! A program may also carry an `! ERROR_EXPECTED: <substring>` line.
+//! That asserts the program **must fail to compile**, and the
+//! compiler's stderr **must contain** the given substring. This is
+//! how we test "should be a diagnostic" cases — Fortran constraint
+//! violations that the compiler is required to reject. The semantics:
+//!
+//!   * If `ERROR_EXPECTED` is present, CHECK lines are ignored.
+//!   * If compilation succeeds, the test fails.
+//!   * If compilation fails but stderr doesn't contain the substring,
+//!     the test fails.
+//!   * If compilation fails with the expected substring, the test
+//!     passes.
+//!
+//! `ERROR_EXPECTED` composes with `XFAIL`: if a program is annotated
+//! with both, an XFAIL fires when the expected error is **not**
+//! produced (the bug is "we don't yet diagnose this"), and an XPASS
+//! fires once we start diagnosing it correctly (so the XFAIL
+//! annotation can come off and the program becomes a regular
+//! "diagnostic regression" test).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,6 +84,19 @@ fn extract_xfail(source: &str) -> Option<String> {
     for line in source.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("! XFAIL:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract `! ERROR_EXPECTED:` substring text. Returns the expected
+/// stderr substring if any. Programs with this annotation are
+/// asserted to fail compilation.
+fn extract_error_expected(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("! ERROR_EXPECTED:") {
             return Some(rest.trim().to_string());
         }
     }
@@ -154,13 +189,15 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
 
     let xfail_reason = extract_xfail(&source_text);
+    let error_expected = extract_error_expected(&source_text);
     let checks = extract_checks(&source_text);
-    if checks.is_empty() && xfail_reason.is_none() {
-        // Programs with no CHECKs and no XFAIL marker are
-        // mis-configured tests, not test failures.
-        return TestOutcome::Fail(
-            format!("{}: no CHECK annotations and not marked XFAIL", filename),
-        );
+    if checks.is_empty() && xfail_reason.is_none() && error_expected.is_none() {
+        // Programs with no CHECKs, no XFAIL marker, and no ERROR
+        // marker are mis-configured tests, not test failures.
+        return TestOutcome::Fail(format!(
+            "{}: no CHECK / XFAIL / ERROR_EXPECTED annotations",
+            filename,
+        ));
     }
 
     // Try the compile/run/check pipeline. Any failure path returns
@@ -181,6 +218,27 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             ])
             .output()
             .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+
+        // ERROR_EXPECTED branch: compilation MUST fail with the
+        // expected stderr substring. CHECKs are ignored.
+        if let Some(expected) = &error_expected {
+            if compile.status.success() {
+                let _ = fs::remove_file(&binary);
+                return Err(format!(
+                    "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
+                    filename, opt_flag, expected,
+                ));
+            }
+            let stderr = String::from_utf8_lossy(&compile.stderr);
+            if !stderr.contains(expected.as_str()) {
+                return Err(format!(
+                    "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
+                     Full stderr:\n{}",
+                    filename, opt_flag, expected, stderr,
+                ));
+            }
+            return Ok(());
+        }
 
         if !compile.status.success() {
             let stderr = String::from_utf8_lossy(&compile.stderr);
