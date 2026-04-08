@@ -1,23 +1,26 @@
-! Audit #4 MAJOR-2 — module array initializers from reshape() or
-! implied-do silently zero.
+! Audit #4 MAJOR-2 — module array initializers via reshape() or
+! implied-do now const-fold correctly.
 !
-! eval_const_array_init only matches Expr::ArrayConstructor with
-! literal AcValue::Expr children. It does NOT handle:
-!   * reshape(constructor, shape) function calls
-!   * AcValue::ImpliedDo
-!   * Expr::Name references in element positions
+! Fixed: eval_const_array_init now uses two helpers that handle
+! the full constructor grammar:
 !
-! In every unsupported case the global is silently initialized to
-! GlobalInit::Zero with no diagnostic. The B2 fix passed its test
-! programs only because they happened to use literal-element
-! constructors.
+!   * collect_const_array_scalars walks the expression
+!     recursively, supporting Expr::ArrayConstructor (literal
+!     elements), Expr::FunctionCall("reshape", [src, shape])
+!     (passes through src elements unchanged — Fortran's
+!     reshape preserves linearization order even when permuting
+!     dims), and parameter references via the C1 const map.
+!   * collect_ac_value handles each AcValue, including
+!     implied-do iterators with const bounds. Implied-do binds
+!     its variable in a local param_consts overlay so the
+!     inner expression can reference it (`(i*i, i=1,5)`).
 !
-! Three module variables to check:
-!   * arr1 via reshape — values 1..4 in column-major order
+! Three module variables verified:
+!   * arr1 via reshape — values 1..4
 !   * arr2 via implied-do — 1..5
-!   * arr3 via parameter-relative literals (also tests folder)
+!   * arr3 via parameter-relative literals (already worked
+!     after C1, kept as a regression pin)
 !
-! XFAIL: audit MAJOR-2 (module array reshape/implied-do drops init)
 ! CHECK: 1 2 3 4
 ! CHECK: 1 2 3 4 5
 ! CHECK: 100 200 300

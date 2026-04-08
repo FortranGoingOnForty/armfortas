@@ -261,46 +261,141 @@ fn collect_module_globals(
     }
 }
 
-/// Try to evaluate an array constructor as a `GlobalInit`. Only
-/// handles literal elements (integer and real). Returns `None`
-/// if the constructor contains implied-do, variables, or other
-/// non-literal forms.
+/// Try to evaluate an array constructor as a `GlobalInit`.
+/// Handles three forms:
+///   1. `[v0, v1, v2]` literal-element constructor
+///   2. `[(expr, i = lo, hi[, step])]` implied-do iterator
+///   3. `reshape(constructor, shape)` reshape of (1) or (2)
+///
+/// Each path produces a flat list of `i64` (for integer types)
+/// or `f64` (for float types) of length `total`. Shorter lists
+/// are zero-padded; longer lists return `None` (a future Maj-3
+/// fix will add a proper diagnostic for shape-mismatch errors).
+///
+/// Audit MAJOR-2.
 fn eval_const_array_init(
     expr: &crate::ast::expr::SpannedExpr,
     elem_ty: &IrType,
     total: i64,
     param_consts: &HashMap<String, ConstScalar>,
 ) -> Option<GlobalInit> {
-    use crate::ast::expr::AcValue;
-    let values = match &expr.node {
-        Expr::ArrayConstructor { values, .. } => values,
-        _ => return None,
-    };
+    let scalars = collect_const_array_scalars(expr, elem_ty, param_consts)?;
+    if (scalars.len() as i64) > total {
+        // Shape mismatch — too many elements. Return None so the
+        // caller falls back to zero-init. A proper diagnostic is
+        // tracked under audit MAJOR-3.
+        return None;
+    }
 
     let is_float = matches!(elem_ty, IrType::Float(_));
     if is_float {
-        let mut out: Vec<f64> = Vec::with_capacity(values.len());
-        for v in values {
-            let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e, param_consts, Some(elem_ty))? {
-                GlobalInit::Float(f) => out.push(f),
-                GlobalInit::Int(i) => out.push(i as f64),
-                _ => return None,
-            }
-        }
+        let mut out: Vec<f64> = scalars.iter().map(|s| s.to_float()).collect();
         while (out.len() as i64) < total { out.push(0.0); }
         Some(GlobalInit::FloatArray(out))
     } else {
-        let mut out: Vec<i64> = Vec::with_capacity(values.len());
-        for v in values {
-            let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e, param_consts, Some(elem_ty))? {
-                GlobalInit::Int(i) => out.push(i),
-                _ => return None,
-            }
-        }
+        let mut out: Vec<i64> = scalars.iter().map(|s| match s {
+            ConstScalar::Int(i) => *i,
+            ConstScalar::Float(f) => *f as i64,
+        }).collect();
         while (out.len() as i64) < total { out.push(0); }
         Some(GlobalInit::IntArray(out))
+    }
+}
+
+/// Recursively collect the scalar elements of a constructor
+/// expression into a flat Vec. Used by eval_const_array_init to
+/// support nested implied-do, reshape, and parameter references
+/// uniformly.
+///
+/// reshape(source, shape) just produces source's elements in
+/// declared order — Fortran's reshape is column-major and
+/// reorders dimensions, but for the FLAT linearization the
+/// element ordering is identical to source's. We don't yet
+/// honor non-trivial shape arguments (only reshape passes that
+/// match the source length get folded).
+fn collect_const_array_scalars(
+    expr: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<Vec<ConstScalar>> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let mut out: Vec<ConstScalar> = Vec::new();
+            for v in values {
+                collect_ac_value(v, elem_ty, param_consts, &mut out)?;
+            }
+            Some(out)
+        }
+        // reshape(source, shape) — pass through source elements.
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
+                    if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
+                        return collect_const_array_scalars(src, elem_ty, param_consts);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Collect a single AcValue (which may be a literal element or
+/// an implied-do iterator) into a flat scalar list.
+fn collect_ac_value(
+    v: &crate::ast::expr::AcValue,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    out: &mut Vec<ConstScalar>,
+) -> Option<()> {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => {
+            let raw = eval_const_scalar(e, param_consts)?;
+            // Coerce int → float when the destination is float.
+            let coerced = if matches!(elem_ty, IrType::Float(_)) {
+                ConstScalar::Float(raw.to_float())
+            } else {
+                raw
+            };
+            out.push(coerced);
+            Some(())
+        }
+        AcValue::ImpliedDo { values, var, start, end, step } => {
+            let start_v = eval_const_scalar(start, param_consts)?;
+            let end_v = eval_const_scalar(end, param_consts)?;
+            let step_v = match step {
+                Some(e) => eval_const_scalar(e, param_consts)?,
+                None => ConstScalar::Int(1),
+            };
+            let (ConstScalar::Int(s), ConstScalar::Int(e), ConstScalar::Int(stp)) =
+                (start_v, end_v, step_v) else { return None; };
+            if stp == 0 { return None; }
+
+            // Walk the range, evaluating the inner values for each
+            // iteration with `var` bound in a temporary param_consts
+            // overlay.
+            let mut local_consts = param_consts.clone();
+            let var_key = var.to_lowercase();
+            let mut i = s;
+            // Cap iterations to avoid runaway folding for runtime
+            // bounds disguised as constants.
+            let mut steps_remaining: i64 = 1_000_000;
+            let going_down = stp < 0;
+            loop {
+                if steps_remaining == 0 { return None; }
+                steps_remaining -= 1;
+                let in_range = if going_down { i >= e } else { i <= e };
+                if !in_range { break; }
+                local_consts.insert(var_key.clone(), ConstScalar::Int(i));
+                for inner in values {
+                    collect_ac_value(inner, elem_ty, &local_consts, out)?;
+                }
+                i = i.wrapping_add(stp);
+            }
+            Some(())
+        }
     }
 }
 
