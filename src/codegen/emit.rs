@@ -315,7 +315,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::FmovReg => format!("fmov {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
 
-        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
+        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm
+        | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
             let offset_val = match &inst.operands[2] {
@@ -323,15 +324,25 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
+            // Pick the mnemonic by opcode. LDRSB / LDRSH expect a
+            // Wt destination (sign-extended into the lower 32 bits);
+            // the dest operand is already a Gp32 vreg in those
+            // cases, so the formatted register name is `w_`.
+            let mnemonic = match inst.opcode {
+                ArmOpcode::LdrsbImm => "ldrsb",
+                ArmOpcode::LdrshImm => "ldrsh",
+                _ => "ldr",
+            };
             if (-256..=255).contains(&offset_val) {
-                format!("ldr {}, [{}, #{}]", dest, base, offset_val)
+                format!("{} {}, [{}, #{}]", mnemonic, dest, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then load.
-                format!("mov x8, #{}\n    add x8, {}, x8\n    ldr {}, [x8]",
-                    offset_val, base, dest)
+                format!("mov x8, #{}\n    add x8, {}, x8\n    {} {}, [x8]",
+                    offset_val, base, mnemonic, dest)
             }
         }
-        ArmOpcode::StrImm | ArmOpcode::StrFpImm => {
+        ArmOpcode::StrImm | ArmOpcode::StrFpImm
+        | ArmOpcode::StrbImm | ArmOpcode::StrhImm => {
             let src = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
             let offset_val = match &inst.operands[2] {
@@ -339,12 +350,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
+            let mnemonic = match inst.opcode {
+                ArmOpcode::StrbImm => "strb",
+                ArmOpcode::StrhImm => "strh",
+                _ => "str",
+            };
             if (-256..=255).contains(&offset_val) {
-                format!("str {}, [{}, #{}]", src, base, offset_val)
+                format!("{} {}, [{}, #{}]", mnemonic, src, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then store.
-                format!("mov x8, #{}\n    add x8, {}, x8\n    str {}, [x8]",
-                    offset_val, base, src)
+                format!("mov x8, #{}\n    add x8, {}, x8\n    {} {}, [x8]",
+                    offset_val, base, mnemonic, src)
             }
         }
 

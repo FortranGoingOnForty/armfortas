@@ -170,7 +170,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
         let mb_id = ctx.block_map[&block.id];
 
         for inst in &block.insts {
-            select_inst(&mut mf, &mut ctx, mb_id, inst);
+            select_inst(&mut mf, &mut ctx, mb_id, inst, func);
         }
 
         if let Some(term) = &block.terminator {
@@ -250,7 +250,7 @@ impl ISelCtx {
 }
 
 /// Select machine instructions for a single IR instruction.
-fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst) {
+fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, func: &Function) {
     match &inst.kind {
         // ---- Constants ----
         InstKind::ConstInt(val, width) => {
@@ -724,8 +724,19 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::Load(addr) => {
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            let is_fp = matches!(class, RegClass::Fp32 | RegClass::Fp64);
-            let opcode = if is_fp { ArmOpcode::LdrFpImm } else { ArmOpcode::LdrImm };
+            // Pick the load opcode by element width. i8 → LDRSB
+            // (sign-extended into Wt), i16 → LDRSH, i32/Bool → LDR
+            // Wt, i64/ptr → LDR Xt, FP → LDR Dt/St. Audit
+            // CRITICAL-2: previously every integer load used the
+            // 32-bit `ldr w_, [_]` regardless of width, so an i8
+            // load read 4 bytes and the result depended on what
+            // happened to follow the byte in memory.
+            let opcode = match &inst.ty {
+                IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
+                IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
+                IrType::Float(_) => ArmOpcode::LdrFpImm,
+                _ => ArmOpcode::LdrImm,
+            };
 
             // If addr is an alloca, load directly from the frame slot.
             if let Some(&offset) = ctx.alloca_offsets.get(addr) {
@@ -754,9 +765,30 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
 
         InstKind::Store(val, addr) => {
             let val_vreg = ctx.lookup_vreg(*val);
-            let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
-            let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
-            let opcode = if is_fp { ArmOpcode::StrFpImm } else { ArmOpcode::StrImm };
+            // Audit CRITICAL-2: pick the store opcode by the IR
+            // VALUE's declared type, not the pointer's pointee.
+            // Byte-level GEPs into derived types and array
+            // constructors use Ptr<i8> as a generic offset cursor
+            // even when the actual element being stored is i32 —
+            // checking the pointee in those cases would
+            // incorrectly emit STRB and write only 1 byte.
+            //
+            // The value's IR type is the source of truth for
+            // store width. STRB / STRH are only used when the
+            // value itself is i8/i16/Bool.
+            let val_ty = func.value_type(*val);
+            let opcode = match &val_ty {
+                Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
+                Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
+                Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
+                _ => {
+                    // Default to the value's reg class for any
+                    // other case (i32, i64, ptr).
+                    let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
+                    let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
+                    if is_fp { ArmOpcode::StrFpImm } else { ArmOpcode::StrImm }
+                }
+            };
 
             if let Some(&offset) = ctx.alloca_offsets.get(addr) {
                 mf.block_mut(mb).insts.push(MachineInst {

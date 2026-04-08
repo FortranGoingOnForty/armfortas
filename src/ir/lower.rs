@@ -241,7 +241,7 @@ fn collect_module_globals(
                 } else {
                     // Scalar module variable.
                     let init = entity.init.as_ref()
-                        .and_then(|e| eval_const_global_init(e, &param_consts));
+                        .and_then(|e| eval_const_global_init(e, &param_consts, Some(&ir_ty)));
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -282,7 +282,7 @@ fn eval_const_array_init(
         let mut out: Vec<f64> = Vec::with_capacity(values.len());
         for v in values {
             let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e, param_consts)? {
+            match eval_const_global_init(e, param_consts, Some(elem_ty))? {
                 GlobalInit::Float(f) => out.push(f),
                 GlobalInit::Int(i) => out.push(i as f64),
                 _ => return None,
@@ -294,7 +294,7 @@ fn eval_const_array_init(
         let mut out: Vec<i64> = Vec::with_capacity(values.len());
         for v in values {
             let AcValue::Expr(e) = v else { return None; };
-            match eval_const_global_init(e, param_consts)? {
+            match eval_const_global_init(e, param_consts, Some(elem_ty))? {
                 GlobalInit::Int(i) => out.push(i),
                 _ => return None,
             }
@@ -531,6 +531,32 @@ fn lower_unit(
     }
 }
 
+/// Sign-extend an i64 const value at the target IR type's width.
+/// `integer(kind=1) :: x = 256` parses to 256, which doesn't fit
+/// in i8; the user almost certainly meant the truncation
+/// (`256 mod 256 = 0`). Clamp by masking to the low N bits and
+/// re-sign-extending. Out-of-range floats and aggregates are
+/// passed through unchanged. Audit CRITICAL-2.
+fn clamp_const_to_type(v: ConstScalar, target: &IrType) -> ConstScalar {
+    match (v, target) {
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I8)) => {
+            ConstScalar::Int((i as i8) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I16)) => {
+            ConstScalar::Int((i as i16) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I32)) => {
+            ConstScalar::Int((i as i32) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Bool) => {
+            ConstScalar::Int(if i != 0 { 1 } else { 0 })
+        }
+        // Int → Float (e.g. `real :: x = 1`).
+        (ConstScalar::Int(i), IrType::Float(_)) => ConstScalar::Float(i as f64),
+        _ => v,
+    }
+}
+
 /// Try to evaluate a scalar initializer expression at compile time
 /// to a `GlobalInit`. Used by SAVE-promotion in `alloc_decls`.
 ///
@@ -548,10 +574,17 @@ fn lower_unit(
 fn eval_const_global_init(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
+    target: Option<&IrType>,
 ) -> Option<GlobalInit> {
-    eval_const_scalar(e, param_consts).map(|v| match v {
-        ConstScalar::Int(i) => GlobalInit::Int(i),
-        ConstScalar::Float(f) => GlobalInit::Float(f),
+    eval_const_scalar(e, param_consts).map(|raw| {
+        let clamped = match target {
+            Some(t) => clamp_const_to_type(raw, t),
+            None => raw,
+        };
+        match clamped {
+            ConstScalar::Int(i) => GlobalInit::Int(i),
+            ConstScalar::Float(f) => GlobalInit::Float(f),
+        }
     })
 }
 
@@ -996,7 +1029,7 @@ fn alloc_decls(
                     // statement elsewhere in the same decl list.
                     let init_expr: Option<&crate::ast::expr::SpannedExpr> =
                         entity.init.as_ref().or_else(|| parameter_inits.get(&key).copied());
-                    if let Some(init) = init_expr.and_then(|e| eval_const_global_init(e, &param_consts)) {
+                    if let Some(init) = init_expr.and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty))) {
                         let global_name = save_global_name(func_name, &key);
                         pending_globals.push(PendingGlobal {
                             global: Global {

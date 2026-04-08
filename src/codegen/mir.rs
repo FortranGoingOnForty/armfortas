@@ -91,6 +91,10 @@ pub enum ArmOpcode {
     // ---- Memory ----
     StrImm,      // STR Xt, [Xn, #imm]
     LdrImm,      // LDR Xt, [Xn, #imm]
+    StrhImm,     // STRH Wt, [Xn, #imm]  (store 16-bit half)
+    LdrshImm,    // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
+    StrbImm,     // STRB Wt, [Xn, #imm]  (store 8-bit byte)
+    LdrsbImm,    // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
     StrFpImm,    // STR Dt, [Xn, #imm]  (float store)
     LdrFpImm,    // LDR Dt, [Xn, #imm]  (float load)
     StpPre,      // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
