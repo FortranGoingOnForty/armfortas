@@ -174,8 +174,15 @@ struct ModuleGlobalInfo {
     symbol: String,
     /// Element type (for scalars) or array element type (for arrays).
     ty: IrType,
-    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars.
+    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars
+    /// and for deferred-shape allocatables.
     dims: Vec<(i64, i64)>,
+    /// True for module-level allocatable arrays. The global is a
+    /// 384-byte zero-init descriptor; runtime allocate() populates
+    /// it. install_globals_as_locals threads this through into
+    /// LocalInfo.allocatable so subscript access goes through the
+    /// runtime descriptor path. Audit MAJOR-5.
+    allocatable: bool,
 }
 
 /// Walk a module's declarations and emit a global per variable.
@@ -223,12 +230,40 @@ fn collect_module_globals(
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
+            let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             for entity in entities {
                 let symbol = format!("afs_mod_{}_{}",
                     mod_name.to_lowercase(),
                     entity.name.to_lowercase());
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
+
+                // Audit MAJOR-5: module-level allocatable arrays.
+                // Emit a 384-byte zero-init descriptor as the
+                // global; runtime allocate() populates it. The
+                // shape (deferred or fixed) doesn't matter for
+                // emission — the descriptor stores it at runtime.
+                if is_allocatable && array_spec.is_some() {
+                    let desc_ty = IrType::Array(
+                        Box::new(IrType::Int(IntWidth::I8)),
+                        384,
+                    );
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: desc_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims: vec![],
+                            allocatable: true,
+                        },
+                    );
+                    continue;
+                }
 
                 if let Some(specs) = array_spec {
                     // Array module variable. Compute dims and
@@ -281,6 +316,7 @@ fn collect_module_globals(
                             symbol,
                             ty: ir_ty.clone(),
                             dims,
+                            allocatable: false,
                         },
                     );
                 } else {
@@ -298,6 +334,7 @@ fn collect_module_globals(
                             symbol,
                             ty: ir_ty.clone(),
                             dims: vec![],
+                            allocatable: false,
                         },
                     );
                 }
@@ -1042,12 +1079,22 @@ fn install_one_global(
     info: &ModuleGlobalInfo,
 ) {
     if locals.contains_key(&local_key) { return; }
-    let addr = b.global_addr(&info.symbol, info.ty.clone());
+    // For allocatable module arrays the global is a 384-byte
+    // descriptor — global_addr produces a `Ptr<Array<i8, 384>>`
+    // which feeds the runtime allocate/deallocate/subscript
+    // helpers as the descriptor address.
+    let addr_ty = if info.allocatable {
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
+    } else {
+        info.ty.clone()
+    };
+    let addr = b.global_addr(&info.symbol, addr_ty);
     locals.insert(local_key, LocalInfo {
         addr,
         ty: info.ty.clone(),
         dims: info.dims.clone(),
-        allocatable: false, by_ref: false,
+        allocatable: info.allocatable,
+        by_ref: false,
         char_kind: CharKind::None, derived_type: None, inline_const: None,
     });
 }

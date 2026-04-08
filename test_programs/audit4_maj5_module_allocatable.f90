@@ -1,25 +1,19 @@
-! Audit #4 MAJOR-5 — module-level allocatable arrays are
-! completely non-functional.
+! Audit #4 MAJOR-5 — module-level allocatable arrays now work.
 !
-! Module deferred-shape arrays `integer, allocatable :: arr(:)`
-! get total = 0 from extract_array_dims (assumed/deferred shape
-! returns extent 0), and collect_module_globals' total <= 0
-! guard skips emission entirely. install_globals_as_locals can't
-! find the global, so subsequent references fall through and the
-! program silently produces 0s for everything.
+! Fixed: collect_module_globals now detects the
+! `is_allocatable && array_spec.is_some()` case BEFORE the
+! total<=0 deferred-shape skip and emits a 384-byte zero-init
+! descriptor global. ModuleGlobalInfo gains an `allocatable`
+! field; install_one_global propagates it into LocalInfo and
+! types the addr as `Ptr<Array<i8, 384>>` so the runtime
+! allocate/deallocate/subscript helpers see the descriptor.
 !
-! Worse: even the allocate() and assignment statements get
-! elided because their target name resolves to const_int 0
-! before reaching lowering — the IR shows zero stores at all,
-! just a print of literal 0.
-!
-! Module allocatables need to emit a 384-byte zero-init descriptor
-! global (not a typed array) and install with allocatable=true so
-! `allocate(arr(...))` finds the descriptor at runtime.
+! With this in place, the existing local-allocatable lowering
+! pipeline just works for module-scope allocatables — no
+! changes needed to the runtime ABI.
 !
 ! Critical for fortsh: ~55 modules use allocatable shell state.
 !
-! XFAIL: audit MAJOR-5 (module allocatable arrays nonfunctional)
 ! CHECK: 10 20 30 40 50
 program audit4_maj5_module_allocatable
   use audit4_maj5_mod
