@@ -133,8 +133,10 @@ pub fn lower_file(
 
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
+    // Top-level units have no host, so an empty host_uses slice.
+    let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts);
+        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host);
     }
     module
 }
@@ -278,7 +280,21 @@ fn eval_const_array_init(
     }
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<(String, String), ModuleGlobalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+fn lower_unit(
+    module: &mut Module,
+    unit: &SpannedUnit,
+    st: &SymbolTable,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    // Audit CRITICAL-4: USE imports from the host program unit
+    // (and its hosts, transitively). Per F2018 §16.2, names
+    // imported into a host are visible in its contained
+    // subprograms via host association. Each lower_unit call
+    // accumulates its own uses on top of host_uses and passes
+    // the combined list down to any nested subprogram. The
+    // top-level call from lower_file passes an empty slice.
+    host_uses: &[crate::ast::decl::SpannedDecl],
+) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -286,10 +302,18 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
+            // Combined USE list for this unit: host_uses inherited
+            // from the program ancestry + this unit's own uses.
+            // Programs themselves have no host, so host_uses is
+            // typically empty here, but a Program declared inside
+            // a Module (rare but legal) would inherit module uses.
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
+
             {
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -303,12 +327,14 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 module.add_global(pg.global);
             }
 
-            // Lower CONTAINS subprograms.
+            // Lower CONTAINS subprograms with this unit's combined
+            // uses as their host_uses, so host association threads
+            // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
             }
         }
-        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, .. } => {
+        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
             // BIND(C): use specified C name, otherwise use Fortran name.
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
@@ -327,6 +353,8 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
 
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
@@ -363,7 +391,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -376,8 +404,16 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             for pg in pending_globals {
                 module.add_global(pg.global);
             }
+
+            // Lower nested CONTAINS subprograms (this was a latent
+            // bug — the previous code only walked Program::contains).
+            // Each nested sub inherits this subroutine's combined
+            // host_uses + own uses.
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
+            }
         }
-        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, .. } => {
+        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
@@ -400,6 +436,8 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             let mut func = Function::new(func_name.clone(), params, ret_ty.clone());
             let mut ctx = LowerCtx::new(st, globals, type_layouts);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
 
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
@@ -439,7 +477,7 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                 ctx.result_type = Some(ret_ty.clone());
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -453,6 +491,11 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
             module.add_function(func);
             for pg in pending_globals {
                 module.add_global(pg.global);
+            }
+
+            // Lower nested CONTAINS subprograms.
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
             }
         }
         ProgramUnit::Module { .. } => {
