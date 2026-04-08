@@ -1,16 +1,14 @@
-! Audit #4 MAJOR-3 — module array with too-long initializer
-! must be a compile-time error.
+! Audit #4 MAJOR-3 — module array with too-long initializer is
+! now diagnosed as a compile-time error.
 !
-! Per F2018 §7.4.4, an initializer's shape must conform with the
-! variable's declared shape. `integer :: arr(2) = [1,2,3]` is a
-! constraint violation. Today eval_const_array_init silently
-! truncates and emit_globals doesn't assert the count matches.
+! Fixed: collect_module_globals invokes collect_const_array_scalars
+! BEFORE eval_const_array_init and checks scalars.len() against
+! the declared total. Over-long is rejected with an error
+! mentioning the actual vs expected element counts.
 !
-! When the fix lands, the compiler must reject this with a
-! diagnostic mentioning the shape mismatch. Stderr should
-! contain "shape" or "initializer" or similar.
+! Per F2018 §7.4.4 the initializer's shape must conform with the
+! variable's declared shape; this used to be silently truncated.
 !
-! XFAIL: audit MAJOR-3 (module array too-long initializer not diagnosed)
 ! ERROR_EXPECTED: shape
 program audit4_maj3_module_array_too_long
   use audit4_maj3_mod

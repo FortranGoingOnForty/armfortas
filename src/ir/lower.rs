@@ -68,6 +68,13 @@ struct LowerCtx<'a> {
     /// USE statements, honor ONLY lists, and apply renames.
     globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    /// Names that a `use mod, only: ...` statement explicitly
+    /// excluded. install_globals_as_locals populates this from the
+    /// difference between a module's exported globals and the
+    /// only-list. Audit MAJOR-1: a reference to a name in this
+    /// set must produce a compile error rather than silently
+    /// lowering to const_int 0.
+    filtered_names: HashSet<String>,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
     /// For functions: the return type.
@@ -76,7 +83,16 @@ struct LowerCtx<'a> {
 
 impl<'a> LowerCtx<'a> {
     fn new(st: &'a SymbolTable, globals: &'a HashMap<(String, String), ModuleGlobalInfo>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
-        Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
+        Self {
+            locals: HashMap::new(),
+            loops: Vec::new(),
+            st,
+            globals,
+            type_layouts,
+            filtered_names: HashSet::new(),
+            result_addr: None,
+            result_type: None,
+        }
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
@@ -222,6 +238,28 @@ fn collect_module_globals(
                         Box::new(ir_ty.clone()),
                         total as u64,
                     );
+
+                    // Audit MAJOR-3: detect over-long initializer
+                    // BEFORE eval_const_array_init returns None.
+                    // Per F2018 §7.4.4, the initializer's shape
+                    // must conform with the variable's declared
+                    // shape; over-long is a hard error.
+                    if let Some(init_e) = &entity.init {
+                        if let Some(scalars) =
+                            collect_const_array_scalars(init_e, &ir_ty, &param_consts)
+                        {
+                            if (scalars.len() as i64) > total {
+                                eprintln!(
+                                    "armfortas: error: initializer for '{}' has \
+                                     {} elements but its declared shape requires \
+                                     {} (audit MAJOR-3 — initializer shape \
+                                     mismatch)",
+                                    entity.name, scalars.len(), total,
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
 
                     let init = entity.init.as_ref()
                         .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts));
@@ -433,6 +471,8 @@ fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -511,6 +551,8 @@ fn lower_unit(
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -597,6 +639,8 @@ fn lower_unit(
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -812,6 +856,153 @@ fn collect_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
 /// uniformly with stack locals. Must run *after* `alloc_decls` so
 /// that any same-named local declared in this subprogram shadows
 /// the global per Fortran scoping rules.
+/// Walk a body of statements and check every Expr::Name against
+/// the function's filtered names set. If any match, emit a hard
+/// compile-time error mentioning the filtered name. This is the
+/// pre-lowering hook for audit MAJOR-1: USE ONLY hides a name
+/// must not silently lower to const_int 0.
+fn check_no_filtered_refs(
+    body: &[crate::ast::stmt::SpannedStmt],
+    filtered: &HashSet<String>,
+) {
+    if filtered.is_empty() { return; }
+    for stmt in body {
+        check_filtered_in_stmt(stmt, filtered);
+    }
+}
+
+fn check_filtered_in_stmt(
+    stmt: &crate::ast::stmt::SpannedStmt,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        Stmt::Assignment { target, value } => {
+            check_filtered_in_expr(target, filtered);
+            check_filtered_in_expr(value, filtered);
+        }
+        Stmt::Print { format, items } => {
+            check_filtered_in_expr(format, filtered);
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            check_filtered_in_expr(condition, filtered);
+            check_no_filtered_refs(then_body, filtered);
+            for (cond, body) in else_ifs {
+                check_filtered_in_expr(cond, filtered);
+                check_no_filtered_refs(body, filtered);
+            }
+            if let Some(eb) = else_body {
+                check_no_filtered_refs(eb, filtered);
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            check_filtered_in_expr(condition, filtered);
+            check_filtered_in_stmt(action, filtered);
+        }
+        Stmt::DoLoop { start, end, step, body, .. } => {
+            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = step { check_filtered_in_expr(e, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::DoWhile { condition, body, .. } => {
+            check_filtered_in_expr(condition, filtered);
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::Call { callee, args } => {
+            check_filtered_in_expr(callee, filtered);
+            for a in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    check_filtered_in_expr(e, filtered);
+                }
+            }
+        }
+        Stmt::Block { body, .. } => check_no_filtered_refs(body, filtered),
+        _ => {}
+    }
+}
+
+fn check_filtered_in_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    filtered: &HashSet<String>,
+) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if filtered.contains(&key) {
+                eprintln!(
+                    "armfortas: error: '{}' is not accessible in this scope — \
+                     it was filtered out by a USE ONLY clause (audit MAJOR-1)",
+                    name,
+                );
+                std::process::exit(1);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_filtered_in_expr(left, filtered);
+            check_filtered_in_expr(right, filtered);
+        }
+        Expr::UnaryOp { operand, .. } => check_filtered_in_expr(operand, filtered),
+        Expr::ParenExpr { inner } => check_filtered_in_expr(inner, filtered),
+        Expr::FunctionCall { callee, args } => {
+            check_filtered_in_expr(callee, filtered);
+            for a in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    check_filtered_in_expr(e, filtered);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk the function's USE statements and collect every name
+/// from a USE-only-imported module that the only-list filtered
+/// out. Audit MAJOR-1: those names must NOT silently fall
+/// through to const_int 0; the lowerer treats them as undefined
+/// at the reference site.
+fn compute_filtered_names(
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+) -> HashSet<String> {
+    use crate::ast::decl::OnlyItem;
+    let mut filtered: HashSet<String> = HashSet::new();
+    for decl in uses {
+        let Decl::UseStmt { module, only: Some(only_list), .. } = &decl.node else { continue; };
+        let mod_key = module.to_lowercase();
+        // The set of names this module exports (limited to what
+        // collect_module_globals registered — module functions and
+        // derived types are tracked elsewhere and remain visible).
+        let mut exports: HashSet<String> = HashSet::new();
+        for ((mk, var), _info) in globals {
+            if *mk == mod_key {
+                exports.insert(var.clone());
+            }
+        }
+        // The set of (lowercase) names the only-list explicitly
+        // imports. A rename's `remote` is what's pulled from the
+        // module; a Name is itself.
+        let mut imported: HashSet<String> = HashSet::new();
+        for item in only_list {
+            match item {
+                OnlyItem::Name(n) => { imported.insert(n.to_lowercase()); }
+                OnlyItem::Rename(rn) => { imported.insert(rn.remote.to_lowercase()); }
+            }
+        }
+        // Anything in exports but not imported is now filtered.
+        for e in &exports {
+            if !imported.contains(e) {
+                filtered.insert(e.clone());
+            }
+        }
+    }
+    filtered
+}
+
 /// Install a module-level global as a `LocalInfo` entry under the
 /// given local key. Shared helper so all install paths build a
 /// consistent LocalInfo shape.

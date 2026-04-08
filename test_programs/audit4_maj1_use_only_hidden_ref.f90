@@ -1,24 +1,14 @@
-! Audit #4 MAJOR-1 — USE ONLY filtering allows explicit references
-! to filtered names, silently lowering them to const_int 0.
+! Audit #4 MAJOR-1 — USE ONLY filtered names now produce a
+! compile-time error.
 !
-! With `implicit none`, referencing a name that the only-list
-! excluded must be a compile-time error per F2018 §11.2.2 (USE
-! association brings in only the listed names; anything else is
-! undefined). Without implicit none it should at minimum warn
-! that an implicit local is being created from a host name.
+! Fixed: lower.rs computes a `filtered_names` set per scope by
+! diffing each `use mod, only: ...` against that module's
+! exported globals. A pre-pass walks the function body before
+! lowering and emits a hard compile-time error mentioning the
+! filtered name when any reference to it is detected. Per
+! F2018 §11.2.2, USE association brings in only the listed
+! names — anything else must be diagnosed.
 !
-! Today the C2 fix correctly excludes `hidden` from the locals
-! map (so it's not USE-imported), but sema doesn't track the
-! "could-have-been-imported" set, and the lowerer falls through
-! to const_int 0 without diagnosing.
-!
-! Fix: track the module's public surface that the only-list
-! filtered out, and have sema diagnose references against it.
-!
-! Both annotations: ERROR_EXPECTED for the post-fix behavior
-! (we eventually diagnose), XFAIL for today (we don't).
-!
-! XFAIL: audit MAJOR-1 (USE ONLY hidden name not diagnosed)
 ! ERROR_EXPECTED: hidden
 program audit4_maj1_use_only_hidden_ref
   use audit4_maj1_mod, only: shown
