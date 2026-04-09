@@ -21,6 +21,7 @@ The canonical leaf-assertion language lives in source comments inside
 - `! ASM_CHECK:` / `! ASM_NOT:`
 - `! FILE_CHECK:` / `! FILE_NOT:`
 - `! REPRO_CHECK:`
+- `! OPT_EQ:`
 - `! IR_CHECK:`
 - `! IR_NOT:`
 

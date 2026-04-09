@@ -135,6 +135,19 @@
 //!
 //! These are test-local determinism assertions, lighter-weight than the
 //! dedicated global determinism tests at the bottom of this file.
+//!
+//! ## OPT_EQ annotations
+//!
+//! Cross-opt invariants can be asserted explicitly:
+//!
+//!   * `! OPT_EQ: O0,O1,O2 => stdout|stderr|exit`
+//!   * `! OPT_EQ: O0,O1 => asm`
+//!
+//! The first listed opt level is the baseline. When that level runs, the
+//! harness compiles the same source at the other listed opt levels and
+//! compares the requested surfaces. This lets a test say "these runtime
+//! surfaces must agree across optimization" without also pinning every
+//! assembly detail at every level.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -163,6 +176,21 @@ enum ReproStage {
     Asm,
     Obj,
     Run,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptEqComponent {
+    Stdout,
+    Stderr,
+    Exit,
+    Asm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OptEqRule {
+    line_num: usize,
+    opt_flags: Vec<String>,
+    components: Vec<OptEqComponent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +434,75 @@ fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>,
     Ok(stages)
 }
 
+fn parse_supported_opt(token: &str, filename: &str, line_num: usize) -> Result<String, String> {
+    let trimmed = token.trim().trim_start_matches('-');
+    match trimmed {
+        "O0" | "O1" | "O2" | "O3" | "Ofast" => Ok(format!("-{}", trimmed)),
+        other => Err(format!(
+            "{}:{}: OPT_EQ only supports O0, O1, O2, O3, or Ofast; got '{}'",
+            filename, line_num, other
+        )),
+    }
+}
+
+fn extract_opt_eq_rules(source: &str, filename: &str) -> Result<Vec<OptEqRule>, String> {
+    let mut rules = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let line_num = i + 1;
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("! OPT_EQ:") else {
+            continue;
+        };
+        let Some((opts_text, components_text)) = rest.trim().split_once("=>") else {
+            return Err(format!(
+                "{}:{}: OPT_EQ must be written as <opts> => <components>",
+                filename, line_num
+            ));
+        };
+
+        let opt_flags = opts_text
+            .split(',')
+            .map(|token| parse_supported_opt(token, filename, line_num))
+            .collect::<Result<Vec<_>, _>>()?;
+        if opt_flags.len() < 2 {
+            return Err(format!(
+                "{}:{}: OPT_EQ needs at least two opt levels to compare",
+                filename, line_num
+            ));
+        }
+
+        let mut components = Vec::new();
+        for token in components_text.split('|') {
+            let component = match token.trim() {
+                "stdout" => OptEqComponent::Stdout,
+                "stderr" => OptEqComponent::Stderr,
+                "exit" => OptEqComponent::Exit,
+                "asm" => OptEqComponent::Asm,
+                other => {
+                    return Err(format!(
+                        "{}:{}: OPT_EQ components must be stdout, stderr, exit, or asm; got '{}'",
+                        filename, line_num, other
+                    ))
+                }
+            };
+            components.push(component);
+        }
+        if components.is_empty() {
+            return Err(format!(
+                "{}:{}: OPT_EQ needs at least one comparison component",
+                filename, line_num
+            ));
+        }
+
+        rules.push(OptEqRule {
+            line_num,
+            opt_flags,
+            components,
+        });
+    }
+    Ok(rules)
+}
+
 fn diagnostic_contains_span(stderr: &str, expected: ExpectedSpan) -> bool {
     let needle = format!("{}:{}:", expected.line, expected.col);
     stderr.contains(&needle)
@@ -574,16 +671,16 @@ fn collect_sandbox_files(
             collect_sandbox_files(root, &path, out)?;
         } else {
             let rel = path.strip_prefix(root).unwrap();
-            out.insert(
-                rel.to_string_lossy().replace('\\', "/"),
-                fs::read(&path)?,
-            );
+            out.insert(rel.to_string_lossy().replace('\\', "/"), fs::read(&path)?);
         }
     }
     Ok(())
 }
 
-fn snapshot_sandbox_files(sandbox: &Path, filename: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
+fn snapshot_sandbox_files(
+    sandbox: &Path,
+    filename: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
     collect_sandbox_files(sandbox, sandbox, &mut files).map_err(|e| {
         format!(
@@ -596,7 +693,11 @@ fn snapshot_sandbox_files(sandbox: &Path, filename: &str) -> Result<BTreeMap<Str
     Ok(files)
 }
 
-fn run_binary_in_sandbox(binary: &Path, sandbox: &Path, filename: &str) -> Result<RunSnapshot, String> {
+fn run_binary_in_sandbox(
+    binary: &Path,
+    sandbox: &Path,
+    filename: &str,
+) -> Result<RunSnapshot, String> {
     let run = Command::new(binary)
         .current_dir(sandbox)
         .output()
@@ -682,14 +783,18 @@ fn compile_stage_bytes(
     };
     let out = unique_temp_path(kind, stem, level, ext);
     let compile = Command::new(compiler)
-        .args([
-            source.to_str().unwrap(),
-            opt_flag,
-        ])
+        .args([source.to_str().unwrap(), opt_flag])
         .args(extra_args)
         .args(["-o", out.to_str().unwrap()])
         .output()
-        .map_err(|e| format!("{}: cannot run compiler for {} repro: {}", source.display(), kind, e))?;
+        .map_err(|e| {
+            format!(
+                "{}: cannot run compiler for {} repro: {}",
+                source.display(),
+                kind,
+                e
+            )
+        })?;
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr);
         let _ = fs::remove_file(&out);
@@ -701,10 +806,181 @@ fn compile_stage_bytes(
             stderr
         ));
     }
-    let bytes = fs::read(&out)
-        .map_err(|e| format!("{}: cannot read {} output {}: {}", source.display(), kind, out.display(), e))?;
+    let bytes = fs::read(&out).map_err(|e| {
+        format!(
+            "{}: cannot read {} output {}: {}",
+            source.display(),
+            kind,
+            out.display(),
+            e
+        )
+    })?;
     let _ = fs::remove_file(&out);
     Ok(bytes)
+}
+
+fn compile_and_run_snapshot(
+    compiler: &Path,
+    source: &Path,
+    opt_flag: &str,
+    filename: &str,
+) -> Result<RunSnapshot, String> {
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+    let level = opt_flag.trim_start_matches('-');
+    let binary = unique_temp_path("test_bin", stem, level, "");
+    let sandbox = unique_temp_path("test_sandbox", stem, &format!("{}_opt_eq", level), "");
+
+    let compile = Command::new(compiler)
+        .args([
+            source.to_str().unwrap(),
+            opt_flag,
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        let _ = fs::remove_file(&binary);
+        return Err(format!(
+            "{} [{}]: OPT_EQ comparison compile failed:\n{}",
+            filename, opt_flag, stderr
+        ));
+    }
+
+    fs::create_dir_all(&sandbox).map_err(|e| {
+        format!(
+            "{}: cannot create OPT_EQ sandbox dir {}: {}",
+            filename,
+            sandbox.display(),
+            e
+        )
+    })?;
+    let snapshot = run_binary_in_sandbox(&binary, &sandbox, filename)?;
+    let _ = fs::remove_file(&binary);
+    let _ = fs::remove_dir_all(&sandbox);
+    Ok(snapshot)
+}
+
+fn render_opt_eq_components(components: &[OptEqComponent]) -> String {
+    components
+        .iter()
+        .map(|component| match component {
+            OptEqComponent::Stdout => "stdout",
+            OptEqComponent::Stderr => "stderr",
+            OptEqComponent::Exit => "exit",
+            OptEqComponent::Asm => "asm",
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn compare_opt_eq_runtime_components(
+    baseline: &RunSnapshot,
+    other: &RunSnapshot,
+    components: &[OptEqComponent],
+) -> Option<String> {
+    for component in components {
+        match component {
+            OptEqComponent::Exit if baseline.exit_code != other.exit_code => {
+                return Some(format!(
+                    "exit mismatch: baseline {}, other {}",
+                    baseline.exit_code, other.exit_code
+                ))
+            }
+            OptEqComponent::Stdout if baseline.stdout != other.stdout => {
+                return Some(format!(
+                    "stdout mismatch:\nbaseline:\n{}\nother:\n{}",
+                    baseline.stdout, other.stdout
+                ))
+            }
+            OptEqComponent::Stderr if baseline.stderr != other.stderr => {
+                return Some(format!(
+                    "stderr mismatch:\nbaseline:\n{}\nother:\n{}",
+                    baseline.stderr, other.stderr
+                ))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn run_opt_eq_rules(
+    compiler: &Path,
+    source: &Path,
+    opt_flag: &str,
+    filename: &str,
+    baseline_snapshot: &RunSnapshot,
+    rules: &[OptEqRule],
+) -> Result<(), String> {
+    for rule in rules {
+        if rule.opt_flags.first().map(String::as_str) != Some(opt_flag) {
+            continue;
+        }
+
+        let baseline_asm = if rule.components.contains(&OptEqComponent::Asm) {
+            Some(compile_stage_bytes(
+                compiler,
+                source,
+                opt_flag,
+                ReproStage::Asm,
+            )?)
+        } else {
+            None
+        };
+
+        for compare_opt in rule.opt_flags.iter().skip(1) {
+            if rule
+                .components
+                .iter()
+                .any(|component| *component != OptEqComponent::Asm)
+            {
+                let other = compile_and_run_snapshot(compiler, source, compare_opt, filename)?;
+                if let Some(detail) =
+                    compare_opt_eq_runtime_components(baseline_snapshot, &other, &rule.components)
+                {
+                    return Err(format!(
+                        "{} [{}]: OPT_EQ({} => {}) failed comparing {} to {}: {}",
+                        filename,
+                        opt_flag,
+                        rule.opt_flags
+                            .iter()
+                            .map(|flag| flag.trim_start_matches('-'))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        render_opt_eq_components(&rule.components),
+                        opt_flag,
+                        compare_opt,
+                        detail,
+                    ));
+                }
+            }
+
+            if let Some(baseline_asm) = &baseline_asm {
+                let other_asm =
+                    compile_stage_bytes(compiler, source, compare_opt, ReproStage::Asm)?;
+                if baseline_asm != &other_asm {
+                    return Err(format!(
+                        "{} [{}]: OPT_EQ({} => {}) failed comparing {} to {}: assembly output differed",
+                        filename,
+                        opt_flag,
+                        rule
+                            .opt_flags
+                            .iter()
+                            .map(|flag| flag.trim_start_matches('-'))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        render_opt_eq_components(&rule.components),
+                        opt_flag,
+                        compare_opt,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn describe_run_difference(first: &RunSnapshot, second: &RunSnapshot) -> String {
@@ -782,17 +1058,17 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
     let ir_checks = extract_ir_checks(&source_text);
     let asm_checks = extract_asm_checks(&source_text);
-    let file_checks = match extract_file_checks(
-        &source_text,
-        filename,
-        "! FILE_CHECK:",
-        "! FILE_NOT:",
-    ) {
+    let file_checks =
+        match extract_file_checks(&source_text, filename, "! FILE_CHECK:", "! FILE_NOT:") {
+            Ok(checks) => checks,
+            Err(e) => return TestOutcome::Fail(e),
+        };
+    let repro_checks = match extract_repro_checks(&source_text, filename) {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
     };
-    let repro_checks = match extract_repro_checks(&source_text, filename) {
-        Ok(checks) => checks,
+    let opt_eq_rules = match extract_opt_eq_rules(&source_text, filename) {
+        Ok(rules) => rules,
         Err(e) => return TestOutcome::Fail(e),
     };
     if checks.is_empty()
@@ -801,6 +1077,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && asm_checks.is_empty()
         && file_checks.is_empty()
         && repro_checks.is_empty()
+        && opt_eq_rules.is_empty()
         && expected_exit_code.is_none()
         && error_span.is_none()
         && xfail_reason.is_none()
@@ -943,7 +1220,8 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     }
                 }
                 ReproStage::Run => {
-                    let repro_sandbox = unique_temp_path("test_sandbox", stem, &format!("{}_repro", level), "");
+                    let repro_sandbox =
+                        unique_temp_path("test_sandbox", stem, &format!("{}_repro", level), "");
                     fs::create_dir_all(&repro_sandbox).map_err(|e| {
                         format!(
                             "{}: cannot create repro sandbox dir {}: {}",
@@ -1023,6 +1301,15 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             let _ = fs::remove_file(&asm_dest);
             match_asm_checks(&asm_checks, &asm_text, &label)?;
         }
+
+        run_opt_eq_rules(
+            compiler,
+            source,
+            opt_flag,
+            filename,
+            &snapshot,
+            &opt_eq_rules,
+        )?;
 
         Ok(())
     };
@@ -1254,6 +1541,30 @@ fn extract_repro_checks_rejects_unknown_stage() {
 }
 
 #[test]
+fn extract_opt_eq_rules_accepts_runtime_and_asm_components() {
+    let source = "! OPT_EQ: O0,O1,O2 => stdout|stderr|exit|asm\n";
+    let rules = extract_opt_eq_rules(source, "inline.f90").unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].opt_flags, vec!["-O0", "-O1", "-O2"]);
+    assert_eq!(
+        rules[0].components,
+        vec![
+            OptEqComponent::Stdout,
+            OptEqComponent::Stderr,
+            OptEqComponent::Exit,
+            OptEqComponent::Asm
+        ]
+    );
+}
+
+#[test]
+fn extract_opt_eq_rules_rejects_unknown_component() {
+    let source = "! OPT_EQ: O0,O1 => ir\n";
+    let err = extract_opt_eq_rules(source, "inline.f90").unwrap_err();
+    assert!(err.contains("stdout, stderr, exit, or asm"));
+}
+
+#[test]
 fn extract_exit_code_rejects_multiple_annotations() {
     let source = "! EXIT_CODE: 1\n! EXIT_CODE: 2\nprogram t\nend program t\n";
     let err = extract_exit_code(source, "inline.f90").unwrap_err();
@@ -1336,7 +1647,10 @@ fn file_checks_allow_file_roundtrip() {
 
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("file_io.f90 should pass with FILE_CHECK coverage, got {:?}", other),
+        other => panic!(
+            "file_io.f90 should pass with FILE_CHECK coverage, got {:?}",
+            other
+        ),
     }
 }
 
@@ -1352,6 +1666,28 @@ fn repro_checks_allow_hello_stage_repro() {
 
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("hello.f90 should pass with REPRO_CHECK coverage, got {:?}", other),
+        other => panic!(
+            "hello.f90 should pass with REPRO_CHECK coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("hello.f90");
+    assert!(
+        source.exists(),
+        "hello.f90 missing — needed for OPT_EQ coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "hello.f90 should pass with OPT_EQ coverage, got {:?}",
+            other
+        ),
     }
 }

@@ -1,5 +1,23 @@
 # Testing 02: Pipeline Oracles and Side-Effect Checks
 
+## Status
+
+Active.
+
+The first concrete slice is now rooted in the armfortas-first harness:
+
+- `OPT_EQ` is the first explicit cross-opt oracle
+- it lets one source assert that selected surfaces must agree across
+  optimization levels
+- the initial component set is:
+  - `stdout`
+  - `stderr`
+  - `exit`
+  - `asm`
+
+That gives the harness a deliberate place to express "runtime invariant across
+opt levels" without pretending every IR or ASM shape must remain frozen.
+
 ## Goal
 
 Push the harness beyond "compile, run, compare stdout" into richer pipeline
