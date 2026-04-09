@@ -1,5 +1,32 @@
 # Testing 01: Shared Annotation Language
 
+## Status
+
+Complete.
+
+The first-wave shared directives are now real in the root harness, and the
+same source-comment language is flowing into `bencch` where it makes sense:
+
+- root harness:
+  - `STDERR_CHECK`
+  - `EXIT_CODE`
+  - `ERROR_SPAN`
+  - `ASM_CHECK` / `ASM_NOT`
+  - `FILE_CHECK` / `FILE_NOT`
+  - `REPRO_CHECK`
+- `bencch` shared-comment compatibility:
+  - `run.stdout` -> `CHECK`
+  - `run.stderr` -> `STDERR_CHECK`
+  - `run.exit_code` -> `EXIT_CODE`
+  - `run.files` -> `FILE_CHECK` / `FILE_NOT`
+  - `ir` -> `IR_CHECK` / `IR_NOT`
+  - `asm` -> `ASM_CHECK` / `ASM_NOT`
+  - `expect-fail <stage> check-comments` -> `ERROR_EXPECTED` + optional `ERROR_SPAN`
+  - `consistency => check-comments` -> `REPRO_CHECK`
+
+The important closeout line is that source comments are now genuinely shared
+instead of only documented as shared.
+
 ## Goal
 
 Define one source-directed assertion language for both the root harness and
@@ -65,3 +92,14 @@ The language definition is ready when the docs clearly specify:
 - an ASM test with `ASM_CHECK` and `ASM_NOT`
 - a filesystem-side-effect test with `FILE_CHECK` and `FILE_NOT`
 - a reproducibility test with `REPRO_CHECK`
+
+Those scenarios are now covered by committed root fixtures plus `bencch`
+compat suites under `suites/compat/`.
+
+## Next
+
+Testing 02 picks up from here:
+
+- phase-triangulation and side-effect oracles
+- deeper filesystem assertions beyond simple file roundtrips
+- more deliberate reproducibility and cross-stage consistency campaigns
