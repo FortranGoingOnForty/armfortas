@@ -2235,6 +2235,157 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
     }
 }
 
+/// Resolve the raw data pointer and declared length for a character argument expression.
+/// Returns `None` if the argument is not a recognized fixed-length character.
+fn char_addr_and_len(
+    b: &mut FuncBuilder,
+    arg_spanned: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<(ValueId, i64)> {
+    use crate::ast::expr::Expr;
+    match &arg_spanned.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            match &info.char_kind {
+                CharKind::Fixed(n) => {
+                    let ptr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                    Some((ptr, *n))
+                }
+                CharKind::Deferred | CharKind::None => None,
+            }
+        }
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            Some((ptr, value.len() as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Lower character intrinsic functions (LEN, LEN_TRIM, ICHAR, CHAR, INDEX, SCAN, VERIFY,
+/// ADJUSTL, ADJUSTR, TRIM). These need access to `locals` (for CharKind info) and the
+/// original un-lowered argument expressions, so they cannot go through `lower_intrinsic`.
+/// Returns Some(ValueId) if recognized, None otherwise.
+fn lower_char_intrinsic(
+    b: &mut FuncBuilder,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<ValueId> {
+    use crate::ast::expr::SectionSubscript;
+
+    // Extract the SpannedExpr from argument i.
+    let arg_spanned = |i: usize| -> Option<&crate::ast::expr::SpannedExpr> {
+        args.get(i).and_then(|a| {
+            if let SectionSubscript::Element(e) = &a.value { Some(e) } else { None }
+        })
+    };
+
+    match name {
+        "len" => {
+            let (_, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            Some(b.const_i64(declared_len))
+        }
+        "len_trim" => {
+            let (ptr, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let len_val = b.const_i64(declared_len);
+            Some(b.call(FuncRef::External("afs_len_trim".into()),
+                vec![ptr, len_val], IrType::Int(IntWidth::I64)))
+        }
+        "ichar" => {
+            let (ptr, _) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let byte = b.load_typed(ptr, IrType::Int(IntWidth::I8));
+            Some(b.call(FuncRef::External("afs_ichar".into()),
+                vec![byte], IrType::Int(IntWidth::I32)))
+        }
+        "char" => {
+            let int_arg = args.first().and_then(|a| {
+                if let SectionSubscript::Element(e) = &a.value {
+                    Some(lower_expr(b, locals, e, st))
+                } else { None }
+            })?;
+            let i32_arg = match b.func().value_type(int_arg) {
+                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_arg, IntWidth::I32),
+                _ => int_arg,
+            };
+            let byte_val = b.call(FuncRef::External("afs_char".into()),
+                vec![i32_arg], IrType::Int(IntWidth::I8));
+            // Allocate a 1-byte buffer and store through a byte-level GEP to avoid
+            // the Ptr<[i8 x 1]> vs Ptr<i8> store-type mismatch.
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1));
+            let zero = b.const_i64(0);
+            let byte_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+            b.store(byte_val, byte_ptr);
+            Some(buf)
+        }
+        "index" => {
+            let (hay_ptr, hay_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (needle_ptr, needle_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let hay_len_val = b.const_i64(hay_len);
+            let needle_len_val = b.const_i64(needle_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_index".into()),
+                vec![hay_ptr, hay_len_val, needle_ptr, needle_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "scan" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let src_len_val = b.const_i64(src_len);
+            let set_len_val = b.const_i64(set_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_scan".into()),
+                vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "verify" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let src_len_val = b.const_i64(src_len);
+            let set_len_val = b.const_i64(set_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_verify".into()),
+                vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "adjustl" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("afs_adjustl".into()),
+                vec![buf, src_ptr, len_val], IrType::Void);
+            Some(buf)
+        }
+        "adjustr" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("afs_adjustr".into()),
+                vec![buf, src_ptr, len_val], IrType::Void);
+            Some(buf)
+        }
+        "trim" => {
+            // TRIM(s): returns character with trailing blanks removed.
+            // Allocate buffer of declared length, memcpy source, return buffer pointer.
+            // The actual printed length is discovered by len_trim at the call site.
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("memcpy".into()),
+                vec![buf, src_ptr, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            Some(buf)
+        }
+        _ => None,
+    }
+}
+
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
 fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<ValueId> {
@@ -3058,6 +3209,75 @@ fn lower_string_expr(
                 let zero = b.const_i64(0);
                 (val, zero)
             }
+        }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                let first_char_arg = args.first().and_then(|a| {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value { Some(e) } else { None }
+                });
+                match key.as_str() {
+                    "trim" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("memcpy".into()),
+                                    vec![buf, src_ptr, len_val],
+                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                // Compute the trimmed length at runtime.
+                                let trimmed_len = b.call(FuncRef::External("afs_len_trim".into()),
+                                    vec![src_ptr, len_val], IrType::Int(IntWidth::I64));
+                                return (buf, trimmed_len);
+                            }
+                        }
+                    }
+                    "adjustl" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("afs_adjustl".into()),
+                                    vec![buf, src_ptr, len_val], IrType::Void);
+                                return (buf, len_val);
+                            }
+                        }
+                    }
+                    "adjustr" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("afs_adjustr".into()),
+                                    vec![buf, src_ptr, len_val], IrType::Void);
+                                return (buf, len_val);
+                            }
+                        }
+                    }
+                    "char" => {
+                        // CHAR(i) → 1-byte buffer.
+                        if let Some(arg) = first_char_arg {
+                            let int_val = lower_expr(b, locals, arg, st);
+                            let i32_val = match b.func().value_type(int_val) {
+                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_val, IntWidth::I32),
+                                _ => int_val,
+                            };
+                            let byte_val = b.call(FuncRef::External("afs_char".into()),
+                                vec![i32_val], IrType::Int(IntWidth::I8));
+                            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1));
+                            let zero = b.const_i64(0);
+                            let byte_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                            b.store(byte_val, byte_ptr);
+                            let one = b.const_i64(1);
+                            return (buf, one);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let val = lower_expr(b, locals, expr, st);
+            let len = b.const_i64(string_literal_len(expr));
+            (val, len)
         }
         Expr::BinaryOp { op: BinaryOp::Concat, left, right } => {
             // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
@@ -4773,12 +4993,17 @@ fn lower_write_items_adv(
     advance: bool,
 ) {
     for item in items {
-        let is_char = if let Expr::Name { name } = &item.node {
-            ctx.locals.get(&name.to_lowercase())
+        let is_char = match &item.node {
+            Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
                 .map(|i| i.char_kind != CharKind::None)
-                .unwrap_or(false)
-        } else {
-            false
+                .unwrap_or(false),
+            Expr::FunctionCall { callee, .. } => {
+                if let Expr::Name { name } = &callee.node {
+                    matches!(name.to_lowercase().as_str(),
+                        "trim" | "adjustl" | "adjustr" | "char")
+                } else { false }
+            }
+            _ => false,
         };
 
         // Whole-array print: a plain Name reference whose local
@@ -4865,12 +5090,17 @@ fn lower_fmt_push(
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
 ) {
-    let is_char = if let Expr::Name { name } = &item.node {
-        ctx.locals.get(&name.to_lowercase())
+    let is_char = match &item.node {
+        Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
             .map(|i| i.char_kind != CharKind::None)
-            .unwrap_or(false)
-    } else {
-        false
+            .unwrap_or(false),
+        Expr::FunctionCall { callee, .. } => {
+            if let Expr::Name { name } = &callee.node {
+                matches!(name.to_lowercase().as_str(),
+                    "trim" | "adjustl" | "adjustr" | "char")
+            } else { false }
+        }
+        _ => false,
     };
 
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
@@ -6190,6 +6420,11 @@ fn lower_expr_full(
                         }
                         return tmp;
                     }
+                }
+
+                // Try character intrinsics (need access to locals for CharKind).
+                if let Some(result) = lower_char_intrinsic(b, &key, args, locals, st) {
+                    return result;
                 }
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
