@@ -32,6 +32,7 @@ pub mod fusion;
 pub mod call_resolve;
 pub mod callgraph;
 pub mod inline;
+pub mod simplify_cfg;
 
 #[cfg(test)]
 mod audit_tests;
