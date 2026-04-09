@@ -33,6 +33,8 @@ Filesystem-side-effect oracles are also expanding beyond content checks:
   families without hardcoding every byte of formatted output
 - `FILE_RERUN_MODE` makes overwrite-vs-append intent explicit instead of
   relying on a human to infer it from the source
+- `FILE_SET_EXACT` lets a test pin the full runtime side-effect surface,
+  not just a handful of named files
 - `REPRO_CHECK: run_same_sandbox` makes repeated-run side effects explicit,
   so append-vs-replace and stale-file bugs can be tested deliberately
 
@@ -40,8 +42,11 @@ Phase triangulation is also getting a stronger policy mode:
 
 - `PHASE_TRIANGULATE: ... | clean` requires compile-only surfaces to leave
   only their requested artifact in a private phase sandbox
+- `PHASE_TRIANGULATE: ... | repro` requires compile-only surfaces to stay
+  byte-identical across repeated materialization
 - that lets a runtime-side-effecting test prove `--emit-ir`, `-S`, and `-c`
-  do not accidentally create the files that only linked execution should create
+  do not accidentally create the files that only linked execution should create,
+  while also keeping those compile-only outputs deterministic
 
 ## Goal
 
