@@ -13,11 +13,29 @@ use super::inst::*;
 use super::builder::FuncBuilder;
 
 use crate::ast::decl::ArraySpec;
+use crate::lexer::Span;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
+
+#[derive(Debug, Clone)]
+pub struct LowerError {
+    pub span: Span,
+    pub msg: String,
+}
+
+impl std::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}: error: {}",
+            self.span.start.line, self.span.start.col, self.msg
+        )
+    }
+}
+
+impl std::error::Error for LowerError {}
 
 /// Loop context for EXIT/CYCLE targeting.
 struct LoopScope {
@@ -171,14 +189,14 @@ pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Module {
+) -> Result<Module, LowerError> {
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
 
     // Pass 1: collect module-level variables.
     for unit in units {
         if let ProgramUnit::Module { name, decls, .. } = &unit.node {
-            collect_module_globals(&mut module, &mut globals, name, decls);
+            collect_module_globals(&mut module, &mut globals, name, decls)?;
         }
     }
 
@@ -218,9 +236,18 @@ pub fn lower_file(
     // Top-level units have no host, so an empty host_uses slice.
     let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs, &optional_params);
+        lower_unit(
+            &mut module,
+            unit,
+            st,
+            &globals,
+            type_layouts,
+            &no_host,
+            &alloc_return_funcs,
+            &optional_params,
+        )?;
     }
-    module
+    Ok(module)
 }
 
 /// Walk a program unit and any nested `contains` to collect the
@@ -536,7 +563,7 @@ fn collect_module_globals(
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
-) {
+) -> Result<(), LowerError> {
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
@@ -628,19 +655,15 @@ fn collect_module_globals(
                             collect_const_array_scalars(init_e, &ir_ty, &param_consts)
                         {
                             if (scalars.len() as i64) > total {
-                                eprintln!(
-                                    "armfortas: error: {}:{}: initializer for '{}' has \
-                                     {} elements but its declared shape requires \
-                                     {} (audit MAJOR-3 — initializer shape \
-                                     mismatch)",
-                                    init_e.span.start.line,
-                                    init_e.span.start.col,
-                                    entity.name,
-                                    scalars.len(),
-                                    total,
-                                );
-                                let _ = std::io::stderr().flush();
-                                std::process::exit(1);
+                                return Err(LowerError {
+                                    span: init_e.span,
+                                    msg: format!(
+                                        "initializer for '{}' has {} elements but its declared shape requires {} (audit MAJOR-3 — initializer shape mismatch)",
+                                        entity.name,
+                                        scalars.len(),
+                                        total,
+                                    ),
+                                });
                             }
                         }
                     }
@@ -683,6 +706,7 @@ fn collect_module_globals(
             }
         }
     }
+    Ok(())
 }
 
 /// Try to evaluate an array constructor as a `GlobalInit`.
@@ -839,7 +863,7 @@ fn lower_unit(
     host_uses: &[crate::ast::decl::SpannedDecl],
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
-) {
+) -> Result<(), LowerError> {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -866,7 +890,7 @@ fn lower_unit(
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
-                check_no_filtered_refs(body, &ctx.filtered_names);
+                check_no_filtered_refs(body, &ctx.filtered_names)?;
                 init_decls(&mut b, &ctx.locals, decls, st);
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -885,7 +909,16 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    alloc_return_funcs,
+                    optional_params,
+                )?;
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
@@ -949,7 +982,7 @@ fn lower_unit(
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
-                check_no_filtered_refs(body, &ctx.filtered_names);
+                check_no_filtered_refs(body, &ctx.filtered_names)?;
                 init_decls(&mut b, &ctx.locals, decls, st);
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
@@ -970,7 +1003,16 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    alloc_return_funcs,
+                    optional_params,
+                )?;
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
@@ -1093,7 +1135,7 @@ fn lower_unit(
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
-                check_no_filtered_refs(body, &ctx.filtered_names);
+                check_no_filtered_refs(body, &ctx.filtered_names)?;
                 init_decls(&mut b, &ctx.locals, decls, st);
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -1118,7 +1160,16 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    alloc_return_funcs,
+                    optional_params,
+                )?;
             }
         }
         ProgramUnit::Module { uses, contains, .. } => {
@@ -1129,11 +1180,21 @@ fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    alloc_return_funcs,
+                    optional_params,
+                )?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Emit IR instructions that materialize a folded constant
@@ -1356,11 +1417,14 @@ fn collect_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
 fn check_no_filtered_refs(
     body: &[crate::ast::stmt::SpannedStmt],
     filtered: &HashSet<String>,
-) {
-    if filtered.is_empty() { return; }
-    for stmt in body {
-        check_filtered_in_stmt(stmt, filtered);
+) -> Result<(), LowerError> {
+    if filtered.is_empty() {
+        return Ok(());
     }
+    for stmt in body {
+        check_filtered_in_stmt(stmt, filtered)?;
+    }
+    Ok(())
 }
 
 /// Walk every Stmt variant and recurse into substatements + every
@@ -1374,74 +1438,74 @@ fn check_no_filtered_refs(
 fn check_filtered_in_stmt(
     stmt: &crate::ast::stmt::SpannedStmt,
     filtered: &HashSet<String>,
-) {
+) -> Result<(), LowerError> {
     use crate::ast::stmt::Stmt;
     match &stmt.node {
         // ---- Assignment ----
         Stmt::Assignment { target, value }
         | Stmt::PointerAssignment { target, value } => {
-            check_filtered_in_expr(target, filtered);
-            check_filtered_in_expr(value, filtered);
+            check_filtered_in_expr(target, filtered)?;
+            check_filtered_in_expr(value, filtered)?;
         }
 
         // ---- IF ----
         Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
-            check_filtered_in_expr(condition, filtered);
-            check_no_filtered_refs(then_body, filtered);
+            check_filtered_in_expr(condition, filtered)?;
+            check_no_filtered_refs(then_body, filtered)?;
             for (cond, body) in else_ifs {
-                check_filtered_in_expr(cond, filtered);
-                check_no_filtered_refs(body, filtered);
+                check_filtered_in_expr(cond, filtered)?;
+                check_no_filtered_refs(body, filtered)?;
             }
             if let Some(eb) = else_body {
-                check_no_filtered_refs(eb, filtered);
+                check_no_filtered_refs(eb, filtered)?;
             }
         }
         Stmt::IfStmt { condition, action } => {
-            check_filtered_in_expr(condition, filtered);
-            check_filtered_in_stmt(action, filtered);
+            check_filtered_in_expr(condition, filtered)?;
+            check_filtered_in_stmt(action, filtered)?;
         }
 
         // ---- DO loops ----
         Stmt::DoLoop { start, end, step, body, .. } => {
-            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
-            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
-            if let Some(e) = step { check_filtered_in_expr(e, filtered); }
-            check_no_filtered_refs(body, filtered);
+            if let Some(e) = start { check_filtered_in_expr(e, filtered)?; }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered)?; }
+            if let Some(e) = step { check_filtered_in_expr(e, filtered)?; }
+            check_no_filtered_refs(body, filtered)?;
         }
         Stmt::DoWhile { condition, body, .. } => {
-            check_filtered_in_expr(condition, filtered);
-            check_no_filtered_refs(body, filtered);
+            check_filtered_in_expr(condition, filtered)?;
+            check_no_filtered_refs(body, filtered)?;
         }
         Stmt::DoConcurrent { controls, mask, body, .. } => {
             for c in controls {
-                check_filtered_in_expr(&c.start, filtered);
-                check_filtered_in_expr(&c.end, filtered);
-                if let Some(s) = &c.step { check_filtered_in_expr(s, filtered); }
+                check_filtered_in_expr(&c.start, filtered)?;
+                check_filtered_in_expr(&c.end, filtered)?;
+                if let Some(s) = &c.step { check_filtered_in_expr(s, filtered)?; }
             }
-            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
-            check_no_filtered_refs(body, filtered);
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered)?; }
+            check_no_filtered_refs(body, filtered)?;
         }
 
         // ---- SELECT ----
         Stmt::SelectCase { selector, cases, .. } => {
-            check_filtered_in_expr(selector, filtered);
+            check_filtered_in_expr(selector, filtered)?;
             for case in cases {
                 for sel in &case.selectors {
                     use crate::ast::stmt::CaseSelector;
                     match sel {
-                        CaseSelector::Value(e) => check_filtered_in_expr(e, filtered),
+                        CaseSelector::Value(e) => check_filtered_in_expr(e, filtered)?,
                         CaseSelector::Range { low, high } => {
-                            if let Some(e) = low { check_filtered_in_expr(e, filtered); }
-                            if let Some(e) = high { check_filtered_in_expr(e, filtered); }
+                            if let Some(e) = low { check_filtered_in_expr(e, filtered)?; }
+                            if let Some(e) = high { check_filtered_in_expr(e, filtered)?; }
                         }
                         CaseSelector::Default => {}
                     }
                 }
-                check_no_filtered_refs(&case.body, filtered);
+                check_no_filtered_refs(&case.body, filtered)?;
             }
         }
         Stmt::SelectType { selector, guards, .. } => {
-            check_filtered_in_expr(selector, filtered);
+            check_filtered_in_expr(selector, filtered)?;
             for guard in guards {
                 use crate::ast::stmt::TypeGuard;
                 let body = match guard {
@@ -1449,80 +1513,80 @@ fn check_filtered_in_stmt(
                     | TypeGuard::ClassIs { body, .. }
                     | TypeGuard::ClassDefault { body } => body,
                 };
-                check_no_filtered_refs(body, filtered);
+                check_no_filtered_refs(body, filtered)?;
             }
         }
 
         // ---- WHERE / FORALL ----
         Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
-            check_filtered_in_expr(mask, filtered);
-            check_no_filtered_refs(body, filtered);
+            check_filtered_in_expr(mask, filtered)?;
+            check_no_filtered_refs(body, filtered)?;
             for (mcond, ebody) in elsewhere {
-                if let Some(m) = mcond { check_filtered_in_expr(m, filtered); }
-                check_no_filtered_refs(ebody, filtered);
+                if let Some(m) = mcond { check_filtered_in_expr(m, filtered)?; }
+                check_no_filtered_refs(ebody, filtered)?;
             }
         }
         Stmt::WhereStmt { mask, stmt } => {
-            check_filtered_in_expr(mask, filtered);
-            check_filtered_in_stmt(stmt, filtered);
+            check_filtered_in_expr(mask, filtered)?;
+            check_filtered_in_stmt(stmt, filtered)?;
         }
         Stmt::ForallConstruct { specs, mask, body, .. } => {
             for s in specs {
-                check_filtered_in_expr(&s.start, filtered);
-                check_filtered_in_expr(&s.end, filtered);
-                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+                check_filtered_in_expr(&s.start, filtered)?;
+                check_filtered_in_expr(&s.end, filtered)?;
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered)?; }
             }
-            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
-            check_no_filtered_refs(body, filtered);
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered)?; }
+            check_no_filtered_refs(body, filtered)?;
         }
         Stmt::ForallStmt { specs, mask, stmt } => {
             for s in specs {
-                check_filtered_in_expr(&s.start, filtered);
-                check_filtered_in_expr(&s.end, filtered);
-                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+                check_filtered_in_expr(&s.start, filtered)?;
+                check_filtered_in_expr(&s.end, filtered)?;
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered)?; }
             }
-            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
-            check_filtered_in_stmt(stmt, filtered);
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered)?; }
+            check_filtered_in_stmt(stmt, filtered)?;
         }
 
         // ---- BLOCK / ASSOCIATE ----
-        Stmt::Block { body, .. } => check_no_filtered_refs(body, filtered),
+        Stmt::Block { body, .. } => check_no_filtered_refs(body, filtered)?,
         Stmt::Associate { assocs, body, .. } => {
             for (_, e) in assocs {
-                check_filtered_in_expr(e, filtered);
+                check_filtered_in_expr(e, filtered)?;
             }
-            check_no_filtered_refs(body, filtered);
+            check_no_filtered_refs(body, filtered)?;
         }
 
         // ---- Branch / transfer ----
         Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } => {
-            if let Some(e) = code { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = code { check_filtered_in_expr(e, filtered)?; }
         }
         Stmt::Return { value } => {
-            if let Some(e) = value { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = value { check_filtered_in_expr(e, filtered)?; }
         }
         Stmt::ComputedGoto { selector, .. } => {
-            check_filtered_in_expr(selector, filtered);
+            check_filtered_in_expr(selector, filtered)?;
         }
         Stmt::ArithmeticIf { expr, .. } => {
-            check_filtered_in_expr(expr, filtered);
+            check_filtered_in_expr(expr, filtered)?;
         }
         Stmt::Exit { .. }
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
         | Stmt::Continue { .. } => {}
         Stmt::Labeled { stmt: inner, .. } => {
-            check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered);
+            check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered)?;
         }
 
         // ---- I/O ----
         Stmt::Print { format, items } => {
-            check_filtered_in_expr(format, filtered);
-            for item in items { check_filtered_in_expr(item, filtered); }
+            check_filtered_in_expr(format, filtered)?;
+            for item in items { check_filtered_in_expr(item, filtered)?; }
         }
         Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
-            for c in controls { check_filtered_in_expr(&c.value, filtered); }
-            for item in items { check_filtered_in_expr(item, filtered); }
+            for c in controls { check_filtered_in_expr(&c.value, filtered)?; }
+            for item in items { check_filtered_in_expr(item, filtered)?; }
         }
         Stmt::Open { specs }
         | Stmt::Close { specs }
@@ -1531,26 +1595,26 @@ fn check_filtered_in_stmt(
         | Stmt::Endfile { specs }
         | Stmt::Flush { specs }
         | Stmt::Wait { specs } => {
-            for c in specs { check_filtered_in_expr(&c.value, filtered); }
+            for c in specs { check_filtered_in_expr(&c.value, filtered)?; }
         }
         Stmt::Inquire { specs, items } => {
-            for c in specs { check_filtered_in_expr(&c.value, filtered); }
-            for item in items { check_filtered_in_expr(item, filtered); }
+            for c in specs { check_filtered_in_expr(&c.value, filtered)?; }
+            for item in items { check_filtered_in_expr(item, filtered)?; }
         }
 
         // ---- Memory ----
         Stmt::Allocate { items, opts } | Stmt::Deallocate { items, opts } => {
-            for item in items { check_filtered_in_expr(item, filtered); }
-            for c in opts { check_filtered_in_expr(&c.value, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered)?; }
+            for c in opts { check_filtered_in_expr(&c.value, filtered)?; }
         }
         Stmt::Nullify { items } => {
-            for item in items { check_filtered_in_expr(item, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered)?; }
         }
 
         // ---- Other executable ----
         Stmt::Call { callee, args } => {
-            check_filtered_in_expr(callee, filtered);
-            for a in args { check_filtered_in_subscript(&a.value, filtered); }
+            check_filtered_in_expr(callee, filtered)?;
+            for a in args { check_filtered_in_subscript(&a.value, filtered)?; }
         }
         Stmt::Namelist { .. } => {}
         Stmt::Declaration(_) => {
@@ -1560,46 +1624,45 @@ fn check_filtered_in_stmt(
             // unknown names. Conservative: skip here.
         }
     }
+    Ok(())
 }
 
 fn check_filtered_in_expr(
     expr: &crate::ast::expr::SpannedExpr,
     filtered: &HashSet<String>,
-) {
+) -> Result<(), LowerError> {
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
             if filtered.contains(&key) {
-                eprintln!(
-                    "armfortas: error: {}:{}: '{}' is not accessible in this scope — \
-                     it was filtered out by a USE ONLY clause (audit MAJOR-1)",
-                    expr.span.start.line,
-                    expr.span.start.col,
-                    name,
-                );
-                let _ = std::io::stderr().flush();
-                std::process::exit(1);
+                return Err(LowerError {
+                    span: expr.span,
+                    msg: format!(
+                        "'{}' is not accessible in this scope — it was filtered out by a USE ONLY clause (audit MAJOR-1)",
+                        name
+                    ),
+                });
             }
         }
         Expr::ComponentAccess { base, .. } => {
-            check_filtered_in_expr(base, filtered);
+            check_filtered_in_expr(base, filtered)?;
         }
         Expr::BinaryOp { left, right, .. } => {
-            check_filtered_in_expr(left, filtered);
-            check_filtered_in_expr(right, filtered);
+            check_filtered_in_expr(left, filtered)?;
+            check_filtered_in_expr(right, filtered)?;
         }
-        Expr::UnaryOp { operand, .. } => check_filtered_in_expr(operand, filtered),
-        Expr::ParenExpr { inner } => check_filtered_in_expr(inner, filtered),
+        Expr::UnaryOp { operand, .. } => check_filtered_in_expr(operand, filtered)?,
+        Expr::ParenExpr { inner } => check_filtered_in_expr(inner, filtered)?,
         Expr::FunctionCall { callee, args } => {
-            check_filtered_in_expr(callee, filtered);
-            for a in args { check_filtered_in_subscript(&a.value, filtered); }
+            check_filtered_in_expr(callee, filtered)?;
+            for a in args { check_filtered_in_subscript(&a.value, filtered)?; }
         }
         Expr::ArrayConstructor { values, .. } => {
-            for v in values { check_filtered_in_acvalue(v, filtered); }
+            for v in values { check_filtered_in_acvalue(v, filtered)?; }
         }
         Expr::ComplexLiteral { real, imag } => {
-            check_filtered_in_expr(real, filtered);
-            check_filtered_in_expr(imag, filtered);
+            check_filtered_in_expr(real, filtered)?;
+            check_filtered_in_expr(imag, filtered)?;
         }
         // Pure literals: nothing to walk.
         Expr::IntegerLiteral { .. }
@@ -1608,37 +1671,40 @@ fn check_filtered_in_expr(
         | Expr::LogicalLiteral { .. }
         | Expr::BozLiteral { .. } => {}
     }
+    Ok(())
 }
 
 fn check_filtered_in_subscript(
     sub: &crate::ast::expr::SectionSubscript,
     filtered: &HashSet<String>,
-) {
+) -> Result<(), LowerError> {
     use crate::ast::expr::SectionSubscript;
     match sub {
-        SectionSubscript::Element(e) => check_filtered_in_expr(e, filtered),
+        SectionSubscript::Element(e) => check_filtered_in_expr(e, filtered)?,
         SectionSubscript::Range { start, end, stride } => {
-            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
-            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
-            if let Some(e) = stride { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = start { check_filtered_in_expr(e, filtered)?; }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered)?; }
+            if let Some(e) = stride { check_filtered_in_expr(e, filtered)?; }
         }
     }
+    Ok(())
 }
 
 fn check_filtered_in_acvalue(
     v: &crate::ast::expr::AcValue,
     filtered: &HashSet<String>,
-) {
+) -> Result<(), LowerError> {
     use crate::ast::expr::AcValue;
     match v {
-        AcValue::Expr(e) => check_filtered_in_expr(e, filtered),
+        AcValue::Expr(e) => check_filtered_in_expr(e, filtered)?,
         AcValue::ImpliedDo { values, start, end, step, .. } => {
-            for inner in values { check_filtered_in_acvalue(inner, filtered); }
-            check_filtered_in_expr(start, filtered);
-            check_filtered_in_expr(end, filtered);
-            if let Some(s) = step { check_filtered_in_expr(s, filtered); }
+            for inner in values { check_filtered_in_acvalue(inner, filtered)?; }
+            check_filtered_in_expr(start, filtered)?;
+            check_filtered_in_expr(end, filtered)?;
+            if let Some(s) = step { check_filtered_in_expr(s, filtered)?; }
         }
     }
+    Ok(())
 }
 
 /// Walk the function's USE statements and collect every name
@@ -7059,7 +7125,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         let (st, layouts) = resolve::resolve_file(&units).unwrap();
-        lower_file(&units, &st, &layouts)
+        lower_file(&units, &st, &layouts).unwrap()
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {
@@ -7102,6 +7168,33 @@ end program
 ");
         assert!(ir.contains("const_float"));
         assert!(ir.contains("fmul"));
+    }
+
+    #[test]
+    fn lower_reports_filtered_use_only_error_instead_of_exiting() {
+        let src = "\
+module m
+  integer :: visible = 1
+  integer :: hidden = 2
+end module m
+
+program p
+  use m, only: visible
+  integer :: x
+  associate (y => hidden)
+    x = y
+  end associate
+  print *, x
+end program
+";
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let (st, layouts) = resolve::resolve_file(&units).unwrap();
+        let err = lower_file(&units, &st, &layouts).unwrap_err();
+        assert!(err.msg.contains("USE ONLY clause"));
+        assert_eq!(err.span.start.line, 9);
+        assert_eq!(err.span.start.col, 19);
     }
 
     #[test]

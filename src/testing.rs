@@ -330,7 +330,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         });
     }
 
-    let ir_module = lower::lower_file(&units, &st, &type_layouts);
+    let ir_module = lower::lower_file(&units, &st, &type_layouts).map_err(|e| CaptureFailure {
+        input: input.clone(),
+        opt_level: request.opt_level,
+        stage: FailureStage::Ir,
+        detail: format!("{}:{}:{}: {}", input.display(), e.span.start.line, e.span.start.col, e.msg),
+        stages: stages.clone(),
+    })?;
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
