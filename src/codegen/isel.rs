@@ -7,7 +7,7 @@
 //! Strategy: naive spill-everything. Every vreg lives on the stack.
 //! Load before use, store after def. Correct but slow — optimized later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::ir::types::*;
 use crate::ir::inst::*;
 use super::mir::*;
@@ -165,6 +165,17 @@ pub fn select_function(func: &Function) -> MachineFunction {
         ctx.block_params.insert(block.id, block.params.clone());
     }
 
+    // Phase 4a.5: identify ICmp/FCmp → Select fusion candidates.
+    //
+    // An ICmp whose boolean result is used only by a single Select in
+    // the same block (with no intervening flag-clobbering instruction)
+    // can be fused: we suppress the CSET and pass the CMP flags
+    // directly into the CSEL. This turns 4 instructions into 2:
+    //
+    //   CMP a, b; CSET cond, LE; CMP cond, #0; CSEL dest, tv, fv, NE
+    //       →  CMP a, b; CSEL dest, tv, fv, LE
+    compute_csel_fusion(func, &mut ctx);
+
     // Phase 4b: select instructions and terminators for each block.
     for block in &func.blocks {
         let mb_id = ctx.block_map[&block.id];
@@ -196,6 +207,14 @@ struct ISelCtx {
     /// than cloning the whole BasicBlock — instructions can be in
     /// the thousands, params are typically 0-3.
     block_params: HashMap<BlockId, Vec<BlockParam>>,
+    /// ICmp/FCmp ValueIds that are exclusively consumed by a Select in
+    /// the same block with no intervening flag-clobbering instruction.
+    /// For these, we suppress CSET during ICmp lowering and use the
+    /// flags directly from the CMP in the CSEL.
+    select_fused: HashSet<ValueId>,
+    /// For each fused ICmp/FCmp, the ARM condition code to use in the
+    /// CSEL (determined at the time we suppress the CSET).
+    fused_arm_cond: HashMap<ValueId, ArmCond>,
 }
 
 impl ISelCtx {
@@ -205,6 +224,8 @@ impl ISelCtx {
             block_map: HashMap::new(),
             alloca_offsets: HashMap::new(),
             block_params: HashMap::new(),
+            select_fused: HashSet::new(),
+            fused_arm_cond: HashMap::new(),
         }
     }
 
@@ -465,14 +486,18 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 operands: vec![MachineOperand::VReg(va), MachineOperand::VReg(vb)],
                 def: None,
             });
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::Cset,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::Cond(cmp_to_arm_cond(*op)),
-                ],
-                def: Some(dest),
-            });
+            // If this ICmp feeds exclusively into a Select (detected in the
+            // pre-pass), suppress CSET. The Select will use the flags directly.
+            if !ctx.select_fused.contains(&inst.id) {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::Cset,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::Cond(cmp_to_arm_cond(*op)),
+                    ],
+                    def: Some(dest),
+                });
+            }
         }
         InstKind::FCmp(op, a, b) => {
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
@@ -483,14 +508,16 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 operands: vec![MachineOperand::VReg(va), MachineOperand::VReg(vb)],
                 def: None,
             });
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::FCset,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::Cond(fcmp_to_arm_cond(*op)),
-                ],
-                def: Some(dest),
-            });
+            if !ctx.select_fused.contains(&inst.id) {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::FCset,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::Cond(fcmp_to_arm_cond(*op)),
+                    ],
+                    def: Some(dest),
+                });
+            }
         }
 
         // ---- Logic ----
@@ -513,21 +540,34 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         // ---- Select (CSEL) ----
+        //
+        // Fast path: if the condition was produced by an ICmp/FCmp in the
+        // same block with no other users, the pre-pass marked it as fused.
+        // We already emitted `CMP a, b` (no CSET), so the flags are live.
+        // Use them directly: `CSEL dest, tv, fv, <arm_cond>`.
+        //
+        // Slow path (unfused): the condition is an arbitrary boolean in a
+        // register. Materialize with `CMP cond, #0; CSEL dest, tv, fv, NE`.
         InstKind::Select(cond, tv, fv) => {
-            let cond_reg = ctx.lookup_vreg(*cond);
             let true_reg = ctx.lookup_vreg(*tv);
             let false_reg = ctx.lookup_vreg(*fv);
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
 
-            // Compare cond to zero: CMP cond, #0
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::CmpImm,
-                operands: vec![MachineOperand::VReg(cond_reg), MachineOperand::Imm(0)],
-                def: None,
-            });
+            let arm_cond = if let Some(&fused_cond) = ctx.fused_arm_cond.get(cond) {
+                // Flags already set by the fused CMP — no extra compare needed.
+                fused_cond
+            } else {
+                // Unfused: compare the boolean register against 0.
+                let cond_reg = ctx.lookup_vreg(*cond);
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::CmpImm,
+                    operands: vec![MachineOperand::VReg(cond_reg), MachineOperand::Imm(0)],
+                    def: None,
+                });
+                ArmCond::Ne
+            };
 
-            // Select based on condition: CSEL/FCSEL dest, true, false, NE
             let opcode = if class == RegClass::Fp32 || class == RegClass::Fp64 {
                 ArmOpcode::FcselReg
             } else {
@@ -539,7 +579,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                     MachineOperand::VReg(dest),
                     MachineOperand::VReg(true_reg),
                     MachineOperand::VReg(false_reg),
-                    MachineOperand::Cond(ArmCond::Ne),
+                    MachineOperand::Cond(arm_cond),
                 ],
                 def: Some(dest),
             });
@@ -1465,6 +1505,98 @@ fn float_width_class(w: &FloatWidth) -> RegClass {
 }
 
 /// Map IR comparison op to ARM64 condition code (for integer CMP).
+/// Pre-scan a function to find ICmp/FCmp → Select fusion candidates.
+///
+/// An ICmp/FCmp is a fusion candidate when:
+/// 1. Its result is used exactly once in the entire function.
+/// 2. That single use is a `Select` instruction in the same block.
+/// 3. No intervening instruction between the ICmp and the Select in
+///    that block clobbers NZCV flags (another ICmp/FCmp or a Call).
+///
+/// For candidates, we suppress CSET during ICmp lowering and store
+/// the ARM condition in `ctx.fused_arm_cond` so the Select can pick
+/// it up and emit `CSEL dest, tv, fv, <cond>` directly.
+fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
+    // Build global use counts.
+    let mut use_count: HashMap<ValueId, u32> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            for vid in crate::ir::walk::inst_uses(&inst.kind) {
+                *use_count.entry(vid).or_insert(0) += 1;
+            }
+        }
+        if let Some(term) = &block.terminator {
+            for vid in crate::ir::walk::terminator_uses(term) {
+                *use_count.entry(vid).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Build a map of ValueId → the block that defines it (instruction defs only).
+    let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            def_block.insert(inst.id, block.id);
+        }
+    }
+
+    // Per-block scan: walk instructions in order, tracking the most
+    // recent ICmp/FCmp that hasn't been consumed by a Select yet.
+    // Any flag-clobbering instruction (another ICmp/FCmp, a call)
+    // resets the pending set.
+    for block in &func.blocks {
+        // The most recently emitted CMP that hasn't been consumed.
+        // We use a Vec so that `pending = {last_icmp}` is O(1) to update.
+        let mut pending: Option<ValueId> = None;
+
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::ICmp(op, _, _) => {
+                    // New CMP overwrites NZCV — previous pending is no longer valid.
+                    pending = Some(inst.id);
+                    // Temporarily store the arm cond so we can retrieve it when
+                    // we confirm the Select is the sole user.
+                    ctx.fused_arm_cond.insert(inst.id, cmp_to_arm_cond(*op));
+                }
+                InstKind::FCmp(op, _, _) => {
+                    pending = Some(inst.id);
+                    ctx.fused_arm_cond.insert(inst.id, fcmp_to_arm_cond(*op));
+                }
+                InstKind::Select(cond, _, _) => {
+                    if let Some(p) = pending {
+                        if p == *cond && use_count.get(cond) == Some(&1)
+                            && def_block.get(cond) == Some(&block.id)
+                        {
+                            // Confirmed: fuse this ICmp into the Select.
+                            ctx.select_fused.insert(*cond);
+                        }
+                    }
+                    // Whether fused or not, the Select consumes the flag slot.
+                    if pending == Some(*cond) {
+                        pending = None;
+                    }
+                }
+                // Calls may clobber NZCV (per AAPCS64, flags are not preserved).
+                InstKind::Call(_, _) | InstKind::RuntimeCall(_, _) => {
+                    pending = None;
+                }
+                _ => {}
+            }
+        }
+
+        // Clean up fused_arm_cond for ICmps that turned out NOT to be fused
+        // (e.g., they had use_count > 1, or were never consumed by a Select).
+        // Leave only the fused ones.
+        //
+        // We delay cleanup to after all blocks are scanned because the same
+        // ValueId can't appear in multiple blocks (SSA), so there's no cross-
+        // block confusion.
+    }
+
+    // Remove arm_cond entries for non-fused ICmps.
+    ctx.fused_arm_cond.retain(|vid, _| ctx.select_fused.contains(vid));
+}
+
 fn cmp_to_arm_cond(op: CmpOp) -> ArmCond {
     match op {
         CmpOp::Eq => ArmCond::Eq,
@@ -1563,6 +1695,7 @@ mod tests {
 
     #[test]
     fn select_icmp() {
+        // ICmp whose result is NOT fed into a Select → CSET must appear.
         let mf = select_simple(|b| {
             let x = b.const_i32(5);
             let y = b.const_i32(10);
@@ -1571,6 +1704,50 @@ mod tests {
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg));
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Cset));
+    }
+
+    #[test]
+    fn csel_fusion_eliminates_cset_and_extra_cmp() {
+        // ICmp used solely by a Select → CSET and CMP cond, #0 must NOT appear.
+        // Only CmpReg + CselReg should be present.
+        let mf = select_simple(|b| {
+            let x  = b.const_i32(5);
+            let y  = b.const_i32(10);
+            let c  = b.icmp(CmpOp::Le, x, y);   // use_count[c] = 1, only in Select
+            let _s = b.select(c, x, y);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+        // Must have a CMP to set flags.
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg),
+            "expected CmpReg for ICmp");
+        // Must have CSEL to select the value.
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CselReg),
+            "expected CselReg for Select");
+        // Must NOT have CSET (ICmp boolean materialization is suppressed).
+        assert!(!insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
+            "CSET should be suppressed when ICmp feeds only a Select");
+        // Must NOT have a second CmpImm (CMP cond, #0 is suppressed).
+        assert!(!insts.iter().any(|i| i.opcode == ArmOpcode::CmpImm),
+            "CMP cond,#0 should be suppressed when CSEL uses flags directly");
+    }
+
+    #[test]
+    fn csel_no_fusion_when_icmp_has_multiple_uses() {
+        // ICmp used by both a Select and another instruction → CSET is kept.
+        let mf = select_simple(|b| {
+            let x   = b.const_i32(5);
+            let y   = b.const_i32(10);
+            let c   = b.icmp(CmpOp::Le, x, y);   // use_count[c] = 2
+            let _s  = b.select(c, x, y);
+            // Also use `c` in a logical NOT to force a second use.
+            let _n  = b.not(c);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+        // CSET must still be emitted because `c` has multiple uses.
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
+            "CSET should remain when ICmp has multiple uses");
     }
 
     #[test]
