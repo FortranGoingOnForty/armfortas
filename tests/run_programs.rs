@@ -106,7 +106,7 @@
 //! should use stable substrings that are intentionally expected
 //! across the requested matrix.
 //!
-//! ## FILE_CHECK / FILE_NOT / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE annotations
+//! ## FILE_CHECK / FILE_NOT / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT annotations
 //!
 //! Runtime tests can assert on files created inside their per-test
 //! sandbox:
@@ -127,6 +127,9 @@
 //!     program is executed twice in the same sandbox, the named file must
 //!     either be byte-identical after both runs (`stable`) or grow by
 //!     strict append (`append`).
+//!   * `! FILE_SET_EXACT: <relative-path>[,<relative-path>...]` — the
+//!     final sandbox file set must match exactly, with no extra side
+//!     effects beyond the listed relative paths.
 //!
 //! Paths are sandbox-relative on purpose. The harness runs each binary
 //! in a private temp directory, so file assertions pin side effects
@@ -169,6 +172,7 @@
 //!
 //!   * `! PHASE_TRIANGULATE: ir|asm|obj`
 //!   * `! PHASE_TRIANGULATE: ir|asm|obj|clean`
+//!   * `! PHASE_TRIANGULATE: ir|asm|obj|repro`
 //!
 //! The linked runtime path is the anchor. If the program runs correctly but
 //! one of the requested extra surfaces fails to compile or produces an empty
@@ -180,6 +184,11 @@
 //! only their explicit output artifact in a private phase sandbox. That lets a
 //! runtime-side-effecting program assert that `--emit-ir`, `-S`, and `-c` do
 //! not accidentally create the files that only linked execution should create.
+//!
+//! `repro` strengthens it in a different direction: each requested compile-only
+//! phase must produce byte-identical output across two independent compilations.
+//! This keeps pipeline oracles from checking only "exists" when what we really
+//! need is "exists, stays clean, and stays deterministic".
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -227,6 +236,11 @@ struct FileRerunModeCheck {
     mode: FileRerunMode,
 }
 
+struct FileSetExactCheck {
+    line_num: usize,
+    rel_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReproStage {
     Asm,
@@ -256,6 +270,7 @@ enum PhaseSurface {
     Asm,
     Obj,
     Clean,
+    Repro,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,6 +646,62 @@ fn extract_file_rerun_mode_checks(
     Ok(checks)
 }
 
+fn extract_file_set_exact(
+    source: &str,
+    filename: &str,
+) -> Result<Option<FileSetExactCheck>, String> {
+    let mut found: Option<FileSetExactCheck> = None;
+    for (i, line) in source.lines().enumerate() {
+        let line_num = i + 1;
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("! FILE_SET_EXACT:") else {
+            continue;
+        };
+        if let Some(existing) = &found {
+            return Err(format!(
+                "{}:{}: multiple FILE_SET_EXACT annotations are not allowed (another at line {})",
+                filename, line_num, existing.line_num
+            ));
+        }
+
+        let mut rel_paths = Vec::new();
+        for token in rest.trim().split(',') {
+            let rel_path = token.trim();
+            if rel_path.is_empty() {
+                return Err(format!(
+                    "{}:{}: FILE_SET_EXACT paths cannot be empty",
+                    filename, line_num
+                ));
+            }
+            if Path::new(rel_path).is_absolute() {
+                return Err(format!(
+                    "{}:{}: FILE_SET_EXACT paths must be relative, got '{}'",
+                    filename, line_num, rel_path
+                ));
+            }
+            if !rel_paths
+                .iter()
+                .any(|existing: &String| existing == rel_path)
+            {
+                rel_paths.push(rel_path.to_string());
+            }
+        }
+        if rel_paths.is_empty() {
+            return Err(format!(
+                "{}:{}: FILE_SET_EXACT needs at least one relative path",
+                filename, line_num
+            ));
+        }
+        rel_paths.sort();
+
+        found = Some(FileSetExactCheck {
+            line_num,
+            rel_paths,
+        });
+    }
+    Ok(found)
+}
+
 fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>, String> {
     let mut stages = Vec::new();
     for (i, line) in source.lines().enumerate() {
@@ -753,9 +824,10 @@ fn extract_phase_triangulation(
                 "asm" => PhaseSurface::Asm,
                 "obj" => PhaseSurface::Obj,
                 "clean" => PhaseSurface::Clean,
+                "repro" => PhaseSurface::Repro,
                 other => {
                     return Err(format!(
-                    "{}:{}: PHASE_TRIANGULATE surfaces must be ir, asm, obj, or clean; got '{}'",
+                    "{}:{}: PHASE_TRIANGULATE surfaces must be ir, asm, obj, clean, or repro; got '{}'",
                     filename, line_num, other
                 ))
                 }
@@ -772,10 +844,10 @@ fn extract_phase_triangulation(
         }
         if surfaces
             .iter()
-            .all(|surface| *surface == PhaseSurface::Clean)
+            .all(|surface| matches!(surface, PhaseSurface::Clean | PhaseSurface::Repro))
         {
             return Err(format!(
-                "{}:{}: PHASE_TRIANGULATE(clean) needs at least one of ir, asm, or obj",
+                "{}:{}: PHASE_TRIANGULATE policy-only annotations need at least one of ir, asm, or obj",
                 filename, line_num
             ));
         }
@@ -1048,11 +1120,27 @@ fn match_file_rerun_mode_checks(
     Ok(())
 }
 
+fn match_file_set_exact(
+    check: &FileSetExactCheck,
+    files: &BTreeMap<String, Vec<u8>>,
+    filename: &str,
+) -> Result<(), String> {
+    let actual = files.keys().cloned().collect::<Vec<_>>();
+    if actual != check.rel_paths {
+        return Err(format!(
+            "{}:{}: FILE_SET_EXACT failed: expected {:?}, got {:?}",
+            filename, check.line_num, check.rel_paths, actual
+        ));
+    }
+    Ok(())
+}
+
 fn collect_declared_runtime_paths(
     file_checks: &[FileCheck],
     file_presence_checks: &[FilePresenceCheck],
     file_line_count_checks: &[FileLineCountCheck],
     file_rerun_mode_checks: &[FileRerunModeCheck],
+    file_set_exact: Option<&FileSetExactCheck>,
 ) -> BTreeMap<String, String> {
     let mut paths = BTreeMap::new();
     for check in file_checks {
@@ -1082,6 +1170,13 @@ fn collect_declared_runtime_paths(
         paths
             .entry(check.rel_path.clone())
             .or_insert_with(|| "FILE_RERUN_MODE".to_string());
+    }
+    if let Some(check) = file_set_exact {
+        for rel_path in &check.rel_paths {
+            paths
+                .entry(rel_path.clone())
+                .or_insert_with(|| "FILE_SET_EXACT".to_string());
+        }
     }
     paths
 }
@@ -1144,6 +1239,7 @@ fn compile_phase_artifact(
         PhaseSurface::Asm => "asm",
         PhaseSurface::Obj => "obj",
         PhaseSurface::Clean => unreachable!("clean is a triangulation policy, not an artifact"),
+        PhaseSurface::Repro => unreachable!("repro is a triangulation policy, not an artifact"),
     };
     let phase_sandbox = unique_temp_path(
         "phase_sandbox",
@@ -1164,6 +1260,7 @@ fn compile_phase_artifact(
         PhaseSurface::Asm => ("phase-output.s", &["-S"]),
         PhaseSurface::Obj => ("phase-output.o", &["-c"]),
         PhaseSurface::Clean => unreachable!(),
+        PhaseSurface::Repro => unreachable!(),
     };
     let output_path = phase_sandbox.join(output_name);
 
@@ -1486,6 +1583,7 @@ fn render_phase_surfaces(surfaces: &[PhaseSurface]) -> String {
             PhaseSurface::Asm => "asm",
             PhaseSurface::Obj => "obj",
             PhaseSurface::Clean => "clean",
+            PhaseSurface::Repro => "repro",
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -1500,6 +1598,7 @@ fn run_phase_triangulation(
     declared_runtime_paths: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let require_clean = triangulation.surfaces.contains(&PhaseSurface::Clean);
+    let require_repro = triangulation.surfaces.contains(&PhaseSurface::Repro);
     for surface in &triangulation.surfaces {
         match surface {
             PhaseSurface::Ir | PhaseSurface::Asm | PhaseSurface::Obj => {
@@ -1511,6 +1610,7 @@ fn run_phase_triangulation(
                         PhaseSurface::Asm => "assembly",
                         PhaseSurface::Obj => "object",
                         PhaseSurface::Clean => unreachable!(),
+                        PhaseSurface::Repro => unreachable!(),
                     };
                     return Err(format!(
                         "{}:{}: PHASE_TRIANGULATE({}) produced empty {} output at {}",
@@ -1555,8 +1655,47 @@ fn run_phase_triangulation(
                         ));
                     }
                 }
+                if require_repro {
+                    let second_artifact =
+                        compile_phase_artifact(compiler, source, opt_flag, *surface, filename)?;
+                    if require_clean {
+                        let second_file_keys: Vec<&str> = second_artifact
+                            .sandbox_files
+                            .keys()
+                            .map(|key| key.as_str())
+                            .collect();
+                        if second_file_keys != vec![second_artifact.output_rel_path.as_str()] {
+                            return Err(format!(
+                                "{}:{}: PHASE_TRIANGULATE({}) failed at {}: repeated compile-only phase left unexpected files {:?} (expected only '{}')",
+                                filename,
+                                triangulation.line_num,
+                                render_phase_surfaces(&triangulation.surfaces),
+                                opt_flag,
+                                second_file_keys,
+                                second_artifact.output_rel_path,
+                            ));
+                        }
+                    }
+                    if artifact.output_bytes != second_artifact.output_bytes {
+                        let surface_name = match surface {
+                            PhaseSurface::Ir => "IR",
+                            PhaseSurface::Asm => "assembly",
+                            PhaseSurface::Obj => "object",
+                            PhaseSurface::Clean => unreachable!(),
+                            PhaseSurface::Repro => unreachable!(),
+                        };
+                        return Err(format!(
+                            "{}:{}: PHASE_TRIANGULATE({}) failed at {}: {} output changed across repeated compile-only runs",
+                            filename,
+                            triangulation.line_num,
+                            render_phase_surfaces(&triangulation.surfaces),
+                            opt_flag,
+                            surface_name,
+                        ));
+                    }
+                }
             }
-            PhaseSurface::Clean => {}
+            PhaseSurface::Clean | PhaseSurface::Repro => {}
         }
     }
     Ok(())
@@ -1654,6 +1793,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
     };
+    let file_set_exact = match extract_file_set_exact(&source_text, filename) {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let repro_checks = match extract_repro_checks(&source_text, filename) {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
@@ -1674,6 +1817,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && file_presence_checks.is_empty()
         && file_line_count_checks.is_empty()
         && file_rerun_mode_checks.is_empty()
+        && file_set_exact.is_none()
         && repro_checks.is_empty()
         && opt_eq_rules.is_empty()
         && phase_triangulation.is_none()
@@ -1685,7 +1829,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
             filename,
         ));
     }
@@ -1822,6 +1966,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
+        }
+        if let Some(check) = &file_set_exact {
+            if let Err(e) = match_file_set_exact(check, &snapshot.files, &label) {
+                let _ = fs::remove_file(&binary);
+                let _ = fs::remove_dir_all(&sandbox);
+                return Err(e);
+            }
         }
         if !file_rerun_mode_checks.is_empty() {
             let second = run_binary_in_sandbox(&binary, &sandbox, filename)?;
@@ -1987,6 +2138,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 &file_presence_checks,
                 &file_line_count_checks,
                 &file_rerun_mode_checks,
+                file_set_exact.as_ref(),
             );
             run_phase_triangulation(
                 compiler,
@@ -2252,6 +2404,14 @@ fn extract_file_rerun_mode_checks_accepts_stable_and_append() {
 }
 
 #[test]
+fn extract_file_set_exact_accepts_relative_paths() {
+    let check = extract_file_set_exact("! FILE_SET_EXACT: out.txt, log.txt\n", "inline.f90")
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.rel_paths, vec!["log.txt", "out.txt"]);
+}
+
+#[test]
 fn file_rerun_mode_matcher_accepts_strict_append_growth() {
     let checks = vec![FileRerunModeCheck {
         line_num: 1,
@@ -2313,8 +2473,8 @@ fn extract_opt_eq_rules_rejects_unknown_component() {
 }
 
 #[test]
-fn extract_phase_triangulation_accepts_ir_asm_obj_and_clean() {
-    let source = "! PHASE_TRIANGULATE: ir|asm|obj|clean\n";
+fn extract_phase_triangulation_accepts_ir_asm_obj_clean_and_repro() {
+    let source = "! PHASE_TRIANGULATE: ir|asm|obj|clean|repro\n";
     let rule = extract_phase_triangulation(source, "inline.f90")
         .unwrap()
         .unwrap();
@@ -2324,7 +2484,8 @@ fn extract_phase_triangulation_accepts_ir_asm_obj_and_clean() {
             PhaseSurface::Ir,
             PhaseSurface::Asm,
             PhaseSurface::Obj,
-            PhaseSurface::Clean
+            PhaseSurface::Clean,
+            PhaseSurface::Repro
         ]
     );
 }
@@ -2333,14 +2494,14 @@ fn extract_phase_triangulation_accepts_ir_asm_obj_and_clean() {
 fn extract_phase_triangulation_rejects_unknown_surface() {
     let source = "! PHASE_TRIANGULATE: run\n";
     let err = extract_phase_triangulation(source, "inline.f90").unwrap_err();
-    assert!(err.contains("ir, asm, obj, or clean"));
+    assert!(err.contains("ir, asm, obj, clean, or repro"));
 }
 
 #[test]
 fn extract_phase_triangulation_rejects_clean_only() {
-    let source = "! PHASE_TRIANGULATE: clean\n";
+    let source = "! PHASE_TRIANGULATE: clean|repro\n";
     let err = extract_phase_triangulation(source, "inline.f90").unwrap_err();
-    assert!(err.contains("needs at least one of ir, asm, or obj"));
+    assert!(err.contains("policy-only annotations"));
 }
 
 #[test]
@@ -2453,6 +2614,25 @@ fn file_presence_checks_allow_rewind_side_effects() {
 }
 
 #[test]
+fn file_set_exact_allows_rewind_single_output() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("io_rewind.f90");
+    assert!(
+        source.exists(),
+        "io_rewind.f90 missing — needed for FILE_SET_EXACT coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "io_rewind.f90 should pass with FILE_SET_EXACT coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn file_rerun_mode_append_fixture_tracks_current_compiler_gap() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
@@ -2542,6 +2722,25 @@ fn phase_triangulation_allows_function_call_pipeline_surfaces() {
         TestOutcome::Pass => {}
         other => panic!(
             "function_call.f90 should pass with PHASE_TRIANGULATE coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn phase_triangulation_repro_keeps_function_call_compile_surfaces_stable() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("function_call.f90");
+    assert!(
+        source.exists(),
+        "function_call.f90 missing — needed for PHASE_TRIANGULATE(repro) coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "function_call.f90 should pass with PHASE_TRIANGULATE(repro) coverage, got {:?}",
             other
         ),
     }
