@@ -355,14 +355,16 @@ fn promote_function(func: &mut Function) -> bool {
                         // This is a load from a promotable alloca.
                         // Rewrite uses of `inst_id` to the current
                         // stack top.
-                        let cur = *stacks[idx].last()
-                            .expect("mem2reg: stack empty at load");
+                        let cur = resolve_promoted_value(
+                            *stacks[idx].last().expect("mem2reg: stack empty at load"),
+                            load_renames,
+                        );
                         load_renames.insert(inst_id, cur);
                         dead_loads.insert(inst_id);
                     }
                 }
                 InstKind::Store(val, addr) => {
-                    let val = *val;
+                    let val = resolve_promoted_value(*val, load_renames);
                     let addr = *addr;
                     if let Some(&idx) = alloca_index.get(&addr) {
                         stacks[idx].push(val);
@@ -412,8 +414,10 @@ fn promote_function(func: &mut Function) -> bool {
                 // matches the order the params were pushed onto
                 // `succ.params` during phase 3.
                 let new_args: Vec<ValueId> = order.iter()
-                    .map(|&idx| *stacks[idx].last()
-                        .expect("mem2reg: stack empty at branch"))
+                    .map(|&idx| resolve_promoted_value(
+                        *stacks[idx].last().expect("mem2reg: stack empty at branch"),
+                        load_renames,
+                    ))
                     .collect();
                 // Locate the slots in the terminator's arg list.
                 let block_mut = func.block_mut(block_id);
@@ -464,6 +468,20 @@ fn promote_function(func: &mut Function) -> bool {
     }
 
     true
+}
+
+fn resolve_promoted_value(
+    mut value: ValueId,
+    load_renames: &HashMap<ValueId, ValueId>,
+) -> ValueId {
+    let mut seen = HashSet::new();
+    while let Some(&next) = load_renames.get(&value) {
+        if !seen.insert(value) || next == value {
+            break;
+        }
+        value = next;
+    }
+    value
 }
 
 /// Find alloca instructions whose only uses are `Load(alloca)` and
@@ -1313,6 +1331,148 @@ mod tests {
                 Terminator::Branch(_, args) => assert_eq!(args.len(), 2,
                     "predecessor {:?} should pass 2 args to merge", pred),
                 _ => panic!("predecessor terminator should be Branch"),
+            }
+        }
+    }
+
+    // =============================================================
+    // Regression: storing a freshly-loaded promoted value into a
+    // second promotable slot inside a branch must not leave the
+    // second slot's later loads pointing at the deleted load ID.
+    // Audit 29.8 surfaced this from a SAVE-backed branchy scalar
+    // shape lowered from real Fortran.
+    // =============================================================
+    #[test]
+    fn branchy_store_of_promoted_load_keeps_ir_valid() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new(
+            "f".into(),
+            vec![Param {
+                name: "flag".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+            }],
+            IrType::Int(IntWidth::I32),
+        );
+        let entry = f.entry;
+
+        let result_slot = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let save_slot = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let tmp_slot = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c7 = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, entry, InstKind::Store(c7, save_slot), IrType::Void);
+        let zero = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let cond = push_inst(
+            &mut f,
+            entry,
+            InstKind::ICmp(CmpOp::Gt, ValueId(0), zero),
+            IrType::Bool,
+        );
+        let then_b = f.create_block("then");
+        let else_b = f.create_block("else");
+        let merge = f.create_block("merge");
+        f.block_mut(entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: then_b,
+            true_args: vec![],
+            false_dest: else_b,
+            false_args: vec![],
+        });
+
+        let then_load = push_inst(
+            &mut f,
+            then_b,
+            InstKind::Load(save_slot),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, then_b, InstKind::Store(then_load, tmp_slot), IrType::Void);
+        let then_tmp = push_inst(
+            &mut f,
+            then_b,
+            InstKind::Load(tmp_slot),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, then_b, InstKind::Store(then_tmp, result_slot), IrType::Void);
+        f.block_mut(then_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        let else_load = push_inst(
+            &mut f,
+            else_b,
+            InstKind::Load(save_slot),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, else_b, InstKind::Store(else_load, tmp_slot), IrType::Void);
+        let else_tmp = push_inst(
+            &mut f,
+            else_b,
+            InstKind::Load(tmp_slot),
+            IrType::Int(IntWidth::I32),
+        );
+        let one = push_inst(
+            &mut f,
+            else_b,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let bumped = push_inst(
+            &mut f,
+            else_b,
+            InstKind::IAdd(else_tmp, one),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(&mut f, else_b, InstKind::Store(bumped, result_slot), IrType::Void);
+        f.block_mut(else_b).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        let merged = push_inst(
+            &mut f,
+            merge,
+            InstKind::Load(result_slot),
+            IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(merged)));
+        m.add_function(f);
+
+        assert!(Mem2Reg.run(&mut m), "branchy chain should be promotable");
+        let errs = verify_module(&m);
+        assert!(
+            errs.is_empty(),
+            "post-mem2reg IR invalid for branchy load/store chain: {:?}",
+            errs
+        );
+
+        let f = &m.functions[0];
+        for block in &f.blocks {
+            for inst in &block.insts {
+                assert!(
+                    !matches!(inst.kind, InstKind::Alloca(_) | InstKind::Load(_) | InstKind::Store(_, _)),
+                    "promoted branchy scalar should leave no memory traffic, found {:?}",
+                    inst.kind
+                );
             }
         }
     }
