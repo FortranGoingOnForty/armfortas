@@ -12,6 +12,7 @@ use super::cse::LocalCse;
 use super::strength_reduce::StrengthReduce;
 use super::licm::Licm;
 use super::mem2reg::Mem2Reg;
+use super::dse::Dse;
 
 /// Compiler optimization levels.
 ///
@@ -111,33 +112,27 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dce));
         }
         OptLevel::O2 | OptLevel::Os => {
-            // O1 plus LICM, small inlining, strength reduction,
-            // bounds-check elim, GVN, SROA, DSE, small loop unroll,
-            // FMA fusion. Os trims unrolling/inlining heuristics.
+            // O1 plus LICM, strength reduction, DSE.
+            // GVN, SROA, inlining, FMA fusion, loop unrolling deferred.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dse));
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // Audit Cos-1: O3/Ofast currently runs the same pass
-            // pipeline as O2. The aspirational additions —
-            // vectorization, aggressive inlining, IPO,
-            // devirtualization, speculative optimizations,
-            // Ofast fast-math reassociation — are deferred to a
-            // later sprint (NEON vectorization is the natural
-            // next milestone). The arms are kept distinct so the
-            // -O3/-Ofast flags continue to be accepted and the
-            // future additions land in the obvious place.
+            // O2 passes. Vectorization, aggressive inlining, IPO,
+            // fast-math — deferred to later sprints.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dse));
             pm.add(Box::new(Dce));
         }
     }

@@ -17,6 +17,7 @@ pub mod cse;
 pub mod strength_reduce;
 pub mod licm;
 pub mod mem2reg;
+pub mod dse;
 
 #[cfg(test)]
 mod audit_tests;
