@@ -69,6 +69,21 @@
 //! parameter-inlining and module-allocatable bugs as runtime tests
 //! only. A future regression that broke the IR shape but happened
 //! to land on the right runtime answer would slip through.
+//!
+//! ## STDERR_CHECK / EXIT_CODE annotations
+//!
+//! Runtime tests can also assert on stderr and process exit status:
+//!
+//!   * `! STDERR_CHECK: <substring>` — ordered substring checks
+//!     against the program's stderr stream.
+//!   * `! EXIT_CODE: <int>` — exact process exit code. Without this
+//!     annotation, the harness preserves the old rule that runtime
+//!     tests must exit successfully.
+//!
+//! This makes runtime tests expressive enough for paths like
+//! `ERROR STOP`, warning-like stderr output, and future
+//! side-effect-heavy programs without forcing them through
+//! `ERROR_EXPECTED`, which is compile-failure-only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,14 +95,14 @@ struct Check {
     pattern: String,
 }
 
-/// Extract `! CHECK:` patterns from a Fortran source file.
-fn extract_checks(source: &str) -> Vec<Check> {
+/// Extract ordered substring checks from a Fortran source file.
+fn extract_prefixed_checks(source: &str, prefix: &str) -> Vec<Check> {
     source
         .lines()
         .enumerate()
         .filter_map(|(i, line)| {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("! CHECK:") {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
                 Some(Check {
                     line_num: i + 1,
                     pattern: rest.trim().to_string(),
@@ -97,6 +112,16 @@ fn extract_checks(source: &str) -> Vec<Check> {
             }
         })
         .collect()
+}
+
+/// Extract `! CHECK:` patterns from a Fortran source file.
+fn extract_checks(source: &str) -> Vec<Check> {
+    extract_prefixed_checks(source, "! CHECK:")
+}
+
+/// Extract `! STDERR_CHECK:` patterns from a Fortran source file.
+fn extract_stderr_checks(source: &str) -> Vec<Check> {
+    extract_prefixed_checks(source, "! STDERR_CHECK:")
 }
 
 /// Extract `! XFAIL:` reason text. Returns the first reason found, or
@@ -124,6 +149,36 @@ fn extract_error_expected(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract `! EXIT_CODE:` and parse it as an exact expected exit
+/// status. Multiple annotations are rejected as a test setup error
+/// so the expected runtime contract stays unambiguous.
+fn extract_exit_code(source: &str, filename: &str) -> Result<Option<i32>, String> {
+    let mut matches = source.lines().enumerate().filter_map(|(i, line)| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("! EXIT_CODE:")
+            .map(|rest| (i + 1, rest.trim()))
+    });
+
+    let Some((line_num, raw)) = matches.next() else {
+        return Ok(None);
+    };
+
+    if let Some((extra_line, _)) = matches.next() {
+        return Err(format!(
+            "{}:{}: multiple EXIT_CODE annotations are not allowed (another at line {})",
+            filename, line_num, extra_line
+        ));
+    }
+
+    raw.parse::<i32>().map(Some).map_err(|_| {
+        format!(
+            "{}:{}: EXIT_CODE must be a decimal integer, got '{}'",
+            filename, line_num, raw
+        )
+    })
 }
 
 /// A single IR-shape assertion. Positive checks must appear in
@@ -196,7 +251,12 @@ fn match_ir_checks(checks: &[IrCheck], ir: &str, filename: &str) -> Result<(), S
 
 /// Match checks against actual output lines. Checks must appear in order
 /// but not necessarily consecutively — intervening output lines are allowed.
-fn match_checks(checks: &[Check], output: &str, filename: &str) -> Result<(), String> {
+fn match_checks(
+    checks: &[Check],
+    output: &str,
+    filename: &str,
+    directive_name: &str,
+) -> Result<(), String> {
     let output_lines: Vec<&str> = output.lines().collect();
     let mut output_idx = 0;
 
@@ -212,9 +272,9 @@ fn match_checks(checks: &[Check], output: &str, filename: &str) -> Result<(), St
         }
         if !found {
             return Err(format!(
-                "{}:{}: CHECK failed: expected '{}' not found in remaining output\n\
+                "{}:{}: {} failed: expected '{}' not found in remaining output\n\
                  Full output:\n{}",
-                filename, check.line_num, check.pattern, output
+                filename, check.line_num, directive_name, check.pattern, output
             ));
         }
     }
@@ -225,10 +285,7 @@ fn match_checks(checks: &[Check], output: &str, filename: &str) -> Result<(), St
 /// Find the armfortas binary.
 fn find_compiler() -> PathBuf {
     // Look in cargo's target directory.
-    let candidates = [
-        "target/debug/armfortas",
-        "target/release/armfortas",
-    ];
+    let candidates = ["target/debug/armfortas", "target/release/armfortas"];
     for c in &candidates {
         let p = PathBuf::from(c);
         if p.exists() {
@@ -240,10 +297,7 @@ fn find_compiler() -> PathBuf {
 
 /// Find the test_programs directory.
 fn find_test_programs() -> PathBuf {
-    let candidates = [
-        "test_programs",
-        "../test_programs",
-    ];
+    let candidates = ["test_programs", "../test_programs"];
     for c in &candidates {
         let p = PathBuf::from(c);
         if p.is_dir() {
@@ -282,17 +336,23 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let xfail_reason = extract_xfail(&source_text);
     let error_expected = extract_error_expected(&source_text);
     let checks = extract_checks(&source_text);
+    let stderr_checks = extract_stderr_checks(&source_text);
+    let expected_exit_code = match extract_exit_code(&source_text, filename) {
+        Ok(code) => code,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let ir_checks = extract_ir_checks(&source_text);
     if checks.is_empty()
+        && stderr_checks.is_empty()
         && ir_checks.is_empty()
+        && expected_exit_code.is_none()
         && xfail_reason.is_none()
         && error_expected.is_none()
     {
-        // Programs with no CHECKs, no IR_CHECKs, no XFAIL marker,
-        // and no ERROR marker are mis-configured tests, not test
-        // failures.
+        // Programs with no runtime or shape assertions, no XFAIL marker,
+        // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / IR_CHECK / XFAIL / ERROR_EXPECTED annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / XFAIL / ERROR_EXPECTED annotations",
             filename,
         ));
     }
@@ -351,31 +411,43 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // threads from racing on shared paths.
         let sandbox = std::env::temp_dir().join(format!("afs_test_sandbox_{}_{}", stem, level));
         let _ = fs::remove_dir_all(&sandbox);
-        fs::create_dir_all(&sandbox)
-            .map_err(|e| format!("{}: cannot create sandbox dir {}: {}", filename, sandbox.display(), e))?;
+        fs::create_dir_all(&sandbox).map_err(|e| {
+            format!(
+                "{}: cannot create sandbox dir {}: {}",
+                filename,
+                sandbox.display(),
+                e
+            )
+        })?;
 
         let run = Command::new(&binary)
             .current_dir(&sandbox)
             .output()
             .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
 
-        if !run.status.success() {
-            let stderr = String::from_utf8_lossy(&run.stderr);
+        let actual_exit_code = run.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let expected_exit_code = expected_exit_code.unwrap_or(0);
+        if actual_exit_code != expected_exit_code {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(format!(
-                "{} [{}]: execution failed (exit {}): {}",
-                filename,
-                opt_flag,
-                run.status.code().unwrap_or(-1),
-                stderr,
+                "{} [{}]: execution exit mismatch: expected {}, got {}\n\
+                 stderr:\n{}",
+                filename, opt_flag, expected_exit_code, actual_exit_code, stderr,
             ));
         }
 
         let stdout = String::from_utf8_lossy(&run.stdout);
         let label = format!("{} [{}]", filename, opt_flag);
-        if let Err(e) = match_checks(&checks, &stdout, &label) {
+        if let Err(e) = match_checks(&checks, &stdout, &label, "CHECK") {
             let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
+            return Err(e);
+        }
+        if let Err(e) = match_checks(&stderr_checks, &stderr, &label, "STDERR_CHECK") {
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
         }
         let _ = fs::remove_file(&binary);
@@ -479,7 +551,11 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
 
     eprintln!(
         "\n[{}] {} passed, {} xfailed, {} failed out of {} test programs",
-        opt_flag, passed, xfailed, failures.len(), sources.len(),
+        opt_flag,
+        passed,
+        xfailed,
+        failures.len(),
+        sources.len(),
     );
 
     if failures.is_empty() {
@@ -558,7 +634,10 @@ fn codegen_is_deterministic_at_o2() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("two_loops.f90");
-    assert!(source.exists(), "two_loops.f90 missing — needed for determinism check");
+    assert!(
+        source.exists(),
+        "two_loops.f90 missing — needed for determinism check"
+    );
 
     let first = compile_to_asm(&compiler, &source, "-O2");
     let second = compile_to_asm(&compiler, &source, "-O2");
@@ -581,7 +660,10 @@ fn codegen_is_deterministic_with_module_globals() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("module_init.f90");
-    assert!(source.exists(), "module_init.f90 missing — needed for determinism check");
+    assert!(
+        source.exists(),
+        "module_init.f90 missing — needed for determinism check"
+    );
 
     for opt in ["-O0", "-O1", "-O2", "-O3"] {
         let first = compile_to_asm(&compiler, &source, opt);
@@ -593,5 +675,50 @@ fn codegen_is_deterministic_with_module_globals() {
              in non-deterministic order.",
             opt,
         );
+    }
+}
+
+#[test]
+fn extract_exit_code_accepts_integer_annotation() {
+    let source = "! EXIT_CODE: 17\nprogram t\nend program t\n";
+    assert_eq!(extract_exit_code(source, "inline.f90").unwrap(), Some(17));
+}
+
+#[test]
+fn extract_exit_code_rejects_multiple_annotations() {
+    let source = "! EXIT_CODE: 1\n! EXIT_CODE: 2\nprogram t\nend program t\n";
+    let err = extract_exit_code(source, "inline.f90").unwrap_err();
+    assert!(err.contains("multiple EXIT_CODE annotations"));
+}
+
+#[test]
+fn match_checks_reports_stderr_check_failures_by_name() {
+    let checks = vec![Check {
+        line_num: 1,
+        pattern: "ERROR STOP".into(),
+    }];
+    let err = match_checks(
+        &checks,
+        "different stderr",
+        "inline.f90 [O0]",
+        "STDERR_CHECK",
+    )
+    .unwrap_err();
+    assert!(err.contains("STDERR_CHECK failed"));
+}
+
+#[test]
+fn stderr_and_exit_code_annotations_allow_error_stop() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_stop_status.f90");
+    assert!(
+        source.exists(),
+        "error_stop_status.f90 missing — needed for stderr/exit-code harness coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("error_stop_status.f90 should pass, got {:?}", other),
     }
 }
