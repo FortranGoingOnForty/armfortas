@@ -241,49 +241,15 @@ fn find_inst(func: &Function, vid: ValueId) -> Option<&Inst> {
     None
 }
 
-/// Conservative legality check: only interchange when the body contains
-/// no stores that read from the same array with a different subscript
-/// pattern (which would create loop-carried dependencies).
-///
-/// For simple `a(i,j) = expr` patterns where `expr` doesn't read from
-/// `a`, interchange is always legal.
+/// Legality check using dependence analysis. Verifies that swapping
+/// the loop order does not reverse any dependence direction.
 fn is_interchange_legal(
     func: &Function,
     inner_loop: &super::loop_tree::LoopTreeNode,
     outer_iv: ValueId,
     inner_iv: ValueId,
 ) -> bool {
-    // Collect all GEP base pointers used in stores.
-    let mut store_bases: HashSet<ValueId> = HashSet::new();
-    // Collect all GEP base pointers used in loads.
-    let mut load_bases: HashSet<ValueId> = HashSet::new();
-
-    for &bid in &inner_loop.body {
-        let block = func.block(bid);
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Store(_, ptr) => {
-                    if let Some(base) = trace_gep_base(func, *ptr) {
-                        store_bases.insert(base);
-                    }
-                }
-                InstKind::Load(ptr) => {
-                    if let Some(base) = trace_gep_base(func, *ptr) {
-                        load_bases.insert(base);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Conservative: if any array is both stored and loaded in the loop
-    // body, there might be a loop-carried dependency. Reject.
-    for base in &store_bases {
-        if load_bases.contains(base) { return false; }
-    }
-    let _ = (outer_iv, inner_iv);
-    true
+    super::dep_analysis::interchange_legal(func, &inner_loop.body, outer_iv, inner_iv)
 }
 
 /// Trace through a GEP chain to find the base array pointer.
