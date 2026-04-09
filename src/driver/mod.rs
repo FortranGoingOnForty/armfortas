@@ -262,6 +262,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         linearscan::apply_allocation(mf, &result, &liveness);
         linearscan::insert_callee_saves(mf, &result.callee_saved_used);
         linearscan::coalesce_moves(mf);
+        // 8.5. Tail call optimization (O1+): BL + epilogue → epilogue + B.
+        // Runs after regalloc so we can inspect physical register assignments.
+        if opts.opt_level >= OptLevel::O1 {
+            crate::codegen::tailcall::tail_call_opt(mf);
+        }
     }
 
     // 9. Emit assembly.

@@ -10,3 +10,4 @@ pub mod regalloc;
 pub mod linearscan;
 pub mod emit;
 pub mod peephole;
+pub mod tailcall;

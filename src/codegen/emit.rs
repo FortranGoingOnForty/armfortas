@@ -551,9 +551,18 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
 
         ArmOpcode::B => {
-            if let MachineOperand::BlockRef(id) = &inst.operands[0] {
-                format!("b {}", mf.block(*id).label)
-            } else { "b ???".into() }
+            match &inst.operands[0] {
+                MachineOperand::BlockRef(id) => format!("b {}", mf.block(*id).label),
+                // Tail call to an external symbol (TCO): B _callee
+                MachineOperand::Extern(name) => {
+                    if name.starts_with('_') {
+                        format!("b {}", name)
+                    } else {
+                        format!("b _{}", name)
+                    }
+                }
+                _ => "b ???".into(),
+            }
         }
         ArmOpcode::BCond => {
             let cond = if let MachineOperand::Cond(c) = &inst.operands[0] { cond_str(*c) } else { "eq" };
