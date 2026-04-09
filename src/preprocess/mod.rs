@@ -123,6 +123,9 @@ struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     include_paths: Vec<PathBuf>,
     cond_stack: Vec<CondState>,
+    /// O(1) counter: number of non-Active levels on the stack.
+    /// `is_emitting()` is just `skip_depth == 0`.
+    skip_depth: u32,
     /// Include depth for recursion guard.
     include_depth: u32,
     /// Fixed-form source mode.
@@ -139,6 +142,7 @@ impl Preprocessor {
             fixed_form: config.fixed_form,
             line_override: None,
             cond_stack: Vec::new(),
+            skip_depth: 0,
             include_depth: 0,
         }
     }
@@ -153,7 +157,7 @@ impl Preprocessor {
     }
 
     fn is_emitting(&self) -> bool {
-        self.cond_stack.iter().all(|s| matches!(s, CondState::Active))
+        self.skip_depth == 0
     }
 
     fn process(&mut self, source: &str, filename: &str) -> Result<PreprocOutput, PreprocError> {
@@ -308,27 +312,52 @@ impl Preprocessor {
         }
     }
 
+    // ---- Conditional directive helpers (maintain skip_depth counter) ----
+
+    fn push_cond(&mut self, state: CondState) {
+        if !matches!(state, CondState::Active) { self.skip_depth += 1; }
+        self.cond_stack.push(state);
+    }
+
+    fn set_top_cond(&mut self, new: CondState) {
+        let old = *self.cond_stack.last().unwrap();
+        let was_skip = !matches!(old, CondState::Active);
+        let now_skip = !matches!(new, CondState::Active);
+        match (was_skip, now_skip) {
+            (false, true) => self.skip_depth += 1,
+            (true, false) => self.skip_depth -= 1,
+            _ => {}
+        }
+        *self.cond_stack.last_mut().unwrap() = new;
+    }
+
+    fn pop_cond(&mut self) -> Option<CondState> {
+        let popped = self.cond_stack.pop()?;
+        if !matches!(popped, CondState::Active) { self.skip_depth -= 1; }
+        Some(popped)
+    }
+
     // ---- Conditional directives ----
 
     fn do_ifdef(&mut self, args: &str, negate: bool) -> Result<(), PreprocError> {
         let name = args.split_whitespace().next().unwrap_or("");
         if !self.is_emitting() {
-            self.cond_stack.push(CondState::ParentSkipping);
+            self.push_cond(CondState::ParentSkipping);
             return Ok(());
         }
         let defined = self.defines.contains_key(name);
         let condition = if negate { !defined } else { defined };
-        self.cond_stack.push(if condition { CondState::Active } else { CondState::Skipping });
+        self.push_cond(if condition { CondState::Active } else { CondState::Skipping });
         Ok(())
     }
 
     fn do_if(&mut self, args: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
         if !self.is_emitting() {
-            self.cond_stack.push(CondState::ParentSkipping);
+            self.push_cond(CondState::ParentSkipping);
             return Ok(());
         }
         let val = self.eval_condition(args, filename, line_num)?;
-        self.cond_stack.push(if val { CondState::Active } else { CondState::Skipping });
+        self.push_cond(if val { CondState::Active } else { CondState::Skipping });
         Ok(())
     }
 
@@ -338,17 +367,15 @@ impl Preprocessor {
                 filename: filename.into(), line: line_num,
                 msg: "#elif without matching #if".into(),
             }),
-            Some(CondState::ParentSkipping) => Ok(()), // stay as ParentSkipping
+            Some(CondState::ParentSkipping) => Ok(()),
             Some(CondState::Active) => {
-                // Was true, now done — skip rest.
-                *self.cond_stack.last_mut().unwrap() = CondState::Done;
+                self.set_top_cond(CondState::Done);
                 Ok(())
             }
-            Some(CondState::Done) => Ok(()), // already found true branch
+            Some(CondState::Done) => Ok(()),
             Some(CondState::Skipping) => {
-                // Previous branch was false, evaluate this one.
                 let val = self.eval_condition(args, filename, line_num)?;
-                *self.cond_stack.last_mut().unwrap() = if val { CondState::Active } else { CondState::Skipping };
+                self.set_top_cond(if val { CondState::Active } else { CondState::Skipping });
                 Ok(())
             }
         }
@@ -362,19 +389,19 @@ impl Preprocessor {
             }),
             Some(CondState::ParentSkipping) => Ok(()),
             Some(CondState::Active) => {
-                *self.cond_stack.last_mut().unwrap() = CondState::Done;
+                self.set_top_cond(CondState::Done);
                 Ok(())
             }
             Some(CondState::Done) => Ok(()),
             Some(CondState::Skipping) => {
-                *self.cond_stack.last_mut().unwrap() = CondState::Active;
+                self.set_top_cond(CondState::Active);
                 Ok(())
             }
         }
     }
 
     fn do_endif(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
-        if self.cond_stack.pop().is_none() {
+        if self.pop_cond().is_none() {
             return Err(PreprocError {
                 filename: filename.into(), line: line_num,
                 msg: "#endif without matching #if".into(),
