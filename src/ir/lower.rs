@@ -4559,6 +4559,35 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     }
 }
 
+/// Returns true if an expression contains no function calls, I/O, or
+/// other side effects. Used by Select lowering to ensure both branches
+/// are safe to evaluate unconditionally.
+fn is_pure_expr(expr: &crate::ast::expr::Expr) -> bool {
+    use crate::ast::expr::Expr;
+    match expr {
+        // Leaf nodes — always pure.
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::Name { .. } => true,
+
+        // Binary/unary — pure if operands are pure.
+        Expr::BinaryOp { left, right, .. } => {
+            is_pure_expr(&left.node) && is_pure_expr(&right.node)
+        }
+        Expr::UnaryOp { operand, .. } => is_pure_expr(&operand.node),
+        Expr::ParenExpr { inner } => is_pure_expr(&inner.node),
+
+        // Function calls, array constructors, component access — not pure
+        // (function calls have side effects; component access and array
+        // constructors may involve complex lowering).
+        _ => false,
+    }
+}
+
 /// Try to lower `if (cond) x = a; else x = b` as a Select instruction
 /// instead of a diamond of basic blocks. Returns true on success.
 ///
@@ -4617,6 +4646,13 @@ fn try_lower_select(
     };
     if !info.dims.is_empty() || info.allocatable { return false; }
     if !matches!(info.char_kind, CharKind::None) { return false; }
+
+    // Both RHS expressions must be side-effect-free (no function calls,
+    // no I/O). Select evaluates BOTH branches unconditionally, so a
+    // call like `fib(n-1)` in an else branch would execute even when
+    // the condition is true — causing infinite recursion.
+    if !is_pure_expr(&then_val_expr.node) { return false; }
+    if !is_pure_expr(&else_val_expr.node) { return false; }
 
     // Lower condition, then both value expressions, then emit Select + Store.
     let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
