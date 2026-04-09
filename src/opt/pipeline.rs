@@ -19,6 +19,8 @@ use super::preheader::PreheaderInsert;
 use super::unswitch::LoopUnswitch;
 use super::interchange::LoopInterchange;
 use super::peel::LoopPeel;
+use super::fission::LoopFission;
+use super::fusion::LoopFusion;
 
 /// Compiler optimization levels.
 ///
@@ -132,6 +134,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
+            pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
@@ -165,6 +169,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
+            pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }

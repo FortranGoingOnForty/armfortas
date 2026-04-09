@@ -27,6 +27,8 @@ pub mod unswitch;
 pub mod interchange;
 pub mod dep_analysis;
 pub mod peel;
+pub mod fission;
+pub mod fusion;
 
 #[cfg(test)]
 mod audit_tests;
