@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
+use crate::ir::walk::find_natural_loops;
 
 /// A node in the call graph — one per function in the module.
 #[derive(Debug)]
@@ -55,7 +56,14 @@ impl CallGraph {
             let mut callees: Vec<u32> = callees_set.into_iter().collect();
             callees.sort();
             nodes[i].callees = callees.clone();
-            nodes[i].inst_count = count;
+
+            // Apply loop cost multiplier: functions with loops have higher
+            // dynamic cost than their static instruction count suggests.
+            // Multiply by 4 for each loop found (conservative estimate of
+            // average trip count impact on code expansion after inlining).
+            let loops = find_natural_loops(func);
+            let loop_multiplier = if loops.is_empty() { 1 } else { 4 * loops.len() };
+            nodes[i].inst_count = count * loop_multiplier;
 
             // Register callers.
             for &callee in &callees {
