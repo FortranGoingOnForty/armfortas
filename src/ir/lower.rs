@@ -4888,8 +4888,13 @@ fn lower_fmt_push(
                 let widened = b.int_extend(val, IntWidth::I64, true);
                 b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
             }
+            IrType::Float(FloatWidth::F32) => {
+                // afs_fmt_push_real takes f64; explicitly widen f32 → f64.
+                // AArch64 does NOT auto-promote floats across the call boundary.
+                let widened = b.float_extend(val, FloatWidth::F64);
+                b.call(FuncRef::External("afs_fmt_push_real".into()), vec![widened], IrType::Void);
+            }
             IrType::Float(_) => {
-                // afs_fmt_push_real takes f64; f32 is promoted by calling convention.
                 b.call(FuncRef::External("afs_fmt_push_real".into()), vec![val], IrType::Void);
             }
             IrType::Bool => {
