@@ -60,7 +60,12 @@ pub fn print_module(module: &Module) -> String {
 /// Print a function to a string.
 pub fn print_function(func: &Function) -> String {
     let mut out = String::new();
-    write!(out, "  func @{}(", func.name).unwrap();
+    // Print function attributes.
+    let mut attrs = Vec::new();
+    if func.is_pure { attrs.push("pure"); }
+    if func.is_elemental { attrs.push("elemental"); }
+    let attr_str = if attrs.is_empty() { String::new() } else { format!(" [{}]", attrs.join(", ")) };
+    write!(out, "  func @{}{}(", func.name, attr_str).unwrap();
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { write!(out, ", ").unwrap(); }
         write!(out, "%{}: {}", p.id.0, p.ty).unwrap();

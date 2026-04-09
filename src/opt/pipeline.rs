@@ -81,7 +81,7 @@ impl OptLevel {
     /// builder below will gate registration on this. Same for the
     /// other two predicates.
     pub fn inlining(self) -> bool {
-        matches!(self, Self::O2 | Self::O3 | Self::Os | Self::Ofast)
+        matches!(self, Self::O1 | Self::O2 | Self::O3 | Self::Os | Self::Ofast)
     }
 
     /// Does this level enable loop vectorization (NEON)?

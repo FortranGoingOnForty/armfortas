@@ -85,7 +85,7 @@ impl CallGraph {
 
     /// Return function indices in bottom-up order: callees before
     /// callers. This is the correct order for inlining.
-    pub fn reverse_postorder(&self) -> Vec<u32> {
+    pub fn bottom_up_order(&self) -> Vec<u32> {
         let n = self.nodes.len();
         let mut visited = vec![false; n];
         let mut order = Vec::new();
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_postorder_callees_first() {
+    fn bottom_up_order_callees_first() {
         let mut m = Module::new("test".into());
         // callee (idx 0) — no calls
         let mut callee = Function::new("callee".into(), vec![], IrType::Void);
@@ -225,7 +225,7 @@ mod tests {
         m.add_function(caller);
 
         let cg = CallGraph::build(&m);
-        let rpo = cg.reverse_postorder();
+        let rpo = cg.bottom_up_order();
         // Callee should come before caller in RPO.
         let callee_pos = rpo.iter().position(|&i| i == 0).unwrap();
         let caller_pos = rpo.iter().position(|&i| i == 1).unwrap();

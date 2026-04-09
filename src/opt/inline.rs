@@ -49,7 +49,7 @@ impl Pass for Inline {
         if self.threshold == 0 { return false; }
 
         let cg = CallGraph::build(module);
-        let order = cg.reverse_postorder();
+        let order = cg.bottom_up_order();
         let mut changed = false;
 
         for &caller_idx in &order {
