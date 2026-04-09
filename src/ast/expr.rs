@@ -133,13 +133,13 @@ impl SpannedExpr {
             Expr::ArrayConstructor { values, type_spec } => {
                 let vals: Vec<String> = values.iter().map(|v| match v {
                     AcValue::Expr(e) => e.to_sexpr(),
-                    AcValue::ImpliedDo { values, var, start, end, step } => {
-                        let vals: Vec<String> = values.iter().map(|v| match v {
+                    AcValue::ImpliedDo(ido) => {
+                        let vals: Vec<String> = ido.values.iter().map(|v| match v {
                             AcValue::Expr(e) => e.to_sexpr(),
-                            AcValue::ImpliedDo { .. } => "(nested-implied-do)".into(),
+                            AcValue::ImpliedDo(_) => "(nested-implied-do)".into(),
                         }).collect();
-                        let step_str = step.as_ref().map_or(String::new(), |s| format!(", {}", s.to_sexpr()));
-                        format!("({}, {}={}, {}{})", vals.join(", "), var, start.to_sexpr(), end.to_sexpr(), step_str)
+                        let step_str = ido.step.as_ref().map_or(String::new(), |s| format!(", {}", s.to_sexpr()));
+                        format!("({}, {}={}, {}{})", vals.join(", "), ido.var, ido.start.to_sexpr(), ido.end.to_sexpr(), step_str)
                     }
                 }).collect();
                 if let Some(ts) = type_spec {
@@ -249,16 +249,19 @@ pub struct Argument {
 
 /// Array constructor value — either an expression or an implied-do loop.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum AcValue {
     Expr(SpannedExpr),
-    ImpliedDo {
-        values: Vec<AcValue>,
-        var: String,
-        start: SpannedExpr,
-        end: SpannedExpr,
-        step: Option<SpannedExpr>,
-    },
+    ImpliedDo(Box<ImpliedDoLoop>),
+}
+
+/// Implied-do loop contents (boxed to shrink AcValue from ~288 to ~16 bytes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpliedDoLoop {
+    pub values: Vec<AcValue>,
+    pub var: String,
+    pub start: SpannedExpr,
+    pub end: SpannedExpr,
+    pub step: Option<SpannedExpr>,
 }
 
 /// Section subscript — either a single element or a range (for array sections/substrings).

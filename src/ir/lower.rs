@@ -780,7 +780,8 @@ fn collect_ac_value(
             out.push(coerced);
             Some(())
         }
-        AcValue::ImpliedDo { values, var, start, end, step } => {
+        AcValue::ImpliedDo(ido) => {
+            let (values, var, start, end, step) = (&ido.values, &ido.var, &ido.start, &ido.end, &ido.step);
             let start_v = eval_const_scalar(start, param_consts)?;
             let end_v = eval_const_scalar(end, param_consts)?;
             let step_v = match step {
@@ -1623,11 +1624,11 @@ fn check_filtered_in_acvalue(
     use crate::ast::expr::AcValue;
     match v {
         AcValue::Expr(e) => check_filtered_in_expr(e, filtered),
-        AcValue::ImpliedDo { values, start, end, step, .. } => {
-            for inner in values { check_filtered_in_acvalue(inner, filtered); }
-            check_filtered_in_expr(start, filtered);
-            check_filtered_in_expr(end, filtered);
-            if let Some(s) = step { check_filtered_in_expr(s, filtered); }
+        AcValue::ImpliedDo(ido) => {
+            for inner in &ido.values { check_filtered_in_acvalue(inner, filtered); }
+            check_filtered_in_expr(&ido.start, filtered);
+            check_filtered_in_expr(&ido.end, filtered);
+            if let Some(s) = &ido.step { check_filtered_in_expr(s, filtered); }
         }
     }
 }
@@ -5134,10 +5135,10 @@ fn store_ac_values_into(
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
             }
-            crate::ast::expr::AcValue::ImpliedDo { values: inner, var, start, end, step } => {
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
                 store_ac_implied_do(
                     b, locals, dest_base, elem_ty, elem_bytes, off_slot,
-                    inner, var, start, end, step.as_ref(), st,
+                    &ido.values, &ido.var, &ido.start, &ido.end, ido.step.as_ref(), st,
                 );
             }
         }
@@ -5247,10 +5248,10 @@ fn store_ac_implied_do(
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
             }
-            crate::ast::expr::AcValue::ImpliedDo { values: nested, var: nv, start: ns, end: ne, step: nstep } => {
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
                 store_ac_implied_do(
                     b, &scratch_locals, dest_base, elem_ty, elem_bytes, off_slot,
-                    nested, nv, ns, ne, nstep.as_ref(), st,
+                    &ido.values, &ido.var, &ido.start, &ido.end, ido.step.as_ref(), st,
                 );
             }
         }

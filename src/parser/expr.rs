@@ -472,13 +472,13 @@ impl<'a> Parser<'a> {
                         None
                     };
                     self.expect(&TokenKind::RParen)?;
-                    return Ok(AcValue::ImpliedDo {
+                    return Ok(AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
                         values,
                         var: var_tok.text,
                         start,
                         end,
                         step,
-                    });
+                    })));
                 }
             }
             values.push(self.parse_ac_value()?);

@@ -961,18 +961,18 @@ impl<'a> Parser<'a> {
                     // Build as a synthetic expression — a FunctionCall-like node
                     // that sema can recognize as an I/O implied-do.
                     let span = span_from_to(start, self.prev_span());
-                    use crate::ast::expr::{Expr, AcValue};
+                    use crate::ast::expr::{Expr, AcValue, ImpliedDoLoop};
                     let values: Vec<AcValue> = inner_items.into_iter()
                         .map(AcValue::Expr).collect();
                     return Ok(Spanned::new(Expr::ArrayConstructor {
                         type_spec: None,
-                        values: vec![AcValue::ImpliedDo {
+                        values: vec![AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
                             values,
                             var,
                             start: loop_start,
                             end,
                             step: step.map(|s| *s),
-                        }],
+                        }))],
                     }, span));
                 }
             }
