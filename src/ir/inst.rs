@@ -39,6 +39,10 @@ pub enum RuntimeFunc {
     StringCompare,
     Stop,
     ErrorStop,
+    /// Bounds check: `afs_check_bounds(index, lower_bound, upper_bound)`.
+    /// Aborts if index < lower or index > upper. Inserted at array access
+    /// sites; eliminated at O2+ when provably safe.
+    CheckBounds,
 }
 
 /// Comparison operations.

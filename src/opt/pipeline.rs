@@ -26,6 +26,7 @@ use super::dead_func::DeadFuncElim;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
+use super::bce::Bce;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 

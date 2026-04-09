@@ -38,6 +38,7 @@ pub mod sroa;
 pub mod alias;
 pub mod gvn;
 pub mod global_lsf;
+pub mod bce;
 
 #[cfg(test)]
 mod audit_tests;
