@@ -134,15 +134,16 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O2 => {
             // O1 plus LICM, strength reduction, DSE, LSF, loop transforms.
-            // SROA, GVN, GlobalLsf disabled: pipeline interaction bugs
-            // (second Mem2Reg + unswitching SSA, GlobalLsf cross-call
-            // forwarding). Deferred to 29.8.5 with proper .refs study.
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            // GlobalLsf disabled: forwards stale loop bounds on fibonacci
+            // (loop runs too many iterations at O2). Needs proper clobber
+            // analysis for ALL paths, not just immediate dominator.
+            // pm.add(Box::new(GlobalLsf));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -156,6 +157,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
+            pm.add(Box::new(Gvn));  // after loop passes to avoid SSA conflicts
             pm.add(Box::new(Dce));
         }
         OptLevel::Os => {

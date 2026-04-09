@@ -128,6 +128,33 @@ fn find_dominating_store(
         }
     }
 
+    // Before checking dominators, verify the load_block itself has no
+    // clobbers (calls or aliasing stores) before the load. If it does,
+    // cross-block forwarding is unsafe — the clobber invalidates any
+    // store from a dominating block.
+    let block = func.block(load_block);
+    let mut load_block_has_clobber = false;
+    for inst in &block.insts {
+        // Stop at the load itself.
+        if let InstKind::Load(ptr) = &inst.kind {
+            if *ptr == load_ptr { break; }
+        }
+        // Any call before the load is a clobber (LLVM MemorySSA principle:
+        // every call is a MemoryDef unless proven NoModRef).
+        if matches!(&inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)) {
+            load_block_has_clobber = true;
+            break;
+        }
+        // Any aliasing store before the load is a clobber.
+        if let InstKind::Store(_, ptr) = &inst.kind {
+            if matches!(alias::query(func, *ptr, load_ptr), AliasResult::MayAlias | AliasResult::MustAlias) {
+                load_block_has_clobber = true;
+                break;
+            }
+        }
+    }
+    if load_block_has_clobber { return None; }
+
     // Walk up dominator tree looking for stores in dominating blocks.
     let mut current = load_block;
     while let Some(&idom) = idoms.get(&current) {
