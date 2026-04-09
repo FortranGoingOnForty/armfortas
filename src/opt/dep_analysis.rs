@@ -256,23 +256,58 @@ fn gcd(a: u64, b: u64) -> u64 {
 // High-level queries for loop passes
 // ---------------------------------------------------------------------------
 
-/// Check if all memory accesses in two loop bodies are independent
-/// (safe to fuse the loops).
+/// Check if two adjacent loop bodies can be legally fused.
+///
+/// Fusion is safe when no cross-loop dependence would be reversed.
+/// Same-iteration dependencies (subscript diff = 0) are ALWAYS
+/// fusion-legal: the write in A's body precedes the read in B's
+/// body within the same fused iteration. Only cross-iteration
+/// backward dependencies (B writes, A reads at a later iteration)
+/// would be reversed by fusion — and those can't exist between
+/// adjacent loops that don't share a carried state.
+/// Check if two adjacent loop bodies can be legally fused.
+///
+/// `iv_a` and `iv_b` are the IVs of the two loops — they iterate
+/// over the same range, so for dependence purposes they are the
+/// same variable. We remap `iv_b → iv_a` in B's subscripts before
+/// comparing.
 pub fn fusion_legal(
     func: &Function,
     body_a: &HashSet<BlockId>,
     body_b: &HashSet<BlockId>,
-    ivs: &HashSet<ValueId>,
+    iv_a: ValueId,
+    iv_b: ValueId,
 ) -> bool {
-    let refs_a = collect_mem_refs(func, body_a, ivs);
-    let refs_b = collect_mem_refs(func, body_b, ivs);
+    let mut ivs_a = HashSet::new();
+    ivs_a.insert(iv_a);
+    let mut ivs_b = HashSet::new();
+    ivs_b.insert(iv_b);
 
-    // Check all cross-loop pairs where at least one is a write.
+    let refs_a = collect_mem_refs(func, body_a, &ivs_a);
+    let refs_b_raw = collect_mem_refs(func, body_b, &ivs_b);
+
+    // Remap iv_b → iv_a in B's subscripts so the comparison works.
+    let refs_b: Vec<MemRef> = refs_b_raw.into_iter().map(|mut r| {
+        for term in &mut r.subscript.terms {
+            if term.1 == iv_b { term.1 = iv_a; }
+        }
+        r
+    }).collect();
+
     for ra in &refs_a {
         for rb in &refs_b {
             if !ra.is_write && !rb.is_write { continue; }
-            let dep = test_dependence(ra, rb);
-            if dep.dependent { return false; }
+            if ra.base != rb.base { continue; }
+
+            let diff = rb.subscript.sub(&ra.subscript);
+
+            // Same-iteration access (diff = 0) → fusion-legal.
+            if diff.terms.is_empty() && diff.constant == 0 {
+                continue;
+            }
+
+            // Non-zero distance → conservative reject.
+            return false;
         }
     }
     true

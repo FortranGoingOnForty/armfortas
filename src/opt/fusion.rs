@@ -60,12 +60,13 @@ fn fusion_in_function(func: &mut Function) -> bool {
             let iv_a = hdr_a.params[0].id;
             let iv_b = hdr_b.params[0].id;
 
-            // Loop A's exit must flow directly to loop B's preheader.
+            // Loop A's exit must flow directly to loop B's preheader
+            // (or BE loop B's preheader — common when exit_a branches
+            // directly to B's header).
             let exit_a = find_loop_exit(func, lp_a);
             let Some(exit_a) = exit_a else { continue };
 
-            // The exit block must branch (possibly through a chain) to ph_b.
-            if !flows_to(func, exit_a, ph_b) { continue; }
+            if exit_a != ph_b && !flows_to(func, exit_a, ph_b) { continue; }
 
             // Matching iteration spaces: same init, bound, stride constants.
             let Some(init_a) = get_init_const(func, lp_a, &preds) else { continue };
@@ -77,10 +78,7 @@ fn fusion_in_function(func: &mut Function) -> bool {
             if bound_a != bound_b { continue; }
 
             // Check legality via dep analysis.
-            let mut ivs = HashSet::new();
-            ivs.insert(iv_a);
-            ivs.insert(iv_b);
-            if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, &ivs) {
+            if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, iv_a, iv_b) {
                 continue;
             }
 
@@ -183,33 +181,74 @@ fn do_fusion(
     exit_a: BlockId,
     exit_b: BlockId,
 ) {
-    // Build remap: iv_b → iv_a, and new IDs for all cloned instructions.
+    // Build remap: iv_b → iv_a.
     let mut val_map: std::collections::HashMap<ValueId, ValueId> = std::collections::HashMap::new();
     val_map.insert(iv_b, iv_a);
 
-    // Clone B's body instructions with remapped operands.
-    let b_insts: Vec<Inst> = func.block(body_b_id).insts.clone();
+    // Clone ALL instructions from B's preheader (exit_a / the gap
+    // block between the loops) into A's body. These are typically
+    // constants that LICM hoisted out of B's loop. After fusion,
+    // exit_a won't dominate A's body, so we must duplicate them.
     let mut new_insts = Vec::new();
-    for inst in &b_insts {
-        let new_id = func.next_value_id();
-        func.register_type(new_id, inst.ty.clone());
-        val_map.insert(inst.id, new_id);
-        let new_kind = remap_inst_kind(&inst.kind, &val_map);
-        new_insts.push(Inst {
-            id: new_id,
-            kind: new_kind,
-            ty: inst.ty.clone(),
-            span: inst.span,
-        });
+    let exit_insts: Vec<Inst> = func.block(exit_a).insts.clone();
+    for inst in &exit_insts {
+        if is_clonable(&inst.kind) {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, inst.ty.clone());
+            val_map.insert(inst.id, new_id);
+            new_insts.push(Inst {
+                id: new_id,
+                kind: inst.kind.clone(),
+                ty: inst.ty.clone(),
+                span: inst.span,
+            });
+        }
     }
 
-    // Append the cloned instructions to A's body block.
+    // Also scan ALL of B's body blocks (not just body_b_id) for
+    // instructions to clone.
+    let b_body_sorted: Vec<BlockId> = {
+        let mut v: Vec<BlockId> = lp_b.body.iter().copied().collect();
+        v.sort_by_key(|b| b.0);
+        v
+    };
+
+    for &bid in &b_body_sorted {
+        if bid == lp_b.header { continue; } // skip header (just relay)
+        if bid == lp_b.latches[0] { continue; } // skip latch (IV increment)
+        let block = func.block(bid);
+        // Skip comparison blocks (they have the loop exit condition).
+        let is_cmp = block.insts.iter().any(|i| matches!(i.kind, InstKind::ICmp(..)));
+        if is_cmp && !block.insts.iter().any(|i| matches!(i.kind, InstKind::Store(..))) {
+            continue;
+        }
+        // Clone this block's instructions.
+        let block_insts: Vec<Inst> = block.insts.clone();
+        for inst in &block_insts {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, inst.ty.clone());
+            val_map.insert(inst.id, new_id);
+            let new_kind = remap_inst_kind(&inst.kind, &val_map);
+            new_insts.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: inst.ty.clone(),
+                span: inst.span,
+            });
+        }
+    }
+
+    // Append cloned constants + B's body instructions to A's body block.
     func.block_mut(body_a_id).insts.extend(new_insts);
 
     // Redirect loop A's exit to where loop B's exit goes.
-    // Loop A's exit block currently branches to loop B's preheader.
-    // After fusion, it should go directly to where loop B's exit goes.
+    // Loop A's exit block (exit_a) currently branches to B's preheader.
+    // After fusion, it should contain B's exit block's instructions
+    // (the print statements and return) instead.
+    let exit_b_insts: Vec<Inst> = func.block(exit_b).insts.clone();
     let exit_b_term = func.block(exit_b).terminator.clone();
+    func.block_mut(exit_a).insts.clear();
+    func.block_mut(exit_a).insts.extend(exit_b_insts);
     func.block_mut(exit_a).terminator = exit_b_term;
 
     // Mark loop B's blocks as unreachable.
@@ -218,6 +257,25 @@ fn do_fusion(
     }
 
     prune_unreachable(func);
+}
+
+fn find_inst_in_func(func: &Function, vid: ValueId) -> Option<Inst> {
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if inst.id == vid { return Some(inst.clone()); }
+        }
+    }
+    None
+}
+
+/// Can this instruction kind be safely duplicated (no side effects)?
+fn is_clonable(kind: &InstKind) -> bool {
+    matches!(kind,
+        InstKind::ConstInt(..) | InstKind::ConstFloat(..) | InstKind::ConstBool(..)
+        | InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::IMul(..)
+        | InstKind::IntExtend(..) | InstKind::IntTrunc(..)
+        | InstKind::GetElementPtr(..)
+    )
 }
 
 // ---------------------------------------------------------------------------
