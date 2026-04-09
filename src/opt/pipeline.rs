@@ -163,6 +163,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
@@ -176,6 +178,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
+            pm.add(Box::new(Gvn));
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
@@ -183,6 +186,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
