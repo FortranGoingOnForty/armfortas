@@ -20,6 +20,7 @@ use super::unswitch::LoopUnswitch;
 use super::interchange::LoopInterchange;
 use super::peel::LoopPeel;
 use super::call_resolve::CallResolve;
+use super::inline::Inline;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -117,6 +118,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Inline::for_level(OptLevel::O1)));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
@@ -127,6 +129,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -147,6 +150,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -164,6 +168,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));

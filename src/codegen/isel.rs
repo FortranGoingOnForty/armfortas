@@ -14,7 +14,35 @@ use super::mir::*;
 
 /// Select machine instructions for an entire IR module.
 pub fn select_module(module: &Module) -> Vec<MachineFunction> {
-    module.functions.iter().map(select_function).collect()
+    // Build function name table for resolving Internal call refs.
+    let func_names: Vec<String> = module.functions.iter()
+        .map(|f| f.name.clone())
+        .collect();
+    module.functions.iter()
+        .map(|f| select_function_with_names(f, &func_names))
+        .collect()
+}
+
+fn select_function_with_names(func: &Function, func_names: &[String]) -> MachineFunction {
+    let mut mf = select_function(func);
+    // Resolve any Internal call references to actual function names.
+    for block in &mut mf.blocks {
+        for inst in &mut block.insts {
+            if let super::mir::ArmOpcode::Bl = inst.opcode {
+                if let Some(super::mir::MachineOperand::Extern(ref mut name)) = inst.operands.first_mut() {
+                    // Check if this is a placeholder "_func_N" name from isel.
+                    if name.starts_with("_func_") {
+                        if let Ok(idx) = name[6..].parse::<usize>() {
+                            if idx < func_names.len() {
+                                *name = func_names[idx].clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mf
 }
 
 /// Select machine instructions for one IR function.

@@ -31,6 +31,7 @@ pub mod fission;
 pub mod fusion;
 pub mod call_resolve;
 pub mod callgraph;
+pub mod inline;
 
 #[cfg(test)]
 mod audit_tests;
