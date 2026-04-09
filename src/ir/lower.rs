@@ -4075,7 +4075,15 @@ fn lower_array_store(
     let base = array_base_addr(b, info);
     let idx64 = widen_idx_to_i64(b, idx);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    b.store(value, elem_ptr);
+    // Audit5 CRITICAL-1: coerce the RHS to the array element
+    // type before the store. Without this, an i32-typed value
+    // assigned into an i8 array would emit a 4-byte STR through
+    // a 1-byte slot, clobbering the next 3 bytes. The verifier's
+    // store-pointee width check has a `pointee_is_byte` escape
+    // hatch for derived-type byte-cursor GEPs, so the bad store
+    // wasn't caught at the IR level either.
+    let coerced = coerce_to_type(b, value, &info.ty);
+    b.store(coerced, elem_ptr);
 }
 
 /// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.

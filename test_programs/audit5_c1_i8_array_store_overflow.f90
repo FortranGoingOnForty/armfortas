@@ -1,24 +1,21 @@
-! Audit #5 CRITICAL-1 — i8 array store emits 4-byte STR through
-! a 1-byte slot, clobbering the next 3 bytes.
+! Audit #5 CRITICAL-1 — i8 array element stores now coerce the
+! RHS to the element type before storing.
 !
-! The audit-4 CRITICAL-2 fix made isel pick the store opcode by
-! the IR VALUE's type (a deliberate choice to support byte-level
-! GEPs into derived types where Ptr<i8> is a generic offset
-! cursor). The dual obligation is that lower_array_store must
-! truncate the value to the element type before the store —
-! and it doesn't. The verifier was supposed to catch this via
-! the audit-4 Maj-2 check, but `pointee_is_byte` escapes the
-! check for every i8 store, including legitimate array stores.
+! Fixed: lower_array_store now calls coerce_to_type on the value
+! before emitting `b.store(...)`. The CRITICAL-2 fix from audit
+! #4 made isel pick the store opcode by the value's IR type, so
+! the IR's value type is the source of truth for store width.
+! The dual obligation is that array element assignments must
+! truncate to the declared element type — and that's what the
+! coerce_to_type call enforces.
 !
-! Test design: the canary is passed BY REFERENCE to a subroutine,
-! which forces mem2reg to keep it as a memory alloca rather than
-! promoting it to a register. Without this, mem2reg + const_prop
-! at -O1+ sees the canary's stored -1 and the (separate) array
-! alloca as non-aliasing and folds the canary read to literal
-! -1, hiding the runtime corruption. Pass-by-ref makes the
-! canary's address escape and forces a real memory load.
+! Test design: the canary is passed BY REFERENCE to a contained
+! subroutine. mem2reg refuses to promote allocas whose address
+! escapes, so the canary's value comes from a real memory load
+! rather than a const-folded register. Without this, mem2reg
+! at -O1+ would see the canary alloca and the array alloca as
+! non-aliasing and hide the bug behind a const-prop'd literal.
 !
-! XFAIL: audit5 CRITICAL-1 (i8 array store overflows neighbors)
 ! CHECK: -1
 program audit5_c1_i8_array_store_overflow
   integer(kind=1) :: canary
