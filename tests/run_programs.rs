@@ -106,7 +106,7 @@
 //! should use stable substrings that are intentionally expected
 //! across the requested matrix.
 //!
-//! ## FILE_CHECK / FILE_NOT / FILE_EXISTS / FILE_MISSING annotations
+//! ## FILE_CHECK / FILE_NOT / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT annotations
 //!
 //! Runtime tests can assert on files created inside their per-test
 //! sandbox:
@@ -121,6 +121,8 @@
 //!     run, regardless of content.
 //!   * `! FILE_MISSING: <relative-path>` — the file must not exist after
 //!     the run.
+//!   * `! FILE_LINE_COUNT: <relative-path> => <int>` — the file must
+//!     exist and contain exactly that many text lines.
 //!
 //! Paths are sandbox-relative on purpose. The harness runs each binary
 //! in a private temp directory, so file assertions pin side effects
@@ -136,6 +138,9 @@
 //!     identical object bytes.
 //!   * `! REPRO_CHECK: run` — execute twice in fresh sandboxes and
 //!     require identical exit/stdout/stderr plus identical written files.
+//!   * `! REPRO_CHECK: run_same_sandbox` — execute twice in the same
+//!     sandbox and require the second run to leave the same final
+//!     exit/stdout/stderr and file snapshot as the first.
 //!
 //! These are test-local determinism assertions, lighter-weight than the
 //! dedicated global determinism tests at the bottom of this file.
@@ -194,11 +199,18 @@ struct FilePresenceCheck {
     should_exist: bool,
 }
 
+struct FileLineCountCheck {
+    line_num: usize,
+    rel_path: String,
+    expected_lines: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReproStage {
     Asm,
     Obj,
     Run,
+    RunSameSandbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,6 +498,59 @@ fn extract_file_presence_checks(
     Ok(checks)
 }
 
+fn extract_file_line_count_checks(
+    source: &str,
+    filename: &str,
+) -> Result<Vec<FileLineCountCheck>, String> {
+    let mut checks = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("! FILE_LINE_COUNT:") else {
+            continue;
+        };
+        let Some((raw_path, raw_count)) = rest.trim().split_once("=>") else {
+            return Err(format!(
+                "{}:{}: FILE_LINE_COUNT must be written as <relative-path> => <int>",
+                filename,
+                i + 1
+            ));
+        };
+
+        let rel_path = raw_path.trim();
+        if rel_path.is_empty() {
+            return Err(format!(
+                "{}:{}: FILE_LINE_COUNT path cannot be empty",
+                filename,
+                i + 1
+            ));
+        }
+        if Path::new(rel_path).is_absolute() {
+            return Err(format!(
+                "{}:{}: FILE_LINE_COUNT path must be relative, got '{}'",
+                filename,
+                i + 1,
+                rel_path
+            ));
+        }
+
+        let expected_lines = raw_count.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{}:{}: FILE_LINE_COUNT line count must be a non-negative integer, got '{}'",
+                filename,
+                i + 1,
+                raw_count.trim()
+            )
+        })?;
+
+        checks.push(FileLineCountCheck {
+            line_num: i + 1,
+            rel_path: rel_path.to_string(),
+            expected_lines,
+        });
+    }
+    Ok(checks)
+}
+
 fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>, String> {
     let mut stages = Vec::new();
     for (i, line) in source.lines().enumerate() {
@@ -497,9 +562,10 @@ fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>,
             "asm" => ReproStage::Asm,
             "obj" => ReproStage::Obj,
             "run" => ReproStage::Run,
+            "run_same_sandbox" => ReproStage::RunSameSandbox,
             other => {
                 return Err(format!(
-                    "{}:{}: REPRO_CHECK must be one of asm, obj, run; got '{}'",
+                    "{}:{}: REPRO_CHECK must be one of asm, obj, run, run_same_sandbox; got '{}'",
                     filename,
                     i + 1,
                     other
@@ -825,6 +891,31 @@ fn match_file_presence_checks(
     Ok(())
 }
 
+fn match_file_line_count_checks(
+    checks: &[FileLineCountCheck],
+    files: &BTreeMap<String, Vec<u8>>,
+    filename: &str,
+) -> Result<(), String> {
+    for check in checks {
+        let Some(bytes) = files.get(&check.rel_path) else {
+            return Err(format!(
+                "{}:{}: FILE_LINE_COUNT expected sandbox file '{}' to exist",
+                filename, check.line_num, check.rel_path
+            ));
+        };
+        let text = String::from_utf8_lossy(bytes);
+        let actual_lines = text.lines().count();
+        if actual_lines != check.expected_lines {
+            return Err(format!(
+                "{}:{}: FILE_LINE_COUNT failed for '{}': expected {} lines, got {}\n\
+                 Full file contents:\n{}",
+                filename, check.line_num, check.rel_path, check.expected_lines, actual_lines, text
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_sandbox_files(
     sandbox: &Path,
     filename: &str,
@@ -928,6 +1019,9 @@ fn compile_stage_bytes(
         ReproStage::Asm => ("asm", ".s", &["-S"]),
         ReproStage::Obj => ("obj", ".o", &["-c"]),
         ReproStage::Run => unreachable!("run reproducibility uses runtime snapshots"),
+        ReproStage::RunSameSandbox => {
+            unreachable!("same-sandbox reproducibility uses runtime snapshots")
+        }
     };
     let out = unique_temp_path(kind, stem, level, ext);
     let compile = Command::new(compiler)
@@ -1310,6 +1404,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
     };
+    let file_line_count_checks = match extract_file_line_count_checks(&source_text, filename) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let repro_checks = match extract_repro_checks(&source_text, filename) {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
@@ -1328,6 +1426,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && asm_checks.is_empty()
         && file_checks.is_empty()
         && file_presence_checks.is_empty()
+        && file_line_count_checks.is_empty()
         && repro_checks.is_empty()
         && opt_eq_rules.is_empty()
         && phase_triangulation.is_none()
@@ -1339,7 +1438,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
             filename,
         ));
     }
@@ -1464,6 +1563,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
         }
+        if let Err(e) =
+            match_file_line_count_checks(&file_line_count_checks, &snapshot.files, &label)
+        {
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
+            return Err(e);
+        }
         for stage in &repro_checks {
             match stage {
                 ReproStage::Asm | ReproStage::Obj => {
@@ -1474,6 +1580,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                             ReproStage::Asm => "asm",
                             ReproStage::Obj => "obj",
                             ReproStage::Run => unreachable!(),
+                            ReproStage::RunSameSandbox => unreachable!(),
                         };
                         let _ = fs::remove_file(&binary);
                         let _ = fs::remove_dir_all(&sandbox);
@@ -1502,6 +1609,18 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                         let _ = fs::remove_dir_all(&sandbox);
                         return Err(format!(
                             "{} [{}]: REPRO_CHECK(run) failed: {}",
+                            filename, opt_flag, detail
+                        ));
+                    }
+                }
+                ReproStage::RunSameSandbox => {
+                    let second = run_binary_in_sandbox(&binary, &sandbox, filename)?;
+                    if snapshot != second {
+                        let detail = describe_run_difference(&snapshot, &second);
+                        let _ = fs::remove_file(&binary);
+                        let _ = fs::remove_dir_all(&sandbox);
+                        return Err(format!(
+                            "{} [{}]: REPRO_CHECK(run_same_sandbox) failed: {}",
                             filename, opt_flag, detail
                         ));
                     }
@@ -1813,10 +1932,26 @@ fn extract_file_presence_checks_accepts_exists_and_missing() {
 }
 
 #[test]
+fn extract_file_line_count_checks_accepts_relative_path_and_count() {
+    let source = "! FILE_LINE_COUNT: out.txt => 1000\n";
+    let checks = extract_file_line_count_checks(source, "inline.f90").unwrap();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].rel_path, "out.txt");
+    assert_eq!(checks[0].expected_lines, 1000);
+}
+
+#[test]
 fn extract_repro_checks_rejects_unknown_stage() {
     let source = "! REPRO_CHECK: ir\n";
     let err = extract_repro_checks(source, "inline.f90").unwrap_err();
-    assert!(err.contains("asm, obj, run"));
+    assert!(err.contains("asm, obj, run, run_same_sandbox"));
+}
+
+#[test]
+fn extract_repro_checks_accepts_run_same_sandbox_stage() {
+    let source = "! REPRO_CHECK: run_same_sandbox\n";
+    let checks = extract_repro_checks(source, "inline.f90").unwrap();
+    assert_eq!(checks, vec![ReproStage::RunSameSandbox]);
 }
 
 #[test]
@@ -1966,6 +2101,25 @@ fn file_presence_checks_allow_rewind_side_effects() {
         TestOutcome::Pass => {}
         other => panic!(
             "io_rewind.f90 should pass with FILE_EXISTS/FILE_MISSING coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn file_line_count_and_same_sandbox_repro_allow_flush_stress() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("io_flush_stress.f90");
+    assert!(
+        source.exists(),
+        "io_flush_stress.f90 missing — needed for FILE_LINE_COUNT and run_same_sandbox coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "io_flush_stress.f90 should pass with FILE_LINE_COUNT and REPRO_CHECK(run_same_sandbox), got {:?}",
             other
         ),
     }

@@ -29,6 +29,10 @@ Filesystem-side-effect oracles are also expanding beyond content checks:
 
 - `FILE_EXISTS` and `FILE_MISSING` let tests assert presence or absence
   directly, not only substring content when a file happens to exist
+- `FILE_LINE_COUNT` lets tests pin structural file shape for rewind/flush
+  families without hardcoding every byte of formatted output
+- `REPRO_CHECK: run_same_sandbox` makes repeated-run side effects explicit,
+  so append-vs-replace and stale-file bugs can be tested deliberately
 
 ## Goal
 
