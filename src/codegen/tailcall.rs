@@ -37,7 +37,8 @@
 //! * Gate: we don't fire on non-void calls where a non-trivial result-capture
 //!   sequence remains (e.g., `MOV x1, x0`) — those are left alone.
 
-use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand};
+use std::collections::HashSet;
+use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, PhysReg};
 
 /// Run tail call optimization on a single machine function.
 ///
@@ -82,6 +83,17 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         if bl_candidate == usize::MAX { continue; }
         if block.insts[bl_candidate].opcode != ArmOpcode::Bl { continue; }
 
+        // SAFETY: reject TCO when any argument register (x0–x7) holds a value
+        // derived from our frame pointer (e.g. a pointer to a stack-allocated
+        // local / derived-type struct).  After the epilogue tears down our
+        // frame, the callee's prologue reuses that memory; any pointer into it
+        // becomes dangling.  Taint analysis: track GP registers set from
+        // `sub xN, x29, #M` (alloca) and propagated through MovReg / AddReg /
+        // AddImm / Mul.  If any x0–x7 is tainted, the tail call is unsafe.
+        if has_frame_derived_arg(&block.insts[..bl_candidate]) {
+            continue;
+        }
+
         // Extract the call target from the Bl operand.
         let label = match block.insts[bl_candidate].operands.first() {
             Some(MachineOperand::Extern(s)) => s.clone(),
@@ -103,6 +115,125 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
             operands: vec![MachineOperand::Extern(label)],
             def: None,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safety helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if any GP argument register (x0–x7) contains a frame-derived
+/// pointer at the point of the Bl.
+///
+/// "Frame-derived" means the register was set — directly or transitively — from
+/// a `sub xN, x29, #M` (alloca materialization).
+///
+/// The analysis is a forward taint propagation over both registers AND
+/// FP-relative stack slots, so it correctly handles the spill/reload pattern:
+///
+/// ```text
+/// sub  x10, x29, #4       ; x10 = frame addr (tainted)
+/// str  x10, [x29, #-16]   ; slot -16 now tainted
+/// ...
+/// ldr  x9,  [x29, #-16]   ; x9 = frame addr (tainted via slot)
+/// mov  x0,  x9            ; x0 tainted → unsafe TCO
+/// ```
+fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
+    // GP register numbers whose current value is derived from the frame pointer.
+    let mut tainted_regs: HashSet<u8> = HashSet::new();
+    // FP-relative offsets whose memory contents are frame-derived pointers.
+    let mut tainted_slots: HashSet<i64> = HashSet::new();
+
+    for inst in insts {
+        match inst.opcode {
+            // sub xN, x29, #imm  →  xN holds a frame-relative address.
+            ArmOpcode::SubImm => {
+                if op_is_fp(inst, 1) {
+                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                }
+            }
+            // add xN, xM, xP  (GEP: propagate taint from either source)
+            ArmOpcode::AddReg => {
+                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
+                    || op_gp(inst, 2).map_or(false, |n| tainted_regs.contains(&n))
+                {
+                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                }
+            }
+            // add xN, xM, #imm  (GEP with constant offset / address arithmetic)
+            ArmOpcode::AddImm => {
+                if op_is_fp(inst, 1)
+                    || op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
+                {
+                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                }
+            }
+            // mov xN, xM  (register copy — propagates taint to arg reg)
+            ArmOpcode::MovReg => {
+                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n)) {
+                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                }
+            }
+            // mul xN, xM, xP  (index computation in GEP; conservative)
+            ArmOpcode::Mul => {
+                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
+                    || op_gp(inst, 2).map_or(false, |n| tainted_regs.contains(&n))
+                {
+                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                }
+            }
+            // str xN, [x29, #off] — if xN is tainted, the slot becomes tainted.
+            ArmOpcode::StrImm => {
+                if op_gp(inst, 0).map_or(false, |n| tainted_regs.contains(&n))
+                    && op_is_fp(inst, 1)
+                {
+                    if let Some(off) = op_fp_offset(inst, 2) { tainted_slots.insert(off); }
+                }
+            }
+            // ldr xN, [x29, #off] — if the slot is tainted, xN becomes tainted.
+            ArmOpcode::LdrImm => {
+                if op_is_fp(inst, 1) {
+                    if let Some(off) = op_fp_offset(inst, 2) {
+                        if tainted_slots.contains(&off) {
+                            if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Argument registers are x0–x7 (PhysReg::Gp(0)–Gp(7)).
+    (0u8..8).any(|n| tainted_regs.contains(&n))
+}
+
+/// True if operand at `idx` is the frame pointer (x29 = PhysReg::Gp(29)).
+#[inline]
+fn op_is_fp(inst: &MachineInst, idx: usize) -> bool {
+    matches!(
+        inst.operands.get(idx),
+        Some(MachineOperand::PhysReg(p)) if *p == PhysReg::FP
+    )
+}
+
+/// GP register number (0–30) for the PhysReg::Gp operand at `idx`, or None.
+#[inline]
+fn op_gp(inst: &MachineInst, idx: usize) -> Option<u8> {
+    match inst.operands.get(idx)? {
+        MachineOperand::PhysReg(PhysReg::Gp(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Frame-pointer-relative offset for the operand at `idx`, or None.
+/// Accepts both `Imm` and `FrameSlot` variants.
+#[inline]
+fn op_fp_offset(inst: &MachineInst, idx: usize) -> Option<i64> {
+    match inst.operands.get(idx)? {
+        MachineOperand::Imm(v) => Some(*v),
+        MachineOperand::FrameSlot(v) => Some(*v as i64),
+        _ => None,
     }
 }
 
