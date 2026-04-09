@@ -122,20 +122,19 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O2 => {
             // O1 plus LICM, strength reduction, DSE, LSF, loop transforms.
+            // LoopPeel, LoopFission, LoopFusion disabled pending 29.6.7
+            // rewrite (audit: peel has 5 bugs; fission/fusion are stubs).
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
-            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
-            pm.add(Box::new(LoopFission));
-            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
@@ -147,7 +146,6 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
-            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
@@ -163,14 +161,11 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
-            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
-            pm.add(Box::new(LoopFission));
-            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
