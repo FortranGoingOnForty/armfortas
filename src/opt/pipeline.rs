@@ -137,13 +137,11 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Sroa));    // after SSA + const fold (GCC pattern)
+            pm.add(Box::new(Mem2Reg)); // re-promote SROA-created scalar allocas
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
-            // GlobalLsf disabled: forwards stale loop bounds on fibonacci
-            // (loop runs too many iterations at O2). Needs proper clobber
-            // analysis for ALL paths, not just immediate dominator.
-            // pm.add(Box::new(GlobalLsf));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
