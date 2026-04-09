@@ -26,6 +26,7 @@ pub mod preheader;
 pub mod unswitch;
 pub mod interchange;
 pub mod dep_analysis;
+pub mod peel;
 
 #[cfg(test)]
 mod audit_tests;
