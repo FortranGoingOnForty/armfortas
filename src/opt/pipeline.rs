@@ -13,6 +13,7 @@ use super::strength_reduce::StrengthReduce;
 use super::licm::Licm;
 use super::mem2reg::Mem2Reg;
 use super::dse::Dse;
+use super::lsf::LocalLsf;
 use super::unroll::LoopUnroll;
 
 /// Compiler optimization levels.
@@ -108,16 +109,18 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // (loads block every hoist attempt).
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
+            pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
         OptLevel::O2 => {
-            // O1 plus LICM, strength reduction, DSE, loop unrolling (≤8 trips).
+            // O1 plus LICM, strength reduction, DSE, LSF, loop unrolling.
             // GVN, SROA, inlining deferred to sprint 29.7/29.8.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
+            pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
@@ -130,6 +133,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
+            pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
@@ -142,6 +146,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
+            pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
