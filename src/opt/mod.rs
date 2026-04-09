@@ -36,6 +36,7 @@ pub mod simplify_cfg;
 pub mod dead_func;
 pub mod sroa;
 pub mod alias;
+pub mod gvn;
 
 #[cfg(test)]
 mod audit_tests;
