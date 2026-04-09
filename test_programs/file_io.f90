@@ -9,6 +9,9 @@
 ! FileWrite (can't read). Fixed by inferring action from status.
 !
 ! CHECK: 42
+! FILE_CHECK: afs_io_test.dat => 42
+! FILE_NOT: afs_io_test.dat => 99
+! REPRO_CHECK: run
 program test_file_io
     implicit none
     integer :: x
