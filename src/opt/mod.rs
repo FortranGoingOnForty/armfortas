@@ -37,6 +37,7 @@ pub mod dead_func;
 pub mod sroa;
 pub mod alias;
 pub mod gvn;
+pub mod global_lsf;
 
 #[cfg(test)]
 mod audit_tests;
