@@ -179,6 +179,18 @@ pub fn lower_file(
         collect_alloc_return_funcs(&unit.node, &mut alloc_return_funcs);
     }
 
+    // Pass 1.6: collect COMMON block variable types from all program
+    // units and emit one global per (block, variable) pair. F77 §5.5:
+    // all scopes that reference the same COMMON block must share the
+    // same backing memory. Each variable gets its own global so the IR
+    // type system sees the right element type; full contiguity (needed
+    // for EQUIVALENCE across COMMON boundaries) is deferred.
+    // Audit6 BLOCKING-2.
+    let mut emitted_common: HashSet<String> = HashSet::new();
+    for unit in units {
+        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
@@ -234,6 +246,90 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Scan a program unit (and its `contains` chain) for `Decl::CommonBlock`
+/// statements and emit one scalar global per (block, variable) pair into
+/// the module. All scopes that declare the same COMMON block share these
+/// globals, giving correct F77 §5.5 shared-memory semantics for scalars.
+///
+/// Naming: `afs_common_<block_name>_<var_name>` (lowercase).
+/// The blank COMMON uses the synthetic block name `__blank__`.
+/// Audit6 BLOCKING-2.
+fn collect_and_emit_common_globals(
+    unit: &ProgramUnit,
+    module: &mut Module,
+    emitted: &mut HashSet<String>,
+) {
+    use crate::ast::decl::Decl;
+    let emit_for_decls = |decls: &[crate::ast::decl::SpannedDecl], module: &mut Module, emitted: &mut HashSet<String>| {
+        for decl in decls {
+            if let Decl::CommonBlock { name, vars } = &decl.node {
+                let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
+                for var in vars {
+                    let symbol = format!("afs_common_{}_{}", block_name, var.to_lowercase());
+                    if emitted.contains(&symbol) { continue; }
+                    emitted.insert(symbol.clone());
+                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls);
+                    module.add_global(Global {
+                        name: symbol,
+                        ty: elem_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                }
+            }
+        }
+    };
+    match unit {
+        ProgramUnit::Program { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        ProgramUnit::Subroutine { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        ProgramUnit::Function { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        _ => {}
+    }
+}
+
+/// Install COMMON block variables as global_addr locals before `alloc_decls`
+/// runs. Because `alloc_decls` skips names already in `locals`, the COMMON
+/// variables are not re-alloca'd with private storage. Each variable is
+/// installed as a direct (non-by_ref) local whose addr is a GlobalAddr
+/// pointing to the shared COMMON global. Audit6 BLOCKING-2.
+fn install_common_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    use crate::ast::decl::Decl;
+    for decl in decls {
+        if let Decl::CommonBlock { name, vars } = &decl.node {
+            let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
+            for var in vars {
+                let key = var.to_lowercase();
+                if locals.contains_key(&key) { continue; }
+                let symbol = format!("afs_common_{}_{}", block_name, key);
+                let elem_ty = arg_type_from_decls(&key, decls);
+                let addr = b.global_addr(&symbol, elem_ty.clone());
+                locals.insert(key, LocalInfo {
+                    addr,
+                    ty: elem_ty,
+                    dims: vec![],
+                    allocatable: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                });
+            }
+        }
     }
 }
 
@@ -587,6 +683,7 @@ fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                install_common_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
@@ -667,6 +764,7 @@ fn lower_unit(
                     }
                 }
 
+                install_common_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
@@ -807,6 +905,7 @@ fn lower_unit(
                     ctx.result_type = Some(ir_ret_ty.clone());
                 }
 
+                install_common_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);

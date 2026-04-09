@@ -12,7 +12,6 @@
 ! global. Fortran 77 baseline feature, in CLAUDE.md "in scope
 ! and required" list.
 !
-! XFAIL: audit6 BLOCKING-2 (COMMON blocks not actually shared)
 ! CHECK: 10 20
 program audit6_b2_common_block
   integer :: a, b
