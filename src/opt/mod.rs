@@ -30,6 +30,7 @@ pub mod peel;
 pub mod fission;
 pub mod fusion;
 pub mod call_resolve;
+pub mod callgraph;
 
 #[cfg(test)]
 mod audit_tests;
