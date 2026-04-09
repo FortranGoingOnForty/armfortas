@@ -194,6 +194,7 @@ source-embedded assertions such as:
 - `! ASM_CHECK:` / `! ASM_NOT:` for assembly shape
 - `! FILE_CHECK:` / `! FILE_NOT:` for sandbox file side effects
 - `! FILE_EXISTS:` / `! FILE_MISSING:` for explicit sandbox presence or absence
+- `! FILE_LINE_COUNT:` for structural file-shape assertions
 - `! REPRO_CHECK:` for per-test asm/object/run reproducibility
 - `! OPT_EQ:` for explicit cross-opt invariants
 - `! PHASE_TRIANGULATE:` for same-opt IR/ASM/object availability oracles

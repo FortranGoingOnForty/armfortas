@@ -5,6 +5,9 @@
 ! buffered I/O state corruption under rapid flush cycles.
 !
 ! CHECK: 500500
+! FILE_EXISTS: afs_flush_stress.dat
+! FILE_LINE_COUNT: afs_flush_stress.dat => 1000
+! REPRO_CHECK: run_same_sandbox
 program test_io_flush_stress
     implicit none
     integer :: i, val, total
