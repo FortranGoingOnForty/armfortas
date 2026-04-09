@@ -8,6 +8,7 @@
 ! FILE_EXISTS: afs_flush_stress.dat
 ! FILE_LINE_COUNT: afs_flush_stress.dat => 1000
 ! REPRO_CHECK: run_same_sandbox
+! PHASE_TRIANGULATE: ir|asm|obj|clean
 program test_io_flush_stress
     implicit none
     integer :: i, val, total

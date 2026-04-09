@@ -6,6 +6,7 @@
 ! FILE_EXISTS: afs_rewind.dat
 ! FILE_MISSING: afs_rewind.tmp
 ! FILE_LINE_COUNT: afs_rewind.dat => 1
+! FILE_RERUN_MODE: afs_rewind.dat => stable
 program test_io_rewind
     implicit none
     integer :: x

@@ -19,6 +19,7 @@ The canonical leaf-assertion language lives in source comments inside
 - `! FILE_CHECK:` / `! FILE_NOT:`
 - `! FILE_EXISTS:` / `! FILE_MISSING:`
 - `! FILE_LINE_COUNT:`
+- `! FILE_RERUN_MODE:`
 - `! REPRO_CHECK:`
 - `! OPT_EQ:`
 - `! PHASE_TRIANGULATE:`
