@@ -29,6 +29,7 @@ pub mod dep_analysis;
 pub mod peel;
 pub mod fission;
 pub mod fusion;
+pub mod call_resolve;
 
 #[cfg(test)]
 mod audit_tests;

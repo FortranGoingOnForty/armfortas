@@ -19,6 +19,7 @@ use super::preheader::PreheaderInsert;
 use super::unswitch::LoopUnswitch;
 use super::interchange::LoopInterchange;
 use super::peel::LoopPeel;
+use super::call_resolve::CallResolve;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -113,6 +114,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // through local variables, CSE can't dedupe across
             // store/load pairs, and LICM is effectively dormant
             // (loads block every hoist attempt).
+            pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(LocalLsf));
@@ -122,6 +124,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O2 => {
             // O1 plus LICM, strength reduction, DSE, LSF, loop transforms.
+            pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
@@ -141,6 +144,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::Os => {
             // Like O2 but no loop unrolling (prefer code size).
+            pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
@@ -157,6 +161,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O3 | OptLevel::Ofast => {
             // O2 passes + loop unrolling + interchange.
+            pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
