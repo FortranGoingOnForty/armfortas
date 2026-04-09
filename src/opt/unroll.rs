@@ -610,34 +610,42 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
             shape.exit
         };
 
+        // Args to pass when branching to the exit block.
+        let exit_args = if after_iter == shape.exit {
+            shape.exit_args.clone()
+        } else {
+            vec![]
+        };
+
         if nb == 0 {
             // No body — the single pass-through block jumps to after_iter.
             func.block_mut(iter_blocks[k][0]).terminator =
-                Some(Terminator::Branch(after_iter, vec![]));
+                Some(Terminator::Branch(after_iter, exit_args));
         } else {
             for bi in 0..nb_actual {
                 let cur_blk = iter_blocks[k][bi];
-                let next_blk = if bi + 1 < nb_actual {
-                    iter_blocks[k][bi + 1]
+                let (next_blk, args) = if bi + 1 < nb_actual {
+                    (iter_blocks[k][bi + 1], vec![])
                 } else {
                     // Last body block of iter k → after_iter.
-                    after_iter
+                    (after_iter, exit_args.clone())
                 };
                 let _ = original_body_next[bi]; // consumed above
                 func.block_mut(cur_blk).terminator =
-                    Some(Terminator::Branch(next_blk, vec![]));
+                    Some(Terminator::Branch(next_blk, args));
             }
         }
     }
 
     // Rewrite preheader terminator: skip the loop header, jump to first iter.
-    let first_block = if tc > 0 {
-        iter_blocks[0][0]
+    let (first_block, preheader_args) = if tc > 0 {
+        (iter_blocks[0][0], vec![])
     } else {
-        shape.exit
+        // Zero-trip loop: jump directly to exit with its required args.
+        (shape.exit, shape.exit_args.clone())
     };
     func.block_mut(shape.preheader).terminator =
-        Some(Terminator::Branch(first_block, vec![]));
+        Some(Terminator::Branch(first_block, preheader_args));
 
     // Mark loop control blocks as Unreachable → prune_unreachable removes them.
     func.block_mut(shape.header).terminator   = Some(Terminator::Unreachable);
