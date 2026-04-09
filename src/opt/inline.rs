@@ -91,8 +91,12 @@ fn inline_calls_in_function(
 
     if call_sites.is_empty() { return false; }
 
-    // Inline one call site at a time (CFG changes invalidate indices).
-    let (call_block_id, call_inst_idx, callee_idx, caller_args) = call_sites[0].clone();
+    // Process all call sites in reverse order. Each inline appends new
+    // blocks at the end and splits the call-containing block; processing
+    // in reverse preserves indices for earlier (lower-index) sites.
+    let mut any_inlined = false;
+    for &(call_block_id, call_inst_idx, callee_idx, ref caller_args) in call_sites.iter().rev() {
+        let caller_args = caller_args.clone();
 
     // Clone the callee's body into the caller.
     let callee = &module.functions[callee_idx as usize];
@@ -226,8 +230,14 @@ fn inline_calls_in_function(
         caller.block_mut(post_call).terminator = Some(new_term);
     }
 
-    prune_unreachable(caller);
-    true
+        any_inlined = true;
+    } // end for call_sites
+
+    if any_inlined {
+        let caller = &mut module.functions[caller_idx as usize];
+        prune_unreachable(caller);
+    }
+    any_inlined
 }
 
 #[cfg(test)]
