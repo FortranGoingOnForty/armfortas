@@ -206,7 +206,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let ir_module = lower::lower_file(&units, &st, &type_layouts);
+    let mut ir_module = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
@@ -215,6 +215,25 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!("internal error: IR verification failed:\n{}", msg));
+    }
+
+    // 6.5. Run IR optimization pipeline.
+    //
+    // This is where const_fold, mem2reg, LICM, DSE, loop unrolling, and
+    // every other IR-level pass actually fire. At O0 the pipeline is empty
+    // so nothing changes. The pipeline runs to fixpoint; the pass manager
+    // verifies the IR after every pass.
+    {
+        use crate::opt::pipeline::OptLevel as IrOpt;
+        let ir_opt = match opts.opt_level {
+            OptLevel::O0    => IrOpt::O0,
+            OptLevel::O1    => IrOpt::O1,
+            OptLevel::O2    => IrOpt::O2,
+            OptLevel::O3    => IrOpt::O3,
+            OptLevel::Ofast => IrOpt::Ofast,
+        };
+        let pm = crate::opt::build_pipeline(ir_opt);
+        pm.run(&mut ir_module);
     }
 
     if opts.emit_ir {

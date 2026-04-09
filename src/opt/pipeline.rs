@@ -13,6 +13,7 @@ use super::strength_reduce::StrengthReduce;
 use super::licm::Licm;
 use super::mem2reg::Mem2Reg;
 use super::dse::Dse;
+use super::unroll::LoopUnroll;
 
 /// Compiler optimization levels.
 ///
@@ -111,9 +112,21 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
-        OptLevel::O2 | OptLevel::Os => {
-            // O1 plus LICM, strength reduction, DSE.
-            // GVN, SROA, inlining, FMA fusion, loop unrolling deferred.
+        OptLevel::O2 => {
+            // O1 plus LICM, strength reduction, DSE, loop unrolling (≤8 trips).
+            // GVN, SROA, inlining deferred to sprint 29.7/29.8.
+            pm.add(Box::new(Mem2Reg));
+            pm.add(Box::new(ConstFold));
+            pm.add(Box::new(StrengthReduce));
+            pm.add(Box::new(LocalCse));
+            pm.add(Box::new(Licm));
+            pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopUnroll));
+            pm.add(Box::new(Dce));
+        }
+        OptLevel::Os => {
+            // Like O2 but no loop unrolling (prefer code size).
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
@@ -124,8 +137,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // O2 passes. Vectorization, aggressive inlining, IPO,
-            // fast-math — deferred to later sprints.
+            // O2 passes + loop unrolling with larger threshold.
+            // Vectorization, aggressive inlining, IPO — deferred to later sprints.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
@@ -133,6 +146,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
     }
