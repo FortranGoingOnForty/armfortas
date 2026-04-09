@@ -88,10 +88,6 @@ fn unswitch_in_function(func: &mut Function) -> bool {
         // branch to the true successor.
         let true_cond_block = true_map[&cond_block];
         let true_true_dest = true_map[&true_dest];
-        let remapped_true_args: Vec<ValueId> = true_args.iter()
-            .map(|v| *true_map.get(&BlockId(v.0)).and_then(|_| None).unwrap_or(v))
-            .collect();
-        // Remap value args through the clone map.
         let true_val_map = build_value_map(func, lp, &true_blocks, &true_map);
         let remapped_true_args: Vec<ValueId> = true_args.iter()
             .map(|v| *true_val_map.get(v).unwrap_or(v))
