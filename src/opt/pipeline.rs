@@ -26,7 +26,6 @@ use super::dead_func::DeadFuncElim;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
-use super::bce::Bce;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -144,6 +143,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
+            pm.add(Box::new(GlobalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(LoopPeel));
@@ -170,6 +170,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
+            pm.add(Box::new(GlobalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(LoopPeel));
@@ -193,6 +194,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
+            pm.add(Box::new(GlobalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(LoopPeel));
