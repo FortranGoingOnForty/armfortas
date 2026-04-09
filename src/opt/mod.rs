@@ -25,6 +25,7 @@ pub mod loop_utils;
 pub mod preheader;
 pub mod unswitch;
 pub mod interchange;
+pub mod dep_analysis;
 
 #[cfg(test)]
 mod audit_tests;
