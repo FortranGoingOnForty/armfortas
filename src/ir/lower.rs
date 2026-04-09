@@ -3244,28 +3244,54 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         IrType::Void,
                                     );
                                 } else {
-                                    // Multi-D: compute each dim and call afs_allocate_array.
-                                    // For now, fall back to computing total size and using simple allocate.
-                                    let mut total: Option<ValueId> = None;
-                                    for arg in args {
-                                        let dim_size = match &arg.value {
+                                    // Multi-D: build a stack DimDescriptor[rank] with
+                                    // (lower=1, upper=N_i, stride=1) per dim, then call
+                                    // afs_allocate_array(desc, elem_size, rank, dims, stat).
+                                    // Audit5 MAJOR-1: previously fell back to flattening
+                                    // extents into afs_allocate_1d, which left rank=1
+                                    // in the descriptor and broke m(i,j) subscripting.
+                                    let rank = args.len();
+                                    let dim_buf_bytes = (rank * 24) as u64;
+                                    let dim_buf = b.alloca(IrType::Array(
+                                        Box::new(IrType::Int(IntWidth::I8)),
+                                        dim_buf_bytes,
+                                    ));
+                                    let one_i64 = b.const_i64(1);
+                                    for (i, arg) in args.iter().enumerate() {
+                                        let upper_raw = match &arg.value {
                                             crate::ast::expr::SectionSubscript::Element(e) => {
                                                 lower_expr(b, &ctx.locals, e, ctx.st)
                                             }
-                                            _ => b.const_i32(1),
+                                            _ => b.const_i64(1),
                                         };
-                                        total = Some(match total {
-                                            Some(prev) => b.imul(prev, dim_size),
-                                            None => dim_size,
-                                        });
+                                        // Widen upper to i64 if the expression returned i32.
+                                        let upper = if matches!(
+                                            b.func().value_type(upper_raw),
+                                            Some(IrType::Int(IntWidth::I32))
+                                        ) {
+                                            b.int_extend(upper_raw, IntWidth::I64, true)
+                                        } else {
+                                            upper_raw
+                                        };
+                                        let base = (i * 24) as i64;
+                                        let off_lo = b.const_i64(base);
+                                        let off_up = b.const_i64(base + 8);
+                                        let off_st = b.const_i64(base + 16);
+                                        let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+                                        let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+                                        let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+                                        b.store(one_i64, p_lo);
+                                        b.store(upper, p_up);
+                                        b.store(one_i64, p_st);
                                     }
-                                    let n = total.unwrap_or_else(|| b.const_i64(1));
-                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
-                                        b.int_extend(n, IntWidth::I64, true)
-                                    } else { n };
+                                    let rank_val = b.const_i32(rank as i32);
+                                    // Real i32 slot for STAT to give the runtime a valid
+                                    // pointer to write into rather than relying on
+                                    // const-i64-0 being interpreted as a null pointer.
+                                    let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                                     b.call(
-                                        FuncRef::External("afs_allocate_1d".into()),
-                                        vec![info.addr, es, n64],
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![info.addr, es, rank_val, dim_buf, stat_slot],
                                         IrType::Void,
                                     );
                                 }
@@ -3780,7 +3806,85 @@ fn lower_array_element(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
 ) -> ValueId {
-    // Compute flat index from subscripts.
+    let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
+    let base = array_base_addr(b, info);
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
+    b.load(elem_ptr)
+}
+
+/// Compute the column-major flat ELEMENT offset (i64) for an array
+/// subscript expression, returning a value suitable for `b.gep` (which
+/// scales by the GEP result element size).
+///
+/// Two paths:
+///   * Static-shape arrays (`info.dims` populated): fold strides at
+///     compile time.
+///   * Allocatable arrays (rank/extents only known at runtime): load
+///     lower_bound and upper_bound from the runtime descriptor and
+///     accumulate the cumulative stride as a runtime i64.
+///
+/// Audit5 MAJOR-1: previously both lower_array_element and
+/// lower_array_store fell back to `(1, 1)` for every dim of an
+/// allocatable, leaving cumulative stride = 1. m(i, j) for a 3x4
+/// allocatable then computed `(i-1) + (j-1)` instead of
+/// `(i-1) + (j-1)*3`, so writes clobbered each other and reads
+/// returned garbage.
+fn compute_flat_elem_offset(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> ValueId {
+    if info.allocatable {
+        // Runtime descriptor path. Each DimDescriptor is 24 bytes
+        // starting at descriptor offset 24:
+        //   +0  lower_bound : i64
+        //   +8  upper_bound : i64
+        //   +16 stride      : i64 (we use 1)
+        let mut flat: Option<ValueId> = None;
+        let mut cum_stride: Option<ValueId> = None; // i64
+        let one64 = b.const_i64(1);
+        for (dim_idx, arg) in args.iter().enumerate() {
+            let sub_raw = match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    lower_expr(b, locals, e, st)
+                }
+                _ => b.const_i64(0),
+            };
+            let sub = widen_idx_to_i64(b, sub_raw);
+
+            let dim_base = 24 + (dim_idx as i64) * 24;
+            let off_lo = b.const_i64(dim_base);
+            let off_up = b.const_i64(dim_base + 8);
+            let p_lo = b.gep(info.addr, vec![off_lo], IrType::Int(IntWidth::I8));
+            let p_up = b.gep(info.addr, vec![off_up], IrType::Int(IntWidth::I8));
+            let lo = b.load_typed(p_lo, IrType::Int(IntWidth::I64));
+            let up = b.load_typed(p_up, IrType::Int(IntWidth::I64));
+
+            let adjusted = b.isub(sub, lo);
+
+            let dim_offset = match cum_stride {
+                None => adjusted, // first dim has cumulative stride 1
+                Some(s) => b.imul(adjusted, s),
+            };
+            flat = Some(match flat {
+                Some(prev) => b.iadd(prev, dim_offset),
+                None => dim_offset,
+            });
+
+            // cum_stride *= (upper - lower + 1)
+            let span = b.isub(up, lo);
+            let extent = b.iadd(span, one64);
+            cum_stride = Some(match cum_stride {
+                None => extent,
+                Some(prev) => b.imul(prev, extent),
+            });
+        }
+        return flat.unwrap_or_else(|| b.const_i64(0));
+    }
+
+    // Static-shape path: fold strides at compile time.
     let mut flat_offset: Option<ValueId> = None;
     let mut stride: i64 = 1;
 
@@ -3796,7 +3900,6 @@ fn lower_array_element(
             (1, 1)
         };
 
-        // offset_dim = (subscript - lower) * stride
         let lower_val = b.const_i32(lower as i32);
         let adjusted = b.isub(subscript, lower_val);
 
@@ -3816,15 +3919,12 @@ fn lower_array_element(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let base = array_base_addr(b, info);
     // Widen index to i64 for pointer arithmetic. ARM64 GEP lowering
     // needs an i64 subscript so the codegen `mul` lands as
     // `mul x, x, x` instead of `mul x, w, x` (which the assembler
     // rejects). Applies to BOTH stack and allocatable arrays —
     // gating on `info.allocatable` was the audit's CRITICAL-1.
-    let idx64 = widen_idx_to_i64(b, idx);
-    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    b.load(elem_ptr)
+    widen_idx_to_i64(b, idx)
 }
 
 /// Widen an i32 (or smaller) index value to i64 for pointer
@@ -4038,42 +4138,8 @@ fn lower_array_store(
     value: ValueId,
     st: &SymbolTable,
 ) {
-    let mut flat_offset: Option<ValueId> = None;
-    let mut stride: i64 = 1;
-
-    for (dim_idx, arg) in args.iter().enumerate() {
-        let subscript = match &arg.value {
-            crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
-            _ => b.const_i32(0),
-        };
-
-        let (lower, extent) = if dim_idx < info.dims.len() {
-            info.dims[dim_idx]
-        } else {
-            (1, 1)
-        };
-
-        let lower_val = b.const_i32(lower as i32);
-        let adjusted = b.isub(subscript, lower_val);
-
-        let dim_offset = if stride == 1 {
-            adjusted
-        } else {
-            let stride_val = b.const_i32(stride as i32);
-            b.imul(adjusted, stride_val)
-        };
-
-        flat_offset = Some(match flat_offset {
-            Some(prev) => b.iadd(prev, dim_offset),
-            None => dim_offset,
-        });
-
-        stride *= extent;
-    }
-
-    let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
+    let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
     let base = array_base_addr(b, info);
-    let idx64 = widen_idx_to_i64(b, idx);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     // Audit5 CRITICAL-1: coerce the RHS to the array element
     // type before the store. Without this, an i32-typed value
