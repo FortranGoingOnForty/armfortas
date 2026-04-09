@@ -1,4 +1,5 @@
 ! CHECK: 25
+! PHASE_TRIANGULATE: ir|asm|obj
 program test_func
     implicit none
     integer :: x, y

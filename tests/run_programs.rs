@@ -148,6 +148,19 @@
 //! compares the requested surfaces. This lets a test say "these runtime
 //! surfaces must agree across optimization" without also pinning every
 //! assembly detail at every level.
+//!
+//! ## PHASE_TRIANGULATE annotations
+//!
+//! Phase triangulation lets a runtime test say that additional compiler
+//! surfaces must also materialize successfully at the same optimization level:
+//!
+//!   * `! PHASE_TRIANGULATE: ir|asm|obj`
+//!
+//! The linked runtime path is the anchor. If the program runs correctly but
+//! one of the requested extra surfaces fails to compile or produces an empty
+//! artifact, the test still fails. This is how the harness starts relating
+//! linked execution to `--emit-ir`, `-S`, and `-c` instead of treating them as
+//! isolated one-off checks.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -191,6 +204,19 @@ struct OptEqRule {
     line_num: usize,
     opt_flags: Vec<String>,
     components: Vec<OptEqComponent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseSurface {
+    Ir,
+    Asm,
+    Obj,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhaseTriangulation {
+    line_num: usize,
+    surfaces: Vec<PhaseSurface>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +527,52 @@ fn extract_opt_eq_rules(source: &str, filename: &str) -> Result<Vec<OptEqRule>, 
         });
     }
     Ok(rules)
+}
+
+fn extract_phase_triangulation(
+    source: &str,
+    filename: &str,
+) -> Result<Option<PhaseTriangulation>, String> {
+    let mut found: Option<PhaseTriangulation> = None;
+    for (i, line) in source.lines().enumerate() {
+        let line_num = i + 1;
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("! PHASE_TRIANGULATE:") else {
+            continue;
+        };
+        if let Some(existing) = &found {
+            return Err(format!(
+                "{}:{}: multiple PHASE_TRIANGULATE annotations are not allowed (another at line {})",
+                filename, line_num, existing.line_num
+            ));
+        }
+
+        let mut surfaces = Vec::new();
+        for token in rest.trim().split('|') {
+            let surface = match token.trim() {
+                "ir" => PhaseSurface::Ir,
+                "asm" => PhaseSurface::Asm,
+                "obj" => PhaseSurface::Obj,
+                other => {
+                    return Err(format!(
+                        "{}:{}: PHASE_TRIANGULATE surfaces must be ir, asm, or obj; got '{}'",
+                        filename, line_num, other
+                    ))
+                }
+            };
+            if !surfaces.contains(&surface) {
+                surfaces.push(surface);
+            }
+        }
+        if surfaces.is_empty() {
+            return Err(format!(
+                "{}:{}: PHASE_TRIANGULATE needs at least one surface",
+                filename, line_num
+            ));
+        }
+        found = Some(PhaseTriangulation { line_num, surfaces });
+    }
+    Ok(found)
 }
 
 fn diagnostic_contains_span(stderr: &str, expected: ExpectedSpan) -> bool {
@@ -862,6 +934,39 @@ fn compile_and_run_snapshot(
     Ok(snapshot)
 }
 
+fn compile_ir_text(
+    compiler: &Path,
+    source: &Path,
+    opt_flag: &str,
+    filename: &str,
+) -> Result<String, String> {
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+    let level = opt_flag.trim_start_matches('-');
+    let out = unique_temp_path("test_ir", stem, level, ".txt");
+    let compile = Command::new(compiler)
+        .args([
+            source.to_str().unwrap(),
+            opt_flag,
+            "--emit-ir",
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .map_err(|e| format!("{}: cannot run --emit-ir: {}", filename, e))?;
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        let _ = fs::remove_file(&out);
+        return Err(format!(
+            "{} [{}]: --emit-ir compilation failed:\n{}",
+            filename, opt_flag, stderr
+        ));
+    }
+    let text =
+        fs::read_to_string(&out).map_err(|e| format!("{}: cannot read IR: {}", filename, e))?;
+    let _ = fs::remove_file(&out);
+    Ok(text)
+}
+
 fn render_opt_eq_components(components: &[OptEqComponent]) -> String {
     components
         .iter()
@@ -983,6 +1088,68 @@ fn run_opt_eq_rules(
     Ok(())
 }
 
+fn render_phase_surfaces(surfaces: &[PhaseSurface]) -> String {
+    surfaces
+        .iter()
+        .map(|surface| match surface {
+            PhaseSurface::Ir => "ir",
+            PhaseSurface::Asm => "asm",
+            PhaseSurface::Obj => "obj",
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn run_phase_triangulation(
+    compiler: &Path,
+    source: &Path,
+    opt_flag: &str,
+    filename: &str,
+    triangulation: &PhaseTriangulation,
+) -> Result<(), String> {
+    for surface in &triangulation.surfaces {
+        match surface {
+            PhaseSurface::Ir => {
+                let ir_text = compile_ir_text(compiler, source, opt_flag, filename)?;
+                if ir_text.trim().is_empty() {
+                    return Err(format!(
+                        "{}:{}: PHASE_TRIANGULATE({}) produced empty IR output at {}",
+                        filename,
+                        triangulation.line_num,
+                        render_phase_surfaces(&triangulation.surfaces),
+                        opt_flag,
+                    ));
+                }
+            }
+            PhaseSurface::Asm => {
+                let asm = compile_stage_bytes(compiler, source, opt_flag, ReproStage::Asm)?;
+                if asm.is_empty() {
+                    return Err(format!(
+                        "{}:{}: PHASE_TRIANGULATE({}) produced empty assembly output at {}",
+                        filename,
+                        triangulation.line_num,
+                        render_phase_surfaces(&triangulation.surfaces),
+                        opt_flag,
+                    ));
+                }
+            }
+            PhaseSurface::Obj => {
+                let obj = compile_stage_bytes(compiler, source, opt_flag, ReproStage::Obj)?;
+                if obj.is_empty() {
+                    return Err(format!(
+                        "{}:{}: PHASE_TRIANGULATE({}) produced empty object output at {}",
+                        filename,
+                        triangulation.line_num,
+                        render_phase_surfaces(&triangulation.surfaces),
+                        opt_flag,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn describe_run_difference(first: &RunSnapshot, second: &RunSnapshot) -> String {
     if first.exit_code != second.exit_code {
         return format!(
@@ -1071,6 +1238,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Ok(rules) => rules,
         Err(e) => return TestOutcome::Fail(e),
     };
+    let phase_triangulation = match extract_phase_triangulation(&source_text, filename) {
+        Ok(rule) => rule,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     if checks.is_empty()
         && stderr_checks.is_empty()
         && ir_checks.is_empty()
@@ -1078,6 +1249,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && file_checks.is_empty()
         && repro_checks.is_empty()
         && opt_eq_rules.is_empty()
+        && phase_triangulation.is_none()
         && expected_exit_code.is_none()
         && error_span.is_none()
         && xfail_reason.is_none()
@@ -1093,6 +1265,12 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     if error_span.is_some() && error_expected.is_none() {
         return TestOutcome::Fail(format!(
             "{}: ERROR_SPAN requires ERROR_EXPECTED so the harness knows which compile failure to validate",
+            filename,
+        ));
+    }
+    if phase_triangulation.is_some() && error_expected.is_some() {
+        return TestOutcome::Fail(format!(
+            "{}: PHASE_TRIANGULATE is for successful compile/run tests and cannot be combined with ERROR_EXPECTED",
             filename,
         ));
     }
@@ -1310,6 +1488,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             &snapshot,
             &opt_eq_rules,
         )?;
+
+        if let Some(triangulation) = &phase_triangulation {
+            run_phase_triangulation(compiler, source, opt_flag, filename, triangulation)?;
+        }
 
         Ok(())
     };
@@ -1565,6 +1747,25 @@ fn extract_opt_eq_rules_rejects_unknown_component() {
 }
 
 #[test]
+fn extract_phase_triangulation_accepts_ir_asm_obj() {
+    let source = "! PHASE_TRIANGULATE: ir|asm|obj\n";
+    let rule = extract_phase_triangulation(source, "inline.f90")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rule.surfaces,
+        vec![PhaseSurface::Ir, PhaseSurface::Asm, PhaseSurface::Obj]
+    );
+}
+
+#[test]
+fn extract_phase_triangulation_rejects_unknown_surface() {
+    let source = "! PHASE_TRIANGULATE: run\n";
+    let err = extract_phase_triangulation(source, "inline.f90").unwrap_err();
+    assert!(err.contains("ir, asm, or obj"));
+}
+
+#[test]
 fn extract_exit_code_rejects_multiple_annotations() {
     let source = "! EXIT_CODE: 1\n! EXIT_CODE: 2\nprogram t\nend program t\n";
     let err = extract_exit_code(source, "inline.f90").unwrap_err();
@@ -1687,6 +1888,25 @@ fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
         TestOutcome::Pass => {}
         other => panic!(
             "hello.f90 should pass with OPT_EQ coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn phase_triangulation_allows_function_call_pipeline_surfaces() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("function_call.f90");
+    assert!(
+        source.exists(),
+        "function_call.f90 missing — needed for PHASE_TRIANGULATE coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "function_call.f90 should pass with PHASE_TRIANGULATE coverage, got {:?}",
             other
         ),
     }

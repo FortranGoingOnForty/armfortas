@@ -18,6 +18,13 @@ The first concrete slice is now rooted in the armfortas-first harness:
 That gives the harness a deliberate place to express "runtime invariant across
 opt levels" without pretending every IR or ASM shape must remain frozen.
 
+The next concrete slice is phase triangulation:
+
+- `PHASE_TRIANGULATE` lets one runtime test require successful
+  `--emit-ir`, `-S`, and/or `-c` materialization at the same opt level
+- this is a bench feature, not a compiler feature: it strengthens how we
+  observe pipeline coherence without changing what the compiler does
+
 ## Goal
 
 Push the harness beyond "compile, run, compare stdout" into richer pipeline
