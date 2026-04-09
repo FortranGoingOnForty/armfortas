@@ -47,6 +47,12 @@
 //! annotation can come off and the program becomes a regular
 //! "diagnostic regression" test).
 //!
+//! `! ERROR_SPAN: <line>:<col>` composes with `ERROR_EXPECTED` and
+//! asserts that the diagnostic points at the expected source
+//! location. The span check is substring-based against the emitted
+//! diagnostic location text, so the compiler can print either
+//! `path:line:col:` or `line:col:` and still satisfy the contract.
+//!
 //! ## IR_CHECK / IR_NOT annotations
 //!
 //! For tests that need to assert on the *shape* of the lowered IR
@@ -84,6 +90,21 @@
 //! `ERROR STOP`, warning-like stderr output, and future
 //! side-effect-heavy programs without forcing them through
 //! `ERROR_EXPECTED`, which is compile-failure-only.
+//!
+//! ## ASM_CHECK / ASM_NOT annotations
+//!
+//! Runtime tests can also pin emitted assembly shape:
+//!
+//!   * `! ASM_CHECK: <substring>` — the substring must appear in
+//!     the compiler's `-S` output. Multiple checks must appear in
+//!     the order they are declared.
+//!   * `! ASM_NOT: <substring>` — the substring must NOT appear in
+//!     the emitted assembly text.
+//!
+//! Unlike IR checks, assembly shape can legitimately vary by opt
+//! level, so ASM checks fire at every optimization level. Tests
+//! should use stable substrings that are intentionally expected
+//! across the requested matrix.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -151,6 +172,60 @@ fn extract_error_expected(source: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedSpan {
+    line_num: usize,
+    line: usize,
+    col: usize,
+}
+
+/// Extract `! ERROR_SPAN:` and parse it as an exact line:col pair.
+fn extract_error_span(source: &str, filename: &str) -> Result<Option<ExpectedSpan>, String> {
+    let mut matches = source.lines().enumerate().filter_map(|(i, line)| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("! ERROR_SPAN:")
+            .map(|rest| (i + 1, rest.trim()))
+    });
+
+    let Some((line_num, raw)) = matches.next() else {
+        return Ok(None);
+    };
+
+    if let Some((extra_line, _)) = matches.next() {
+        return Err(format!(
+            "{}:{}: multiple ERROR_SPAN annotations are not allowed (another at line {})",
+            filename, line_num, extra_line
+        ));
+    }
+
+    let Some((line, col)) = raw.split_once(':') else {
+        return Err(format!(
+            "{}:{}: ERROR_SPAN must be written as <line>:<col>, got '{}'",
+            filename, line_num, raw
+        ));
+    };
+
+    let line = line.parse::<usize>().map_err(|_| {
+        format!(
+            "{}:{}: ERROR_SPAN line must be a decimal integer, got '{}'",
+            filename, line_num, line
+        )
+    })?;
+    let col = col.parse::<usize>().map_err(|_| {
+        format!(
+            "{}:{}: ERROR_SPAN column must be a decimal integer, got '{}'",
+            filename, line_num, col
+        )
+    })?;
+
+    Ok(Some(ExpectedSpan {
+        line_num,
+        line,
+        col,
+    }))
+}
+
 /// Extract `! EXIT_CODE:` and parse it as an exact expected exit
 /// status. Multiple annotations are rejected as a test setup error
 /// so the expected runtime contract stays unambiguous.
@@ -181,31 +256,36 @@ fn extract_exit_code(source: &str, filename: &str) -> Result<Option<i32>, String
     })
 }
 
-/// A single IR-shape assertion. Positive checks must appear in
+fn diagnostic_contains_span(stderr: &str, expected: ExpectedSpan) -> bool {
+    let needle = format!("{}:{}:", expected.line, expected.col);
+    stderr.contains(&needle)
+}
+
+/// A single text-shape assertion. Positive checks must appear in
 /// order; negative checks must not appear at all. Source line
 /// numbers are kept so failure messages can point at the right
 /// annotation.
-struct IrCheck {
+struct ShapeCheck {
     line_num: usize,
     pattern: String,
     negative: bool,
 }
 
-/// Extract `! IR_CHECK:` and `! IR_NOT:` annotations from a source.
-fn extract_ir_checks(source: &str) -> Vec<IrCheck> {
+/// Extract positive and negative shape assertions from a source.
+fn extract_shape_checks(source: &str, pos_prefix: &str, neg_prefix: &str) -> Vec<ShapeCheck> {
     source
         .lines()
         .enumerate()
         .filter_map(|(i, line)| {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("! IR_CHECK:") {
-                Some(IrCheck {
+            if let Some(rest) = trimmed.strip_prefix(pos_prefix) {
+                Some(ShapeCheck {
                     line_num: i + 1,
                     pattern: rest.trim().to_string(),
                     negative: false,
                 })
-            } else if let Some(rest) = trimmed.strip_prefix("! IR_NOT:") {
-                Some(IrCheck {
+            } else if let Some(rest) = trimmed.strip_prefix(neg_prefix) {
+                Some(ShapeCheck {
                     line_num: i + 1,
                     pattern: rest.trim().to_string(),
                     negative: true,
@@ -217,36 +297,74 @@ fn extract_ir_checks(source: &str) -> Vec<IrCheck> {
         .collect()
 }
 
+/// Extract `! IR_CHECK:` and `! IR_NOT:` annotations from a source.
+fn extract_ir_checks(source: &str) -> Vec<ShapeCheck> {
+    extract_shape_checks(source, "! IR_CHECK:", "! IR_NOT:")
+}
+
+/// Extract `! ASM_CHECK:` and `! ASM_NOT:` annotations from a source.
+fn extract_asm_checks(source: &str) -> Vec<ShapeCheck> {
+    extract_shape_checks(source, "! ASM_CHECK:", "! ASM_NOT:")
+}
+
 /// Apply IR shape assertions against an --emit-ir text dump.
 /// Positive assertions match in declared order (intervening lines
 /// are allowed). Negative assertions match against the entire
 /// text — if the substring appears anywhere, the test fails.
-fn match_ir_checks(checks: &[IrCheck], ir: &str, filename: &str) -> Result<(), String> {
+fn match_shape_checks(
+    checks: &[ShapeCheck],
+    text: &str,
+    filename: &str,
+    directive_name: &str,
+    full_label: &str,
+) -> Result<(), String> {
     let mut search_offset = 0;
     for check in checks {
         if check.negative {
-            if ir.contains(&check.pattern) {
+            if text.contains(&check.pattern) {
                 return Err(format!(
-                    "{}:{}: IR_NOT failed: substring '{}' appears in IR\n\
-                     Full IR:\n{}",
-                    filename, check.line_num, check.pattern, ir,
+                    "{}:{}: {} failed: substring '{}' appears in {}\n\
+                     Full {}:\n{}",
+                    filename,
+                    check.line_num,
+                    directive_name,
+                    check.pattern,
+                    full_label,
+                    full_label,
+                    text,
                 ));
             }
         } else {
             // Positive: search forward from the previous match
-            // position so multiple IR_CHECKs enforce ordering.
-            if let Some(rel) = ir[search_offset..].find(&check.pattern) {
+            // position so multiple checks enforce ordering.
+            if let Some(rel) = text[search_offset..].find(&check.pattern) {
                 search_offset += rel + check.pattern.len();
             } else {
                 return Err(format!(
-                    "{}:{}: IR_CHECK failed: substring '{}' not found from offset {}\n\
-                     Full IR:\n{}",
-                    filename, check.line_num, check.pattern, search_offset, ir,
+                    "{}:{}: {} failed: substring '{}' not found from offset {}\n\
+                     Full {}:\n{}",
+                    filename,
+                    check.line_num,
+                    directive_name,
+                    check.pattern,
+                    search_offset,
+                    full_label,
+                    text,
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// Apply IR shape assertions against an --emit-ir text dump.
+fn match_ir_checks(checks: &[ShapeCheck], ir: &str, filename: &str) -> Result<(), String> {
+    match_shape_checks(checks, ir, filename, "IR_CHECK/IR_NOT", "IR")
+}
+
+/// Apply assembly shape assertions against a -S text dump.
+fn match_asm_checks(checks: &[ShapeCheck], asm: &str, filename: &str) -> Result<(), String> {
+    match_shape_checks(checks, asm, filename, "ASM_CHECK/ASM_NOT", "assembly")
 }
 
 /// Match checks against actual output lines. Checks must appear in order
@@ -335,6 +453,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
     let xfail_reason = extract_xfail(&source_text);
     let error_expected = extract_error_expected(&source_text);
+    let error_span = match extract_error_span(&source_text, filename) {
+        Ok(span) => span,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let checks = extract_checks(&source_text);
     let stderr_checks = extract_stderr_checks(&source_text);
     let expected_exit_code = match extract_exit_code(&source_text, filename) {
@@ -342,17 +464,26 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Err(e) => return TestOutcome::Fail(e),
     };
     let ir_checks = extract_ir_checks(&source_text);
+    let asm_checks = extract_asm_checks(&source_text);
     if checks.is_empty()
         && stderr_checks.is_empty()
         && ir_checks.is_empty()
+        && asm_checks.is_empty()
         && expected_exit_code.is_none()
+        && error_span.is_none()
         && xfail_reason.is_none()
         && error_expected.is_none()
     {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / XFAIL / ERROR_EXPECTED annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            filename,
+        ));
+    }
+    if error_span.is_some() && error_expected.is_none() {
+        return TestOutcome::Fail(format!(
+            "{}: ERROR_SPAN requires ERROR_EXPECTED so the harness knows which compile failure to validate",
             filename,
         ));
     }
@@ -393,6 +524,15 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                      Full stderr:\n{}",
                     filename, opt_flag, expected, stderr,
                 ));
+            }
+            if let Some(expected_span) = error_span {
+                if !diagnostic_contains_span(&stderr, expected_span) {
+                    return Err(format!(
+                        "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
+                         Full stderr:\n{}",
+                        filename, opt_flag, expected_span.line, expected_span.col, stderr,
+                    ));
+                }
             }
             return Ok(());
         }
@@ -484,6 +624,35 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 .map_err(|e| format!("{}: cannot read IR: {}", filename, e))?;
             let _ = fs::remove_file(&ir_dest);
             match_ir_checks(&ir_checks, &ir_text, &label)?;
+        }
+
+        if !asm_checks.is_empty() {
+            let asm_dest = std::env::temp_dir().join(format!(
+                "afs_test_{}_{}.s",
+                source.file_stem().unwrap().to_str().unwrap(),
+                level,
+            ));
+            let asm_compile = Command::new(compiler)
+                .args([
+                    source.to_str().unwrap(),
+                    opt_flag,
+                    "-S",
+                    "-o",
+                    asm_dest.to_str().unwrap(),
+                ])
+                .output()
+                .map_err(|e| format!("{}: cannot run -S: {}", filename, e))?;
+            if !asm_compile.status.success() {
+                let stderr = String::from_utf8_lossy(&asm_compile.stderr);
+                return Err(format!(
+                    "{} [{}]: -S compilation failed:\n{}",
+                    filename, opt_flag, stderr,
+                ));
+            }
+            let asm_text = fs::read_to_string(&asm_dest)
+                .map_err(|e| format!("{}: cannot read assembly: {}", filename, e))?;
+            let _ = fs::remove_file(&asm_dest);
+            match_asm_checks(&asm_checks, &asm_text, &label)?;
         }
 
         Ok(())
@@ -685,6 +854,19 @@ fn extract_exit_code_accepts_integer_annotation() {
 }
 
 #[test]
+fn extract_error_span_accepts_line_and_column() {
+    let source = "! ERROR_EXPECTED: hidden\n! ERROR_SPAN: 13:19\nprogram t\nend program t\n";
+    assert_eq!(
+        extract_error_span(source, "inline.f90").unwrap(),
+        Some(ExpectedSpan {
+            line_num: 2,
+            line: 13,
+            col: 19,
+        })
+    );
+}
+
+#[test]
 fn extract_exit_code_rejects_multiple_annotations() {
     let source = "! EXIT_CODE: 1\n! EXIT_CODE: 2\nprogram t\nend program t\n";
     let err = extract_exit_code(source, "inline.f90").unwrap_err();
@@ -708,6 +890,19 @@ fn match_checks_reports_stderr_check_failures_by_name() {
 }
 
 #[test]
+fn diagnostic_contains_span_matches_line_and_column_fragment() {
+    let stderr = "armfortas: error: 13:19: hidden is not accessible";
+    assert!(diagnostic_contains_span(
+        stderr,
+        ExpectedSpan {
+            line_num: 1,
+            line: 13,
+            col: 19,
+        }
+    ));
+}
+
+#[test]
 fn stderr_and_exit_code_annotations_allow_error_stop() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
@@ -720,5 +915,24 @@ fn stderr_and_exit_code_annotations_allow_error_stop() {
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
         other => panic!("error_stop_status.f90 should pass, got {:?}", other),
+    }
+}
+
+#[test]
+fn error_expected_and_span_match_hidden_use_only_error() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("audit6_filter_associate.f90");
+    assert!(
+        source.exists(),
+        "audit6_filter_associate.f90 missing — needed for ERROR_SPAN coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "audit6_filter_associate.f90 should pass with ERROR_EXPECTED + ERROR_SPAN, got {:?}",
+            other
+        ),
     }
 }

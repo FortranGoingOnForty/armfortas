@@ -171,9 +171,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 3. Lex.
     let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| {
         format!(
-            "{}:{}: lexer error: {}",
+            "{}:{}:{}: lexer error: {}",
             opts.input.display(),
             e.span.start.line,
+            e.span.start.col,
             e.msg
         )
     })?;
@@ -191,15 +192,23 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     })?;
 
     // 5. Semantic analysis.
-    let (st, type_layouts) = resolve::resolve_file(&units)
-        .map_err(|e| format!("{}:{}: {}", opts.input.display(), e.span.start.line, e.msg))?;
+    let (st, type_layouts) = resolve::resolve_file(&units).map_err(|e| {
+        format!(
+            "{}:{}:{}: {}",
+            opts.input.display(),
+            e.span.start.line,
+            e.span.start.col,
+            e.msg
+        )
+    })?;
     let diags = validate::validate_file(&units, &st);
     for d in &diags {
         if d.kind == validate::DiagKind::Error {
             return Err(format!(
-                "{}:{}: error: {}",
+                "{}:{}:{}: error: {}",
                 opts.input.display(),
                 d.span.start.line,
+                d.span.start.col,
                 d.msg
             ));
         }
