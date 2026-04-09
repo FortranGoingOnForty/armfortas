@@ -210,6 +210,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
+            pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
             pm.add(Box::new(Dce));
         }
     }
@@ -245,6 +246,20 @@ mod tests {
         for lvl in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
             let pm = build_pipeline(lvl);
             assert!(!pm.is_empty(), "pipeline {:?} should have at least one pass", lvl);
+        }
+    }
+
+    #[test]
+    fn higher_optimization_levels_keep_gvn_enabled() {
+        for lvl in [OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+            let pm = build_pipeline(lvl);
+            let names = pm.pass_names();
+            assert!(
+                names.contains(&"gvn"),
+                "pipeline {:?} should include gvn, got {:?}",
+                lvl,
+                names
+            );
         }
     }
 }

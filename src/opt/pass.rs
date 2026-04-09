@@ -54,6 +54,11 @@ impl PassManager {
         self.passes.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pass_names(&self) -> Vec<&'static str> {
+        self.passes.iter().map(|pass| pass.name()).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.passes.is_empty()
     }
