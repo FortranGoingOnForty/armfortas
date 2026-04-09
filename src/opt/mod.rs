@@ -23,6 +23,7 @@ pub mod unroll;
 pub mod loop_tree;
 pub mod loop_utils;
 pub mod preheader;
+pub mod unswitch;
 
 #[cfg(test)]
 mod audit_tests;
