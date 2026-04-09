@@ -190,6 +190,8 @@ source-embedded assertions such as:
 - `! EXIT_CODE:` for exact runtime exit status
 - `! XFAIL:` for known open bugs
 - `! ERROR_EXPECTED:` for diagnostics that must be emitted
+- `! ERROR_SPAN:` for exact diagnostic location
+- `! ASM_CHECK:` / `! ASM_NOT:` for assembly shape
 - `! IR_CHECK:` / `! IR_NOT:` for IR shape
 
 Those source comments are the canonical leaf-assertion language for the
