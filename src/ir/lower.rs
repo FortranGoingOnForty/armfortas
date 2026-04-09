@@ -3426,77 +3426,50 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             };
 
                             if info.allocatable {
-                                // Allocatable: call afs_allocate_1d for 1D, afs_allocate_array for multi-D.
-                                // info.addr is the descriptor alloca.
+                                // Build a stack DimDescriptor[rank] honoring
+                                // each subscript's actual (lower, upper) bounds,
+                                // then call afs_allocate_array. Both 1-D and
+                                // multi-D go through the same path now —
+                                // afs_allocate_1d hardcodes lower=1, so it
+                                // can't represent `allocate(a(0:N))` correctly.
+                                //
+                                // Audit6 BLOCKING-4: the old code only handled
+                                // SectionSubscript::Element and silently fell
+                                // through to const_i64(1) on Range subscripts.
+                                // For `allocate(m(0:2, 0:3))` the parser
+                                // produces Range { 0, 2 } / Range { 0, 3 }, so
+                                // every dim's upper became 1 and the runtime
+                                // allocated a single element while writes went
+                                // out of bounds (heap corruption).
                                 let es = b.const_i64(elem_size_bytes);
-                                if args.len() == 1 {
-                                    let n = match &args[0].value {
-                                        crate::ast::expr::SectionSubscript::Element(e) => {
-                                            lower_expr(b, &ctx.locals, e, ctx.st)
-                                        }
-                                        _ => b.const_i64(1),
-                                    };
-                                    // Widen to i64 if needed.
-                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
-                                        b.int_extend(n, IntWidth::I64, true)
-                                    } else { n };
-                                    b.call(
-                                        FuncRef::External("afs_allocate_1d".into()),
-                                        vec![info.addr, es, n64],
-                                        IrType::Void,
-                                    );
-                                } else {
-                                    // Multi-D: build a stack DimDescriptor[rank] with
-                                    // (lower=1, upper=N_i, stride=1) per dim, then call
-                                    // afs_allocate_array(desc, elem_size, rank, dims, stat).
-                                    // Audit5 MAJOR-1: previously fell back to flattening
-                                    // extents into afs_allocate_1d, which left rank=1
-                                    // in the descriptor and broke m(i,j) subscripting.
-                                    let rank = args.len();
-                                    let dim_buf_bytes = (rank * 24) as u64;
-                                    let dim_buf = b.alloca(IrType::Array(
-                                        Box::new(IrType::Int(IntWidth::I8)),
-                                        dim_buf_bytes,
-                                    ));
-                                    let one_i64 = b.const_i64(1);
-                                    for (i, arg) in args.iter().enumerate() {
-                                        let upper_raw = match &arg.value {
-                                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                                lower_expr(b, &ctx.locals, e, ctx.st)
-                                            }
-                                            _ => b.const_i64(1),
-                                        };
-                                        // Widen upper to i64 if the expression returned i32.
-                                        let upper = if matches!(
-                                            b.func().value_type(upper_raw),
-                                            Some(IrType::Int(IntWidth::I32))
-                                        ) {
-                                            b.int_extend(upper_raw, IntWidth::I64, true)
-                                        } else {
-                                            upper_raw
-                                        };
-                                        let base = (i * 24) as i64;
-                                        let off_lo = b.const_i64(base);
-                                        let off_up = b.const_i64(base + 8);
-                                        let off_st = b.const_i64(base + 16);
-                                        let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
-                                        let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
-                                        let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
-                                        b.store(one_i64, p_lo);
-                                        b.store(upper, p_up);
-                                        b.store(one_i64, p_st);
-                                    }
-                                    let rank_val = b.const_i32(rank as i32);
-                                    // Real i32 slot for STAT to give the runtime a valid
-                                    // pointer to write into rather than relying on
-                                    // const-i64-0 being interpreted as a null pointer.
-                                    let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
-                                    b.call(
-                                        FuncRef::External("afs_allocate_array".into()),
-                                        vec![info.addr, es, rank_val, dim_buf, stat_slot],
-                                        IrType::Void,
-                                    );
+                                let rank = args.len();
+                                let dim_buf_bytes = (rank * 24) as u64;
+                                let dim_buf = b.alloca(IrType::Array(
+                                    Box::new(IrType::Int(IntWidth::I8)),
+                                    dim_buf_bytes,
+                                ));
+                                let one_i64 = b.const_i64(1);
+                                for (i, arg) in args.iter().enumerate() {
+                                    let (lo64, up64) =
+                                        lower_alloc_bounds(b, &ctx.locals, &arg.value, ctx.st);
+                                    let base = (i * 24) as i64;
+                                    let off_lo = b.const_i64(base);
+                                    let off_up = b.const_i64(base + 8);
+                                    let off_st = b.const_i64(base + 16);
+                                    let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+                                    let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+                                    let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+                                    b.store(lo64, p_lo);
+                                    b.store(up64, p_up);
+                                    b.store(one_i64, p_st);
                                 }
+                                let rank_val = b.const_i32(rank as i32);
+                                let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
+                                b.call(
+                                    FuncRef::External("afs_allocate_array".into()),
+                                    vec![info.addr, es, rank_val, dim_buf, stat_slot],
+                                    IrType::Void,
+                                );
                             } else {
                                 // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
                                 let size_val = b.const_i32(elem_size_bytes as i32);
@@ -4136,6 +4109,56 @@ fn widen_idx_to_i64(b: &mut FuncBuilder, idx: ValueId) -> ValueId {
         Some(IrType::Int(IntWidth::I64)) => idx,
         Some(IrType::Int(_)) => b.int_extend(idx, IntWidth::I64, true),
         _ => idx,
+    }
+}
+
+/// Lower an ALLOCATE bound subscript to (lower_bound, upper_bound)
+/// as i64 values. Both forms are valid:
+///
+///   allocate(a(N))      → Element(N)        → (1, N)
+///   allocate(a(0:N))    → Range(0, N)       → (0, N)
+///   allocate(a(lo:hi))  → Range(lo, hi)     → (lo, hi)
+///
+/// A bare `Range { start: None, .. }` defaults the lower bound
+/// to 1 (Fortran convention). A `Range` with no `end` is
+/// invalid in ALLOCATE — defaults to 1 to keep the runtime
+/// from segfaulting and let the verifier catch it.
+///
+/// Audit6 BLOCKING-4: the previous Stmt::Allocate code only
+/// handled Element subscripts and silently dropped the Range
+/// case to const_i64(1), causing heap corruption on
+/// `allocate(m(0:2, 0:3))`.
+fn lower_alloc_bounds(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    sub: &crate::ast::expr::SectionSubscript,
+    st: &SymbolTable,
+) -> (ValueId, ValueId) {
+    use crate::ast::expr::SectionSubscript;
+    match sub {
+        SectionSubscript::Element(e) => {
+            let up = lower_expr(b, locals, e, st);
+            let up64 = widen_idx_to_i64(b, up);
+            let lo64 = b.const_i64(1);
+            (lo64, up64)
+        }
+        SectionSubscript::Range { start, end, .. } => {
+            let lo64 = match start {
+                Some(e) => {
+                    let v = lower_expr(b, locals, e, st);
+                    widen_idx_to_i64(b, v)
+                }
+                None => b.const_i64(1),
+            };
+            let up64 = match end {
+                Some(e) => {
+                    let v = lower_expr(b, locals, e, st);
+                    widen_idx_to_i64(b, v)
+                }
+                None => b.const_i64(1),
+            };
+            (lo64, up64)
+        }
     }
 }
 

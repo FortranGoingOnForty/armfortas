@@ -1,28 +1,17 @@
-! Audit #6 BLOCKING-4 — `allocate(m(0:2, 0:3))` silently
-! produces a 1-element heap allocation, then writes go out of
-! bounds (heap corruption).
+! Audit #6 BLOCKING-4 — `allocate(m(0:2, 0:3))` with non-1
+! lower bounds.
 !
-! Root cause: in lower.rs Stmt::Allocate, the multi-D path
-! looks at args[i].value but only handles
-! SectionSubscript::Element. When the user writes a Range like
-! `0:2` the arm falls through to `b.const_i64(1)`, so every
-! dim's upper bound becomes 1. The descriptor then claims
-! extents (1, 1) and the runtime allocates a single element.
+! Fixed: a new lower_alloc_bounds helper extracts the
+! (lower, upper) pair from each subscript, handling both
+! Element(N) → (1, N) and Range(lo, hi) → (lo, hi). The
+! Stmt::Allocate arm now goes through a unified path that
+! always calls afs_allocate_array (afs_allocate_1d hardcoded
+! lower=1 and couldn't represent the 0:N case at all). The
+! actual lower bound is now stored in the runtime descriptor,
+! and compute_flat_elem_offset reads it at subscript time, so
+! m(0,0) hits offset 0 and m(2,3) hits offset 11 in a 12-cell
+! allocation.
 !
-! The 1-D case has the same shape but happens to be exercised
-! only by tests that pass an Element subscript, so the bug
-! lurked under existing coverage.
-!
-! Compounding bug: even if upper bounds were honored, the
-! current code hardcodes lower=1 for every dim regardless of
-! the source `0:N` syntax. compute_flat_elem_offset reads the
-! lower from the descriptor at subscript time, so the
-! subscript math would still be wrong.
-!
-! Expected runtime: m(0,0)=7, m(1,2)=127, m(2,3)=237.
-! Observed: m(0,0)=7 (lucky), m(1,2)=37 (wrong), m(2,3)=237.
-!
-! XFAIL: audit6 BLOCKING-4 (allocate Range lower bounds dropped)
 ! CHECK: 7
 ! CHECK: 127
 ! CHECK: 237

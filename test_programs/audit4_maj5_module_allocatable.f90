@@ -14,17 +14,21 @@
 !
 ! Critical for fortsh: ~55 modules use allocatable shell state.
 !
-! IR-shape assertions (audit5 MIN-2):
+! IR-shape assertions (audit5 MIN-2, updated audit6 BLOCKING-4):
 !   * The module variable must materialize as a real 384-byte
 !     descriptor global (zeroed by the loader), not as a stub
 !     scalar global or a never-installed local.
 !   * `allocate(arr(5))` must lower to a runtime call into
-!     afs_allocate_1d (the rank=1 fast path), not into a generic
-!     malloc that bypasses the descriptor.
+!     afs_allocate_array — audit6 BLOCKING-4 unified the 1-D
+!     and multi-D paths through afs_allocate_array because
+!     afs_allocate_1d hardcoded lower=1 and couldn't represent
+!     `allocate(a(0:N))`. The 1-D fast path is gone; everything
+!     goes through afs_allocate_array now.
 !
 ! CHECK: 10 20 30 40 50
 ! IR_CHECK: global @afs_mod_audit4_maj5_mod_arr: [i8 x 384] = zeroinit
-! IR_CHECK: call @afs_allocate_1d
+! IR_CHECK: call @afs_allocate_array
+! IR_NOT: call @afs_allocate_1d
 program audit4_maj5_module_allocatable
   use audit4_maj5_mod
   allocate(arr(5))

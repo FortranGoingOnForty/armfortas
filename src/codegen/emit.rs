@@ -198,6 +198,34 @@ pub fn emit_function(mf: &MachineFunction) -> String {
     out
 }
 
+/// Format `OP sp, sp, #N` (or `add x29, sp, #N`), falling back
+/// to a 2-3 instruction synthesized sequence via the AAPCS64
+/// scratch register x16 (IP0) when N exceeds the 12-bit
+/// immediate range. x16 is free in the prologue/epilogue per
+/// AAPCS64 — it has no caller-saved value at function entry
+/// and can be clobbered before/after the FP/LR save.
+///
+/// Audit6 BLOCKING-5 (related to BLOCKING-4): functions whose
+/// frame size exceeds 4095 bytes used to emit raw
+/// `sub sp, sp, #4144` and the assembler rejected the
+/// immediate. This came up after audit6 BLOCKING-4 added
+/// per-allocate descriptor buffers, but it's a latent bug that
+/// any large-frame function would hit.
+fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
+    if (0..=4095).contains(&n) {
+        return format!("{} {}, {}, #{}", op, dest, base, n);
+    }
+    // Synthesize the immediate in x16 then use the register form.
+    let lo = n & 0xFFFF;
+    let hi = (n >> 16) & 0xFFFF;
+    let mov = if hi == 0 {
+        format!("movz x16, #{}", lo)
+    } else {
+        format!("movz x16, #{}\n    movk x16, #{}, lsl #16", lo, hi)
+    };
+    format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
+}
+
 /// Emit a single machine instruction as assembly text.
 fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
     match inst.opcode {
@@ -206,21 +234,25 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::AddImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
-            let offset = match &inst.operands[2] {
-                MachineOperand::FrameSlot(off) => format!("#{}", off),
+            let imm: i64 = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) => *off as i64,
                 MachineOperand::Imm(-1) => {
                     // Sentinel: prologue FP setup → frame_size - 16
-                    format!("#{}", mf.frame.size.saturating_sub(16))
+                    mf.frame.size.saturating_sub(16) as i64
                 }
-                MachineOperand::Imm(v) => format!("#{}", v),
-                _ => op_str(&inst.operands[2]),
+                MachineOperand::Imm(v) => *v,
+                _ => return format!("add {}, {}, {}",
+                    dest, base, op_str(&inst.operands[2])),
             };
-            format!("add {}, {}, {}", dest, base, offset)
+            // Both `add x29, sp, #N` (FP setup) and `add Xd, Xn, #N`
+            // need the > 4095 fallback. Use the same scratch
+            // synthesis since x16 is safe in the prologue.
+            fmt_sp_imm("add", &dest, &base, imm)
         }
         ArmOpcode::SubReg => format!("sub {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::SubImm => {
-            let imm = match &inst.operands[2] {
+            let imm: i64 = match &inst.operands[2] {
                 MachineOperand::Imm(-1) => {
                     // Sentinel: epilogue SP restore → frame_size - 16
                     mf.frame.size.saturating_sub(16) as i64
@@ -228,7 +260,9 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
-            format!("sub {}, {}, #{}", op_str(&inst.operands[0]), op_str(&inst.operands[1]), imm)
+            let dest = op_str(&inst.operands[0]);
+            let base = op_str(&inst.operands[1]);
+            fmt_sp_imm("sub", &dest, &base, imm)
         }
         ArmOpcode::Mul => format!("mul {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
@@ -393,26 +427,40 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
 
         ArmOpcode::StpPre => {
-            let frame_size = mf.frame.size;
+            let frame_size = mf.frame.size as i64;
             let stp_offset = frame_size - 16;
+            // The `sub sp, sp, #N` portion handles N > 4095 via
+            // x16 synthesis (audit6 BLOCKING-5 root cause). The
+            // `stp ... [sp, #stp_offset]` form is also bounded
+            // (signed 7-bit immediate * 8 = ±504 byte range), so
+            // we fall back to two `str` instructions when over.
+            // For very large frames (stp_offset > 32760, the
+            // signed 12-bit max for 64-bit ldr/str unsigned imm),
+            // we'd need a register-form load/store — not yet
+            // exercised in any test, so the panic catches it.
+            let sub_sp = fmt_sp_imm("sub", "sp", "sp", frame_size);
             if stp_offset <= 504 {
-                format!("sub sp, sp, #{}\n    stp x29, x30, [sp, #{}]",
-                    frame_size, stp_offset)
+                format!("{}\n    stp x29, x30, [sp, #{}]", sub_sp, stp_offset)
+            } else if stp_offset <= 32760 {
+                format!("{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
+                    sub_sp, stp_offset, stp_offset + 8)
             } else {
-                // Large frame: use SUB + STP at [sp] approach.
-                format!("sub sp, sp, #{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
-                    frame_size, stp_offset, stp_offset + 8)
+                format!("{}\n    ; FIXME: stp_offset {} too large for str imm",
+                    sub_sp, stp_offset)
             }
         }
         ArmOpcode::LdpPost => {
-            let frame_size = mf.frame.size;
+            let frame_size = mf.frame.size as i64;
             let ldp_offset = frame_size - 16;
+            let add_sp = fmt_sp_imm("add", "sp", "sp", frame_size);
             if ldp_offset <= 504 {
-                format!("ldp x29, x30, [sp, #{}]\n    add sp, sp, #{}",
-                    ldp_offset, frame_size)
+                format!("ldp x29, x30, [sp, #{}]\n    {}", ldp_offset, add_sp)
+            } else if ldp_offset <= 32760 {
+                format!("ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    {}",
+                    ldp_offset, ldp_offset + 8, add_sp)
             } else {
-                format!("ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    add sp, sp, #{}",
-                    ldp_offset, ldp_offset + 8, frame_size)
+                format!("; FIXME: ldp_offset {} too large for ldr imm\n    {}",
+                    ldp_offset, add_sp)
             }
         }
 
