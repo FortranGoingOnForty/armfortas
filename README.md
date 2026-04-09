@@ -150,8 +150,8 @@ armfortas/
 │   ├── codegen/     ARM64 instruction selection, linear scan register allocation
 │   ├── driver/      CLI, compilation orchestration
 │   └── runtime/     libarmfortas_rt — I/O, intrinsics, memory management
-├── bencch/          Compiler benchmark and test harness (git submodule)
-├── test_programs/   ~110 end-to-end test programs with CHECK annotations
+├── bencch/          Structured compiler runner and reporting bench (git submodule)
+├── test_programs/   ~110 end-to-end programs with source-directed annotations
 └── runtime/         Runtime library source
 ```
 
@@ -181,7 +181,39 @@ cargo run -p afs-tests -- run --suite runtime     # bencch runtime suite
 cargo run -p afs-tests -- run --suite consistency # reproducibility checks
 ```
 
-The end-to-end harness compiles each `.f90` file in `test_programs/`, runs the binary, and checks stdout against `! CHECK:` annotations. All tests run at every optimization level (`-O0` through `-Ofast`). Programs with known bugs carry `! XFAIL:` annotations that reference the audit finding — they count as passing until the bug is fixed, at which point CI catches the unexpected success.
+The root `armfortas` harness is the fast, armfortas-first runner. It compiles
+each `.f90` file in `test_programs/`, runs the binary, and evaluates
+source-embedded assertions such as:
+
+- `! CHECK:` for stdout
+- `! XFAIL:` for known open bugs
+- `! ERROR_EXPECTED:` for diagnostics that must be emitted
+- `! IR_CHECK:` / `! IR_NOT:` for IR shape
+
+Those source comments are the canonical leaf-assertion language for the
+project. The root harness is where new annotation ideas should land first.
+
+`bencch` is the structured matrix/reporting/differential runner around that
+same testing language. It is best for:
+
+- opt matrices
+- differential/reference runs
+- module graphs
+- capability-aware execution
+- reports and bundles
+
+The two surfaces are meant to converge on syntax and expectations, not drift
+into separate testing dialects.
+
+All root end-to-end tests run at every optimization level (`-O0` through
+`-Ofast`). Programs with known bugs carry `! XFAIL:` annotations that reference
+the audit finding — they count as passing until the bug is fixed, at which
+point CI catches the unexpected success.
+
+The follow-through roadmap for this reset lives under `.docs/testing/`. That
+parallel testing track covers shared annotations, pipeline oracles,
+metamorphic and generated testing, determinism, triage, and fortsh-scale
+campaigns.
 
 ## Target
 

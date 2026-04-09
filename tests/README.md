@@ -1,12 +1,47 @@
 # armfortas tests
 
-The root `tests/` directory now holds armfortas-local harnesses and integration
-checks that belong in the compiler repo itself.
+The root `tests/` directory is the armfortas-first testing lab.
 
-The extracted structured bench lives in the `bencch/` submodule.
+This is where new source-directed testing ideas should land first:
 
-Current handoff point:
+- end-to-end runtime assertions
+- expected diagnostics
+- IR and later ASM shape assertions
+- determinism and full-pipeline regression checks
 
-- `bencch` was split out after the Sprint 6 audit/hardening slice.
-- The next planned bench slice is deeper Sprint 6 differential coverage and
-  object/tool consistency work.
+The canonical leaf-assertion language lives in source comments inside
+`test_programs/` and other shared fixtures:
+
+- `! CHECK:`
+- `! XFAIL:`
+- `! ERROR_EXPECTED:`
+- `! IR_CHECK:`
+- `! IR_NOT:`
+
+That source comment language is meant to converge with `bencch`, not drift from
+it.
+
+## Relationship To `bencch`
+
+The extracted structured bench lives in the `bencch/` submodule. It remains a
+co-equal tool, but it now has a clearer role:
+
+- the root harness is the fast armfortas-first runner
+- `bencch` is the structured matrix/reporting/differential runner
+
+`bencch` should reuse source directives from shared fixtures whenever possible.
+Its suite DSL is for orchestration — opts, references, module graphs,
+capability policy, reports, and bundles — not for inventing a separate leaf
+assertion language.
+
+## Roadmap
+
+The testing reset and follow-through sprints now live under
+`.docs/testing/`. Those docs define:
+
+- the armfortas-first doctrine
+- the shared annotation roadmap
+- pipeline oracle work
+- metamorphic and generated testing
+- determinism, reduction, and triage
+- fortsh-scale testing campaigns
