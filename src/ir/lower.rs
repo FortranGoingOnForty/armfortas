@@ -1718,6 +1718,17 @@ fn init_decls(
                     if global_addr_ids.contains(&info.addr) {
                         continue;
                     }
+                    // Audit5 MAJOR-3: PARAMETER scalars folded by
+                    // alloc_decls have inline_const set and a
+                    // sentinel alloca that is never loaded — every
+                    // use materializes the constant directly. The
+                    // store here would be dead in the IR forever
+                    // at -O0 (mem2reg cleans it up at -O1+, but
+                    // we shouldn't generate dead code in the first
+                    // place).
+                    if info.inline_const.is_some() {
+                        continue;
+                    }
                     let val = lower_expr(b, locals, init_expr, st);
                     let coerced = coerce_to_type(b, val, &info.ty);
                     b.store(coerced, info.addr);
@@ -1740,6 +1751,14 @@ fn init_decls(
                     // into .data at link time, so skip the runtime
                     // store. Audit MAJOR-1 interaction.
                     if global_addr_ids.contains(&info.addr) {
+                        continue;
+                    }
+                    // Audit5 MAJOR-3: same dead-store skip as the
+                    // TypeDecl arm above. Standalone PARAMETER
+                    // statements also produce inline_const-tagged
+                    // locals when alloc_decls successfully folds
+                    // the value.
+                    if info.inline_const.is_some() {
                         continue;
                     }
                     let val = lower_expr(b, locals, expr, st);
