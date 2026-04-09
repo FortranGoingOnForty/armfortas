@@ -13,6 +13,8 @@ The canonical leaf-assertion language lives in source comments inside
 `test_programs/` and other shared fixtures:
 
 - `! CHECK:`
+- `! STDERR_CHECK:`
+- `! EXIT_CODE:`
 - `! XFAIL:`
 - `! ERROR_EXPECTED:`
 - `! IR_CHECK:`

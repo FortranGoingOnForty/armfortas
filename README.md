@@ -186,6 +186,8 @@ each `.f90` file in `test_programs/`, runs the binary, and evaluates
 source-embedded assertions such as:
 
 - `! CHECK:` for stdout
+- `! STDERR_CHECK:` for runtime stderr
+- `! EXIT_CODE:` for exact runtime exit status
 - `! XFAIL:` for known open bugs
 - `! ERROR_EXPECTED:` for diagnostics that must be emitted
 - `! IR_CHECK:` / `! IR_NOT:` for IR shape
