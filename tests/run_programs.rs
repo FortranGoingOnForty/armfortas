@@ -105,15 +105,85 @@
 //! level, so ASM checks fire at every optimization level. Tests
 //! should use stable substrings that are intentionally expected
 //! across the requested matrix.
+//!
+//! ## FILE_CHECK / FILE_NOT annotations
+//!
+//! Runtime tests can assert on files created inside their per-test
+//! sandbox:
+//!
+//!   * `! FILE_CHECK: <relative-path> => <substring>` — the file must
+//!     exist after execution, and the substring must appear in its
+//!     contents. Multiple checks for the same file must appear in the
+//!     order declared.
+//!   * `! FILE_NOT: <relative-path> => <substring>` — the file must
+//!     exist, and the substring must not appear in its contents.
+//!
+//! Paths are sandbox-relative on purpose. The harness runs each binary
+//! in a private temp directory, so file assertions pin side effects
+//! without letting tests stomp on one another.
+//!
+//! ## REPRO_CHECK annotations
+//!
+//! Tests can also opt into explicit reproducibility checks:
+//!
+//!   * `! REPRO_CHECK: asm` — compile twice with `-S` and require
+//!     identical assembly bytes.
+//!   * `! REPRO_CHECK: obj` — compile twice with `-c` and require
+//!     identical object bytes.
+//!   * `! REPRO_CHECK: run` — execute twice in fresh sandboxes and
+//!     require identical exit/stdout/stderr plus identical written files.
+//!
+//! These are test-local determinism assertions, lighter-weight than the
+//! dedicated global determinism tests at the bottom of this file.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// A single expected check.
 struct Check {
     line_num: usize,
     pattern: String,
+}
+
+/// A single file-content assertion against the per-test sandbox.
+struct FileCheck {
+    line_num: usize,
+    rel_path: String,
+    pattern: String,
+    negative: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReproStage {
+    Asm,
+    Obj,
+    Run,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunSnapshot {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+fn unique_temp_path(prefix: &str, stem: &str, tag: &str, ext: &str) -> PathBuf {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "afs_{}_{}_{}_{}_{}{}",
+        prefix,
+        std::process::id(),
+        id,
+        stem,
+        tag.trim_start_matches('-'),
+        ext
+    ))
 }
 
 /// Extract ordered substring checks from a Fortran source file.
@@ -256,6 +326,86 @@ fn extract_exit_code(source: &str, filename: &str) -> Result<Option<i32>, String
     })
 }
 
+fn extract_file_checks(
+    source: &str,
+    filename: &str,
+    pos_prefix: &str,
+    neg_prefix: &str,
+) -> Result<Vec<FileCheck>, String> {
+    let mut checks = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let (rest, negative) = if let Some(rest) = trimmed.strip_prefix(pos_prefix) {
+            (rest.trim(), false)
+        } else if let Some(rest) = trimmed.strip_prefix(neg_prefix) {
+            (rest.trim(), true)
+        } else {
+            continue;
+        };
+
+        let Some((raw_path, raw_pattern)) = rest.split_once("=>") else {
+            return Err(format!(
+                "{}:{}: {} must be written as <relative-path> => <substring>",
+                filename,
+                i + 1,
+                if negative { "FILE_NOT" } else { "FILE_CHECK" }
+            ));
+        };
+
+        let rel_path = raw_path.trim();
+        if rel_path.is_empty() {
+            return Err(format!(
+                "{}:{}: FILE_CHECK/FILE_NOT path cannot be empty",
+                filename,
+                i + 1
+            ));
+        }
+        if Path::new(rel_path).is_absolute() {
+            return Err(format!(
+                "{}:{}: FILE_CHECK/FILE_NOT path must be relative, got '{}'",
+                filename,
+                i + 1,
+                rel_path
+            ));
+        }
+
+        checks.push(FileCheck {
+            line_num: i + 1,
+            rel_path: rel_path.to_string(),
+            pattern: raw_pattern.trim().to_string(),
+            negative,
+        });
+    }
+    Ok(checks)
+}
+
+fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>, String> {
+    let mut stages = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("! REPRO_CHECK:") else {
+            continue;
+        };
+        let stage = match rest.trim() {
+            "asm" => ReproStage::Asm,
+            "obj" => ReproStage::Obj,
+            "run" => ReproStage::Run,
+            other => {
+                return Err(format!(
+                    "{}:{}: REPRO_CHECK must be one of asm, obj, run; got '{}'",
+                    filename,
+                    i + 1,
+                    other
+                ));
+            }
+        };
+        if !stages.contains(&stage) {
+            stages.push(stage);
+        }
+    }
+    Ok(stages)
+}
+
 fn diagnostic_contains_span(stderr: &str, expected: ExpectedSpan) -> bool {
     let needle = format!("{}:{}:", expected.line, expected.col);
     stderr.contains(&needle)
@@ -367,6 +517,98 @@ fn match_asm_checks(checks: &[ShapeCheck], asm: &str, filename: &str) -> Result<
     match_shape_checks(checks, asm, filename, "ASM_CHECK/ASM_NOT", "assembly")
 }
 
+fn match_file_checks(
+    checks: &[FileCheck],
+    files: &BTreeMap<String, Vec<u8>>,
+    filename: &str,
+) -> Result<(), String> {
+    let mut search_offsets: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for check in checks {
+        let Some(bytes) = files.get(&check.rel_path) else {
+            return Err(format!(
+                "{}:{}: FILE_CHECK/FILE_NOT expected sandbox file '{}' to exist",
+                filename, check.line_num, check.rel_path
+            ));
+        };
+        let text = String::from_utf8_lossy(bytes);
+        if check.negative {
+            if text.contains(&check.pattern) {
+                return Err(format!(
+                    "{}:{}: FILE_CHECK/FILE_NOT failed: substring '{}' appears in sandbox file '{}'\n\
+                     Full file contents:\n{}",
+                    filename, check.line_num, check.pattern, check.rel_path, text
+                ));
+            }
+        } else {
+            let search_offset = search_offsets.entry(&check.rel_path).or_insert(0);
+            if let Some(rel) = text[*search_offset..].find(&check.pattern) {
+                *search_offset += rel + check.pattern.len();
+            } else {
+                return Err(format!(
+                    "{}:{}: FILE_CHECK/FILE_NOT failed: substring '{}' not found in sandbox file '{}' from offset {}\n\
+                     Full file contents:\n{}",
+                    filename,
+                    check.line_num,
+                    check.pattern,
+                    check.rel_path,
+                    *search_offset,
+                    text
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_sandbox_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_sandbox_files(root, &path, out)?;
+        } else {
+            let rel = path.strip_prefix(root).unwrap();
+            out.insert(
+                rel.to_string_lossy().replace('\\', "/"),
+                fs::read(&path)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_sandbox_files(sandbox: &Path, filename: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut files = BTreeMap::new();
+    collect_sandbox_files(sandbox, sandbox, &mut files).map_err(|e| {
+        format!(
+            "{}: cannot snapshot sandbox {}: {}",
+            filename,
+            sandbox.display(),
+            e
+        )
+    })?;
+    Ok(files)
+}
+
+fn run_binary_in_sandbox(binary: &Path, sandbox: &Path, filename: &str) -> Result<RunSnapshot, String> {
+    let run = Command::new(binary)
+        .current_dir(sandbox)
+        .output()
+        .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
+    Ok(RunSnapshot {
+        exit_code: run.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+        files: snapshot_sandbox_files(sandbox, filename)?,
+    })
+}
+
 /// Match checks against actual output lines. Checks must appear in order
 /// but not necessarily consecutively — intervening output lines are allowed.
 fn match_checks(
@@ -425,6 +667,81 @@ fn find_test_programs() -> PathBuf {
     panic!("cannot find test_programs/ directory");
 }
 
+fn compile_stage_bytes(
+    compiler: &Path,
+    source: &Path,
+    opt_flag: &str,
+    stage: ReproStage,
+) -> Result<Vec<u8>, String> {
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+    let level = opt_flag.trim_start_matches('-');
+    let (kind, ext, extra_args): (&str, &str, &[&str]) = match stage {
+        ReproStage::Asm => ("asm", ".s", &["-S"]),
+        ReproStage::Obj => ("obj", ".o", &["-c"]),
+        ReproStage::Run => unreachable!("run reproducibility uses runtime snapshots"),
+    };
+    let out = unique_temp_path(kind, stem, level, ext);
+    let compile = Command::new(compiler)
+        .args([
+            source.to_str().unwrap(),
+            opt_flag,
+        ])
+        .args(extra_args)
+        .args(["-o", out.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("{}: cannot run compiler for {} repro: {}", source.display(), kind, e))?;
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        let _ = fs::remove_file(&out);
+        return Err(format!(
+            "{} [{}]: {} reproducibility compile failed:\n{}",
+            source.file_name().unwrap().to_string_lossy(),
+            opt_flag,
+            kind,
+            stderr
+        ));
+    }
+    let bytes = fs::read(&out)
+        .map_err(|e| format!("{}: cannot read {} output {}: {}", source.display(), kind, out.display(), e))?;
+    let _ = fs::remove_file(&out);
+    Ok(bytes)
+}
+
+fn describe_run_difference(first: &RunSnapshot, second: &RunSnapshot) -> String {
+    if first.exit_code != second.exit_code {
+        return format!(
+            "exit code mismatch: first {}, second {}",
+            first.exit_code, second.exit_code
+        );
+    }
+    if first.stdout != second.stdout {
+        return format!(
+            "stdout mismatch:\nfirst:\n{}\nsecond:\n{}",
+            first.stdout, second.stdout
+        );
+    }
+    if first.stderr != second.stderr {
+        return format!(
+            "stderr mismatch:\nfirst:\n{}\nsecond:\n{}",
+            first.stderr, second.stderr
+        );
+    }
+    if first.files.keys().collect::<Vec<_>>() != second.files.keys().collect::<Vec<_>>() {
+        return format!(
+            "sandbox file set mismatch: first {:?}, second {:?}",
+            first.files.keys().collect::<Vec<_>>(),
+            second.files.keys().collect::<Vec<_>>()
+        );
+    }
+    for (path, first_bytes) in &first.files {
+        let second_bytes = &second.files[path];
+        if first_bytes != second_bytes {
+            return format!("sandbox file contents differ for '{}'", path);
+        }
+    }
+    "unknown runtime observation mismatch".to_string()
+}
+
 /// What happened when we ran a test program.
 #[derive(Debug)]
 enum TestOutcome {
@@ -465,10 +782,25 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
     let ir_checks = extract_ir_checks(&source_text);
     let asm_checks = extract_asm_checks(&source_text);
+    let file_checks = match extract_file_checks(
+        &source_text,
+        filename,
+        "! FILE_CHECK:",
+        "! FILE_NOT:",
+    ) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
+    let repro_checks = match extract_repro_checks(&source_text, filename) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     if checks.is_empty()
         && stderr_checks.is_empty()
         && ir_checks.is_empty()
         && asm_checks.is_empty()
+        && file_checks.is_empty()
+        && repro_checks.is_empty()
         && expected_exit_code.is_none()
         && error_span.is_none()
         && xfail_reason.is_none()
@@ -477,7 +809,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
             filename,
         ));
     }
@@ -495,7 +827,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // and successive runs at different levels don't stomp each other.
         let stem = source.file_stem().unwrap().to_str().unwrap();
         let level = opt_flag.trim_start_matches('-');
-        let binary = std::env::temp_dir().join(format!("afs_test_{}_{}", stem, level));
+        let binary = unique_temp_path("test_bin", stem, level, "");
 
         let compile = Command::new(compiler)
             .args([
@@ -549,8 +881,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // filesystem (open(file=...)) write into this directory via relative
         // paths, which keeps the parallel test_programs_end_to_end_o*
         // threads from racing on shared paths.
-        let sandbox = std::env::temp_dir().join(format!("afs_test_sandbox_{}_{}", stem, level));
-        let _ = fs::remove_dir_all(&sandbox);
+        let sandbox = unique_temp_path("test_sandbox", stem, level, "");
         fs::create_dir_all(&sandbox).map_err(|e| {
             format!(
                 "{}: cannot create sandbox dir {}: {}",
@@ -560,13 +891,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             )
         })?;
 
-        let run = Command::new(&binary)
-            .current_dir(&sandbox)
-            .output()
-            .map_err(|e| format!("{}: cannot run binary: {}", filename, e))?;
+        let snapshot = run_binary_in_sandbox(&binary, &sandbox, filename)?;
 
-        let actual_exit_code = run.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&run.stderr);
+        let actual_exit_code = snapshot.exit_code;
+        let stderr = &snapshot.stderr;
         let expected_exit_code = expected_exit_code.unwrap_or(0);
         if actual_exit_code != expected_exit_code {
             let _ = fs::remove_file(&binary);
@@ -578,7 +906,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stdout = &snapshot.stdout;
         let label = format!("{} [{}]", filename, opt_flag);
         if let Err(e) = match_checks(&checks, &stdout, &label, "CHECK") {
             let _ = fs::remove_file(&binary);
@@ -590,6 +918,54 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
         }
+        if let Err(e) = match_file_checks(&file_checks, &snapshot.files, &label) {
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
+            return Err(e);
+        }
+        for stage in &repro_checks {
+            match stage {
+                ReproStage::Asm | ReproStage::Obj => {
+                    let first = compile_stage_bytes(compiler, source, opt_flag, *stage)?;
+                    let second = compile_stage_bytes(compiler, source, opt_flag, *stage)?;
+                    if first != second {
+                        let stage_name = match stage {
+                            ReproStage::Asm => "asm",
+                            ReproStage::Obj => "obj",
+                            ReproStage::Run => unreachable!(),
+                        };
+                        let _ = fs::remove_file(&binary);
+                        let _ = fs::remove_dir_all(&sandbox);
+                        return Err(format!(
+                            "{} [{}]: REPRO_CHECK({}) failed: two compilations produced different {} bytes",
+                            filename, opt_flag, stage_name, stage_name
+                        ));
+                    }
+                }
+                ReproStage::Run => {
+                    let repro_sandbox = unique_temp_path("test_sandbox", stem, &format!("{}_repro", level), "");
+                    fs::create_dir_all(&repro_sandbox).map_err(|e| {
+                        format!(
+                            "{}: cannot create repro sandbox dir {}: {}",
+                            filename,
+                            repro_sandbox.display(),
+                            e
+                        )
+                    })?;
+                    let second = run_binary_in_sandbox(&binary, &repro_sandbox, filename)?;
+                    let _ = fs::remove_dir_all(&repro_sandbox);
+                    if snapshot != second {
+                        let detail = describe_run_difference(&snapshot, &second);
+                        let _ = fs::remove_file(&binary);
+                        let _ = fs::remove_dir_all(&sandbox);
+                        return Err(format!(
+                            "{} [{}]: REPRO_CHECK(run) failed: {}",
+                            filename, opt_flag, detail
+                        ));
+                    }
+                }
+            }
+        }
         let _ = fs::remove_file(&binary);
         let _ = fs::remove_dir_all(&sandbox);
 
@@ -599,10 +975,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // at -O1+ would always fail. The runtime CHECKs above
         // continue to run at every level.
         if !ir_checks.is_empty() && opt_flag == "-O0" {
-            let ir_dest = std::env::temp_dir().join(format!(
-                "afs_test_{}_ir.txt",
-                source.file_stem().unwrap().to_str().unwrap(),
-            ));
+            let ir_dest = unique_temp_path("test_ir", stem, "o0", ".txt");
             let ir_compile = Command::new(compiler)
                 .args([
                     source.to_str().unwrap(),
@@ -627,11 +1000,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         }
 
         if !asm_checks.is_empty() {
-            let asm_dest = std::env::temp_dir().join(format!(
-                "afs_test_{}_{}.s",
-                source.file_stem().unwrap().to_str().unwrap(),
-                level,
-            ));
+            let asm_dest = unique_temp_path("test_asm", stem, level, ".s");
             let asm_compile = Command::new(compiler)
                 .args([
                     source.to_str().unwrap(),
@@ -776,12 +1145,12 @@ fn test_programs_end_to_end_ofast() {
 /// test pins the invariant going forward so any future regression
 /// trips immediately instead of intermittently.
 fn compile_to_asm(compiler: &Path, source: &Path, opt: &str) -> Vec<u8> {
-    let asm_path = std::env::temp_dir().join(format!(
-        "afs_det_{}_{}_{}.s",
-        std::process::id(),
+    let asm_path = unique_temp_path(
+        "det_asm",
         source.file_stem().unwrap().to_str().unwrap(),
         opt.trim_start_matches('-'),
-    ));
+        ".s",
+    );
     let status = Command::new(compiler)
         .args([
             source.to_str().unwrap(),
@@ -867,6 +1236,24 @@ fn extract_error_span_accepts_line_and_column() {
 }
 
 #[test]
+fn extract_file_checks_accepts_relative_path_and_pattern() {
+    let source = "! FILE_CHECK: out.txt => hello\n! FILE_NOT: out.txt => goodbye\n";
+    let checks = extract_file_checks(source, "inline.f90", "! FILE_CHECK:", "! FILE_NOT:").unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].rel_path, "out.txt");
+    assert_eq!(checks[0].pattern, "hello");
+    assert!(!checks[0].negative);
+    assert!(checks[1].negative);
+}
+
+#[test]
+fn extract_repro_checks_rejects_unknown_stage() {
+    let source = "! REPRO_CHECK: ir\n";
+    let err = extract_repro_checks(source, "inline.f90").unwrap_err();
+    assert!(err.contains("asm, obj, run"));
+}
+
+#[test]
 fn extract_exit_code_rejects_multiple_annotations() {
     let source = "! EXIT_CODE: 1\n! EXIT_CODE: 2\nprogram t\nend program t\n";
     let err = extract_exit_code(source, "inline.f90").unwrap_err();
@@ -934,5 +1321,37 @@ fn error_expected_and_span_match_hidden_use_only_error() {
             "audit6_filter_associate.f90 should pass with ERROR_EXPECTED + ERROR_SPAN, got {:?}",
             other
         ),
+    }
+}
+
+#[test]
+fn file_checks_allow_file_roundtrip() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("file_io.f90");
+    assert!(
+        source.exists(),
+        "file_io.f90 missing — needed for FILE_CHECK coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("file_io.f90 should pass with FILE_CHECK coverage, got {:?}", other),
+    }
+}
+
+#[test]
+fn repro_checks_allow_hello_stage_repro() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("hello.f90");
+    assert!(
+        source.exists(),
+        "hello.f90 missing — needed for REPRO_CHECK coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("hello.f90 should pass with REPRO_CHECK coverage, got {:?}", other),
     }
 }
