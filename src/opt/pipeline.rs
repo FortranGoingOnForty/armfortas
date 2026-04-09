@@ -26,6 +26,7 @@ use super::dead_func::DeadFuncElim;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
+use super::bce::Bce;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -141,6 +142,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Bce));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(GlobalLsf));
@@ -168,6 +170,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Bce));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(GlobalLsf));
@@ -192,6 +195,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Bce));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(GlobalLsf));

@@ -7,6 +7,20 @@
 use crate::descriptor::*;
 use std::ptr;
 
+// ---- BOUNDS CHECKS ----
+
+/// Abort if an array subscript is outside the legal closed interval.
+#[no_mangle]
+pub extern "C" fn afs_check_bounds(index: i64, lower: i64, upper: i64) {
+    if index < lower || index > upper {
+        eprintln!(
+            "Bounds check failed: index {} outside [{}, {}]",
+            index, lower, upper
+        );
+        std::process::exit(1);
+    }
+}
+
 // ---- ALLOCATE ----
 
 /// Allocate an array described by the given dimensions.
@@ -829,4 +843,3 @@ pub extern "C" fn afs_dot_product_int(
     }
     dot
 }
-

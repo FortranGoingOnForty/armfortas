@@ -4942,6 +4942,15 @@ fn lower_array_element(
     b.load(elem_ptr)
 }
 
+fn emit_bounds_check(
+    b: &mut FuncBuilder,
+    index: ValueId,
+    lower: ValueId,
+    upper: ValueId,
+) {
+    b.runtime_call(RuntimeFunc::CheckBounds, vec![index, lower, upper], IrType::Void);
+}
+
 /// Compute the column-major flat ELEMENT offset (i64) for an array
 /// subscript expression, returning a value suitable for `b.gep` (which
 /// scales by the GEP result element size).
@@ -4991,6 +5000,7 @@ fn compute_flat_elem_offset(
             let p_up = b.gep(info.addr, vec![off_up], IrType::Int(IntWidth::I8));
             let lo = b.load_typed(p_lo, IrType::Int(IntWidth::I64));
             let up = b.load_typed(p_up, IrType::Int(IntWidth::I64));
+            emit_bounds_check(b, sub, lo, up);
 
             let adjusted = b.isub(sub, lo);
 
@@ -5023,20 +5033,23 @@ fn compute_flat_elem_offset(
             crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
             _ => b.const_i32(0),
         };
+        let subscript64 = widen_idx_to_i64(b, subscript);
 
         let (lower, extent) = if dim_idx < info.dims.len() {
             info.dims[dim_idx]
         } else {
             (1, 1)
         };
-
-        let lower_val = b.const_i32(lower as i32);
-        let adjusted = b.isub(subscript, lower_val);
+        let upper = lower + extent - 1;
+        let lower_val = b.const_i64(lower);
+        let upper_val = b.const_i64(upper);
+        emit_bounds_check(b, subscript64, lower_val, upper_val);
+        let adjusted = b.isub(subscript64, lower_val);
 
         let dim_offset = if stride == 1 {
             adjusted
         } else {
-            let stride_val = b.const_i32(stride as i32);
+            let stride_val = b.const_i64(stride);
             b.imul(adjusted, stride_val)
         };
 
@@ -5048,13 +5061,7 @@ fn compute_flat_elem_offset(
         stride *= extent;
     }
 
-    let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    // Widen index to i64 for pointer arithmetic. ARM64 GEP lowering
-    // needs an i64 subscript so the codegen `mul` lands as
-    // `mul x, x, x` instead of `mul x, w, x` (which the assembler
-    // rejects). Applies to BOTH stack and allocatable arrays —
-    // gating on `info.allocatable` was the audit's CRITICAL-1.
-    widen_idx_to_i64(b, idx)
+    flat_offset.unwrap_or_else(|| b.const_i64(0))
 }
 
 /// Widen an i32 (or smaller) index value to i64 for pointer
