@@ -453,6 +453,28 @@ pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
     }
 }
 
+/// Write a complex(4) value (list-directed): " (re,im)".
+/// `ptr` points to a two-element f32 array [real, imag].
+#[no_mangle]
+pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
+    let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
+    }
+}
+
+/// Write a complex(8) value (list-directed): " (re,im)".
+/// `ptr` points to a two-element f64 array [real, imag].
+#[no_mangle]
+pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
+    let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
+    }
+}
+
 /// Write a character string (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {

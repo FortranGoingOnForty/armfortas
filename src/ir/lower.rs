@@ -3417,6 +3417,39 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
     }
 }
 
+/// True if `ty` is the complex representation: `[f32/f64 x 2]` or `ptr<[f32/f64 x 2]>`.
+/// Complex allocas have pointer type in the IR; the underlying element type is the array.
+fn is_complex_ty(ty: &IrType) -> bool {
+    match ty {
+        IrType::Array(ref e, 2) => matches!(e.as_ref(), IrType::Float(_)),
+        IrType::Ptr(ref inner) => {
+            matches!(inner.as_ref(), IrType::Array(ref e, 2) if matches!(e.as_ref(), IrType::Float(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Float width of a complex type, whether `[f32/f64 x 2]` or `ptr<[f32/f64 x 2]>`.
+fn complex_float_width(ty: &IrType) -> FloatWidth {
+    let elem = match ty {
+        IrType::Array(ref e, 2) => e.as_ref(),
+        IrType::Ptr(ref inner) => match inner.as_ref() {
+            IrType::Array(ref e, 2) => e.as_ref(),
+            _ => return FloatWidth::F32,
+        },
+        _ => return FloatWidth::F32,
+    };
+    match elem {
+        IrType::Float(FloatWidth::F64) => FloatWidth::F64,
+        _ => FloatWidth::F32,
+    }
+}
+
+/// Byte size of a complex value stored as `[f32 x 2]` (8) or `[f64 x 2]` (16).
+fn complex_byte_size(ty: &IrType) -> i64 {
+    if complex_float_width(ty) == FloatWidth::F64 { 16 } else { 8 }
+}
+
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 ///
@@ -3662,6 +3695,22 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     b.call(FuncRef::External("memcpy".into()),
                                         vec![info.addr, val, size_val],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                } else if is_complex_ty(&info.ty) {
+                                    // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
+                                    // Memcpy the 8 or 16 bytes into the destination slot.
+                                    let src = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                    let bytes = complex_byte_size(&info.ty);
+                                    let sz = b.const_i64(bytes);
+                                    if info.by_ref {
+                                        let dst = b.load(info.addr);
+                                        b.call(FuncRef::External("memcpy".into()),
+                                            vec![dst, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                    } else {
+                                        b.call(FuncRef::External("memcpy".into()),
+                                            vec![info.addr, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                    }
                                 } else if info.by_ref {
                                     let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
                                     let ptr = b.load(info.addr);
@@ -5213,11 +5262,40 @@ fn lower_write_items_adv(
             if let Expr::Name { name } = &item.node {
                 let key = name.to_lowercase();
                 if let Some(info) = ctx.locals.get(&key).cloned() {
+                    if is_complex_ty(&info.ty) {
+                        // Complex variable: pass pointer to [f32/f64 x 2] buffer.
+                        let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                        let func = if matches!(info.ty, IrType::Array(ref e, 2)
+                                if matches!(e.as_ref(), IrType::Float(FloatWidth::F64))) {
+                            "afs_write_complex_f64"
+                        } else {
+                            "afs_write_complex_f32"
+                        };
+                        b.call(FuncRef::External(func.into()), vec![unit, addr], IrType::Void);
+                        continue;
+                    }
                     if !info.dims.is_empty() || info.allocatable {
                         lower_whole_array_write(b, ctx, &info, unit);
                         continue;
                     }
                 }
+            }
+            // Complex literal in print position: detect ptr<[f32/f64 x 2]>
+            if matches!(item.node, Expr::ComplexLiteral { .. }) {
+                let addr = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
+                // Default to f32 — if literal had f64 components lower_expr would
+                // have allocated [f64 x 2]. Check the original node to be precise.
+                let func = if let Expr::ComplexLiteral { real, imag } = &item.node {
+                    let is_double = |e: &crate::ast::expr::SpannedExpr| {
+                        if let Expr::RealLiteral { text, .. } = &e.node {
+                            text.to_lowercase().contains('d')
+                        } else { false }
+                    };
+                    if is_double(real) || is_double(imag) { "afs_write_complex_f64" }
+                    else { "afs_write_complex_f32" }
+                } else { "afs_write_complex_f32" };
+                b.call(FuncRef::External(func.into()), vec![unit, addr], IrType::Void);
+                continue;
             }
             if let Expr::FunctionCall { callee, args } = &item.node {
                 if let Expr::Name { name } = &callee.node {
@@ -5258,8 +5336,20 @@ fn lower_write_items_adv(
                 IrType::Float(FloatWidth::F64) => "afs_write_real64",
                 IrType::Float(_) => "afs_write_real",
                 IrType::Bool => "afs_write_logical",
-                IrType::Ptr(_) => {
-                    // Pointer type — likely a string. Use write_string with literal length.
+                IrType::Ptr(ref inner) => {
+                    // Complex expression result: ptr<[f32/f64 x 2]>
+                    if is_complex_ty(&ty) {
+                        let fw = complex_float_width(&ty);
+                        let func = if fw == FloatWidth::F64 {
+                            "afs_write_complex_f64"
+                        } else {
+                            "afs_write_complex_f32"
+                        };
+                        b.call(FuncRef::External(func.into()), vec![unit, val], IrType::Void);
+                        continue;
+                    }
+                    // Other pointer — likely a string. Use write_string with literal length.
+                    let _ = inner; // suppress unused warning
                     let len = string_literal_len(item);
                     let len_val = b.const_i64(len);
                     b.call(FuncRef::External("afs_write_string".into()), vec![unit, val, len_val], IrType::Void);
@@ -6453,6 +6543,17 @@ fn lower_expr_full(
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
+                } else if is_complex_ty(&info.ty) {
+                    if info.by_ref {
+                        // by-ref complex: info.addr holds ptr-to-ptr-to-buffer.
+                        // Load once to get ptr-to-buffer; caller treats as address.
+                        b.load(info.addr)
+                    } else {
+                        // Complex variable: return the stack-buffer address.
+                        // Complex is stored as [f32/f64 x 2] — callers use the address
+                        // directly (memcpy for assignment, ptr for I/O, GEP for components).
+                        info.addr
+                    }
                 } else if info.by_ref {
                     // Pass-by-reference param: load the pointer, then load through it.
                     let ptr = b.load(info.addr);
@@ -6473,6 +6574,51 @@ fn lower_expr_full(
             let mut rhs = lower_expr(b, locals, right, st);
             let lty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
             let rty = b.func().value_type(rhs).unwrap_or(IrType::Int(IntWidth::I32));
+
+            // Complex arithmetic: both operands are ptr<[f32/f64 x 2]>.
+            // Add/Sub operate component-wise; Mul uses (ac-bd, ad+bc).
+            if is_complex_ty(&lty) || is_complex_ty(&rty) {
+                let fw = if complex_float_width(&lty) == FloatWidth::F64
+                    || complex_float_width(&rty) == FloatWidth::F64
+                {
+                    FloatWidth::F64
+                } else {
+                    FloatWidth::F32
+                };
+                let elem = IrType::Float(fw);
+                let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                let zero = b.const_i64(0);
+                // Load components from lhs (re_l, im_l).
+                let re_l_ptr = b.gep(lhs, vec![zero], IrType::Int(IntWidth::I8));
+                let im_l_ptr = b.gep(lhs, vec![esz], IrType::Int(IntWidth::I8));
+                let re_l = b.load_typed(re_l_ptr, elem.clone());
+                let im_l = b.load_typed(im_l_ptr, elem.clone());
+                // Load components from rhs (re_r, im_r).
+                let re_r_ptr = b.gep(rhs, vec![zero], IrType::Int(IntWidth::I8));
+                let im_r_ptr = b.gep(rhs, vec![esz], IrType::Int(IntWidth::I8));
+                let re_r = b.load_typed(re_r_ptr, elem.clone());
+                let im_r = b.load_typed(im_r_ptr, elem.clone());
+                let arr_ty = IrType::Array(Box::new(elem.clone()), 2);
+                let buf = b.alloca(arr_ty);
+                let (re_res, im_res) = match op {
+                    BinaryOp::Add => (b.fadd(re_l, re_r), b.fadd(im_l, im_r)),
+                    BinaryOp::Sub => (b.fsub(re_l, re_r), b.fsub(im_l, im_r)),
+                    BinaryOp::Mul => {
+                        // (ac-bd, ad+bc)
+                        let ac = b.fmul(re_l, re_r);
+                        let bd = b.fmul(im_l, im_r);
+                        let ad = b.fmul(re_l, im_r);
+                        let bc = b.fmul(im_l, re_r);
+                        (b.fsub(ac, bd), b.fadd(ad, bc))
+                    }
+                    _ => (re_l, im_l), // unsupported: return lhs unchanged
+                };
+                let dst_re = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                let dst_im = b.gep(buf, vec![esz], IrType::Int(IntWidth::I8));
+                b.store(re_res, dst_re);
+                b.store(im_res, dst_im);
+                return buf;
+            }
 
             // Implicit type promotion: if one side is int and the other float,
             // convert the int to float (Fortran mixed-mode arithmetic).
@@ -6750,7 +6896,42 @@ fn lower_expr_full(
             buf
         }
 
-        _ => b.const_i32(0), // placeholder for unhandled expressions
+        Expr::ComplexLiteral { real, imag } => {
+            // Complex numbers are stored as a 2-element float array on the stack.
+            // Determine float width from the literal parts: if either uses a 'd'/'D'
+            // exponent it's double precision (f64), otherwise single (f32).
+            let is_double = |e: &crate::ast::expr::SpannedExpr| -> bool {
+                if let Expr::RealLiteral { text, .. } = &e.node {
+                    text.to_lowercase().contains('d')
+                } else {
+                    false
+                }
+            };
+            let fw = if is_double(real) || is_double(imag) {
+                FloatWidth::F64
+            } else {
+                FloatWidth::F32
+            };
+            let elem_ty = IrType::Float(fw);
+            let elem_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);
+            let buf = b.alloca(arr_ty);
+
+            let real_raw = lower_expr_full(b, locals, real, st, type_layouts);
+            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts);
+            let real_val = coerce_to_type(b, real_raw, &elem_ty);
+            let imag_val = coerce_to_type(b, imag_raw, &elem_ty);
+
+            // Store real at byte offset 0, imag at byte offset elem_bytes.
+            let zero = b.const_i64(0);
+            let real_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+            b.store(real_val, real_ptr);
+            let imag_ptr = b.gep(buf, vec![elem_bytes], IrType::Int(IntWidth::I8));
+            b.store(imag_val, imag_ptr);
+
+            buf
+        }
+
     }
 }
 

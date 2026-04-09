@@ -445,8 +445,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 format!("{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
                     sub_sp, stp_offset, stp_offset + 8)
             } else {
-                format!("{}\n    ; FIXME: stp_offset {} too large for str imm",
-                    sub_sp, stp_offset)
+                // Frame too large for any ldr/str unsigned immediate.
+                // Synthesize the address in x9 (caller-saved scratch)
+                // then use register-offset str.
+                let x9_addr = fmt_sp_imm("add", "x9", "sp", stp_offset);
+                format!("{}\n    {}\n    str x29, [x9]\n    str x30, [x9, #8]",
+                    sub_sp, x9_addr)
             }
         }
         ArmOpcode::LdpPost => {
@@ -459,8 +463,11 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 format!("ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    {}",
                     ldp_offset, ldp_offset + 8, add_sp)
             } else {
-                format!("; FIXME: ldp_offset {} too large for ldr imm\n    {}",
-                    ldp_offset, add_sp)
+                // Frame too large for unsigned immediate ldr.
+                // Synthesize address in x9 then restore with register-offset ldr.
+                let x9_addr = fmt_sp_imm("add", "x9", "sp", ldp_offset);
+                format!("{}\n    ldr x29, [x9]\n    ldr x30, [x9, #8]\n    {}",
+                    x9_addr, add_sp)
             }
         }
 
