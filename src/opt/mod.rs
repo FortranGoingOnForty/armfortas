@@ -34,6 +34,7 @@ pub mod callgraph;
 pub mod inline;
 pub mod simplify_cfg;
 pub mod dead_func;
+pub mod sroa;
 
 #[cfg(test)]
 mod audit_tests;

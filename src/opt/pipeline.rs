@@ -23,6 +23,7 @@ use super::call_resolve::CallResolve;
 use super::inline::Inline;
 use super::simplify_cfg::SimplifyCfg;
 use super::dead_func::DeadFuncElim;
+use super::sroa::Sroa;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -136,6 +137,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg)); // 2nd: promotes SROA scalars
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -159,6 +162,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg)); // 2nd: promotes SROA scalars
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -179,6 +184,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg)); // 2nd: promotes SROA scalars
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
