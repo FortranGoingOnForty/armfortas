@@ -1039,10 +1039,16 @@ fn lower_unit(
                 lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
             }
         }
-        ProgramUnit::Module { .. } => {
-            // Module globals are installed in pass 1
-            // (collect_module_globals). Pass 2 has nothing to do
-            // for modules — they have no executable body.
+        ProgramUnit::Module { uses, contains, .. } => {
+            // Module globals are installed in pass 1 (collect_module_globals).
+            // The module body has no executable statements, but its CONTAINS
+            // subprograms (module procedures) must be lowered as top-level
+            // functions so they are emitted into the object file.
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
+            }
         }
         _ => {}
     }
