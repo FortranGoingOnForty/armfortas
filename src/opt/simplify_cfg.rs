@@ -42,7 +42,6 @@ fn simplify_function(func: &mut Function) -> bool {
     // If block B has no instructions, no block params, and terminates
     // with Branch(C, []), replace all branches to B with branches to C.
     loop {
-        let preds = predecessors(func);
         let mut redirect: Option<(BlockId, BlockId)> = None;
 
         for block in &func.blocks {
@@ -91,7 +90,7 @@ fn simplify_function(func: &mut Function) -> bool {
                         unique.dedup();
                         if unique.len() == 1 && unique[0] == block.id {
                             // Can merge: append successor's contents to predecessor.
-                            if block.id != func.entry || true {
+                            if true {
                                 merge = Some((block.id, *succ));
                                 break;
                             }
