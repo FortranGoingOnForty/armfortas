@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use super::inst::*;
+use super::types::{IrType, IntWidth};
 use super::walk::{inst_uses, terminator_uses, terminator_targets, compute_dominators};
 
 /// Verification error.
@@ -42,13 +43,32 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
-    // 2. Entry block has no predecessors (no branch targets it as a phi/param source).
-    //    More precisely: entry block should have no block parameters.
-    let entry = func.block(func.entry);
-    if !entry.params.is_empty() {
+    // 2. Entry block has no predecessors. The block params on entry
+    //    represent function parameters and are reserved for the
+    //    function ABI; nothing inside the function body should be
+    //    able to branch back to entry. The check splits into:
+    //      a) entry has no block params, AND
+    //      b) no other block's terminator targets entry.
+    //    Both halves must hold for SSA construction to be sound —
+    //    a back-edge into entry would let cross-block phi flow
+    //    overwrite the function's incoming params.
+    let entry_block = func.block(func.entry);
+    if !entry_block.params.is_empty() {
         errors.push(VerifyError {
             msg: "entry block must not have block parameters".into(),
         });
+    }
+    for block in &func.blocks {
+        let Some(term) = &block.terminator else { continue; };
+        if terminator_targets(term).contains(&func.entry) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "block '{}' branches back into the entry block — \
+                     entry must have no predecessors",
+                    block.name,
+                ),
+            });
+        }
     }
 
     // 3. All ValueIds used must be defined.
@@ -308,6 +328,22 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         msg: format!("integer op %{} has non-integer operand %{} : {}", inst.id.0, b.0, tb),
                     });
                 }
+                // Audit MAJOR-4: enforce exact width agreement.
+                // Mixing widths like IMul(i32, i64) would silently
+                // miscompile because codegen has no implicit
+                // promotion — every binary op picks one operand's
+                // width and the other operand reads stale upper
+                // bits. Lowering today never produces a width
+                // mismatch, but the verifier is the last line of
+                // defense for future passes.
+                if ta.is_int() && tb.is_int() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer op %{}: operand width mismatch %{} : {} vs %{} : {}",
+                            inst.id.0, a.0, ta, b.0, tb,
+                        ),
+                    });
+                }
             }
         }
         InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
@@ -326,13 +362,48 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         msg: format!("float op %{} has non-float operand %{} : {}", inst.id.0, b.0, tb),
                     });
                 }
+                // Same width-agreement rule for floats. Mixing
+                // f32 and f64 in a single binary op is illegal —
+                // lowering inserts FloatExtend/FloatTrunc to align
+                // operands, and a missing widening would land here.
+                if ta.is_float() && tb.is_float() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float op %{}: operand width mismatch %{} : {} vs %{} : {}",
+                            inst.id.0, a.0, ta, b.0, tb,
+                        ),
+                    });
+                }
             }
         }
-        InstKind::Store(_, addr) => {
-            if let Some(ty) = func.value_type(*addr) {
+        InstKind::Store(val, addr) => {
+            let addr_ty = func.value_type(*addr);
+            if let Some(ty) = &addr_ty {
                 if !ty.is_ptr() {
                     errors.push(VerifyError {
                         msg: format!("store %{} to non-pointer %{} : {}", inst.id.0, addr.0, ty),
+                    });
+                }
+            }
+            // Audit Maj-2: enforce value/pointee type agreement.
+            // A Store(i64_val, ptr<i32>) would silently truncate
+            // at codegen because isel picks the str width from
+            // the value's reg class, not the pointer's pointee.
+            if let (Some(IrType::Ptr(pointee)), Some(vty)) =
+                (&addr_ty, func.value_type(*val))
+            {
+                let inner: &IrType = pointee.as_ref();
+                // Byte-level GEPs into derived-type layouts use
+                // `ptr<i8>` as a marker with arbitrary pointee on
+                // the real access path. Skip the check in that
+                // specific case to avoid spurious errors.
+                let pointee_is_byte = matches!(inner, IrType::Int(IntWidth::I8));
+                if !pointee_is_byte && vty != *inner {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "store %{}: value type {} doesn't match pointee type {}",
+                            inst.id.0, vty, inner,
+                        ),
                     });
                 }
             }
@@ -346,6 +417,49 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
+
+        // Bitwise binary ops: both operands must be integers of
+        // the same width. Audit Med-1.
+        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) | InstKind::BitXor(a, b)
+        | InstKind::Shl(a, b) | InstKind::LShr(a, b) | InstKind::AShr(a, b) => {
+            let ta = func.value_type(*a);
+            let tb = func.value_type(*b);
+            if let (Some(ta), Some(tb)) = (&ta, &tb) {
+                if !ta.is_int() || !tb.is_int() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "bitwise op %{}: operand must be integer ({} / {})",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+                if ta.is_int() && tb.is_int() && ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "bitwise op %{}: operand width mismatch {} vs {}",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Logical And/Or: both operands must be Bool.
+        InstKind::And(a, b) | InstKind::Or(a, b) => {
+            let ta = func.value_type(*a);
+            let tb = func.value_type(*b);
+            if let (Some(ta), Some(tb)) = (&ta, &tb) {
+                if !matches!(ta, IrType::Bool) || !matches!(tb, IrType::Bool) {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "logical op %{}: operands must be Bool ({} / {})",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
         _ => {} // other instructions checked as needed
     }
 }
@@ -408,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn back_edge_into_entry_errors() {
+        // entry → body → entry  (illegal back-edge into entry).
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let body = func.create_block("body");
+        func.block_mut(func.entry).terminator = Some(Terminator::Branch(body, vec![]));
+        func.block_mut(body).terminator = Some(Terminator::Branch(func.entry, vec![]));
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("entry block")),
+            "expected entry-back-edge error, got: {:?}", errs,
+        );
+    }
+
+    #[test]
     fn branch_arg_mismatch() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
@@ -437,6 +565,48 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("non-integer operand")));
+    }
+
+    #[test]
+    fn store_value_pointee_mismatch_errors() {
+        // Audit Min-1: Store(i64_val, ptr<i32>) must be rejected
+        // by the verifier — codegen has no implicit narrowing
+        // and would silently truncate.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let val = b.const_i64(123);
+            let addr = b.alloca(IrType::Int(IntWidth::I32));
+            b.store(val, addr);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("doesn't match pointee type")),
+            "expected pointee type mismatch error, got: {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn int_op_width_mismatch_errors() {
+        // IMul(i32, i64) should be rejected — codegen has no
+        // implicit width promotion and the verifier is the last
+        // line of defense before mismatched widths reach isel.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let a = b.const_i32(1);
+            let c = b.const_i64(2);
+            b.emit_bogus_iadd(a, c);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("width mismatch")),
+            "expected width mismatch, got: {:?}",
+            errs,
+        );
     }
 
     #[test]

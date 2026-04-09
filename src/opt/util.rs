@@ -7,6 +7,11 @@
 //! belongs in `ir/walk.rs`; this file just makes it accessible to
 //! the `opt` module tree.
 
+// `dominator_tree_preorder` lives in `crate::ir::walk` and is tested
+// there but no optimizer pass currently consumes it (mem2reg walks
+// the dominator tree itself via `dominator_tree_children`). Drop the
+// re-export until something actually needs it — the audit (N13)
+// flagged it as dead code from this module's perspective.
 #[allow(unused_imports)]
 pub use crate::ir::walk::{
     inst_uses,
@@ -17,6 +22,9 @@ pub use crate::ir::walk::{
     substitute_uses,
     predecessors,
     compute_dominators,
+    compute_immediate_dominators,
+    dominator_tree_children,
+    compute_dominance_frontiers,
     find_natural_loops,
     NaturalLoop,
     prune_unreachable,

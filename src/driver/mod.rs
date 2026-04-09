@@ -249,6 +249,14 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         asm_text.push('\n');
     }
 
+    // Emit module-level globals (SAVE'd locals + module variables)
+    // into a __DATA,__data section. Must come before _main so the
+    // labels are defined when functions reference them.
+    if !ir_module.globals.is_empty() {
+        asm_text.push_str(&emit::emit_globals(&ir_module.globals));
+        asm_text.push('\n');
+    }
+
     // Emit _main entry point (must be in __TEXT section).
     if let Some(user_func) = allocated.first() {
         if user_func.name != "main" {

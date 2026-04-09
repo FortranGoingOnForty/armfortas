@@ -13,7 +13,7 @@ use super::inst::*;
 use super::builder::FuncBuilder;
 
 use crate::ast::decl::ArraySpec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
@@ -52,6 +52,13 @@ struct LocalInfo {
     char_kind: CharKind,
     /// Derived type name (for component access resolution). Empty for non-derived.
     derived_type: Option<String>,
+    /// For PARAMETER-attributed locals whose initializer const-folds:
+    /// the compile-time value to inline at every use. When `Some`,
+    /// `Expr::Name` lookups should materialize this constant
+    /// directly via `b.const_i32`/`b.const_i64`/etc., instead of
+    /// loading through `addr`. Audit MAJOR-4: this lets parameters
+    /// avoid wasting a `.data` slot per scope.
+    inline_const: Option<ConstScalar>,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -59,25 +66,75 @@ struct LowerCtx<'a> {
     locals: HashMap<String, LocalInfo>,
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
-    globals: &'a HashMap<String, (usize, IrType)>,
+    /// Module-scoped globals visible by (lowercase module name,
+    /// lowercase variable name). Populated by the lower_file
+    /// pre-pass over `ProgramUnit::Module` units so any subsequent
+    /// function that USE-imports the module can resolve the name
+    /// to a `GlobalAddr`. Keying by (module, var) is what lets
+    /// install_globals_as_locals filter by the current function's
+    /// USE statements, honor ONLY lists, and apply renames.
+    globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    /// Names that a `use mod, only: ...` statement explicitly
+    /// excluded. install_globals_as_locals populates this from the
+    /// difference between a module's exported globals and the
+    /// only-list. Audit MAJOR-1: a reference to a name in this
+    /// set must produce a compile error rather than silently
+    /// lowering to const_int 0.
+    filtered_names: HashSet<String>,
     /// For functions: address of the result variable (for RETURN).
     result_addr: Option<ValueId>,
     /// For functions: the return type.
     result_type: Option<IrType>,
+    /// True when this function uses the sret (hidden-output-param) convention
+    /// because it returns an allocatable array. Stmt::Return emits `ret void`
+    /// instead of loading result_addr. Audit6 BLOCKING-1.
+    is_alloc_return: bool,
+    /// Names of functions in the compilation unit that return allocatable
+    /// arrays (sret convention). Used at call sites to detect when to
+    /// pass a temp descriptor as the hidden first arg. Audit6 BLOCKING-1.
+    alloc_return_funcs: &'a HashSet<String>,
+    /// Per-subroutine optional-parameter bitmap: maps lowercase callee name
+    /// to a Vec<bool> (one entry per positional parameter, true = OPTIONAL).
+    /// Pre-populated by `collect_optional_params` so call sites can pass
+    /// null pointers for absent optional arguments (PRESENT support).
+    optional_params: &'a HashMap<String, Vec<bool>>,
+    /// Map from Fortran statement label (u64) to the IR basic block that
+    /// begins at that label. Pre-populated by `collect_label_blocks` before
+    /// lowering so that GOTO can branch forward as well as backward.
+    label_blocks: HashMap<u64, BlockId>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<String, (usize, IrType)>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
-        Self { locals: HashMap::new(), loops: Vec::new(), st, globals, type_layouts, result_addr: None, result_type: None }
+    fn new(
+        st: &'a SymbolTable,
+        globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
+        type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+        alloc_return_funcs: &'a HashSet<String>,
+        optional_params: &'a HashMap<String, Vec<bool>>,
+    ) -> Self {
+        Self {
+            locals: HashMap::new(),
+            loops: Vec::new(),
+            st,
+            globals,
+            type_layouts,
+            filtered_names: HashSet::new(),
+            result_addr: None,
+            result_type: None,
+            is_alloc_return: false,
+            alloc_return_funcs,
+            optional_params,
+            label_blocks: HashMap::new(),
+        }
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None, derived_type: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -99,44 +156,733 @@ impl<'a> LowerCtx<'a> {
 }
 
 /// Lower a file of program units to an IR module.
+///
+/// Two passes:
+///   1. Walk every `ProgramUnit::Module`, register its globals into
+///      `module.globals` (with const-evaluated initializers where
+///      possible) and into a `globals` resolution map keyed by
+///      lowercase variable name. This map is what `Expr::Name`
+///      lowering consults when a name isn't a local.
+///   2. Walk every unit again to lower its functions; module units
+///      are skipped on this pass since their globals are already
+///      installed.
 pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Module {
     let mut module = Module::new("main".into());
-    let globals = HashMap::new();
+    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
+
+    // Pass 1: collect module-level variables.
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts);
+        if let ProgramUnit::Module { name, decls, .. } = &unit.node {
+            collect_module_globals(&mut module, &mut globals, name, decls);
+        }
+    }
+
+    // Pass 1.5: walk every program unit (and its `contains` chain)
+    // and collect the names of functions whose result variable is
+    // declared `allocatable`. Audit6 BLOCKING-1: these need a hidden
+    // first parameter at lowering time so the caller can pass a
+    // descriptor address into which the function fills its result.
+    let mut alloc_return_funcs: HashSet<String> = HashSet::new();
+    for unit in units {
+        collect_alloc_return_funcs(&unit.node, &mut alloc_return_funcs);
+    }
+
+    // Pass 1.6: collect COMMON block variable types from all program
+    // units and emit one global per (block, variable) pair. F77 §5.5:
+    // all scopes that reference the same COMMON block must share the
+    // same backing memory. Each variable gets its own global so the IR
+    // type system sees the right element type; full contiguity (needed
+    // for EQUIVALENCE across COMMON boundaries) is deferred.
+    // Audit6 BLOCKING-2.
+    let mut emitted_common: HashSet<String> = HashSet::new();
+    for unit in units {
+        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common);
+    }
+
+    // Pass 1.7: collect optional-parameter bitmaps for every subroutine/function.
+    // Maps lowercase callee name → Vec<bool> (per-position, true = OPTIONAL).
+    // Used at call sites to pass null pointers for absent optional arguments
+    // so PRESENT() works correctly inside the callee.
+    let mut optional_params: HashMap<String, Vec<bool>> = HashMap::new();
+    for unit in units {
+        collect_optional_params(&unit.node, &mut optional_params);
+    }
+
+    // Pass 2: lower each unit. Modules already had their globals
+    // installed in pass 1; lower_unit's Module arm is a no-op.
+    // Top-level units have no host, so an empty host_uses slice.
+    let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
+    for unit in units {
+        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs, &optional_params);
     }
     module
 }
 
-fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals: &HashMap<String, (usize, IrType)>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+/// Walk a program unit and any nested `contains` to collect the
+/// names of functions whose result variable is declared
+/// `allocatable`. The set is keyed by lowercase function name and
+/// is consulted at call sites in pass 2.
+///
+/// Audit6 BLOCKING-1: a function `function f() result(r); integer,
+/// allocatable :: r(:)` cannot be returned by value through the
+/// usual scalar result alloca — the descriptor is 384 bytes and
+/// the type system needs to know about it at every call site.
+/// We model this with a hidden first `ptr<[i8 x 384]>` parameter
+/// that the caller passes in, and the function writes its result
+/// into that descriptor.
+fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
+    use crate::ast::decl::Attribute;
+    let scan_decls = |decls: &[crate::ast::decl::SpannedDecl], result_name: &str| -> bool {
+        let key = result_name.to_lowercase();
+        for decl in decls {
+            if let Decl::TypeDecl { entities, attrs, .. } = &decl.node {
+                for entity in entities {
+                    if entity.name.to_lowercase() == key {
+                        return attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+                    }
+                }
+            }
+        }
+        false
+    };
+    match unit {
+        ProgramUnit::Function { name, decls, contains, result, .. } => {
+            let result_name = result.as_deref().unwrap_or(name.as_str());
+            if scan_decls(decls, result_name) {
+                out.insert(name.to_lowercase());
+            }
+            for sub in contains {
+                collect_alloc_return_funcs(&sub.node, out);
+            }
+        }
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Subroutine { contains, .. }
+        | ProgramUnit::Module { contains, .. } => {
+            for sub in contains {
+                collect_alloc_return_funcs(&sub.node, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scan a program unit and its CONTAINS chain and record, for each
+/// subroutine/function, which of its positional dummy arguments carry
+/// the OPTIONAL attribute.
+///
+/// Result: `out` maps lowercase subroutine/function name →
+/// `Vec<bool>` (index = parameter position, value = is_optional).
+/// Used at call sites to pass null pointers for absent optional args,
+/// enabling PRESENT() intrinsic queries inside the callee.
+fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    use crate::ast::decl::Attribute;
+    use crate::ast::unit::DummyArg;
+    let record = |name: &str, args: &[DummyArg], decls: &[crate::ast::decl::SpannedDecl],
+                  out: &mut HashMap<String, Vec<bool>>| {
+        let param_names: Vec<String> = args.iter().filter_map(|a| {
+            if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+        }).collect();
+        if param_names.is_empty() { return; }
+        let optional_flags: Vec<bool> = param_names.iter().map(|pname| {
+            for d in decls {
+                if let crate::ast::decl::Decl::TypeDecl { attrs, entities, .. } = &d.node {
+                    let is_optional = attrs.iter().any(|a| matches!(a, Attribute::Optional));
+                    if is_optional && entities.iter().any(|e| e.name.to_lowercase() == *pname) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }).collect();
+        out.insert(name.to_lowercase(), optional_flags);
+    };
+    match unit {
+        ProgramUnit::Subroutine { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        ProgramUnit::Function { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+            for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        _ => {}
+    }
+}
+
+/// Scan a program unit (and its `contains` chain) for `Decl::CommonBlock`
+/// statements and emit one scalar global per (block, variable) pair into
+/// the module. All scopes that declare the same COMMON block share these
+/// globals, giving correct F77 §5.5 shared-memory semantics for scalars.
+///
+/// Naming: `afs_common_<block_name>_<var_name>` (lowercase).
+/// The blank COMMON uses the synthetic block name `__blank__`.
+/// Audit6 BLOCKING-2.
+fn collect_and_emit_common_globals(
+    unit: &ProgramUnit,
+    module: &mut Module,
+    emitted: &mut HashSet<String>,
+) {
+    use crate::ast::decl::Decl;
+    let emit_for_decls = |decls: &[crate::ast::decl::SpannedDecl], module: &mut Module, emitted: &mut HashSet<String>| {
+        for decl in decls {
+            if let Decl::CommonBlock { name, vars } = &decl.node {
+                let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
+                for var in vars {
+                    let symbol = format!("afs_common_{}_{}", block_name, var.to_lowercase());
+                    if emitted.contains(&symbol) { continue; }
+                    emitted.insert(symbol.clone());
+                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls);
+                    module.add_global(Global {
+                        name: symbol,
+                        ty: elem_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                }
+            }
+        }
+    };
+    match unit {
+        ProgramUnit::Program { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        ProgramUnit::Subroutine { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        ProgramUnit::Function { decls, contains, .. } => {
+            emit_for_decls(decls, module, emitted);
+            for sub in contains { collect_and_emit_common_globals(&sub.node, module, emitted); }
+        }
+        _ => {}
+    }
+}
+
+/// Install COMMON block variables as global_addr locals before `alloc_decls`
+/// runs. Because `alloc_decls` skips names already in `locals`, the COMMON
+/// variables are not re-alloca'd with private storage. Each variable is
+/// installed as a direct (non-by_ref) local whose addr is a GlobalAddr
+/// pointing to the shared COMMON global. Audit6 BLOCKING-2.
+fn install_common_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    use crate::ast::decl::Decl;
+    for decl in decls {
+        if let Decl::CommonBlock { name, vars } = &decl.node {
+            let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
+            for var in vars {
+                let key = var.to_lowercase();
+                if locals.contains_key(&key) { continue; }
+                let symbol = format!("afs_common_{}_{}", block_name, key);
+                let elem_ty = arg_type_from_decls(&key, decls);
+                let addr = b.global_addr(&symbol, elem_ty.clone());
+                locals.insert(key, LocalInfo {
+                    addr,
+                    ty: elem_ty,
+                    dims: vec![],
+                    allocatable: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                });
+            }
+        }
+    }
+}
+
+/// Install EQUIVALENCE group members as aliased locals before `alloc_decls`.
+///
+/// F77 §5.4: each member of an equivalence group must share the same
+/// backing storage. We allocate one `[i8 x total]` backing store and
+/// install each variable with a GEP into it at its byte offset. The
+/// GEP element type matches the variable's declared type so that
+/// subsequent loads and stores are correctly typed (the verifier
+/// allows `store T, Ptr<T>` unconditionally). Audit6 BLOCKING-3.
+///
+/// Supported members:
+///   * `Expr::Name` — scalar variable at offset 0 within itself.
+///   * `Expr::FunctionCall { callee: name, args: [Element(idx)] }` —
+///     array element `name(idx)`, at byte offset `(idx−1)*elem_size`
+///     relative to the start of the array. Array must already be in
+///     scope via a static (non-allocatable) TypeDecl so we can compute
+///     the size at compile time.
+///
+/// The "anchor" of the group is the member with the smallest byte
+/// offset after mapping each member's internal offset to a shared
+/// coordinate space. All other members are GEP'd at their relative
+/// distance from the anchor. The backing store is sized to cover the
+/// maximum extent across all members.
+fn install_equivalence_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    use crate::ast::decl::Decl;
+    use crate::ast::expr::Expr;
+    use crate::ast::expr::SectionSubscript;
+
+    for decl in decls {
+        if let Decl::EquivalenceStmt { groups } = &decl.node {
+            for group in groups {
+                // Resolve each member to (var_name, elem_ty, within_var_byte_offset).
+                // within_var_byte_offset: for `name` → 0; for `name(i)` → (i-1)*elem_size.
+                let mut members: Vec<(String, IrType, i64)> = Vec::new();
+                for expr in group {
+                    match &expr.node {
+                        Expr::Name { name } => {
+                            let key = name.to_lowercase();
+                            let ty = arg_type_from_decls(&key, decls);
+                            members.push((key, ty, 0));
+                        }
+                        Expr::FunctionCall { callee, args } => {
+                            if let Expr::Name { name } = &callee.node {
+                                let key = name.to_lowercase();
+                                let ty = arg_type_from_decls(&key, decls);
+                                let idx = if let Some(sub) = args.first() {
+                                    if let SectionSubscript::Element(e) = &sub.value {
+                                        eval_const_int(e).unwrap_or(1)
+                                    } else { 1 }
+                                } else { 1 };
+                                let byte_off = (idx.max(1) - 1) * ir_scalar_byte_size(&ty);
+                                members.push((key, ty, byte_off));
+                            }
+                        }
+                        _ => {} // skip complex expressions
+                    }
+                }
+                if members.is_empty() { continue; }
+
+                // Find the smallest within_var offset — this becomes the "origin".
+                let min_off = members.iter().map(|(_, _, o)| *o).min().unwrap_or(0);
+
+                // Compute total backing store size (bytes).
+                let total = members.iter().map(|(_, ty, o)| {
+                    (o - min_off) + ir_scalar_byte_size(ty)
+                }).max().unwrap_or(8);
+
+                // Allocate the byte-array backing store.
+                let backing_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), total as u64);
+                let backing = b.alloca(backing_ty);
+
+                for (var_name, elem_ty, within_off) in &members {
+                    if locals.contains_key(var_name) { continue; }
+                    let rel = within_off - min_off; // byte offset into backing
+                    // GEP with element type = elem_ty so the result is Ptr<elem_ty>.
+                    // For I32 at rel=0: gep(backing, [0], I32) → Ptr<I32> (backing itself).
+                    // For I32 at rel=4: gep(backing, [1], I32) → Ptr<I32> (backing + 4).
+                    let elem_size = ir_scalar_byte_size(elem_ty);
+                    let gep_idx = if elem_size > 0 { rel / elem_size } else { 0 };
+                    let idx_val = b.const_i64(gep_idx);
+                    let addr = b.gep(backing, vec![idx_val], elem_ty.clone());
+                    locals.insert(var_name.clone(), LocalInfo {
+                        addr,
+                        ty: elem_ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Information about a module-level global, tracked in
+/// `lower_file`'s globals map so `install_globals_as_locals` can
+/// reconstruct a `LocalInfo` for it inside each function that
+/// USE-imports the module.
+#[derive(Clone)]
+struct ModuleGlobalInfo {
+    /// Mach-O symbol name (already prefixed with `afs_mod_<mod>_`).
+    symbol: String,
+    /// Element type (for scalars) or array element type (for arrays).
+    ty: IrType,
+    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars
+    /// and for deferred-shape allocatables.
+    dims: Vec<(i64, i64)>,
+    /// True for module-level allocatable arrays. The global is a
+    /// 384-byte zero-init descriptor; runtime allocate() populates
+    /// it. install_globals_as_locals threads this through into
+    /// LocalInfo.allocatable so subscript access goes through the
+    /// runtime descriptor path. Audit MAJOR-5.
+    allocatable: bool,
+}
+
+/// Walk a module's declarations and emit a global per variable.
+/// Handles scalars (with literal initializers) and fixed-size
+/// arrays (with array-constructor initializers). Resolves the
+/// initializer at compile time where possible; otherwise falls
+/// through to zero-init.
+///
+/// Array variables with non-literal initializers or dynamic dims
+/// are currently rejected by falling through to scalar emission —
+/// that's a known gap tracked for follow-up.
+fn collect_module_globals(
+    module: &mut Module,
+    globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
+    mod_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    use crate::ast::decl::Attribute;
+    // Module-level parameter table built incrementally so a later
+    // parameter declaration can reference earlier ones.
+    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec: _, attrs, entities } = &decl.node {
+            let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+            if !is_param { continue; }
+            for entity in entities {
+                if let Some(init) = &entity.init {
+                    if let Some(val) = eval_const_scalar(init, &param_consts) {
+                        param_consts.insert(entity.name.to_lowercase(), val);
+                    }
+                }
+            }
+        }
+        if let Decl::ParameterStmt { pairs } = &decl.node {
+            for (name, expr) in pairs {
+                if let Some(val) = eval_const_scalar(expr, &param_consts) {
+                    param_consts.insert(name.to_lowercase(), val);
+                }
+            }
+        }
+    }
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
+            let ir_ty = lower_type_spec(type_spec);
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
+            });
+            let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+            for entity in entities {
+                let symbol = format!("afs_mod_{}_{}",
+                    mod_name.to_lowercase(),
+                    entity.name.to_lowercase());
+
+                let array_spec = entity.array_spec.as_ref().or(attr_dims);
+
+                // Audit MAJOR-5: module-level allocatable arrays.
+                // Emit a 384-byte zero-init descriptor as the
+                // global; runtime allocate() populates it. The
+                // shape (deferred or fixed) doesn't matter for
+                // emission — the descriptor stores it at runtime.
+                if is_allocatable && array_spec.is_some() {
+                    let desc_ty = IrType::Array(
+                        Box::new(IrType::Int(IntWidth::I8)),
+                        384,
+                    );
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: desc_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims: vec![],
+                            allocatable: true,
+                        },
+                    );
+                    continue;
+                }
+
+                if let Some(specs) = array_spec {
+                    // Array module variable. Compute dims and
+                    // build an array-typed global with a matching
+                    // IntArray/FloatArray initializer when the
+                    // entity.init is an array constructor of
+                    // literal values.
+                    let dims = extract_array_dims(specs);
+                    let total: i64 = dims.iter().map(|(_, e)| *e).product();
+                    if total <= 0 {
+                        continue; // assumed/deferred shape — skip
+                    }
+                    let global_ty = IrType::Array(
+                        Box::new(ir_ty.clone()),
+                        total as u64,
+                    );
+
+                    // Audit MAJOR-3: detect over-long initializer
+                    // BEFORE eval_const_array_init returns None.
+                    // Per F2018 §7.4.4, the initializer's shape
+                    // must conform with the variable's declared
+                    // shape; over-long is a hard error.
+                    if let Some(init_e) = &entity.init {
+                        if let Some(scalars) =
+                            collect_const_array_scalars(init_e, &ir_ty, &param_consts)
+                        {
+                            if (scalars.len() as i64) > total {
+                                eprintln!(
+                                    "armfortas: error: initializer for '{}' has \
+                                     {} elements but its declared shape requires \
+                                     {} (audit MAJOR-3 — initializer shape \
+                                     mismatch)",
+                                    entity.name, scalars.len(), total,
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+
+                    let init = entity.init.as_ref()
+                        .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts));
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: global_ty,
+                        initializer: Some(init.unwrap_or(GlobalInit::Zero)),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims,
+                            allocatable: false,
+                        },
+                    );
+                } else {
+                    // Scalar module variable.
+                    let init = entity.init.as_ref()
+                        .and_then(|e| eval_const_global_init(e, &param_consts, Some(&ir_ty)));
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: ir_ty.clone(),
+                        initializer: Some(init.unwrap_or(GlobalInit::Zero)),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims: vec![],
+                            allocatable: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Try to evaluate an array constructor as a `GlobalInit`.
+/// Handles three forms:
+///   1. `[v0, v1, v2]` literal-element constructor
+///   2. `[(expr, i = lo, hi[, step])]` implied-do iterator
+///   3. `reshape(constructor, shape)` reshape of (1) or (2)
+///
+/// Each path produces a flat list of `i64` (for integer types)
+/// or `f64` (for float types) of length `total`. Shorter lists
+/// are zero-padded; longer lists return `None` (a future Maj-3
+/// fix will add a proper diagnostic for shape-mismatch errors).
+///
+/// Audit MAJOR-2.
+fn eval_const_array_init(
+    expr: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    total: i64,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<GlobalInit> {
+    let scalars = collect_const_array_scalars(expr, elem_ty, param_consts)?;
+    if (scalars.len() as i64) > total {
+        // Shape mismatch — too many elements. Return None so the
+        // caller falls back to zero-init. A proper diagnostic is
+        // tracked under audit MAJOR-3.
+        return None;
+    }
+
+    let is_float = matches!(elem_ty, IrType::Float(_));
+    if is_float {
+        let mut out: Vec<f64> = scalars.iter().map(|s| s.to_float()).collect();
+        while (out.len() as i64) < total { out.push(0.0); }
+        Some(GlobalInit::FloatArray(out))
+    } else {
+        let mut out: Vec<i64> = scalars.iter().map(|s| match s {
+            ConstScalar::Int(i) => *i,
+            ConstScalar::Float(f) => *f as i64,
+        }).collect();
+        while (out.len() as i64) < total { out.push(0); }
+        Some(GlobalInit::IntArray(out))
+    }
+}
+
+/// Recursively collect the scalar elements of a constructor
+/// expression into a flat Vec. Used by eval_const_array_init to
+/// support nested implied-do, reshape, and parameter references
+/// uniformly.
+///
+/// reshape(source, shape) just produces source's elements in
+/// declared order — Fortran's reshape is column-major and
+/// reorders dimensions, but for the FLAT linearization the
+/// element ordering is identical to source's. We don't yet
+/// honor non-trivial shape arguments (only reshape passes that
+/// match the source length get folded).
+fn collect_const_array_scalars(
+    expr: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<Vec<ConstScalar>> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let mut out: Vec<ConstScalar> = Vec::new();
+            for v in values {
+                collect_ac_value(v, elem_ty, param_consts, &mut out)?;
+            }
+            Some(out)
+        }
+        // reshape(source, shape) — pass through source elements.
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
+                    if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
+                        return collect_const_array_scalars(src, elem_ty, param_consts);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Collect a single AcValue (which may be a literal element or
+/// an implied-do iterator) into a flat scalar list.
+fn collect_ac_value(
+    v: &crate::ast::expr::AcValue,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    out: &mut Vec<ConstScalar>,
+) -> Option<()> {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => {
+            let raw = eval_const_scalar(e, param_consts)?;
+            // Coerce int → float when the destination is float.
+            let coerced = if matches!(elem_ty, IrType::Float(_)) {
+                ConstScalar::Float(raw.to_float())
+            } else {
+                raw
+            };
+            out.push(coerced);
+            Some(())
+        }
+        AcValue::ImpliedDo { values, var, start, end, step } => {
+            let start_v = eval_const_scalar(start, param_consts)?;
+            let end_v = eval_const_scalar(end, param_consts)?;
+            let step_v = match step {
+                Some(e) => eval_const_scalar(e, param_consts)?,
+                None => ConstScalar::Int(1),
+            };
+            let (ConstScalar::Int(s), ConstScalar::Int(e), ConstScalar::Int(stp)) =
+                (start_v, end_v, step_v) else { return None; };
+            if stp == 0 { return None; }
+
+            // Walk the range, evaluating the inner values for each
+            // iteration with `var` bound in a temporary param_consts
+            // overlay.
+            let mut local_consts = param_consts.clone();
+            let var_key = var.to_lowercase();
+            let mut i = s;
+            // Cap iterations to avoid runaway folding for runtime
+            // bounds disguised as constants.
+            let mut steps_remaining: i64 = 1_000_000;
+            let going_down = stp < 0;
+            loop {
+                if steps_remaining == 0 { return None; }
+                steps_remaining -= 1;
+                let in_range = if going_down { i >= e } else { i <= e };
+                if !in_range { break; }
+                local_consts.insert(var_key.clone(), ConstScalar::Int(i));
+                for inner in values {
+                    collect_ac_value(inner, elem_ty, &local_consts, out)?;
+                }
+                i = i.wrapping_add(stp);
+            }
+            Some(())
+        }
+    }
+}
+
+fn lower_unit(
+    module: &mut Module,
+    unit: &SpannedUnit,
+    st: &SymbolTable,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    // Audit CRITICAL-4: USE imports from the host program unit
+    // (and its hosts, transitively). Per F2018 §16.2, names
+    // imported into a host are visible in its contained
+    // subprograms via host association. Each lower_unit call
+    // accumulates its own uses on top of host_uses and passes
+    // the combined list down to any nested subprogram. The
+    // top-level call from lower_file passes an empty slice.
+    host_uses: &[crate::ast::decl::SpannedDecl],
+    alloc_return_funcs: &HashSet<String>,
+    optional_params: &HashMap<String, Vec<bool>>,
+) {
     match &unit.node {
-        ProgramUnit::Program { name, decls, body, contains, .. } => {
+        ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
-            let mut func = Function::new(fname, vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            // Fortran PROGRAM bodies are never the C entry point — driver/mod.rs
+            // always emits a `_main` wrapper. Use a private name so a user-written
+            // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
+            let body_fname = format!("__prog_{}", fname);
+            let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
+
+            // Combined USE list for this unit: host_uses inherited
+            // from the program ancestry + this unit's own uses.
+            // Programs themselves have no host, so host_uses is
+            // typically empty here, but a Program declared inside
+            // a Module (rare but legal) would inherit module uses.
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
 
             {
                 let mut b = FuncBuilder::new(&mut func);
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
+                init_decls(&mut b, &ctx.locals, decls, st);
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
                 }
                 ensure_termination(&mut b, None);
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
 
-            // Lower CONTAINS subprograms.
+            // Lower CONTAINS subprograms with this unit's combined
+            // uses as their host_uses, so host association threads
+            // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
-        ProgramUnit::Subroutine { name, decls, body, args, bind, .. } => {
+        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
             // BIND(C): use specified C name, otherwise use Fortran name.
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
@@ -152,8 +898,11 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                     }
                 } else { None }
             }).collect();
-            let mut func = Function::new(func_name, params, IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut func = Function::new(func_name.clone(), params, IrType::Void);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
 
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
@@ -183,46 +932,101 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name,
+                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         };
                         ctx.locals.insert(pname.clone(), info);
                     }
                 }
 
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
+                init_decls(&mut b, &ctx.locals, decls, st);
+                // Pre-create blocks for all statement labels so GOTO can branch forward.
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
                 }
                 ensure_termination(&mut b, None);
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
+
+            // Lower nested CONTAINS subprograms (this was a latent
+            // bug — the previous code only walked Program::contains).
+            // Each nested sub inherits this subroutine's combined
+            // host_uses + own uses.
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+            }
         }
-        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, .. } => {
+        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
-            let ret_ty = return_type.as_ref()
-                .map(lower_type_spec)
-                .unwrap_or_else(|| {
-                    let result_name = result.as_deref().unwrap_or(name.as_str());
-                    arg_type_from_decls(result_name, decls)
-                });
-            let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
-                if let DummyArg::Name(n) = arg {
-                    let elem_ty = arg_type_from_decls(n, decls);
-                    if arg_has_value_attr(n, decls) {
-                        Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
-                    } else {
-                        Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
-                    }
-                } else { None }
-            }).collect();
-            let mut func = Function::new(func_name, params, ret_ty.clone());
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
 
+            // Audit6 BLOCKING-1: functions with allocatable result use the
+            // sret (hidden-output-param) convention. The caller allocas a
+            // 384-byte descriptor and passes its address as param 0; the
+            // function writes its result into that descriptor and returns
+            // void. This avoids trying to return 384 bytes "by value".
+            let is_alloc_return = alloc_return_funcs.contains(&func_name.to_lowercase());
+
+            let (func_params, ir_ret_ty) = if is_alloc_return {
+                // Hidden first param: ptr to caller-provided 384-byte descriptor.
+                let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)));
+                let sret = Param { name: "_sret".into(), ty: desc_ptr_ty, id: ValueId(0) };
+                // Real args shifted by 1 so _sret is param 0.
+                let real: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
+                    if let DummyArg::Name(n) = arg {
+                        let elem_ty = arg_type_from_decls(n, decls);
+                        if arg_has_value_attr(n, decls) {
+                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32 + 1) })
+                        } else {
+                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32 + 1) })
+                        }
+                    } else { None }
+                }).collect();
+                let mut params = vec![sret];
+                params.extend(real);
+                (params, IrType::Void)
+            } else {
+                let ret_ty = return_type.as_ref()
+                    .map(lower_type_spec)
+                    .unwrap_or_else(|| {
+                        let result_name = result.as_deref().unwrap_or(name.as_str());
+                        arg_type_from_decls(result_name, decls)
+                    });
+                let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
+                    if let DummyArg::Name(n) = arg {
+                        let elem_ty = arg_type_from_decls(n, decls);
+                        if arg_has_value_attr(n, decls) {
+                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                        } else {
+                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                        }
+                    } else { None }
+                }).collect();
+                (params, ret_ty)
+            };
+
+            let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            ctx.is_alloc_return = is_alloc_return;
+            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
+
+            // Build param_info skipping the sret param (it's not a Fortran variable).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
+                .filter(|p| p.name != "_sret")
                 .map(|p| {
                     let is_ptr = matches!(&p.ty, IrType::Ptr(_));
                     let elem_ty = match &p.ty {
@@ -248,51 +1052,841 @@ fn lower_unit(module: &mut Module, unit: &SpannedUnit, st: &SymbolTable, globals
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name,
+                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         });
                     }
                 }
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
-                let result_addr = b.alloca(ret_ty.clone());
-                ctx.insert_scalar(result_name, result_addr, ret_ty.clone());
-                ctx.result_addr = Some(result_addr);
-                ctx.result_type = Some(ret_ty.clone());
 
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts);
+                if is_alloc_return {
+                    // The sret param (ValueId 0) IS the descriptor address.
+                    // Pre-insert the result variable as an allocatable backed by that
+                    // descriptor so alloc_decls skips it (locals.contains_key → continue).
+                    let elem_ty = arg_type_from_decls(&result_name, decls);
+                    ctx.locals.insert(result_name.clone(), LocalInfo {
+                        addr: ValueId(0),
+                        ty: elem_ty,
+                        dims: vec![],
+                        allocatable: true,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                    });
+                    // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
+                } else {
+                    let result_addr = b.alloca(ir_ret_ty.clone());
+                    ctx.insert_scalar(result_name, result_addr, ir_ret_ty.clone());
+                    ctx.result_addr = Some(result_addr);
+                    ctx.result_type = Some(ir_ret_ty.clone());
+                }
+
+                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                check_no_filtered_refs(body, &ctx.filtered_names);
+                init_decls(&mut b, &ctx.locals, decls, st);
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
-                    let rv = b.load(result_addr);
-                    b.ret(Some(rv));
+                    let skip = if is_alloc_return { Some(ValueId(0)) } else { None };
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, skip);
+                    if is_alloc_return {
+                        b.ret(None);
+                    } else {
+                        let result_addr = ctx.result_addr.expect("non-sret function has result_addr");
+                        let rv = b.load(result_addr);
+                        b.ret(Some(rv));
+                    }
                 }
             }
 
             module.add_function(func);
+            for pg in pending_globals {
+                module.add_global(pg.global);
+            }
+
+            // Lower nested CONTAINS subprograms.
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+            }
         }
-        ProgramUnit::Module { name, decls, .. } => {
-            // Module variables become globals.
-            for decl in decls {
-                if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
-                    let ir_ty = lower_type_spec(type_spec);
-                    for entity in entities {
-                        module.add_global(Global {
-                            name: format!("{}::{}", name, entity.name),
-                            ty: ir_ty.clone(),
-                            initializer: Some(GlobalInit::Zero),
-                        });
-                    }
-                }
+        ProgramUnit::Module { uses, contains, .. } => {
+            // Module globals are installed in pass 1 (collect_module_globals).
+            // The module body has no executable statements, but its CONTAINS
+            // subprograms (module procedures) must be lowered as top-level
+            // functions so they are emitted into the object file.
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
+            for sub in contains {
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
         _ => {}
     }
 }
 
+/// Emit IR instructions that materialize a folded constant
+/// scalar at the given target type. Used by Maj4 parameter
+/// inlining: when an `Expr::Name` references a parameter whose
+/// initializer const-folds, we emit `b.const_i32(value)` (or
+/// the appropriate width) directly instead of going through a
+/// global address + load.
+fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType) -> ValueId {
+    match (c, target) {
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i),
+        (ConstScalar::Int(i), IrType::Int(_)) => b.const_i32(i as i32),
+        (ConstScalar::Int(i), IrType::Bool) => b.const_bool(i != 0),
+        (ConstScalar::Int(i), IrType::Float(FloatWidth::F64)) => b.const_f64(i as f64),
+        (ConstScalar::Int(i), IrType::Float(FloatWidth::F32)) => b.const_f32(i as f32),
+        (ConstScalar::Float(f), IrType::Float(FloatWidth::F64)) => b.const_f64(f),
+        (ConstScalar::Float(f), IrType::Float(FloatWidth::F32)) => b.const_f32(f as f32),
+        (ConstScalar::Float(f), IrType::Int(IntWidth::I64)) => b.const_i64(f as i64),
+        (ConstScalar::Float(f), IrType::Int(_)) => b.const_i32(f as i32),
+        // Fallback — emit a zero of the target's class.
+        _ => b.const_i32(0),
+    }
+}
+
+/// Sign-extend an i64 const value at the target IR type's width.
+/// `integer(kind=1) :: x = 256` parses to 256, which doesn't fit
+/// in i8; the user almost certainly meant the truncation
+/// (`256 mod 256 = 0`). Clamp by masking to the low N bits and
+/// re-sign-extending. Out-of-range floats and aggregates are
+/// passed through unchanged. Audit CRITICAL-2.
+fn clamp_const_to_type(v: ConstScalar, target: &IrType) -> ConstScalar {
+    match (v, target) {
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I8)) => {
+            ConstScalar::Int((i as i8) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I16)) => {
+            ConstScalar::Int((i as i16) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I32)) => {
+            ConstScalar::Int((i as i32) as i64)
+        }
+        (ConstScalar::Int(i), IrType::Bool) => {
+            ConstScalar::Int(if i != 0 { 1 } else { 0 })
+        }
+        // Int → Float (e.g. `real :: x = 1`).
+        (ConstScalar::Int(i), IrType::Float(_)) => ConstScalar::Float(i as f64),
+        _ => v,
+    }
+}
+
+/// Try to evaluate a scalar initializer expression at compile time
+/// to a `GlobalInit`. Used by SAVE-promotion in `alloc_decls`.
+///
+/// Handles literals, unary minus, parenthesization, and binary
+/// arithmetic (`+`, `-`, `*`, `/`, `**`) on any combination of
+/// integer and real operands, plus references to named PARAMETERs
+/// declared earlier in the same scope (looked up via `param_consts`).
+/// Mixed int/real promotes to real per Fortran's usual arithmetic
+/// rules. Anything that can't be folded (function calls, derived
+/// types, strings, names that aren't compile-time parameters)
+/// returns `None`. The caller then falls back to alloca + runtime
+/// store, which DOES break SAVE semantics — every new non-foldable
+/// case is a silent off-spec wrong-result, so the folder should
+/// cover as much as possible.
+fn eval_const_global_init(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    target: Option<&IrType>,
+) -> Option<GlobalInit> {
+    eval_const_scalar(e, param_consts).map(|raw| {
+        let clamped = match target {
+            Some(t) => clamp_const_to_type(raw, t),
+            None => raw,
+        };
+        match clamped {
+            ConstScalar::Int(i) => GlobalInit::Int(i),
+            ConstScalar::Float(f) => GlobalInit::Float(f),
+        }
+    })
+}
+
+/// Internal const-folding result for initializer expressions.
+/// Int is used for integer kinds AND logical (0/1). Float is
+/// used for real/double precision.
+#[derive(Debug, Clone, Copy)]
+enum ConstScalar {
+    Int(i64),
+    Float(f64),
+}
+
+impl ConstScalar {
+    fn to_float(self) -> f64 {
+        match self { ConstScalar::Int(i) => i as f64, ConstScalar::Float(f) => f }
+    }
+}
+
+fn eval_const_scalar(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<ConstScalar> {
+    use crate::ast::expr::{UnaryOp, BinaryOp};
+    match &e.node {
+        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(ConstScalar::Int),
+        Expr::RealLiteral { text, .. } => {
+            text.replace('d', "e").replace('D', "E").parse::<f64>().ok().map(ConstScalar::Float)
+        }
+        Expr::LogicalLiteral { value, .. } => {
+            Some(ConstScalar::Int(if *value { 1 } else { 0 }))
+        }
+        // Audit CRITICAL-1: a name reference resolves only if it's
+        // a compile-time parameter declared earlier in the same
+        // scope. Anything else (regular local, dummy arg, module
+        // global) is not a compile-time constant and the folder
+        // gives up — the caller falls back to runtime evaluation.
+        Expr::Name { name } => {
+            param_consts.get(&name.to_lowercase()).copied()
+        }
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_const_scalar(operand, param_consts)?;
+            match op {
+                UnaryOp::Minus => Some(match v {
+                    ConstScalar::Int(i) => ConstScalar::Int(-i),
+                    ConstScalar::Float(f) => ConstScalar::Float(-f),
+                }),
+                UnaryOp::Plus => Some(v),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let lv = eval_const_scalar(left, param_consts)?;
+            let rv = eval_const_scalar(right, param_consts)?;
+            // Promote to float when either operand is float.
+            let any_float = matches!(lv, ConstScalar::Float(_))
+                || matches!(rv, ConstScalar::Float(_));
+            if any_float {
+                let l = lv.to_float();
+                let r = rv.to_float();
+                match op {
+                    BinaryOp::Add => Some(ConstScalar::Float(l + r)),
+                    BinaryOp::Sub => Some(ConstScalar::Float(l - r)),
+                    BinaryOp::Mul => Some(ConstScalar::Float(l * r)),
+                    // Audit Min-5: fold all IEEE 754 cases. Float
+                    // division by zero now folds to ±Inf or NaN
+                    // (matching `f64::powf`, which already folds
+                    // negative-base fractional powers to NaN).
+                    // Consistent with gfortran's `parameter ::
+                    // x = 1.0/0.0 → +inf` behavior.
+                    BinaryOp::Div => Some(ConstScalar::Float(l / r)),
+                    BinaryOp::Pow => Some(ConstScalar::Float(l.powf(r))),
+                    _ => None,
+                }
+            } else {
+                let (ConstScalar::Int(l), ConstScalar::Int(r)) = (lv, rv) else { return None };
+                match op {
+                    BinaryOp::Add => Some(ConstScalar::Int(l.wrapping_add(r))),
+                    BinaryOp::Sub => Some(ConstScalar::Int(l.wrapping_sub(r))),
+                    BinaryOp::Mul => Some(ConstScalar::Int(l.wrapping_mul(r))),
+                    BinaryOp::Div => {
+                        if r == 0 { None } else { Some(ConstScalar::Int(l / r)) }
+                    }
+                    BinaryOp::Pow => {
+                        // Integer power with non-negative exponent.
+                        if r < 0 || r > i32::MAX as i64 { return None; }
+                        let mut acc: i64 = 1;
+                        for _ in 0..r { acc = acc.wrapping_mul(l); }
+                        Some(ConstScalar::Int(acc))
+                    }
+                    _ => None,
+                }
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_scalar(inner, param_consts),
+        _ => None,
+    }
+}
+
+/// A pending global variable produced by the lowerer for a SAVE'd
+/// scalar local. Flushed into the IR Module after the containing
+/// function finishes lowering.
+struct PendingGlobal {
+    global: Global,
+}
+
+/// Synthesize a unique global symbol name for a SAVE'd local.
+/// Audit Min-2: previously used `__save_` but the leading double
+/// underscore is reserved for implementation symbols by Mach-O
+/// (and by POSIX). Switched to `afs_save_` which makes the
+/// provenance obvious and avoids the reserved-prefix footgun.
+fn save_global_name(func_name: &str, local_name: &str) -> String {
+    format!("afs_save_{}_{}", func_name.to_lowercase(), local_name.to_lowercase())
+}
+
+/// Collect the set of ValueIds whose defining instruction is a
+/// `GlobalAddr`. Used by `init_decls` to skip re-initializing
+/// SAVE-promoted locals on every function call. One pre-pass over
+/// the function beats the O(N²) per-local scan the original
+/// implementation did (Audit Maj-3).
+fn collect_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
+    let mut set = HashSet::new();
+    for block in &b.func().blocks {
+        for inst in &block.insts {
+            if matches!(inst.kind, InstKind::GlobalAddr(_)) {
+                set.insert(inst.id);
+            }
+        }
+    }
+    set
+}
+
+/// Install module-level globals as `LocalInfo` entries in the
+/// function-local map so `Expr::Name` lookups can resolve them
+/// uniformly with stack locals. Must run *after* `alloc_decls` so
+/// that any same-named local declared in this subprogram shadows
+/// the global per Fortran scoping rules.
+/// Walk a body of statements and check every Expr::Name against
+/// the function's filtered names set. If any match, emit a hard
+/// compile-time error mentioning the filtered name. This is the
+/// pre-lowering hook for audit MAJOR-1: USE ONLY hides a name
+/// must not silently lower to const_int 0.
+fn check_no_filtered_refs(
+    body: &[crate::ast::stmt::SpannedStmt],
+    filtered: &HashSet<String>,
+) {
+    if filtered.is_empty() { return; }
+    for stmt in body {
+        check_filtered_in_stmt(stmt, filtered);
+    }
+}
+
+/// Walk every Stmt variant and recurse into substatements + every
+/// expression-bearing field. Audit5 MAJOR-2: the original walker
+/// only covered Assignment/Print/Write/Read/If/Do/Call/Block, so
+/// filtered USE ONLY refs slipped through WHERE constructs, FORALL,
+/// SELECT CASE, SELECT TYPE, ASSOCIATE, ALLOCATE/DEALLOCATE
+/// argument exprs, IO control specifiers, and ALL of the executable
+/// transfer-of-control statements that carry expressions
+/// (STOP code, RETURN value, ARITHMETIC IF, COMPUTED GOTO).
+fn check_filtered_in_stmt(
+    stmt: &crate::ast::stmt::SpannedStmt,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        // ---- Assignment ----
+        Stmt::Assignment { target, value }
+        | Stmt::PointerAssignment { target, value } => {
+            check_filtered_in_expr(target, filtered);
+            check_filtered_in_expr(value, filtered);
+        }
+
+        // ---- IF ----
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            check_filtered_in_expr(condition, filtered);
+            check_no_filtered_refs(then_body, filtered);
+            for (cond, body) in else_ifs {
+                check_filtered_in_expr(cond, filtered);
+                check_no_filtered_refs(body, filtered);
+            }
+            if let Some(eb) = else_body {
+                check_no_filtered_refs(eb, filtered);
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            check_filtered_in_expr(condition, filtered);
+            check_filtered_in_stmt(action, filtered);
+        }
+
+        // ---- DO loops ----
+        Stmt::DoLoop { start, end, step, body, .. } => {
+            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = step { check_filtered_in_expr(e, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::DoWhile { condition, body, .. } => {
+            check_filtered_in_expr(condition, filtered);
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::DoConcurrent { controls, mask, body, .. } => {
+            for c in controls {
+                check_filtered_in_expr(&c.start, filtered);
+                check_filtered_in_expr(&c.end, filtered);
+                if let Some(s) = &c.step { check_filtered_in_expr(s, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+
+        // ---- SELECT ----
+        Stmt::SelectCase { selector, cases, .. } => {
+            check_filtered_in_expr(selector, filtered);
+            for case in cases {
+                for sel in &case.selectors {
+                    use crate::ast::stmt::CaseSelector;
+                    match sel {
+                        CaseSelector::Value(e) => check_filtered_in_expr(e, filtered),
+                        CaseSelector::Range { low, high } => {
+                            if let Some(e) = low { check_filtered_in_expr(e, filtered); }
+                            if let Some(e) = high { check_filtered_in_expr(e, filtered); }
+                        }
+                        CaseSelector::Default => {}
+                    }
+                }
+                check_no_filtered_refs(&case.body, filtered);
+            }
+        }
+        Stmt::SelectType { selector, guards, .. } => {
+            check_filtered_in_expr(selector, filtered);
+            for guard in guards {
+                use crate::ast::stmt::TypeGuard;
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                check_no_filtered_refs(body, filtered);
+            }
+        }
+
+        // ---- WHERE / FORALL ----
+        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+            check_filtered_in_expr(mask, filtered);
+            check_no_filtered_refs(body, filtered);
+            for (mcond, ebody) in elsewhere {
+                if let Some(m) = mcond { check_filtered_in_expr(m, filtered); }
+                check_no_filtered_refs(ebody, filtered);
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            check_filtered_in_expr(mask, filtered);
+            check_filtered_in_stmt(stmt, filtered);
+        }
+        Stmt::ForallConstruct { specs, mask, body, .. } => {
+            for s in specs {
+                check_filtered_in_expr(&s.start, filtered);
+                check_filtered_in_expr(&s.end, filtered);
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for s in specs {
+                check_filtered_in_expr(&s.start, filtered);
+                check_filtered_in_expr(&s.end, filtered);
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_filtered_in_stmt(stmt, filtered);
+        }
+
+        // ---- BLOCK / ASSOCIATE ----
+        Stmt::Block { body, .. } => check_no_filtered_refs(body, filtered),
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, e) in assocs {
+                check_filtered_in_expr(e, filtered);
+            }
+            check_no_filtered_refs(body, filtered);
+        }
+
+        // ---- Branch / transfer ----
+        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } => {
+            if let Some(e) = code { check_filtered_in_expr(e, filtered); }
+        }
+        Stmt::Return { value } => {
+            if let Some(e) = value { check_filtered_in_expr(e, filtered); }
+        }
+        Stmt::ComputedGoto { selector, .. } => {
+            check_filtered_in_expr(selector, filtered);
+        }
+        Stmt::ArithmeticIf { expr, .. } => {
+            check_filtered_in_expr(expr, filtered);
+        }
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. } => {}
+        Stmt::Labeled { stmt: inner, .. } => {
+            check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered);
+        }
+
+        // ---- I/O ----
+        Stmt::Print { format, items } => {
+            check_filtered_in_expr(format, filtered);
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
+            for c in controls { check_filtered_in_expr(&c.value, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for c in specs { check_filtered_in_expr(&c.value, filtered); }
+        }
+        Stmt::Inquire { specs, items } => {
+            for c in specs { check_filtered_in_expr(&c.value, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+
+        // ---- Memory ----
+        Stmt::Allocate { items, opts } | Stmt::Deallocate { items, opts } => {
+            for item in items { check_filtered_in_expr(item, filtered); }
+            for c in opts { check_filtered_in_expr(&c.value, filtered); }
+        }
+        Stmt::Nullify { items } => {
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+
+        // ---- Other executable ----
+        Stmt::Call { callee, args } => {
+            check_filtered_in_expr(callee, filtered);
+            for a in args { check_filtered_in_subscript(&a.value, filtered); }
+        }
+        Stmt::Namelist { .. } => {}
+        Stmt::Declaration(_) => {
+            // Initializers in inline declarations could reference
+            // module names, but Decl init exprs go through a
+            // separate const-fold path that already errors on
+            // unknown names. Conservative: skip here.
+        }
+    }
+}
+
+fn check_filtered_in_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    filtered: &HashSet<String>,
+) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if filtered.contains(&key) {
+                eprintln!(
+                    "armfortas: error: '{}' is not accessible in this scope — \
+                     it was filtered out by a USE ONLY clause (audit MAJOR-1)",
+                    name,
+                );
+                std::process::exit(1);
+            }
+        }
+        Expr::ComponentAccess { base, .. } => {
+            check_filtered_in_expr(base, filtered);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_filtered_in_expr(left, filtered);
+            check_filtered_in_expr(right, filtered);
+        }
+        Expr::UnaryOp { operand, .. } => check_filtered_in_expr(operand, filtered),
+        Expr::ParenExpr { inner } => check_filtered_in_expr(inner, filtered),
+        Expr::FunctionCall { callee, args } => {
+            check_filtered_in_expr(callee, filtered);
+            for a in args { check_filtered_in_subscript(&a.value, filtered); }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for v in values { check_filtered_in_acvalue(v, filtered); }
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            check_filtered_in_expr(real, filtered);
+            check_filtered_in_expr(imag, filtered);
+        }
+        // Pure literals: nothing to walk.
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. } => {}
+    }
+}
+
+fn check_filtered_in_subscript(
+    sub: &crate::ast::expr::SectionSubscript,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::expr::SectionSubscript;
+    match sub {
+        SectionSubscript::Element(e) => check_filtered_in_expr(e, filtered),
+        SectionSubscript::Range { start, end, stride } => {
+            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = stride { check_filtered_in_expr(e, filtered); }
+        }
+    }
+}
+
+fn check_filtered_in_acvalue(
+    v: &crate::ast::expr::AcValue,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => check_filtered_in_expr(e, filtered),
+        AcValue::ImpliedDo { values, start, end, step, .. } => {
+            for inner in values { check_filtered_in_acvalue(inner, filtered); }
+            check_filtered_in_expr(start, filtered);
+            check_filtered_in_expr(end, filtered);
+            if let Some(s) = step { check_filtered_in_expr(s, filtered); }
+        }
+    }
+}
+
+/// Walk the function's USE statements and collect every name
+/// from a USE-only-imported module that the only-list filtered
+/// out. Audit MAJOR-1: those names must NOT silently fall
+/// through to const_int 0; the lowerer treats them as undefined
+/// at the reference site.
+fn compute_filtered_names(
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+) -> HashSet<String> {
+    use crate::ast::decl::OnlyItem;
+    let mut filtered: HashSet<String> = HashSet::new();
+    for decl in uses {
+        let Decl::UseStmt { module, only: Some(only_list), .. } = &decl.node else { continue; };
+        let mod_key = module.to_lowercase();
+        // The set of names this module exports (limited to what
+        // collect_module_globals registered — module functions and
+        // derived types are tracked elsewhere and remain visible).
+        let mut exports: HashSet<String> = HashSet::new();
+        for (mk, var) in globals.keys() {
+            if *mk == mod_key {
+                exports.insert(var.clone());
+            }
+        }
+        // The set of (lowercase) names the only-list explicitly
+        // imports. A rename's `remote` is what's pulled from the
+        // module; a Name is itself.
+        let mut imported: HashSet<String> = HashSet::new();
+        for item in only_list {
+            match item {
+                OnlyItem::Name(n) => { imported.insert(n.to_lowercase()); }
+                OnlyItem::Rename(rn) => { imported.insert(rn.remote.to_lowercase()); }
+            }
+        }
+        // Anything in exports but not imported is now filtered.
+        for e in &exports {
+            if !imported.contains(e) {
+                filtered.insert(e.clone());
+            }
+        }
+    }
+    filtered
+}
+
+/// Install a module-level global as a `LocalInfo` entry under the
+/// given local key. Shared helper so all install paths build a
+/// consistent LocalInfo shape.
+fn install_one_global(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    info: &ModuleGlobalInfo,
+) {
+    if locals.contains_key(&local_key) { return; }
+    // For allocatable module arrays the global is a 384-byte
+    // descriptor — global_addr produces a `Ptr<Array<i8, 384>>`
+    // which feeds the runtime allocate/deallocate/subscript
+    // helpers as the descriptor address.
+    let addr_ty = if info.allocatable {
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
+    } else {
+        info.ty.clone()
+    };
+    let addr = b.global_addr(&info.symbol, addr_ty);
+    locals.insert(local_key, LocalInfo {
+        addr,
+        ty: info.ty.clone(),
+        dims: info.dims.clone(),
+        allocatable: info.allocatable,
+        by_ref: false,
+        char_kind: CharKind::None, derived_type: None, inline_const: None,
+    });
+}
+
+/// Install module globals imported by this function's USE
+/// statements as `LocalInfo` entries. Honors:
+///   * USE ONLY filtering — only names in the only-list are installed
+///   * Renames — both forms, `use m, only: y => x` and
+///     `use m, x => y` (non-only rename)
+///   * Cross-module collision detection — if two modules bring in
+///     the same local key through their use list, the emitted IR
+///     would resolve ambiguously; we skip the second one and note
+///     the collision in an eprintln (sema doesn't yet diagnose).
+///
+/// Audit C2/C3/C4: previously this function installed every
+/// global regardless of any USE statement, ignored ONLY filtering,
+/// silently dropped USE renames, and let two same-named variables
+/// from different modules silently overwrite each other.
+fn install_globals_as_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) {
+    use crate::ast::decl::OnlyItem;
+
+    // Sorted per-use iteration so the emitted global_addr
+    // instructions land in deterministic order. Audit B-3 holds
+    // across this path too.
+    //
+    // The two-pass pattern:
+    //   1. Enumerate the (use statement, key-in-local-scope, module_key)
+    //      triples this function imports.
+    //   2. Sort by local-scope key.
+    //   3. Install in order, checking for collision before inserting.
+    let mut pending: Vec<(String, (String, String))> = Vec::new();
+
+    for decl in uses {
+        let Decl::UseStmt { module, nature: _, renames, only } = &decl.node else { continue; };
+        let mod_key = module.to_lowercase();
+        if let Some(only_list) = only {
+            for item in only_list {
+                match item {
+                    OnlyItem::Name(n) => {
+                        let n_lc = n.to_lowercase();
+                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
+                    }
+                    OnlyItem::Rename(rn) => {
+                        pending.push((
+                            rn.local.to_lowercase(),
+                            (mod_key.clone(), rn.remote.to_lowercase()),
+                        ));
+                    }
+                }
+            }
+        } else {
+            // No ONLY list: import every name from the module,
+            // minus any rename targets (which are substituted).
+            let rename_targets: std::collections::HashSet<String> =
+                renames.iter().map(|r| r.remote.to_lowercase()).collect();
+            for (mk, var) in globals.keys() {
+                if *mk != mod_key { continue; }
+                if rename_targets.contains(var) { continue; }
+                pending.push((var.clone(), (mod_key.clone(), var.clone())));
+            }
+            for rn in renames {
+                pending.push((
+                    rn.local.to_lowercase(),
+                    (mod_key.clone(), rn.remote.to_lowercase()),
+                ));
+            }
+        }
+    }
+
+    pending.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut installed_from: HashMap<String, String> = HashMap::new();
+    for (local_key, (mod_key, var_key)) in pending {
+        if let Some(info) = globals.get(&(mod_key.clone(), var_key.clone())) {
+            // Collision check: two modules exporting the same local key.
+            if let Some(prev_mod) = installed_from.get(&local_key) {
+                if *prev_mod != mod_key {
+                    eprintln!(
+                        "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
+                         keeping the first",
+                        local_key, prev_mod, mod_key,
+                    );
+                    continue;
+                }
+            }
+            installed_from.insert(local_key.clone(), mod_key);
+            install_one_global(b, locals, local_key, info);
+        } else {
+            // Not an IR global — check if it's an intrinsic module parameter constant
+            // (iso_c_binding, iso_fortran_env). These are registered in the symbol
+            // table but never emitted as IR globals; install them as inline_const locals.
+            if locals.contains_key(&local_key) { continue; }
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                if let Some(sym) = st.scope(mod_scope_id).symbols.get(&var_key) {
+                    if sym.attrs.parameter {
+                        if let Some(cv) = sym.const_value {
+                            let ty = IrType::Int(IntWidth::I32);
+                            // Create a dummy alloca (never loaded from; inline_const
+                            // short-circuits at every use site via materialize_const_scalar).
+                            let addr = b.alloca(ty.clone());
+                            locals.insert(local_key.clone(), LocalInfo {
+                                addr,
+                                ty,
+                                dims: vec![],
+                                allocatable: false,
+                                by_ref: false,
+                                char_kind: CharKind::None,
+                                derived_type: None,
+                                inline_const: Some(ConstScalar::Int(cv)),
+                            });
+                            installed_from.insert(local_key, mod_key);
+                        }
+                    }
+                }
+            }
+            // If still not found (e.g., USE references a name that doesn't exist),
+            // skip silently — sema should have diagnosed it.
+        }
+    }
+}
+
 /// Allocate local variables from declarations. Handles both scalars and arrays.
-fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, decls: &[crate::ast::decl::SpannedDecl], type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+fn alloc_decls(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+) {
     use crate::ast::decl::Attribute;
+
+    // Pre-scan standalone PARAMETER statements so a TypeDecl entity
+    // whose value comes from a separate `parameter (name = expr)`
+    // statement still triggers SAVE-promotion at alloc time. Without
+    // this pre-scan, the standalone form would silently fall back to
+    // the alloca + per-call store path.
+    let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    for d in decls {
+        if let Decl::ParameterStmt { pairs } = &d.node {
+            for (name, expr) in pairs {
+                parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+    }
+
+    // Audit CRITICAL-1: build the per-scope parameter constants
+    // table so SAVE-promotion's eval_const_global_init can resolve
+    // `Expr::Name` references against compile-time-known parameters
+    // declared earlier in the same scope. Without this, an init
+    // like `integer :: x = k * 2` (k a parameter) silently falls
+    // back to alloca + per-call store and breaks SAVE semantics.
+    //
+    // Parameters can reference earlier parameters (`tau = 2 * pi`),
+    // so we walk decls in order and build the map incrementally.
+    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    for d in decls {
+        match &d.node {
+            Decl::TypeDecl { attrs, entities, .. } => {
+                let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+                if !is_param { continue; }
+                for entity in entities {
+                    if let Some(init) = &entity.init {
+                        if let Some(val) = eval_const_scalar(init, &param_consts) {
+                            param_consts.insert(entity.name.to_lowercase(), val);
+                        }
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    if let Some(val) = eval_const_scalar(expr, &param_consts) {
+                        param_consts.insert(name.to_lowercase(), val);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let elem_ty = lower_type_spec(type_spec);
@@ -336,7 +1930,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     locals.insert(key, LocalInfo {
                         addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         dims: vec![], allocatable: true, by_ref: false,
-                        char_kind: CharKind::Deferred, derived_type: None,
+                        char_kind: CharKind::Deferred, derived_type: None, inline_const: None,
                     });
                     continue;
                 } else if let Some(len) = char_len {
@@ -351,7 +1945,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         locals.insert(key, LocalInfo {
                             addr, ty: IrType::Int(IntWidth::I8),
                             dims: vec![], allocatable: false, by_ref: false,
-                            char_kind: CharKind::Fixed(len), derived_type: None,
+                            char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None,
                         });
                         continue; // skip normal path
                     }
@@ -365,7 +1959,7 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
@@ -390,12 +1984,12 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
                     // Derived type variable: allocate struct-sized byte array.
@@ -411,19 +2005,309 @@ fn alloc_decls(b: &mut FuncBuilder, locals: &mut HashMap<String, LocalInfo>, dec
                             allocatable: false,
                             by_ref: false,
                             char_kind: CharKind::None,
-                            derived_type: Some(type_name.clone()),
+                            derived_type: Some(type_name.clone()), inline_const: None,
                         });
                     } else {
                         // Unknown derived type — fall back to 8-byte alloca.
                         let addr = b.alloca(IrType::Int(IntWidth::I64));
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     }
                 } else {
-                    // Scalar variable.
-                    let addr = b.alloca(elem_ty.clone());
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                    // Scalar variable. Three sub-cases:
+                    //   (a) PARAMETER-attributed and folds → inline
+                    //       at every use site. No alloca, no global,
+                    //       no .data slot. Audit MAJOR-4.
+                    //   (b) Has a const-evaluable init but isn't a
+                    //       parameter → SAVE-promote to a module
+                    //       global (F2018 §8.5.16 implicit SAVE).
+                    //   (c) Plain alloca, no init.
+                    let init_expr: Option<&crate::ast::expr::SpannedExpr> =
+                        entity.init.as_ref().or_else(|| parameter_inits.get(&key).copied());
+                    let is_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter))
+                        || parameter_inits.contains_key(&key);
+
+                    if is_parameter {
+                        // Audit MAJOR-4: pure compile-time parameter.
+                        // Try to fold; if we can, store the value in
+                        // inline_const and skip the global+alloca.
+                        // Use a one-byte sentinel alloca for `addr`
+                        // so other code paths that touch info.addr
+                        // still work, but never load through it.
+                        let folded = init_expr
+                            .and_then(|e| eval_const_scalar(e, &param_consts))
+                            .map(|raw| clamp_const_to_type(raw, &elem_ty));
+                        if let Some(value) = folded {
+                            // Sentinel alloca — never read.
+                            let addr = b.alloca(elem_ty.clone());
+                            locals.insert(key, LocalInfo {
+                                addr, ty: elem_ty.clone(),
+                                dims: vec![], allocatable: false, by_ref: false,
+                                char_kind: CharKind::None, derived_type: None,
+                                inline_const: Some(value),
+                            });
+                            continue;
+                        }
+                        // Fall through to the SAVE path if the
+                        // parameter init can't be folded — at least
+                        // semantics are preserved.
+                    }
+
+                    if let Some(init) = init_expr.and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty))) {
+                        let global_name = save_global_name(func_name, &key);
+                        pending_globals.push(PendingGlobal {
+                            global: Global {
+                                name: global_name.clone(),
+                                ty: elem_ty.clone(),
+                                initializer: Some(init),
+                            },
+                        });
+                        let addr = b.global_addr(&global_name, elem_ty.clone());
+                        locals.insert(key, LocalInfo {
+                            addr, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None,
+                        });
+                    } else {
+                        let addr = b.alloca(elem_ty.clone());
+                        locals.insert(key, LocalInfo {
+                            addr, ty: elem_ty.clone(),
+                            dims: vec![], allocatable: false, by_ref: false,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None,
+                        });
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Lower initializer expressions for declared variables.
+///
+/// Handles two AST shapes:
+///   1. `Decl::TypeDecl` entities with `entity.init` set. This
+///      covers BOTH `integer :: x = 42` and
+///      `integer, parameter :: pi = 3.14` — the parameter
+///      attribute doesn't change the lowering, only sema's
+///      classification of the symbol.
+///   2. Standalone `Decl::ParameterStmt { pairs }`, where each
+///      pair refers to an already-allocated local declared
+///      elsewhere in the same decl list.
+///
+/// Most scalar locals with const-evaluable initializers are
+/// SAVE-promoted to module globals back in `alloc_decls`; for
+/// those, `is_global_addr` returns true and this pass leaves the
+/// initialization to the .data section. The remaining cases this
+/// pass handles are non-const initializers (rare).
+///
+/// Must run *after* `alloc_decls` so that all locals exist. Only
+/// stores into scalar slots — array, character, derived-type, and
+/// allocatable initializers have their own paths in alloc_decls.
+fn init_decls(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) {
+    // Pre-collect the set of GlobalAddr-defining ValueIds so the
+    // inner skip check is O(1). Audit Maj-3.
+    let global_addr_ids = collect_global_addr_values(b);
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for entity in entities {
+                    let Some(init_expr) = &entity.init else { continue; };
+                    let key = entity.name.to_lowercase();
+                    let Some(info) = locals.get(&key) else { continue; };
+                    // Dummy arguments (by_ref locals) cannot have
+                    // initializers per the Fortran standard — they
+                    // bind to caller storage. If sema lets one
+                    // through it would be a bug; the debug_assert
+                    // catches it in development without crashing
+                    // release builds. Audit Min-4.
+                    debug_assert!(
+                        !info.by_ref,
+                        "init_decls: dummy argument {:?} should not have an initializer",
+                        key,
+                    );
+                    if info.by_ref { continue; }
+
+                    // Array entity with an array constructor init:
+                    // store each literal element into the slot.
+                    // Only stack/non-allocatable arrays are handled
+                    // here; allocatable arrays would need their
+                    // descriptor allocated first.
+                    if !info.dims.is_empty()
+                        && !info.allocatable
+                        && matches!(info.char_kind, CharKind::None)
+                        && info.derived_type.is_none()
+                    {
+                        if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
+                            store_ac_values_into(b, locals, info.addr, &info.ty, values, st);
+                        }
+                        continue;
+                    }
+
+                    // Only initialize plain scalar slots; characters,
+                    // allocatables, and derived types are handled
+                    // elsewhere.
+                    if !info.dims.is_empty()
+                        || info.allocatable
+                        || !matches!(info.char_kind, CharKind::None)
+                        || info.derived_type.is_some()
+                    {
+                        continue;
+                    }
+                    // SAVE-promoted locals are backed by a module
+                    // global already initialized at link time. Don't
+                    // re-store on every call — that would defeat
+                    // the SAVE semantics (audit MAJOR-1).
+                    if global_addr_ids.contains(&info.addr) {
+                        continue;
+                    }
+                    // Audit5 MAJOR-3: PARAMETER scalars folded by
+                    // alloc_decls have inline_const set and a
+                    // sentinel alloca that is never loaded — every
+                    // use materializes the constant directly. The
+                    // store here would be dead in the IR forever
+                    // at -O0 (mem2reg cleans it up at -O1+, but
+                    // we shouldn't generate dead code in the first
+                    // place).
+                    if info.inline_const.is_some() {
+                        continue;
+                    }
+                    let val = lower_expr(b, locals, init_expr, st);
+                    let coerced = coerce_to_type(b, val, &info.ty);
+                    b.store(coerced, info.addr);
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    let key = name.to_lowercase();
+                    let Some(info) = locals.get(&key) else { continue; };
+                    if !info.dims.is_empty()
+                        || info.allocatable
+                        || info.by_ref
+                        || !matches!(info.char_kind, CharKind::None)
+                        || info.derived_type.is_some()
+                    {
+                        continue;
+                    }
+                    // SAVE-promoted locals are backed by a module
+                    // global; the initial value is already baked
+                    // into .data at link time, so skip the runtime
+                    // store. Audit MAJOR-1 interaction.
+                    if global_addr_ids.contains(&info.addr) {
+                        continue;
+                    }
+                    // Audit5 MAJOR-3: same dead-store skip as the
+                    // TypeDecl arm above. Standalone PARAMETER
+                    // statements also produce inline_const-tagged
+                    // locals when alloc_decls successfully folds
+                    // the value.
+                    if info.inline_const.is_some() {
+                        continue;
+                    }
+                    let val = lower_expr(b, locals, expr, st);
+                    let coerced = coerce_to_type(b, val, &info.ty);
+                    b.store(coerced, info.addr);
+                }
+            }
+            // Audit MEDIUM-3: DATA statements. Each set pairs
+            // target objects with values. For the simple form
+            // `data x /42/, y /3.14/`, walk objects + values
+            // pairwise and emit a store per scalar Name target.
+            // Implied-do object lists and value-side repetition
+            // (`r*v`) are not yet supported — they fall through
+            // silently and are tracked as future work.
+            Decl::DataStmt { sets } => {
+                for set in sets {
+                    let n = set.objects.len().min(set.values.len());
+                    for (target, value) in
+                        set.objects.iter().zip(set.values.iter()).take(n)
+                    {
+                        let Expr::Name { name } = &target.node else { continue; };
+                        let key = name.to_lowercase();
+                        let Some(info) = locals.get(&key) else { continue; };
+                        if !info.dims.is_empty()
+                            || info.allocatable
+                            || info.by_ref
+                            || !matches!(info.char_kind, CharKind::None)
+                            || info.derived_type.is_some()
+                        {
+                            continue;
+                        }
+                        // Don't shadow a SAVE-promoted global —
+                        // its initial value is in .data already.
+                        if global_addr_ids.contains(&info.addr) {
+                            continue;
+                        }
+                        let val = lower_expr(b, locals, value, st);
+                        let coerced = coerce_to_type(b, val, &info.ty);
+                        b.store(coerced, info.addr);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Coerce a scalar value to a target type for initializer storage.
+///
+/// Covers every Fortran scalar coercion that can show up at an
+/// initializer-store site:
+///   * Int → Int width change (sign-extend or truncate). Audit
+///     Min-3: Fortran integers are always signed, so the int_extend
+///     `signed` flag is hardcoded to `true`.
+///   * Int ↔ Float (round to nearest for Float→Int).
+///   * F32 ↔ F64 (extend / truncate).
+///   * Bool ↔ Int (round-trip via int_extend; Fortran logicals
+///     occupy a full kind so this is rare but legal).
+///
+/// Anything that doesn't match one of those cases falls into the
+/// `_ => val` arm and a `debug_assert!` fires — silently passing
+/// the wrong-typed value would let a future caller wire mismatched
+/// types into a Store, which the verifier (after MAJOR-4) would
+/// then catch much later. Better to fail loudly at the source.
+fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId {
+    let src = match b.func().value_type(val) {
+        Some(t) => t,
+        None => return val,
+    };
+    if src == *target {
+        return val;
+    }
+    match (&src, target) {
+        // Int → Float
+        (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
+        // Float → Int
+        (IrType::Float(_), IrType::Int(iw)) => b.float_to_int(val, *iw),
+        // F32 ↔ F64
+        (IrType::Float(FloatWidth::F32), IrType::Float(FloatWidth::F64)) => {
+            b.float_extend(val, FloatWidth::F64)
+        }
+        (IrType::Float(FloatWidth::F64), IrType::Float(FloatWidth::F32)) => {
+            b.float_trunc(val, FloatWidth::F32)
+        }
+        // Int width change. Audit Min-3: Fortran integers are signed.
+        (IrType::Int(src_w), IrType::Int(dst_w)) => {
+            if dst_w.bits() > src_w.bits() {
+                b.int_extend(val, *dst_w, true)
+            } else if dst_w.bits() < src_w.bits() {
+                b.int_trunc(val, *dst_w)
+            } else {
+                val
+            }
+        }
+        // Bool ↔ Int via int_extend. Bool is i1 in our model.
+        (IrType::Bool, IrType::Int(iw)) => b.int_extend(val, *iw, false),
+        (IrType::Int(_), IrType::Bool) => b.int_trunc(val, IntWidth::I8),
+        _ => {
+            debug_assert!(
+                false,
+                "coerce_to_type: unhandled coercion {:?} → {:?}", src, target,
+            );
+            val
         }
     }
 }
@@ -452,6 +2336,157 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
         Expr::IntegerLiteral { text, .. } => text.parse().ok(),
         Expr::UnaryOp { op: UnaryOp::Minus, operand } => {
             eval_const_int(operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the raw data pointer and declared length for a character argument expression.
+/// Returns `None` if the argument is not a recognized fixed-length character.
+fn char_addr_and_len(
+    b: &mut FuncBuilder,
+    arg_spanned: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<(ValueId, i64)> {
+    use crate::ast::expr::Expr;
+    match &arg_spanned.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            match &info.char_kind {
+                CharKind::Fixed(n) => {
+                    let ptr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                    Some((ptr, *n))
+                }
+                CharKind::Deferred | CharKind::None => None,
+            }
+        }
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            Some((ptr, value.len() as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Lower character intrinsic functions (LEN, LEN_TRIM, ICHAR, CHAR, INDEX, SCAN, VERIFY,
+/// ADJUSTL, ADJUSTR, TRIM). These need access to `locals` (for CharKind info) and the
+/// original un-lowered argument expressions, so they cannot go through `lower_intrinsic`.
+/// Returns Some(ValueId) if recognized, None otherwise.
+fn lower_char_intrinsic(
+    b: &mut FuncBuilder,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<ValueId> {
+    use crate::ast::expr::SectionSubscript;
+
+    // Extract the SpannedExpr from argument i.
+    let arg_spanned = |i: usize| -> Option<&crate::ast::expr::SpannedExpr> {
+        args.get(i).and_then(|a| {
+            if let SectionSubscript::Element(e) = &a.value { Some(e) } else { None }
+        })
+    };
+
+    match name {
+        "len" => {
+            let (_, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            Some(b.const_i64(declared_len))
+        }
+        "len_trim" => {
+            let (ptr, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let len_val = b.const_i64(declared_len);
+            Some(b.call(FuncRef::External("afs_len_trim".into()),
+                vec![ptr, len_val], IrType::Int(IntWidth::I64)))
+        }
+        "ichar" => {
+            let (ptr, _) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let byte = b.load_typed(ptr, IrType::Int(IntWidth::I8));
+            Some(b.call(FuncRef::External("afs_ichar".into()),
+                vec![byte], IrType::Int(IntWidth::I32)))
+        }
+        "char" => {
+            let int_arg = args.first().and_then(|a| {
+                if let SectionSubscript::Element(e) = &a.value {
+                    Some(lower_expr(b, locals, e, st))
+                } else { None }
+            })?;
+            let i32_arg = match b.func().value_type(int_arg) {
+                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_arg, IntWidth::I32),
+                _ => int_arg,
+            };
+            let byte_val = b.call(FuncRef::External("afs_char".into()),
+                vec![i32_arg], IrType::Int(IntWidth::I8));
+            // Allocate a 1-byte buffer and store through a byte-level GEP to avoid
+            // the Ptr<[i8 x 1]> vs Ptr<i8> store-type mismatch.
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1));
+            let zero = b.const_i64(0);
+            let byte_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+            b.store(byte_val, byte_ptr);
+            Some(buf)
+        }
+        "index" => {
+            let (hay_ptr, hay_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (needle_ptr, needle_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let hay_len_val = b.const_i64(hay_len);
+            let needle_len_val = b.const_i64(needle_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_index".into()),
+                vec![hay_ptr, hay_len_val, needle_ptr, needle_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "scan" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let src_len_val = b.const_i64(src_len);
+            let set_len_val = b.const_i64(set_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_scan".into()),
+                vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "verify" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
+            let src_len_val = b.const_i64(src_len);
+            let set_len_val = b.const_i64(set_len);
+            let back_val = arg_spanned(2)
+                .map(|e| lower_expr(b, locals, e, st))
+                .unwrap_or_else(|| b.const_i32(0));
+            Some(b.call(FuncRef::External("afs_verify".into()),
+                vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
+                IrType::Int(IntWidth::I64)))
+        }
+        "adjustl" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("afs_adjustl".into()),
+                vec![buf, src_ptr, len_val], IrType::Void);
+            Some(buf)
+        }
+        "adjustr" => {
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("afs_adjustr".into()),
+                vec![buf, src_ptr, len_val], IrType::Void);
+            Some(buf)
+        }
+        "trim" => {
+            // TRIM(s): returns character with trailing blanks removed.
+            // Allocate buffer of declared length, memcpy source, return buffer pointer.
+            // The actual printed length is discovered by len_trim at the call site.
+            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), src_len as u64));
+            let len_val = b.const_i64(src_len);
+            b.call(FuncRef::External("memcpy".into()),
+                vec![buf, src_ptr, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            Some(buf)
         }
         _ => None,
     }
@@ -1281,6 +3316,75 @@ fn lower_string_expr(
                 (val, zero)
             }
         }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                let first_char_arg = args.first().and_then(|a| {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value { Some(e) } else { None }
+                });
+                match key.as_str() {
+                    "trim" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("memcpy".into()),
+                                    vec![buf, src_ptr, len_val],
+                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                // Compute the trimmed length at runtime.
+                                let trimmed_len = b.call(FuncRef::External("afs_len_trim".into()),
+                                    vec![src_ptr, len_val], IrType::Int(IntWidth::I64));
+                                return (buf, trimmed_len);
+                            }
+                        }
+                    }
+                    "adjustl" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("afs_adjustl".into()),
+                                    vec![buf, src_ptr, len_val], IrType::Void);
+                                return (buf, len_val);
+                            }
+                        }
+                    }
+                    "adjustr" => {
+                        if let Some(arg) = first_char_arg {
+                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
+                                let len_val = b.const_i64(declared_len);
+                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                                b.call(FuncRef::External("afs_adjustr".into()),
+                                    vec![buf, src_ptr, len_val], IrType::Void);
+                                return (buf, len_val);
+                            }
+                        }
+                    }
+                    "char" => {
+                        // CHAR(i) → 1-byte buffer.
+                        if let Some(arg) = first_char_arg {
+                            let int_val = lower_expr(b, locals, arg, st);
+                            let i32_val = match b.func().value_type(int_val) {
+                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_val, IntWidth::I32),
+                                _ => int_val,
+                            };
+                            let byte_val = b.call(FuncRef::External("afs_char".into()),
+                                vec![i32_val], IrType::Int(IntWidth::I8));
+                            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1));
+                            let zero = b.const_i64(0);
+                            let byte_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                            b.store(byte_val, byte_ptr);
+                            let one = b.const_i64(1);
+                            return (buf, one);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let val = lower_expr(b, locals, expr, st);
+            let len = b.const_i64(string_literal_len(expr));
+            (val, len)
+        }
         Expr::BinaryOp { op: BinaryOp::Concat, left, right } => {
             // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
             let (a_ptr, a_len) = lower_string_expr(b, locals, left, st);
@@ -1315,9 +3419,45 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
-fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
-    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
-    for info in locals.values() {
+///
+/// Iterates locals in alphabetical order by name to make the emitted
+/// IR (and therefore the assembly) deterministic across runs. The
+/// previous version walked `locals.values()` directly, picking up the
+/// HashMap's randomized iteration order — surfaced as non-reproducible
+/// builds for any function with multiple allocatable locals.
+/// When `skip_addr` is `Some(addr)`, skip deallocation for any local whose
+/// `info.addr` matches. Used to preserve sret result ownership: the result
+/// variable of an allocatable-returning function is allocated inside the
+/// callee but ownership is transferred to the caller — the callee must
+/// NOT free it. Audit6 BLOCKING-1.
+fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry, skip_addr: Option<ValueId>) {
+    // Audit Med-2: only allocate the stat_addr scratch slot if we
+    // actually need it for an `afs_deallocate_array` call. Without
+    // this guard every function (even one with no allocatables)
+    // got a zombie i32 alloca right before its ret, bloating the
+    // frame and the IR — and DCE couldn't drop it because allocas
+    // are classified as side-effecting.
+    let needs_dealloc = locals.values()
+        .any(|info| info.allocatable || info.char_kind == CharKind::Deferred);
+    let needs_stat = locals.values().any(|info| info.allocatable);
+    if !needs_dealloc && !locals.values().any(|info|
+        !info.by_ref && info.derived_type.as_ref()
+            .and_then(|tn| type_layouts.get(tn))
+            .is_some_and(|l| !l.final_procs.is_empty()))
+    {
+        return;
+    }
+
+    let stat_addr = if needs_stat {
+        Some(b.alloca(IrType::Int(IntWidth::I32)))
+    } else {
+        None
+    };
+    let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (_name, info) in sorted {
+        // Skip caller-owned allocatables (sret result variables).
+        if skip_addr == Some(info.addr) { continue; }
         if info.char_kind == CharKind::Deferred {
             b.call(
                 FuncRef::External("afs_dealloc_string".into()),
@@ -1327,7 +3467,7 @@ fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalIn
         } else if info.allocatable {
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
-                vec![info.addr, stat_addr],
+                vec![info.addr, stat_addr.unwrap()],
                 IrType::Void,
             );
         }
@@ -1396,11 +3536,48 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
 }
 
 /// Lower a list of statements.
+/// Pre-scan a body of statements and create one IR basic block per
+/// Fortran statement label. Must be called before `lower_stmts` so
+/// that both forward and backward `GOTO` targets can branch to an
+/// already-existing block.
+fn collect_label_blocks(b: &mut FuncBuilder, stmts: &[SpannedStmt], out: &mut HashMap<u64, BlockId>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Labeled { label, stmt: inner } => {
+                let bb = b.create_block(&format!("label_{}", label));
+                out.entry(*label).or_insert(bb);
+                // Recurse into the inner statement (e.g., a DO or IF block with labels inside).
+                collect_label_blocks(b, std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::Continue { label: Some(lbl) } => {
+                let bb = b.create_block(&format!("label_{}", lbl));
+                out.entry(*lbl).or_insert(bb);
+            }
+            Stmt::IfConstruct { then_body, else_ifs, else_body, .. } => {
+                collect_label_blocks(b, then_body, out);
+                for (_, body) in else_ifs { collect_label_blocks(b, body, out); }
+                if let Some(body) = else_body { collect_label_blocks(b, body, out); }
+            }
+            Stmt::IfStmt { action, .. } => {
+                collect_label_blocks(b, std::slice::from_ref(action.as_ref()), out);
+            }
+            Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } | Stmt::DoConcurrent { body, .. } => {
+                collect_label_blocks(b, body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
-        // If current block already has a terminator (e.g., after STOP), skip dead code.
-        if b.func().block(b.current_block()).terminator.is_some() {
-            break;
+        // Labeled statements and labeled CONTINUEs create new basic blocks; they must be
+        // processed even after a branch/goto terminates the current block. All other dead
+        // code (statements after a terminator in an unlabeled position) is skipped.
+        let is_label_creating = matches!(&stmt.node,
+            Stmt::Labeled { .. } | Stmt::Continue { label: Some(_) });
+        if !is_label_creating && b.func().block(b.current_block()).terminator.is_some() {
+            continue; // dead code — but keep looping so we can find the next label
         }
         lower_stmt(b, ctx, stmt);
     }
@@ -1437,17 +3614,42 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                             CharKind::None => {
                                 if !info.dims.is_empty() || info.allocatable {
-                                    if matches!(&value.node, Expr::FunctionCall { .. }) {
-                                        // Array = func_returning_array (e.g., c = matmul(a,b)).
-                                        // The function returns a temp descriptor pointer.
-                                        // Use afs_assign_allocatable to copy data and handle reallocation.
-                                        let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                        b.call(FuncRef::External("afs_assign_allocatable".into()),
-                                            vec![info.addr, src_desc], IrType::Void);
-                                        // Deallocate the temporary result descriptor's heap data.
-                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
-                                        b.call(FuncRef::External("afs_deallocate_array".into()),
-                                            vec![src_desc, stat], IrType::Void);
+                                    if let Expr::FunctionCall { callee, args: call_args } = &value.node {
+                                        if let Expr::Name { name: callee_name } = &callee.node {
+                                            let callee_key = callee_name.to_lowercase();
+                                            if ctx.alloc_return_funcs.contains(&callee_key) {
+                                                // Audit6 BLOCKING-1: sret call — pass info.addr as
+                                                // the hidden first arg so the function writes its
+                                                // result directly into the destination descriptor.
+                                                // No temp descriptor or afs_assign_allocatable needed.
+                                                let ref_args: Vec<ValueId> = call_args.iter().map(|a| {
+                                                    match &a.value {
+                                                        crate::ast::expr::SectionSubscript::Element(e) =>
+                                                            lower_arg_by_ref(b, &ctx.locals, e, ctx.st),
+                                                        _ => b.const_i32(0),
+                                                    }
+                                                }).collect();
+                                                let mut all_args = vec![info.addr];
+                                                all_args.extend(ref_args);
+                                                b.call(FuncRef::External(callee_name.clone()), all_args, IrType::Void);
+                                            } else {
+                                                // Non-sret: function returns a temp descriptor.
+                                                let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                                b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                                    vec![info.addr, src_desc], IrType::Void);
+                                                let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                                b.call(FuncRef::External("afs_deallocate_array".into()),
+                                                    vec![src_desc, stat], IrType::Void);
+                                            }
+                                        } else {
+                                            // Indirect callee: fall back to assign path.
+                                            let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                            b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                                vec![info.addr, src_desc], IrType::Void);
+                                            let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                            b.call(FuncRef::External("afs_deallocate_array".into()),
+                                                vec![src_desc, stat], IrType::Void);
+                                        }
                                     } else {
                                         lower_array_assign(b, ctx, &info, value);
                                     }
@@ -1586,7 +3788,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
                     // Not an intrinsic — general subroutine call.
-                    let arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                    let mut arg_vals: Vec<ValueId> = args.iter().map(|a| {
                         match &a.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
                                 lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
@@ -1594,6 +3796,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             _ => b.const_i32(0),
                         }
                     }).collect();
+                    // If the callee has more parameters than provided args, and the
+                    // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
+                    if let Some(opt_flags) = ctx.optional_params.get(&key) {
+                        for flag in opt_flags.iter().skip(arg_vals.len()) {
+                            if *flag {
+                                arg_vals.push(b.const_i64(0)); // null → absent
+                            }
+                        }
+                    }
                     b.call(FuncRef::External(name.clone()), arg_vals, IrType::Void);
                 }
             }
@@ -1763,7 +3974,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         allocatable: false,
                         by_ref: false,
                         char_kind: CharKind::None,
-                        derived_type: None,
+                        derived_type: None, inline_const: None,
                     });
                 }
             }
@@ -1925,8 +4136,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Return { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
-            if let Some(addr) = ctx.result_addr {
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
+            if ctx.is_alloc_return {
+                // sret convention: result was written into the hidden first param.
+                b.ret(None);
+            } else if let Some(addr) = ctx.result_addr {
                 let rv = b.load(addr);
                 b.ret(Some(rv));
             } else {
@@ -1935,17 +4150,43 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Stop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
         Stmt::ErrorStop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
             b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
             b.unreachable();
         }
 
-        Stmt::Allocate { items, .. } => {
+        Stmt::Allocate { items, opts } => {
+            // Resolve STAT= option: find the user's stat variable address.
+            // The runtime writes 0 on success or a nonzero error code to this slot.
+            // If absent, use a private scratch slot (allocation failure aborts).
+            let stat_addr: ValueId = {
+                let stat_expr = opts.iter().find(|o| {
+                    o.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("stat")).unwrap_or(false)
+                });
+                if let Some(stat_io) = stat_expr {
+                    if let Expr::Name { name } = &stat_io.value.node {
+                        if let Some(stat_info) = ctx.locals.get(&name.to_lowercase()) {
+                            // Pass the user's variable address directly: runtime writes
+                            // 0 (success) or error code into it, so the variable is set.
+                            stat_info.addr
+                        } else {
+                            b.alloca(IrType::Int(IntWidth::I32))
+                        }
+                    } else {
+                        b.alloca(IrType::Int(IntWidth::I32))
+                    }
+                } else {
+                    b.alloca(IrType::Int(IntWidth::I32))
+                }
+            };
+
             for item in items {
                 if let Expr::FunctionCall { callee, args } = &item.node {
                     let base_name = extract_base_name(callee);
@@ -1959,51 +4200,38 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             };
 
                             if info.allocatable {
-                                // Allocatable: call afs_allocate_1d for 1D, afs_allocate_array for multi-D.
-                                // info.addr is the descriptor alloca.
+                                // Build a stack DimDescriptor[rank] honoring
+                                // each subscript's actual (lower, upper) bounds,
+                                // then call afs_allocate_array. Both 1-D and
+                                // multi-D go through the same path now.
                                 let es = b.const_i64(elem_size_bytes);
-                                if args.len() == 1 {
-                                    let n = match &args[0].value {
-                                        crate::ast::expr::SectionSubscript::Element(e) => {
-                                            lower_expr(b, &ctx.locals, e, ctx.st)
-                                        }
-                                        _ => b.const_i64(1),
-                                    };
-                                    // Widen to i64 if needed.
-                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
-                                        b.int_extend(n, IntWidth::I64, true)
-                                    } else { n };
-                                    b.call(
-                                        FuncRef::External("afs_allocate_1d".into()),
-                                        vec![info.addr, es, n64],
-                                        IrType::Void,
-                                    );
-                                } else {
-                                    // Multi-D: compute each dim and call afs_allocate_array.
-                                    // For now, fall back to computing total size and using simple allocate.
-                                    let mut total: Option<ValueId> = None;
-                                    for arg in args {
-                                        let dim_size = match &arg.value {
-                                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                                lower_expr(b, &ctx.locals, e, ctx.st)
-                                            }
-                                            _ => b.const_i32(1),
-                                        };
-                                        total = Some(match total {
-                                            Some(prev) => b.imul(prev, dim_size),
-                                            None => dim_size,
-                                        });
-                                    }
-                                    let n = total.unwrap_or_else(|| b.const_i64(1));
-                                    let n64 = if matches!(b.func().value_type(n), Some(IrType::Int(IntWidth::I32))) {
-                                        b.int_extend(n, IntWidth::I64, true)
-                                    } else { n };
-                                    b.call(
-                                        FuncRef::External("afs_allocate_1d".into()),
-                                        vec![info.addr, es, n64],
-                                        IrType::Void,
-                                    );
+                                let rank = args.len();
+                                let dim_buf_bytes = (rank * 24) as u64;
+                                let dim_buf = b.alloca(IrType::Array(
+                                    Box::new(IrType::Int(IntWidth::I8)),
+                                    dim_buf_bytes,
+                                ));
+                                let one_i64 = b.const_i64(1);
+                                for (i, arg) in args.iter().enumerate() {
+                                    let (lo64, up64) =
+                                        lower_alloc_bounds(b, &ctx.locals, &arg.value, ctx.st);
+                                    let base = (i * 24) as i64;
+                                    let off_lo = b.const_i64(base);
+                                    let off_up = b.const_i64(base + 8);
+                                    let off_st = b.const_i64(base + 16);
+                                    let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+                                    let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+                                    let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+                                    b.store(lo64, p_lo);
+                                    b.store(up64, p_up);
+                                    b.store(one_i64, p_st);
                                 }
+                                let rank_val = b.const_i32(rank as i32);
+                                b.call(
+                                    FuncRef::External("afs_allocate_array".into()),
+                                    vec![info.addr, es, rank_val, dim_buf, stat_addr],
+                                    IrType::Void,
+                                );
                             } else {
                                 // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
                                 let size_val = b.const_i32(elem_size_bytes as i32);
@@ -2058,7 +4286,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
             }
             lower_stmts(b, ctx, body);
 
@@ -2068,7 +4296,34 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Continue { .. } => {} // no-op
+        Stmt::Continue { label: Some(lbl) } => {
+            // Labeled CONTINUE: fall through to the label's block.
+            if let Some(&label_bb) = ctx.label_blocks.get(lbl) {
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(label_bb, vec![]);
+                }
+                b.set_block(label_bb);
+            }
+        }
+        Stmt::Continue { label: None } => {} // no-op
+
+        Stmt::Goto { label } => {
+            if let Some(&target_bb) = ctx.label_blocks.get(label) {
+                b.branch(target_bb, vec![]);
+            }
+        }
+
+        Stmt::Labeled { label, stmt: inner } => {
+            // Create an edge from the current block into the label's block (fall-through),
+            // then switch to the label's block and lower the inner statement.
+            if let Some(&label_bb) = ctx.label_blocks.get(label) {
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(label_bb, vec![]);
+                }
+                b.set_block(label_bb);
+            }
+            lower_stmt(b, ctx, inner);
+        }
 
         Stmt::Open { specs } => {
             // Extract UNIT and FILE from specs. Simplified: first spec is unit, second is file.
@@ -2333,7 +4588,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
             addr
         });
 
@@ -2515,7 +4770,85 @@ fn lower_array_element(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
 ) -> ValueId {
-    // Compute flat index from subscripts.
+    let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
+    let base = array_base_addr(b, info);
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
+    b.load(elem_ptr)
+}
+
+/// Compute the column-major flat ELEMENT offset (i64) for an array
+/// subscript expression, returning a value suitable for `b.gep` (which
+/// scales by the GEP result element size).
+///
+/// Two paths:
+///   * Static-shape arrays (`info.dims` populated): fold strides at
+///     compile time.
+///   * Allocatable arrays (rank/extents only known at runtime): load
+///     lower_bound and upper_bound from the runtime descriptor and
+///     accumulate the cumulative stride as a runtime i64.
+///
+/// Audit5 MAJOR-1: previously both lower_array_element and
+/// lower_array_store fell back to `(1, 1)` for every dim of an
+/// allocatable, leaving cumulative stride = 1. m(i, j) for a 3x4
+/// allocatable then computed `(i-1) + (j-1)` instead of
+/// `(i-1) + (j-1)*3`, so writes clobbered each other and reads
+/// returned garbage.
+fn compute_flat_elem_offset(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+) -> ValueId {
+    if info.allocatable {
+        // Runtime descriptor path. Each DimDescriptor is 24 bytes
+        // starting at descriptor offset 24:
+        //   +0  lower_bound : i64
+        //   +8  upper_bound : i64
+        //   +16 stride      : i64 (we use 1)
+        let mut flat: Option<ValueId> = None;
+        let mut cum_stride: Option<ValueId> = None; // i64
+        let one64 = b.const_i64(1);
+        for (dim_idx, arg) in args.iter().enumerate() {
+            let sub_raw = match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    lower_expr(b, locals, e, st)
+                }
+                _ => b.const_i64(0),
+            };
+            let sub = widen_idx_to_i64(b, sub_raw);
+
+            let dim_base = 24 + (dim_idx as i64) * 24;
+            let off_lo = b.const_i64(dim_base);
+            let off_up = b.const_i64(dim_base + 8);
+            let p_lo = b.gep(info.addr, vec![off_lo], IrType::Int(IntWidth::I8));
+            let p_up = b.gep(info.addr, vec![off_up], IrType::Int(IntWidth::I8));
+            let lo = b.load_typed(p_lo, IrType::Int(IntWidth::I64));
+            let up = b.load_typed(p_up, IrType::Int(IntWidth::I64));
+
+            let adjusted = b.isub(sub, lo);
+
+            let dim_offset = match cum_stride {
+                None => adjusted, // first dim has cumulative stride 1
+                Some(s) => b.imul(adjusted, s),
+            };
+            flat = Some(match flat {
+                Some(prev) => b.iadd(prev, dim_offset),
+                None => dim_offset,
+            });
+
+            // cum_stride *= (upper - lower + 1)
+            let span = b.isub(up, lo);
+            let extent = b.iadd(span, one64);
+            cum_stride = Some(match cum_stride {
+                None => extent,
+                Some(prev) => b.imul(prev, extent),
+            });
+        }
+        return flat.unwrap_or_else(|| b.const_i64(0));
+    }
+
+    // Static-shape path: fold strides at compile time.
     let mut flat_offset: Option<ValueId> = None;
     let mut stride: i64 = 1;
 
@@ -2531,7 +4864,6 @@ fn lower_array_element(
             (1, 1)
         };
 
-        // offset_dim = (subscript - lower) * stride
         let lower_val = b.const_i32(lower as i32);
         let adjusted = b.isub(subscript, lower_val);
 
@@ -2551,15 +4883,264 @@ fn lower_array_element(
     }
 
     let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
-    let base = array_base_addr(b, info);
-    // Widen index to i64 for pointer arithmetic if needed.
-    let idx64 = if info.allocatable {
-        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
-            b.int_extend(idx, IntWidth::I64, true)
-        } else { idx }
-    } else { idx };
-    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    b.load(elem_ptr)
+    // Widen index to i64 for pointer arithmetic. ARM64 GEP lowering
+    // needs an i64 subscript so the codegen `mul` lands as
+    // `mul x, x, x` instead of `mul x, w, x` (which the assembler
+    // rejects). Applies to BOTH stack and allocatable arrays —
+    // gating on `info.allocatable` was the audit's CRITICAL-1.
+    widen_idx_to_i64(b, idx)
+}
+
+/// Widen an i32 (or smaller) index value to i64 for pointer
+/// arithmetic. Pass through for values already i64 or larger.
+fn widen_idx_to_i64(b: &mut FuncBuilder, idx: ValueId) -> ValueId {
+    match b.func().value_type(idx) {
+        Some(IrType::Int(IntWidth::I64)) => idx,
+        Some(IrType::Int(_)) => b.int_extend(idx, IntWidth::I64, true),
+        _ => idx,
+    }
+}
+
+/// Lower an ALLOCATE bound subscript to (lower_bound, upper_bound)
+/// as i64 values. Both forms are valid:
+///
+///   allocate(a(N))      → Element(N)        → (1, N)
+///   allocate(a(0:N))    → Range(0, N)       → (0, N)
+///   allocate(a(lo:hi))  → Range(lo, hi)     → (lo, hi)
+///
+/// A bare `Range { start: None, .. }` defaults the lower bound
+/// to 1 (Fortran convention). A `Range` with no `end` is
+/// invalid in ALLOCATE — defaults to 1 to keep the runtime
+/// from segfaulting and let the verifier catch it.
+///
+/// Audit6 BLOCKING-4: the previous Stmt::Allocate code only
+/// handled Element subscripts and silently dropped the Range
+/// case to const_i64(1), causing heap corruption on
+/// `allocate(m(0:2, 0:3))`.
+fn lower_alloc_bounds(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    sub: &crate::ast::expr::SectionSubscript,
+    st: &SymbolTable,
+) -> (ValueId, ValueId) {
+    use crate::ast::expr::SectionSubscript;
+    match sub {
+        SectionSubscript::Element(e) => {
+            let up = lower_expr(b, locals, e, st);
+            let up64 = widen_idx_to_i64(b, up);
+            let lo64 = b.const_i64(1);
+            (lo64, up64)
+        }
+        SectionSubscript::Range { start, end, .. } => {
+            let lo64 = match start {
+                Some(e) => {
+                    let v = lower_expr(b, locals, e, st);
+                    widen_idx_to_i64(b, v)
+                }
+                None => b.const_i64(1),
+            };
+            let up64 = match end {
+                Some(e) => {
+                    let v = lower_expr(b, locals, e, st);
+                    widen_idx_to_i64(b, v)
+                }
+                None => b.const_i64(1),
+            };
+            (lo64, up64)
+        }
+    }
+}
+
+/// Element-byte size for an IR scalar type. Used by array
+/// constructor lowering to compute byte offsets into a destination
+/// buffer. Defaults to 8 for unknown/wide types so we never
+/// under-step (a wrong-direction error would silently scribble
+/// over adjacent elements).
+fn ir_scalar_byte_size(ty: &IrType) -> i64 {
+    match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+        _ => 8,
+    }
+}
+
+/// Store the literal values of an array constructor into a
+/// destination buffer, one element at a time via byte-level GEP.
+///
+/// `dest_base` is a byte pointer to the start of the buffer
+/// (already loaded from a descriptor if the dest is allocatable).
+/// `elem_ty` is the element type used to coerce/size each value.
+///
+/// Handles both literal expressions and implied-do iterators.
+/// Literal expressions use a compile-time byte offset; implied-do
+/// iterators generate a real runtime loop that advances an
+/// alloca-backed offset. The DO variable is installed in a
+/// clone of `locals` so the inner expression can reference it.
+///
+/// Audit BLOCKING-1: previously the implied-do branch silently
+/// skipped all stores and advanced a compile-time counter,
+/// leaving the destination buffer with whatever stack bytes
+/// happened to be there (the comment lied about allocas being
+/// zeroed). Programs that used `[(expr, i=1,n)]` got garbage.
+fn store_ac_values_into(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_ty: &IrType,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+) {
+    let elem_bytes = ir_scalar_byte_size(elem_ty);
+    // Runtime byte offset. Starts at 0 and is bumped by elem_bytes
+    // after each store. Using an alloca (not a ValueId) lets the
+    // implied-do loop body update the offset across iterations.
+    let off_slot = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, off_slot);
+    let step_bytes = b.const_i64(elem_bytes);
+
+    for v in values {
+        match v {
+            crate::ast::expr::AcValue::Expr(e) => {
+                let raw = lower_expr(b, locals, e, st);
+                let coerced = coerce_to_type(b, raw, elem_ty);
+                let cur_off = b.load(off_slot);
+                let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                b.store(coerced, p);
+                let next_off = b.iadd(cur_off, step_bytes);
+                b.store(next_off, off_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo { values: inner, var, start, end, step } => {
+                store_ac_implied_do(
+                    b, locals, dest_base, elem_ty, elem_bytes, off_slot,
+                    inner, var, start, end, step.as_ref(), st,
+                );
+            }
+        }
+    }
+}
+
+/// Lower an implied-do array constructor iterator:
+///   `( inner_values, var = start, end [, step] )`
+/// produces the sequence `inner_values[var=start], inner_values[var=start+step], …`.
+/// Each iteration evaluates the inner value list with `var` bound
+/// to the current iteration, stores them at the current offset,
+/// and advances the offset. The DO variable is installed into a
+/// scratch clone of `locals` for the duration of the iterator.
+#[allow(clippy::too_many_arguments)]
+fn store_ac_implied_do(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_ty: &IrType,
+    elem_bytes: i64,
+    off_slot: ValueId,
+    inner: &[crate::ast::expr::AcValue],
+    var: &str,
+    start: &crate::ast::expr::SpannedExpr,
+    end: &crate::ast::expr::SpannedExpr,
+    step: Option<&crate::ast::expr::SpannedExpr>,
+    st: &SymbolTable,
+) {
+    // DO variable as a fresh i32 alloca, installed in a scratch
+    // locals map so the inner expressions can reference it.
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_val = lower_expr(b, locals, start, st);
+    let start_coerced = coerce_to_type(b, start_val, &var_ty);
+    b.store(start_coerced, var_addr);
+
+    let end_val = lower_expr(b, locals, end, st);
+    let end_coerced = coerce_to_type(b, end_val, &var_ty);
+
+    let step_val_raw = match step {
+        Some(e) => lower_expr(b, locals, e, st),
+        None => b.const_i32(1),
+    };
+    let step_val = coerce_to_type(b, step_val_raw, &var_ty);
+
+    let mut scratch_locals = locals.clone();
+    scratch_locals.insert(var.to_lowercase(), LocalInfo {
+        addr: var_addr,
+        ty: var_ty.clone(),
+        dims: vec![],
+        allocatable: false,
+        by_ref: false,
+        char_kind: CharKind::None,
+        derived_type: None, inline_const: None,
+    });
+
+    // Loop skeleton: check → body → exit. Mirrors the regular DO
+    // lowerer's sign-of-step handling: if `step` is a compile-time
+    // constant, pick `Le` for positive and `Ge` for negative; if
+    // it's a runtime value, branch on the sign and emit two check
+    // arms. Audit BLOCKING-1: the previous version hardcoded `Le`
+    // and `[(i, i=5,1,-1)]` skipped the body entirely.
+    let check = b.create_block("ac_impdo_check");
+    let body  = b.create_block("ac_impdo_body");
+    let exit  = b.create_block("ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let cur_var = b.load(var_addr);
+    let const_step = step.and_then(eval_const_int);
+    if let Some(sv) = const_step {
+        let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let cond = b.icmp(cmp_op, cur_var, end_coerced);
+        b.cond_branch(cond, body, vec![], exit, vec![]);
+    } else {
+        // Runtime step: branch on sign at the check site so we
+        // pick the correct comparison without recomputing on each
+        // iteration. Two check sub-blocks, one per direction.
+        let zero = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+        let bb_neg = b.create_block("ac_impdo_neg_check");
+        let bb_pos = b.create_block("ac_impdo_pos_check");
+        b.cond_branch(step_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let cond_neg = b.icmp(CmpOp::Ge, cur_var, end_coerced);
+        b.cond_branch(cond_neg, body, vec![], exit, vec![]);
+
+        b.set_block(bb_pos);
+        let cond_pos = b.icmp(CmpOp::Le, cur_var, end_coerced);
+        b.cond_branch(cond_pos, body, vec![], exit, vec![]);
+    }
+
+    // Body: evaluate each inner value and store at the current
+    // offset. Recurses into store_ac_values_into so nested
+    // implied-do works.
+    b.set_block(body);
+    for iv in inner {
+        match iv {
+            crate::ast::expr::AcValue::Expr(e) => {
+                let raw = lower_expr(b, &scratch_locals, e, st);
+                let coerced = coerce_to_type(b, raw, elem_ty);
+                let cur_off = b.load(off_slot);
+                let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                b.store(coerced, p);
+                let step_bytes = b.const_i64(elem_bytes);
+                let next_off = b.iadd(cur_off, step_bytes);
+                b.store(next_off, off_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo { values: nested, var: nv, start: ns, end: ne, step: nstep } => {
+                store_ac_implied_do(
+                    b, &scratch_locals, dest_base, elem_ty, elem_bytes, off_slot,
+                    nested, nv, ns, ne, nstep.as_ref(), st,
+                );
+            }
+        }
+    }
+    // Advance the DO variable and loop.
+    let cur_var_end = b.load(var_addr);
+    let next_var = b.iadd(cur_var_end, step_val);
+    b.store(next_var, var_addr);
+    b.branch(check, vec![]);
+
+    // Continue emitting into exit.
+    b.set_block(exit);
 }
 
 /// Lower an array element store: compute flat offset, GEP, store.
@@ -2571,48 +5152,18 @@ fn lower_array_store(
     value: ValueId,
     st: &SymbolTable,
 ) {
-    let mut flat_offset: Option<ValueId> = None;
-    let mut stride: i64 = 1;
-
-    for (dim_idx, arg) in args.iter().enumerate() {
-        let subscript = match &arg.value {
-            crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
-            _ => b.const_i32(0),
-        };
-
-        let (lower, extent) = if dim_idx < info.dims.len() {
-            info.dims[dim_idx]
-        } else {
-            (1, 1)
-        };
-
-        let lower_val = b.const_i32(lower as i32);
-        let adjusted = b.isub(subscript, lower_val);
-
-        let dim_offset = if stride == 1 {
-            adjusted
-        } else {
-            let stride_val = b.const_i32(stride as i32);
-            b.imul(adjusted, stride_val)
-        };
-
-        flat_offset = Some(match flat_offset {
-            Some(prev) => b.iadd(prev, dim_offset),
-            None => dim_offset,
-        });
-
-        stride *= extent;
-    }
-
-    let idx = flat_offset.unwrap_or_else(|| b.const_i32(0));
+    let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
     let base = array_base_addr(b, info);
-    let idx64 = if info.allocatable {
-        if matches!(b.func().value_type(idx), Some(IrType::Int(IntWidth::I32))) {
-            b.int_extend(idx, IntWidth::I64, true)
-        } else { idx }
-    } else { idx };
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    b.store(value, elem_ptr);
+    // Audit5 CRITICAL-1: coerce the RHS to the array element
+    // type before the store. Without this, an i32-typed value
+    // assigned into an i8 array would emit a 4-byte STR through
+    // a 1-byte slot, clobbering the next 3 bytes. The verifier's
+    // store-pointee width check has a `pointee_is_byte` escape
+    // hatch for derived-type byte-cursor GEPs, so the bad store
+    // wasn't caught at the IR level either.
+    let coerced = coerce_to_type(b, value, &info.ty);
+    b.store(coerced, elem_ptr);
 }
 
 /// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.
@@ -2633,13 +5184,67 @@ fn lower_write_items_adv(
     advance: bool,
 ) {
     for item in items {
-        let is_char = if let Expr::Name { name } = &item.node {
-            ctx.locals.get(&name.to_lowercase())
+        let is_char = match &item.node {
+            Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
                 .map(|i| i.char_kind != CharKind::None)
-                .unwrap_or(false)
-        } else {
-            false
+                .unwrap_or(false),
+            Expr::FunctionCall { callee, .. } => {
+                if let Expr::Name { name } = &callee.node {
+                    matches!(name.to_lowercase().as_str(),
+                        "trim" | "adjustl" | "adjustr" | "char")
+                } else { false }
+            }
+            _ => false,
         };
+
+        // Whole-array print: a plain Name reference whose local
+        // has array dims. Iterate elements and call the per-element
+        // write helper. Without this, the Ptr<_> the item lowers to
+        // would fall into the IrType::Ptr arm below and dispatch to
+        // afs_write_string with a bogus length.
+        //
+        // Also handles 1-D array slices `a(lo:hi)` and `a(lo:hi:step)`
+        // by detecting a FunctionCall with a Range subscript on an
+        // array name. Slices bypass the section-descriptor code
+        // path (which crashes in afs_create_section for a bare
+        // write item) and instead lower directly into a bounded
+        // loop over the underlying base.
+        if !is_char {
+            if let Expr::Name { name } = &item.node {
+                let key = name.to_lowercase();
+                if let Some(info) = ctx.locals.get(&key).cloned() {
+                    if !info.dims.is_empty() || info.allocatable {
+                        lower_whole_array_write(b, ctx, &info, unit);
+                        continue;
+                    }
+                }
+            }
+            if let Expr::FunctionCall { callee, args } = &item.node {
+                if let Expr::Name { name } = &callee.node {
+                    let key = name.to_lowercase();
+                    if let Some(info) = ctx.locals.get(&key).cloned() {
+                        if !info.dims.is_empty() || info.allocatable {
+                            let has_range = args.iter().any(|a|
+                                matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }));
+                            if has_range {
+                                if args.len() == 1 {
+                                    lower_1d_slice_write(b, ctx, &info, &args[0], unit);
+                                } else {
+                                    // Audit CRITICAL-3: multi-dim
+                                    // slice prints used to fall
+                                    // through to afs_create_section
+                                    // on a bare stack pointer and
+                                    // crash. Now lowered as nested
+                                    // column-major loops directly.
+                                    lower_section_write_nd(b, ctx, &info, args, unit);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
@@ -2676,12 +5281,17 @@ fn lower_fmt_push(
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
 ) {
-    let is_char = if let Expr::Name { name } = &item.node {
-        ctx.locals.get(&name.to_lowercase())
+    let is_char = match &item.node {
+        Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
             .map(|i| i.char_kind != CharKind::None)
-            .unwrap_or(false)
-    } else {
-        false
+            .unwrap_or(false),
+        Expr::FunctionCall { callee, .. } => {
+            if let Expr::Name { name } = &callee.node {
+                matches!(name.to_lowercase().as_str(),
+                    "trim" | "adjustl" | "adjustr" | "char")
+            } else { false }
+        }
+        _ => false,
     };
 
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
@@ -2699,8 +5309,13 @@ fn lower_fmt_push(
                 let widened = b.int_extend(val, IntWidth::I64, true);
                 b.call(FuncRef::External("afs_fmt_push_int".into()), vec![widened], IrType::Void);
             }
+            IrType::Float(FloatWidth::F32) => {
+                // afs_fmt_push_real takes f64; explicitly widen f32 → f64.
+                // AArch64 does NOT auto-promote floats across the call boundary.
+                let widened = b.float_extend(val, FloatWidth::F64);
+                b.call(FuncRef::External("afs_fmt_push_real".into()), vec![widened], IrType::Void);
+            }
             IrType::Float(_) => {
-                // afs_fmt_push_real takes f64; f32 is promoted by calling convention.
                 b.call(FuncRef::External("afs_fmt_push_real".into()), vec![val], IrType::Void);
             }
             IrType::Bool => {
@@ -2719,6 +5334,382 @@ fn lower_fmt_push(
             }
         }
     }
+}
+
+/// Lower a 1-D slice write item: `print *, a(lo:hi[:step])`.
+/// Iterates the declared range and calls the per-element write
+/// helper. Sections with a rank > 1 and non-lower-dim subscripts
+/// are not yet supported and fall through to the existing
+/// section-descriptor path, which may not format nicely.
+///
+/// Missing bounds default to the array's declared extents:
+///   `a(:)`   → full range
+///   `a(lo:)` → lo to end
+///   `a(:hi)` → start to hi
+fn lower_1d_slice_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    arg: &crate::ast::expr::Argument,
+    unit: ValueId,
+) {
+    let (start_e, end_e, stride_e) = match &arg.value {
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            (start.as_ref(), end.as_ref(), stride.as_ref())
+        }
+        _ => return,
+    };
+
+    // Default to the declared bounds of dimension 0.
+    let (decl_lo, decl_ext) = info.dims.first().copied().unwrap_or((1, 0));
+    let decl_hi = decl_lo + decl_ext - 1;
+
+    let start_val = match start_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_lo as i32),
+    };
+    let end_val = match end_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_hi as i32),
+    };
+    let stride_val = match stride_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(1),
+    };
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // `i` counter, starts at the slice's first index.
+    let i_addr = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(start_val, i_addr);
+
+    let bb_check = b.create_block("slice_write_check");
+    let bb_body  = b.create_block("slice_write_body");
+    let bb_exit  = b.create_block("slice_write_exit");
+    b.branch(bb_check, vec![]);
+
+    // Sign-of-stride handling, mirroring the regular DO lowerer.
+    // For ascending stride, exit when `i > end`; for descending,
+    // exit when `i < end`. Audit BLOCKING-2: the previous version
+    // hardcoded `Gt`, so `print *, a(5:1:-1)` exited on the very
+    // first iteration with no elements written.
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let const_stride = stride_e.and_then(eval_const_int);
+    if let Some(sv) = const_stride {
+        let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+        let done = b.icmp(done_op, i, end_val);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    } else {
+        // Runtime stride: branch on sign at the check site.
+        let zero = b.const_i32(0);
+        let stride_neg = b.icmp(CmpOp::Lt, stride_val, zero);
+        let bb_neg = b.create_block("slice_write_neg_check");
+        let bb_pos = b.create_block("slice_write_pos_check");
+        b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let done_neg = b.icmp(CmpOp::Lt, i, end_val);
+        b.cond_branch(done_neg, bb_exit, vec![], bb_body, vec![]);
+
+        b.set_block(bb_pos);
+        let done_pos = b.icmp(CmpOp::Gt, i, end_val);
+        b.cond_branch(done_pos, bb_exit, vec![], bb_body, vec![]);
+    }
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    // Translate declared-index `i` → byte offset into base:
+    //   (i - decl_lo) * elem_bytes
+    let lo_const = b.const_i32(decl_lo as i32);
+    let zero_based = b.isub(i_val, lo_const);
+    let zero_based64 = widen_idx_to_i64(b, zero_based);
+    let step = b.const_i64(elem_bytes);
+    let byte_off = b.imul(zero_based64, step);
+    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let elem = b.load_typed(p, info.ty.clone());
+    b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let next = b.iadd(i_val, stride_val);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+/// Lower an N-dimensional array section write item, e.g.
+/// `print *, m(:, 1)` or `print *, m(2:3, 1:2)`. Generates one
+/// nested loop per dimension, innermost = dim 0 (Fortran column-
+/// major iteration order), and at the leaf computes the flat
+/// byte offset into the array's base.
+///
+/// Element subscripts (`m(:, 1)`) collapse to a single iteration
+/// at the fixed value. Range subscripts iterate from start to
+/// end with the given stride (defaults: declared bounds, stride
+/// 1). Stride sign is honored both at compile time and at runtime.
+///
+/// Audit CRITICAL-3: multi-dim slice prints used to mis-dispatch
+/// through afs_create_section on a bare stack pointer and crash
+/// at runtime reading 384 bytes of garbage as a descriptor.
+fn lower_section_write_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    unit: ValueId,
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // For each dimension we need: a runtime counter alloca plus
+    // its start/end/stride values, the declared lower bound (for
+    // base-relative offset arithmetic), and the cumulative stride
+    // for column-major flat-offset computation. start_val is
+    // saved so non-innermost loop bodies can RE-init the inner
+    // counter on each outer iteration.
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        decl_lo: i64,
+        cum_stride: i64,
+    }
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_stride: i64 = 1;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let (decl_lo, decl_ext) = info.dims.get(dim_idx).copied().unwrap_or((1, 0));
+        let decl_hi = decl_lo + decl_ext - 1;
+
+        let counter = b.alloca(IrType::Int(IntWidth::I32));
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_lo as i32),
+                };
+                let end_v = match end {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_hi as i32),
+                };
+                let stride_v = match stride {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(1),
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let v = lower_expr(b, &ctx.locals, e, ctx.st);
+                // Single-element dimension: start == end, stride 1.
+                (v, v, b.const_i32(1), Some(1))
+            }
+        };
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter, start_val, end_val, stride_val, const_stride,
+            decl_lo, cum_stride,
+        });
+        cum_stride *= decl_ext.max(1);
+    }
+
+    // Build nested check/body/exit blocks, OUTERMOST first (last
+    // dim) — we want innermost = dim 0 for column-major iteration.
+    // Layout per dimension d (counting from outermost):
+    //   check_d → body_d? exit_d
+    //   body_d:
+    //     [if d > 0] init counter[d-1] = start[d-1]; branch check_{d-1}
+    //     [if d == 0] compute offset, GEP, write, branch incr_0
+    //   incr_d: counter[d] += stride[d]; branch check_d
+    //   exit_d
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("sec_check_d{}", d)));
+        bodies.push(b.create_block(&format!("sec_body_d{}", d)));
+        incrs.push(b.create_block(&format!("sec_incr_d{}", d)));
+        exits.push(b.create_block(&format!("sec_exit_d{}", d)));
+    }
+
+    // Enter the outermost loop. Walking from outermost (n-1) to
+    // innermost (0) means index n-1 is the LAST in the dims vec.
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    // Emit each dimension's check/incr/exit. Body chains down to
+    // the next inner dim (or to the leaf computation at d == 0).
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev; // outermost first
+
+        // Check block: load counter, compare against end with the
+        // appropriate cmp op (sign of stride).
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let zero = b.const_i32(0);
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero);
+            let bb_neg = b.create_block(&format!("sec_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("sec_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        // Body block. If we're at the innermost dim, compute the
+        // offset and emit the load+write. Otherwise, init the
+        // next-inner dim's counter and branch to its check.
+        b.set_block(bodies[d]);
+        if d == 0 {
+            // Innermost: compute flat offset = sum over all dims of
+            // (counter - decl_lo) * cum_stride * elem_bytes.
+            let mut byte_offset: Option<ValueId> = None;
+            // Borrow `dims` immutably while iterating it; the loop
+            // body needs &mut b so we collect the per-dim values
+            // first, then emit the IR for the sum afterwards.
+            let dim_data: Vec<(ValueId, i64, i64)> = dims.iter()
+                .map(|d| (d.counter, d.decl_lo, d.cum_stride))
+                .collect();
+            for (counter, decl_lo, cum_stride_d) in dim_data {
+                let cnt = b.load(counter);
+                let lo_const = b.const_i32(decl_lo as i32);
+                let zero_based = b.isub(cnt, lo_const);
+                let zero_based64 = widen_idx_to_i64(b, zero_based);
+                let stride_const = b.const_i64(cum_stride_d * elem_bytes);
+                let term = b.imul(zero_based64, stride_const);
+                byte_offset = Some(match byte_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
+            let p = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
+            let elem = b.load_typed(p, info.ty.clone());
+            b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+            b.branch(incrs[0], vec![]);
+        } else {
+            // Not innermost: re-init the next-inner dim's counter
+            // to its start value (RESET on each outer iteration),
+            // then branch to its check block.
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        // Increment block: counter += stride; branch back to check.
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        // Exit block: continue out to next-outer increment, or
+        // fall through past everything if this was the outermost.
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+        // If d == n-1 (outermost exit), the caller of this helper
+        // continues emitting after exits[outer]. We leave the
+        // current block set to exits[outer] below.
+    }
+
+    // The final current block must be exits[outer] so subsequent
+    // statement lowering continues after the section loop.
+    b.set_block(exits[outer]);
+}
+
+/// Lower a whole-array write item: iterate every element of the
+/// array and call the per-element write helper. Used by `print *,
+/// arr` and equivalent forms. Without this the array's base
+/// pointer leaks into the Ptr<_> arm of the scalar write
+/// dispatcher and gets mis-routed to afs_write_string.
+fn lower_whole_array_write(
+    b: &mut FuncBuilder,
+    _ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    unit: ValueId,
+) {
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let writer = match &info.ty {
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    // Compile-time-known size for stack arrays; runtime descriptor
+    // call for allocatables.
+    let n = if info.allocatable {
+        b.call(FuncRef::External("afs_array_size".into()),
+               vec![info.addr], IrType::Int(IntWidth::I64))
+    } else {
+        let total: i64 = info.dims.iter().map(|(_, ext)| *ext).product();
+        b.const_i64(total.max(0))
+    };
+
+    // Stack-allocated loop counter, like lower_array_assign.
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("write_arr_check");
+    let bb_body  = b.create_block("write_arr_body");
+    let bb_exit  = b.create_block("write_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    let byte_off = b.imul(i_val, elem_bytes_v);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let elem = b.load_typed(ptr, info.ty.clone());
+    b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
 }
 
 /// Get the data base address for an array variable.
@@ -2785,7 +5776,7 @@ fn lower_forall_nested(
             ctx.locals.insert(key.clone(), LocalInfo {
                 addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
                 allocatable: false, by_ref: false, char_kind: CharKind::None,
-                derived_type: None,
+                derived_type: None, inline_const: None,
             });
             addr
         });
@@ -2837,6 +5828,17 @@ fn lower_array_assign(
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) {
+    // a = [v0, v1, v2, ...] — element-wise store of an array
+    // constructor's literal values into the destination.
+    if let Expr::ArrayConstructor { values, .. } = &value.node {
+        let dest_base = if dest_info.allocatable {
+            b.load_typed(dest_info.addr,
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+        } else { dest_info.addr };
+        store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        return;
+    }
+
     // Check if RHS is also an array variable → element-wise copy via memcpy.
     let rhs_is_array = if let Expr::Name { name } = &value.node {
         ctx.locals.get(&name.to_lowercase())
@@ -3441,6 +6443,13 @@ fn lower_expr_full(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             if let Some(info) = locals.get(&key) {
+                // Audit MAJOR-4: PARAMETER-attributed locals with
+                // a folded value get inlined directly. The const
+                // is materialized via the appropriate b.const_*
+                // helper, matching the local's declared type.
+                if let Some(c) = info.inline_const {
+                    return materialize_const_scalar(b, c, &info.ty);
+                }
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
@@ -3604,6 +6613,36 @@ fn lower_expr_full(
                     }
                 }
 
+                // Try character intrinsics (need access to locals for CharKind).
+                if let Some(result) = lower_char_intrinsic(b, &key, args, locals, st) {
+                    return result;
+                }
+
+                // PRESENT(x): check if optional dummy argument x was passed.
+                // By-ref params are stored as `alloca Ptr<T>` in locals; when the
+                // caller omits an optional arg it passes null (0). Load the stored
+                // pointer and compare to zero → non-zero means present.
+                if key == "present" {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            if let Expr::Name { name: arg_name } = &e.node {
+                                let akey = arg_name.to_lowercase();
+                                if let Some(info) = locals.get(&akey) {
+                                    if info.by_ref {
+                                        // Load the incoming pointer stored in the by-ref slot.
+                                        // If absent, caller passes 0; if present, non-zero address.
+                                        let ptr_val = b.load(info.addr);
+                                        let zero = b.const_i64(0);
+                                        return b.icmp(CmpOp::Ne, ptr_val, zero);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If we can't resolve it (non-standard usage), assume present.
+                    return b.const_bool(true);
+                }
+
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
@@ -3679,7 +6718,67 @@ fn lower_expr_full(
             b.const_i32(0) // fallback for unresolved component access
         }
 
+        Expr::ArrayConstructor { values, .. } => {
+            // Allocate a temporary stack array, store each literal
+            // element into it, return the base pointer. Element
+            // type is inferred from the first element's IR type
+            // (or defaults to i32 for an empty constructor — rare
+            // but legal). Implied-do values are slot-skipped by
+            // store_ac_values_into; see the helper for details.
+            //
+            // The expression form is needed when an array literal
+            // appears as a function argument or print item; the
+            // assignment form (`a = [1,2,3]`) bypasses this and
+            // routes through lower_array_assign for direct stores.
+            let elem_ty = values.iter()
+                .find_map(|v| match v {
+                    crate::ast::expr::AcValue::Expr(e) => {
+                        // Peek at the first element's type by
+                        // lowering it on a scratch path. Rather
+                        // than actually lower (and have to undo),
+                        // approximate from the AST: integer
+                        // literals → i32, real → f64, etc.
+                        Some(infer_const_expr_ty(&e.node))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(IrType::Int(IntWidth::I32));
+            let n = values.len() as u64;
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1));
+            let buf = b.alloca(arr_ty);
+            store_ac_values_into(b, locals, buf, &elem_ty, values, st);
+            buf
+        }
+
         _ => b.const_i32(0), // placeholder for unhandled expressions
+    }
+}
+
+/// Approximate the IR type of a constant-or-near-constant
+/// expression by inspecting the AST. Used by ArrayConstructor
+/// lowering to pick an element type without actually emitting IR.
+/// Conservative — falls back to i32 for anything it can't
+/// classify.
+fn infer_const_expr_ty(e: &Expr) -> IrType {
+    match e {
+        Expr::IntegerLiteral { kind, .. } => {
+            if kind.as_deref() == Some("8") {
+                IrType::Int(IntWidth::I64)
+            } else {
+                IrType::Int(IntWidth::I32)
+            }
+        }
+        Expr::RealLiteral { text, .. } => {
+            if text.to_lowercase().contains('d') {
+                IrType::Float(FloatWidth::F64)
+            } else {
+                IrType::Float(FloatWidth::F32)
+            }
+        }
+        Expr::LogicalLiteral { .. } => IrType::Bool,
+        Expr::UnaryOp { operand, .. } => infer_const_expr_ty(&operand.node),
+        Expr::ParenExpr { inner } => infer_const_expr_ty(&inner.node),
+        _ => IrType::Int(IntWidth::I32),
     }
 }
 
@@ -4042,7 +7141,7 @@ program test
   deallocate(a)
 end program
 ");
-        assert!(ir.contains("call @afs_allocate_1d"), "expected allocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_allocate_array"), "expected allocate call in:\n{}", ir);
         assert!(ir.contains("call @afs_deallocate_array"), "expected deallocate call in:\n{}", ir);
     }
 

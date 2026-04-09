@@ -11,6 +11,7 @@ use super::dce::Dce;
 use super::cse::LocalCse;
 use super::strength_reduce::StrengthReduce;
 use super::licm::Licm;
+use super::mem2reg::Mem2Reg;
 
 /// Compiler optimization levels.
 ///
@@ -96,6 +97,14 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
         }
         OptLevel::O1 => {
             // Cheap, always-correct cleanup.
+            //
+            // Mem2reg runs FIRST so every downstream pass sees SSA
+            // values instead of alloca/load/store round-trips.
+            // Without it, const_fold can't propagate constants
+            // through local variables, CSE can't dedupe across
+            // store/load pairs, and LICM is effectively dormant
+            // (loads block every hoist attempt).
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
@@ -105,6 +114,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             // O1 plus LICM, small inlining, strength reduction,
             // bounds-check elim, GVN, SROA, DSE, small loop unroll,
             // FMA fusion. Os trims unrolling/inlining heuristics.
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));
@@ -113,9 +123,16 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // O2 plus vectorization, aggressive inlining, IPO,
-            // devirtualization, speculative optimizations.
-            // Ofast additionally enables fast-math reassociation.
+            // Audit Cos-1: O3/Ofast currently runs the same pass
+            // pipeline as O2. The aspirational additions —
+            // vectorization, aggressive inlining, IPO,
+            // devirtualization, speculative optimizations,
+            // Ofast fast-math reassociation — are deferred to a
+            // later sprint (NEON vectorization is the natural
+            // next milestone). The arms are kept distinct so the
+            // -O3/-Ofast flags continue to be accepted and the
+            // future additions land in the obvious place.
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalCse));

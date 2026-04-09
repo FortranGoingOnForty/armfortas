@@ -16,22 +16,18 @@ pub mod dce;
 pub mod cse;
 pub mod strength_reduce;
 pub mod licm;
+pub mod mem2reg;
 
 #[cfg(test)]
 mod audit_tests;
 
-#[allow(unused_imports)]
-pub use pass::{Pass, PassManager, PassRunResult};
+// Public surface of the opt module: only the entry points the
+// driver actually uses. Audit Cos-2: previously every pass was
+// re-exported behind `#[allow(unused_imports)]`, which masked any
+// future regressions that orphaned a re-export.
 pub use pipeline::{OptLevel, build_pipeline};
-#[allow(unused_imports)]
-pub use const_fold::ConstFold;
-#[allow(unused_imports)]
-pub use const_prop::ConstProp;
-#[allow(unused_imports)]
-pub use dce::Dce;
-#[allow(unused_imports)]
+
+// Test-only re-export so audit_tests can refer to passes by their
+// short name without the full module path.
+#[cfg(test)]
 pub use cse::LocalCse;
-#[allow(unused_imports)]
-pub use strength_reduce::StrengthReduce;
-#[allow(unused_imports)]
-pub use licm::Licm;

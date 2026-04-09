@@ -4,3 +4,21 @@
 target/
 tests/reports/
 CLAUDE.md
+AGENTS.md
+
+# Compiled binaries from interactive testing in the workspace root.
+# These are leftover outputs of `armfortas <foo>.f90` runs that
+# default to a binary named after the program. Audit Min-4.
+/allocatable
+/audit_test
+/iso_c_check
+/test_boz
+/test_doconcurrent
+/test_locality
+/test_null_ptr
+/test_stop
+/test_use_iso
+
+# IR / object dumps from --emit-ir and -c runs.
+/*.ir
+/*.o

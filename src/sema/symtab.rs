@@ -31,6 +31,13 @@ impl SymbolTable {
         };
         Self { scopes: vec![global], current: 0 }
     }
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self { Self::new() }
+}
+
+impl SymbolTable {
 
     /// Create a new child scope of the current scope.
     pub fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {

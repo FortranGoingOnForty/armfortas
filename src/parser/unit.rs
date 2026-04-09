@@ -385,6 +385,44 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // Standalone declaration statements that introduce no
+            // new type. Audit MAJOR-2: prior to this dispatch the
+            // PARAMETER/COMMON/DATA parsers existed but were never
+            // called, so `parameter (x = 42)` at statement-start was
+            // silently dropped and the program ran with x=0.
+            //
+            // Audit Maj-5: Fortran has no reserved words, so a
+            // legacy F77 program may use `parameter`, `common`, or
+            // `data` as a variable name. Disambiguate by peeking
+            // at the next token: the declaration form is always
+            // followed by `(` (for PARAMETER and DATA) or `/` (for
+            // COMMON); an expression-statement use as an LHS is
+            // followed by `=`. This is a single-token lookahead.
+            let next_tok = self.tokens.get(self.pos + 1)
+                .map(|t| t.kind.clone());
+            if text == "parameter" && next_tok.as_ref() == Some(&TokenKind::LParen) {
+                self.advance(); // consume 'parameter'
+                decls.push(self.parse_parameter_stmt()?);
+                continue;
+            }
+            if text == "common"
+                && matches!(next_tok.as_ref(), Some(TokenKind::Slash))
+            {
+                self.advance(); // consume 'common'
+                decls.push(self.parse_common_block()?);
+                continue;
+            }
+            if text == "data" && next_tok.as_ref() == Some(&TokenKind::Identifier) {
+                self.advance(); // consume 'data'
+                decls.push(self.parse_data_stmt()?);
+                continue;
+            }
+            if text == "equivalence" && next_tok.as_ref() == Some(&TokenKind::LParen) {
+                self.advance(); // consume 'equivalence'
+                decls.push(self.parse_equivalence_stmt()?);
+                continue;
+            }
+
             // Try as executable statement.
             body.push(self.parse_stmt()?);
         }

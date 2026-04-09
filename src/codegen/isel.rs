@@ -35,10 +35,16 @@ pub fn select_function(func: &Function) -> MachineFunction {
 
     // Phase 2: create machine blocks corresponding to IR blocks.
     // Entry block already exists as MBlockId(0).
+    //
+    // Block labels are prefixed with the function name so two
+    // functions in the same .s file don't collide on common names
+    // like `do_check_1`. The `L` prefix turns them into local
+    // symbols on Apple's assembler.
     ctx.block_map.insert(func.entry, MBlockId(0));
     for block in &func.blocks {
         if block.id != func.entry {
-            let mb_id = mf.new_block(&block.name);
+            let label = format!("L{}_{}", mf.name, block.name);
+            let mb_id = mf.new_block(&label);
             ctx.block_map.insert(block.id, mb_id);
         }
     }
@@ -114,22 +120,61 @@ pub fn select_function(func: &Function) -> MachineFunction {
         }
     }
 
-    // Phase 4: select instructions for each block.
+    // Phase 4a: allocate vregs for EVERY block parameter AND every
+    // instruction result *before* walking any instructions. We need
+    // this upfront because:
+    //
+    //  - A branch terminator needs to know the target block's
+    //    param vregs to emit "move branch arg → target param"
+    //    copies, and the target block may not have been walked yet.
+    //
+    //  - An instruction in block A may reference an SSA value
+    //    defined in block B that appears later in `func.blocks`
+    //    vec order (perfectly legal under SSA dominance — block B
+    //    can dominate block A even if it comes later in the vec).
+    //    Without upfront allocation, the lookup fails.
+    //
+    // Allocation here doesn't emit machine instructions; it just
+    // reserves vreg IDs for every IR ValueId so Phase 4b can use
+    // `lookup_vreg` without ordering concerns.
     for block in &func.blocks {
-        let mb_id = ctx.block_map[&block.id];
-        // Block params → allocate vregs.
         for bp in &block.params {
             let class = type_to_reg_class(&bp.ty);
             let vreg = mf.new_vreg(class);
             ctx.value_map.insert(bp.id, vreg);
         }
+        for inst in &block.insts {
+            // Allocas are special: they're handled by Phase 1
+            // (stack-slot allocation). They don't get vregs.
+            if matches!(inst.kind, InstKind::Alloca(_)) { continue; }
+            // Void-typed insts (Store, RuntimeCall returning void,
+            // etc.) don't produce a usable value.
+            if matches!(inst.ty, IrType::Void) { continue; }
+            let class = type_to_reg_class(&inst.ty);
+            let vreg = mf.new_vreg(class);
+            ctx.value_map.insert(inst.id, vreg);
+        }
+    }
+
+    // Snapshot just each IR block's params into ctx so
+    // `select_terminator` can look them up while we hold a separate
+    // &mut MachineFunction borrow. We don't need a full BasicBlock
+    // clone — only the param list — so this avoids cloning every
+    // instruction in the function for each terminator we visit.
+    for block in &func.blocks {
+        ctx.block_params.insert(block.id, block.params.clone());
+    }
+
+    // Phase 4b: select instructions and terminators for each block.
+    for block in &func.blocks {
+        let mb_id = ctx.block_map[&block.id];
 
         for inst in &block.insts {
-            select_inst(&mut mf, &mut ctx, mb_id, inst);
+            select_inst(&mut mf, &mut ctx, mb_id, inst, func);
         }
 
         if let Some(term) = &block.terminator {
-            select_terminator(&mut mf, &mut ctx, mb_id, term);
+            select_terminator(&mut mf, &mut ctx, mb_id, term, block);
         }
     }
 
@@ -144,6 +189,13 @@ struct ISelCtx {
     block_map: HashMap<BlockId, MBlockId>,
     /// IR alloca ValueId → stack frame offset.
     alloca_offsets: HashMap<ValueId, i32>,
+    /// IR BlockId → its block params. Snapshotted before phase 4b
+    /// so terminator selection can read each target's params
+    /// without re-borrowing the function while &mut MachineFunction
+    /// is held. Cloning just the param vec is dramatically cheaper
+    /// than cloning the whole BasicBlock — instructions can be in
+    /// the thousands, params are typically 0-3.
+    block_params: HashMap<BlockId, Vec<BlockParam>>,
 }
 
 impl ISelCtx {
@@ -152,12 +204,24 @@ impl ISelCtx {
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             alloca_offsets: HashMap::new(),
+            block_params: HashMap::new(),
         }
     }
 
     /// Get the vreg for an IR value, or create one if needed.
+    /// In debug builds, asserts that an existing mapping has the
+    /// same register class as requested — a class mismatch means
+    /// Phase 4a (vreg pre-allocation) and Phase 4b (instruction
+    /// selection) disagree about a value's type, which would
+    /// silently corrupt code.
     fn get_vreg(&mut self, mf: &mut MachineFunction, val: ValueId, class: RegClass) -> VRegId {
         if let Some(&vreg) = self.value_map.get(&val) {
+            debug_assert!(
+                mf.vregs.iter().find(|v| v.id == vreg).map(|v| v.class) == Some(class),
+                "isel: vreg class mismatch for IR value %{} (existing class \
+                 differs from requested {:?}) — phase 4a/4b disagreement",
+                val.0, class,
+            );
             return vreg;
         }
         let vreg = mf.new_vreg(class);
@@ -167,8 +231,16 @@ impl ISelCtx {
 
     /// Get the vreg for an IR value, assuming it was already mapped.
     fn lookup_vreg(&self, val: ValueId) -> VRegId {
-        *self.value_map.get(&val)
-            .unwrap_or_else(|| panic!("isel: unmapped IR value %{}", val.0))
+        *self.value_map.get(&val).unwrap_or_else(|| {
+            panic!(
+                "isel: unmapped IR value %{} — phase 4a should have allocated \
+                 a vreg for every IR value before phase 4b runs. {} values are \
+                 currently mapped. This usually means a forward reference, \
+                 a missing block param, or a value defined in an unreachable \
+                 block.",
+                val.0, self.value_map.len(),
+            )
+        })
     }
 
     /// Get machine block for an IR block.
@@ -178,7 +250,7 @@ impl ISelCtx {
 }
 
 /// Select machine instructions for a single IR instruction.
-fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst) {
+fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, func: &Function) {
     match &inst.kind {
         // ---- Constants ----
         InstKind::ConstInt(val, width) => {
@@ -225,9 +297,65 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         InstKind::Undef(_) => {
+            // Emit a deterministic zero instead of leaving the vreg
+            // undefined. A truly undefined vreg lets the register
+            // allocator hand us whatever physical register is free,
+            // and that register's stale contents leak into reads —
+            // which makes optimization-level diffs nondeterministic
+            // and turns "undef ⇒ anything" into "undef ⇒ whatever
+            // happened to be in x14 at this point in the program."
+            //
+            // mem2reg synthesizes Undef as the initial value of a
+            // promoted slot before any store. The Fortran semantics
+            // for reading uninitialized storage are undefined, but
+            // a hard zero is at least reproducible across opt
+            // levels and friendly to debuggers.
             let class = type_to_reg_class(&inst.ty);
-            let _dest = ctx.get_vreg(mf, inst.id, class);
-            // Undef: just allocate the vreg, no instruction needed.
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            match class {
+                RegClass::Gp32 => {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::MovReg,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::PhysReg(PhysReg::Wzr),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Gp64 => {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::MovReg,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::PhysReg(PhysReg::Xzr),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Fp32 => {
+                    let cp_idx = mf.add_const(ConstPoolEntry::F32(0.0));
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AdrpLdr,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::ConstPool(cp_idx),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                RegClass::Fp64 => {
+                    let cp_idx = mf.add_const(ConstPoolEntry::F64(0.0));
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AdrpLdr,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::ConstPool(cp_idx),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+            }
         }
 
         // ---- Integer arithmetic ----
@@ -557,6 +685,22 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         // ---- Memory ----
+        InstKind::GlobalAddr(name) => {
+            // Materialize the address of a module-level global into
+            // a Gp64 vreg via ADRP+ADD against `_globalname`. Loads
+            // and stores then operate on this pointer the same way
+            // they operate on an alloca address.
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::AdrpAdd,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::GlobalLabel(name.clone()),
+                ],
+                def: Some(dest),
+            });
+        }
+
         InstKind::Alloca(_) => {
             // Alloca is handled in Phase 1 (stack slot allocation).
             // The "address" is a frame slot offset. Map the ValueId to the offset.
@@ -580,8 +724,19 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::Load(addr) => {
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            let is_fp = matches!(class, RegClass::Fp32 | RegClass::Fp64);
-            let opcode = if is_fp { ArmOpcode::LdrFpImm } else { ArmOpcode::LdrImm };
+            // Pick the load opcode by element width. i8 → LDRSB
+            // (sign-extended into Wt), i16 → LDRSH, i32/Bool → LDR
+            // Wt, i64/ptr → LDR Xt, FP → LDR Dt/St. Audit
+            // CRITICAL-2: previously every integer load used the
+            // 32-bit `ldr w_, [_]` regardless of width, so an i8
+            // load read 4 bytes and the result depended on what
+            // happened to follow the byte in memory.
+            let opcode = match &inst.ty {
+                IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
+                IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
+                IrType::Float(_) => ArmOpcode::LdrFpImm,
+                _ => ArmOpcode::LdrImm,
+            };
 
             // If addr is an alloca, load directly from the frame slot.
             if let Some(&offset) = ctx.alloca_offsets.get(addr) {
@@ -610,9 +765,30 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
 
         InstKind::Store(val, addr) => {
             let val_vreg = ctx.lookup_vreg(*val);
-            let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
-            let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
-            let opcode = if is_fp { ArmOpcode::StrFpImm } else { ArmOpcode::StrImm };
+            // Audit CRITICAL-2: pick the store opcode by the IR
+            // VALUE's declared type, not the pointer's pointee.
+            // Byte-level GEPs into derived types and array
+            // constructors use Ptr<i8> as a generic offset cursor
+            // even when the actual element being stored is i32 —
+            // checking the pointee in those cases would
+            // incorrectly emit STRB and write only 1 byte.
+            //
+            // The value's IR type is the source of truth for
+            // store width. STRB / STRH are only used when the
+            // value itself is i8/i16/Bool.
+            let val_ty = func.value_type(*val);
+            let opcode = match &val_ty {
+                Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
+                Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
+                Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
+                _ => {
+                    // Default to the value's reg class for any
+                    // other case (i32, i64, ptr).
+                    let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
+                    let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
+                    if is_fp { ArmOpcode::StrFpImm } else { ArmOpcode::StrImm }
+                }
+            };
 
             if let Some(&offset) = ctx.alloca_offsets.get(addr) {
                 mf.block_mut(mb).insts.push(MachineInst {
@@ -846,7 +1022,14 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
 }
 
 /// Select machine instructions for a terminator.
-fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, term: &Terminator) {
+fn select_terminator(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    term: &Terminator,
+    src_block: &BasicBlock,
+) {
+    let _ = src_block; // used implicitly via `term`'s args; kept for clarity
     match term {
         Terminator::Return(None) => {
             emit_epilogue(mf, mb);
@@ -868,7 +1051,14 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
             });
             emit_epilogue(mf, mb);
         }
-        Terminator::Branch(dest, _args) => {
+        Terminator::Branch(dest, args) => {
+            // Emit parallel copy from each branch arg into the
+            // target block's corresponding param vreg BEFORE the
+            // actual branch instruction. Without this, block
+            // parameters introduced by mem2reg or the lowerer
+            // would never receive their incoming values at edge
+            // points, producing infinite loops or stale data.
+            emit_branch_arg_copies(mf, ctx, mb, *dest, args);
             let target = ctx.lookup_block(*dest);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::B,
@@ -876,28 +1066,82 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
                 def: None,
             });
         }
-        Terminator::CondBranch { cond, true_dest, false_dest, .. } => {
+        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
             let cond_vreg = ctx.lookup_vreg(*cond);
             let true_mb = ctx.lookup_block(*true_dest);
             let false_mb = ctx.lookup_block(*false_dest);
 
-            // CMP cond, #0; B.NE true_label; B false_label
+            // For a conditional branch, the parallel copies for
+            // the two arms must happen only on the taken edge. We
+            // emit the copies inside per-arm trampoline sequences:
+            //
+            //   CMP cond, #0
+            //   B.EQ false_copies_then_jump   (conditional jump to
+            //                                  false-side copies)
+            //   <true copies>
+            //   B true_dest
+            //  false_copies_then_jump:
+            //   <false copies>
+            //   B false_dest
+            //
+            // To keep the machine CFG simple we instead emit the
+            // false-side copies + jump as a new machine block.
+            // But that's invasive. For the common case where
+            // neither arm has copies, fall back to the original
+            // shape. When either arm has copies, materialize a
+            // shim block for that arm.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::CmpImm,
                 operands: vec![MachineOperand::VReg(cond_vreg), MachineOperand::Imm(0)],
                 def: None,
             });
+
+            // True arm: if there are branch args to copy, create
+            // a shim block that does the copies then jumps to the
+            // true destination. Otherwise, branch directly.
+            let true_target = if true_args.is_empty() {
+                true_mb
+            } else {
+                // Prefix with the function name so labels stay
+                // unique across functions in the same .s file. Two
+                // functions could otherwise both emit `L3_true_shim`.
+                let label = format!("L{}_{}_true_shim", mf.name, mb.0);
+                let shim = mf.new_block(&label);
+                emit_branch_arg_copies(mf, ctx, shim, *true_dest, true_args);
+                mf.block_mut(shim).insts.push(MachineInst {
+                    opcode: ArmOpcode::B,
+                    operands: vec![MachineOperand::BlockRef(true_mb)],
+                    def: None,
+                });
+                shim
+            };
+
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::BCond,
                 operands: vec![
                     MachineOperand::Cond(ArmCond::Ne),
-                    MachineOperand::BlockRef(true_mb),
+                    MachineOperand::BlockRef(true_target),
                 ],
                 def: None,
             });
+
+            // False arm: same treatment.
+            let false_target = if false_args.is_empty() {
+                false_mb
+            } else {
+                let label = format!("L{}_{}_false_shim", mf.name, mb.0);
+                let shim = mf.new_block(&label);
+                emit_branch_arg_copies(mf, ctx, shim, *false_dest, false_args);
+                mf.block_mut(shim).insts.push(MachineInst {
+                    opcode: ArmOpcode::B,
+                    operands: vec![MachineOperand::BlockRef(false_mb)],
+                    def: None,
+                });
+                shim
+            };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::B,
-                operands: vec![MachineOperand::BlockRef(false_mb)],
+                operands: vec![MachineOperand::BlockRef(false_target)],
                 def: None,
             });
         }
@@ -936,6 +1180,117 @@ fn select_terminator(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, 
                 operands: vec![MachineOperand::Imm(1)],
                 def: None,
             });
+        }
+    }
+}
+
+/// Emit the parallel-copy that materializes branch arguments into
+/// the target block's parameter vregs.
+///
+/// At an SSA block boundary the IR semantics say "all the new values
+/// arrive in the target's params simultaneously." On a register
+/// machine that means we have to perform multiple `mov` operations
+/// such that none of them clobbers a value still needed by another
+/// pending move. The classical solution:
+///
+///  1. Skip identity copies (`dst == src`).
+///  2. Repeatedly find a pending copy whose `dst` is **not** also
+///     the `src` of some other pending copy. Such a copy is "safe"
+///     — emitting it can't trample anything still needed.
+///  3. If every remaining copy is part of a cycle (no safe copy
+///     exists), break the cycle by moving the head of any pending
+///     copy through a freshly-allocated scratch vreg, then continue.
+///
+/// Cycles arise when block params swap with each other across an
+/// edge. The lowerer doesn't currently produce that shape, but
+/// mem2reg may once we have more sophisticated reaching-definition
+/// flow, so handling it now keeps a future bug out of the IR.
+fn emit_branch_arg_copies(
+    mf: &mut MachineFunction,
+    ctx: &ISelCtx,
+    mb: MBlockId,
+    target_block: BlockId,
+    args: &[ValueId],
+) {
+    if args.is_empty() { return; }
+
+    // Look up the target block's param vregs in the same order
+    // they appear in the IR (which is also the order they were
+    // allocated in Phase 4a, so the i-th arg corresponds to the
+    // i-th param).
+    let target_params = ctx.block_params.get(&target_block)
+        .expect("isel: branch target not in block_params snapshot");
+    if target_params.len() != args.len() {
+        // Verifier should reject this — but if it leaks through
+        // we want a clear panic, not silent corruption.
+        panic!(
+            "isel: branch arg count {} ≠ target block param count {}",
+            args.len(), target_params.len()
+        );
+    }
+
+    // Build the list of (dst_vreg, src_vreg) pairs.
+    let mut pending: Vec<(VRegId, VRegId)> = Vec::with_capacity(args.len());
+    for (arg, bp) in args.iter().zip(target_params.iter()) {
+        let dst = ctx.lookup_vreg(bp.id);
+        let src = ctx.lookup_vreg(*arg);
+        if dst != src {
+            pending.push((dst, src));
+        }
+    }
+    if pending.is_empty() { return; }
+
+    // Helper to look up a vreg's RegClass via mf.vregs.
+    fn class_of(mf: &MachineFunction, v: VRegId) -> RegClass {
+        mf.vregs.iter().find(|r| r.id == v)
+            .map(|r| r.class)
+            .expect("isel: vreg not registered")
+    }
+
+    // Helper to choose the right move opcode for a vreg's class.
+    fn move_opcode_for(class: RegClass) -> ArmOpcode {
+        match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::FmovReg,
+            RegClass::Gp64 | RegClass::Gp32 => ArmOpcode::MovReg,
+        }
+    }
+
+    let emit_move = |mf: &mut MachineFunction, mb: MBlockId, dst: VRegId, src: VRegId| {
+        let class = class_of(mf, dst);
+        let opcode = move_opcode_for(class);
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode,
+            operands: vec![
+                MachineOperand::VReg(dst),
+                MachineOperand::VReg(src),
+            ],
+            def: Some(dst),
+        });
+    };
+
+    // Iteratively emit safe moves; break cycles via scratch.
+    while !pending.is_empty() {
+        // Find a safe copy: dst is not the src of any other
+        // pending copy.
+        let safe_idx = (0..pending.len()).find(|&i| {
+            let (d, _) = pending[i];
+            !pending.iter().enumerate().any(|(j, &(_, s))| j != i && s == d)
+        });
+
+        if let Some(idx) = safe_idx {
+            let (d, s) = pending.remove(idx);
+            emit_move(mf, mb, d, s);
+        } else {
+            // No safe copy → all remaining are part of a cycle.
+            // Break by routing the first copy through a scratch.
+            let (d, s) = pending[0];
+            let class = class_of(mf, s);
+            let temp = mf.new_vreg(class);
+            emit_move(mf, mb, temp, s);
+            pending[0] = (d, temp);
+            // The next iteration's safe-search will find this
+            // copy's `temp` source has no other readers, making
+            // (d, temp) safe to emit.
         }
     }
 }
@@ -1299,5 +1654,207 @@ mod tests {
             ))
         });
         assert!(has_mov_zr, "const 0 should use MOV from XZR or WZR");
+    }
+
+    // ---- Parallel-copy / branch arg copy tests ----
+    //
+    // The branch arg copy resolver in `emit_branch_arg_copies` handles
+    // cross-edge moves into block params. When the source/destination
+    // graph contains a cycle, the resolver routes one copy through a
+    // scratch vreg. These tests construct minimal IR functions that
+    // exercise each topology, run isel, and inspect the resulting move
+    // count in the source machine block.
+
+    /// Helper: count vreg→vreg moves of the given opcode in a block,
+    /// excluding moves that target a physical register (those are
+    /// epilogue/return marshaling, not parallel copies).
+    fn count_vreg_moves(block: &MachineBlock, opcode: ArmOpcode) -> usize {
+        block.insts.iter()
+            .filter(|i| i.opcode == opcode)
+            .filter(|i| {
+                // True parallel copies are VReg → VReg.
+                matches!(i.operands.first(), Some(MachineOperand::VReg(_)))
+                    && matches!(i.operands.get(1), Some(MachineOperand::VReg(_)))
+            })
+            .count()
+    }
+
+    fn find_block<'a>(mf: &'a MachineFunction, contains: &str) -> &'a MachineBlock {
+        mf.blocks.iter()
+            .find(|b| b.label.contains(contains))
+            .unwrap_or_else(|| panic!(
+                "no machine block containing '{}' (have: {:?})",
+                contains,
+                mf.blocks.iter().map(|b| &b.label).collect::<Vec<_>>(),
+            ))
+    }
+
+    #[test]
+    fn branch_arg_2_cycle_routes_through_scratch() {
+        // body branches to header swapping the two int params:
+        //   br header(pb, pa)
+        // pending = [(pa,pb), (pb,pa)] — pure 2-cycle, requires:
+        //   tmp = pb;  pb = pa;  pa = tmp     (3 moves)
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            b.branch(header, vec![v0, v1]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            b.branch(header, vec![pb, pa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 3,
+            "2-cycle should emit 3 vreg→vreg moves (scratch + 2 swaps), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_3_cycle_routes_through_scratch() {
+        // br header(pb, pc, pa) — rotate three params left.
+        // pending = [(pa,pb),(pb,pc),(pc,pa)]
+        // Resolution: tmp = pb;  pb = pc;  pc = pa;  pa = tmp   (4 moves)
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pc = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let v2 = b.const_i32(3);
+            b.branch(header, vec![v0, v1, v2]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            b.branch(header, vec![pb, pc, pa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 4,
+            "3-cycle should emit 4 vreg→vreg moves (scratch + 3 rotates), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_cycle_plus_independent_tail() {
+        // 2-cycle on (pa,pb) plus an independent (pc <- v_extra) tail.
+        // br header(pb, pa, v_extra)
+        // The tail (pc, v_extra) is always safe and emits as a single
+        // move; the 2-cycle adds 3 moves for a total of 4.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let _pc = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let v2 = b.const_i32(3);
+            b.branch(header, vec![v0, v1, v2]);
+
+            b.set_block(header);
+            b.cond_branch(pa, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            // Body needs a fresh value for pc so it's not part of the
+            // cycle and so it can't degenerate into pa/pb.
+            let v3 = b.const_i32(99);
+            b.branch(header, vec![pb, pa, v3]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        assert_eq!(
+            moves, 4,
+            "cycle+tail should emit 4 vreg→vreg moves (3 for cycle + 1 for tail), got {}: {:#?}",
+            moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn branch_arg_mixed_gp_fp_classes() {
+        // Two int params and two float params, all swapped pairwise.
+        // pending splits into a GP 2-cycle and an FP 2-cycle, each of
+        // which independently needs a scratch.
+        // Expected: 3 GP MovReg + 3 FP FmovReg = 6 total moves.
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let header = b.create_block("header");
+            let ia = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let ib = b.add_block_param(header, IrType::Int(IntWidth::I32));
+            let fa = b.add_block_param(header, IrType::Float(FloatWidth::F64));
+            let fb = b.add_block_param(header, IrType::Float(FloatWidth::F64));
+            let body = b.create_block("body");
+            let exit = b.create_block("exit");
+
+            let v0 = b.const_i32(1);
+            let v1 = b.const_i32(2);
+            let f0 = b.const_f64(1.0);
+            let f1 = b.const_f64(2.0);
+            b.branch(header, vec![v0, v1, f0, f1]);
+
+            b.set_block(header);
+            b.cond_branch(ia, body, vec![], exit, vec![]);
+
+            b.set_block(body);
+            // Swap both pairs: ints (ib, ia) and floats (fb, fa).
+            b.branch(header, vec![ib, ia, fb, fa]);
+
+            b.set_block(exit);
+            b.ret_void();
+        }
+        let mf = select_function(&func);
+        let body_mb = find_block(&mf, "body");
+        let gp_moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
+        let fp_moves = count_vreg_moves(body_mb, ArmOpcode::FmovReg);
+        assert_eq!(
+            gp_moves, 3,
+            "GP 2-cycle should emit 3 MovReg, got {}: {:#?}",
+            gp_moves, body_mb.insts,
+        );
+        assert_eq!(
+            fp_moves, 3,
+            "FP 2-cycle should emit 3 FmovReg, got {}: {:#?}",
+            fp_moves, body_mb.insts,
+        );
     }
 }

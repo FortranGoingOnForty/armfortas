@@ -94,6 +94,9 @@ pub enum Stmt {
     Goto { label: u64 },
     ComputedGoto { labels: Vec<u64>, selector: SpannedExpr },
     ArithmeticIf { expr: SpannedExpr, neg: u64, zero: u64, pos: u64 },
+    /// Statement label on any executable statement: `10 i = i + 1`.
+    /// The parser emits this when it sees an integer literal at statement start.
+    Labeled { label: u64, stmt: Box<SpannedStmt> },
 
     // ---- I/O ----
     Write { controls: Vec<IoControl>, items: Vec<SpannedExpr> },

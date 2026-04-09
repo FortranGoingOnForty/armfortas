@@ -10,7 +10,7 @@ use crate::ir::inst::*;
 use crate::ir::types::{IrType, IntWidth, FloatWidth};
 use crate::lexer::{Span, Position};
 use crate::ir::verify::verify_module;
-use super::Pass;
+use super::pass::Pass;
 use super::const_fold::ConstFold;
 use super::const_prop::ConstProp;
 use super::dce::Dce;

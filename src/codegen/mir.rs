@@ -91,6 +91,10 @@ pub enum ArmOpcode {
     // ---- Memory ----
     StrImm,      // STR Xt, [Xn, #imm]
     LdrImm,      // LDR Xt, [Xn, #imm]
+    StrhImm,     // STRH Wt, [Xn, #imm]  (store 16-bit half)
+    LdrshImm,    // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
+    StrbImm,     // STRB Wt, [Xn, #imm]  (store 8-bit byte)
+    LdrsbImm,    // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
     StrFpImm,    // STR Dt, [Xn, #imm]  (float store)
     LdrFpImm,    // LDR Dt, [Xn, #imm]  (float load)
     StpPre,      // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
@@ -140,6 +144,10 @@ pub enum MachineOperand {
     BlockRef(MBlockId),
     /// External symbol name (for BL to functions).
     Extern(String),
+    /// Module-level global by name. Used by ADRP+ADD for SAVE'd
+    /// locals and module variables, where the operand resolves to
+    /// `_globalname@PAGE` / `_globalname@PAGEOFF` at emit time.
+    GlobalLabel(String),
     /// Constant pool entry index.
     ConstPool(u32),
     /// Shift amount for MOVZ/MOVK (0, 16, 32, 48).
@@ -246,7 +254,13 @@ impl StackFrame {
         //           ret
         Self { locals: Vec::new(), size: 16, next_offset: 0 }
     }
+}
 
+impl Default for StackFrame {
+    fn default() -> Self { Self::new() }
+}
+
+impl StackFrame {
     /// Allocate a local variable slot. Returns a negative offset from FP.
     /// Locals grow downward from FP: first local at [FP-8], etc.
     pub fn alloc_local(&mut self, size: u32) -> i32 {

@@ -126,6 +126,11 @@ pub enum InstKind {
     Load(ValueId),
     Store(ValueId, ValueId),              // store(value, addr)
     GetElementPtr(ValueId, Vec<ValueId>), // base, indices
+    /// Address of a module-level global. Returns `Ptr<T>` where T
+    /// is the global's declared type. Used by SAVE'd locals (those
+    /// with initializers in subprograms) and module variables —
+    /// any storage that must persist across function calls.
+    GlobalAddr(String),
 
     // ---- Calls ----
     Call(FuncRef, Vec<ValueId>),
@@ -300,6 +305,14 @@ pub enum GlobalInit {
     Int(i64),
     Float(f64),
     String(Vec<u8>),
+    /// Array literal: a sequence of per-element initializers of
+    /// the same homogeneous element type. Used by module array
+    /// variables with `[v0, v1, ...]` or `(/ v0, v1, ... /)`
+    /// constructors. The Vec's length is the array's total element
+    /// count (product of dims); shorter initializers are padded
+    /// with Zero at lowering time.
+    IntArray(Vec<i64>),
+    FloatArray(Vec<f64>),
 }
 
 /// The top-level IR module.

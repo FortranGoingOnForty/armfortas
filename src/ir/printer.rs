@@ -27,6 +27,14 @@ pub fn print_module(module: &Module) -> String {
                 GlobalInit::Int(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::Float(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::String(s) => write!(out, " = {:?}", String::from_utf8_lossy(s)).unwrap(),
+                GlobalInit::IntArray(vs) => {
+                    let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+                    write!(out, " = [{}]", s.join(", ")).unwrap();
+                }
+                GlobalInit::FloatArray(vs) => {
+                    let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+                    write!(out, " = [{}]", s.join(", ")).unwrap();
+                }
             }
         }
         writeln!(out).unwrap();
@@ -169,6 +177,7 @@ pub fn print_inst(inst: &Inst) -> String {
             let idx_str: Vec<String> = idxs.iter().map(|i| format!("%{}", i.0)).collect();
             format!("gep %{}, [{}]", base.0, idx_str.join(", "))
         }
+        InstKind::GlobalAddr(name) => format!("global_addr @{}", name),
 
         InstKind::Call(fref, args) => {
             let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();

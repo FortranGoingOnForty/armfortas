@@ -48,6 +48,12 @@ struct Key {
     operands: Vec<ValueId>,
     /// Auxiliary integer (used for things like comparison op, bitwidth, etc.)
     aux: i64,
+    /// Optional name for instructions whose value depends on a
+    /// symbol (currently only `GlobalAddr`). Audit Med-2: a hashed
+    /// aux risked theoretical SipHash13 collisions merging two
+    /// different globals into one ADRP+ADD; the explicit name is
+    /// soundness-bearing, not a performance hint.
+    name: Option<String>,
     /// Result type — same expression on same operands but different
     /// declared result type would be a bug, but we include it for safety.
     ty: IrType,
@@ -57,13 +63,22 @@ struct Key {
 /// instruction is impure or otherwise not a CSE candidate.
 fn key_of(inst: &Inst) -> Option<Key> {
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i64| -> Option<Key> {
-        Some(Key { tag, operands: ops, aux, ty: inst.ty.clone() })
+        Some(Key { tag, operands: ops, aux, name: None, ty: inst.ty.clone() })
+    };
+    let mk_named = |tag: u32, name: String| -> Option<Key> {
+        Some(Key { tag, operands: vec![], aux: 0, name: Some(name), ty: inst.ty.clone() })
     };
     let canon = |a: ValueId, b: ValueId| -> Vec<ValueId> {
         if a.0 <= b.0 { vec![a, b] } else { vec![b, a] }
     };
 
     match &inst.kind {
+        // Pure address-of-global — no operands, pure function of
+        // the symbol name. Two ADRP+ADD pairs to the same global
+        // inside the same block should fold. Audit Med-3 (CSE-eligible)
+        // and Med-2 (collision-free key).
+        InstKind::GlobalAddr(name) => mk_named(90, name.clone()),
+
         // Constants ------------------------------------------------------
         // Audit Min-4: width is carried by the `ty` field, so the
         // aux can just be the literal value / bit pattern.

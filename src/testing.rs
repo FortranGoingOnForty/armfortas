@@ -607,6 +607,7 @@ fn format_machine_operand(mf: &MachineFunction, operand: &MachineOperand) -> Str
         MachineOperand::Extern(name) => format!("extern {}", name),
         MachineOperand::ConstPool(index) => format!("constpool[{}]", index),
         MachineOperand::Shift(bits) => format!("lsl #{}", bits),
+        MachineOperand::GlobalLabel(name) => format!("global:{}", name),
     }
 }
 
