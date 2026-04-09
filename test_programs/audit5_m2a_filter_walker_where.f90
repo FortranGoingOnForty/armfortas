@@ -1,15 +1,13 @@
 ! Audit #5 MAJOR-2 (a) — filtered USE ONLY references inside a
-! WHERE construct slip past check_no_filtered_refs.
+! WHERE construct.
 !
-! The audit-4 MAJOR-1 walker only handles Assignment/Print/Write
-! /Read/If/Do/Call/Block. WHERE is missing, so a `where (arr <
-! hidden)` reference compiles cleanly and crashes at runtime
-! because the filtered name resolves to const_int 0 and the
-! mask logic does the wrong thing.
+! Fixed: check_filtered_in_stmt now handles WhereConstruct,
+! WhereStmt, and the rest of the executable Stmt variants. The
+! mask expression of `where (arr < hidden)` is walked, and a
+! reference to a USE-ONLY-filtered name now produces a
+! compile-time diagnostic instead of silently lowering to
+! const_int 0.
 !
-! Expected: compile-time error mentioning `hidden`.
-!
-! XFAIL: audit5 MAJOR-2 (filter walker doesn't cover WHERE)
 ! ERROR_EXPECTED: hidden
 module audit5_m2a_mod
   integer :: visible = 1

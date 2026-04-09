@@ -941,23 +941,28 @@ fn check_no_filtered_refs(
     }
 }
 
+/// Walk every Stmt variant and recurse into substatements + every
+/// expression-bearing field. Audit5 MAJOR-2: the original walker
+/// only covered Assignment/Print/Write/Read/If/Do/Call/Block, so
+/// filtered USE ONLY refs slipped through WHERE constructs, FORALL,
+/// SELECT CASE, SELECT TYPE, ASSOCIATE, ALLOCATE/DEALLOCATE
+/// argument exprs, IO control specifiers, and ALL of the executable
+/// transfer-of-control statements that carry expressions
+/// (STOP code, RETURN value, ARITHMETIC IF, COMPUTED GOTO).
 fn check_filtered_in_stmt(
     stmt: &crate::ast::stmt::SpannedStmt,
     filtered: &HashSet<String>,
 ) {
     use crate::ast::stmt::Stmt;
     match &stmt.node {
-        Stmt::Assignment { target, value } => {
+        // ---- Assignment ----
+        Stmt::Assignment { target, value }
+        | Stmt::PointerAssignment { target, value } => {
             check_filtered_in_expr(target, filtered);
             check_filtered_in_expr(value, filtered);
         }
-        Stmt::Print { format, items } => {
-            check_filtered_in_expr(format, filtered);
-            for item in items { check_filtered_in_expr(item, filtered); }
-        }
-        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
-            for item in items { check_filtered_in_expr(item, filtered); }
-        }
+
+        // ---- IF ----
         Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
             check_filtered_in_expr(condition, filtered);
             check_no_filtered_refs(then_body, filtered);
@@ -973,6 +978,8 @@ fn check_filtered_in_stmt(
             check_filtered_in_expr(condition, filtered);
             check_filtered_in_stmt(action, filtered);
         }
+
+        // ---- DO loops ----
         Stmt::DoLoop { start, end, step, body, .. } => {
             if let Some(e) = start { check_filtered_in_expr(e, filtered); }
             if let Some(e) = end { check_filtered_in_expr(e, filtered); }
@@ -983,16 +990,150 @@ fn check_filtered_in_stmt(
             check_filtered_in_expr(condition, filtered);
             check_no_filtered_refs(body, filtered);
         }
-        Stmt::Call { callee, args } => {
-            check_filtered_in_expr(callee, filtered);
-            for a in args {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    check_filtered_in_expr(e, filtered);
+        Stmt::DoConcurrent { controls, mask, body, .. } => {
+            for c in controls {
+                check_filtered_in_expr(&c.start, filtered);
+                check_filtered_in_expr(&c.end, filtered);
+                if let Some(s) = &c.step { check_filtered_in_expr(s, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+
+        // ---- SELECT ----
+        Stmt::SelectCase { selector, cases, .. } => {
+            check_filtered_in_expr(selector, filtered);
+            for case in cases {
+                for sel in &case.selectors {
+                    use crate::ast::stmt::CaseSelector;
+                    match sel {
+                        CaseSelector::Value(e) => check_filtered_in_expr(e, filtered),
+                        CaseSelector::Range { low, high } => {
+                            if let Some(e) = low { check_filtered_in_expr(e, filtered); }
+                            if let Some(e) = high { check_filtered_in_expr(e, filtered); }
+                        }
+                        CaseSelector::Default => {}
+                    }
                 }
+                check_no_filtered_refs(&case.body, filtered);
             }
         }
+        Stmt::SelectType { selector, guards, .. } => {
+            check_filtered_in_expr(selector, filtered);
+            for guard in guards {
+                use crate::ast::stmt::TypeGuard;
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                check_no_filtered_refs(body, filtered);
+            }
+        }
+
+        // ---- WHERE / FORALL ----
+        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+            check_filtered_in_expr(mask, filtered);
+            check_no_filtered_refs(body, filtered);
+            for (mcond, ebody) in elsewhere {
+                if let Some(m) = mcond { check_filtered_in_expr(m, filtered); }
+                check_no_filtered_refs(ebody, filtered);
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            check_filtered_in_expr(mask, filtered);
+            check_filtered_in_stmt(stmt, filtered);
+        }
+        Stmt::ForallConstruct { specs, mask, body, .. } => {
+            for s in specs {
+                check_filtered_in_expr(&s.start, filtered);
+                check_filtered_in_expr(&s.end, filtered);
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_no_filtered_refs(body, filtered);
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for s in specs {
+                check_filtered_in_expr(&s.start, filtered);
+                check_filtered_in_expr(&s.end, filtered);
+                if let Some(st) = &s.step { check_filtered_in_expr(st, filtered); }
+            }
+            if let Some(m) = mask { check_filtered_in_expr(m, filtered); }
+            check_filtered_in_stmt(stmt, filtered);
+        }
+
+        // ---- BLOCK / ASSOCIATE ----
         Stmt::Block { body, .. } => check_no_filtered_refs(body, filtered),
-        _ => {}
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, e) in assocs {
+                check_filtered_in_expr(e, filtered);
+            }
+            check_no_filtered_refs(body, filtered);
+        }
+
+        // ---- Branch / transfer ----
+        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } => {
+            if let Some(e) = code { check_filtered_in_expr(e, filtered); }
+        }
+        Stmt::Return { value } => {
+            if let Some(e) = value { check_filtered_in_expr(e, filtered); }
+        }
+        Stmt::ComputedGoto { selector, .. } => {
+            check_filtered_in_expr(selector, filtered);
+        }
+        Stmt::ArithmeticIf { expr, .. } => {
+            check_filtered_in_expr(expr, filtered);
+        }
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. } => {}
+
+        // ---- I/O ----
+        Stmt::Print { format, items } => {
+            check_filtered_in_expr(format, filtered);
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
+            for c in controls { check_filtered_in_expr(&c.value, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for c in specs { check_filtered_in_expr(&c.value, filtered); }
+        }
+        Stmt::Inquire { specs, items } => {
+            for c in specs { check_filtered_in_expr(&c.value, filtered); }
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+
+        // ---- Memory ----
+        Stmt::Allocate { items, opts } | Stmt::Deallocate { items, opts } => {
+            for item in items { check_filtered_in_expr(item, filtered); }
+            for c in opts { check_filtered_in_expr(&c.value, filtered); }
+        }
+        Stmt::Nullify { items } => {
+            for item in items { check_filtered_in_expr(item, filtered); }
+        }
+
+        // ---- Other executable ----
+        Stmt::Call { callee, args } => {
+            check_filtered_in_expr(callee, filtered);
+            for a in args { check_filtered_in_subscript(&a.value, filtered); }
+        }
+        Stmt::Namelist { .. } => {}
+        Stmt::Declaration(_) => {
+            // Initializers in inline declarations could reference
+            // module names, but Decl init exprs go through a
+            // separate const-fold path that already errors on
+            // unknown names. Conservative: skip here.
+        }
     }
 }
 
@@ -1012,6 +1153,9 @@ fn check_filtered_in_expr(
                 std::process::exit(1);
             }
         }
+        Expr::ComponentAccess { base, .. } => {
+            check_filtered_in_expr(base, filtered);
+        }
         Expr::BinaryOp { left, right, .. } => {
             check_filtered_in_expr(left, filtered);
             check_filtered_in_expr(right, filtered);
@@ -1020,13 +1164,52 @@ fn check_filtered_in_expr(
         Expr::ParenExpr { inner } => check_filtered_in_expr(inner, filtered),
         Expr::FunctionCall { callee, args } => {
             check_filtered_in_expr(callee, filtered);
-            for a in args {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    check_filtered_in_expr(e, filtered);
-                }
-            }
+            for a in args { check_filtered_in_subscript(&a.value, filtered); }
         }
-        _ => {}
+        Expr::ArrayConstructor { values, .. } => {
+            for v in values { check_filtered_in_acvalue(v, filtered); }
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            check_filtered_in_expr(real, filtered);
+            check_filtered_in_expr(imag, filtered);
+        }
+        // Pure literals: nothing to walk.
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. } => {}
+    }
+}
+
+fn check_filtered_in_subscript(
+    sub: &crate::ast::expr::SectionSubscript,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::expr::SectionSubscript;
+    match sub {
+        SectionSubscript::Element(e) => check_filtered_in_expr(e, filtered),
+        SectionSubscript::Range { start, end, stride } => {
+            if let Some(e) = start { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = end { check_filtered_in_expr(e, filtered); }
+            if let Some(e) = stride { check_filtered_in_expr(e, filtered); }
+        }
+    }
+}
+
+fn check_filtered_in_acvalue(
+    v: &crate::ast::expr::AcValue,
+    filtered: &HashSet<String>,
+) {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => check_filtered_in_expr(e, filtered),
+        AcValue::ImpliedDo { values, start, end, step, .. } => {
+            for inner in values { check_filtered_in_acvalue(inner, filtered); }
+            check_filtered_in_expr(start, filtered);
+            check_filtered_in_expr(end, filtered);
+            if let Some(s) = step { check_filtered_in_expr(s, filtered); }
+        }
     }
 }
 

@@ -1,14 +1,13 @@
 ! Audit #5 MAJOR-2 (b) — filtered USE ONLY references inside an
-! array constructor are silently replaced with zero.
+! array constructor.
 !
-! check_filtered_in_expr handles BinaryOp/UnaryOp/Paren/FunctionCall
-! /Name but wildcards through Expr::ArrayConstructor and
-! AcValue::Expr / AcValue::ImpliedDo. So `(/ 1, hidden, 3 /)`
-! produces `1 0 3` at runtime without diagnosing.
+! Fixed: check_filtered_in_expr now recurses through
+! Expr::ArrayConstructor via a new check_filtered_in_acvalue
+! helper that walks both AcValue::Expr and AcValue::ImpliedDo
+! (including the implied-do bounds and step). A reference to
+! a USE-ONLY-filtered name inside `(/ 1, hidden, 3 /)` now
+! produces a compile-time diagnostic.
 !
-! Expected: compile-time error mentioning `hidden`.
-!
-! XFAIL: audit5 MAJOR-2 (filter walker doesn't cover ArrayConstructor)
 ! ERROR_EXPECTED: hidden
 module audit5_m2b_mod
   integer :: visible = 1
