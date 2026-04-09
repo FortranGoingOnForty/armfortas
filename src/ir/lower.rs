@@ -935,7 +935,7 @@ fn lower_unit(
                         let dt_name = arg_derived_type_name(pname, decls);
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: vec![], allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls), allocatable: false, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         };
                         ctx.locals.insert(pname.clone(), info);
@@ -1059,7 +1059,7 @@ fn lower_unit(
                         let dt_name = arg_derived_type_name(pname, decls);
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: vec![], allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls), allocatable: false, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         });
                     }
@@ -3220,6 +3220,30 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
         }
     }
     IrType::Int(IntWidth::I32) // fallback
+}
+
+fn arg_dims_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> Vec<(i64, i64)> {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                    Some(specs)
+                } else {
+                    None
+                }
+            });
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    let array_spec = entity.array_spec.as_ref().or(attr_dims);
+                    return array_spec
+                        .map(|specs| extract_array_dims(specs))
+                        .unwrap_or_default();
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Check if a dummy argument is a derived type, returning the type name if so.
@@ -5934,6 +5958,9 @@ fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
         // Load base_addr (first 8 bytes of descriptor) as a pointer.
         // The descriptor alloca is [i8 x 384], but the first field is a pointer.
         b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    } else if info.by_ref {
+        // Dummy arrays are stored as "slot holding caller base pointer".
+        b.load(info.addr)
     } else {
         info.addr
     }
