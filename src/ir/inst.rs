@@ -217,6 +217,10 @@ pub struct Function {
     /// O(1) type lookup cache. Populated during construction; call
     /// `rebuild_type_cache()` after optimizer passes mutate the IR.
     type_cache: HashMap<ValueId, IrType>,
+    /// Fortran PURE attribute — function has no side effects.
+    pub is_pure: bool,
+    /// Fortran ELEMENTAL attribute — operates element-wise on arrays.
+    pub is_elemental: bool,
 }
 
 impl Function {
@@ -237,6 +241,8 @@ impl Function {
             next_value,
             next_block: 1,
             type_cache,
+            is_pure: false,
+            is_elemental: false,
         }
     }
 

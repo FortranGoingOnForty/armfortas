@@ -883,7 +883,7 @@ fn lower_unit(
                 lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
-        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
+        ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
             // BIND(C): use specified C name, otherwise use Fortran name.
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
@@ -900,6 +900,9 @@ fn lower_unit(
                 } else { None }
             }).collect();
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
+            use crate::ast::unit::Prefix;
+            func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
+            func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -968,7 +971,7 @@ fn lower_unit(
                 lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
-        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
+        ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
@@ -1019,6 +1022,10 @@ fn lower_unit(
             };
 
             let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
+            // Propagate PURE/ELEMENTAL from AST prefix.
+            use crate::ast::unit::Prefix;
+            func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
+            func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
