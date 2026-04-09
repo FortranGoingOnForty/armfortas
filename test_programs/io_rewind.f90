@@ -3,6 +3,8 @@
 ! Exercises: REWIND statement, file position reset.
 !
 ! CHECK: 99
+! FILE_EXISTS: afs_rewind.dat
+! FILE_MISSING: afs_rewind.tmp
 program test_io_rewind
     implicit none
     integer :: x

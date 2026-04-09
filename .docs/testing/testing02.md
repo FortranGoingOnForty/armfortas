@@ -25,6 +25,11 @@ The next concrete slice is phase triangulation:
 - this is a bench feature, not a compiler feature: it strengthens how we
   observe pipeline coherence without changing what the compiler does
 
+Filesystem-side-effect oracles are also expanding beyond content checks:
+
+- `FILE_EXISTS` and `FILE_MISSING` let tests assert presence or absence
+  directly, not only substring content when a file happens to exist
+
 ## Goal
 
 Push the harness beyond "compile, run, compare stdout" into richer pipeline
