@@ -20,6 +20,7 @@ pub mod mem2reg;
 pub mod dse;
 pub mod lsf;
 pub mod unroll;
+pub mod loop_tree;
 
 #[cfg(test)]
 mod audit_tests;
