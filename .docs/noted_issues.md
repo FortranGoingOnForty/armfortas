@@ -130,16 +130,17 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 ## IR Lowering — Sprint 29 Audit Findings
 
-- **(BLOCKING)** ComplexLiteral expressions not lowered: `Expr::ComplexLiteral` has no match arm in `lower_expr_full`; falls through to `_ => b.const_i32(0)` placeholder. Any complex literal `(1.0, 2.0)` silently becomes 0. → Sprint 29/30 (Complex Number Intrinsics)
-- **(BLOCKING)** Stack frames larger than ~32KB produce broken prologue/epilogue: `emit.rs` emits a `; FIXME` comment when `stp_offset > 32760` instead of a valid instruction sequence. Functions with >32KB of local storage corrupt their own frame. → Codegen fix needed before Sprint 30.
+- **[FIXED]** ~~ComplexLiteral expressions not lowered~~ → `Expr::ComplexLiteral` arm added to `lower_expr_full`. Complex stored as `[f32/f64 x 2]` on stack; assignment uses memcpy; arithmetic (add/sub/mul) correct; `afs_write_complex_f32/f64` runtime functions added for list-directed I/O.
+- **[FIXED]** ~~Stack frames larger than ~32KB produce broken prologue/epilogue~~ → `emit.rs` StpPre/LdpPost arms now use x9 scratch register to synthesize the address (`add x9, sp, #N; str x29/x30`) when `stp_offset > 32760`.
 
 ## Optimizer — Sprint 29 Deferred (pipeline.rs)
 
 - **(D)** `-O3`/`-Ofast` run identical passes to `-O2`. Accepted at the flag level; correctness is preserved but no extra optimization. Deferred: NEON vectorization, aggressive inlining, IPO, devirtualization, fast-math reassociation.
 - **(D)** Function inlining: not implemented at any level. `O2.inlining()` returns true but no `Inline` pass exists.
-- **(D)** GVN (global value numbering), SROA (scalar replacement of aggregates), DSE (dead store elimination), loop unrolling — all deferred.
-- **(D)** FMADD/FMSUB fusion: mentioned in O2 pipeline comment, not implemented.
-- **(D)** LDP/STP pair merging beyond prologue/epilogue.
+- **(D)** GVN (global value numbering), SROA (scalar replacement of aggregates) — deferred.
+- **[FIXED]** ~~DSE, loop unrolling, FMADD/FMSUB fusion~~ → Sprint 29 delivered all three. DSE is intra-block only; loop unroll handles trip count ≤ 8 with single IV; FMADD/FMSUB peephole fuses single-use fmul into fma.
+- **(D)** LDP/STP pair merging beyond prologue/epilogue: current pairing is callee-save-only in `linearscan.rs`. General body-level load/store pair merging not implemented.
+- **(D)** Tail call optimization: implementation correct (`tailcall.rs`), but the pattern (Bl immediately before callee-restore cluster + LdpPost + Ret in same block) rarely fires because Fortran tail calls are typically inside conditionals, placing the Bl and epilogue in separate blocks. Not a bug — inert until cross-block TCO or block merging is added.
 
 ## Derived Types & OOP (Sprint 28)
 
@@ -160,9 +161,8 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| **[FIXED]** | 38 | Sprint 21.5 (14), Sprint 25/25.5 (11), Sprint 26 (8), Sprint 27 (5) |
-| **(BLOCKING)** New (Sprint 29 audit) | 2 | ComplexLiteral lowering; large frame prologue corruption |
+| **[FIXED]** | 41 | Sprint 21.5 (14), Sprint 25/25.5 (11), Sprint 26 (8), Sprint 27 (5), Sprint 29 (3) |
 | **(B)** Naturally resolved | 13 | Covered by Sprints 26.5, 28.7, and remaining plan |
 | **(C)** fortsh-blocking | 14 | Defer to integration (Sprints 33-35) |
 | **(D)** Exotic/rare | 19 | Keep noted, no planned work |
-| **(D)** Optimizer deferred | 5 | O3/Ofast parity, inlining, GVN/SROA/DSE, FMADD, LDP/STP |
+| **(D)** Optimizer deferred | 5 | O3/Ofast parity, inlining, GVN/SROA, body-level LDP/STP, cross-block TCO |
