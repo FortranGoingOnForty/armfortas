@@ -29,3 +29,8 @@ That sequence is deliberate:
 
 This keeps the compiler repo as the creative lab while still letting `bencch`
 stay strong at structured campaigns.
+
+## Supporting Notes
+
+- [Preservation and Branch Posture](preservation.md) — active worktrees,
+  preserved branches, and what to keep live vs selectively port later

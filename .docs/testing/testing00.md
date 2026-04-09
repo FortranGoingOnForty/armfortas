@@ -41,6 +41,16 @@ We explicitly pivot to:
 
 We explicitly do **not** keep "compiler-agnostic bench" as the main vision.
 
+## Preservation Posture
+
+That pivot is about the mission, not about pretending the older `bencch` work
+never happened.
+
+The preserved structured-runner line should stay available as a parallel branch
+family, with selective later ports of ideas that help the armfortas-first
+testing doctrine. See `.docs/testing/preservation.md` for the branch/worktree
+inventory and the keep / maybe-port / leave-frozen policy.
+
 ## Deliverables
 
 - testing doctrine documented in `.docs/testing/overview.md`
