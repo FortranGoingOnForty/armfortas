@@ -77,53 +77,18 @@ fn is_hoist_candidate(kind: &InstKind) -> bool {
     )
 }
 
-/// Find the unique preheader for a natural loop, if one exists.
-///
-/// Returns `Some(preheader_id)` only when:
-///  * the header has exactly one predecessor outside the loop body,
-///  * that predecessor's terminator is an unconditional `Branch` to
-///    the header (so it has no other live successors), and
-///  * the preheader is not itself the header.
+/// Delegate to shared loop utility.
 fn find_preheader(
     func: &Function,
     lp: &NaturalLoop,
     preds: &HashMap<BlockId, Vec<BlockId>>,
 ) -> Option<BlockId> {
-    let header_preds = preds.get(&lp.header)?;
-    // Audit N-5: `predecessors` doesn't dedupe. A terminator that
-    // branches to the same block twice (e.g., `CondBranch { true: B,
-    // false: B }` or a `Switch` with two cases → B) lists that block
-    // twice in the preds vector. We deduplicate here so the
-    // out-of-loop count reflects distinct predecessor blocks rather
-    // than distinct predecessor *edges*.
-    let mut outside: Vec<BlockId> = header_preds
-        .iter()
-        .copied()
-        .filter(|p| !lp.body.contains(p))
-        .collect();
-    outside.sort_by_key(|b| b.0);
-    outside.dedup();
-    if outside.len() != 1 { return None; }
-    let ph = outside[0];
-    if ph == lp.header { return None; }
-    let ph_block = func.block(ph);
-    match &ph_block.terminator {
-        Some(Terminator::Branch(dest, _)) if *dest == lp.header => Some(ph),
-        _ => None,
-    }
+    super::loop_utils::find_preheader(func, lp, preds)
 }
 
-/// Build the set of `ValueId`s defined inside the loop body. A value
-/// counts as "loop-defined" if it's a block param of any body block or
-/// the result of an instruction in any body block.
+/// Delegate to shared loop utility.
 fn loop_defined_values(func: &Function, lp: &NaturalLoop) -> HashSet<ValueId> {
-    let mut defs = HashSet::new();
-    for block in &func.blocks {
-        if !lp.body.contains(&block.id) { continue; }
-        for bp in &block.params { defs.insert(bp.id); }
-        for inst in &block.insts { defs.insert(inst.id); }
-    }
-    defs
+    super::loop_utils::loop_defined_values(func, lp)
 }
 
 /// One hoist directive: move instruction at (block_idx, inst_idx) into

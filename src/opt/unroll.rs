@@ -334,21 +334,9 @@ fn collect_body_chain(
     Some(chain)
 }
 
-/// Resolve a ValueId to a compile-time i64 constant, if possible.
-///
-/// Scans the function's instructions for a `ConstInt` definition.
+/// Delegate to shared loop utility.
 fn resolve_const_int(func: &Function, vid: ValueId) -> Option<i64> {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if inst.id == vid {
-                if let InstKind::ConstInt(v, _) = inst.kind {
-                    return Some(v);
-                }
-                return None; // defined, but not a constant
-            }
-        }
-    }
-    None
+    super::loop_utils::resolve_const_int(func, vid)
 }
 
 /// Inspect the header to find the loop bound and exit block.

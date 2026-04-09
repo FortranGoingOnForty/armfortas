@@ -21,6 +21,7 @@ pub mod dse;
 pub mod lsf;
 pub mod unroll;
 pub mod loop_tree;
+pub mod loop_utils;
 
 #[cfg(test)]
 mod audit_tests;
