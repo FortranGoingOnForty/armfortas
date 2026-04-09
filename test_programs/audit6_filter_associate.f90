@@ -2,6 +2,7 @@
 ! association exprs. Same family as audit6_filter_forall.
 !
 ! ERROR_EXPECTED: hidden
+! ERROR_SPAN: 14:19
 module audit6_filter_associate_mod
   integer :: visible = 1
   integer :: hidden = 999

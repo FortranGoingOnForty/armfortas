@@ -14,6 +14,7 @@ use super::builder::FuncBuilder;
 
 use crate::ast::decl::ArraySpec;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
@@ -628,12 +629,17 @@ fn collect_module_globals(
                         {
                             if (scalars.len() as i64) > total {
                                 eprintln!(
-                                    "armfortas: error: initializer for '{}' has \
+                                    "armfortas: error: {}:{}: initializer for '{}' has \
                                      {} elements but its declared shape requires \
                                      {} (audit MAJOR-3 — initializer shape \
                                      mismatch)",
-                                    entity.name, scalars.len(), total,
+                                    init_e.span.start.line,
+                                    init_e.span.start.col,
+                                    entity.name,
+                                    scalars.len(),
+                                    total,
                                 );
+                                let _ = std::io::stderr().flush();
                                 std::process::exit(1);
                             }
                         }
@@ -1565,10 +1571,13 @@ fn check_filtered_in_expr(
             let key = name.to_lowercase();
             if filtered.contains(&key) {
                 eprintln!(
-                    "armfortas: error: '{}' is not accessible in this scope — \
+                    "armfortas: error: {}:{}: '{}' is not accessible in this scope — \
                      it was filtered out by a USE ONLY clause (audit MAJOR-1)",
+                    expr.span.start.line,
+                    expr.span.start.col,
                     name,
                 );
+                let _ = std::io::stderr().flush();
                 std::process::exit(1);
             }
         }
