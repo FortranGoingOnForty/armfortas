@@ -106,7 +106,7 @@
 //! should use stable substrings that are intentionally expected
 //! across the requested matrix.
 //!
-//! ## FILE_CHECK / FILE_NOT annotations
+//! ## FILE_CHECK / FILE_NOT / FILE_EXISTS / FILE_MISSING annotations
 //!
 //! Runtime tests can assert on files created inside their per-test
 //! sandbox:
@@ -117,6 +117,10 @@
 //!     order declared.
 //!   * `! FILE_NOT: <relative-path> => <substring>` — the file must
 //!     exist, and the substring must not appear in its contents.
+//!   * `! FILE_EXISTS: <relative-path>` — the file must exist after the
+//!     run, regardless of content.
+//!   * `! FILE_MISSING: <relative-path>` — the file must not exist after
+//!     the run.
 //!
 //! Paths are sandbox-relative on purpose. The harness runs each binary
 //! in a private temp directory, so file assertions pin side effects
@@ -182,6 +186,12 @@ struct FileCheck {
     rel_path: String,
     pattern: String,
     negative: bool,
+}
+
+struct FilePresenceCheck {
+    line_num: usize,
+    rel_path: String,
+    should_exist: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +438,49 @@ fn extract_file_checks(
             rel_path: rel_path.to_string(),
             pattern: raw_pattern.trim().to_string(),
             negative,
+        });
+    }
+    Ok(checks)
+}
+
+fn extract_file_presence_checks(
+    source: &str,
+    filename: &str,
+) -> Result<Vec<FilePresenceCheck>, String> {
+    let mut checks = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let (rest, should_exist, directive_name) =
+            if let Some(rest) = trimmed.strip_prefix("! FILE_EXISTS:") {
+                (rest.trim(), true, "FILE_EXISTS")
+            } else if let Some(rest) = trimmed.strip_prefix("! FILE_MISSING:") {
+                (rest.trim(), false, "FILE_MISSING")
+            } else {
+                continue;
+            };
+
+        if rest.is_empty() {
+            return Err(format!(
+                "{}:{}: {} path cannot be empty",
+                filename,
+                i + 1,
+                directive_name
+            ));
+        }
+        if Path::new(rest).is_absolute() {
+            return Err(format!(
+                "{}:{}: {} path must be relative, got '{}'",
+                filename,
+                i + 1,
+                directive_name,
+                rest
+            ));
+        }
+
+        checks.push(FilePresenceCheck {
+            line_num: i + 1,
+            rel_path: rest.to_string(),
+            should_exist,
         });
     }
     Ok(checks)
@@ -744,6 +797,29 @@ fn collect_sandbox_files(
         } else {
             let rel = path.strip_prefix(root).unwrap();
             out.insert(rel.to_string_lossy().replace('\\', "/"), fs::read(&path)?);
+        }
+    }
+    Ok(())
+}
+
+fn match_file_presence_checks(
+    checks: &[FilePresenceCheck],
+    files: &BTreeMap<String, Vec<u8>>,
+    filename: &str,
+) -> Result<(), String> {
+    for check in checks {
+        let exists = files.contains_key(&check.rel_path);
+        if check.should_exist && !exists {
+            return Err(format!(
+                "{}:{}: FILE_EXISTS failed: sandbox file '{}' was not created",
+                filename, check.line_num, check.rel_path
+            ));
+        }
+        if !check.should_exist && exists {
+            return Err(format!(
+                "{}:{}: FILE_MISSING failed: sandbox file '{}' was created",
+                filename, check.line_num, check.rel_path
+            ));
         }
     }
     Ok(())
@@ -1230,6 +1306,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             Ok(checks) => checks,
             Err(e) => return TestOutcome::Fail(e),
         };
+    let file_presence_checks = match extract_file_presence_checks(&source_text, filename) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let repro_checks = match extract_repro_checks(&source_text, filename) {
         Ok(checks) => checks,
         Err(e) => return TestOutcome::Fail(e),
@@ -1247,6 +1327,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && ir_checks.is_empty()
         && asm_checks.is_empty()
         && file_checks.is_empty()
+        && file_presence_checks.is_empty()
         && repro_checks.is_empty()
         && opt_eq_rules.is_empty()
         && phase_triangulation.is_none()
@@ -1258,7 +1339,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
             filename,
         ));
     }
@@ -1374,6 +1455,11 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             return Err(e);
         }
         if let Err(e) = match_file_checks(&file_checks, &snapshot.files, &label) {
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir_all(&sandbox);
+            return Err(e);
+        }
+        if let Err(e) = match_file_presence_checks(&file_presence_checks, &snapshot.files, &label) {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
@@ -1716,6 +1802,17 @@ fn extract_file_checks_accepts_relative_path_and_pattern() {
 }
 
 #[test]
+fn extract_file_presence_checks_accepts_exists_and_missing() {
+    let source = "! FILE_EXISTS: out.txt\n! FILE_MISSING: ghost.txt\n";
+    let checks = extract_file_presence_checks(source, "inline.f90").unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].rel_path, "out.txt");
+    assert!(checks[0].should_exist);
+    assert_eq!(checks[1].rel_path, "ghost.txt");
+    assert!(!checks[1].should_exist);
+}
+
+#[test]
 fn extract_repro_checks_rejects_unknown_stage() {
     let source = "! REPRO_CHECK: ir\n";
     let err = extract_repro_checks(source, "inline.f90").unwrap_err();
@@ -1850,6 +1947,25 @@ fn file_checks_allow_file_roundtrip() {
         TestOutcome::Pass => {}
         other => panic!(
             "file_io.f90 should pass with FILE_CHECK coverage, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn file_presence_checks_allow_rewind_side_effects() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("io_rewind.f90");
+    assert!(
+        source.exists(),
+        "io_rewind.f90 missing — needed for FILE_EXISTS/FILE_MISSING coverage"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "io_rewind.f90 should pass with FILE_EXISTS/FILE_MISSING coverage, got {:?}",
             other
         ),
     }
