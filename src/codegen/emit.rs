@@ -484,6 +484,33 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             }
         }
 
+        // Non-preindex STP/LDP for callee-save pairs.
+        // Operands: [src1/dst1, src2/dst2, base, imm].
+        ArmOpcode::StpOffset => {
+            let r1  = op_str(&inst.operands[0]);
+            let r2  = op_str(&inst.operands[1]);
+            let base = op_str(&inst.operands[2]);
+            let off  = match &inst.operands[3] {
+                MachineOperand::Imm(v)        => *v,
+                MachineOperand::FrameSlot(v)  => *v as i64,
+                _ => 0,
+            };
+            // Detect FP vs GP to pick correct mnemonic.
+            let mnemonic = if r1.starts_with('d') || r1.starts_with('s') { "stp" } else { "stp" };
+            format!("{} {}, {}, [{}, #{}]", mnemonic, r1, r2, base, off)
+        }
+        ArmOpcode::LdpOffset => {
+            let r1  = op_str(&inst.operands[0]);
+            let r2  = op_str(&inst.operands[1]);
+            let base = op_str(&inst.operands[2]);
+            let off  = match &inst.operands[3] {
+                MachineOperand::Imm(v)        => *v,
+                MachineOperand::FrameSlot(v)  => *v as i64,
+                _ => 0,
+            };
+            format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
+        }
+
         ArmOpcode::AdrpLdr => {
             if let MachineOperand::ConstPool(idx) = &inst.operands[1] {
                 let label = const_pool_label(&mf.name, *idx);

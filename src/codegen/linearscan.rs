@@ -378,30 +378,20 @@ pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
         !matches!(i.opcode, ArmOpcode::StpPre | ArmOpcode::AddImm)
     }).unwrap_or(0);
 
-    let mut saves = Vec::new();
-    for &(reg, offset) in &save_slots {
-        let (store_op, store_reg) = match reg {
-            PhysReg::Fp(_) | PhysReg::Fp32(_) => (ArmOpcode::StrFpImm, reg),
-            _ => (ArmOpcode::StrImm, reg),
-        };
-        saves.push(MachineInst {
-            opcode: store_op,
-            operands: vec![
-                MachineOperand::PhysReg(store_reg),
-                MachineOperand::PhysReg(PhysReg::FP),
-                MachineOperand::Imm(offset as i64),
-            ],
-            def: None,
-        });
-    }
-    // Insert saves at the prologue end.
+    // Emit saves, pairing consecutive same-class registers into STP.
+    // save_slots are ordered by increasing register number; slots are
+    // allocated at decreasing offsets (-8, -16, -24, ...). Adjacent
+    // slots differ by 8 bytes — exactly the STP stride for GP64/FP64.
+    //
+    // STP Xt1, Xt2, [Xn, #off]: stores Xt1 at Xn+off, Xt2 at Xn+off+8.
+    // So to store reg_low (at lower_offset) and reg_high (at lower_offset+8):
+    //   STP reg_low, reg_high, [FP, #lower_offset]
+    let saves = emit_callee_store_pairs(&save_slots, false);
     for (i, save) in saves.into_iter().enumerate() {
         mf.blocks[0].insts.insert(prologue_end + i, save);
     }
 
     // Insert restores before every epilogue sequence (LdpPost).
-    // The epilogue is LdpPost + ADD sp + RET. Restores must go before LdpPost
-    // because LdpPost restores x29 (FP) to the caller's value.
     for block in &mut mf.blocks {
         let mut insertions = Vec::new();
         for (i, inst) in block.insts.iter().enumerate() {
@@ -410,27 +400,91 @@ pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
             }
         }
         for &ldp_idx in insertions.iter().rev() {
-            let mut restores = Vec::new();
-            for &(reg, offset) in save_slots.iter().rev() {
-                let (load_op, load_reg) = match reg {
-                    PhysReg::Fp(_) | PhysReg::Fp32(_) => (ArmOpcode::LdrFpImm, reg),
-                    _ => (ArmOpcode::LdrImm, reg),
-                };
-                restores.push(MachineInst {
-                    opcode: load_op,
-                    operands: vec![
-                        MachineOperand::PhysReg(load_reg),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::Imm(offset as i64),
-                    ],
-                    def: None,
-                });
-            }
-            for restore in restores {
+            // Restores in reverse order (mirror of saves).
+            let restores = emit_callee_store_pairs(&save_slots, true);
+            for restore in restores.into_iter().rev() {
                 block.insts.insert(ldp_idx, restore);
             }
         }
     }
+}
+
+/// Build the save (or restore) instruction list for a set of callee-saved
+/// slots, pairing consecutive adjacent GP/FP slots into STP/LDP.
+///
+/// `restore` = true → emit LDP/LDR (load); false → STP/STR (store).
+///
+/// Pairing rule: slots[i] and slots[i+1] are paired when:
+///   * Both are GP or both are FP (same register class)
+///   * slots[i+1].offset == slots[i].offset - 8 (adjacent 8-byte slots)
+///
+/// STP Xt1, Xt2, [Xn, #off] → Xt1 at off, Xt2 at off+8.
+/// We pair as: STP slots[i+1].reg, slots[i].reg, [FP, #slots[i+1].offset]
+/// because slots[i+1] has the lower (more negative) offset.
+fn emit_callee_store_pairs(
+    save_slots: &[(PhysReg, i32)],
+    restore: bool,
+) -> Vec<MachineInst> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < save_slots.len() {
+        let (reg1, off1) = save_slots[i];
+        // Try to pair with next slot.
+        if i + 1 < save_slots.len() {
+            let (reg2, off2) = save_slots[i + 1];
+            let is_gp1 = !matches!(reg1, PhysReg::Fp(_) | PhysReg::Fp32(_));
+            let is_gp2 = !matches!(reg2, PhysReg::Fp(_) | PhysReg::Fp32(_));
+            let same_class = is_gp1 == is_gp2;
+            // off1 is the higher slot (less negative); off2 = off1 - 8.
+            let adjacent = off2 == off1 - 8;
+            // STP offset must fit in 7-bit signed × 8: range -512..504.
+            let in_range = off2 >= -512 && off2 <= 504;
+            if same_class && adjacent && in_range {
+                let (opcode, low_reg, high_reg) = if restore {
+                    // LDP: low_reg gets off2, high_reg gets off1.
+                    let op = if is_gp1 { ArmOpcode::LdpOffset } else { ArmOpcode::LdpOffset };
+                    (op, reg2, reg1)
+                } else {
+                    // STP: store low_reg at off2, high_reg at off2+8=off1.
+                    let op = if is_gp1 { ArmOpcode::StpOffset } else { ArmOpcode::StpOffset };
+                    (op, reg2, reg1)
+                };
+                result.push(MachineInst {
+                    opcode,
+                    operands: vec![
+                        MachineOperand::PhysReg(low_reg),
+                        MachineOperand::PhysReg(high_reg),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(off2 as i64),
+                    ],
+                    def: None,
+                });
+                i += 2;
+                continue;
+            }
+        }
+        // Emit individual STR/LDR.
+        let (op, is_fp) = match reg1 {
+            PhysReg::Fp(_) | PhysReg::Fp32(_) => {
+                if restore { (ArmOpcode::LdrFpImm, true) } else { (ArmOpcode::StrFpImm, true) }
+            }
+            _ => {
+                if restore { (ArmOpcode::LdrImm, false) } else { (ArmOpcode::StrImm, false) }
+            }
+        };
+        let _ = is_fp;
+        result.push(MachineInst {
+            opcode: op,
+            operands: vec![
+                MachineOperand::PhysReg(reg1),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(off1 as i64),
+            ],
+            def: if restore { Some(match reg1 { PhysReg::Gp(n) | PhysReg::Gp32(n) => crate::codegen::mir::VRegId(n.into()), PhysReg::Fp(n) | PhysReg::Fp32(n) => crate::codegen::mir::VRegId(n.into()), _ => crate::codegen::mir::VRegId(0) }) } else { None },
+        });
+        i += 1;
+    }
+    result
 }
 
 /// Basic move coalescing: eliminate mov instructions where src == dest.
