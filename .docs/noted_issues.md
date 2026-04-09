@@ -136,7 +136,8 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 ## Optimizer — Sprint 29 Deferred (pipeline.rs)
 
 - **(D)** `-O3`/`-Ofast` run identical passes to `-O2`. Accepted at the flag level; correctness is preserved but no extra optimization. Deferred: NEON vectorization, aggressive inlining, IPO, devirtualization, fast-math reassociation.
-- **(D)** Function inlining: not implemented at any level. `O2.inlining()` returns true but no `Inline` pass exists.
+- **[FIXED]** ~~Function inlining: not implemented~~ → Sprint 29.7 delivered call resolution, call graph, cost model, inline pass, SimplifyCFG, and dead function elimination. Inlining is one-at-a-time per pass manager iteration (safe). Multi-site-per-invocation was attempted but caused SSA breakage when two calls in the same block were split; reverted.
+- **(D)** Inline performance: one call site per pass manager iteration means O(iterations) for functions with many call sites. With `max_iterations=32`, functions with >~10 inlinable sites may not fully inline. The correct optimization is re-scanning the modified function within a single invocation (not batching all sites upfront, which breaks SSA). Deferred to a future sprint.
 - **(D)** GVN (global value numbering), SROA (scalar replacement of aggregates) — deferred.
 - **[FIXED]** ~~DSE, loop unrolling, FMADD/FMSUB fusion~~ → Sprint 29 delivered all three. DSE is intra-block only; loop unroll handles trip count ≤ 8 with single IV; FMADD/FMSUB peephole fuses single-use fmul into fma.
 - **(D)** LDP/STP pair merging beyond prologue/epilogue: current pairing is callee-save-only in `linearscan.rs`. General body-level load/store pair merging not implemented.
