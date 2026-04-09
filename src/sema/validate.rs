@@ -24,7 +24,7 @@ pub enum FortranStandard {
 }
 
 impl FortranStandard {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_flag(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "f77" | "fortran77" => Some(Self::F77),
             "f90" | "fortran90" => Some(Self::F90),

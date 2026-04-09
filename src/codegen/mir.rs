@@ -254,7 +254,13 @@ impl StackFrame {
         //           ret
         Self { locals: Vec::new(), size: 16, next_offset: 0 }
     }
+}
 
+impl Default for StackFrame {
+    fn default() -> Self { Self::new() }
+}
+
+impl StackFrame {
     /// Allocate a local variable slot. Returns a negative offset from FP.
     /// Locals grow downward from FP: first local at [FP-8], etc.
     pub fn alloc_local(&mut self, size: u32) -> i32 {

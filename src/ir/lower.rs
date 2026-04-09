@@ -3799,8 +3799,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
                     if let Some(opt_flags) = ctx.optional_params.get(&key) {
-                        for i in arg_vals.len()..opt_flags.len() {
-                            if opt_flags[i] {
+                        for flag in opt_flags.iter().skip(arg_vals.len()) {
+                            if *flag {
                                 arg_vals.push(b.const_i64(0)); // null → absent
                             }
                         }
