@@ -1,31 +1,23 @@
 //! Loop peeling pass.
 //!
-//! Peels the first iteration of a loop when the body contains a
-//! conditional that compares the IV to its initial value. The peeled
-//! iteration becomes straight-line code in the preheader, and the
-//! loop starts at init+stride. This removes the boundary-condition
-//! branch from the hot loop, enabling further simplification by
-//! const prop and DCE.
+//! Peels the first iteration of a counted loop when the body contains
+//! an equality check against the initial IV value (`if (i == 1)`).
 //!
-//! ```text
-//! Before:
-//!   do i = 1, n
-//!     if (i == 1) then ... else ... end if
-//!   end do
+//! The approach: clone the ENTIRE loop as a subgraph using `clone_loop`,
+//! then redirect two edges so the clone executes exactly one iteration:
+//!   1. Clone's latch back-edge → original loop header (passing init+stride)
+//!   2. Clone's cmp exit → original loop's exit block
 //!
-//! After:
-//!   [peeled body with i=1]
-//!   do i = 2, n
-//!     [body without the i==1 branch — simplified by later passes]
-//!   end do
-//! ```
+//! This preserves all internal control flow (if/else branches) in the
+//! peeled iteration. Later const-prop folds `iv=init_const` through the
+//! clone, turning `if (i==1)` into `if (true)` and eliminating dead code.
 
 use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{find_natural_loops, predecessors};
 use super::loop_utils::{find_preheader, resolve_const_int, loop_defined_values,
-                        remap_inst_kind, remap_terminator};
+                        clone_loop, build_value_map};
 use super::pass::Pass;
 
 pub struct LoopPeel;
@@ -53,7 +45,6 @@ fn peel_in_function(func: &mut Function) -> bool {
         let hdr = func.block(lp.header);
         if hdr.params.len() != 1 { continue; }
         let iv = hdr.params[0].id;
-        let iv_ty = hdr.params[0].ty.clone();
 
         // Get the init value from the preheader's branch to header.
         let init_val = match &func.block(ph_id).terminator {
@@ -62,39 +53,28 @@ fn peel_in_function(func: &mut Function) -> bool {
             _ => continue,
         };
 
-        // Init must be a compile-time constant (so we can substitute it).
+        // Init must be a compile-time constant.
         let Some(init_const) = resolve_const_int(func, init_val) else { continue };
 
-        // Check if the body has a CondBranch comparing the IV to the
-        // init value (e.g., `if (i == 1)` when init is 1).
-        let loop_defs = loop_defined_values(func, lp);
-        if !has_init_conditional(func, lp, iv, init_val, &loop_defs) {
-            continue;
-        }
-
-        // Find the latch and its stride.
+        // Must have a single latch.
         if lp.latches.len() != 1 { continue; }
-        let latch = lp.latches[0];
-        let latch_blk = func.block(latch);
+        let latch_id = lp.latches[0];
 
-        // Latch must branch back to header with one arg (the next IV).
-        let next_iv = match &latch_blk.terminator {
+        // Latch must branch back to header with one arg.
+        let next_iv = match &func.block(latch_id).terminator {
             Some(Terminator::Branch(dest, args)) if *dest == lp.header && args.len() == 1 =>
                 args[0],
             _ => continue,
         };
 
-        // next_iv must be iadd(iv, stride) where stride is a constant.
+        // Find stride: next_iv = iadd(iv, stride_const).
         let stride_const = {
             let mut found = None;
-            for inst in &latch_blk.insts {
+            for inst in &func.block(latch_id).insts {
                 if inst.id == next_iv {
                     if let InstKind::IAdd(a, b) = &inst.kind {
-                        if *a == iv {
-                            found = resolve_const_int(func, *b);
-                        } else if *b == iv {
-                            found = resolve_const_int(func, *a);
-                        }
+                        if *a == iv { found = resolve_const_int(func, *b); }
+                        else if *b == iv { found = resolve_const_int(func, *a); }
                     }
                     break;
                 }
@@ -103,37 +83,56 @@ fn peel_in_function(func: &mut Function) -> bool {
         };
         let Some(stride) = stride_const else { continue };
 
-        // Peel the first iteration.
-        do_peel(func, lp, ph_id, iv, &iv_ty, init_const, stride);
+        // Check if body has a FIRST-ITERATION conditional:
+        // ICmp(Eq, iv, init_val) feeding a CondBranch.
+        let loop_defs = loop_defined_values(func, lp);
+        if !has_first_iter_conditional(func, lp, iv, init_const, &loop_defs) {
+            continue;
+        }
+
+        // Find the loop's exit block (cmp's false-branch target outside the body).
+        let exit_block = find_loop_exit(func, lp);
+        let Some(exit_id) = exit_block else { continue };
+
+        // Also find the exit args (values passed to exit on the false branch).
+        let exit_args = find_exit_args(func, lp, exit_id);
+
+        // ---- Perform the peel ----
+        do_peel(func, lp, ph_id, init_val, latch_id, exit_id, &exit_args, stride);
         return true; // one at a time
     }
     false
 }
 
-/// Check if the loop body has a CondBranch that compares the IV to the
-/// init value (or a value equal to it).
-fn has_init_conditional(
+/// Only match `ICmp(Eq, iv, val)` where `val` resolves to the same
+/// constant as the loop's init value. This is the "first iteration"
+/// check. Do NOT match bound checks like `ICmp(Le, iv, 10)`.
+fn has_first_iter_conditional(
     func: &Function,
     lp: &crate::ir::walk::NaturalLoop,
     iv: ValueId,
-    init_val: ValueId,
+    init_const: i64,
     loop_defs: &HashSet<ValueId>,
 ) -> bool {
     for &bid in &lp.body {
         let block = func.block(bid);
-        // Look for ICmp instructions that compare the IV.
         for inst in &block.insts {
-            if let InstKind::ICmp(_, a, b) = &inst.kind {
-                let involves_iv = *a == iv || *b == iv;
-                let other = if *a == iv { *b } else { *a };
-                // The other operand should be the init value or a constant
-                // equal to the init constant, and must be loop-invariant.
-                let other_is_init = other == init_val || !loop_defs.contains(&other);
-                if involves_iv && other_is_init {
-                    // Check if this comparison feeds a CondBranch in the body.
-                    let comp_id = inst.id;
-                    if let Some(Terminator::CondBranch { cond, .. }) = &block.terminator {
-                        if *cond == comp_id { return true; }
+            if let InstKind::ICmp(CmpOp::Eq, a, b) = &inst.kind {
+                // One operand must be the IV.
+                let (is_iv, other) = if *a == iv { (true, *b) }
+                    else if *b == iv { (true, *a) }
+                    else { (false, ValueId(0)) };
+                if !is_iv { continue; }
+
+                // The other operand must resolve to the init constant
+                // and be loop-invariant.
+                if loop_defs.contains(&other) { continue; }
+                if let Some(c) = resolve_const_int(func, other) {
+                    if c == init_const {
+                        // Must feed a CondBranch in this block.
+                        if let Some(Terminator::CondBranch { cond, .. }) = &block.terminator {
+                            if *cond == inst.id { return true; }
+                        }
                     }
                 }
             }
@@ -142,89 +141,119 @@ fn has_init_conditional(
     false
 }
 
-/// Peel the first iteration: clone the body with IV=init_const into
-/// the preheader, then adjust the loop to start at init+stride.
+/// Find the loop's exit block (first false-branch target outside the body).
+fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
+    for &bid in &lp.body {
+        let block = func.block(bid);
+        if let Some(Terminator::CondBranch { false_dest, .. }) = &block.terminator {
+            if !lp.body.contains(false_dest) {
+                return Some(*false_dest);
+            }
+        }
+    }
+    None
+}
+
+/// Get the args passed to the exit block from the cmp's false-branch.
+fn find_exit_args(func: &Function, lp: &crate::ir::walk::NaturalLoop, exit_id: BlockId) -> Vec<ValueId> {
+    for &bid in &lp.body {
+        let block = func.block(bid);
+        if let Some(Terminator::CondBranch { false_dest, false_args, .. }) = &block.terminator {
+            if *false_dest == exit_id {
+                return false_args.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Perform the peel using clone_loop.
+///
+/// Strategy:
+/// 1. Clone the entire loop as a subgraph (preserves if/else, etc.)
+/// 2. Redirect clone's latch → original header (with init+stride)
+/// 3. Redirect clone's cmp exit → original exit block
+/// 4. Preheader → clone's header (with init)
 fn do_peel(
     func: &mut Function,
     lp: &crate::ir::walk::NaturalLoop,
     ph_id: BlockId,
-    iv: ValueId,
-    iv_ty: &IrType,
-    init_const: i64,
+    init_val: ValueId,
+    latch_id: BlockId,
+    exit_id: BlockId,
+    exit_args: &[ValueId],
     stride: i64,
 ) {
-    let iv_width = match iv_ty {
-        IrType::Int(w) => *w,
-        _ => return,
-    };
+    // Clone the entire loop.
+    let (block_map, _new_blocks) = clone_loop(func, lp);
+    let val_map = build_value_map(func, lp, &block_map);
 
-    // Emit the IV constant (init value) in a new "peel" block.
-    let peel_block = func.create_block("peel");
-    let iv_const_id = func.next_value_id();
-    func.register_type(iv_const_id, iv_ty.clone());
-    func.block_mut(peel_block).insts.push(Inst {
-        id: iv_const_id,
-        kind: InstKind::ConstInt(init_const, iv_width),
+    // The IV type (needed to emit the init+stride constant).
+    let hdr = func.block(lp.header);
+    let iv_ty = hdr.params[0].ty.clone();
+    let iv_width = match &iv_ty { IrType::Int(w) => *w, _ => return };
+    let init_const = resolve_const_int(func, init_val).unwrap();
+
+    // Emit init+stride constant in a helper block so it's available.
+    let next_init_id = func.next_value_id();
+    func.register_type(next_init_id, iv_ty.clone());
+    // We'll place this constant in the clone's latch before rewriting it.
+
+    // --- Redirect clone's latch ---
+    // Clone's latch currently branches to clone's header. Redirect it
+    // to the ORIGINAL header, passing init+stride.
+    let clone_latch = block_map[&latch_id];
+    // Add the init+stride constant to the clone's latch.
+    let dummy_span = crate::lexer::Span {
+        file_id: 0,
+        start: crate::lexer::Position { line: 0, col: 0 },
+        end: crate::lexer::Position { line: 0, col: 0 },
+    };
+    func.block_mut(clone_latch).insts.push(Inst {
+        id: next_init_id,
+        kind: InstKind::ConstInt(init_const + stride, iv_width),
         ty: iv_ty.clone(),
-        span: crate::lexer::Span {
-            file_id: 0,
-            start: crate::lexer::Position { line: 0, col: 0 },
-            end: crate::lexer::Position { line: 0, col: 0 },
-        },
+        span: dummy_span,
     });
+    func.block_mut(clone_latch).terminator =
+        Some(Terminator::Branch(lp.header, vec![next_init_id]));
 
-    // Build a value substitution map: iv → iv_const_id.
-    let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
-    val_map.insert(iv, iv_const_id);
-
-    // Clone body instructions (excluding header and latch structure)
-    // into the peel block. We clone all body blocks' instructions
-    // sequentially into a single peel block for simplicity.
-    let body_sorted: Vec<BlockId> = {
-        let mut v: Vec<BlockId> = lp.body.iter().copied().collect();
-        v.sort_by_key(|b| b.0);
-        v
-    };
-
-    for &old_bid in &body_sorted {
-        let old_insts: Vec<Inst> = func.block(old_bid).insts.clone();
-        for inst in &old_insts {
-            // Skip the IV-related comparison and branch — the peeled
-            // iteration executes unconditionally.
-            let new_vid = func.next_value_id();
-            func.register_type(new_vid, inst.ty.clone());
-            val_map.insert(inst.id, new_vid);
-            let new_kind = remap_inst_kind(&inst.kind, &val_map);
-            func.block_mut(peel_block).insts.push(Inst {
-                id: new_vid,
-                kind: new_kind,
-                ty: inst.ty.clone(),
-                span: inst.span,
-            });
+    // --- Redirect clone's cmp exit ---
+    // Find the cmp block in the clone (the one with a CondBranch whose
+    // false-dest was the clone's exit). Redirect its false-dest to the
+    // ORIGINAL exit block with the original exit args.
+    for &orig_bid in &lp.body {
+        let block = func.block(orig_bid);
+        if let Some(Terminator::CondBranch { false_dest, .. }) = &block.terminator {
+            if *false_dest == exit_id {
+                // This is the cmp block in the original. Find its clone.
+                let clone_cmp = block_map[&orig_bid];
+                // The clone's false-dest currently points to the cloned exit
+                // (which doesn't exist as a separate block since exit_id is
+                // outside the loop body and wasn't cloned). Actually, clone_loop
+                // only clones blocks IN the body, so the exit_id wasn't cloned.
+                // The clone's terminator already points to exit_id — but with
+                // remapped args. We need to ensure the exit_args are correct.
+                //
+                // clone_loop's remap_terminator remaps values but not block
+                // targets that are OUTSIDE the body. So the clone's cmp false-dest
+                // already points to the original exit_id. The false_args were
+                // remapped through val_map. This should be correct as-is.
+                //
+                // However, we need to double-check: the exit args in the clone
+                // might reference cloned values that should reference originals.
+                // Actually no — for the peeled iteration, the cloned values ARE
+                // the correct ones (they compute the exit condition for iteration 1).
+                let _ = clone_cmp; // Already correct — exit_id is outside body.
+                break;
+            }
         }
     }
 
-    // Emit the new init value (init + stride) for the remaining loop.
-    let new_init_id = func.next_value_id();
-    func.register_type(new_init_id, iv_ty.clone());
-    func.block_mut(peel_block).insts.push(Inst {
-        id: new_init_id,
-        kind: InstKind::ConstInt(init_const + stride, iv_width),
-        ty: iv_ty.clone(),
-        span: crate::lexer::Span {
-            file_id: 0,
-            start: crate::lexer::Position { line: 0, col: 0 },
-            end: crate::lexer::Position { line: 0, col: 0 },
-        },
-    });
-
-    // Peel block branches to the loop header with the new init.
-    func.block_mut(peel_block).terminator =
-        Some(Terminator::Branch(lp.header, vec![new_init_id]));
-
-    // Rewrite preheader to branch to the peel block instead of the header.
+    // --- Wire preheader → clone's header ---
+    let clone_header = block_map[&lp.header];
     func.block_mut(ph_id).terminator =
-        Some(Terminator::Branch(peel_block, vec![]));
+        Some(Terminator::Branch(clone_header, vec![init_val]));
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +264,17 @@ fn do_peel(
 mod tests {
     use super::*;
     use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::inst::*;
     use crate::opt::pass::Pass;
+    use crate::lexer::{Span, Position};
+
+    fn span() -> Span {
+        let pos = Position { line: 0, col: 0 };
+        Span { file_id: 0, start: pos, end: pos }
+    }
 
     #[test]
-    fn peel_pass_no_op_on_empty() {
+    fn peel_no_op_on_empty() {
         let mut m = Module::new("test".into());
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
@@ -246,5 +282,80 @@ mod tests {
         let pass = LoopPeel;
         let changed = pass.run(&mut m);
         assert!(!changed, "no loops → no peeling");
+    }
+
+    #[test]
+    fn peel_no_op_without_eq_check() {
+        // Loop with no `if (i == init)` → should not peel.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+
+        let header = f.create_block("header");
+        let cmp = f.create_block("cmp");
+        let body = f.create_block("body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let entry = f.entry;
+
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c1, ty: IrType::Int(IntWidth::I32), span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let c10 = f.next_value_id();
+        f.register_type(c10, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c10, ty: IrType::Int(IntWidth::I32), span: span(),
+            kind: InstKind::ConstInt(10, IntWidth::I32),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![c1]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).terminator = Some(Terminator::Branch(cmp, vec![]));
+
+        let cmp_v = f.next_value_id();
+        f.register_type(cmp_v, IrType::Bool);
+        f.block_mut(cmp).insts.push(Inst {
+            id: cmp_v, ty: IrType::Bool, span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv, c10),
+        });
+        f.block_mut(cmp).terminator = Some(Terminator::CondBranch {
+            cond: cmp_v,
+            true_dest: body, true_args: vec![],
+            false_dest: exit, false_args: vec![],
+        });
+
+        // Body has NO equality check — just a store.
+        let alloca = f.next_value_id();
+        f.register_type(alloca, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(body).insts.push(Inst {
+            id: alloca, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+        });
+        let store_id = f.next_value_id();
+        f.register_type(store_id, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: store_id, ty: IrType::Void, span: span(),
+            kind: InstKind::Store(iv, alloca),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(latch, vec![]));
+
+        let nxt = f.next_value_id();
+        f.register_type(nxt, IrType::Int(IntWidth::I32));
+        f.block_mut(latch).insts.push(Inst {
+            id: nxt, ty: IrType::Int(IntWidth::I32), span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));
+
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = LoopPeel;
+        let changed = pass.run(&mut m);
+        assert!(!changed, "loop without i==init check should not be peeled");
     }
 }

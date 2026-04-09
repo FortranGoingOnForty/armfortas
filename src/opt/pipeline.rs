@@ -130,6 +130,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
+            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
@@ -146,6 +147,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
+            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
@@ -161,6 +163,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(PreheaderInsert));
+            pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
