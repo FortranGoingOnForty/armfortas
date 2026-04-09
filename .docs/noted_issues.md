@@ -62,7 +62,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(C)** USE-without-ONLY renames create duplicate associations.
 - **(D)** Submodule resolution missing. fortsh has zero submodules.
 - **(B)** Named interface registration → Sprint 28 (Derived Types & OOP).
-- **(C)** Standalone PARAMETER/COMMON/AttributeStmt processing missing.
+- **[FIXED]** ~~Standalone PARAMETER/COMMON processing missing~~ → Sprint 29 (COMMON blocks, EQUIVALENCE). COMMON: one global per block variable; EQUIVALENCE: shared backing store with GEP aliasing. AttributeStmt still missing.
 - **(C)** Ambiguous USE detection missing. `bencch` Sprint 7 graph suites now show `use collision_left_values, only: payload` together with `use collision_right_values, only: payload` compiling successfully in the same program instead of being rejected as ambiguous.
 - **(B)** Module default/private access is not enforced in authored `USE` graphs → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use visible_values, only: hidden` compiling successfully even when the module declares `private` default access and only marks `shown` as public.
 - **(B)** Renamed re-export graphs still leak the original name at import sites → Sprint 30 (Module System). `bencch` Sprint 7 graph suites now show `use bridge_aliases, only: payload` compiling successfully even though the intermediate module only imports the upstream entity as `lifted`, and the same leak appears in mixed `ONLY` graphs where a renamed import (`kept`) is still reachable later as `alpha`.
