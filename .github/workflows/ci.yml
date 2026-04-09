@@ -30,7 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments
+      - run: cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments
 
   test-armfortas:
     name: "Tests: armfortas unit"
