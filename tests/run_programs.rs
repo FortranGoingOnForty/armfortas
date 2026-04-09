@@ -46,6 +46,29 @@
 //! fires once we start diagnosing it correctly (so the XFAIL
 //! annotation can come off and the program becomes a regular
 //! "diagnostic regression" test).
+//!
+//! ## IR_CHECK / IR_NOT annotations
+//!
+//! For tests that need to assert on the *shape* of the lowered IR
+//! (not just the runtime answer), two extra annotations exist:
+//!
+//!   * `! IR_CHECK: <substring>` — the substring must appear in the
+//!     compiler's `--emit-ir` output. Multiple IR_CHECKs must appear
+//!     in the order they're declared.
+//!   * `! IR_NOT: <substring>` — the substring must NOT appear in the
+//!     `--emit-ir` output. Used for negative-shape assertions like
+//!     "this PARAMETER local must not have a `store` instruction"
+//!     or "this expression must not lower to a `global_addr`".
+//!
+//! IR shape is only stable at -O0 (the optimization passes erase
+//! dead code, fold constants, hoist loads, etc.), so IR_CHECK /
+//! IR_NOT only fire at the -O0 test level. The runtime CHECKs
+//! continue to run at every opt level as before.
+//!
+//! Audit5 MIN-2: this exists because audit4 captured the
+//! parameter-inlining and module-allocatable bugs as runtime tests
+//! only. A future regression that broke the IR shape but happened
+//! to land on the right runtime answer would slip through.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,6 +124,74 @@ fn extract_error_expected(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A single IR-shape assertion. Positive checks must appear in
+/// order; negative checks must not appear at all. Source line
+/// numbers are kept so failure messages can point at the right
+/// annotation.
+struct IrCheck {
+    line_num: usize,
+    pattern: String,
+    negative: bool,
+}
+
+/// Extract `! IR_CHECK:` and `! IR_NOT:` annotations from a source.
+fn extract_ir_checks(source: &str) -> Vec<IrCheck> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("! IR_CHECK:") {
+                Some(IrCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: false,
+                })
+            } else if let Some(rest) = trimmed.strip_prefix("! IR_NOT:") {
+                Some(IrCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: true,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Apply IR shape assertions against an --emit-ir text dump.
+/// Positive assertions match in declared order (intervening lines
+/// are allowed). Negative assertions match against the entire
+/// text — if the substring appears anywhere, the test fails.
+fn match_ir_checks(checks: &[IrCheck], ir: &str, filename: &str) -> Result<(), String> {
+    let mut search_offset = 0;
+    for check in checks {
+        if check.negative {
+            if ir.contains(&check.pattern) {
+                return Err(format!(
+                    "{}:{}: IR_NOT failed: substring '{}' appears in IR\n\
+                     Full IR:\n{}",
+                    filename, check.line_num, check.pattern, ir,
+                ));
+            }
+        } else {
+            // Positive: search forward from the previous match
+            // position so multiple IR_CHECKs enforce ordering.
+            if let Some(rel) = ir[search_offset..].find(&check.pattern) {
+                search_offset += rel + check.pattern.len();
+            } else {
+                return Err(format!(
+                    "{}:{}: IR_CHECK failed: substring '{}' not found from offset {}\n\
+                     Full IR:\n{}",
+                    filename, check.line_num, check.pattern, search_offset, ir,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Match checks against actual output lines. Checks must appear in order
@@ -191,11 +282,17 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let xfail_reason = extract_xfail(&source_text);
     let error_expected = extract_error_expected(&source_text);
     let checks = extract_checks(&source_text);
-    if checks.is_empty() && xfail_reason.is_none() && error_expected.is_none() {
-        // Programs with no CHECKs, no XFAIL marker, and no ERROR
-        // marker are mis-configured tests, not test failures.
+    let ir_checks = extract_ir_checks(&source_text);
+    if checks.is_empty()
+        && ir_checks.is_empty()
+        && xfail_reason.is_none()
+        && error_expected.is_none()
+    {
+        // Programs with no CHECKs, no IR_CHECKs, no XFAIL marker,
+        // and no ERROR marker are mis-configured tests, not test
+        // failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / XFAIL / ERROR_EXPECTED annotations",
+            "{}: no CHECK / IR_CHECK / XFAIL / ERROR_EXPECTED annotations",
             filename,
         ));
     }
@@ -277,10 +374,47 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
         let stdout = String::from_utf8_lossy(&run.stdout);
         let label = format!("{} [{}]", filename, opt_flag);
-        let res = match_checks(&checks, &stdout, &label);
+        if let Err(e) = match_checks(&checks, &stdout, &label) {
+            let _ = fs::remove_file(&binary);
+            return Err(e);
+        }
         let _ = fs::remove_file(&binary);
         let _ = fs::remove_dir_all(&sandbox);
-        res
+
+        // IR shape assertions: only at -O0, where the IR is
+        // stable. Optimization passes (mem2reg, LICM, CSE, etc.)
+        // erase the very shape we want to pin, so running these
+        // at -O1+ would always fail. The runtime CHECKs above
+        // continue to run at every level.
+        if !ir_checks.is_empty() && opt_flag == "-O0" {
+            let ir_dest = std::env::temp_dir().join(format!(
+                "afs_test_{}_ir.txt",
+                source.file_stem().unwrap().to_str().unwrap(),
+            ));
+            let ir_compile = Command::new(compiler)
+                .args([
+                    source.to_str().unwrap(),
+                    "-O0",
+                    "--emit-ir",
+                    "-o",
+                    ir_dest.to_str().unwrap(),
+                ])
+                .output()
+                .map_err(|e| format!("{}: cannot run --emit-ir: {}", filename, e))?;
+            if !ir_compile.status.success() {
+                let stderr = String::from_utf8_lossy(&ir_compile.stderr);
+                return Err(format!(
+                    "{} [{}]: --emit-ir compilation failed:\n{}",
+                    filename, opt_flag, stderr,
+                ));
+            }
+            let ir_text = fs::read_to_string(&ir_dest)
+                .map_err(|e| format!("{}: cannot read IR: {}", filename, e))?;
+            let _ = fs::remove_file(&ir_dest);
+            match_ir_checks(&ir_checks, &ir_text, &label)?;
+        }
+
+        Ok(())
     };
 
     let result = inner();
