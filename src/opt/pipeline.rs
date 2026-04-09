@@ -137,6 +137,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
@@ -171,6 +172,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
