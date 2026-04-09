@@ -13,7 +13,14 @@
 !   m(1,3)=13 m(2,3)=23 m(3,3)=33
 !   m(1,4)=14 m(2,4)=24 m(3,4)=34
 !
+! IR-shape assertions (audit5 MIN-2):
+!   * Multi-D allocate must call afs_allocate_array with a
+!     stack DimDescriptor[rank], NOT fall back to afs_allocate_1d.
+!     (The pre-fix flatten-and-call-1d path was the bug.)
+!
 ! CHECK: 11 21 31 12 22 32 13 23 33 14 24 34
+! IR_CHECK: call @afs_allocate_array
+! IR_NOT: call @afs_allocate_1d
 module audit5_m1_mod
   integer, allocatable :: m(:,:)
 end module audit5_m1_mod

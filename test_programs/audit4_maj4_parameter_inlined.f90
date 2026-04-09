@@ -8,11 +8,21 @@
 ! materializes the constant directly via b.const_i32/i64/f32/f64
 ! at every use, with no .data slot allocated for the parameter.
 !
-! Verified by inspecting --emit-ir output: the IR for `result = k*k`
-! shows two `const_int 10` instructions and an `imul`, with NO
-! `global_addr @afs_save_*_k` and no `load` of the parameter slot.
+! IR-shape assertions (audit5 MIN-2):
+!   * The PARAMETER must NOT get a SAVE-style global. Without
+!     inline_const, alloc_decls would emit `global @afs_save_*_k`.
+!   * The PARAMETER must NOT have a `load` instruction reading
+!     from its sentinel slot — every use site materializes a
+!     fresh `const_int 10`.
+!   * `result = k * k` must lower to two const_int 10s feeding
+!     an `imul` directly.
 !
 ! CHECK: 100
+! IR_NOT: global @afs_save
+! IR_NOT: load %0 : i32
+! IR_CHECK: const_int 10
+! IR_CHECK: const_int 10
+! IR_CHECK: imul
 program audit4_maj4_parameter_inlined
   call s()
 contains

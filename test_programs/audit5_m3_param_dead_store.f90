@@ -24,7 +24,15 @@
 ! produced the right value), so this is purely an IR-cleanup
 ! finding. The CHECK line below pins the runtime contract.
 !
+! IR-shape assertions (audit5 MIN-2):
+!   * The PARAMETER's sentinel alloca must have NO `store`
+!     instruction targeting it. The pre-fix init_decls emitted a
+!     `store %const, %0` that this assertion would catch.
+!   * The PARAMETER's sentinel slot must also have no `load`.
+!
 ! CHECK: 100
+! IR_NOT: store %2, %0
+! IR_NOT: load %0 : i32
 program audit5_m3_param_dead_store
   call s()
 contains
