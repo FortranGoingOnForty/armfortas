@@ -13,7 +13,6 @@
 !
 ! Expected: compiles, runs, prints "1 2 3 4 5".
 !
-! XFAIL: audit6 BLOCKING-1 (allocatable function return type)
 ! CHECK: 1 2 3 4 5
 program audit6_b1_allocatable_function_return
   implicit none

@@ -86,10 +86,23 @@ struct LowerCtx<'a> {
     result_addr: Option<ValueId>,
     /// For functions: the return type.
     result_type: Option<IrType>,
+    /// True when this function uses the sret (hidden-output-param) convention
+    /// because it returns an allocatable array. Stmt::Return emits `ret void`
+    /// instead of loading result_addr. Audit6 BLOCKING-1.
+    is_alloc_return: bool,
+    /// Names of functions in the compilation unit that return allocatable
+    /// arrays (sret convention). Used at call sites to detect when to
+    /// pass a temp descriptor as the hidden first arg. Audit6 BLOCKING-1.
+    alloc_return_funcs: &'a HashSet<String>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(st: &'a SymbolTable, globals: &'a HashMap<(String, String), ModuleGlobalInfo>, type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry) -> Self {
+    fn new(
+        st: &'a SymbolTable,
+        globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
+        type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+        alloc_return_funcs: &'a HashSet<String>,
+    ) -> Self {
         Self {
             locals: HashMap::new(),
             loops: Vec::new(),
@@ -99,6 +112,8 @@ impl<'a> LowerCtx<'a> {
             filtered_names: HashSet::new(),
             result_addr: None,
             result_type: None,
+            is_alloc_return: false,
+            alloc_return_funcs,
         }
     }
 
@@ -154,14 +169,72 @@ pub fn lower_file(
         }
     }
 
+    // Pass 1.5: walk every program unit (and its `contains` chain)
+    // and collect the names of functions whose result variable is
+    // declared `allocatable`. Audit6 BLOCKING-1: these need a hidden
+    // first parameter at lowering time so the caller can pass a
+    // descriptor address into which the function fills its result.
+    let mut alloc_return_funcs: HashSet<String> = HashSet::new();
+    for unit in units {
+        collect_alloc_return_funcs(&unit.node, &mut alloc_return_funcs);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
     let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host);
+        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs);
     }
     module
+}
+
+/// Walk a program unit and any nested `contains` to collect the
+/// names of functions whose result variable is declared
+/// `allocatable`. The set is keyed by lowercase function name and
+/// is consulted at call sites in pass 2.
+///
+/// Audit6 BLOCKING-1: a function `function f() result(r); integer,
+/// allocatable :: r(:)` cannot be returned by value through the
+/// usual scalar result alloca — the descriptor is 384 bytes and
+/// the type system needs to know about it at every call site.
+/// We model this with a hidden first `ptr<[i8 x 384]>` parameter
+/// that the caller passes in, and the function writes its result
+/// into that descriptor.
+fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
+    use crate::ast::decl::Attribute;
+    let scan_decls = |decls: &[crate::ast::decl::SpannedDecl], result_name: &str| -> bool {
+        let key = result_name.to_lowercase();
+        for decl in decls {
+            if let Decl::TypeDecl { entities, attrs, .. } = &decl.node {
+                for entity in entities {
+                    if entity.name.to_lowercase() == key {
+                        return attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+                    }
+                }
+            }
+        }
+        false
+    };
+    match unit {
+        ProgramUnit::Function { name, decls, contains, result, .. } => {
+            let result_name = result.as_deref().unwrap_or(name.as_str());
+            if scan_decls(decls, result_name) {
+                out.insert(name.to_lowercase());
+            }
+            for sub in contains {
+                collect_alloc_return_funcs(&sub.node, out);
+            }
+        }
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Subroutine { contains, .. }
+        | ProgramUnit::Module { contains, .. } => {
+            for sub in contains {
+                collect_alloc_return_funcs(&sub.node, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Information about a module-level global, tracked in
@@ -495,12 +568,13 @@ fn lower_unit(
     // the combined list down to any nested subprogram. The
     // top-level call from lower_file passes an empty slice.
     host_uses: &[crate::ast::decl::SpannedDecl],
+    alloc_return_funcs: &HashSet<String>,
 ) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let mut func = Function::new(fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -520,7 +594,7 @@ fn lower_unit(
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
                 }
                 ensure_termination(&mut b, None);
             }
@@ -534,7 +608,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
@@ -554,7 +628,7 @@ fn lower_unit(
                 } else { None }
             }).collect();
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -600,7 +674,7 @@ fn lower_unit(
                 init_decls(&mut b, &ctx.locals, decls, st);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
                 }
                 ensure_termination(&mut b, None);
             }
@@ -615,36 +689,69 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
-            let ret_ty = return_type.as_ref()
-                .map(lower_type_spec)
-                .unwrap_or_else(|| {
-                    let result_name = result.as_deref().unwrap_or(name.as_str());
-                    arg_type_from_decls(result_name, decls)
-                });
-            let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
-                if let DummyArg::Name(n) = arg {
-                    let elem_ty = arg_type_from_decls(n, decls);
-                    if arg_has_value_attr(n, decls) {
-                        Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
-                    } else {
-                        Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
-                    }
-                } else { None }
-            }).collect();
-            let mut func = Function::new(func_name.clone(), params, ret_ty.clone());
-            let mut ctx = LowerCtx::new(st, globals, type_layouts);
+
+            // Audit6 BLOCKING-1: functions with allocatable result use the
+            // sret (hidden-output-param) convention. The caller allocas a
+            // 384-byte descriptor and passes its address as param 0; the
+            // function writes its result into that descriptor and returns
+            // void. This avoids trying to return 384 bytes "by value".
+            let is_alloc_return = alloc_return_funcs.contains(&func_name.to_lowercase());
+
+            let (func_params, ir_ret_ty) = if is_alloc_return {
+                // Hidden first param: ptr to caller-provided 384-byte descriptor.
+                let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)));
+                let sret = Param { name: "_sret".into(), ty: desc_ptr_ty, id: ValueId(0) };
+                // Real args shifted by 1 so _sret is param 0.
+                let real: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
+                    if let DummyArg::Name(n) = arg {
+                        let elem_ty = arg_type_from_decls(n, decls);
+                        if arg_has_value_attr(n, decls) {
+                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32 + 1) })
+                        } else {
+                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32 + 1) })
+                        }
+                    } else { None }
+                }).collect();
+                let mut params = vec![sret];
+                params.extend(real);
+                (params, IrType::Void)
+            } else {
+                let ret_ty = return_type.as_ref()
+                    .map(lower_type_spec)
+                    .unwrap_or_else(|| {
+                        let result_name = result.as_deref().unwrap_or(name.as_str());
+                        arg_type_from_decls(result_name, decls)
+                    });
+                let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
+                    if let DummyArg::Name(n) = arg {
+                        let elem_ty = arg_type_from_decls(n, decls);
+                        if arg_has_value_attr(n, decls) {
+                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                        } else {
+                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                        }
+                    } else { None }
+                }).collect();
+                (params, ret_ty)
+            };
+
+            let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
+            ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
 
+            // Build param_info skipping the sret param (it's not a Fortran variable).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
+                .filter(|p| p.name != "_sret")
                 .map(|p| {
                     let is_ptr = matches!(&p.ty, IrType::Ptr(_));
                     let elem_ty = match &p.ty {
@@ -676,10 +783,29 @@ fn lower_unit(
                 }
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
-                let result_addr = b.alloca(ret_ty.clone());
-                ctx.insert_scalar(result_name, result_addr, ret_ty.clone());
-                ctx.result_addr = Some(result_addr);
-                ctx.result_type = Some(ret_ty.clone());
+
+                if is_alloc_return {
+                    // The sret param (ValueId 0) IS the descriptor address.
+                    // Pre-insert the result variable as an allocatable backed by that
+                    // descriptor so alloc_decls skips it (locals.contains_key → continue).
+                    let elem_ty = arg_type_from_decls(&result_name, decls);
+                    ctx.locals.insert(result_name.clone(), LocalInfo {
+                        addr: ValueId(0),
+                        ty: elem_ty,
+                        dims: vec![],
+                        allocatable: true,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                    });
+                    // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
+                } else {
+                    let result_addr = b.alloca(ir_ret_ty.clone());
+                    ctx.insert_scalar(result_name, result_addr, ir_ret_ty.clone());
+                    ctx.result_addr = Some(result_addr);
+                    ctx.result_type = Some(ir_ret_ty.clone());
+                }
 
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
@@ -689,9 +815,15 @@ fn lower_unit(
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts);
-                    let rv = b.load(result_addr);
-                    b.ret(Some(rv));
+                    let skip = if is_alloc_return { Some(ValueId(0)) } else { None };
+                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, skip);
+                    if is_alloc_return {
+                        b.ret(None);
+                    } else {
+                        let result_addr = ctx.result_addr.expect("non-sret function has result_addr");
+                        let rv = b.load(result_addr);
+                        b.ret(Some(rv));
+                    }
                 }
             }
 
@@ -702,7 +834,7 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
             }
         }
         ProgramUnit::Module { .. } => {
@@ -2759,7 +2891,12 @@ fn string_literal_len(expr: &crate::ast::expr::SpannedExpr) -> i64 {
 /// previous version walked `locals.values()` directly, picking up the
 /// HashMap's randomized iteration order — surfaced as non-reproducible
 /// builds for any function with multiple allocatable locals.
-fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry) {
+/// When `skip_addr` is `Some(addr)`, skip deallocation for any local whose
+/// `info.addr` matches. Used to preserve sret result ownership: the result
+/// variable of an allocatable-returning function is allocated inside the
+/// callee but ownership is transferred to the caller — the callee must
+/// NOT free it. Audit6 BLOCKING-1.
+fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalInfo>, type_layouts: &crate::sema::type_layout::TypeLayoutRegistry, skip_addr: Option<ValueId>) {
     // Audit Med-2: only allocate the stat_addr scratch slot if we
     // actually need it for an `afs_deallocate_array` call. Without
     // this guard every function (even one with no allocatables)
@@ -2785,6 +2922,8 @@ fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalIn
     let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (_name, info) in sorted {
+        // Skip caller-owned allocatables (sret result variables).
+        if skip_addr == Some(info.addr) { continue; }
         if info.char_kind == CharKind::Deferred {
             b.call(
                 FuncRef::External("afs_dealloc_string".into()),
@@ -2904,17 +3043,42 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                             CharKind::None => {
                                 if !info.dims.is_empty() || info.allocatable {
-                                    if matches!(&value.node, Expr::FunctionCall { .. }) {
-                                        // Array = func_returning_array (e.g., c = matmul(a,b)).
-                                        // The function returns a temp descriptor pointer.
-                                        // Use afs_assign_allocatable to copy data and handle reallocation.
-                                        let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-                                        b.call(FuncRef::External("afs_assign_allocatable".into()),
-                                            vec![info.addr, src_desc], IrType::Void);
-                                        // Deallocate the temporary result descriptor's heap data.
-                                        let stat = b.alloca(IrType::Int(IntWidth::I32));
-                                        b.call(FuncRef::External("afs_deallocate_array".into()),
-                                            vec![src_desc, stat], IrType::Void);
+                                    if let Expr::FunctionCall { callee, args: call_args } = &value.node {
+                                        if let Expr::Name { name: callee_name } = &callee.node {
+                                            let callee_key = callee_name.to_lowercase();
+                                            if ctx.alloc_return_funcs.contains(&callee_key) {
+                                                // Audit6 BLOCKING-1: sret call — pass info.addr as
+                                                // the hidden first arg so the function writes its
+                                                // result directly into the destination descriptor.
+                                                // No temp descriptor or afs_assign_allocatable needed.
+                                                let ref_args: Vec<ValueId> = call_args.iter().map(|a| {
+                                                    match &a.value {
+                                                        crate::ast::expr::SectionSubscript::Element(e) =>
+                                                            lower_arg_by_ref(b, &ctx.locals, e, ctx.st),
+                                                        _ => b.const_i32(0),
+                                                    }
+                                                }).collect();
+                                                let mut all_args = vec![info.addr];
+                                                all_args.extend(ref_args);
+                                                b.call(FuncRef::External(callee_name.clone()), all_args, IrType::Void);
+                                            } else {
+                                                // Non-sret: function returns a temp descriptor.
+                                                let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                                b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                                    vec![info.addr, src_desc], IrType::Void);
+                                                let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                                b.call(FuncRef::External("afs_deallocate_array".into()),
+                                                    vec![src_desc, stat], IrType::Void);
+                                            }
+                                        } else {
+                                            // Indirect callee: fall back to assign path.
+                                            let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                            b.call(FuncRef::External("afs_assign_allocatable".into()),
+                                                vec![info.addr, src_desc], IrType::Void);
+                                            let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                            b.call(FuncRef::External("afs_deallocate_array".into()),
+                                                vec![src_desc, stat], IrType::Void);
+                                        }
                                     } else {
                                         lower_array_assign(b, ctx, &info, value);
                                     }
@@ -3392,8 +3556,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Return { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
-            if let Some(addr) = ctx.result_addr {
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
+            if ctx.is_alloc_return {
+                // sret convention: result was written into the hidden first param.
+                b.ret(None);
+            } else if let Some(addr) = ctx.result_addr {
                 let rv = b.load(addr);
                 b.ret(Some(rv));
             } else {
@@ -3402,12 +3570,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Stop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
         Stmt::ErrorStop { .. } => {
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts);
+            let skip = if ctx.is_alloc_return { Some(ValueId(0)) } else { None };
+            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
             b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
             b.unreachable();
         }
