@@ -192,6 +192,8 @@ source-embedded assertions such as:
 - `! ERROR_EXPECTED:` for diagnostics that must be emitted
 - `! ERROR_SPAN:` for exact diagnostic location
 - `! ASM_CHECK:` / `! ASM_NOT:` for assembly shape
+- `! FILE_CHECK:` / `! FILE_NOT:` for sandbox file side effects
+- `! REPRO_CHECK:` for per-test asm/object/run reproducibility
 - `! IR_CHECK:` / `! IR_NOT:` for IR shape
 
 Those source comments are the canonical leaf-assertion language for the
