@@ -333,6 +333,106 @@ fn install_common_locals(
     }
 }
 
+/// Install EQUIVALENCE group members as aliased locals before `alloc_decls`.
+///
+/// F77 §5.4: each member of an equivalence group must share the same
+/// backing storage. We allocate one `[i8 x total]` backing store and
+/// install each variable with a GEP into it at its byte offset. The
+/// GEP element type matches the variable's declared type so that
+/// subsequent loads and stores are correctly typed (the verifier
+/// allows `store T, Ptr<T>` unconditionally). Audit6 BLOCKING-3.
+///
+/// Supported members:
+///   * `Expr::Name` — scalar variable at offset 0 within itself.
+///   * `Expr::FunctionCall { callee: name, args: [Element(idx)] }` —
+///     array element `name(idx)`, at byte offset `(idx−1)*elem_size`
+///     relative to the start of the array. Array must already be in
+///     scope via a static (non-allocatable) TypeDecl so we can compute
+///     the size at compile time.
+///
+/// The "anchor" of the group is the member with the smallest byte
+/// offset after mapping each member's internal offset to a shared
+/// coordinate space. All other members are GEP'd at their relative
+/// distance from the anchor. The backing store is sized to cover the
+/// maximum extent across all members.
+fn install_equivalence_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    use crate::ast::decl::Decl;
+    use crate::ast::expr::Expr;
+    use crate::ast::expr::SectionSubscript;
+
+    for decl in decls {
+        if let Decl::EquivalenceStmt { groups } = &decl.node {
+            for group in groups {
+                // Resolve each member to (var_name, elem_ty, within_var_byte_offset).
+                // within_var_byte_offset: for `name` → 0; for `name(i)` → (i-1)*elem_size.
+                let mut members: Vec<(String, IrType, i64)> = Vec::new();
+                for expr in group {
+                    match &expr.node {
+                        Expr::Name { name } => {
+                            let key = name.to_lowercase();
+                            let ty = arg_type_from_decls(&key, decls);
+                            members.push((key, ty, 0));
+                        }
+                        Expr::FunctionCall { callee, args } => {
+                            if let Expr::Name { name } = &callee.node {
+                                let key = name.to_lowercase();
+                                let ty = arg_type_from_decls(&key, decls);
+                                let idx = if let Some(sub) = args.first() {
+                                    if let SectionSubscript::Element(e) = &sub.value {
+                                        eval_const_int(e).unwrap_or(1)
+                                    } else { 1 }
+                                } else { 1 };
+                                let byte_off = (idx.max(1) - 1) * ir_scalar_byte_size(&ty);
+                                members.push((key, ty, byte_off));
+                            }
+                        }
+                        _ => {} // skip complex expressions
+                    }
+                }
+                if members.is_empty() { continue; }
+
+                // Find the smallest within_var offset — this becomes the "origin".
+                let min_off = members.iter().map(|(_, _, o)| *o).min().unwrap_or(0);
+
+                // Compute total backing store size (bytes).
+                let total = members.iter().map(|(_, ty, o)| {
+                    (o - min_off) + ir_scalar_byte_size(ty)
+                }).max().unwrap_or(8);
+
+                // Allocate the byte-array backing store.
+                let backing_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), total as u64);
+                let backing = b.alloca(backing_ty);
+
+                for (var_name, elem_ty, within_off) in &members {
+                    if locals.contains_key(var_name) { continue; }
+                    let rel = within_off - min_off; // byte offset into backing
+                    // GEP with element type = elem_ty so the result is Ptr<elem_ty>.
+                    // For I32 at rel=0: gep(backing, [0], I32) → Ptr<I32> (backing itself).
+                    // For I32 at rel=4: gep(backing, [1], I32) → Ptr<I32> (backing + 4).
+                    let elem_size = ir_scalar_byte_size(elem_ty);
+                    let gep_idx = if elem_size > 0 { rel / elem_size } else { 0 };
+                    let idx_val = b.const_i64(gep_idx);
+                    let addr = b.gep(backing, vec![idx_val], elem_ty.clone());
+                    locals.insert(var_name.clone(), LocalInfo {
+                        addr,
+                        ty: elem_ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Information about a module-level global, tracked in
 /// `lower_file`'s globals map so `install_globals_as_locals` can
 /// reconstruct a `LocalInfo` for it inside each function that
@@ -684,6 +784,7 @@ fn lower_unit(
             {
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
@@ -765,6 +866,7 @@ fn lower_unit(
                 }
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
@@ -906,6 +1008,7 @@ fn lower_unit(
                 }
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);

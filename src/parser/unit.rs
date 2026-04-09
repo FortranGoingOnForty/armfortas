@@ -417,6 +417,11 @@ impl<'a> Parser<'a> {
                 decls.push(self.parse_data_stmt()?);
                 continue;
             }
+            if text == "equivalence" && next_tok.as_ref() == Some(&TokenKind::LParen) {
+                self.advance(); // consume 'equivalence'
+                decls.push(self.parse_equivalence_stmt()?);
+                continue;
+            }
 
             // Try as executable statement.
             body.push(self.parse_stmt()?);

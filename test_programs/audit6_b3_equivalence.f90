@@ -8,7 +8,6 @@
 ! independent alloca. Fortran 77 baseline feature, in
 ! CLAUDE.md "in scope and required" list.
 !
-! XFAIL: audit6 BLOCKING-3 (EQUIVALENCE not lowered as alias)
 ! CHECK: 42
 program audit6_b3_equivalence
   integer :: a, b
