@@ -17,6 +17,30 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let start = self.current_span();
 
+        // Check for statement label: a decimal integer at statement start.
+        // In Fortran, any statement can be prefixed by a label (e.g. `10 i = i + 1`).
+        // Disambiguate from arithmetic IF branch targets (which appear after a `)`) by
+        // checking that the integer is genuinely the first token of the statement.
+        if self.peek() == &TokenKind::IntegerLiteral {
+            let next_pos = self.pos + 1;
+            if next_pos < self.tokens.len() {
+                let next_kind = &self.tokens[next_pos].kind;
+                // Only treat as a label if the following token starts a statement.
+                // Reject if followed by a comma (e.g. computed-GOTO label list handled elsewhere).
+                if matches!(next_kind,
+                    TokenKind::Identifier
+                    | TokenKind::IntegerLiteral
+                    | TokenKind::LParen)
+                {
+                    let label_text = self.advance().clone().text;
+                    let label: u64 = label_text.parse().unwrap_or(0);
+                    let inner = self.parse_stmt()?;
+                    let span = span_from_to(start, self.prev_span());
+                    return Ok(Spanned::new(Stmt::Labeled { label, stmt: Box::new(inner) }, span));
+                }
+            }
+        }
+
         // Check for named construct: name: if/do/select/...
         if self.peek() == &TokenKind::Identifier {
             let next_pos = self.pos + 1;

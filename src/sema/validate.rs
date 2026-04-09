@@ -398,6 +398,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Continue { label: Some(lbl) } => {
             register_label(ctx, *lbl, stmt.span);
         }
+        Stmt::Labeled { label, stmt: inner } => {
+            register_label(ctx, *label, stmt.span);
+            validate_stmt(ctx, inner);
+        }
 
         // ---- Control flow — recurse into bodies ----
         Stmt::IfConstruct { then_body, else_ifs, else_body, .. } => {
