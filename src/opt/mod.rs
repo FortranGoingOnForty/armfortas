@@ -22,6 +22,7 @@ pub mod lsf;
 pub mod unroll;
 pub mod loop_tree;
 pub mod loop_utils;
+pub mod preheader;
 
 #[cfg(test)]
 mod audit_tests;

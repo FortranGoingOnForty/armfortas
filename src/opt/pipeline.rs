@@ -15,6 +15,7 @@ use super::mem2reg::Mem2Reg;
 use super::dse::Dse;
 use super::lsf::LocalLsf;
 use super::unroll::LoopUnroll;
+use super::preheader::PreheaderInsert;
 
 /// Compiler optimization levels.
 ///
@@ -122,6 +123,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
@@ -135,6 +137,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
@@ -148,6 +151,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(PreheaderInsert));
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
