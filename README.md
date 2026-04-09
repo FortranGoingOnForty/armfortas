@@ -195,9 +195,10 @@ source-embedded assertions such as:
 - `! FILE_CHECK:` / `! FILE_NOT:` for sandbox file side effects
 - `! FILE_EXISTS:` / `! FILE_MISSING:` for explicit sandbox presence or absence
 - `! FILE_LINE_COUNT:` for structural file-shape assertions
+- `! FILE_RERUN_MODE:` for explicit overwrite vs append intent across reruns
 - `! REPRO_CHECK:` for per-test asm/object/run reproducibility
 - `! OPT_EQ:` for explicit cross-opt invariants
-- `! PHASE_TRIANGULATE:` for same-opt IR/ASM/object availability oracles
+- `! PHASE_TRIANGULATE:` for same-opt IR/ASM/object availability and compile-cleanliness oracles
 - `! IR_CHECK:` / `! IR_NOT:` for IR shape
 
 Those source comments are the canonical leaf-assertion language for the

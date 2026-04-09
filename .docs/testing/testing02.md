@@ -31,8 +31,17 @@ Filesystem-side-effect oracles are also expanding beyond content checks:
   directly, not only substring content when a file happens to exist
 - `FILE_LINE_COUNT` lets tests pin structural file shape for rewind/flush
   families without hardcoding every byte of formatted output
+- `FILE_RERUN_MODE` makes overwrite-vs-append intent explicit instead of
+  relying on a human to infer it from the source
 - `REPRO_CHECK: run_same_sandbox` makes repeated-run side effects explicit,
   so append-vs-replace and stale-file bugs can be tested deliberately
+
+Phase triangulation is also getting a stronger policy mode:
+
+- `PHASE_TRIANGULATE: ... | clean` requires compile-only surfaces to leave
+  only their requested artifact in a private phase sandbox
+- that lets a runtime-side-effecting test prove `--emit-ir`, `-S`, and `-c`
+  do not accidentally create the files that only linked execution should create
 
 ## Goal
 
