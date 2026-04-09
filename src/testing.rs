@@ -17,6 +17,8 @@ use crate::codegen::mir::{
 };
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
+use crate::opt::build_pipeline;
+use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
 use crate::parser::Parser;
@@ -350,13 +352,42 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     if wants(Stage::Ir) {
         stages.insert(Stage::Ir, CapturedStage::Text(ir_text.clone()));
     }
+    let needs_optimized_pipeline =
+        request.requested.iter().any(|stage| {
+            matches!(
+                stage,
+                Stage::OptIr | Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run
+            )
+        })
+        && request.opt_level != OptLevel::O0;
+
+    let optimized_module = if needs_optimized_pipeline {
+        let mut optimized = ir_module.clone();
+        let ir_opt = match request.opt_level {
+            OptLevel::O0 => IrOptLevel::O0,
+            OptLevel::O1 => IrOptLevel::O1,
+            OptLevel::O2 => IrOptLevel::O2,
+            OptLevel::O3 => IrOptLevel::O3,
+            OptLevel::Ofast => IrOptLevel::Ofast,
+        };
+        let pm = build_pipeline(ir_opt);
+        pm.run(&mut optimized);
+        Some(optimized)
+    } else {
+        None
+    };
+
     if wants(Stage::OptIr) {
-        // Optimization plumbing lives on a later branch; for now this stage is
-        // the lowered IR snapshot so the bench has a stable slot ready.
-        stages.insert(Stage::OptIr, CapturedStage::Text(ir_text.clone()));
+        let opt_ir_text = if let Some(module) = optimized_module.as_ref() {
+            ir_printer::print_module(module)
+        } else {
+            ir_text.clone()
+        };
+        stages.insert(Stage::OptIr, CapturedStage::Text(opt_ir_text));
     }
 
-    let machine_funcs = isel::select_module(&ir_module);
+    let backend_ir = optimized_module.as_ref().unwrap_or(&ir_module);
+    let machine_funcs = isel::select_module(backend_ir);
     if wants(Stage::Mir) {
         stages.insert(
             Stage::Mir,
