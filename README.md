@@ -181,7 +181,42 @@ cargo run -p afs-tests -- run --suite runtime     # bencch runtime suite
 cargo run -p afs-tests -- run --suite consistency # reproducibility checks
 ```
 
-The end-to-end harness compiles each `.f90` file in `test_programs/`, runs the binary, and checks stdout against `! CHECK:` annotations. All tests run at every optimization level (`-O0` through `-Ofast`). Programs with known bugs carry `! XFAIL:` annotations that reference the audit finding — they count as passing until the bug is fixed, at which point CI catches the unexpected success.
+<<<<<<< HEAD
+The root `armfortas` harness is the fast, armfortas-first runner. It compiles
+each `.f90` file in `test_programs/`, runs the binary, and evaluates
+source-embedded assertions such as:
+
+- `! CHECK:` for stdout
+- `! STDERR_CHECK:` for runtime stderr
+- `! EXIT_CODE:` for exact runtime exit status
+- `! XFAIL:` for known open bugs
+- `! ERROR_EXPECTED:` for diagnostics that must be emitted
+- `! ERROR_SPAN:` for exact diagnostic location
+- `! ASM_CHECK:` / `! ASM_NOT:` for assembly shape
+- `! FILE_CHECK:` / `! FILE_NOT:` for sandbox file side effects
+- `! REPRO_CHECK:` for per-test asm/object/run reproducibility
+- `! OPT_EQ:` for explicit cross-opt invariants
+- `! IR_CHECK:` / `! IR_NOT:` for IR shape
+
+Those source comments are the canonical leaf-assertion language for the
+project. The root harness is where new annotation ideas should land first.
+
+`bencch` is the structured matrix/reporting/differential runner around that
+same testing language. It is best for:
+
+- opt matrices
+- differential/reference runs
+- module graphs
+- capability-aware execution
+- reports and bundles
+
+The two surfaces are meant to converge on syntax and expectations, not drift
+into separate testing dialects.
+
+All root end-to-end tests run at every optimization level (`-O0` through
+`-Ofast`). Programs with known bugs carry `! XFAIL:` annotations that reference
+the audit finding — they count as passing until the bug is fixed, at which
+point CI catches the unexpected success.
 
 ## Target
 
