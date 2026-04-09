@@ -1,24 +1,19 @@
 //! Loop fusion pass.
 //!
-//! Merges two adjacent loops with identical iteration spaces into a
-//! single loop. The second loop's body instructions are spliced into
-//! the first loop's body with the second IV remapped to the first.
+//! Merges two adjacent loops with identical iteration spaces using
+//! the LLVM-inspired "latch redirect" pattern:
+//!   1. Redirect A's latch to B's body (instead of A's header)
+//!   2. Redirect B's latch back to A's header (instead of B's header)
+//!   3. Remove B's header/cmp blocks (now unreachable)
+//!   4. Remap B's IV to A's IV
 //!
-//! ```text
-//! Before:
-//!   do i = 1, n; a(i) = i * 2; end do
-//!   do i = 1, n; b(i) = a(i) + 1; end do
-//!
-//! After:
-//!   do i = 1, n; a(i) = i * 2; b(i) = a(i) + 1; end do
-//! ```
-//!
-//! Requires: identical init/bound/stride, no fusion-preventing deps.
+//! This avoids splicing instructions between blocks entirely.
 
 use std::collections::HashSet;
 use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors, prune_unreachable};
-use super::loop_utils::{find_preheader, resolve_const_int, remap_inst_kind};
+use crate::ir::walk::{find_natural_loops, predecessors};
+use super::loop_utils::remap_inst_kind;
+use super::loop_utils::{find_preheader, resolve_const_int};
 use super::dep_analysis;
 use super::pass::Pass;
 
@@ -41,8 +36,6 @@ fn fusion_in_function(func: &mut Function) -> bool {
     if loops.len() < 2 { return false; }
     let preds = predecessors(func);
 
-    // Try all pairs. We process one fusion per call and let the
-    // pass manager's fixpoint loop handle cascading opportunities.
     for i in 0..loops.len() {
         for j in (i+1)..loops.len() {
             let lp_a = &loops[i];
@@ -52,23 +45,44 @@ fn fusion_in_function(func: &mut Function) -> bool {
             let Some(_ph_a) = find_preheader(func, lp_a, &preds) else { continue };
             let Some(ph_b) = find_preheader(func, lp_b, &preds) else { continue };
             if lp_a.latches.len() != 1 || lp_b.latches.len() != 1 { continue; }
+            let latch_a = lp_a.latches[0];
+            let latch_b = lp_b.latches[0];
 
-            // Both headers must have exactly 1 block param (counted loop IV).
+            // Both headers must have exactly 1 block param (IV).
             let hdr_a = func.block(lp_a.header);
             let hdr_b = func.block(lp_b.header);
             if hdr_a.params.len() != 1 || hdr_b.params.len() != 1 { continue; }
             let iv_a = hdr_a.params[0].id;
             let iv_b = hdr_b.params[0].id;
 
-            // Loop A's exit must flow directly to loop B's preheader
-            // (or BE loop B's preheader — common when exit_a branches
-            // directly to B's header).
+            // Neither loop should be nested inside the other.
+            if lp_a.body.iter().any(|b| lp_b.body.contains(b)) { continue; }
+            if lp_b.body.iter().any(|b| lp_a.body.contains(b)) { continue; }
+
+            // Neither loop should contain inner loops. Fusing loops
+            // with nested inner loops requires more complex handling
+            // (inner loop blocks need reparenting). V1: simple only.
+            let has_inner_a = loops.iter().any(|other|
+                other.header != lp_a.header && lp_a.body.is_superset(&other.body));
+            let has_inner_b = loops.iter().any(|other|
+                other.header != lp_b.header && lp_b.body.is_superset(&other.body));
+            if has_inner_a || has_inner_b { continue; }
+
+            // Skip loops produced by fission in the same pipeline
+            // iteration — they have clone/bridge blocks that fusion
+            // can't handle safely.
+            let has_clone_a = lp_a.body.iter().any(|&b|
+                func.block(b).name.contains("clone") || func.block(b).name.contains("fission"));
+            let has_clone_b = lp_b.body.iter().any(|&b|
+                func.block(b).name.contains("clone") || func.block(b).name.contains("fission"));
+            if has_clone_a || has_clone_b { continue; }
+
+            // Loop A's exit must be (or flow to) loop B's preheader.
             let exit_a = find_loop_exit(func, lp_a);
             let Some(exit_a) = exit_a else { continue };
-
             if exit_a != ph_b && !flows_to(func, exit_a, ph_b) { continue; }
 
-            // Matching iteration spaces: same init, bound, stride constants.
+            // Matching iteration spaces.
             let Some(init_a) = get_init_const(func, lp_a, &preds) else { continue };
             let Some(init_b) = get_init_const(func, lp_b, &preds) else { continue };
             if init_a != init_b { continue; }
@@ -77,28 +91,168 @@ fn fusion_in_function(func: &mut Function) -> bool {
             let Some(bound_b) = find_bound_const(func, lp_b, iv_b) else { continue };
             if bound_a != bound_b { continue; }
 
-            // Check legality via dep analysis.
+            // Dep analysis: fusion legal?
             if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, iv_a, iv_b) {
                 continue;
             }
 
-            // Find the body blocks of each loop (blocks with stores).
-            let body_a = find_body_block(func, lp_a, lp_a.latches[0]);
-            let body_b = find_body_block(func, lp_b, lp_b.latches[0]);
-            let Some(body_a_id) = body_a else { continue };
+            // Find B's body block (the one with stores/computation).
+            let body_b = find_body_block(func, lp_b, latch_b);
             let Some(body_b_id) = body_b else { continue };
 
-            // Find loop B's exit block.
+            // Find B's cmp block (the one with ICmp).
+            let cmp_b = find_cmp_block(func, lp_b);
+            let Some(cmp_b_id) = cmp_b else { continue };
+
+            // Find B's exit block.
             let exit_b = find_loop_exit(func, lp_b);
             let Some(exit_b) = exit_b else { continue };
 
-            // ---- Perform fusion ----
-            do_fusion(func, lp_a, lp_b, body_a_id, body_b_id,
-                      iv_a, iv_b, exit_a, exit_b);
+            // ---- Perform fusion via latch redirect ----
+            do_fusion_latch_redirect(
+                func, lp_a, lp_b,
+                latch_a, latch_b,
+                iv_a, iv_b,
+                body_b_id, cmp_b_id,
+                exit_a, exit_b,
+            );
             return true;
         }
     }
     false
+}
+
+/// Fuse by redirecting latches:
+///   A's latch → B's body (skipping B's header/cmp)
+///   B's latch → A's header
+///   Remap iv_b → iv_a throughout B's body
+fn do_fusion_latch_redirect(
+    func: &mut Function,
+    lp_a: &crate::ir::walk::NaturalLoop,
+    lp_b: &crate::ir::walk::NaturalLoop,
+    latch_a: BlockId,
+    latch_b: BlockId,
+    iv_a: ValueId,
+    iv_b: ValueId,
+    body_b_id: BlockId,
+    _cmp_b_id: BlockId,
+    exit_a: BlockId,
+    exit_b: BlockId,
+) {
+    // Step 1: Remap iv_b → iv_a throughout ALL of B's body blocks.
+    // We rebuild each instruction with the IV substitution.
+    let mut sub_map = std::collections::HashMap::new();
+    sub_map.insert(iv_b, iv_a);
+    for &bid in &lp_b.body {
+        let old_insts: Vec<Inst> = func.block(bid).insts.clone();
+        let new_insts: Vec<Inst> = old_insts.into_iter().map(|inst| {
+            let new_kind = remap_inst_kind(&inst.kind, &sub_map);
+            Inst { kind: new_kind, ..inst }
+        }).collect();
+        func.block_mut(bid).insts = new_insts;
+        // Also remap terminator operands.
+        let old_term = func.block(bid).terminator.clone();
+        if let Some(term) = old_term {
+            let new_term = super::loop_utils::remap_terminator(
+                &term,
+                &std::collections::HashMap::new(), // no block remapping
+                &sub_map,
+            );
+            func.block_mut(bid).terminator = Some(new_term);
+        }
+    }
+
+    // Step 1.5: Clone the gap block's (exit_a's) instructions into B's
+    // body block. These are constants (like `%24 = const 1`) that B's
+    // body needs but that will be destroyed when we replace exit_a's
+    // content with B's exit block in step 3. Prepend them to B's body
+    // so they dominate all uses within B's body.
+    let gap_insts: Vec<Inst> = func.block(exit_a).insts.clone();
+    let existing_b_insts: Vec<Inst> = func.block(body_b_id).insts.clone();
+    func.block_mut(body_b_id).insts = gap_insts;
+    func.block_mut(body_b_id).insts.extend(existing_b_insts);
+
+    // Step 2: A's latch currently branches to A's header. Redirect it
+    // to B's body block instead. This makes the fused loop run A's body
+    // then B's body on each iteration.
+    //
+    // But we need to preserve the IV increment: A's latch computes
+    // iv_next and passes it to A's header. After fusion, B's body
+    // should see iv_a (current iteration), and B's latch should pass
+    // iv_next back to A's header.
+    //
+    // The cleanest approach: redirect A's body exit (the block that
+    // branches to A's latch) to branch to B's body instead. Then B's
+    // body branches to B's latch, and B's latch branches to A's latch,
+    // and A's latch branches to A's header with iv_next.
+    //
+    // Actually simpler: redirect A's latch to branch through B's body
+    // before going back to A's header.
+    //
+    // The issue is that A's latch has the IV increment instruction.
+    // We want: A's body → B's body → A's latch (increment) → A's header.
+    //
+    // So redirect the block that branches to A's latch to go to B's body
+    // instead. Then B's latch branches to A's latch (not B's header).
+
+    // Find the block that branches to latch_a (A's body exit).
+    let a_body_exit = find_branch_to(func, lp_a, latch_a);
+    let Some(a_body_exit_id) = a_body_exit else { return };
+
+    // Redirect A's body exit → B's body.
+    redirect_branch(func, a_body_exit_id, latch_a, body_b_id);
+
+    // Redirect B's latch → A's latch (not B's header).
+    // B's latch currently: br B's_header(iv_next_b). Change to: br A's_latch.
+    // But B's latch's iv_next_b should be discarded — A's latch will
+    // compute iv_next_a. So B's latch should just branch to A's latch
+    // with no args.
+    func.block_mut(latch_b).terminator =
+        Some(Terminator::Branch(latch_a, vec![]));
+
+    // Step 3: A's cmp exit (exit_a) should now go to B's exit (exit_b)
+    // since B's header/cmp are bypassed. Copy B's exit block content
+    // into A's exit block.
+    let exit_b_insts: Vec<Inst> = func.block(exit_b).insts.clone();
+    let exit_b_term = func.block(exit_b).terminator.clone();
+    func.block_mut(exit_a).insts = exit_b_insts;
+    func.block_mut(exit_a).terminator = exit_b_term;
+
+    // Step 4: Mark B's header, cmp, and preheader blocks as unreachable.
+    func.block_mut(lp_b.header).terminator = Some(Terminator::Unreachable);
+    // Mark B's cmp blocks too.
+    for &bid in &lp_b.body {
+        if bid == body_b_id || bid == latch_b { continue; }
+        func.block_mut(bid).terminator = Some(Terminator::Unreachable);
+    }
+
+    crate::ir::walk::prune_unreachable(func);
+}
+
+fn find_branch_to(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    target: BlockId,
+) -> Option<BlockId> {
+    for &bid in &lp.body {
+        if bid == target { continue; }
+        let block = func.block(bid);
+        match &block.terminator {
+            Some(Terminator::Branch(dest, _)) if *dest == target => return Some(bid),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn redirect_branch(func: &mut Function, from: BlockId, old_target: BlockId, new_target: BlockId) {
+    let block = func.block_mut(from);
+    if let Some(Terminator::Branch(dest, args)) = &mut block.terminator {
+        if *dest == old_target {
+            *dest = new_target;
+            args.clear(); // B's body doesn't take args from A's body
+        }
+    }
 }
 
 fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
@@ -112,12 +266,10 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
 }
 
 fn flows_to(func: &Function, from: BlockId, to: BlockId) -> bool {
-    // Direct branch or through a short chain.
     let block = func.block(from);
     match &block.terminator {
         Some(Terminator::Branch(dest, _)) => {
             if *dest == to { return true; }
-            // One level of indirection.
             let mid = func.block(*dest);
             if let Some(Terminator::Branch(dest2, _)) = &mid.terminator {
                 return *dest2 == to;
@@ -169,118 +321,15 @@ fn find_body_block(
     None
 }
 
-/// Fuse loop B into loop A by splicing B's body instructions into A's body.
-fn do_fusion(
-    func: &mut Function,
-    lp_a: &crate::ir::walk::NaturalLoop,
-    lp_b: &crate::ir::walk::NaturalLoop,
-    body_a_id: BlockId,
-    body_b_id: BlockId,
-    iv_a: ValueId,
-    iv_b: ValueId,
-    exit_a: BlockId,
-    exit_b: BlockId,
-) {
-    // Build remap: iv_b → iv_a.
-    let mut val_map: std::collections::HashMap<ValueId, ValueId> = std::collections::HashMap::new();
-    val_map.insert(iv_b, iv_a);
-
-    // Clone ALL instructions from B's preheader (exit_a / the gap
-    // block between the loops) into A's body. These are typically
-    // constants that LICM hoisted out of B's loop. After fusion,
-    // exit_a won't dominate A's body, so we must duplicate them.
-    let mut new_insts = Vec::new();
-    let exit_insts: Vec<Inst> = func.block(exit_a).insts.clone();
-    for inst in &exit_insts {
-        if is_clonable(&inst.kind) {
-            let new_id = func.next_value_id();
-            func.register_type(new_id, inst.ty.clone());
-            val_map.insert(inst.id, new_id);
-            new_insts.push(Inst {
-                id: new_id,
-                kind: inst.kind.clone(),
-                ty: inst.ty.clone(),
-                span: inst.span,
-            });
-        }
-    }
-
-    // Also scan ALL of B's body blocks (not just body_b_id) for
-    // instructions to clone.
-    let b_body_sorted: Vec<BlockId> = {
-        let mut v: Vec<BlockId> = lp_b.body.iter().copied().collect();
-        v.sort_by_key(|b| b.0);
-        v
-    };
-
-    for &bid in &b_body_sorted {
-        if bid == lp_b.header { continue; } // skip header (just relay)
-        if bid == lp_b.latches[0] { continue; } // skip latch (IV increment)
+fn find_cmp_block(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
+    for &bid in &lp.body {
         let block = func.block(bid);
-        // Skip comparison blocks (they have the loop exit condition).
-        let is_cmp = block.insts.iter().any(|i| matches!(i.kind, InstKind::ICmp(..)));
-        if is_cmp && !block.insts.iter().any(|i| matches!(i.kind, InstKind::Store(..))) {
-            continue;
-        }
-        // Clone this block's instructions.
-        let block_insts: Vec<Inst> = block.insts.clone();
-        for inst in &block_insts {
-            let new_id = func.next_value_id();
-            func.register_type(new_id, inst.ty.clone());
-            val_map.insert(inst.id, new_id);
-            let new_kind = remap_inst_kind(&inst.kind, &val_map);
-            new_insts.push(Inst {
-                id: new_id,
-                kind: new_kind,
-                ty: inst.ty.clone(),
-                span: inst.span,
-            });
-        }
-    }
-
-    // Append cloned constants + B's body instructions to A's body block.
-    func.block_mut(body_a_id).insts.extend(new_insts);
-
-    // Redirect loop A's exit to where loop B's exit goes.
-    // Loop A's exit block (exit_a) currently branches to B's preheader.
-    // After fusion, it should contain B's exit block's instructions
-    // (the print statements and return) instead.
-    let exit_b_insts: Vec<Inst> = func.block(exit_b).insts.clone();
-    let exit_b_term = func.block(exit_b).terminator.clone();
-    func.block_mut(exit_a).insts.clear();
-    func.block_mut(exit_a).insts.extend(exit_b_insts);
-    func.block_mut(exit_a).terminator = exit_b_term;
-
-    // Mark loop B's blocks as unreachable.
-    for &bid in &lp_b.body {
-        func.block_mut(bid).terminator = Some(Terminator::Unreachable);
-    }
-
-    prune_unreachable(func);
-}
-
-fn find_inst_in_func(func: &Function, vid: ValueId) -> Option<Inst> {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if inst.id == vid { return Some(inst.clone()); }
+        if block.insts.iter().any(|i| matches!(i.kind, InstKind::ICmp(..))) {
+            return Some(bid);
         }
     }
     None
 }
-
-/// Can this instruction kind be safely duplicated (no side effects)?
-fn is_clonable(kind: &InstKind) -> bool {
-    matches!(kind,
-        InstKind::ConstInt(..) | InstKind::ConstFloat(..) | InstKind::ConstBool(..)
-        | InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::IMul(..)
-        | InstKind::IntExtend(..) | InstKind::IntTrunc(..)
-        | InstKind::GetElementPtr(..)
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -296,6 +345,6 @@ mod tests {
         m.add_function(f);
         let pass = LoopFusion;
         let changed = pass.run(&mut m);
-        assert!(!changed, "no loops → no fusion");
+        assert!(!changed);
     }
 }

@@ -134,11 +134,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
-            // LoopFission/LoopFusion disabled: SSA domination bugs on
-            // multi-loop programs. The dep analysis and candidate detection
-            // work correctly, but the CFG surgery for splicing instructions
-            // across SSA contexts needs more careful handling of external
-            // value cloning and exit block wiring. Tracked for 29.6.8.
+            pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
@@ -172,11 +169,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
-            // LoopFission/LoopFusion disabled: SSA domination bugs on
-            // multi-loop programs. The dep analysis and candidate detection
-            // work correctly, but the CFG surgery for splicing instructions
-            // across SSA contexts needs more careful handling of external
-            // value cloning and exit block wiring. Tracked for 29.6.8.
+            pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
