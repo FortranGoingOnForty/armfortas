@@ -91,13 +91,24 @@ fn is_eligible(func: &Function, alloca_id: ValueId) -> bool {
 
             // Classify this use of the alloca.
             match &inst.kind {
-                // GEP with the alloca as base: OK if single constant index.
+                // GEP with the alloca as base: OK if single constant index
+                // AND the result type matches the element type (not byte-level).
                 InstKind::GetElementPtr(base, indices) if *base == alloca_id => {
                     if indices.len() != 1 { return false; }
                     if resolve_const_int(func, indices[0]).is_none() {
                         return false;
                     }
-                    // This use is fine — constant-index field access.
+                    // Reject byte-level GEPs (ptr<i8>) — SROA only handles
+                    // element-typed accesses. Byte-level GEPs from array
+                    // constructors use raw byte offsets that don't map to
+                    // element indices.
+                    if let Some(IrType::Ptr(inner)) = func.value_type(inst.id) {
+                        if matches!(*inner, IrType::Int(crate::ir::types::IntWidth::I8)) {
+                            // Result is ptr<i8> — byte-level access, not element.
+                            return false;
+                        }
+                    }
+                    // This use is fine — constant-index element access.
                 }
                 // Store where the alloca is the VALUE being stored = pointer escape.
                 InstKind::Store(val, _) if *val == alloca_id => {
