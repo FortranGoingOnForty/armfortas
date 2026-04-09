@@ -79,6 +79,10 @@ impl PassManager {
                 if pass_changed {
                     change_count += 1;
                     changed = true;
+                    // Rebuild O(1) type caches after IR mutations.
+                    for func in &mut module.functions {
+                        func.rebuild_type_cache();
+                    }
                 }
                 if self.verify_after_each {
                     self.verify_or_panic(module, pass.name());

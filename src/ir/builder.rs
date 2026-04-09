@@ -37,6 +37,7 @@ impl<'a> FuncBuilder<'a> {
     /// Add a block parameter and return its ValueId.
     pub fn add_block_param(&mut self, block: BlockId, ty: IrType) -> ValueId {
         let id = self.func.next_value_id();
+        self.func.register_type(id, ty.clone());
         self.func.block_mut(block).params.push(BlockParam { id, ty });
         id
     }
@@ -48,6 +49,7 @@ impl<'a> FuncBuilder<'a> {
 
     fn emit(&mut self, kind: InstKind, ty: IrType) -> ValueId {
         let id = self.func.next_value_id();
+        self.func.register_type(id, ty.clone());
         let inst = Inst { id, kind, ty, span: dummy_span() };
         self.func.block_mut(self.current_block).insts.push(inst);
         id
@@ -55,6 +57,7 @@ impl<'a> FuncBuilder<'a> {
 
     fn emit_with_span(&mut self, kind: InstKind, ty: IrType, span: Span) -> ValueId {
         let id = self.func.next_value_id();
+        self.func.register_type(id, ty.clone());
         let inst = Inst { id, kind, ty, span };
         self.func.block_mut(self.current_block).insts.push(inst);
         id

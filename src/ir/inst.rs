@@ -5,6 +5,7 @@
 
 use super::types::{IrType, IntWidth, FloatWidth};
 use crate::lexer::Span;
+use std::collections::HashMap;
 
 /// A value identifier — unique within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -213,6 +214,9 @@ pub struct Function {
     pub entry: BlockId,
     next_value: u32,
     next_block: u32,
+    /// O(1) type lookup cache. Populated during construction; call
+    /// `rebuild_type_cache()` after optimizer passes mutate the IR.
+    type_cache: HashMap<ValueId, IrType>,
 }
 
 impl Function {
@@ -220,6 +224,10 @@ impl Function {
         let entry = BlockId(0);
         let entry_block = BasicBlock::new(entry, "entry".into());
         let next_value = params.iter().map(|p| p.id.0 + 1).max().unwrap_or(0);
+        let mut type_cache = HashMap::new();
+        for p in &params {
+            type_cache.insert(p.id, p.ty.clone());
+        }
         Self {
             name,
             params,
@@ -228,6 +236,7 @@ impl Function {
             entry,
             next_value,
             next_block: 1,
+            type_cache,
         }
     }
 
@@ -270,23 +279,32 @@ impl Function {
         self.blocks.iter().find(|b| b.id == id)
     }
 
-    /// Get the type of a value by ID.
-    pub fn value_type(&self, id: ValueId) -> Option<IrType> {
-        // Check params.
+    /// Register a value's type in the O(1) lookup cache.
+    /// Called by FuncBuilder during construction.
+    pub fn register_type(&mut self, id: ValueId, ty: IrType) {
+        self.type_cache.insert(id, ty);
+    }
+
+    /// Rebuild the type cache from scratch. Call after optimizer passes
+    /// that add/remove/rewrite instructions.
+    pub fn rebuild_type_cache(&mut self) {
+        self.type_cache.clear();
         for p in &self.params {
-            if p.id == id { return Some(p.ty.clone()); }
+            self.type_cache.insert(p.id, p.ty.clone());
         }
-        // Check block params.
         for block in &self.blocks {
             for bp in &block.params {
-                if bp.id == id { return Some(bp.ty.clone()); }
+                self.type_cache.insert(bp.id, bp.ty.clone());
             }
-            // Check instructions.
             for inst in &block.insts {
-                if inst.id == id { return Some(inst.ty.clone()); }
+                self.type_cache.insert(inst.id, inst.ty.clone());
             }
         }
-        None
+    }
+
+    /// Get the type of a value by ID. O(1) via cache.
+    pub fn value_type(&self, id: ValueId) -> Option<IrType> {
+        self.type_cache.get(&id).cloned()
     }
 }
 
