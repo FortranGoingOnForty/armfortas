@@ -22,6 +22,7 @@ use super::peel::LoopPeel;
 use super::call_resolve::CallResolve;
 use super::inline::Inline;
 use super::simplify_cfg::SimplifyCfg;
+use super::dead_func::DeadFuncElim;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
 
@@ -121,6 +122,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::O1)));
             pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
             pm.add(Box::new(ConstProp));
@@ -133,6 +135,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -155,6 +158,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
@@ -174,6 +178,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(StrengthReduce));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
