@@ -128,6 +128,19 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 - **(C)** Register width mismatch in array index GEP: `mul x24, w23, x26` mixes 32-bit and 64-bit registers. The GEP index needs width promotion before multiplication. Surfaces when passing arrays to subroutines with assumed-shape/assumed-rank args.
 - **(C)** Array intrinsic return type width: SIZE/SUM return i64 but assigning to integer(4) variable stores 8 bytes into 4-byte slot. Needs truncation at assignment site when intrinsic result is wider than target. Direct printing via PRINT works correctly.
 
+## IR Lowering — Sprint 29 Audit Findings
+
+- **(BLOCKING)** ComplexLiteral expressions not lowered: `Expr::ComplexLiteral` has no match arm in `lower_expr_full`; falls through to `_ => b.const_i32(0)` placeholder. Any complex literal `(1.0, 2.0)` silently becomes 0. → Sprint 29/30 (Complex Number Intrinsics)
+- **(BLOCKING)** Stack frames larger than ~32KB produce broken prologue/epilogue: `emit.rs` emits a `; FIXME` comment when `stp_offset > 32760` instead of a valid instruction sequence. Functions with >32KB of local storage corrupt their own frame. → Codegen fix needed before Sprint 30.
+
+## Optimizer — Sprint 29 Deferred (pipeline.rs)
+
+- **(D)** `-O3`/`-Ofast` run identical passes to `-O2`. Accepted at the flag level; correctness is preserved but no extra optimization. Deferred: NEON vectorization, aggressive inlining, IPO, devirtualization, fast-math reassociation.
+- **(D)** Function inlining: not implemented at any level. `O2.inlining()` returns true but no `Inline` pass exists.
+- **(D)** GVN (global value numbering), SROA (scalar replacement of aggregates), DSE (dead store elimination), loop unrolling — all deferred.
+- **(D)** FMADD/FMSUB fusion: mentioned in O2 pipeline comment, not implemented.
+- **(D)** LDP/STP pair merging beyond prologue/epilogue.
+
 ## Derived Types & OOP (Sprint 28)
 
 - **[FIXED]** Component access read/write including chained (x%a%b) and by-ref params.
@@ -148,6 +161,8 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 | Category | Count | Description |
 |----------|-------|-------------|
 | **[FIXED]** | 38 | Sprint 21.5 (14), Sprint 25/25.5 (11), Sprint 26 (8), Sprint 27 (5) |
+| **(BLOCKING)** New (Sprint 29 audit) | 2 | ComplexLiteral lowering; large frame prologue corruption |
 | **(B)** Naturally resolved | 13 | Covered by Sprints 26.5, 28.7, and remaining plan |
 | **(C)** fortsh-blocking | 14 | Defer to integration (Sprints 33-35) |
 | **(D)** Exotic/rare | 19 | Keep noted, no planned work |
+| **(D)** Optimizer deferred | 5 | O3/Ofast parity, inlining, GVN/SROA/DSE, FMADD, LDP/STP |
