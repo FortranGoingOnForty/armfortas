@@ -495,9 +495,14 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::FrameSlot(v)  => *v as i64,
                 _ => 0,
             };
-            // Detect FP vs GP to pick correct mnemonic.
-            let mnemonic = if r1.starts_with('d') || r1.starts_with('s') { "stp" } else { "stp" };
-            format!("{} {}, {}, [{}, #{}]", mnemonic, r1, r2, base, off)
+            // STP signed-offset range: 7-bit signed × 8 → [-512, 504].
+            // Fall back to two individual STR instructions if out of range.
+            if off >= -512 && off <= 504 {
+                format!("stp {}, {}, [{}, #{}]", r1, r2, base, off)
+            } else {
+                format!("str {}, [{}, #{}]\n    str {}, [{}, #{}]",
+                    r1, base, off, r2, base, off + 8)
+            }
         }
         ArmOpcode::LdpOffset => {
             let r1  = op_str(&inst.operands[0]);
@@ -508,7 +513,14 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::FrameSlot(v)  => *v as i64,
                 _ => 0,
             };
-            format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
+            // LDP signed-offset range: 7-bit signed × 8 → [-512, 504].
+            // Fall back to two individual LDR instructions if out of range.
+            if off >= -512 && off <= 504 {
+                format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
+            } else {
+                format!("ldr {}, [{}, #{}]\n    ldr {}, [{}, #{}]",
+                    r1, base, off, r2, base, off + 8)
+            }
         }
 
         ArmOpcode::AdrpLdr => {
@@ -676,6 +688,27 @@ mod tests {
         let asm = emit_simple(|b| b.ret_void());
         assert!(asm.contains(".globl _test"), "missing .globl: {}", asm);
         assert!(asm.contains("_test:"), "missing function label: {}", asm);
+    }
+
+    /// Verify that functions with frame sizes > 4095 use x16 scratch
+    /// synthesis for the `sub sp, sp, #N` prologue and `add sp, sp, #N`
+    /// epilogue rather than an out-of-range immediate.
+    #[test]
+    fn emit_large_frame_prologue() {
+        // 700 allocas of i64 = 700 * 8 = 5600 bytes, well over 4095.
+        let asm = emit_simple(|b| {
+            for _ in 0..700 {
+                let _ = b.alloca(IrType::Int(IntWidth::I64));
+            }
+            b.ret_void();
+        });
+        // The 12-bit immediate max is 4095, so the emitter must
+        // synthesize the frame size via x16.
+        assert!(asm.contains("movz x16,"), "large frame should use x16 synthesis: {}", asm);
+        assert!(asm.contains("sub sp, sp, x16"), "large frame sub should use register form: {}", asm);
+        assert!(asm.contains("add sp, sp, x16"), "large frame add should use register form: {}", asm);
+        // Must NOT contain a raw "sub sp, sp, #5" that exceeds 4095.
+        assert!(!asm.contains("sub sp, sp, #5"), "should not emit out-of-range immediate: {}", asm);
     }
 
     #[test]
