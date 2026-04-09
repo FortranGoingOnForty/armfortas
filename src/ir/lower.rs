@@ -4567,6 +4567,74 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     }
 }
 
+/// Try to lower `if (cond) x = a; else x = b` as a Select instruction
+/// instead of a diamond of basic blocks. Returns true on success.
+///
+/// Detection criteria (all must hold):
+///   1. No else-ifs.
+///   2. Then body has exactly 1 statement — a scalar assignment to a Name.
+///   3. Else body has exactly 1 statement — a scalar assignment to the
+///      **same** Name.
+///   4. The target variable is a non-character, non-array, non-allocatable
+///      local (a simple alloca scalar).
+///
+/// When this fires, the result is a single `Select` + `Store`, enabling
+/// ARM64 `CSEL` instruction selection.
+fn try_lower_select(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    condition: &crate::ast::expr::SpannedExpr,
+    then_body: &[SpannedStmt],
+    else_ifs: &[(crate::ast::expr::SpannedExpr, Vec<SpannedStmt>)],
+    else_body: &Option<Vec<SpannedStmt>>,
+) -> bool {
+    use crate::ast::expr::Expr;
+    use crate::ast::stmt::Stmt;
+
+    // Only simple if/else — no else-if chain.
+    if !else_ifs.is_empty() { return false; }
+    let eb = match else_body { Some(eb) => eb, None => return false };
+
+    // Exactly one statement in each branch.
+    if then_body.len() != 1 || eb.len() != 1 { return false; }
+
+    // Both must be simple scalar assignments (Stmt::Assignment to a Name).
+    let (then_name, then_val_expr) = match &then_body[0].node {
+        Stmt::Assignment { target, value } => match &target.node {
+            Expr::Name { name } => (name.to_lowercase(), value),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let (else_name, else_val_expr) = match &eb[0].node {
+        Stmt::Assignment { target, value } => match &target.node {
+            Expr::Name { name } => (name.to_lowercase(), value),
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    // Both must assign to the same variable.
+    if then_name != else_name { return false; }
+
+    // The variable must be a simple scalar local (not character, not array,
+    // not allocatable). These constraints ensure a plain store suffices.
+    let info = match ctx.locals.get(&then_name) {
+        Some(info) => info.clone(),
+        None => return false,
+    };
+    if !info.dims.is_empty() || info.allocatable { return false; }
+    if !matches!(info.char_kind, CharKind::None) { return false; }
+
+    // Lower condition, then both value expressions, then emit Select + Store.
+    let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
+    let tv = lower_expr(b, &ctx.locals, then_val_expr, ctx.st);
+    let fv = lower_expr(b, &ctx.locals, else_val_expr, ctx.st);
+    let selected = b.select(cond, tv, fv);
+    b.store(selected, info.addr);
+    true
+}
+
 /// Lower IF construct with else-if chain and optional else.
 fn lower_if(
     b: &mut FuncBuilder,
@@ -4576,6 +4644,11 @@ fn lower_if(
     else_ifs: &[(crate::ast::expr::SpannedExpr, Vec<SpannedStmt>)],
     else_body: &Option<Vec<SpannedStmt>>,
 ) {
+    // Fast path: simple diamond `if (cond) x = a; else x = b` → Select.
+    if try_lower_select(b, ctx, condition, then_body, else_ifs, else_body) {
+        return;
+    }
+
     let bb_end = b.create_block("if_end");
 
     let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
@@ -7099,6 +7172,7 @@ end program
 
     #[test]
     fn lower_if_then_else() {
+        // Simple diamond `if (cond) y = a; else y = b` lowers to Select.
         let (_, ir) = lower_and_verify("\
 program test
   implicit none
@@ -7111,7 +7185,27 @@ program test
   end if
 end program
 ");
-        assert!(ir.contains("cond_br"));
+        assert!(ir.contains("select"), "simple diamond should lower to select: {}", ir);
+    }
+
+    #[test]
+    fn lower_if_then_else_branching() {
+        // Non-diamond IF/ELSE (multi-statement body) must still use branches.
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: x, y, z
+  x = 5
+  if (x > 0) then
+    y = 1
+    z = 2
+  else
+    y = -1
+    z = -2
+  end if
+end program
+");
+        assert!(ir.contains("cond_br"), "multi-stmt if/else should use branches: {}", ir);
         assert!(ir.contains("if_then"));
         assert!(ir.contains("if_else"));
         assert!(ir.contains("if_end"));
