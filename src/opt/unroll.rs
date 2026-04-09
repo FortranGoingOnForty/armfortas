@@ -235,8 +235,18 @@ fn detect_simple_loop(
     // means the loop has internal control flow we don't handle here.
     let body_blocks = collect_body_chain(func, cmp_block, latch, &nl.body)?;
 
-    // ---- no body-defined values escape outside the loop ----------------
-    for &bb in &body_blocks {
+    // ---- no loop-defined values escape outside the loop ----------------
+    //
+    // We must check ALL blocks that will be pruned after unrolling — not just
+    // body_blocks. In particular, `header` carries a block param (the IV) that
+    // mem2reg may have threaded into OUTER loop latches via dominance-frontier
+    // placement. If that param is used outside nl.body, the header's block param
+    // becomes undefined after we discard the header block.
+    for &bb in body_blocks.iter()
+        .chain(std::iter::once(&header))
+        .chain(std::iter::once(&cmp_block))
+        .chain(std::iter::once(&latch))
+    {
         if has_escaping_values(func, bb, &nl.body, preds) { return None; }
     }
 
@@ -447,10 +457,14 @@ fn has_escaping_values(
     body: &HashSet<BlockId>,
     preds: &HashMap<BlockId, Vec<BlockId>>,
 ) -> bool {
-    // Collect all ValueIds defined in the latch.
+    // Collect all ValueIds defined in the block — both block params and
+    // instruction results. Block params matter because mem2reg places them at
+    // dominance-frontier blocks; if such a param escapes into an outer-loop
+    // latch it becomes undefined after unrolling removes the block.
     let latch_blk = func.block(latch);
     let mut latch_defs: HashSet<ValueId> = HashSet::new();
-    for inst in &latch_blk.insts { latch_defs.insert(inst.id); }
+    for bp   in &latch_blk.params { latch_defs.insert(bp.id); }
+    for inst in &latch_blk.insts  { latch_defs.insert(inst.id); }
 
     if latch_defs.is_empty() { return false; }
 
@@ -966,5 +980,97 @@ mod tests {
         let f = &m.functions[0];
         // entry + 1 cloned iteration block + exit = 3 blocks
         assert_eq!(f.blocks.len(), 3, "expected entry + 1 iter block + exit");
+    }
+
+    /// Regression: mem2reg places block params at dominance-frontier blocks,
+    /// which can cause an outer-loop latch to reference the inner loop's header
+    /// block param (%iv) in its branch terminator. After unrolling removes the
+    /// inner header, %iv becomes undefined → IR verifier panic.
+    ///
+    /// `has_escaping_values` must check block params (not just instruction
+    /// results) AND must be called for the header block (not just body_blocks).
+    #[test]
+    fn does_not_unroll_when_header_param_escapes_into_outer_block() {
+        // Build: inner loop (entry → header(%iv) → latch → header, | → exit)
+        //        plus an outer_latch block that passes %iv to outer_dest.
+        // outer_latch is not part of the inner nl.body but references %iv.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("escape_test".into(), vec![], IrType::Void);
+
+        let header_id   = f.create_block("header");
+        let latch_id    = f.create_block("latch");
+        let exit_id     = f.create_block("exit");
+        let outer_latch = f.create_block("outer_latch");
+        let outer_dest  = f.create_block("outer_dest");
+        let entry_id    = f.entry;
+
+        // Entry: const 1; br header(1)
+        let lo = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: lo, ty: IrType::Int(IntWidth::I64), span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        f.block_mut(entry_id).terminator =
+            Some(Terminator::Branch(header_id, vec![lo]));
+
+        // Header: block param %iv; icmp %iv ≤ 3; condBr latch, exit
+        let iv = f.next_value_id();
+        f.block_mut(header_id).params.push(BlockParam {
+            id: iv, ty: IrType::Int(IntWidth::I64),
+        });
+        let hi_c = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: hi_c, ty: IrType::Int(IntWidth::I64), span: span(),
+            kind: InstKind::ConstInt(3, IntWidth::I64),
+        });
+        let cmp = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: cmp, ty: IrType::Bool, span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv, hi_c),
+        });
+        f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
+            cond: cmp,
+            true_dest: latch_id, true_args: vec![],
+            false_dest: exit_id, false_args: vec![],
+        });
+
+        // Latch: %next = iadd %iv, 1; br header(%next)
+        let one = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: one, ty: IrType::Int(IntWidth::I64), span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let nxt = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: nxt, ty: IrType::Int(IntWidth::I64), span: span(),
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(latch_id).terminator =
+            Some(Terminator::Branch(header_id, vec![nxt]));
+
+        // Exit: ret void
+        f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
+
+        // outer_latch: br outer_dest(%iv)
+        // Simulates an outer-loop latch that mem2reg threaded %iv through.
+        // %iv is the header's block param — it escapes into this external block.
+        f.block_mut(outer_latch).terminator =
+            Some(Terminator::Branch(outer_dest, vec![iv]));
+
+        // outer_dest(%x): ret void
+        let x = f.next_value_id();
+        f.block_mut(outer_dest).params.push(BlockParam {
+            id: x, ty: IrType::Int(IntWidth::I64),
+        });
+        f.block_mut(outer_dest).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "must not unroll when header block param escapes into an outer-loop block"
+        );
     }
 }
