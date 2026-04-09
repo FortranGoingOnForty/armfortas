@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors, inst_uses, prune_unreachable};
+use crate::ir::walk::{find_natural_loops, predecessors, prune_unreachable};
 use super::loop_utils::{find_preheader, loop_defined_values};
 use super::pass::Pass;
 

@@ -17,6 +17,7 @@ use super::lsf::LocalLsf;
 use super::unroll::LoopUnroll;
 use super::preheader::PreheaderInsert;
 use super::unswitch::LoopUnswitch;
+use super::interchange::LoopInterchange;
 
 /// Compiler optimization levels.
 ///
@@ -128,6 +129,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }
@@ -143,10 +145,11 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 | OptLevel::Ofast => {
-            // O2 passes + loop unrolling with larger threshold.
+            // O2 passes + loop unrolling + interchange.
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(StrengthReduce));
@@ -157,6 +160,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Licm));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Dce));
         }

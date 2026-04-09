@@ -7,7 +7,6 @@
 //! Run early at O2+ so downstream passes (LICM, unswitching, interchange)
 //! can assume every loop has a preheader.
 
-use std::collections::HashMap;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
 use super::loop_utils::find_preheader;
