@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::codegen::{emit, isel, linearscan};
+use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
@@ -228,8 +228,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 7. Instruction selection.
     let machine_funcs = isel::select_module(&ir_module);
 
-    // 8. Register allocation (linear scan).
+    // 7.5. Backend peephole (O2+): FMA fusion, etc.
     let mut allocated: Vec<_> = machine_funcs;
+    if opts.opt_level >= OptLevel::O2 {
+        for mf in &mut allocated {
+            peephole::run_peephole(mf);
+        }
+    }
+
+    // 8. Register allocation (linear scan).
     for mf in &mut allocated {
         let liveness = crate::codegen::liveness::compute_liveness(mf);
         let result = linearscan::linear_scan(mf);

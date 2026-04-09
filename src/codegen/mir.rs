@@ -73,6 +73,11 @@ pub enum ArmOpcode {
     FnegS, FnegD,
     FabsS, FabsD,
     FsqrtS, FsqrtD,
+    // Fused multiply-add/subtract (FMADD/FMSUB/FNMSUB).
+    // 3-source: dest = Sa ± Sn*Sm.
+    FmaddS, FmaddD,   // FMADD:  dest = Sa + Sn*Sm
+    FmsubS, FmsubD,   // FMSUB:  dest = Sa - Sn*Sm
+    FnmsubS, FnmsubD, // FNMSUB: dest = Sn*Sm - Sa
 
     // ---- Conversions ----
     ScvtfSW, ScvtfDW,   // signed int32 → float

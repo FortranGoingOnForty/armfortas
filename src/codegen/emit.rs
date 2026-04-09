@@ -332,6 +332,19 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
         ArmOpcode::FsqrtS | ArmOpcode::FsqrtD => format!("fsqrt {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        // Fused multiply-add/subtract: 4-operand (dest, Sn, Sm, Sa).
+        // FMADD  Sd, Sn, Sm, Sa → Sd = Sa + Sn*Sm
+        // FMSUB  Sd, Sn, Sm, Sa → Sd = Sa - Sn*Sm
+        // FNMSUB Sd, Sn, Sm, Sa → Sd = Sn*Sm - Sa
+        ArmOpcode::FmaddS | ArmOpcode::FmaddD => format!("fmadd {}, {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
+        ArmOpcode::FmsubS | ArmOpcode::FmsubD => format!("fmsub {}, {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
+        ArmOpcode::FnmsubS | ArmOpcode::FnmsubD => format!("fnmsub {}, {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
 
         ArmOpcode::ScvtfSW | ArmOpcode::ScvtfDW |
         ArmOpcode::ScvtfSX | ArmOpcode::ScvtfDX => format!("scvtf {}, {}",
