@@ -94,6 +94,15 @@ struct LowerCtx<'a> {
     /// arrays (sret convention). Used at call sites to detect when to
     /// pass a temp descriptor as the hidden first arg. Audit6 BLOCKING-1.
     alloc_return_funcs: &'a HashSet<String>,
+    /// Per-subroutine optional-parameter bitmap: maps lowercase callee name
+    /// to a Vec<bool> (one entry per positional parameter, true = OPTIONAL).
+    /// Pre-populated by `collect_optional_params` so call sites can pass
+    /// null pointers for absent optional arguments (PRESENT support).
+    optional_params: &'a HashMap<String, Vec<bool>>,
+    /// Map from Fortran statement label (u64) to the IR basic block that
+    /// begins at that label. Pre-populated by `collect_label_blocks` before
+    /// lowering so that GOTO can branch forward as well as backward.
+    label_blocks: HashMap<u64, BlockId>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -102,6 +111,7 @@ impl<'a> LowerCtx<'a> {
         globals: &'a HashMap<(String, String), ModuleGlobalInfo>,
         type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
         alloc_return_funcs: &'a HashSet<String>,
+        optional_params: &'a HashMap<String, Vec<bool>>,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -114,6 +124,8 @@ impl<'a> LowerCtx<'a> {
             result_type: None,
             is_alloc_return: false,
             alloc_return_funcs,
+            optional_params,
+            label_blocks: HashMap::new(),
         }
     }
 
@@ -191,12 +203,21 @@ pub fn lower_file(
         collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common);
     }
 
+    // Pass 1.7: collect optional-parameter bitmaps for every subroutine/function.
+    // Maps lowercase callee name → Vec<bool> (per-position, true = OPTIONAL).
+    // Used at call sites to pass null pointers for absent optional arguments
+    // so PRESENT() works correctly inside the callee.
+    let mut optional_params: HashMap<String, Vec<bool>> = HashMap::new();
+    for unit in units {
+        collect_optional_params(&unit.node, &mut optional_params);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
     let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs);
+        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs, &optional_params);
     }
     module
 }
@@ -244,6 +265,52 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
             for sub in contains {
                 collect_alloc_return_funcs(&sub.node, out);
             }
+        }
+        _ => {}
+    }
+}
+
+/// Scan a program unit and its CONTAINS chain and record, for each
+/// subroutine/function, which of its positional dummy arguments carry
+/// the OPTIONAL attribute.
+///
+/// Result: `out` maps lowercase subroutine/function name →
+/// `Vec<bool>` (index = parameter position, value = is_optional).
+/// Used at call sites to pass null pointers for absent optional args,
+/// enabling PRESENT() intrinsic queries inside the callee.
+fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    use crate::ast::decl::Attribute;
+    use crate::ast::unit::DummyArg;
+    let record = |name: &str, args: &[DummyArg], decls: &[crate::ast::decl::SpannedDecl],
+                  out: &mut HashMap<String, Vec<bool>>| {
+        let param_names: Vec<String> = args.iter().filter_map(|a| {
+            if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+        }).collect();
+        if param_names.is_empty() { return; }
+        let optional_flags: Vec<bool> = param_names.iter().map(|pname| {
+            for d in decls {
+                if let crate::ast::decl::Decl::TypeDecl { attrs, entities, .. } = &d.node {
+                    let is_optional = attrs.iter().any(|a| matches!(a, Attribute::Optional));
+                    if is_optional && entities.iter().any(|e| e.name.to_lowercase() == *pname) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }).collect();
+        out.insert(name.to_lowercase(), optional_flags);
+    };
+    match unit {
+        ProgramUnit::Subroutine { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        ProgramUnit::Function { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+            for sub in contains { collect_optional_params(&sub.node, out); }
         }
         _ => {}
     }
@@ -765,12 +832,17 @@ fn lower_unit(
     // top-level call from lower_file passes an empty slice.
     host_uses: &[crate::ast::decl::SpannedDecl],
     alloc_return_funcs: &HashSet<String>,
+    optional_params: &HashMap<String, Vec<bool>>,
 ) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
-            let mut func = Function::new(fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
+            // Fortran PROGRAM bodies are never the C entry point — driver/mod.rs
+            // always emits a `_main` wrapper. Use a private name so a user-written
+            // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
+            let body_fname = format!("__prog_{}", fname);
+            let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -786,10 +858,11 @@ fn lower_unit(
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
@@ -806,7 +879,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, .. } => {
@@ -826,7 +899,7 @@ fn lower_unit(
                 } else { None }
             }).collect();
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -868,10 +941,12 @@ fn lower_unit(
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
+                // Pre-create blocks for all statement labels so GOTO can branch forward.
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
@@ -889,7 +964,7 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, .. } => {
@@ -943,7 +1018,7 @@ fn lower_unit(
             };
 
             let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1010,10 +1085,11 @@ fn lower_unit(
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses);
+                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
+                collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -1036,7 +1112,7 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
         ProgramUnit::Module { uses, contains, .. } => {
@@ -1047,7 +1123,7 @@ fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
             }
         }
         _ => {}
@@ -1429,6 +1505,9 @@ fn check_filtered_in_stmt(
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
         | Stmt::Continue { .. } => {}
+        Stmt::Labeled { stmt: inner, .. } => {
+            check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered);
+        }
 
         // ---- I/O ----
         Stmt::Print { format, items } => {
@@ -1645,6 +1724,7 @@ fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -1700,25 +1780,51 @@ fn install_globals_as_locals(
 
     let mut installed_from: HashMap<String, String> = HashMap::new();
     for (local_key, (mod_key, var_key)) in pending {
-        let Some(info) = globals.get(&(mod_key.clone(), var_key.clone())) else {
-            // USE referenced a name the module doesn't actually
-            // export. Sema should diagnose this; for now skip
-            // silently so lowering doesn't crash.
-            continue;
-        };
-        // Collision check: two modules exporting the same local key.
-        if let Some(prev_mod) = installed_from.get(&local_key) {
-            if *prev_mod != mod_key {
-                eprintln!(
-                    "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
-                     keeping the first",
-                    local_key, prev_mod, mod_key,
-                );
-                continue;
+        if let Some(info) = globals.get(&(mod_key.clone(), var_key.clone())) {
+            // Collision check: two modules exporting the same local key.
+            if let Some(prev_mod) = installed_from.get(&local_key) {
+                if *prev_mod != mod_key {
+                    eprintln!(
+                        "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
+                         keeping the first",
+                        local_key, prev_mod, mod_key,
+                    );
+                    continue;
+                }
             }
+            installed_from.insert(local_key.clone(), mod_key);
+            install_one_global(b, locals, local_key, info);
+        } else {
+            // Not an IR global — check if it's an intrinsic module parameter constant
+            // (iso_c_binding, iso_fortran_env). These are registered in the symbol
+            // table but never emitted as IR globals; install them as inline_const locals.
+            if locals.contains_key(&local_key) { continue; }
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                if let Some(sym) = st.scope(mod_scope_id).symbols.get(&var_key) {
+                    if sym.attrs.parameter {
+                        if let Some(cv) = sym.const_value {
+                            let ty = IrType::Int(IntWidth::I32);
+                            // Create a dummy alloca (never loaded from; inline_const
+                            // short-circuits at every use site via materialize_const_scalar).
+                            let addr = b.alloca(ty.clone());
+                            locals.insert(local_key.clone(), LocalInfo {
+                                addr,
+                                ty,
+                                dims: vec![],
+                                allocatable: false,
+                                by_ref: false,
+                                char_kind: CharKind::None,
+                                derived_type: None,
+                                inline_const: Some(ConstScalar::Int(cv)),
+                            });
+                            installed_from.insert(local_key, mod_key);
+                        }
+                    }
+                }
+            }
+            // If still not found (e.g., USE references a name that doesn't exist),
+            // skip silently — sema should have diagnosed it.
         }
-        installed_from.insert(local_key.clone(), mod_key);
-        install_one_global(b, locals, local_key, info);
     }
 }
 
@@ -3430,11 +3536,48 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
 }
 
 /// Lower a list of statements.
+/// Pre-scan a body of statements and create one IR basic block per
+/// Fortran statement label. Must be called before `lower_stmts` so
+/// that both forward and backward `GOTO` targets can branch to an
+/// already-existing block.
+fn collect_label_blocks(b: &mut FuncBuilder, stmts: &[SpannedStmt], out: &mut HashMap<u64, BlockId>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Labeled { label, stmt: inner } => {
+                let bb = b.create_block(&format!("label_{}", label));
+                out.entry(*label).or_insert(bb);
+                // Recurse into the inner statement (e.g., a DO or IF block with labels inside).
+                collect_label_blocks(b, std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::Continue { label: Some(lbl) } => {
+                let bb = b.create_block(&format!("label_{}", lbl));
+                out.entry(*lbl).or_insert(bb);
+            }
+            Stmt::IfConstruct { then_body, else_ifs, else_body, .. } => {
+                collect_label_blocks(b, then_body, out);
+                for (_, body) in else_ifs { collect_label_blocks(b, body, out); }
+                if let Some(body) = else_body { collect_label_blocks(b, body, out); }
+            }
+            Stmt::IfStmt { action, .. } => {
+                collect_label_blocks(b, std::slice::from_ref(action.as_ref()), out);
+            }
+            Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } | Stmt::DoConcurrent { body, .. } => {
+                collect_label_blocks(b, body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
-        // If current block already has a terminator (e.g., after STOP), skip dead code.
-        if b.func().block(b.current_block()).terminator.is_some() {
-            break;
+        // Labeled statements and labeled CONTINUEs create new basic blocks; they must be
+        // processed even after a branch/goto terminates the current block. All other dead
+        // code (statements after a terminator in an unlabeled position) is skipped.
+        let is_label_creating = matches!(&stmt.node,
+            Stmt::Labeled { .. } | Stmt::Continue { label: Some(_) });
+        if !is_label_creating && b.func().block(b.current_block()).terminator.is_some() {
+            continue; // dead code — but keep looping so we can find the next label
         }
         lower_stmt(b, ctx, stmt);
     }
@@ -3645,7 +3788,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
                     // Not an intrinsic — general subroutine call.
-                    let arg_vals: Vec<ValueId> = args.iter().map(|a| {
+                    let mut arg_vals: Vec<ValueId> = args.iter().map(|a| {
                         match &a.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
                                 lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
@@ -3653,6 +3796,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             _ => b.const_i32(0),
                         }
                     }).collect();
+                    // If the callee has more parameters than provided args, and the
+                    // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
+                    if let Some(opt_flags) = ctx.optional_params.get(&key) {
+                        for i in arg_vals.len()..opt_flags.len() {
+                            if opt_flags[i] {
+                                arg_vals.push(b.const_i64(0)); // null → absent
+                            }
+                        }
+                    }
                     b.call(FuncRef::External(name.clone()), arg_vals, IrType::Void);
                 }
             }
@@ -4010,7 +4162,31 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             b.unreachable();
         }
 
-        Stmt::Allocate { items, .. } => {
+        Stmt::Allocate { items, opts } => {
+            // Resolve STAT= option: find the user's stat variable address.
+            // The runtime writes 0 on success or a nonzero error code to this slot.
+            // If absent, use a private scratch slot (allocation failure aborts).
+            let stat_addr: ValueId = {
+                let stat_expr = opts.iter().find(|o| {
+                    o.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("stat")).unwrap_or(false)
+                });
+                if let Some(stat_io) = stat_expr {
+                    if let Expr::Name { name } = &stat_io.value.node {
+                        if let Some(stat_info) = ctx.locals.get(&name.to_lowercase()) {
+                            // Pass the user's variable address directly: runtime writes
+                            // 0 (success) or error code into it, so the variable is set.
+                            stat_info.addr
+                        } else {
+                            b.alloca(IrType::Int(IntWidth::I32))
+                        }
+                    } else {
+                        b.alloca(IrType::Int(IntWidth::I32))
+                    }
+                } else {
+                    b.alloca(IrType::Int(IntWidth::I32))
+                }
+            };
+
             for item in items {
                 if let Expr::FunctionCall { callee, args } = &item.node {
                     let base_name = extract_base_name(callee);
@@ -4027,18 +4203,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 // Build a stack DimDescriptor[rank] honoring
                                 // each subscript's actual (lower, upper) bounds,
                                 // then call afs_allocate_array. Both 1-D and
-                                // multi-D go through the same path now —
-                                // afs_allocate_1d hardcodes lower=1, so it
-                                // can't represent `allocate(a(0:N))` correctly.
-                                //
-                                // Audit6 BLOCKING-4: the old code only handled
-                                // SectionSubscript::Element and silently fell
-                                // through to const_i64(1) on Range subscripts.
-                                // For `allocate(m(0:2, 0:3))` the parser
-                                // produces Range { 0, 2 } / Range { 0, 3 }, so
-                                // every dim's upper became 1 and the runtime
-                                // allocated a single element while writes went
-                                // out of bounds (heap corruption).
+                                // multi-D go through the same path now.
                                 let es = b.const_i64(elem_size_bytes);
                                 let rank = args.len();
                                 let dim_buf_bytes = (rank * 24) as u64;
@@ -4062,10 +4227,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     b.store(one_i64, p_st);
                                 }
                                 let rank_val = b.const_i32(rank as i32);
-                                let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                                 b.call(
                                     FuncRef::External("afs_allocate_array".into()),
-                                    vec![info.addr, es, rank_val, dim_buf, stat_slot],
+                                    vec![info.addr, es, rank_val, dim_buf, stat_addr],
                                     IrType::Void,
                                 );
                             } else {
@@ -4132,7 +4296,34 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Continue { .. } => {} // no-op
+        Stmt::Continue { label: Some(lbl) } => {
+            // Labeled CONTINUE: fall through to the label's block.
+            if let Some(&label_bb) = ctx.label_blocks.get(lbl) {
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(label_bb, vec![]);
+                }
+                b.set_block(label_bb);
+            }
+        }
+        Stmt::Continue { label: None } => {} // no-op
+
+        Stmt::Goto { label } => {
+            if let Some(&target_bb) = ctx.label_blocks.get(label) {
+                b.branch(target_bb, vec![]);
+            }
+        }
+
+        Stmt::Labeled { label, stmt: inner } => {
+            // Create an edge from the current block into the label's block (fall-through),
+            // then switch to the label's block and lower the inner statement.
+            if let Some(&label_bb) = ctx.label_blocks.get(label) {
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(label_bb, vec![]);
+                }
+                b.set_block(label_bb);
+            }
+            lower_stmt(b, ctx, inner);
+        }
 
         Stmt::Open { specs } => {
             // Extract UNIT and FILE from specs. Simplified: first spec is unit, second is file.
@@ -6427,6 +6618,31 @@ fn lower_expr_full(
                     return result;
                 }
 
+                // PRESENT(x): check if optional dummy argument x was passed.
+                // By-ref params are stored as `alloca Ptr<T>` in locals; when the
+                // caller omits an optional arg it passes null (0). Load the stored
+                // pointer and compare to zero → non-zero means present.
+                if key == "present" {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            if let Expr::Name { name: arg_name } = &e.node {
+                                let akey = arg_name.to_lowercase();
+                                if let Some(info) = locals.get(&akey) {
+                                    if info.by_ref {
+                                        // Load the incoming pointer stored in the by-ref slot.
+                                        // If absent, caller passes 0; if present, non-zero address.
+                                        let ptr_val = b.load(info.addr);
+                                        let zero = b.const_i64(0);
+                                        return b.icmp(CmpOp::Ne, ptr_val, zero);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If we can't resolve it (non-standard usage), assume present.
+                    return b.const_bool(true);
+                }
+
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
@@ -6925,7 +7141,7 @@ program test
   deallocate(a)
 end program
 ");
-        assert!(ir.contains("call @afs_allocate_1d"), "expected allocate call in:\n{}", ir);
+        assert!(ir.contains("call @afs_allocate_array"), "expected allocate call in:\n{}", ir);
         assert!(ir.contains("call @afs_deallocate_array"), "expected deallocate call in:\n{}", ir);
     }
 
