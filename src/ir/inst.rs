@@ -530,6 +530,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        InstKind::ICmp(CmpOp::Eq | CmpOp::Ne, ..) if uses_i128 => true,
         InstKind::Store(..) => true,
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
             !uses_i128 || inst_ty_has_i128

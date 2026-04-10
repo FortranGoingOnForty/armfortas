@@ -674,6 +674,85 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
 
         // ---- Comparisons ----
         InstKind::ICmp(op, a, b) => {
+            if matches!(func.value_type(*a), Some(IrType::Int(IntWidth::I128)))
+                || matches!(func.value_type(*b), Some(IrType::Int(IntWidth::I128)))
+            {
+                let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
+                let lhs_slot = ctx.lookup_wide_slot(*a);
+                let rhs_slot = ctx.lookup_wide_slot(*b);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    lhs_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    rhs_slot as i64,
+                    PhysReg::Gp(8),
+                    PhysReg::Gp(9),
+                );
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::CmpReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(16)),
+                        MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::Cset,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                        MachineOperand::Cond(cmp_to_arm_cond(*op)),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::CmpReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
+                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::Cset,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                        MachineOperand::Cond(cmp_to_arm_cond(*op)),
+                    ],
+                    def: None,
+                });
+                let combine = match op {
+                    CmpOp::Eq => ArmOpcode::AndReg,
+                    CmpOp::Ne => ArmOpcode::OrrReg,
+                    _ => panic!("isel: unsupported i128 compare op reached backend: {:?}", op),
+                };
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: combine,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                        MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                    ],
+                    def: Some(dest),
+                });
+                return;
+            }
+
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
             let va = ctx.lookup_vreg(*a);
             let vb = ctx.lookup_vreg(*b);
@@ -1973,6 +2052,15 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::ICmp(op, _, _) => {
+                    if crate::ir::walk::inst_uses(&inst.kind)
+                        .into_iter()
+                        .filter_map(|vid| func.value_type(vid))
+                        .any(|ty| matches!(ty, IrType::Int(IntWidth::I128)))
+                    {
+                        pending = None;
+                        ctx.fused_arm_cond.remove(&inst.id);
+                        continue;
+                    }
                     // New CMP overwrites NZCV — previous pending is no longer valid.
                     pending = Some(inst.id);
                     // Temporarily store the arm cond so we can retrieve it when
@@ -2126,6 +2214,20 @@ mod tests {
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg));
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Cset));
+    }
+
+    #[test]
+    fn select_i128_icmp_eq_combines_limb_results() {
+        let mf = select_simple(|b| {
+            let x = b.const_i128(1);
+            let y = b.const_i128(1);
+            let _c = b.icmp(CmpOp::Eq, x, y);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::CmpReg).count() >= 2);
+        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 2);
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
     }
 
     #[test]

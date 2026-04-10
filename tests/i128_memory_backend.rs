@@ -104,6 +104,49 @@ fn simple_local_i128_subneg_emits_borrow_chain_ops_at_o0() {
 }
 
 #[test]
+fn simple_local_i128_eqne_emits_pair_compare_ops_at_o0() {
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_eqne.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+
+    assert!(
+        asm.contains("cmp x16, x8"),
+        "backend should compare the low i128 limb:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cmp x17, x9"),
+        "backend should compare the high i128 limb:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w10, eq"),
+        "backend should materialize low/high equality flags:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("and w10, w10, w11"),
+        "backend should combine equality limbs with AND:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w10, ne"),
+        "backend should materialize low/high inequality flags:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("orr w10, w10, w11"),
+        "backend should combine inequality limbs with OR:\n{}",
+        asm
+    );
+}
+
+#[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(
