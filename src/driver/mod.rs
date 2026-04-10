@@ -483,6 +483,12 @@ mod tests {
         path
     }
 
+    fn i128_external_call_fixture() -> PathBuf {
+        let path = PathBuf::from("tests/fixtures").join("integer16_external_call.f90");
+        assert!(path.exists(), "missing test fixture {}", path.display());
+        path
+    }
+
     #[test]
     fn emit_ir_allows_integer16_staging_at_o0() {
         let output = std::env::temp_dir().join(format!(
@@ -597,6 +603,30 @@ mod tests {
         compile(&opts).expect("internal integer(16) call should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
         assert!(asm.contains("bl _add_one"), "expected internal helper call in asm:\n{}", asm);
+        assert!(asm.contains("stp x0, x1"), "expected pair-register i128 ABI spill in asm:\n{}", asm);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn backend_allows_external_integer16_call_codegen_at_o0() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_external_call_{}_{}.s",
+            std::process::id(),
+            "o0"
+        ));
+        let opts = Options {
+            input: i128_external_call_fixture(),
+            output: Some(output.clone()),
+            emit_asm: true,
+            emit_obj: false,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: OptLevel::O0,
+        };
+
+        compile(&opts).expect("external integer(16) call should codegen at O0");
+        let asm = fs::read_to_string(&output).expect("missing emitted assembly");
+        assert!(asm.contains("bl _add_ext"), "expected external helper call in asm:\n{}", asm);
         assert!(asm.contains("stp x0, x1"), "expected pair-register i128 ABI spill in asm:\n{}", asm);
         let _ = fs::remove_file(output);
     }

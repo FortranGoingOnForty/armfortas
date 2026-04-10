@@ -211,11 +211,13 @@ Landed so far:
 - local `-O0` stack-backed `i128` memory traffic, add/sub/neg, equality, ordered compares,
   and `select`
 - internal-only `-O0` pair-register `i128` params, returns, and same-module calls
+- external `-O0` pair-register `i128` call/return codegen through real Fortran interface
+  declarations, with asm/object determinism coverage
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
 
 Still missing inside the same cleanup item:
-- any external/runtime interop surface that passes `i128` across a function boundary
+- linked cross-object/runtime interop that executes those external `i128` calls end to end
 - optimized (`-O1+`) pipeline support
 
 ### Planned ABI Jump
@@ -228,7 +230,7 @@ Working assumption from local clang ABI probes on Apple ARM64:
 - `__int128` params consume register pairs `xN/xN+1`
 
 Staged plan:
-1. external/runtime interop coverage for the same pair-register ABI surface
+1. linked cross-object/runtime coverage for the same pair-register ABI surface
 2. only after the ABI surface is real, widen optimizer support beyond raw `-O0`
 
 Timing:
