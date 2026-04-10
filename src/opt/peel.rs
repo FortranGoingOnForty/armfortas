@@ -12,12 +12,11 @@
 //! peeled iteration. Later const-prop folds `iv=init_const` through the
 //! clone, turning `if (i==1)` into `if (true)` and eliminating dead code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{find_natural_loops, predecessors};
-use super::loop_utils::{find_preheader, resolve_const_int, loop_defined_values,
-                        clone_loop, build_value_map};
+use super::loop_utils::{find_preheader, resolve_const_int, loop_defined_values, clone_loop};
 use super::pass::Pass;
 
 pub struct LoopPeel;
@@ -95,10 +94,8 @@ fn peel_in_function(func: &mut Function) -> bool {
         let Some(exit_id) = exit_block else { continue };
 
         // Also find the exit args (values passed to exit on the false branch).
-        let exit_args = find_exit_args(func, lp, exit_id);
-
         // ---- Perform the peel ----
-        do_peel(func, lp, ph_id, init_val, latch_id, exit_id, &exit_args, stride);
+        do_peel(func, lp, ph_id, init_val, latch_id, exit_id, stride);
         return true; // one at a time
     }
     false
@@ -181,12 +178,10 @@ fn do_peel(
     init_val: ValueId,
     latch_id: BlockId,
     exit_id: BlockId,
-    exit_args: &[ValueId],
     stride: i64,
 ) {
     // Clone the entire loop.
     let (block_map, _new_blocks) = clone_loop(func, lp);
-    let val_map = build_value_map(func, lp, &block_map);
 
     // The IV type (needed to emit the init+stride constant).
     let hdr = func.block(lp.header);

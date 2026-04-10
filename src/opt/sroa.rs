@@ -61,19 +61,17 @@ fn find_candidates(func: &Function) -> Vec<SroaCandidate> {
 
     for block in &func.blocks {
         for (inst_idx, inst) in block.insts.iter().enumerate() {
-            if let InstKind::Alloca(ref ty) = inst.kind {
-                if let IrType::Array(ref elem, count) = ty {
-                    if *count <= SROA_MAX_FIELDS && *count > 0 {
-                        // Check eligibility: all uses are constant-index GEPs, no escape.
-                        if is_eligible(func, inst.id) {
-                            candidates.push(SroaCandidate {
-                                alloca_id: inst.id,
-                                alloca_block: block.id,
-                                alloca_inst_idx: inst_idx,
-                                elem_ty: (**elem).clone(),
-                                count: *count,
-                            });
-                        }
+            if let InstKind::Alloca(IrType::Array(ref elem, count)) = inst.kind {
+                if count <= SROA_MAX_FIELDS && count > 0 {
+                    // Check eligibility: all uses are constant-index GEPs, no escape.
+                    if is_eligible(func, inst.id) {
+                        candidates.push(SroaCandidate {
+                            alloca_id: inst.id,
+                            alloca_block: block.id,
+                            alloca_inst_idx: inst_idx,
+                            elem_ty: (**elem).clone(),
+                            count,
+                        });
                     }
                 }
             }

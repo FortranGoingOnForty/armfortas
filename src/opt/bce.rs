@@ -267,7 +267,7 @@ fn strip_int_casts(func: &Function, mut value: ValueId) -> ValueId {
     }
 }
 
-fn find_inst_kind<'a>(func: &'a Function, value: ValueId) -> Option<&'a InstKind> {
+fn find_inst_kind(func: &Function, value: ValueId) -> Option<&InstKind> {
     for block in &func.blocks {
         for inst in &block.insts {
             if inst.id == value {

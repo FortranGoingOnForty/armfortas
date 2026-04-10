@@ -384,22 +384,24 @@ fn detect_bound_and_exit(
     let mut is_lt = false;  // true when we need bound-1
 
     for inst in &hdr.insts {
-        match &inst.kind {
-            InstKind::ICmp(op, a, b) => {
-                let (iv_side, other) = if *a == iv { (*a, *b) } else if *b == iv { (*b, *a) } else { continue };
-                let _ = iv_side;
-                let c = resolve_const_int(func, other)?;
-                match op {
-                    CmpOp::Le => { bound = Some(c); is_lt = false; }
-                    CmpOp::Lt => { bound = Some(c); is_lt = true; }
-                    CmpOp::Ge => { bound = Some(c); is_lt = false; } // iv >= c means upper = c when commuted
-                    CmpOp::Gt => { bound = Some(c); is_lt = true; }  // iv > c means upper = c-1 commuted
-                    _ => return None,
-                }
-                cmp_id = Some(inst.id);
-                break;
+        if let InstKind::ICmp(op, a, b) = &inst.kind {
+            let other = if *a == iv {
+                *b
+            } else if *b == iv {
+                *a
+            } else {
+                continue;
+            };
+            let c = resolve_const_int(func, other)?;
+            match op {
+                CmpOp::Le => { bound = Some(c); is_lt = false; }
+                CmpOp::Lt => { bound = Some(c); is_lt = true; }
+                CmpOp::Ge => { bound = Some(c); is_lt = false; } // iv >= c means upper = c when commuted
+                CmpOp::Gt => { bound = Some(c); is_lt = true; }  // iv > c means upper = c-1 commuted
+                _ => return None,
             }
-            _ => {}
+            cmp_id = Some(inst.id);
+            break;
         }
     }
     let cmp_id = cmp_id?;
@@ -748,13 +750,13 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
         InstKind::Load(a)    => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
         InstKind::GetElementPtr(base, idxs) =>
-            InstKind::GetElementPtr(r(base), idxs.iter().map(|i| r(i)).collect()),
+            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect()),
 
         // Calls.
         InstKind::Call(f, args) =>
-            InstKind::Call(f.clone(), args.iter().map(|a| r(a)).collect()),
+            InstKind::Call(f.clone(), args.iter().map(&r).collect()),
         InstKind::RuntimeCall(f, args) =>
-            InstKind::RuntimeCall(f.clone(), args.iter().map(|a| r(a)).collect()),
+            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect()),
 
         // Aggregates.
         InstKind::ExtractField(v, idx)     => InstKind::ExtractField(r(v), *idx),

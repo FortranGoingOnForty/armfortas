@@ -38,6 +38,8 @@ const UNSWITCH_MAX_BODY: usize = 50;
 
 pub struct LoopUnswitch;
 
+type UnswitchCandidate = (BlockId, ValueId, BlockId, Vec<ValueId>, BlockId, Vec<ValueId>);
+
 impl Pass for LoopUnswitch {
     fn name(&self) -> &'static str { "loop-unswitch" }
 
@@ -141,7 +143,7 @@ fn find_unswitch_candidate(
     func: &Function,
     lp: &crate::ir::walk::NaturalLoop,
     loop_defs: &HashSet<ValueId>,
-) -> Option<(BlockId, ValueId, BlockId, Vec<ValueId>, BlockId, Vec<ValueId>)> {
+) -> Option<UnswitchCandidate> {
     for &bid in &lp.body {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch {

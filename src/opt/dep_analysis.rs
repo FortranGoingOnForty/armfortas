@@ -11,7 +11,7 @@
 //! - Column-major strides are compile-time constants for fixed-shape arrays.
 //! - INTENT(IN) arguments cannot alias INTENT(OUT) arguments.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use crate::ir::inst::*;
 
 // ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ pub fn test_dependence(ref_a: &MemRef, ref_b: &MemRef) -> DepResult {
 
     // GCD test: if gcd does not divide the constant difference,
     // the accesses NEVER touch the same element → independent.
-    let dependent = (diff.constant.unsigned_abs() % g) == 0;
+    let dependent = diff.constant.unsigned_abs().is_multiple_of(g);
     DepResult { dependent }
 }
 

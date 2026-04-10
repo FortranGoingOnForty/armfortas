@@ -213,11 +213,11 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         InstKind::Load(a)    => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
         InstKind::GetElementPtr(base, idxs) =>
-            InstKind::GetElementPtr(r(base), idxs.iter().map(|i| r(i)).collect()),
+            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect()),
         InstKind::Call(f, args) =>
-            InstKind::Call(f.clone(), args.iter().map(|a| r(a)).collect()),
+            InstKind::Call(f.clone(), args.iter().map(&r).collect()),
         InstKind::RuntimeCall(f, args) =>
-            InstKind::RuntimeCall(f.clone(), args.iter().map(|a| r(a)).collect()),
+            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect()),
         InstKind::ExtractField(v, idx)     => InstKind::ExtractField(r(v), *idx),
         InstKind::InsertField(v, idx, fld) => InstKind::InsertField(r(v), *idx, r(fld)),
     }
@@ -231,7 +231,7 @@ pub fn remap_terminator(
 ) -> Terminator {
     let rb = |b: &BlockId| *block_map.get(b).unwrap_or(b);
     let rv = |v: &ValueId| *val_map.get(v).unwrap_or(v);
-    let rvs = |vs: &[ValueId]| -> Vec<ValueId> { vs.iter().map(|v| rv(v)).collect() };
+    let rvs = |vs: &[ValueId]| -> Vec<ValueId> { vs.iter().map(&rv).collect() };
     match term {
         Terminator::Return(v) => Terminator::Return(v.map(|x| rv(&x))),
         Terminator::Branch(dest, args) => Terminator::Branch(rb(dest), rvs(args)),

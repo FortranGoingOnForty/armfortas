@@ -16,7 +16,6 @@
 //!
 //! This eliminates the empty block chains left by inlining.
 
-use std::collections::HashMap;
 use crate::ir::inst::*;
 use crate::ir::walk::predecessors;
 use super::pass::Pass;
@@ -90,10 +89,8 @@ fn simplify_function(func: &mut Function) -> bool {
                         unique.dedup();
                         if unique.len() == 1 && unique[0] == block.id {
                             // Can merge: append successor's contents to predecessor.
-                            if true {
-                                merge = Some((block.id, *succ));
-                                break;
-                            }
+                            merge = Some((block.id, *succ));
+                            break;
                         }
                     }
                 }

@@ -24,7 +24,6 @@
 //! use both IVs as simple direct subscripts with no cross-iteration
 //! read-before-write. This avoids needing full dependence analysis.
 
-use std::collections::HashSet;
 use crate::ir::inst::*;
 use crate::ir::walk::predecessors;
 use super::loop_tree::build_loop_tree;
@@ -60,13 +59,13 @@ fn interchange_in_function(func: &mut Function) -> bool {
 
         // Check profitability: is the outer IV used as the first (fast)
         // subscript of a multi-dimensional array GEP?
-        if !should_interchange(func, &inner, outer_shape.iv, inner_shape.iv) {
+        if !should_interchange(func, inner, outer_shape.iv, inner_shape.iv) {
             continue;
         }
 
         // Check legality: conservative — only if the body has no
         // loop-carried dependencies that would change semantics.
-        if !is_interchange_legal(func, &inner, outer_shape.iv, inner_shape.iv) {
+        if !is_interchange_legal(func, inner, outer_shape.iv, inner_shape.iv) {
             continue;
         }
 

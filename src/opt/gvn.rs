@@ -343,9 +343,7 @@ fn key_of(
         // alloca to the stored SSA value when the callee only reads the
         // pointee as a scalar input.
         InstKind::Call(FuncRef::Internal(idx), args) => {
-            let Some(policy) = pure_calls.get(*idx as usize) else {
-                return None;
-            };
+            let policy = pure_calls.get(*idx as usize)?;
             if !policy.reusable || policy.arg_policies.len() != args.len() {
                 return None;
             }
@@ -355,9 +353,7 @@ fn key_of(
                     PureArgPolicy::ByValue => ops.push(remap(*arg)),
                     PureArgPolicy::ReadOnlyWrapperPtr => {
                         let wrapper = remap(*arg);
-                        let Some(stored) = wrapper_values.get(&wrapper) else {
-                            return None;
-                        };
+                        let stored = wrapper_values.get(&wrapper)?;
                         ops.push(remap(*stored));
                     }
                     PureArgPolicy::Unsupported => return None,

@@ -4,7 +4,7 @@
 //! Detects recursive functions via DFS cycle detection. Provides
 //! reverse post-order iteration for bottom-up inlining (callees first).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use crate::ir::inst::*;
 use crate::ir::walk::find_natural_loops;
 
@@ -143,8 +143,8 @@ fn dfs_cycle(nodes: &[CallNode], idx: u32, visiting: &mut HashSet<u32>) -> bool 
         return true; // back-edge → cycle
     }
     for &callee in &nodes[idx as usize].callees {
-        if (callee as usize) < nodes.len() {
-            if dfs_cycle(nodes, callee, visiting) { return true; }
+        if (callee as usize) < nodes.len() && dfs_cycle(nodes, callee, visiting) {
+            return true;
         }
     }
     visiting.remove(&idx);

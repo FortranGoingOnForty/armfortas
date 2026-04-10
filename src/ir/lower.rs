@@ -6650,7 +6650,7 @@ fn loop_indexed_array_ref(
 }
 
 fn control_covers_full_array(ctrl: &ConcurrentControl, dest: &IndexedArrayRef) -> bool {
-    let step_ok = ctrl.step.as_ref().map_or(true, |step| eval_const_int(step) == Some(1));
+    let step_ok = ctrl.step.as_ref().is_none_or(|step| eval_const_int(step) == Some(1));
     if !step_ok {
         return false;
     }

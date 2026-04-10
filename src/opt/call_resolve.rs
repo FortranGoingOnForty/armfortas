@@ -28,16 +28,13 @@ impl Pass for CallResolve {
         for func in &mut module.functions {
             for block in &mut func.blocks {
                 for inst in &mut block.insts {
-                    match &mut inst.kind {
-                        InstKind::Call(ref mut func_ref, _) => {
-                            if let FuncRef::External(name) = func_ref {
-                                if let Some(&idx) = name_to_idx.get(name.as_str()) {
-                                    *func_ref = FuncRef::Internal(idx);
-                                    changed = true;
-                                }
+                    if let InstKind::Call(ref mut func_ref, _) = &mut inst.kind {
+                        if let FuncRef::External(name) = func_ref {
+                            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                                *func_ref = FuncRef::Internal(idx);
+                                changed = true;
                             }
                         }
-                        _ => {}
                     }
                 }
             }

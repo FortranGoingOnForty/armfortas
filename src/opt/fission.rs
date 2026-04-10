@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
-use super::loop_utils::{find_preheader, loop_defined_values, clone_loop, build_value_map};
+use super::loop_utils::{find_preheader, clone_loop};
 use super::dep_analysis::{collect_mem_refs, test_dependence};
 use super::pass::Pass;
 
@@ -85,10 +85,6 @@ fn fission_in_function(func: &mut Function) -> bool {
         let Some(exit_id) = exit_id else { continue };
 
         // Compute backward slices for each store.
-        let loop_defs = loop_defined_values(func, lp);
-        let slice_a = backward_slice(func, stores[0].1, &loop_defs);
-        let slice_b = backward_slice(func, stores[1].1, &loop_defs);
-
         // Clone the loop.
         let (block_map, _) = clone_loop(func, lp);
 
@@ -135,7 +131,7 @@ fn fission_in_function(func: &mut Function) -> bool {
 fn neutralize_store(func: &mut Function, block_id: BlockId, store_idx: usize) {
     let block = func.block_mut(block_id);
     if store_idx >= block.insts.len() { return; }
-    if let InstKind::Store(ref mut val, _) = block.insts[store_idx].kind {
+    if let InstKind::Store(_, _) = block.insts[store_idx].kind {
         // Replace with a store of undef — the store is now dead.
         // We keep the store instruction (not remove it) to preserve
         // SSA structure. DCE will clean it up later.
