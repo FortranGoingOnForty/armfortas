@@ -271,20 +271,14 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
 /// Build the restricted optimization pipeline for modules that still contain
 /// non-global `i128` values.
 ///
-/// This deliberately supports only the first widened lane: `-O1`.
-/// The passes here must preserve the backend's current supported surface
-/// (no wide block params, no mem2reg promotion, no inlining-created join
-/// params) while still providing real wins like constant folding.
+/// This deliberately supports only the first widened optimized lane: `-O1`.
+/// Now that the backend can carry stack-backed `i128` values through block
+/// params and mem2reg-style joins, the widened `i128` lane can use the full
+/// ordinary O1 pipeline. O2+ still remain gated until broader optimized
+/// `i128` shapes are supported end to end.
 pub fn build_i128_pipeline(level: OptLevel) -> Option<PassManager> {
-    let mut pm = PassManager::new();
     match level {
-        OptLevel::O1 => {
-            pm.add(Box::new(CallResolve));
-            pm.add(Box::new(ConstFold));
-            pm.add(Box::new(SimplifyCfg));
-            pm.add(Box::new(Dce));
-            Some(pm)
-        }
+        OptLevel::O1 => Some(build_pipeline(OptLevel::O1)),
         _ => None,
     }
 }
@@ -379,7 +373,7 @@ mod tests {
     fn i128_pipeline_is_available_only_at_o1() {
         assert!(
             build_i128_pipeline(OptLevel::O1).is_some(),
-            "O1 should have a restricted i128-safe pipeline"
+            "O1 should have the widened i128-safe pipeline"
         );
         for lvl in [OptLevel::O0, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
             assert!(
@@ -388,5 +382,17 @@ mod tests {
                 lvl
             );
         }
+    }
+
+    #[test]
+    fn i128_pipeline_matches_full_o1() {
+        let wide = build_i128_pipeline(OptLevel::O1)
+            .expect("O1 should expose the widened i128 pipeline")
+            .pass_names();
+        let full = build_pipeline(OptLevel::O1).pass_names();
+        assert_eq!(
+            wide, full,
+            "the widened i128 O1 lane should stay aligned with the ordinary O1 pipeline"
+        );
     }
 }

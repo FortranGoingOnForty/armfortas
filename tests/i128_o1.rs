@@ -44,8 +44,8 @@ fn o1_optir_const_folds_integer16_mul() {
         raw_ir
     );
     assert!(
-        opt_ir.contains("const_int 42 : i128"),
-        "O1 integer(16) pipeline should fold the wide multiply to a constant:\n{}",
+        opt_ir.contains("const_int 42 : i128") || !opt_ir.contains("i128"),
+        "O1 integer(16) pipeline should fold the wide multiply away before backend, either to a constant or all the way out of the optimized IR:\n{}",
         opt_ir
     );
     assert!(
@@ -100,5 +100,68 @@ fn o1_integer16_object_snapshot_is_deterministic() {
     assert_eq!(
         first, second,
         "O1 integer(16) object snapshots should stay deterministic once the wide multiply folds away"
+    );
+}
+
+#[test]
+fn o1_optir_promotes_branchy_integer16_local() {
+    let raw_ir = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_branchy_mem2reg.f90"),
+            requested: BTreeSet::from([Stage::Ir]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Ir,
+    );
+    let opt_ir = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_branchy_mem2reg.f90"),
+            requested: BTreeSet::from([Stage::OptIr]),
+            opt_level: OptLevel::O1,
+        },
+        Stage::OptIr,
+    );
+
+    assert!(
+        raw_ir.contains("alloca"),
+        "raw integer(16) branchy IR should still materialize stack storage before mem2reg:\n{}",
+        raw_ir
+    );
+    assert!(
+        raw_ir.contains("load"),
+        "raw integer(16) branchy IR should still load the local before O1 promotion:\n{}",
+        raw_ir
+    );
+    assert!(
+        !opt_ir.contains("alloca"),
+        "O1 integer(16) pipeline should eliminate the stack slot after mem2reg promotion:\n{}",
+        opt_ir
+    );
+    assert!(
+        !opt_ir.contains("load"),
+        "O1 integer(16) pipeline should eliminate wide loads after promotion:\n{}",
+        opt_ir
+    );
+}
+
+#[test]
+fn o1_branchy_integer16_program_runs_after_mem2reg() {
+    let result = capture_from_path(&CaptureRequest {
+        input: fixture("integer16_branchy_mem2reg.f90"),
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O1,
+    })
+    .expect("branchy integer(16) program should run at O1 after mem2reg promotion");
+
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run capture");
+
+    assert_eq!(run.exit_code, 0, "expected successful O1 branchy integer(16) run:\n{:#?}", run);
+    assert!(
+        run.stdout.contains('1'),
+        "branchy O1 integer(16) program should print score 1:\n{}",
+        run.stdout
     );
 }
