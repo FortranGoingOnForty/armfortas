@@ -86,7 +86,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             process_contains(st, contains)?;
             st.pop_scope();
         }
-        ProgramUnit::Function { name, args, result, return_type: _, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
+        ProgramUnit::Function { name, args, result, return_type, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
             let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
             st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
                 if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
@@ -110,7 +110,7 @@ fn resolve_unit(st: &mut SymbolTable, unit: &SpannedUnit) -> Result<(), SemaErro
             st.define(Symbol {
                 name: result_name.into(),
                 kind: SymbolKind::Variable,
-                type_info: None,
+                type_info: return_type.as_ref().map(type_spec_to_info),
                 attrs: SymbolAttrs::default(),
                 defined_at: unit.span,
                 scope: st.current_scope(),

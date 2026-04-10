@@ -3435,6 +3435,38 @@ fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool
     Some(mask)
 }
 
+fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
+    use crate::sema::symtab::ScopeKind;
+
+    let key = callee_name.to_lowercase();
+    if let Some(type_info) = st
+        .scopes
+        .iter()
+        .find_map(|scope| scope.symbols.get(&key))
+        .and_then(|sym| sym.type_info.as_ref())
+    {
+        return Some(type_info_to_ir_type(type_info));
+    }
+
+    let callee_scope = st.scopes.iter().find(|scope| {
+        matches!(&scope.kind, ScopeKind::Function(name) if name.to_lowercase() == key)
+    })?;
+
+    let mut result_type = None;
+    for sym in callee_scope.symbols.values() {
+        if callee_scope.arg_order.iter().any(|arg| arg == &sym.name.to_lowercase()) {
+            continue;
+        }
+        if let Some(type_info) = sym.type_info.as_ref() {
+            if result_type.is_some() {
+                return None;
+            }
+            result_type = Some(type_info_to_ir_type(type_info));
+        }
+    }
+    result_type
+}
+
 /// Check if a dummy argument has the VALUE attribute in its declaration.
 fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     let key = arg_name.to_lowercase();
@@ -7868,18 +7900,7 @@ fn lower_expr_full(
 
                 // Look up callee return type from symbol table.
                 // Search all scopes since the current scope may be global after resolve.
-                let callee_sym = st.scopes.iter()
-                    .find_map(|scope| scope.symbols.get(&key));
-                let ret_ty = callee_sym
-                    .and_then(|sym| sym.type_info.as_ref())
-                    .map(crate::sema::types::type_info_to_fortran_type)
-                    .map(|ft| match ft {
-                        crate::sema::types::FortranType::Real { kind } => IrType::float_from_kind(kind),
-                        crate::sema::types::FortranType::Integer { kind } => IrType::int_from_kind(kind),
-                        crate::sema::types::FortranType::Logical { .. } => IrType::Bool,
-                        _ => IrType::Int(IntWidth::I32),
-                    })
-                    .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = callee_return_ir_type(st, &key).unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = internal_funcs
                     .and_then(|map| map.get(&key).copied())
                     .map(FuncRef::Internal)
