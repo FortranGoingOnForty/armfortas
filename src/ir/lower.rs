@@ -6087,6 +6087,103 @@ fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     }
 }
 
+fn array_total_elems_value(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.allocatable {
+        b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![info.addr],
+            IrType::Int(IntWidth::I64),
+        )
+    } else {
+        let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
+        b.const_i64(total.max(0))
+    }
+}
+
+fn whole_array_expr_info(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<LocalInfo> {
+    let Expr::Name { name } = &expr.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    locals.get(&key)
+        .filter(|info| !info.dims.is_empty() || info.allocatable)
+        .cloned()
+}
+
+fn bulk_fill_runtime_name(ty: &IrType) -> Option<&'static str> {
+    match ty {
+        IrType::Int(IntWidth::I32) => Some("afs_fill_i32"),
+        IrType::Float(FloatWidth::F32) => Some("afs_fill_f32"),
+        IrType::Float(FloatWidth::F64) => Some("afs_fill_f64"),
+        _ => None,
+    }
+}
+
+fn bulk_array_binary_runtime_name(op: BinaryOp, ty: &IrType) -> Option<&'static str> {
+    match (op, ty) {
+        (BinaryOp::Add, IrType::Int(IntWidth::I32)) => Some("afs_array_add_i32"),
+        (BinaryOp::Add, IrType::Float(FloatWidth::F32)) => Some("afs_array_add_f32"),
+        (BinaryOp::Add, IrType::Float(FloatWidth::F64)) => Some("afs_array_add_f64"),
+        _ => None,
+    }
+}
+
+fn expr_contains_array_refs(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> bool {
+    let mut arrays = Vec::new();
+    collect_array_names(expr, locals, &mut arrays);
+    !arrays.is_empty()
+}
+
+fn try_lower_bulk_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if let Expr::BinaryOp { op, left, right } = &value.node {
+        if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
+            let lhs_info = whole_array_expr_info(&ctx.locals, left);
+            let rhs_info = whole_array_expr_info(&ctx.locals, right);
+            if let (Some(lhs_info), Some(rhs_info)) = (lhs_info, rhs_info) {
+                if lhs_info.ty == dest_info.ty && rhs_info.ty == dest_info.ty {
+                    let dest_base = array_base_addr(b, dest_info);
+                    let lhs_base = array_base_addr(b, &lhs_info);
+                    let rhs_base = array_base_addr(b, &rhs_info);
+                    let n = array_total_elems_value(b, dest_info);
+                    b.call(
+                        FuncRef::External(kernel.into()),
+                        vec![dest_base, lhs_base, rhs_base, n],
+                        IrType::Void,
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    if !expr_contains_array_refs(value, &ctx.locals) {
+        if let Some(fill_kernel) = bulk_fill_runtime_name(&dest_info.ty) {
+            let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+            let dest_base = array_base_addr(b, dest_info);
+            let n = array_total_elems_value(b, dest_info);
+            b.call(
+                FuncRef::External(fill_kernel.into()),
+                vec![dest_base, n, scalar],
+                IrType::Void,
+            );
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Extract base variable name from an expression.
 fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
     match &expr.node {
@@ -6193,11 +6290,12 @@ fn lower_array_assign(
     // a = [v0, v1, v2, ...] — element-wise store of an array
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
-        let dest_base = if dest_info.allocatable {
-            b.load_typed(dest_info.addr,
-                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-        } else { dest_info.addr };
+        let dest_base = array_base_addr(b, dest_info);
         store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        return;
+    }
+
+    if try_lower_bulk_array_assign(b, ctx, dest_info, value) {
         return;
     }
 
@@ -6210,25 +6308,16 @@ fn lower_array_assign(
 
     if rhs_is_array {
         // a = b: memcpy from b's data to a's data.
-        // For allocatable arrays, load base_addr from both descriptors.
-        let dest_base = if dest_info.allocatable {
-            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-        } else { dest_info.addr };
+        let dest_base = array_base_addr(b, dest_info);
 
         if let Expr::Name { name } = &value.node {
             let key = name.to_lowercase();
             if let Some(src_info) = ctx.locals.get(&key) {
-                let src_base = if src_info.allocatable {
-                    b.load_typed(src_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                } else { src_info.addr };
+                let src_base = array_base_addr(b, src_info);
 
                 // Compute byte count: size(a) * elem_size.
-                let n = b.call(FuncRef::External("afs_array_size".into()),
-                    vec![dest_info.addr], IrType::Int(IntWidth::I64));
-                let elem_bytes = match &dest_info.ty {
-                    IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
-                    _ => b.const_i64(4),
-                };
+                let n = array_total_elems_value(b, dest_info);
+                let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
                 let byte_count = b.imul(n, elem_bytes);
                 b.call(FuncRef::External("memcpy".into()),
                     vec![dest_base, src_base, byte_count],
@@ -6239,12 +6328,8 @@ fn lower_array_assign(
         // a = scalar: broadcast scalar to all elements.
         // Generate a loop with stack-allocated counter.
         let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-        let dest_base = if dest_info.allocatable {
-            b.load_typed(dest_info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-        } else { dest_info.addr };
-
-        let n = b.call(FuncRef::External("afs_array_size".into()),
-            vec![dest_info.addr], IrType::Int(IntWidth::I64));
+        let dest_base = array_base_addr(b, dest_info);
+        let n = array_total_elems_value(b, dest_info);
 
         // Stack-allocated loop counter.
         let i_addr = b.alloca(IrType::Int(IntWidth::I64));
