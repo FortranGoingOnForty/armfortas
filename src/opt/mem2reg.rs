@@ -1351,6 +1351,7 @@ mod tests {
                 name: "flag".into(),
                 ty: IrType::Int(IntWidth::I32),
                 id: ValueId(0),
+                fortran_noalias: false,
             }],
             IrType::Int(IntWidth::I32),
         );

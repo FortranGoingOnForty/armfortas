@@ -35,22 +35,22 @@
 //!
 //! ## Memory operations
 //!
-//! `Load` is conservatively *not* hoisted here — proving a load is
-//! invariant requires showing no `Store`/`Call`/`RuntimeCall` in the
-//! loop can write the same address. Alias analysis lands later;
-//! until then, leaving loads in place is correct.
+//! `Load` is hoisted only when its address is loop-invariant and every
+//! loop `Store` is proven `NoAlias` against that address. Any
+//! `Call`/`RuntimeCall` in the loop still blocks hoisting for now.
 //!
 //! `Alloca` is also not hoisted: each iteration's stack slot might be
 //! semantically distinct (in our IR allocas are entry-block-only in
 //! practice, but we don't bet on that here).
 
+use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use super::util::{find_natural_loops, predecessors, inst_uses, NaturalLoop};
 use crate::ir::inst::*;
 use std::collections::{HashMap, HashSet};
 
-/// True if an instruction is a candidate for LICM (pure, no aliasing
-/// concerns, no side effects, **and safe to speculate**).
+/// True if an instruction is a non-memory candidate for LICM (pure,
+/// no side effects, **and safe to speculate**).
 ///
 /// Audit Med-6: trap-prone arithmetic must not be hoisted out of a
 /// guarding conditional. The classic case is `if (b /= 0) c = a / b`
@@ -58,11 +58,10 @@ use std::collections::{HashMap, HashSet};
 /// `idiv a, b` looks invariant and pure, but hoisting it past the
 /// guard turns a safe program into a SIGFPE. We exclude every
 /// integer/float op that can trap or produce a domain error.
-fn is_hoist_candidate(kind: &InstKind) -> bool {
+fn is_non_memory_hoist_candidate(kind: &InstKind) -> bool {
     !matches!(
         kind,
-        InstKind::Load(..)
-            | InstKind::Store(..)
+        InstKind::Store(..)
             | InstKind::Alloca(..)
             | InstKind::Call(..)
             | InstKind::RuntimeCall(..)
@@ -75,6 +74,34 @@ fn is_hoist_candidate(kind: &InstKind) -> bool {
             | InstKind::FSqrt(..)
             | InstKind::FPow(..)
     )
+}
+
+fn load_is_loop_invariant(
+    func: &Function,
+    lp: &NaturalLoop,
+    load_id: ValueId,
+    load_ptr: ValueId,
+) -> bool {
+    for block in &func.blocks {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for inst in &block.insts {
+            if inst.id == load_id {
+                continue;
+            }
+            match &inst.kind {
+                InstKind::Store(_, ptr) => {
+                    if !matches!(alias::query(func, *ptr, load_ptr), AliasResult::NoAlias) {
+                        return false;
+                    }
+                }
+                InstKind::Call(..) | InstKind::RuntimeCall(..) => return false,
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Delegate to shared loop utility.
@@ -145,7 +172,6 @@ fn licm_function(func: &mut Function) -> bool {
             for (bi, block) in func.blocks.iter().enumerate() {
                 if !lp.body.contains(&block.id) { continue; }
                 for (ii, inst) in block.insts.iter().enumerate() {
-                    if !is_hoist_candidate(&inst.kind) { continue; }
                     if !loop_defs.contains(&inst.id) {
                         // Already hoisted (we mark it removed from
                         // loop_defs after a successful hoist).
@@ -156,6 +182,11 @@ fn licm_function(func: &mut Function) -> bool {
                     // hoisted, or defined outside).
                     let operands = inst_uses(&inst.kind);
                     if operands.iter().any(|v| loop_defs.contains(v)) { continue; }
+                    let hoistable = match &inst.kind {
+                        InstKind::Load(ptr) => load_is_loop_invariant(func, lp, inst.id, *ptr),
+                        _ => is_non_memory_hoist_candidate(&inst.kind),
+                    };
+                    if !hoistable { continue; }
                     hoists.push(Hoist { block_idx: bi, inst_idx: ii });
                 }
             }
@@ -230,6 +261,19 @@ mod tests {
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
         Span { start: p, end: p, file_id: 0 }
+    }
+
+    fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
+        let id = f.next_value_id();
+        let entry = f.entry;
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty: ty.clone(),
+            span: dummy_span(),
+        });
+        f.register_type(id, ty);
+        id
     }
 
     /// Build a tiny loop:
@@ -451,7 +495,107 @@ mod tests {
         let header_block = f.block(header);
         let load_in_header = header_block.insts.iter()
             .any(|i| matches!(i.kind, InstKind::Load(_)));
-        assert!(load_in_header, "Load should not have been hoisted out of the loop");
+        assert!(load_in_header, "ambiguous loop load should not have been hoisted");
+    }
+
+    #[test]
+    fn hoists_load_from_noalias_dummy_across_other_dummy_store() {
+        let params = vec![
+            Param {
+                name: "a".into(),
+                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                id: ValueId(0),
+                fortran_noalias: true,
+            },
+            Param {
+                name: "b".into(),
+                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                id: ValueId(1),
+                fortran_noalias: true,
+            },
+        ];
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), params, IrType::Void);
+
+        let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let limit = push(&mut f, InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
+
+        let header = f.create_block("header");
+        let i_param = f.next_value_id();
+        f.block_mut(header).params.push(BlockParam {
+            id: i_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
+
+        let load_a = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: load_a,
+            kind: InstKind::Load(ValueId(0)),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        let one = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: one,
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        let store = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: store,
+            kind: InstKind::Store(one, ValueId(1)),
+            ty: IrType::Void,
+            span: dummy_span(),
+        });
+        let next = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: next,
+            kind: InstKind::IAdd(i_param, one),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        let done = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: done,
+            kind: InstKind::ICmp(CmpOp::Ge, i_param, limit),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+
+        let exit = f.create_block("exit");
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: done,
+            true_dest: exit,
+            true_args: vec![],
+            false_dest: header,
+            false_args: vec![next],
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        m.add_function(f);
+
+        assert!(Licm.run(&mut m), "LICM should hoist the invariant dummy-arg load");
+
+        let f = &m.functions[0];
+        let entry_block = f.block(f.entry);
+        assert!(
+            entry_block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Load(ValueId(0)))),
+            "hoisted load should land in the loop preheader"
+        );
+        let header_block = f.block(header);
+        assert!(
+            !header_block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Load(ValueId(0)))),
+            "loop-body load should be removed after hoisting"
+        );
     }
 
     /// A stronger hoist test: an IMul whose operands are both

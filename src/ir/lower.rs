@@ -897,11 +897,22 @@ fn lower_unit(
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
+                    let fortran_noalias = arg_is_fortran_noalias(n, decls);
                     if arg_has_value_attr(n, decls) {
                         // VALUE: pass by value (raw type, not pointer).
-                        Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                        Some(Param {
+                            name: n.clone(),
+                            ty: elem_ty,
+                            id: ValueId(i as u32),
+                            fortran_noalias: false,
+                        })
                     } else {
-                        Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                        Some(Param {
+                            name: n.clone(),
+                            ty: IrType::Ptr(Box::new(elem_ty)),
+                            id: ValueId(i as u32),
+                            fortran_noalias,
+                        })
                     }
                 } else { None }
             }).collect();
@@ -992,15 +1003,31 @@ fn lower_unit(
             let (func_params, ir_ret_ty) = if is_alloc_return {
                 // Hidden first param: ptr to caller-provided 384-byte descriptor.
                 let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)));
-                let sret = Param { name: "_sret".into(), ty: desc_ptr_ty, id: ValueId(0) };
+                let sret = Param {
+                    name: "_sret".into(),
+                    ty: desc_ptr_ty,
+                    id: ValueId(0),
+                    fortran_noalias: false,
+                };
                 // Real args shifted by 1 so _sret is param 0.
                 let real: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
                         let elem_ty = arg_type_from_decls(n, decls);
+                        let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         if arg_has_value_attr(n, decls) {
-                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32 + 1) })
+                            Some(Param {
+                                name: n.clone(),
+                                ty: elem_ty,
+                                id: ValueId(i as u32 + 1),
+                                fortran_noalias: false,
+                            })
                         } else {
-                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32 + 1) })
+                            Some(Param {
+                                name: n.clone(),
+                                ty: IrType::Ptr(Box::new(elem_ty)),
+                                id: ValueId(i as u32 + 1),
+                                fortran_noalias,
+                            })
                         }
                     } else { None }
                 }).collect();
@@ -1017,10 +1044,21 @@ fn lower_unit(
                 let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
                         let elem_ty = arg_type_from_decls(n, decls);
+                        let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         if arg_has_value_attr(n, decls) {
-                            Some(Param { name: n.clone(), ty: elem_ty, id: ValueId(i as u32) })
+                            Some(Param {
+                                name: n.clone(),
+                                ty: elem_ty,
+                                id: ValueId(i as u32),
+                                fortran_noalias: false,
+                            })
                         } else {
-                            Some(Param { name: n.clone(), ty: IrType::Ptr(Box::new(elem_ty)), id: ValueId(i as u32) })
+                            Some(Param {
+                                name: n.clone(),
+                                ty: IrType::Ptr(Box::new(elem_ty)),
+                                id: ValueId(i as u32),
+                                fortran_noalias,
+                            })
                         }
                     } else { None }
                 }).collect();
@@ -3303,6 +3341,27 @@ fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -
             for entity in entities {
                 if entity.name.to_lowercase() == key {
                     return attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Value));
+                }
+            }
+        }
+    }
+    false
+}
+
+fn arg_is_fortran_noalias(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return !attrs.iter().any(|attr| {
+                        matches!(
+                            attr,
+                            crate::ast::decl::Attribute::Pointer
+                                | crate::ast::decl::Attribute::Target
+                                | crate::ast::decl::Attribute::Value
+                        )
+                    });
                 }
             }
         }

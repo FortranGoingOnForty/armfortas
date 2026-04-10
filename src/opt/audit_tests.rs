@@ -570,15 +570,15 @@ fn audit_licm_multi_latch_with_self_loop() {
 }
 
 // =============================================================
-// FINDING C-2: LICM is dormant when locals stay in alloca slots
+// FINDING C-2 (closed): LICM now hoists memory-clean local loads
 // =============================================================
 //
-// Mirrors the loop_sum.f90 IR shape: a load inside the loop body
-// blocks invariant analysis. LICM should NOT hoist the load (correct
-// without alias analysis), but it also has nothing else to hoist.
-// Document the constraint via test.
+// Mirrors the loop_sum.f90 IR shape with the strongest safe case: the
+// loop reads a stack slot that is initialized before the loop and never
+// written again inside the loop. LICM should hoist both the invariant
+// const and the invariant load into the preheader.
 #[test]
-fn audit_licm_dormant_with_alloca_load() {
+fn audit_licm_hoists_clean_alloca_load() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let slot = push(&mut f,
@@ -631,12 +631,16 @@ fn audit_licm_dormant_with_alloca_load() {
         .any(|i| matches!(i.kind, InstKind::ConstInt(1, IntWidth::I32)));
     assert!(const1_in_entry,
         "LICM should have hoisted const(1) into the preheader");
-    // The Load should NOT have been hoisted.
+    // The load is now loop-invariant too: no loop store/call can clobber it.
     let header_block = &m.functions[0].blocks[1];
     let load_still_in_header = header_block.insts.iter()
         .any(|i| matches!(i.kind, InstKind::Load(_)));
-    assert!(load_still_in_header,
-        "LICM must not hoist a Load (no alias analysis)");
+    assert!(!load_still_in_header,
+        "LICM should hoist a load when the loop is memory-clean");
+    let load_in_entry = entry_block.insts.iter()
+        .any(|i| matches!(i.kind, InstKind::Load(_)));
+    assert!(load_in_entry,
+        "LICM should move the memory-clean load into the preheader");
 }
 
 // =============================================================

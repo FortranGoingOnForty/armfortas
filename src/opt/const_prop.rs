@@ -338,6 +338,7 @@ mod tests {
             name: "p".into(),
             ty: IrType::Bool,
             id: ValueId(0),
+            fortran_noalias: false,
         }];
         let mut f = Function::new("f".into(), params, IrType::Void);
         let bb_t = f.create_block("then");

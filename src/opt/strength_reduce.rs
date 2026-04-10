@@ -591,8 +591,18 @@ mod tests {
         // imul of two non-const values: should not change.
         let mut m = Module::new("t".into());
         let params = vec![
-            Param { name: "a".into(), ty: IrType::Int(IntWidth::I32), id: ValueId(0) },
-            Param { name: "b".into(), ty: IrType::Int(IntWidth::I32), id: ValueId(1) },
+            Param {
+                name: "a".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "b".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
         ];
         let mut f = Function::new("f".into(), params, IrType::Int(IntWidth::I32));
         let y = push(&mut f, InstKind::IMul(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32));

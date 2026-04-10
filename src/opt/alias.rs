@@ -5,12 +5,13 @@
 //!
 //! - Distinct `Alloca` instructions → NoAlias (different stack slots)
 //! - Distinct `GlobalAddr` names → NoAlias (Fortran no-alias guarantee)
+//! - Distinct ordinary Fortran dummy arguments → NoAlias
 //! - Same pointer value → MustAlias
 //! - GEP from same base with different constant offsets → NoAlias
 //! - Everything else → MayAlias (conservative)
 //!
 //! Used by GVN (to determine if a store kills a prior load's value)
-//! and cross-block load-store forwarding.
+//! cross-block load-store forwarding, and LICM load hoisting.
 
 use crate::ir::inst::*;
 use super::loop_utils::resolve_const_int;
@@ -46,8 +47,18 @@ pub fn query(func: &Function, a: ValueId, b: ValueId) -> AliasResult {
         (PtrBase::Global(name_a), PtrBase::Global(name_b)) => {
             if name_a != name_b { return AliasResult::NoAlias; }
         }
+        (PtrBase::Param(id_a), PtrBase::Param(id_b)) => {
+            if id_a != id_b
+                && param_is_fortran_noalias(func, *id_a)
+                && param_is_fortran_noalias(func, *id_b)
+            {
+                return AliasResult::NoAlias;
+            }
+        }
         (PtrBase::Alloca(_), PtrBase::Global(_)) |
-        (PtrBase::Global(_), PtrBase::Alloca(_)) => {
+        (PtrBase::Global(_), PtrBase::Alloca(_)) |
+        (PtrBase::Alloca(_), PtrBase::Param(_)) |
+        (PtrBase::Param(_), PtrBase::Alloca(_)) => {
             return AliasResult::NoAlias;
         }
         _ => {}
@@ -101,16 +112,22 @@ fn trace_base(func: &Function, ptr: ValueId) -> PtrBase {
         InstKind::Alloca(_) => PtrBase::Alloca(ptr),
         InstKind::GlobalAddr(name) => PtrBase::Global(name.clone()),
         InstKind::GetElementPtr(base, _) => trace_base(func, *base),
-        InstKind::Load(_) => PtrBase::Unknown, // loaded pointer — can't trace
+        InstKind::Load(addr) => trace_param_wrapper(func, *addr)
+            .map(PtrBase::Param)
+            .unwrap_or(PtrBase::Unknown),
         _ => PtrBase::Unknown,
     }
 }
 
 /// Trace a pointer to its constant byte offset from the base, if possible.
 fn trace_offset(func: &Function, ptr: ValueId) -> Option<i64> {
+    if func.params.iter().any(|param| param.id == ptr) {
+        return Some(0);
+    }
     let inst = find_inst(func, ptr)?;
     match &inst.kind {
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) => Some(0),
+        InstKind::Load(addr) => trace_param_wrapper(func, *addr).map(|_| 0),
         InstKind::GetElementPtr(base, indices) => {
             let base_offset = trace_offset(func, *base)?;
             if indices.len() != 1 { return None; }
@@ -119,6 +136,47 @@ fn trace_offset(func: &Function, ptr: ValueId) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+fn param_is_fortran_noalias(func: &Function, param_id: ValueId) -> bool {
+    func.params
+        .iter()
+        .find(|param| param.id == param_id)
+        .map(|param| param.fortran_noalias)
+        .unwrap_or(false)
+}
+
+fn trace_param_wrapper(func: &Function, addr: ValueId) -> Option<ValueId> {
+    let slot = match find_inst(func, addr).map(|inst| &inst.kind) {
+        Some(InstKind::Alloca(_)) => addr,
+        Some(InstKind::GetElementPtr(base, _)) if trace_offset(func, addr)? == 0 => {
+            match trace_base(func, *base) {
+                PtrBase::Alloca(slot) => slot,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let mut stored_param = None;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let InstKind::Store(val, ptr) = &inst.kind else {
+                continue;
+            };
+            if *ptr != slot {
+                continue;
+            }
+            if !func.params.iter().any(|param| param.id == *val) {
+                return None;
+            }
+            if stored_param.replace(*val).is_some() {
+                return None;
+            }
+        }
+    }
+
+    stored_param
 }
 
 fn find_inst(func: &Function, vid: ValueId) -> Option<&Inst> {
@@ -143,6 +201,15 @@ mod tests {
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
         Span { file_id: 0, start: pos, end: pos }
+    }
+
+    fn param(name: &str, id: u32, ty: IrType, fortran_noalias: bool) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            id: ValueId(id),
+            fortran_noalias,
+        }
     }
 
     #[test]
@@ -237,5 +304,78 @@ mod tests {
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
         assert_eq!(query(&f, ga, gb), AliasResult::NoAlias);
+    }
+
+    #[test]
+    fn distinct_noalias_params_do_not_alias() {
+        let params = vec![
+            param("a", 0, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), true),
+            param("b", 1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), true),
+        ];
+        let mut f = Function::new("test".into(), params, IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(query(&f, ValueId(0), ValueId(1)), AliasResult::NoAlias);
+    }
+
+    #[test]
+    fn wrapper_loads_trace_back_to_noalias_params() {
+        let params = vec![
+            param("a", 0, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), true),
+            param("b", 1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), true),
+        ];
+        let mut f = Function::new("test".into(), params, IrType::Void);
+
+        let slot_a = f.next_value_id();
+        f.register_type(slot_a, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: slot_a,
+            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+        });
+        let slot_b = f.next_value_id();
+        f.register_type(slot_b, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: slot_b,
+            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+        });
+        let store_a = f.next_value_id();
+        f.register_type(store_a, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store_a,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(ValueId(0), slot_a),
+        });
+        let store_b = f.next_value_id();
+        f.register_type(store_b, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store_b,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(ValueId(1), slot_b),
+        });
+        let load_a = f.next_value_id();
+        f.register_type(load_a, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: load_a,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::Load(slot_a),
+        });
+        let load_b = f.next_value_id();
+        f.register_type(load_b, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: load_b,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::Load(slot_b),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(query(&f, load_a, load_b), AliasResult::NoAlias);
     }
 }

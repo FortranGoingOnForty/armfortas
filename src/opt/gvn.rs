@@ -574,6 +574,7 @@ mod tests {
             name: "x".into(),
             ty: IrType::Int(IntWidth::I32),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("square".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -643,6 +644,7 @@ mod tests {
             name: "x".into(),
             ty: IrType::Int(IntWidth::I32),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("square".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -713,6 +715,7 @@ mod tests {
             name: "n".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("heavy_fact".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -752,6 +755,7 @@ mod tests {
             name: "n".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("heavy_fact".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -815,6 +819,7 @@ mod tests {
             name: "n".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("heavy_fact".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -964,6 +969,7 @@ mod tests {
             name: "n".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("heavy_fact".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -1209,6 +1215,7 @@ mod tests {
             name: "n".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("heavy_fact".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -1290,6 +1297,7 @@ mod tests {
             name: "p".into(),
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             id: ValueId(0),
+            fortran_noalias: false,
         };
         let mut callee = Function::new("peek".into(), vec![param], IrType::Int(IntWidth::I32));
         callee.is_pure = true;

@@ -206,6 +206,9 @@ pub struct Param {
     pub name: String,
     pub ty: IrType,
     pub id: ValueId,
+    /// Fortran dummy arguments are non-aliasing by default unless
+    /// lowered from POINTER/TARGET-like declarations.
+    pub fortran_noalias: bool,
 }
 
 /// A function in the IR module.
