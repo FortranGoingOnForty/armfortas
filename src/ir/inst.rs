@@ -445,12 +445,15 @@ impl Module {
     /// - module-global `i128` data
     /// - local `i128` allocas and plain memory traffic around them
     /// - `i128` constants that only flow through those memory ops
+    /// - stack-backed `i128` SSA block params and edge copies introduced
+    ///   by mem2reg-style promotion
     /// - local `i128` selects that stay entirely within stack-backed values
-    /// - direct `i128` params/returns and pair-register calls at O0
+    /// - direct `i128` params/returns and pair-register calls
     ///
-    /// It still excludes block params, runtime-call `i128`, optimized-pipeline
-    /// support, and any integer operation whose result or operands are `i128`
-    /// beyond the staged local O0 surface.
+    /// It still excludes runtime-call `i128`, broad optimized-pipeline
+    /// support beyond the staged O1 lane, and any integer operation
+    /// whose result or operands are `i128` beyond the currently lowered
+    /// stack-backed surface.
     pub fn i128_backend_o0_supported(&self) -> bool {
         self.globals
             .iter()
@@ -519,6 +522,11 @@ fn abi_type_i128_backend_o0_supported(
     }
 }
 
+fn ssa_type_i128_backend_o0_supported(module: &Module, ty: &IrType) -> bool {
+    matches!(ty, IrType::Int(IntWidth::I128))
+        || abi_type_i128_backend_o0_supported(module, ty, false)
+}
+
 fn direct_call_i128_backend_o0_supported(
     module: &Module,
     func: &Function,
@@ -548,7 +556,7 @@ fn function_i128_backend_o0_supported(module: &Module, func: &Function) -> bool 
         block
             .params
             .iter()
-            .all(|param| abi_type_i128_backend_o0_supported(module, &param.ty, false))
+            .all(|param| ssa_type_i128_backend_o0_supported(module, &param.ty))
             && block
                 .insts
                 .iter()
@@ -569,6 +577,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
 
     match &inst.kind {
         InstKind::ConstInt(_, IntWidth::I128) => true,
+        InstKind::Undef(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
@@ -603,12 +612,12 @@ fn terminator_i128_backend_o0_supported(
         Terminator::Branch(_, args) => args
             .iter()
             .filter_map(|arg| func.value_type(*arg))
-            .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, false)),
+            .all(|ty| ssa_type_i128_backend_o0_supported(module, &ty)),
         Terminator::CondBranch { true_args, false_args, .. } => true_args
             .iter()
             .chain(false_args.iter())
             .filter_map(|arg| func.value_type(*arg))
-            .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, false)),
+            .all(|ty| ssa_type_i128_backend_o0_supported(module, &ty)),
         _ => !term_uses_i128,
     }
 }

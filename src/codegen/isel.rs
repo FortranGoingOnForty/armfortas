@@ -492,6 +492,19 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 );
                 return;
             }
+            InstKind::Undef(_) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                emit_const_i128_to_phys_pair(mf, mb, 0, PhysReg::Gp(16), PhysReg::Gp(17));
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
             InstKind::IAdd(a, b) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
                 let lhs_slot = ctx.lookup_wide_slot(*a);
@@ -1776,16 +1789,26 @@ fn emit_branch_arg_copies(
         );
     }
 
-    // Build the list of (dst_vreg, src_vreg) pairs.
-    let mut pending: Vec<(VRegId, VRegId)> = Vec::with_capacity(args.len());
+    // Build the pending copy lists. Narrow SSA values move through
+    // vregs; wide i128 values stay stack-backed and must copy slot to
+    // slot through a temporary register pair.
+    let mut pending_narrow: Vec<(VRegId, VRegId)> = Vec::with_capacity(args.len());
+    let mut pending_wide: Vec<(i32, i32)> = Vec::new();
     for (arg, bp) in args.iter().zip(target_params.iter()) {
+        if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+            let dst = ctx.lookup_wide_slot(bp.id);
+            let src = ctx.lookup_wide_slot(*arg);
+            if dst != src {
+                pending_wide.push((dst, src));
+            }
+            continue;
+        }
         let dst = ctx.lookup_vreg(bp.id);
         let src = ctx.lookup_vreg(*arg);
         if dst != src {
-            pending.push((dst, src));
+            pending_narrow.push((dst, src));
         }
     }
-    if pending.is_empty() { return; }
 
     // Helper to look up a vreg's RegClass via mf.vregs.
     fn class_of(mf: &MachineFunction, v: VRegId) -> RegClass {
@@ -1815,10 +1838,10 @@ fn emit_branch_arg_copies(
         });
     };
 
-    // Iteratively emit safe moves; break cycles via scratch.
+    // Iteratively emit safe narrow moves; break cycles via a scratch
+    // vreg of the same class.
+    let mut pending = pending_narrow;
     while !pending.is_empty() {
-        // Find a safe copy: dst is not the src of any other
-        // pending copy.
         let safe_idx = (0..pending.len()).find(|&i| {
             let (d, _) = pending[i];
             !pending.iter().enumerate().any(|(j, &(_, s))| j != i && s == d)
@@ -1828,18 +1851,59 @@ fn emit_branch_arg_copies(
             let (d, s) = pending.remove(idx);
             emit_move(mf, mb, d, s);
         } else {
-            // No safe copy → all remaining are part of a cycle.
-            // Break by routing the first copy through a scratch.
             let (d, s) = pending[0];
             let class = class_of(mf, s);
             let temp = mf.new_vreg(class);
             emit_move(mf, mb, temp, s);
             pending[0] = (d, temp);
-            // The next iteration's safe-search will find this
-            // copy's `temp` source has no other readers, making
-            // (d, temp) safe to emit.
         }
     }
+
+    // Wide i128 block params stay stack-backed, so the same parallel-copy
+    // algorithm runs on stack slots instead of vregs.
+    let mut pending = pending_wide;
+    let mut scratch_slot: Option<i32> = None;
+    while !pending.is_empty() {
+        let safe_idx = (0..pending.len()).find(|&i| {
+            let (d, _) = pending[i];
+            !pending.iter().enumerate().any(|(j, &(_, s))| j != i && s == d)
+        });
+
+        if let Some(idx) = safe_idx {
+            let (d, s) = pending.remove(idx);
+            emit_copy_wide_slot(mf, mb, s, d);
+        } else {
+            let (d, s) = pending[0];
+            let temp = if let Some(slot) = scratch_slot {
+                slot
+            } else {
+                let slot = mf.alloc_local(16);
+                scratch_slot = Some(slot);
+                slot
+            };
+            emit_copy_wide_slot(mf, mb, s, temp);
+            pending[0] = (d, temp);
+        }
+    }
+}
+
+fn emit_copy_wide_slot(mf: &mut MachineFunction, mb: MBlockId, src_slot: i32, dst_slot: i32) {
+    emit_load_phys_i128_pair(
+        mf,
+        mb,
+        MachineOperand::PhysReg(PhysReg::FP),
+        src_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
+    emit_store_phys_i128_pair(
+        mf,
+        mb,
+        MachineOperand::PhysReg(PhysReg::FP),
+        dst_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
 }
 
 // ---- Helpers ----
