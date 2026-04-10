@@ -3984,22 +3984,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             lower_do_loop(b, ctx, DoLoopFields { name, var, start, end, step, body, concurrent: false });
         }
 
-        Stmt::DoConcurrent { controls, body, locality: _, .. } => {
-            // Lower DO CONCURRENT as sequential loop (parallel optimization deferred).
-            if let Some(ctrl) = controls.first() {
-                let var_opt = Some(ctrl.var.clone());
-                let start_opt = Some(ctrl.start.clone());
-                let end_opt = Some(ctrl.end.clone());
-                lower_do_loop(b, ctx, DoLoopFields {
-                    name: &None,
-                    var: &var_opt,
-                    start: &start_opt,
-                    end: &end_opt,
-                    step: &ctrl.step,
-                    body,
-                    concurrent: true,
-                });
-            }
+        Stmt::DoConcurrent { name, controls, mask, body, locality: _, .. } => {
+            lower_do_concurrent(b, ctx, name, controls, mask.as_ref(), body, stmt.span);
         }
 
         Stmt::DoWhile { name, condition, body } => {
@@ -4838,6 +4824,66 @@ struct DoLoopFields<'a> {
     step: &'a Option<crate::ast::expr::SpannedExpr>,
     body: &'a [SpannedStmt],
     concurrent: bool,
+}
+
+fn lower_do_concurrent(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    name: &Option<String>,
+    controls: &[ConcurrentControl],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    body: &[SpannedStmt],
+    span: crate::lexer::Span,
+) {
+    let Some((ctrl, rest)) = controls.split_first() else {
+        return;
+    };
+
+    let var_opt = Some(ctrl.var.clone());
+    let start_opt = Some(ctrl.start.clone());
+    let end_opt = Some(ctrl.end.clone());
+
+    let nested_body_storage;
+    let masked_body_storage;
+    let lowered_body = if rest.is_empty() {
+        if let Some(mask_expr) = mask {
+            masked_body_storage = vec![crate::ast::Spanned::new(
+                Stmt::IfConstruct {
+                    name: None,
+                    condition: mask_expr.clone(),
+                    then_body: body.to_vec(),
+                    else_ifs: vec![],
+                    else_body: None,
+                },
+                mask_expr.span,
+            )];
+            masked_body_storage.as_slice()
+        } else {
+            body
+        }
+    } else {
+        nested_body_storage = vec![crate::ast::Spanned::new(
+            Stmt::DoConcurrent {
+                name: None,
+                controls: rest.to_vec(),
+                mask: mask.cloned(),
+                locality: vec![],
+                body: body.to_vec(),
+            },
+            span,
+        )];
+        nested_body_storage.as_slice()
+    };
+
+    lower_do_loop(b, ctx, DoLoopFields {
+        name,
+        var: &var_opt,
+        start: &start_opt,
+        end: &end_opt,
+        step: &ctrl.step,
+        body: lowered_body,
+        concurrent: true,
+    });
 }
 
 /// Lower DO loop (counted loop with variable, start, end, step).
@@ -7439,6 +7485,37 @@ end program
         assert!(ir.contains("doconc_incr"));
         assert!(ir.contains("doconc_exit"));
         assert!(ir.contains("icmp le"));
+    }
+
+    #[test]
+    fn lower_do_concurrent_mask_emits_guard() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: i, arr(6)
+  arr = 0
+  do concurrent (i = 1:6, mod(i, 2) == 0)
+    arr(i) = i
+  end do
+end program
+");
+        assert!(ir.contains("doconc_check"));
+        assert!(ir.contains("if_then"));
+        assert!(ir.contains("if_end"));
+    }
+
+    #[test]
+    fn lower_do_concurrent_multiple_controls_nests_loops() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: i, j, arr(3, 2)
+  do concurrent (i = 1:3, j = 1:2)
+    arr(i, j) = i * 10 + j
+  end do
+end program
+");
+        assert!(ir.matches("doconc_check").count() >= 2);
     }
 
     #[test]

@@ -96,13 +96,26 @@ fn fusion_in_function(func: &mut Function) -> bool {
                 continue;
             }
 
+            let body_a = find_body_block(func, lp_a, latch_a);
+            let Some(body_a_id) = body_a else { continue };
+
             // Find B's body block (the one with stores/computation).
             let body_b = find_body_block(func, lp_b, latch_b);
             let Some(body_b_id) = body_b else { continue };
 
+            let cmp_a = find_cmp_block(func, lp_a);
+            let Some(cmp_a_id) = cmp_a else { continue };
+
             // Find B's cmp block (the one with ICmp).
             let cmp_b = find_cmp_block(func, lp_b);
             let Some(cmp_b_id) = cmp_b else { continue };
+
+            if !has_simple_fusion_shape(func, lp_a, latch_a, body_a_id, cmp_a_id) {
+                continue;
+            }
+            if !has_simple_fusion_shape(func, lp_b, latch_b, body_b_id, cmp_b_id) {
+                continue;
+            }
 
             // Find B's exit block.
             let exit_b = find_loop_exit(func, lp_b);
@@ -329,6 +342,25 @@ fn find_cmp_block(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
         }
     }
     None
+}
+
+fn has_simple_fusion_shape(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    latch_id: BlockId,
+    body_id: BlockId,
+    cmp_id: BlockId,
+) -> bool {
+    let allowed: HashSet<BlockId> = [lp.header, cmp_id, body_id, latch_id].into_iter().collect();
+    if lp.body.iter().any(|bid| !allowed.contains(bid)) {
+        return false;
+    }
+
+    let body = func.block(body_id);
+    if !body.params.is_empty() {
+        return false;
+    }
+    matches!(&body.terminator, Some(Terminator::Branch(dest, args)) if *dest == latch_id && args.is_empty())
 }
 
 #[cfg(test)]
