@@ -499,15 +499,48 @@ fn global_i128_backend_data_supported(module: &Module, global: &Global) -> bool 
     }
 }
 
+fn abi_type_i128_backend_o0_supported(
+    module: &Module,
+    ty: &IrType,
+    allow_direct_i128_scalar: bool,
+) -> bool {
+    match ty {
+        IrType::Int(IntWidth::I128) => allow_direct_i128_scalar,
+        IrType::Ptr(_) => true,
+        _ => !type_contains_i128(module, ty),
+    }
+}
+
+fn internal_call_i128_backend_o0_supported(
+    module: &Module,
+    func: &Function,
+    callee: &FuncRef,
+    args: &[ValueId],
+    result_ty: &IrType,
+) -> bool {
+    matches!(callee, FuncRef::Internal(_))
+        && abi_type_i128_backend_o0_supported(module, result_ty, true)
+        && args
+            .iter()
+            .filter_map(|arg| func.value_type(*arg))
+            .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, true))
+}
+
 fn function_i128_backend_o0_supported(module: &Module, func: &Function) -> bool {
-    if type_contains_i128(module, &func.return_type)
-        || func.params.iter().any(|param| type_contains_i128(module, &param.ty))
+    if !abi_type_i128_backend_o0_supported(module, &func.return_type, true)
+        || func
+            .params
+            .iter()
+            .any(|param| !abi_type_i128_backend_o0_supported(module, &param.ty, true))
     {
         return false;
     }
 
     func.blocks.iter().all(|block| {
-        block.params.iter().all(|param| !type_contains_i128(module, &param.ty))
+        block
+            .params
+            .iter()
+            .all(|param| abi_type_i128_backend_o0_supported(module, &param.ty, false))
             && block
                 .insts
                 .iter()
@@ -533,6 +566,10 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::ICmp(..) if uses_i128 => true,
         InstKind::Select(..) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        InstKind::Call(callee, args) if inst_ty_has_i128 || uses_i128 => {
+            internal_call_i128_backend_o0_supported(module, func, callee, args, &inst.ty)
+        }
+        InstKind::RuntimeCall(..) if inst_ty_has_i128 || uses_i128 => false,
         InstKind::Store(..) => true,
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
             !uses_i128 || inst_ty_has_i128
@@ -552,10 +589,18 @@ fn terminator_i128_backend_o0_supported(
         .any(|ty| type_contains_i128(module, &ty));
 
     match term {
-        Terminator::Return(Some(val)) => !matches!(
-            func.value_type(*val),
-            Some(ty) if type_contains_i128(module, &ty)
-        ),
+        Terminator::Return(Some(val)) => func
+            .value_type(*val)
+            .is_none_or(|ty| abi_type_i128_backend_o0_supported(module, &ty, true)),
+        Terminator::Branch(_, args) => args
+            .iter()
+            .filter_map(|arg| func.value_type(*arg))
+            .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, false)),
+        Terminator::CondBranch { true_args, false_args, .. } => true_args
+            .iter()
+            .chain(false_args.iter())
+            .filter_map(|arg| func.value_type(*arg))
+            .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, false)),
         _ => !term_uses_i128,
     }
 }
