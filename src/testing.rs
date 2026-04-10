@@ -790,6 +790,7 @@ fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
             obj.to_str().unwrap(),
             &rt_path,
             "-lSystem",
+            "-no_uuid",
             "-syslibroot",
             &sysroot,
             "-e",
