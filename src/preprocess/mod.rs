@@ -119,6 +119,12 @@ enum CondState {
     ParentSkipping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroExpandMode {
+    SourceLine,
+    ConditionExpr,
+}
+
 struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     include_paths: Vec<PathBuf>,
@@ -257,7 +263,7 @@ impl Preprocessor {
             }
 
             if self.is_emitting() {
-                let expanded = self.expand_macros(&logical_line, filename, orig_line_num);
+                let expanded = self.expand_macros(&logical_line);
                 output.push_str(&expanded);
             }
             output.push('\n');
@@ -575,77 +581,29 @@ impl Preprocessor {
 
     /// Expand macros and `defined(NAME)` / `defined NAME` in a condition expression.
     ///
-    /// Three passes:
-    /// 1. Replace `defined(X)` / `defined X` with "1" or "0"
-    /// 2. Recursively expand macros (reusing expand_macros_inner)
-    /// 3. Replace remaining undefined identifiers with "0" (per cpp standard)
+    /// Condition expressions share the same recursive macro engine as
+    /// ordinary source lines, but apply condition-specific semantics:
+    /// `defined` is resolved during the walk and any remaining identifiers
+    /// are rewritten to `0` at the end.
     fn expand_condition_macros(&self, expr: &str) -> String {
-        // Pass 1: resolve `defined(...)` and `defined ...` operators.
-        let after_defined = self.resolve_defined_ops(expr);
-
-        // Pass 2: recursively expand macros (same engine as source lines).
         let expanding = std::collections::HashSet::new();
-        let after_macros = self.expand_macros_inner(&after_defined, &expanding);
-
-        // Pass 3: replace remaining identifiers with 0 (undefined = 0 in #if).
-        replace_undefined_idents(&after_macros)
-    }
-
-    /// Replace `defined(NAME)` and `defined NAME` with "1" or "0".
-    fn resolve_defined_ops(&self, expr: &str) -> String {
-        let mut result = String::new();
-        let mut chars = expr.chars().peekable();
-
-        while let Some(&ch) = chars.peek() {
-            if ch.is_alphabetic() || ch == '_' {
-                let mut ident = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c.is_alphanumeric() || c == '_' {
-                        ident.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-
-                if ident == "defined" {
-                    while chars.peek() == Some(&' ') { chars.next(); }
-                    let has_paren = chars.peek() == Some(&'(');
-                    if has_paren { chars.next(); }
-                    let mut name = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c.is_alphanumeric() || c == '_' {
-                            name.push(c);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if has_paren {
-                        while chars.peek() == Some(&' ') { chars.next(); }
-                        if chars.peek() == Some(&')') { chars.next(); }
-                    }
-                    result.push_str(if self.defines.contains_key(&name) { "1" } else { "0" });
-                } else {
-                    result.push_str(&ident);
-                }
-            } else {
-                result.push(ch);
-                chars.next();
-            }
-        }
-
-        result
+        let expanded = self.expand_macros_inner(expr, &expanding, MacroExpandMode::ConditionExpr);
+        replace_undefined_idents(&expanded)
     }
 
     // ---- Macro expansion in source lines ----
 
-    fn expand_macros(&self, line: &str, _filename: &str, _line_num: u32) -> String {
+    fn expand_macros(&self, line: &str) -> String {
         let expanding = std::collections::HashSet::new();
-        self.expand_macros_inner(line, &expanding)
+        self.expand_macros_inner(line, &expanding, MacroExpandMode::SourceLine)
     }
 
-    fn expand_macros_inner(&self, line: &str, expanding: &std::collections::HashSet<String>) -> String {
+    fn expand_macros_inner(
+        &self,
+        line: &str,
+        expanding: &std::collections::HashSet<String>,
+        mode: MacroExpandMode,
+    ) -> String {
         if self.defines.is_empty() {
             return line.to_string();
         }
@@ -655,14 +613,14 @@ impl Preprocessor {
         let mut i = 0;
 
         while i < bytes.len() {
-            // Skip Fortran comment (! to end of line).
-            if bytes[i] == b'!' {
+            // Skip Fortran comment (! to end of line) in source mode.
+            if mode == MacroExpandMode::SourceLine && bytes[i] == b'!' {
                 result.push_str(&line[i..]);
                 break;
             }
 
-            // Skip string literals.
-            if bytes[i] == b'\'' || bytes[i] == b'"' {
+            // Skip string literals in source mode.
+            if mode == MacroExpandMode::SourceLine && (bytes[i] == b'\'' || bytes[i] == b'"') {
                 let quote = bytes[i];
                 result.push(quote as char);
                 i += 1;
@@ -695,6 +653,13 @@ impl Preprocessor {
                 }
                 let ident = &line[start..i];
 
+                if mode == MacroExpandMode::ConditionExpr && ident == "defined" {
+                    let (name, new_i) = parse_defined_operand(line, i);
+                    result.push_str(if self.defines.contains_key(name) { "1" } else { "0" });
+                    i = new_i;
+                    continue;
+                }
+
                 // Skip if this macro is currently being expanded (blue paint).
                 if expanding.contains(ident) {
                     result.push_str(ident);
@@ -708,7 +673,7 @@ impl Preprocessor {
                                 // Re-expand the result with this macro marked as expanding.
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
-                                result.push_str(&self.expand_macros_inner(&expanded, &next_expanding));
+                                result.push_str(&self.expand_macros_inner(&expanded, &next_expanding, mode));
                                 i = new_i;
                                 continue;
                             }
@@ -718,7 +683,7 @@ impl Preprocessor {
                         // Re-expand object macro body with this macro marked as expanding.
                         let mut next_expanding = expanding.clone();
                         next_expanding.insert(ident.to_string());
-                        result.push_str(&self.expand_macros_inner(&def.body, &next_expanding));
+                        result.push_str(&self.expand_macros_inner(&def.body, &next_expanding, mode));
                     }
                 } else {
                     result.push_str(ident);
@@ -835,6 +800,40 @@ impl Preprocessor {
 
         Some((body, i))
     }
+}
+
+fn parse_defined_operand(expr: &str, start: usize) -> (&str, usize) {
+    let bytes = expr.as_bytes();
+    let mut i = start;
+
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+
+    let has_paren = i < bytes.len() && bytes[i] == b'(';
+    if has_paren {
+        i += 1;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+    }
+
+    let name_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let name = &expr[name_start..i];
+
+    if has_paren {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b')' {
+            i += 1;
+        }
+    }
+
+    (name, i)
 }
 
 // ---- Expression evaluator for #if ----
@@ -1677,6 +1676,24 @@ end module
         // Common real-world pattern: #if defined(FOO) && FOO > 5
         let out = pp_with("#if defined(FOO) && FOO > 5\nyes\n#endif\n", &[("FOO", "10")]);
         assert!(lines(&out).contains(&"yes"));
+    }
+
+    #[test]
+    fn if_function_macro_expands() {
+        let out = pp("#define INC(x) ((x) + 1)\n#if INC(41) > 41\nyes\n#endif\n");
+        assert!(lines(&out).contains(&"yes"), "function macro in #if failed, got: {:?}", lines(&out));
+    }
+
+    #[test]
+    fn if_object_macro_can_expand_into_function_macro() {
+        let out = pp(
+            "#define INC(x) ((x) + 1)\n#define WRAP(x) INC(x)\n#if WRAP(41) > 41\nyes\n#endif\n",
+        );
+        assert!(
+            lines(&out).contains(&"yes"),
+            "object->function macro chain in #if failed, got: {:?}",
+            lines(&out)
+        );
     }
 
     #[test]
