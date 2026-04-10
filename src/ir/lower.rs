@@ -4826,6 +4826,34 @@ struct DoLoopFields<'a> {
     concurrent: bool,
 }
 
+fn try_lower_bulk_do_concurrent(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[ConcurrentControl],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    body: &[SpannedStmt],
+) -> bool {
+    if mask.is_some() || controls.len() != 1 || body.len() != 1 {
+        return false;
+    }
+    let ctrl = &controls[0];
+    let Stmt::Assignment { target, value } = &body[0].node else {
+        return false;
+    };
+    let Some(dest) = loop_indexed_array_ref(&ctx.locals, target, &ctrl.var) else {
+        return false;
+    };
+    if !control_covers_full_array(ctrl, &dest) {
+        return false;
+    }
+    let Some(plan) = build_loop_bulk_plan(&ctx.locals, &dest.info, &ctrl.var, value) else {
+        return false;
+    };
+    let n = array_total_elems_value(b, &dest.info);
+    emit_bulk_array_plan(b, ctx, &dest.info, n, plan);
+    true
+}
+
 fn lower_do_concurrent(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -4835,6 +4863,10 @@ fn lower_do_concurrent(
     body: &[SpannedStmt],
     span: crate::lexer::Span,
 ) {
+    if try_lower_bulk_do_concurrent(b, ctx, controls, mask, body) {
+        return;
+    }
+
     let Some((ctrl, rest)) = controls.split_first() else {
         return;
     };
@@ -6113,6 +6145,35 @@ fn whole_array_expr_info(
         .cloned()
 }
 
+#[derive(Clone)]
+enum BulkArrayPlan {
+    Fill {
+        kernel: &'static str,
+        scalar: crate::ast::expr::SpannedExpr,
+    },
+    ArrayBinary {
+        kernel: &'static str,
+        lhs: LocalInfo,
+        rhs: LocalInfo,
+    },
+    ArrayScalar {
+        kernel: &'static str,
+        array: LocalInfo,
+        scalar: crate::ast::expr::SpannedExpr,
+    },
+    ScalarArray {
+        kernel: &'static str,
+        scalar: crate::ast::expr::SpannedExpr,
+        array: LocalInfo,
+    },
+}
+
+#[derive(Clone)]
+struct IndexedArrayRef {
+    name: String,
+    info: LocalInfo,
+}
+
 fn bulk_fill_runtime_name(ty: &IrType) -> Option<&'static str> {
     match ty {
         IrType::Int(IntWidth::I32) => Some("afs_fill_i32"),
@@ -6127,6 +6188,36 @@ fn bulk_array_binary_runtime_name(op: BinaryOp, ty: &IrType) -> Option<&'static 
         (BinaryOp::Add, IrType::Int(IntWidth::I32)) => Some("afs_array_add_i32"),
         (BinaryOp::Add, IrType::Float(FloatWidth::F32)) => Some("afs_array_add_f32"),
         (BinaryOp::Add, IrType::Float(FloatWidth::F64)) => Some("afs_array_add_f64"),
+        (BinaryOp::Sub, IrType::Int(IntWidth::I32)) => Some("afs_array_sub_i32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F32)) => Some("afs_array_sub_f32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F64)) => Some("afs_array_sub_f64"),
+        (BinaryOp::Mul, IrType::Int(IntWidth::I32)) => Some("afs_array_mul_i32"),
+        (BinaryOp::Mul, IrType::Float(FloatWidth::F32)) => Some("afs_array_mul_f32"),
+        (BinaryOp::Mul, IrType::Float(FloatWidth::F64)) => Some("afs_array_mul_f64"),
+        _ => None,
+    }
+}
+
+fn bulk_array_scalar_runtime_name(op: BinaryOp, ty: &IrType) -> Option<&'static str> {
+    match (op, ty) {
+        (BinaryOp::Add, IrType::Int(IntWidth::I32)) => Some("afs_array_add_scalar_i32"),
+        (BinaryOp::Add, IrType::Float(FloatWidth::F32)) => Some("afs_array_add_scalar_f32"),
+        (BinaryOp::Add, IrType::Float(FloatWidth::F64)) => Some("afs_array_add_scalar_f64"),
+        (BinaryOp::Sub, IrType::Int(IntWidth::I32)) => Some("afs_array_sub_scalar_i32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F32)) => Some("afs_array_sub_scalar_f32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F64)) => Some("afs_array_sub_scalar_f64"),
+        (BinaryOp::Mul, IrType::Int(IntWidth::I32)) => Some("afs_array_mul_scalar_i32"),
+        (BinaryOp::Mul, IrType::Float(FloatWidth::F32)) => Some("afs_array_mul_scalar_f32"),
+        (BinaryOp::Mul, IrType::Float(FloatWidth::F64)) => Some("afs_array_mul_scalar_f64"),
+        _ => None,
+    }
+}
+
+fn bulk_scalar_array_runtime_name(op: BinaryOp, ty: &IrType) -> Option<&'static str> {
+    match (op, ty) {
+        (BinaryOp::Sub, IrType::Int(IntWidth::I32)) => Some("afs_scalar_sub_array_i32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F32)) => Some("afs_scalar_sub_array_f32"),
+        (BinaryOp::Sub, IrType::Float(FloatWidth::F64)) => Some("afs_scalar_sub_array_f64"),
         _ => None,
     }
 }
@@ -6140,47 +6231,331 @@ fn expr_contains_array_refs(
     !arrays.is_empty()
 }
 
+fn expr_mentions_name(expr: &crate::ast::expr::SpannedExpr, needle: &str) -> bool {
+    match &expr.node {
+        Expr::Name { name } => name.eq_ignore_ascii_case(needle),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mentions_name(left, needle) || expr_mentions_name(right, needle)
+        }
+        Expr::UnaryOp { operand, .. } => expr_mentions_name(operand, needle),
+        Expr::ParenExpr { inner } => expr_mentions_name(inner, needle),
+        Expr::ComponentAccess { base, .. } => expr_mentions_name(base, needle),
+        Expr::FunctionCall { callee, args } => {
+            expr_mentions_name(callee, needle)
+                || args.iter().any(|arg| match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(e) => expr_mentions_name(e, needle),
+                    crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                        start.as_ref().is_some_and(|e| expr_mentions_name(e, needle))
+                            || end.as_ref().is_some_and(|e| expr_mentions_name(e, needle))
+                            || stride.as_ref().is_some_and(|e| expr_mentions_name(e, needle))
+                    }
+                })
+        }
+        Expr::ArrayConstructor { values, .. } => values.iter().any(|v| match v {
+            crate::ast::expr::AcValue::Expr(e) => expr_mentions_name(e, needle),
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                ido.var.eq_ignore_ascii_case(needle)
+                    || expr_mentions_name(&ido.start, needle)
+                    || expr_mentions_name(&ido.end, needle)
+                    || ido.step.as_ref().is_some_and(|e| expr_mentions_name(e, needle))
+                    || ido.values.iter().any(|inner| match inner {
+                        crate::ast::expr::AcValue::Expr(e) => expr_mentions_name(e, needle),
+                        crate::ast::expr::AcValue::ImpliedDo(_) => false,
+                    })
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn expr_is_size_of_array(expr: &crate::ast::expr::SpannedExpr, array_name: &str) -> bool {
+    match &expr.node {
+        Expr::ParenExpr { inner } => expr_is_size_of_array(inner, array_name),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("size") && args.len() == 1 {
+                    if let crate::ast::expr::SectionSubscript::Element(arg) = &args[0].value {
+                        return matches!(
+                            &arg.node,
+                            Expr::Name { name } if name.eq_ignore_ascii_case(array_name)
+                        );
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn bulk_arrays_compatible(dest_info: &LocalInfo, other_info: &LocalInfo) -> bool {
+    if dest_info.ty != other_info.ty {
+        return false;
+    }
+    if dest_info.allocatable || other_info.allocatable {
+        return true;
+    }
+    dest_info.dims == other_info.dims
+}
+
+fn build_whole_array_bulk_plan(
+    locals: &HashMap<String, LocalInfo>,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> Option<BulkArrayPlan> {
+    if let Expr::BinaryOp { op, left, right } = &value.node {
+        if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
+            let lhs_info = whole_array_expr_info(locals, left);
+            let rhs_info = whole_array_expr_info(locals, right);
+            if let (Some(lhs_info), Some(rhs_info)) = (lhs_info, rhs_info) {
+                if bulk_arrays_compatible(dest_info, &lhs_info)
+                    && bulk_arrays_compatible(dest_info, &rhs_info)
+                {
+                    return Some(BulkArrayPlan::ArrayBinary { kernel, lhs: lhs_info, rhs: rhs_info });
+                }
+            }
+        }
+
+        let lhs_info = whole_array_expr_info(locals, left);
+        let rhs_info = whole_array_expr_info(locals, right);
+        let lhs_scalar = !expr_contains_array_refs(left, locals);
+        let rhs_scalar = !expr_contains_array_refs(right, locals);
+
+        if let Some(lhs_info) = lhs_info {
+            if rhs_scalar && bulk_arrays_compatible(dest_info, &lhs_info) {
+                if let Some(kernel) = bulk_array_scalar_runtime_name(op.clone(), &dest_info.ty) {
+                    return Some(BulkArrayPlan::ArrayScalar {
+                        kernel,
+                        array: lhs_info,
+                        scalar: (**right).clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(rhs_info) = rhs_info {
+            if lhs_scalar && bulk_arrays_compatible(dest_info, &rhs_info) {
+                match op {
+                    BinaryOp::Add | BinaryOp::Mul => {
+                        if let Some(kernel) = bulk_array_scalar_runtime_name(op.clone(), &dest_info.ty) {
+                            return Some(BulkArrayPlan::ArrayScalar {
+                                kernel,
+                                array: rhs_info,
+                                scalar: (**left).clone(),
+                            });
+                        }
+                    }
+                    BinaryOp::Sub => {
+                        if let Some(kernel) = bulk_scalar_array_runtime_name(op.clone(), &dest_info.ty) {
+                            return Some(BulkArrayPlan::ScalarArray {
+                                kernel,
+                                scalar: (**left).clone(),
+                                array: rhs_info,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !expr_contains_array_refs(value, locals) {
+        if let Some(kernel) = bulk_fill_runtime_name(&dest_info.ty) {
+            return Some(BulkArrayPlan::Fill {
+                kernel,
+                scalar: value.clone(),
+            });
+        }
+    }
+
+    None
+}
+
+fn emit_bulk_array_plan(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    n: ValueId,
+    plan: BulkArrayPlan,
+) {
+    let dest_base = array_base_addr(b, dest_info);
+    match plan {
+        BulkArrayPlan::Fill { kernel, scalar } => {
+            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            b.call(FuncRef::External(kernel.into()), vec![dest_base, n, scalar], IrType::Void);
+        }
+        BulkArrayPlan::ArrayBinary { kernel, lhs, rhs } => {
+            let lhs_base = array_base_addr(b, &lhs);
+            let rhs_base = array_base_addr(b, &rhs);
+            b.call(
+                FuncRef::External(kernel.into()),
+                vec![dest_base, lhs_base, rhs_base, n],
+                IrType::Void,
+            );
+        }
+        BulkArrayPlan::ArrayScalar { kernel, array, scalar } => {
+            let array_base = array_base_addr(b, &array);
+            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            b.call(
+                FuncRef::External(kernel.into()),
+                vec![dest_base, array_base, scalar, n],
+                IrType::Void,
+            );
+        }
+        BulkArrayPlan::ScalarArray { kernel, scalar, array } => {
+            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            let array_base = array_base_addr(b, &array);
+            b.call(
+                FuncRef::External(kernel.into()),
+                vec![dest_base, scalar, array_base, n],
+                IrType::Void,
+            );
+        }
+    }
+}
+
+fn loop_indexed_array_ref(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    loop_var: &str,
+) -> Option<IndexedArrayRef> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => loop_indexed_array_ref(locals, inner, loop_var),
+        Expr::FunctionCall { callee, args } => {
+            if args.len() != 1 {
+                return None;
+            }
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let crate::ast::expr::SectionSubscript::Element(index) = &args[0].value else {
+                return None;
+            };
+            let Expr::Name { name: idx_name } = &index.node else {
+                return None;
+            };
+            if !idx_name.eq_ignore_ascii_case(loop_var) {
+                return None;
+            }
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?.clone();
+            if info.allocatable || info.dims.len() == 1 {
+                Some(IndexedArrayRef { name: key, info })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn control_covers_full_array(ctrl: &ConcurrentControl, dest: &IndexedArrayRef) -> bool {
+    let step_ok = ctrl.step.as_ref().map_or(true, |step| eval_const_int(step) == Some(1));
+    if !step_ok {
+        return false;
+    }
+    if dest.info.allocatable {
+        eval_const_int(&ctrl.start) == Some(1) && expr_is_size_of_array(&ctrl.end, &dest.name)
+    } else {
+        let Some((lower, extent)) = dest.info.dims.first().copied() else {
+            return false;
+        };
+        let upper = lower + extent - 1;
+        eval_const_int(&ctrl.start) == Some(lower) && eval_const_int(&ctrl.end) == Some(upper)
+    }
+}
+
+fn build_loop_bulk_plan(
+    locals: &HashMap<String, LocalInfo>,
+    dest_info: &LocalInfo,
+    loop_var: &str,
+    value: &crate::ast::expr::SpannedExpr,
+) -> Option<BulkArrayPlan> {
+    if let Expr::BinaryOp { op, left, right } = &value.node {
+        if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
+            let lhs = loop_indexed_array_ref(locals, left, loop_var);
+            let rhs = loop_indexed_array_ref(locals, right, loop_var);
+            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                if bulk_arrays_compatible(dest_info, &lhs.info)
+                    && bulk_arrays_compatible(dest_info, &rhs.info)
+                {
+                    return Some(BulkArrayPlan::ArrayBinary {
+                        kernel,
+                        lhs: lhs.info,
+                        rhs: rhs.info,
+                    });
+                }
+            }
+        }
+
+        let lhs = loop_indexed_array_ref(locals, left, loop_var);
+        let rhs = loop_indexed_array_ref(locals, right, loop_var);
+        let lhs_scalar = !expr_contains_array_refs(left, locals) && !expr_mentions_name(left, loop_var);
+        let rhs_scalar = !expr_contains_array_refs(right, locals) && !expr_mentions_name(right, loop_var);
+
+        if let Some(lhs) = lhs {
+            if rhs_scalar && bulk_arrays_compatible(dest_info, &lhs.info) {
+                if let Some(kernel) = bulk_array_scalar_runtime_name(op.clone(), &dest_info.ty) {
+                    return Some(BulkArrayPlan::ArrayScalar {
+                        kernel,
+                        array: lhs.info,
+                        scalar: (**right).clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(rhs) = rhs {
+            if lhs_scalar && bulk_arrays_compatible(dest_info, &rhs.info) {
+                match op {
+                    BinaryOp::Add | BinaryOp::Mul => {
+                        if let Some(kernel) = bulk_array_scalar_runtime_name(op.clone(), &dest_info.ty) {
+                            return Some(BulkArrayPlan::ArrayScalar {
+                                kernel,
+                                array: rhs.info,
+                                scalar: (**left).clone(),
+                            });
+                        }
+                    }
+                    BinaryOp::Sub => {
+                        if let Some(kernel) = bulk_scalar_array_runtime_name(op.clone(), &dest_info.ty) {
+                            return Some(BulkArrayPlan::ScalarArray {
+                                kernel,
+                                scalar: (**left).clone(),
+                                array: rhs.info,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !expr_contains_array_refs(value, locals) && !expr_mentions_name(value, loop_var) {
+        if let Some(kernel) = bulk_fill_runtime_name(&dest_info.ty) {
+            return Some(BulkArrayPlan::Fill {
+                kernel,
+                scalar: value.clone(),
+            });
+        }
+    }
+
+    None
+}
+
 fn try_lower_bulk_array_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    if let Expr::BinaryOp { op, left, right } = &value.node {
-        if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
-            let lhs_info = whole_array_expr_info(&ctx.locals, left);
-            let rhs_info = whole_array_expr_info(&ctx.locals, right);
-            if let (Some(lhs_info), Some(rhs_info)) = (lhs_info, rhs_info) {
-                if lhs_info.ty == dest_info.ty && rhs_info.ty == dest_info.ty {
-                    let dest_base = array_base_addr(b, dest_info);
-                    let lhs_base = array_base_addr(b, &lhs_info);
-                    let rhs_base = array_base_addr(b, &rhs_info);
-                    let n = array_total_elems_value(b, dest_info);
-                    b.call(
-                        FuncRef::External(kernel.into()),
-                        vec![dest_base, lhs_base, rhs_base, n],
-                        IrType::Void,
-                    );
-                    return true;
-                }
-            }
-        }
+    if let Some(plan) = build_whole_array_bulk_plan(&ctx.locals, dest_info, value) {
+        let n = array_total_elems_value(b, dest_info);
+        emit_bulk_array_plan(b, ctx, dest_info, n, plan);
+        return true;
     }
-
-    if !expr_contains_array_refs(value, &ctx.locals) {
-        if let Some(fill_kernel) = bulk_fill_runtime_name(&dest_info.ty) {
-            let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
-            let dest_base = array_base_addr(b, dest_info);
-            let n = array_total_elems_value(b, dest_info);
-            b.call(
-                FuncRef::External(fill_kernel.into()),
-                vec![dest_base, n, scalar],
-                IrType::Void,
-            );
-            return true;
-        }
-    }
-
     false
 }
 
@@ -6385,9 +6760,22 @@ fn collect_array_names(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<St
         Expr::UnaryOp { operand, .. } => collect_array_names(operand, locals, out),
         Expr::ParenExpr { inner } => collect_array_names(inner, locals, out),
         Expr::FunctionCall { args, .. } => {
+            if let Expr::FunctionCall { callee, .. } = &expr.node {
+                collect_array_names(callee, locals, out);
+            }
             for a in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                     collect_array_names(e, locals, out);
+                } else if let crate::ast::expr::SectionSubscript::Range { start, end, stride } = &a.value {
+                    if let Some(e) = start {
+                        collect_array_names(e, locals, out);
+                    }
+                    if let Some(e) = end {
+                        collect_array_names(e, locals, out);
+                    }
+                    if let Some(e) = stride {
+                        collect_array_names(e, locals, out);
+                    }
                 }
             }
         }
@@ -6415,12 +6803,17 @@ fn find_array_in_expr(expr: &crate::ast::expr::SpannedExpr, locals: &HashMap<Str
         }
         Expr::UnaryOp { operand, .. } => find_array_in_expr(operand, locals),
         Expr::ParenExpr { inner } => find_array_in_expr(inner, locals),
-        Expr::FunctionCall { args, .. } => {
-            args.iter().find_map(|a| {
+        Expr::FunctionCall { callee, args } => {
+            find_array_in_expr(callee, locals).or_else(|| args.iter().find_map(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                     find_array_in_expr(e, locals)
+                } else if let crate::ast::expr::SectionSubscript::Range { start, end, stride } = &a.value {
+                    start.as_ref()
+                        .and_then(|e| find_array_in_expr(e, locals))
+                        .or_else(|| end.as_ref().and_then(|e| find_array_in_expr(e, locals)))
+                        .or_else(|| stride.as_ref().and_then(|e| find_array_in_expr(e, locals)))
                 } else { None }
-            })
+            }))
         }
         _ => None,
     }
@@ -7601,6 +7994,25 @@ program test
 end program
 ");
         assert!(ir.matches("doconc_check").count() >= 2);
+    }
+
+    #[test]
+    fn lower_do_concurrent_full_array_map_uses_bulk_kernel() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: i, a(8), b(8), c(8)
+  do i = 1, 8
+    a(i) = i
+    b(i) = i * 10
+  end do
+  do concurrent (i = 1:8)
+    c(i) = a(i) + b(i)
+  end do
+end program
+");
+        assert!(ir.contains("call @afs_array_add_i32("));
+        assert!(!ir.contains("doconc_check"));
     }
 
     #[test]
