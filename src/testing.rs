@@ -234,6 +234,7 @@ pub struct RunCapture {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    pub files: BTreeMap<String, Vec<u8>>,
 }
 
 /// Capture the requested stages for one source file.
@@ -463,7 +464,16 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 detail,
                 stages: stages.clone(),
             })?;
+            let sandbox = temp_root.join("run_sandbox");
+            fs::create_dir_all(&sandbox).map_err(|e| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Run,
+                detail: format!("cannot create run sandbox '{}': {}", sandbox.display(), e),
+                stages: stages.clone(),
+            })?;
             let output = Command::new(&bin_path)
+                .current_dir(&sandbox)
                 .output()
                 .map_err(|e| CaptureFailure {
                     input: input.clone(),
@@ -472,12 +482,20 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                     detail: format!("cannot run '{}': {}", bin_path.display(), e),
                     stages: stages.clone(),
                 })?;
+            let files = snapshot_sandbox_files(&sandbox).map_err(|detail| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Run,
+                detail,
+                stages: stages.clone(),
+            })?;
             stages.insert(
                 Stage::Run,
                 CapturedStage::Run(RunCapture {
                     exit_code: output.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    files,
                 }),
             );
         }
@@ -490,6 +508,34 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         opt_level: request.opt_level,
         stages,
     })
+}
+
+fn collect_sandbox_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_sandbox_files(root, &path, out)?;
+        } else {
+            let rel = path.strip_prefix(root).unwrap();
+            out.insert(
+                rel.to_string_lossy().replace('\\', "/"),
+                fs::read(&path)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_sandbox_files(sandbox: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut files = BTreeMap::new();
+    collect_sandbox_files(sandbox, sandbox, &mut files)
+        .map_err(|e| format!("cannot snapshot sandbox '{}': {}", sandbox.display(), e))?;
+    Ok(files)
 }
 
 fn format_tokens(tokens: &[Token]) -> String {
