@@ -13,7 +13,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn optimized_i128_capture_is_rejected_for_now() {
     let err = capture_from_path(&CaptureRequest {
-        input: fixture("integer16_ir.f90"),
+        input: fixture("integer16_add.f90"),
         requested: BTreeSet::from([Stage::OptIr]),
         opt_level: OptLevel::O2,
     })
@@ -30,7 +30,7 @@ fn optimized_i128_capture_is_rejected_for_now() {
 #[test]
 fn backend_i128_capture_is_rejected_for_now() {
     let err = capture_from_path(&CaptureRequest {
-        input: fixture("integer16_ir.f90"),
+        input: fixture("integer16_add.f90"),
         requested: BTreeSet::from([Stage::Obj]),
         opt_level: OptLevel::O0,
     })

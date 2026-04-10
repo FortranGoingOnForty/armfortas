@@ -438,6 +438,30 @@ impl Module {
                 .iter()
                 .all(|global| global_i128_backend_data_supported(self, global))
     }
+
+    /// True when the current O0 backend can lower every live `i128` surface.
+    ///
+    /// Today that means:
+    /// - module-global `i128` data
+    /// - local `i128` allocas and plain memory traffic around them
+    /// - `i128` constants that only flow through those memory ops
+    ///
+    /// It still excludes any ABI-visible or arithmetic use such as function
+    /// params/returns, block params, calls, branches carrying `i128`, and any
+    /// integer operation whose result or operands are `i128`.
+    pub fn i128_backend_o0_supported(&self) -> bool {
+        self.globals
+            .iter()
+            .all(|global| global_i128_backend_data_supported(self, global))
+            && self
+                .extern_funcs
+                .iter()
+                .all(|func| !sig_contains_i128(self, &func.sig))
+            && self
+                .functions
+                .iter()
+                .all(|func| function_i128_backend_o0_supported(self, func))
+    }
 }
 
 fn sig_contains_i128(module: &Module, sig: &super::types::FuncSig) -> bool {
@@ -471,5 +495,62 @@ fn global_i128_backend_data_supported(module: &Module, global: &Global) -> bool 
             )
         }
         _ => !type_contains_i128(module, &global.ty),
+    }
+}
+
+fn function_i128_backend_o0_supported(module: &Module, func: &Function) -> bool {
+    if type_contains_i128(module, &func.return_type)
+        || func.params.iter().any(|param| type_contains_i128(module, &param.ty))
+    {
+        return false;
+    }
+
+    func.blocks.iter().all(|block| {
+        block.params.iter().all(|param| !type_contains_i128(module, &param.ty))
+            && block
+                .insts
+                .iter()
+                .all(|inst| inst_i128_backend_o0_supported(module, func, inst))
+            && block
+                .terminator
+                .as_ref()
+                .is_none_or(|term| terminator_i128_backend_o0_supported(module, func, term))
+    })
+}
+
+fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst) -> bool {
+    let inst_ty_has_i128 = type_contains_i128(module, &inst.ty);
+    let uses_i128 = crate::ir::walk::inst_uses(&inst.kind)
+        .into_iter()
+        .filter_map(|vid| func.value_type(vid))
+        .any(|ty| type_contains_i128(module, &ty));
+
+    match &inst.kind {
+        InstKind::ConstInt(_, IntWidth::I128) => true,
+        InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        InstKind::Store(..) => true,
+        InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
+            !uses_i128 || inst_ty_has_i128
+        }
+        _ => !inst_ty_has_i128 && !uses_i128,
+    }
+}
+
+fn terminator_i128_backend_o0_supported(
+    module: &Module,
+    func: &Function,
+    term: &Terminator,
+) -> bool {
+    let term_uses_i128 = crate::ir::walk::terminator_uses(term)
+        .into_iter()
+        .filter_map(|vid| func.value_type(vid))
+        .any(|ty| type_contains_i128(module, &ty));
+
+    match term {
+        Terminator::Return(Some(val)) => !matches!(
+            func.value_type(*val),
+            Some(ty) if type_contains_i128(module, &ty)
+        ),
+        _ => !term_uses_i128,
     }
 }

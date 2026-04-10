@@ -265,7 +265,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         return Ok(());
     }
 
-    if module_has_i128 && !ir_module.i128_backend_data_only_supported() {
+    if module_has_i128 && !ir_module.i128_backend_o0_supported() {
         return Err(
             "backend does not yet support integer(16) / i128 codegen; use --emit-ir for now"
                 .into(),
@@ -471,6 +471,12 @@ mod tests {
         path
     }
 
+    fn i128_reject_fixture() -> PathBuf {
+        let path = PathBuf::from("tests/fixtures").join("integer16_add.f90");
+        assert!(path.exists(), "missing test fixture {}", path.display());
+        path
+    }
+
     #[test]
     fn emit_ir_allows_integer16_staging_at_o0() {
         let output = std::env::temp_dir().join(format!(
@@ -495,14 +501,14 @@ mod tests {
     }
 
     #[test]
-    fn backend_rejects_integer16_codegen_for_now() {
+    fn backend_rejects_integer16_arithmetic_for_now() {
         let output = std::env::temp_dir().join(format!(
             "armfortas_i128_bin_{}_{}",
             std::process::id(),
             "o0"
         ));
         let opts = Options {
-            input: i128_fixture(),
+            input: i128_reject_fixture(),
             output: Some(output),
             emit_asm: false,
             emit_obj: false,
@@ -517,5 +523,28 @@ mod tests {
             "unexpected backend rejection:\n{}",
             err
         );
+    }
+
+    #[test]
+    fn backend_allows_simple_integer16_memory_codegen_at_o0() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_mem_{}_{}.s",
+            std::process::id(),
+            "o0"
+        ));
+        let opts = Options {
+            input: i128_fixture(),
+            output: Some(output.clone()),
+            emit_asm: true,
+            emit_obj: false,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: OptLevel::O0,
+        };
+
+        compile(&opts).expect("simple integer(16) memory traffic should codegen at O0");
+        let asm = fs::read_to_string(&output).expect("missing emitted assembly");
+        assert!(asm.contains("stp x16, x17"), "expected paired i128 store in asm:\n{}", asm);
+        let _ = fs::remove_file(output);
     }
 }

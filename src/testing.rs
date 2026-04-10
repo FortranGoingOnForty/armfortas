@@ -411,7 +411,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     }
 
     let backend_ir = optimized_module.as_ref().unwrap_or(&ir_module);
-    if module_has_i128 && !backend_ir.i128_backend_data_only_supported() {
+    if module_has_i128 && !backend_ir.i128_backend_o0_supported() {
         return Err(CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,

@@ -167,6 +167,11 @@ pub fn select_function(func: &Function) -> MachineFunction {
     // `lookup_vreg` without ordering concerns.
     for block in &func.blocks {
         for bp in &block.params {
+            if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+                let offset = mf.alloc_local(16);
+                ctx.wide_value_slots.insert(bp.id, offset);
+                continue;
+            }
             let class = type_to_reg_class(&bp.ty);
             let vreg = mf.new_vreg(class);
             ctx.value_map.insert(bp.id, vreg);
@@ -178,6 +183,11 @@ pub fn select_function(func: &Function) -> MachineFunction {
             // Void-typed insts (Store, RuntimeCall returning void,
             // etc.) don't produce a usable value.
             if matches!(inst.ty, IrType::Void) { continue; }
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+                let offset = mf.alloc_local(16);
+                ctx.wide_value_slots.insert(inst.id, offset);
+                continue;
+            }
             let class = type_to_reg_class(&inst.ty);
             let vreg = mf.new_vreg(class);
             ctx.value_map.insert(inst.id, vreg);
@@ -224,6 +234,8 @@ pub fn select_function(func: &Function) -> MachineFunction {
 struct ISelCtx {
     /// IR ValueId → MIR VRegId.
     value_map: HashMap<ValueId, VRegId>,
+    /// IR wide scalar ValueId → stack slot offset used as its backing store.
+    wide_value_slots: HashMap<ValueId, i32>,
     /// IR BlockId → MIR MBlockId.
     block_map: HashMap<BlockId, MBlockId>,
     /// IR alloca ValueId → stack frame offset.
@@ -249,6 +261,7 @@ impl ISelCtx {
     fn new() -> Self {
         Self {
             value_map: HashMap::new(),
+            wide_value_slots: HashMap::new(),
             block_map: HashMap::new(),
             alloca_offsets: HashMap::new(),
             block_params: HashMap::new(),
@@ -296,10 +309,76 @@ impl ISelCtx {
     fn lookup_block(&self, block: BlockId) -> MBlockId {
         *self.block_map.get(&block).unwrap_or(&MBlockId(0))
     }
+
+    fn lookup_wide_slot(&self, val: ValueId) -> i32 {
+        *self.wide_value_slots.get(&val).unwrap_or_else(|| {
+            panic!(
+                "isel: unmapped wide i128 value %{} — phase 4a should have allocated \
+                 a backing slot for every supported i128 SSA value before phase 4b runs",
+                val.0
+            )
+        })
+    }
 }
 
 /// Select machine instructions for a single IR instruction.
 fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, func: &Function) {
+    if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+        match &inst.kind {
+            InstKind::ConstInt(val, IntWidth::I128) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                emit_const_i128_to_phys_pair(mf, mb, *val, PhysReg::Gp(16), PhysReg::Gp(17));
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
+            InstKind::Load(addr) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                if let Some(&offset) = ctx.alloca_offsets.get(addr) {
+                    emit_load_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        offset as i64,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                } else {
+                    let base = ctx.lookup_vreg(*addr);
+                    emit_load_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::VReg(base),
+                        0,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                }
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
+            _ => {
+                panic!(
+                    "isel: unsupported i128 instruction reached backend despite gating: {:?}",
+                    inst.kind
+                );
+            }
+        }
+    }
+
     match &inst.kind {
         // ---- Constants ----
         InstKind::ConstInt(val, width) => {
@@ -832,6 +911,39 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         }
 
         InstKind::Store(val, addr) => {
+            if matches!(func.value_type(*val), Some(IrType::Int(IntWidth::I128))) {
+                let src_slot = ctx.lookup_wide_slot(*val);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    src_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                if let Some(&offset) = ctx.alloca_offsets.get(addr) {
+                    emit_store_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        offset as i64,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                } else {
+                    let base = ctx.lookup_vreg(*addr);
+                    emit_store_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::VReg(base),
+                        0,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                }
+                return;
+            }
+
             let val_vreg = ctx.lookup_vreg(*val);
             // Audit CRITICAL-2: pick the store opcode by the IR
             // VALUE's declared type, not the pointer's pointee.
@@ -1411,6 +1523,96 @@ fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
     mf.block_mut(mb).insts.push(MachineInst {
         opcode: ArmOpcode::Ret,
         operands: vec![],
+        def: None,
+    });
+}
+
+fn split_i128_words(value: i128) -> (u64, u64) {
+    let bits = value as u128;
+    (bits as u64, (bits >> 64) as u64)
+}
+
+fn emit_const_u64_phys(mf: &mut MachineFunction, mb: MBlockId, dest: PhysReg, value: u64) {
+    if value == 0 {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(dest),
+                MachineOperand::PhysReg(PhysReg::Xzr),
+            ],
+            def: None,
+        });
+        return;
+    }
+
+    let mut first = true;
+    for i in 0..4 {
+        let shift = i * 16;
+        let chunk = ((value >> shift) & 0xFFFF) as u16;
+        if chunk != 0 || (first && i == 3) {
+            let opcode = if first { ArmOpcode::Movz } else { ArmOpcode::Movk };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::PhysReg(dest),
+                    MachineOperand::Imm(chunk as i64),
+                    MachineOperand::Shift(shift as u8),
+                ],
+                def: None,
+            });
+            first = false;
+        }
+    }
+}
+
+fn emit_const_i128_to_phys_pair(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    value: i128,
+    lo: PhysReg,
+    hi: PhysReg,
+) {
+    let (low_word, high_word) = split_i128_words(value);
+    emit_const_u64_phys(mf, mb, lo, low_word);
+    emit_const_u64_phys(mf, mb, hi, high_word);
+}
+
+fn emit_store_phys_i128_pair(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    base: MachineOperand,
+    offset: i64,
+    lo: PhysReg,
+    hi: PhysReg,
+) {
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::StpOffset,
+        operands: vec![
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(hi),
+            base,
+            MachineOperand::Imm(offset),
+        ],
+        def: None,
+    });
+}
+
+fn emit_load_phys_i128_pair(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    base: MachineOperand,
+    offset: i64,
+    lo: PhysReg,
+    hi: PhysReg,
+) {
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::LdpOffset,
+        operands: vec![
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(hi),
+            base,
+            MachineOperand::Imm(offset),
+        ],
         def: None,
     });
 }
