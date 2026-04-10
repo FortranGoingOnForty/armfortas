@@ -23,6 +23,7 @@ use super::call_resolve::CallResolve;
 use super::inline::Inline;
 use super::simplify_cfg::SimplifyCfg;
 use super::dead_func::DeadFuncElim;
+use super::dead_arg::DeadArgElim;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
@@ -125,6 +126,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
             pm.add(Box::new(Inline::for_level(OptLevel::O1)));
+            pm.add(Box::new(DeadArgElim));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(LocalLsf));
@@ -140,6 +142,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Sroa));    // after SSA + const fold (GCC pattern)
             pm.add(Box::new(Mem2Reg)); // re-promote SROA-created scalar allocas
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
+            pm.add(Box::new(DeadArgElim));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));
@@ -168,6 +171,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Sroa));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
+            pm.add(Box::new(DeadArgElim));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));
@@ -193,6 +197,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Sroa));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
+            pm.add(Box::new(DeadArgElim));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));

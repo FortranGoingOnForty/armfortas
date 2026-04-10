@@ -237,6 +237,7 @@ pub fn lower_file(
             &alloc_return_funcs,
             &optional_params,
             &elemental_funcs,
+            false,
         );
     }
     module
@@ -885,6 +886,7 @@ fn lower_unit(
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
     elemental_funcs: &HashSet<String>,
+    internal_only: bool,
 ) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
@@ -931,7 +933,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
@@ -965,6 +967,7 @@ fn lower_unit(
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
+            func.internal_only = internal_only;
             let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1030,7 +1033,7 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
@@ -1115,6 +1118,7 @@ fn lower_unit(
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
+            func.internal_only = internal_only;
             let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
@@ -1209,7 +1213,7 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
             }
         }
         ProgramUnit::Module { uses, contains, .. } => {
@@ -1220,7 +1224,7 @@ fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, false);
             }
         }
         _ => {}

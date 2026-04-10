@@ -34,6 +34,7 @@ pub mod callgraph;
 pub mod inline;
 pub mod simplify_cfg;
 pub mod dead_func;
+pub mod dead_arg;
 pub mod sroa;
 pub mod alias;
 pub mod gvn;

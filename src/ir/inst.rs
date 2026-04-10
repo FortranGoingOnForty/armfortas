@@ -228,6 +228,9 @@ pub struct Function {
     pub is_pure: bool,
     /// Fortran ELEMENTAL attribute — operates element-wise on arrays.
     pub is_elemental: bool,
+    /// True for contained procedures that never participate in the
+    /// external object ABI and can be rewritten by IPO passes.
+    pub internal_only: bool,
 }
 
 impl Function {
@@ -250,6 +253,7 @@ impl Function {
             type_cache,
             is_pure: false,
             is_elemental: false,
+            internal_only: false,
         }
     }
 
