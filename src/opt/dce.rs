@@ -42,17 +42,22 @@ use std::collections::{HashMap, HashSet};
 
 /// True if the instruction has any side effect that prevents removal,
 /// regardless of whether its result is used.
-fn has_side_effect(kind: &InstKind) -> bool {
+fn has_side_effect(kind: &InstKind, pure_internal_calls: &[bool]) -> bool {
     matches!(
         kind,
         InstKind::Store(..)
-            | InstKind::Call(..)
             | InstKind::RuntimeCall(..)
             // Alloca produces a stack slot whose identity matters even
             // if no one reads from it (the address may escape via a
             // future store/call). Treat as side-effecting for safety.
             | InstKind::Alloca(..)
-    )
+    ) || match kind {
+        InstKind::Call(FuncRef::Internal(idx), _) => {
+            !pure_internal_calls.get(*idx as usize).copied().unwrap_or(false)
+        }
+        InstKind::Call(..) => true,
+        _ => false,
+    }
 }
 
 /// Collect every `ValueId` referenced as an operand of any instruction
@@ -90,7 +95,7 @@ fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
 ///    corresponding slot. Removing an arg can free its defining
 ///    instruction, so we re-run the inner loop afterwards. Audit
 ///    finding Med-5 / C-1.
-fn dce_function(func: &mut Function) -> bool {
+fn dce_function(func: &mut Function, pure_internal_calls: &[bool]) -> bool {
     let mut any_change = false;
     let mut outer_changed = true;
     while outer_changed {
@@ -104,7 +109,7 @@ fn dce_function(func: &mut Function) -> bool {
             for block in &mut func.blocks {
                 let before = block.insts.len();
                 block.insts.retain(|inst| {
-                    if has_side_effect(&inst.kind) { return true; }
+                    if has_side_effect(&inst.kind, pure_internal_calls) { return true; }
                     if live.contains(&inst.id) { return true; }
                     false
                 });
@@ -231,9 +236,10 @@ pub struct Dce;
 impl Pass for Dce {
     fn name(&self) -> &'static str { "dce" }
     fn run(&self, module: &mut Module) -> bool {
+        let pure_internal_calls: Vec<bool> = module.functions.iter().map(|func| func.is_pure).collect();
         let mut changed = false;
         for func in &mut module.functions {
-            if dce_function(func) { changed = true; }
+            if dce_function(func, &pure_internal_calls) { changed = true; }
         }
         changed
     }
@@ -337,6 +343,31 @@ mod tests {
 
         assert!(!Dce.run(&mut m));
         assert_eq!(m.functions[0].blocks[0].insts.len(), 1);
+    }
+
+    #[test]
+    fn removes_unused_internal_pure_call() {
+        let mut m = Module::new("t".into());
+
+        let mut callee = Function::new("pure_fn".into(), vec![], IrType::Int(IntWidth::I32));
+        callee.is_pure = true;
+        let c = push(&mut callee, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(c)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        assert!(Dce.run(&mut m));
+        assert!(m.functions[1].blocks[0].insts.is_empty(), "unused PURE call should be removed");
     }
 
     #[test]
