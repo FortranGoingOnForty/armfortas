@@ -5,7 +5,7 @@
 //! a `store %val, %ptr`, the load is redundant — we already know the
 //! value is `%val`. This pass:
 //!
-//! 1. Tracks the most recently stored value for each address (`ValueId`).
+//! 1. Tracks the most recently stored value for each address.
 //! 2. On a matching `load`, records `load_id → stored_val` in a
 //!    substitution table.
 //! 3. After scanning the block, rewrites every instruction that uses any
@@ -16,20 +16,18 @@
 //!
 //! ### Alias model
 //!
-//! We use *structural pointer identity*: two addresses are considered the
-//! same if and only if they have the same `ValueId`. This is always sound
-//! (no false forwarding) but may miss opportunities when two independent
-//! GEPs produce the same address. Alias analysis (deferred to sprint 29.8)
-//! would improve coverage.
+//! Uses the Fortran-aware alias oracle:
+//! - `MustAlias` store → later load can forward
+//! - `MayAlias` store → pending forwarded values are conservatively killed
+//! - `NoAlias` store/call arg → pending forwarded values survive
 //!
 //! ### Invalidation rules (conservative)
 //!
 //! | Instruction         | Effect on `available` map                    |
 //! |---------------------|----------------------------------------------|
-//! | `store %v, %ptr`    | `available[ptr] = v`                         |
+//! | `store %v, %ptr`    | kill aliasing entries; record `%ptr → v`     |
 //! | `load %ptr`         | Forward if available; otherwise no-op        |
-//! | `call / rcall`      | Flush entire map (may write any pointer arg) |
-//! | GEP of `%ptr`       | Flush `%ptr` (derived pointer may escape)    |
+//! | `call / rcall`      | Flush only entries aliasing pointer args     |
 //! | Any other           | No-op (reads only)                           |
 //!
 //! ### Example
@@ -46,7 +44,9 @@
 //! ```
 
 use super::pass::Pass;
+use super::alias::{self, AliasResult};
 use crate::ir::inst::*;
+use crate::ir::types::IrType;
 use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
 use std::collections::HashMap;
 
@@ -65,50 +65,53 @@ impl Pass for LocalLsf {
 }
 
 fn lsf_in_function(func: &mut Function) -> bool {
+    #[derive(Clone, Copy)]
+    struct AvailableStore {
+        ptr: ValueId,
+        val: ValueId,
+    }
+
     let mut all_rewrites: HashMap<ValueId, ValueId> = HashMap::new();
     let mut changed = false;
 
     for block in &func.blocks {
-        // available: ptr ValueId → the value most recently stored to it
-        let mut available: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut available: Vec<AvailableStore> = Vec::new();
 
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::Store(val, ptr) => {
-                    available.insert(*ptr, *val);
+                    let eff_ptr = resolve(&all_rewrites, *ptr);
+                    let eff_val = resolve(&all_rewrites, *val);
+                    available.retain(|entry| {
+                        matches!(alias::query(func, entry.ptr, eff_ptr), AliasResult::NoAlias)
+                    });
+                    available.push(AvailableStore { ptr: eff_ptr, val: eff_val });
                 }
 
                 InstKind::Load(ptr) => {
-                    // Resolve the pointer through any prior substitutions so we
-                    // check the forwarded pointer if it was itself renamed.
                     let eff_ptr = resolve(&all_rewrites, *ptr);
-                    if let Some(&fwd) = available.get(&eff_ptr) {
-                        // Forward: load_id → stored_value
-                        all_rewrites.insert(inst.id, fwd);
+                    if let Some(entry) = available.iter().rev().find(|entry| {
+                        matches!(alias::query(func, entry.ptr, eff_ptr), AliasResult::MustAlias)
+                    }) {
+                        all_rewrites.insert(inst.id, entry.val);
                         changed = true;
                     }
                 }
 
-                InstKind::GetElementPtr(base, _) => {
-                    // A GEP exposes `base` — conservatively kill any pending
-                    // forwarding through `base` in case the GEP result is used
-                    // to store before the next load of `base`.
-                    available.remove(base);
-                }
-
                 InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-                    // Any call may write to any pointer arg. For simplicity,
-                    // flush ALL available entries when a call is present.
-                    //
-                    // Refinement: only flush entries for which the address
-                    // appears as a call argument.  The per-arg flush would be:
-                    //   for arg in args { available.remove(arg); }
-                    // But without alias analysis, the call might write through
-                    // a saved copy of an arg that we can't see, so full flush
-                    // is safer for an O1 pass. We can relax at O2+ with alias
-                    // analysis.
-                    let _ = args;
-                    available.clear();
+                    let pointer_args: Vec<ValueId> = args
+                        .iter()
+                        .copied()
+                        .map(|arg| resolve(&all_rewrites, arg))
+                        .filter(|arg| value_is_pointer(func, *arg))
+                        .collect();
+                    if !pointer_args.is_empty() {
+                        available.retain(|entry| {
+                            pointer_args.iter().all(|arg| {
+                                matches!(alias::query(func, entry.ptr, *arg), AliasResult::NoAlias)
+                            })
+                        });
+                    }
                 }
 
                 _ => {} // Pure computation — doesn't affect memory availability.
@@ -162,6 +165,18 @@ fn apply_rewrites(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
     }
 }
 
+fn value_is_pointer(func: &Function, value: ValueId) -> bool {
+    if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
+        return true;
+    }
+    if func.params.iter().any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_))) {
+        return true;
+    }
+    func.blocks.iter().flat_map(|block| block.insts.iter()).find(|inst| inst.id == value)
+        .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -183,6 +198,15 @@ mod tests {
         let entry = f.entry;
         f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
         id
+    }
+
+    fn param(name: &str, id: u32, fortran_noalias: bool) -> Param {
+        Param {
+            name: name.into(),
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            id: ValueId(id),
+            fortran_noalias,
+        }
     }
 
     #[test]
@@ -297,5 +321,74 @@ mod tests {
         let pass = LocalLsf;
         let changed = pass.run(&mut m);
         assert!(!changed, "No forwarding without a prior store");
+    }
+
+    #[test]
+    fn forwards_load_from_must_alias_gep() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 4);
+        let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
+        let ptr = push(&mut f, InstKind::Alloca(arr_ty), arr_ptr_ty);
+        let zero0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let zero1 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let gep0 = push(
+            &mut f,
+            InstKind::GetElementPtr(ptr, vec![zero0]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let gep1 = push(
+            &mut f,
+            InstKind::GetElementPtr(ptr, vec![zero1]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v42, gep0), IrType::Void);
+        let load = push(&mut f, InstKind::Load(gep1), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(LocalLsf.run(&mut m), "LSF should forward across must-alias GEPs");
+        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        assert!(
+            matches!(term, Terminator::Return(Some(v)) if *v == v42),
+            "return should use the stored value after forwarding, got {:?}",
+            term
+        );
+    }
+
+    #[test]
+    fn keeps_store_available_across_noalias_call_arg() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new(
+            "f".into(),
+            vec![param("a", 0, true), param("b", 1, true)],
+            IrType::Int(IntWidth::I32),
+        );
+
+        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v42, ValueId(0)), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("touch".into()), vec![ValueId(1)]),
+            IrType::Void,
+        );
+        let load = push(&mut f, InstKind::Load(ValueId(0)), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            LocalLsf.run(&mut m),
+            "LSF should preserve the stored value across a noalias pointer call"
+        );
+        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        assert!(
+            matches!(term, Terminator::Return(Some(v)) if *v == v42),
+            "return should use the forwarded value across the noalias call, got {:?}",
+            term
+        );
     }
 }
