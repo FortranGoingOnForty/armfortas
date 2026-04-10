@@ -43,6 +43,7 @@ pub mod alias;
 pub mod gvn;
 pub mod global_lsf;
 pub mod bce;
+pub mod vectorize;
 
 #[cfg(test)]
 mod audit_tests;

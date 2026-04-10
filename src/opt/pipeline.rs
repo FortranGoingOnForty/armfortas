@@ -33,6 +33,7 @@ use super::global_lsf::GlobalLsf;
 use super::bce::Bce;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
+use super::vectorize::Vectorize;
 
 /// Compiler optimization levels.
 ///
@@ -225,6 +226,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
             pm.add(Box::new(Dce));
@@ -256,6 +258,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(FastMathReassoc));
             pm.add(Box::new(Gvn));
@@ -324,6 +327,29 @@ mod tests {
         assert!(
             ofast.contains(&"fast-math-reassoc"),
             "Ofast should include fast-math reassociation, got {:?}",
+            ofast
+        );
+    }
+
+    #[test]
+    fn vectorize_is_enabled_only_at_o3_and_above() {
+        let o2 = build_pipeline(OptLevel::O2).pass_names();
+        let o3 = build_pipeline(OptLevel::O3).pass_names();
+        let ofast = build_pipeline(OptLevel::Ofast).pass_names();
+
+        assert!(
+            !o2.contains(&"vectorize"),
+            "O2 should not include vectorize, got {:?}",
+            o2
+        );
+        assert!(
+            o3.contains(&"vectorize"),
+            "O3 should include vectorize, got {:?}",
+            o3
+        );
+        assert!(
+            ofast.contains(&"vectorize"),
+            "Ofast should include vectorize, got {:?}",
             ofast
         );
     }
