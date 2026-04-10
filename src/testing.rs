@@ -369,6 +369,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             OptLevel::O1 => IrOptLevel::O1,
             OptLevel::O2 => IrOptLevel::O2,
             OptLevel::O3 => IrOptLevel::O3,
+            OptLevel::Os => IrOptLevel::Os,
             OptLevel::Ofast => IrOptLevel::Ofast,
         };
         let pm = build_pipeline(ir_opt);

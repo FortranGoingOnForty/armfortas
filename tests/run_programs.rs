@@ -733,9 +733,9 @@ fn extract_repro_checks(source: &str, filename: &str) -> Result<Vec<ReproStage>,
 fn parse_supported_opt(token: &str, filename: &str, line_num: usize) -> Result<String, String> {
     let trimmed = token.trim().trim_start_matches('-');
     match trimmed {
-        "O0" | "O1" | "O2" | "O3" | "Ofast" => Ok(format!("-{}", trimmed)),
+        "O0" | "O1" | "O2" | "O3" | "Os" | "Ofast" => Ok(format!("-{}", trimmed)),
         other => Err(format!(
-            "{}:{}: OPT_EQ only supports O0, O1, O2, O3, or Ofast; got '{}'",
+            "{}:{}: OPT_EQ only supports O0, O1, O2, O3, Os, or Ofast; got '{}'",
             filename, line_num, other
         )),
     }
@@ -2260,6 +2260,13 @@ fn test_programs_end_to_end_o3() {
 }
 
 #[test]
+fn test_programs_end_to_end_os() {
+    if let Err(msg) = run_all_at("-Os") {
+        panic!("Test failures at -Os:\n\n{}", msg);
+    }
+}
+
+#[test]
 fn test_programs_end_to_end_ofast() {
     if let Err(msg) = run_all_at("-Ofast") {
         panic!("Test failures at -Ofast:\n\n{}", msg);
@@ -2452,10 +2459,10 @@ fn extract_repro_checks_accepts_run_same_sandbox_stage() {
 
 #[test]
 fn extract_opt_eq_rules_accepts_runtime_and_asm_components() {
-    let source = "! OPT_EQ: O0,O1,O2 => stdout|stderr|exit|asm\n";
+    let source = "! OPT_EQ: O0,Os,O2 => stdout|stderr|exit|asm\n";
     let rules = extract_opt_eq_rules(source, "inline.f90").unwrap();
     assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0].opt_flags, vec!["-O0", "-O1", "-O2"]);
+    assert_eq!(rules[0].opt_flags, vec!["-O0", "-Os", "-O2"]);
     assert_eq!(
         rules[0].components,
         vec![

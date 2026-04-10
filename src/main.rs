@@ -16,6 +16,7 @@ fn main() {
         eprintln!("  -E           preprocess only");
         eprintln!("  --emit-ir    emit IR");
         eprintln!("  -O0..-O3     optimization level");
+        eprintln!("  -Os          optimize for code size");
         eprintln!("  -Ofast       maximum optimization");
         process::exit(1);
     }

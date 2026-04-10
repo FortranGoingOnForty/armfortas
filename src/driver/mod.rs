@@ -20,6 +20,7 @@ pub enum OptLevel {
     O1,
     O2,
     O3,
+    Os,
     Ofast,
 }
 
@@ -30,6 +31,7 @@ impl OptLevel {
             "o1" => Some(Self::O1),
             "o2" => Some(Self::O2),
             "o3" => Some(Self::O3),
+            "os" => Some(Self::Os),
             "ofast" => Some(Self::Ofast),
             _ => None,
         }
@@ -41,6 +43,7 @@ impl OptLevel {
             Self::O1 => "-O1",
             Self::O2 => "-O2",
             Self::O3 => "-O3",
+            Self::Os => "-Os",
             Self::Ofast => "-Ofast",
         }
     }
@@ -51,6 +54,7 @@ impl OptLevel {
             Self::O1 => "O1",
             Self::O2 => "O2",
             Self::O3 => "O3",
+            Self::Os => "Os",
             Self::Ofast => "Ofast",
         }
     }
@@ -239,6 +243,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             OptLevel::O1    => IrOpt::O1,
             OptLevel::O2    => IrOpt::O2,
             OptLevel::O3    => IrOpt::O3,
+            OptLevel::Os    => IrOpt::Os,
             OptLevel::Ofast => IrOpt::Ofast,
         };
         let pm = crate::opt::build_pipeline(ir_opt);
@@ -423,4 +428,25 @@ fn find_runtime_lib() -> Result<String, String> {
     }
 
     Err("cannot find libarmfortas_rt.a — build with 'cargo build -p armfortas-rt'".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_os_optimization_flag() {
+        assert_eq!(OptLevel::parse_flag("Os"), Some(OptLevel::Os));
+        assert_eq!(OptLevel::parse_flag("os"), Some(OptLevel::Os));
+        assert_eq!(OptLevel::Os.as_flag(), "-Os");
+        assert_eq!(OptLevel::Os.as_str(), "Os");
+    }
+
+    #[test]
+    fn options_from_args_accepts_os() {
+        let args = vec!["-Os".to_string(), "hello.f90".to_string()];
+        let opts = Options::from_args(&args).expect("driver should accept -Os");
+        assert_eq!(opts.opt_level, OptLevel::Os);
+        assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
 }

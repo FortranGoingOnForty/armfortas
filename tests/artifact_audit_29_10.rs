@@ -69,6 +69,7 @@ fn opt_name(opt: OptLevel) -> &'static str {
         OptLevel::O1 => "-O1",
         OptLevel::O2 => "-O2",
         OptLevel::O3 => "-O3",
+        OptLevel::Os => "-Os",
         OptLevel::Ofast => "-Ofast",
     }
 }
@@ -114,7 +115,7 @@ fn optimized_object_snapshot_removes_inlined_helper_symbol() {
 fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
     let source = fixture("module_init.f90");
 
-    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Ofast] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
         let first = capture_text(
             CaptureRequest {
                 input: source.clone(),
