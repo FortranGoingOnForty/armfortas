@@ -170,6 +170,438 @@ unsafe fn add_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: us
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    use core::arch::aarch64::{vld1q_s32, vst1q_s32, vsubq_s32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_s32(lhs.add(i));
+        let b = vld1q_s32(rhs.add(i));
+        vst1q_s32(dest.add(i), vsubq_s32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    use core::arch::aarch64::{vld1q_f32, vst1q_f32, vsubq_f32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_f32(lhs.add(i));
+        let b = vld1q_f32(rhs.add(i));
+        vst1q_f32(dest.add(i), vsubq_f32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    use core::arch::aarch64::{vld1q_f64, vst1q_f64, vsubq_f64};
+
+    let mut i = 0usize;
+    while i + 2 <= len {
+        let a = vld1q_f64(lhs.add(i));
+        let b = vld1q_f64(rhs.add(i));
+        vst1q_f64(dest.add(i), vsubq_f64(a, b));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) - *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    use core::arch::aarch64::{vld1q_s32, vmulq_s32, vst1q_s32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_s32(lhs.add(i));
+        let b = vld1q_s32(rhs.add(i));
+        vst1q_s32(dest.add(i), vmulq_s32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_f32(lhs.add(i));
+        let b = vld1q_f32(rhs.add(i));
+        vst1q_f32(dest.add(i), vmulq_f32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    use core::arch::aarch64::{vld1q_f64, vmulq_f64, vst1q_f64};
+
+    let mut i = 0usize;
+    while i + 2 <= len {
+        let a = vld1q_f64(lhs.add(i));
+        let b = vld1q_f64(rhs.add(i));
+        vst1q_f64(dest.add(i), vmulq_f64(a, b));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) * *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    use core::arch::aarch64::{vaddq_s32, vdupq_n_s32, vld1q_s32, vst1q_s32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_s32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_s32(src.add(i));
+        vst1q_s32(dest.add(i), vaddq_s32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) + scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) + scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    use core::arch::aarch64::{vaddq_f32, vdupq_n_f32, vld1q_f32, vst1q_f32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_f32(src.add(i));
+        vst1q_f32(dest.add(i), vaddq_f32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) + scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) + scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    use core::arch::aarch64::{vaddq_f64, vdupq_n_f64, vld1q_f64, vst1q_f64};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f64(scalar);
+    while i + 2 <= len {
+        let a = vld1q_f64(src.add(i));
+        vst1q_f64(dest.add(i), vaddq_f64(a, splat));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) + scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) + scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_s32, vld1q_s32, vst1q_s32, vsubq_s32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_s32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_s32(src.add(i));
+        vst1q_s32(dest.add(i), vsubq_s32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) - scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) - scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f32, vld1q_f32, vst1q_f32, vsubq_f32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_f32(src.add(i));
+        vst1q_f32(dest.add(i), vsubq_f32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) - scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) - scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sub_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f64, vld1q_f64, vst1q_f64, vsubq_f64};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f64(scalar);
+    while i + 2 <= len {
+        let a = vld1q_f64(src.add(i));
+        vst1q_f64(dest.add(i), vsubq_f64(a, splat));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) - scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn sub_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) - scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn scalar_sub_i32_impl(dest: *mut i32, scalar: i32, src: *const i32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_s32, vld1q_s32, vst1q_s32, vsubq_s32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_s32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_s32(src.add(i));
+        vst1q_s32(dest.add(i), vsubq_s32(splat, a));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = scalar - *src.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn scalar_sub_i32_impl(dest: *mut i32, scalar: i32, src: *const i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = scalar - *src.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn scalar_sub_f32_impl(dest: *mut f32, scalar: f32, src: *const f32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f32, vld1q_f32, vst1q_f32, vsubq_f32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_f32(src.add(i));
+        vst1q_f32(dest.add(i), vsubq_f32(splat, a));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = scalar - *src.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn scalar_sub_f32_impl(dest: *mut f32, scalar: f32, src: *const f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = scalar - *src.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn scalar_sub_f64_impl(dest: *mut f64, scalar: f64, src: *const f64, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f64, vld1q_f64, vst1q_f64, vsubq_f64};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f64(scalar);
+    while i + 2 <= len {
+        let a = vld1q_f64(src.add(i));
+        vst1q_f64(dest.add(i), vsubq_f64(splat, a));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = scalar - *src.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn scalar_sub_f64_impl(dest: *mut f64, scalar: f64, src: *const f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = scalar - *src.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_s32, vld1q_s32, vmulq_s32, vst1q_s32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_s32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_s32(src.add(i));
+        vst1q_s32(dest.add(i), vmulq_s32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) * scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_scalar_i32_impl(dest: *mut i32, src: *const i32, scalar: i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) * scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f32, vld1q_f32, vmulq_f32, vst1q_f32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f32(scalar);
+    while i + 4 <= len {
+        let a = vld1q_f32(src.add(i));
+        vst1q_f32(dest.add(i), vmulq_f32(a, splat));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) * scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_scalar_f32_impl(dest: *mut f32, src: *const f32, scalar: f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) * scalar;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    use core::arch::aarch64::{vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f64(scalar);
+    while i + 2 <= len {
+        let a = vld1q_f64(src.add(i));
+        vst1q_f64(dest.add(i), vmulq_f64(a, splat));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *src.add(i) * scalar;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn mul_scalar_f64_impl(dest: *mut f64, src: *const f64, scalar: f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *src.add(i) * scalar;
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn afs_fill_i32(dest: *mut i32, n: i64, value: i32) {
     if dest.is_null() {
@@ -240,6 +672,222 @@ pub extern "C" fn afs_array_add_f64(dest: *mut f64, lhs: *const f64, rhs: *const
         return;
     }
     unsafe { add_f64_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_i32(dest: *mut i32, lhs: *const i32, rhs: *const i32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_i32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_f32(dest: *mut f32, lhs: *const f32, rhs: *const f32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_f32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_f64(dest: *mut f64, lhs: *const f64, rhs: *const f64, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_f64_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_i32(dest: *mut i32, lhs: *const i32, rhs: *const i32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_i32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_f32(dest: *mut f32, lhs: *const f32, rhs: *const f32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_f32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_f64(dest: *mut f64, lhs: *const f64, rhs: *const f64, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_f64_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_scalar_i32(dest: *mut i32, src: *const i32, scalar: i32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_scalar_i32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_scalar_f32(dest: *mut f32, src: *const f32, scalar: f32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_scalar_f32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_scalar_f64(dest: *mut f64, src: *const f64, scalar: f64, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_scalar_f64_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_scalar_i32(dest: *mut i32, src: *const i32, scalar: i32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_scalar_i32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_scalar_f32(dest: *mut f32, src: *const f32, scalar: f32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_scalar_f32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_sub_scalar_f64(dest: *mut f64, src: *const f64, scalar: f64, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { sub_scalar_f64_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_scalar_sub_array_i32(dest: *mut i32, scalar: i32, src: *const i32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { scalar_sub_i32_impl(dest, scalar, src, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_scalar_sub_array_f32(dest: *mut f32, scalar: f32, src: *const f32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { scalar_sub_f32_impl(dest, scalar, src, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_scalar_sub_array_f64(dest: *mut f64, scalar: f64, src: *const f64, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { scalar_sub_f64_impl(dest, scalar, src, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_scalar_i32(dest: *mut i32, src: *const i32, scalar: i32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_scalar_i32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_scalar_f32(dest: *mut f32, src: *const f32, scalar: f32, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_scalar_f32_impl(dest, src, scalar, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_mul_scalar_f64(dest: *mut f64, src: *const f64, scalar: f64, n: i64) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { mul_scalar_f64_impl(dest, src, scalar, len); }
 }
 
 // ---- ALLOCATE ----
@@ -696,6 +1344,48 @@ mod tests {
         let mut out = [0.0_f64; 4];
         afs_array_add_f64(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
         assert_eq!(out, [11.5, 22.5, 33.5, 44.5]);
+    }
+
+    #[test]
+    fn array_sub_i32_bulk_kernel() {
+        let lhs = [11_i32, 22, 33, 44, 55, 66, 77, 88];
+        let rhs = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let mut out = [0_i32; 8];
+        afs_array_sub_i32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        assert_eq!(out, [10, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn array_mul_f32_bulk_kernel() {
+        let lhs = [1.0_f32, 2.0, 3.0, 4.0];
+        let rhs = [2.0_f32, 3.0, 4.0, 5.0];
+        let mut out = [0.0_f32; 4];
+        afs_array_mul_f32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        assert_eq!(out, [2.0, 6.0, 12.0, 20.0]);
+    }
+
+    #[test]
+    fn array_add_scalar_i32_bulk_kernel() {
+        let src = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let mut out = [0_i32; 8];
+        afs_array_add_scalar_i32(out.as_mut_ptr(), src.as_ptr(), 5, out.len() as i64);
+        assert_eq!(out, [6, 7, 8, 9, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn scalar_sub_array_i32_bulk_kernel() {
+        let src = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let mut out = [0_i32; 8];
+        afs_scalar_sub_array_i32(out.as_mut_ptr(), 20, src.as_ptr(), out.len() as i64);
+        assert_eq!(out, [19, 18, 17, 16, 15, 14, 13, 12]);
+    }
+
+    #[test]
+    fn array_mul_scalar_f64_bulk_kernel() {
+        let src = [1.5_f64, 2.5, 3.5, 4.5];
+        let mut out = [0.0_f64; 4];
+        afs_array_mul_scalar_f64(out.as_mut_ptr(), src.as_ptr(), 2.0, out.len() as i64);
+        assert_eq!(out, [3.0, 5.0, 7.0, 9.0]);
     }
 }
 
