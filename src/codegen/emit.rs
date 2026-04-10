@@ -5,6 +5,17 @@
 use std::fmt::Write;
 use super::mir::*;
 
+fn split_i128_words(value: i128) -> (u64, u64) {
+    let bits = value as u128;
+    (bits as u64, (bits >> 64) as u64)
+}
+
+fn emit_i128_words(out: &mut String, value: i128) {
+    let (lo, hi) = split_i128_words(value);
+    writeln!(out, "    .quad 0x{:016x}", lo).unwrap();
+    writeln!(out, "    .quad 0x{:016x}", hi).unwrap();
+}
+
 /// Emit module-level globals as a `.section __DATA,__data` block.
 /// Each global gets a label and a directive matching its type
 /// (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
@@ -46,6 +57,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                 IrType::Int(IntWidth::I16)               => (1, ".short",  2, false),
                 IrType::Int(IntWidth::I32)               => (2, ".long",   4, false),
                 IrType::Int(IntWidth::I64)               => (3, ".quad",   8, false),
+                IrType::Int(IntWidth::I128)              => (4, ".quad",  16, false),
                 IrType::Float(FloatWidth::F32)           => (2, ".single", 4, true),
                 IrType::Float(FloatWidth::F64)           => (3, ".double", 8, true),
                 _ => (3, ".quad", 8, false),
@@ -55,6 +67,13 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             }
             writeln!(out, "{}:", symbol).unwrap();
             match &g.initializer {
+                Some(GlobalInit::IntArray(vs))
+                    if matches!(elem_ty.as_ref(), IrType::Int(IntWidth::I128)) =>
+                {
+                    for v in vs {
+                        emit_i128_words(&mut out, *v);
+                    }
+                }
                 Some(GlobalInit::IntArray(vs)) if !is_float => {
                     for v in vs {
                         writeln!(out, "    {} {}", directive, v).unwrap();
@@ -69,6 +88,17 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                     let byte_size = count * (elem_bytes as u64);
                     writeln!(out, "    .space {}", byte_size).unwrap();
                 }
+            }
+            continue;
+        }
+
+        if matches!(g.ty, IrType::Int(IntWidth::I128)) {
+            writeln!(out, ".p2align 4").unwrap();
+            writeln!(out, "{}:", symbol).unwrap();
+            match &g.initializer {
+                Some(GlobalInit::Int(v)) => emit_i128_words(&mut out, *v),
+                Some(GlobalInit::Zero) | None => emit_i128_words(&mut out, 0),
+                _ => writeln!(out, "    .space 16").unwrap(),
             }
             continue;
         }
@@ -726,5 +756,45 @@ mod tests {
         assert!(asm.contains("b.ne"), "missing conditional branch: {}", asm);
         assert!(asm.contains("then_"), "missing then label: {}", asm);
         assert!(asm.contains("else_"), "missing else label: {}", asm);
+    }
+
+    #[test]
+    fn emit_i128_scalar_global_as_two_quads() {
+        let asm = emit_globals(&[Global {
+            name: "big".into(),
+            ty: IrType::Int(IntWidth::I128),
+            initializer: Some(GlobalInit::Int(18_446_744_073_709_551_616i128)),
+        }]);
+
+        assert!(asm.contains(".section __DATA,__data"), "missing data section:\n{}", asm);
+        assert!(asm.contains(".private_extern _big"), "missing global symbol:\n{}", asm);
+        assert!(asm.contains(".p2align 4"), "i128 globals need 16-byte alignment:\n{}", asm);
+        assert_eq!(asm.matches(".quad").count(), 2, "scalar i128 should emit two quads:\n{}", asm);
+        assert!(
+            asm.contains(".quad 0x0000000000000000\n    .quad 0x0000000000000001"),
+            "scalar i128 should emit low/high 64-bit words in memory order:\n{}",
+            asm
+        );
+    }
+
+    #[test]
+    fn emit_i128_array_global_as_word_pairs() {
+        let asm = emit_globals(&[Global {
+            name: "arr".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I128)), 2),
+            initializer: Some(GlobalInit::IntArray(vec![1, -1])),
+        }]);
+
+        assert_eq!(asm.matches(".quad").count(), 4, "two i128 elements should emit four quads:\n{}", asm);
+        assert!(
+            asm.contains(".quad 0x0000000000000001\n    .quad 0x0000000000000000"),
+            "positive i128 array element should preserve low/high word order:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(".quad 0xffffffffffffffff\n    .quad 0xffffffffffffffff"),
+            "negative i128 array element should preserve two's-complement words:\n{}",
+            asm
+        );
     }
 }
