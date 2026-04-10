@@ -338,6 +338,95 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 );
                 return;
             }
+            InstKind::IAdd(a, b) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                let lhs_slot = ctx.lookup_wide_slot(*a);
+                let rhs_slot = ctx.lookup_wide_slot(*b);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    lhs_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_i128_add_from_slot(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    rhs_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                    PhysReg::Gp(8),
+                );
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
+            InstKind::ISub(a, b) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                let lhs_slot = ctx.lookup_wide_slot(*a);
+                let rhs_slot = ctx.lookup_wide_slot(*b);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    lhs_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_i128_sub_from_slot(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    rhs_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                    PhysReg::Gp(8),
+                );
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
+            InstKind::INeg(a) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                let src_slot = ctx.lookup_wide_slot(*a);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    src_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_i128_neg(
+                    mf,
+                    mb,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
             InstKind::Load(addr) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
                 if let Some(&offset) = ctx.alloca_offsets.get(addr) {
@@ -1597,6 +1686,24 @@ fn emit_store_phys_i128_pair(
     });
 }
 
+fn emit_load_phys_u64(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    base: MachineOperand,
+    offset: i64,
+    dest: PhysReg,
+) {
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::LdrImm,
+        operands: vec![
+            MachineOperand::PhysReg(dest),
+            base,
+            MachineOperand::Imm(offset),
+        ],
+        def: None,
+    });
+}
+
 fn emit_load_phys_i128_pair(
     mf: &mut MachineFunction,
     mb: MBlockId,
@@ -1612,6 +1719,89 @@ fn emit_load_phys_i128_pair(
             MachineOperand::PhysReg(hi),
             base,
             MachineOperand::Imm(offset),
+        ],
+        def: None,
+    });
+}
+
+fn emit_i128_add_from_slot(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    rhs_base: MachineOperand,
+    rhs_offset: i64,
+    lo: PhysReg,
+    hi: PhysReg,
+    scratch: PhysReg,
+) {
+    emit_load_phys_u64(mf, mb, rhs_base.clone(), rhs_offset, scratch);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::AddsReg,
+        operands: vec![
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(scratch),
+        ],
+        def: None,
+    });
+    emit_load_phys_u64(mf, mb, rhs_base, rhs_offset + 8, scratch);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::AdcReg,
+        operands: vec![
+            MachineOperand::PhysReg(hi),
+            MachineOperand::PhysReg(hi),
+            MachineOperand::PhysReg(scratch),
+        ],
+        def: None,
+    });
+}
+
+fn emit_i128_sub_from_slot(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    rhs_base: MachineOperand,
+    rhs_offset: i64,
+    lo: PhysReg,
+    hi: PhysReg,
+    scratch: PhysReg,
+) {
+    emit_load_phys_u64(mf, mb, rhs_base.clone(), rhs_offset, scratch);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::SubsReg,
+        operands: vec![
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(scratch),
+        ],
+        def: None,
+    });
+    emit_load_phys_u64(mf, mb, rhs_base, rhs_offset + 8, scratch);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::SbcReg,
+        operands: vec![
+            MachineOperand::PhysReg(hi),
+            MachineOperand::PhysReg(hi),
+            MachineOperand::PhysReg(scratch),
+        ],
+        def: None,
+    });
+}
+
+fn emit_i128_neg(mf: &mut MachineFunction, mb: MBlockId, lo: PhysReg, hi: PhysReg) {
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::SubsReg,
+        operands: vec![
+            MachineOperand::PhysReg(lo),
+            MachineOperand::PhysReg(PhysReg::Xzr),
+            MachineOperand::PhysReg(lo),
+        ],
+        def: None,
+    });
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::SbcReg,
+        operands: vec![
+            MachineOperand::PhysReg(hi),
+            MachineOperand::PhysReg(PhysReg::Xzr),
+            MachineOperand::PhysReg(hi),
         ],
         def: None,
     });

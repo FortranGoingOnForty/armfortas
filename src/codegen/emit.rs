@@ -261,6 +261,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
     match inst.opcode {
         ArmOpcode::AddReg => format!("add {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::AddsReg => format!("adds {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::AdcReg => format!("adc {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::AddImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
@@ -280,6 +284,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             fmt_sp_imm("add", &dest, &base, imm)
         }
         ArmOpcode::SubReg => format!("sub {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::SubsReg => format!("subs {}, {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::SbcReg => format!("sbc {}, {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
         ArmOpcode::SubImm => {
             let imm: i64 = match &inst.operands[2] {

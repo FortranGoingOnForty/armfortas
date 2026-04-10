@@ -53,6 +53,57 @@ fn simple_local_i128_roundtrip_emits_wide_pair_moves_at_o0() {
 }
 
 #[test]
+fn simple_local_i128_add_emits_carry_chain_ops_at_o0() {
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_add.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+
+    assert!(
+        asm.contains("adds x16, x16, x8"),
+        "backend should use ADDS for the low i128 word:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("adc x17, x17, x8"),
+        "backend should use ADC for the high i128 word:\n{}",
+        asm
+    );
+}
+
+#[test]
+fn simple_local_i128_subneg_emits_borrow_chain_ops_at_o0() {
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_subneg.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+
+    assert!(
+        asm.contains("subs x16, x16, x8"),
+        "backend should use SUBS for the low i128 subtraction word:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("sbc x17, x17, x8"),
+        "backend should use SBC for the high i128 subtraction word:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("subs x16, xzr, x16"),
+        "backend should use SUBS from xzr for i128 negation:\n{}",
+        asm
+    );
+}
+
+#[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(

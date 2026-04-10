@@ -472,7 +472,7 @@ mod tests {
     }
 
     fn i128_reject_fixture() -> PathBuf {
-        let path = PathBuf::from("tests/fixtures").join("integer16_add.f90");
+        let path = PathBuf::from("tests/fixtures").join("integer16_mul.f90");
         assert!(path.exists(), "missing test fixture {}", path.display());
         path
     }
@@ -545,6 +545,29 @@ mod tests {
         compile(&opts).expect("simple integer(16) memory traffic should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
         assert!(asm.contains("stp x16, x17"), "expected paired i128 store in asm:\n{}", asm);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn backend_allows_simple_integer16_add_codegen_at_o0() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_add_{}_{}.s",
+            std::process::id(),
+            "o0"
+        ));
+        let opts = Options {
+            input: PathBuf::from("tests/fixtures").join("integer16_add.f90"),
+            output: Some(output.clone()),
+            emit_asm: true,
+            emit_obj: false,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: OptLevel::O0,
+        };
+
+        compile(&opts).expect("simple integer(16) add should codegen at O0");
+        let asm = fs::read_to_string(&output).expect("missing emitted assembly");
+        assert!(asm.contains("adds x16, x16, x8"), "expected i128 add carry chain in asm:\n{}", asm);
         let _ = fs::remove_file(output);
     }
 }

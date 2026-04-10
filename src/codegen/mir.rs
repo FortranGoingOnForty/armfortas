@@ -32,8 +32,12 @@ pub enum RegClass {
 pub enum ArmOpcode {
     // ---- Integer arithmetic ----
     AddReg,      // ADD Xd, Xn, Xm
+    AddsReg,     // ADDS Xd, Xn, Xm (sets flags)
+    AdcReg,      // ADC Xd, Xn, Xm
     AddImm,      // ADD Xd, Xn, #imm
     SubReg,      // SUB Xd, Xn, Xm
+    SubsReg,     // SUBS Xd, Xn, Xm (sets flags)
+    SbcReg,      // SBC Xd, Xn, Xm
     SubImm,      // SUB Xd, Xn, #imm
     Mul,         // MUL Xd, Xn, Xm
     Sdiv,        // SDIV Xd, Xn, Xm
