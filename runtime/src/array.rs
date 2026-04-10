@@ -21,6 +21,227 @@ pub extern "C" fn afs_check_bounds(index: i64, lower: i64, upper: i64) {
     }
 }
 
+fn bulk_len(n: i64) -> usize {
+    if n <= 0 {
+        0
+    } else {
+        usize::try_from(n).unwrap_or(0)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fill_i32_impl(dest: *mut i32, len: usize, value: i32) {
+    use core::arch::aarch64::{vdupq_n_s32, vst1q_s32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_s32(value);
+    while i + 4 <= len {
+        vst1q_s32(dest.add(i), splat);
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = value;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn fill_i32_impl(dest: *mut i32, len: usize, value: i32) {
+    for i in 0..len {
+        *dest.add(i) = value;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fill_f32_impl(dest: *mut f32, len: usize, value: f32) {
+    use core::arch::aarch64::{vdupq_n_f32, vst1q_f32};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f32(value);
+    while i + 4 <= len {
+        vst1q_f32(dest.add(i), splat);
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = value;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn fill_f32_impl(dest: *mut f32, len: usize, value: f32) {
+    for i in 0..len {
+        *dest.add(i) = value;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fill_f64_impl(dest: *mut f64, len: usize, value: f64) {
+    use core::arch::aarch64::{vdupq_n_f64, vst1q_f64};
+
+    let mut i = 0usize;
+    let splat = vdupq_n_f64(value);
+    while i + 2 <= len {
+        vst1q_f64(dest.add(i), splat);
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = value;
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn fill_f64_impl(dest: *mut f64, len: usize, value: f64) {
+    for i in 0..len {
+        *dest.add(i) = value;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    use core::arch::aarch64::{vaddq_s32, vld1q_s32, vst1q_s32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_s32(lhs.add(i));
+        let b = vld1q_s32(rhs.add(i));
+        vst1q_s32(dest.add(i), vaddq_s32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_i32_impl(dest: *mut i32, lhs: *const i32, rhs: *const i32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    use core::arch::aarch64::{vaddq_f32, vld1q_f32, vst1q_f32};
+
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let a = vld1q_f32(lhs.add(i));
+        let b = vld1q_f32(rhs.add(i));
+        vst1q_f32(dest.add(i), vaddq_f32(a, b));
+        i += 4;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_f32_impl(dest: *mut f32, lhs: *const f32, rhs: *const f32, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn add_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    use core::arch::aarch64::{vaddq_f64, vld1q_f64, vst1q_f64};
+
+    let mut i = 0usize;
+    while i + 2 <= len {
+        let a = vld1q_f64(lhs.add(i));
+        let b = vld1q_f64(rhs.add(i));
+        vst1q_f64(dest.add(i), vaddq_f64(a, b));
+        i += 2;
+    }
+    while i < len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn add_f64_impl(dest: *mut f64, lhs: *const f64, rhs: *const f64, len: usize) {
+    for i in 0..len {
+        *dest.add(i) = *lhs.add(i) + *rhs.add(i);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fill_i32(dest: *mut i32, n: i64, value: i32) {
+    if dest.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { fill_i32_impl(dest, len, value); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fill_f32(dest: *mut f32, n: i64, value: f32) {
+    if dest.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { fill_f32_impl(dest, len, value); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fill_f64(dest: *mut f64, n: i64, value: f64) {
+    if dest.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { fill_f64_impl(dest, len, value); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_i32(dest: *mut i32, lhs: *const i32, rhs: *const i32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_i32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_f32(dest: *mut f32, lhs: *const f32, rhs: *const f32, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_f32_impl(dest, lhs, rhs, len); }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_add_f64(dest: *mut f64, lhs: *const f64, rhs: *const f64, n: i64) {
+    if dest.is_null() || lhs.is_null() || rhs.is_null() {
+        return;
+    }
+    let len = bulk_len(n);
+    if len == 0 {
+        return;
+    }
+    unsafe { add_f64_impl(dest, lhs, rhs, len); }
+}
+
 // ---- ALLOCATE ----
 
 /// Allocate an array described by the given dimensions.
@@ -450,6 +671,31 @@ mod tests {
         assert!(desc.is_allocated());
         assert_eq!(desc.total_elements(), 0);
         afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn fill_i32_bulk_kernel() {
+        let mut data = [0_i32; 8];
+        afs_fill_i32(data.as_mut_ptr(), data.len() as i64, 7);
+        assert_eq!(data, [7, 7, 7, 7, 7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn array_add_i32_bulk_kernel() {
+        let lhs = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let rhs = [10_i32, 20, 30, 40, 50, 60, 70, 80];
+        let mut out = [0_i32; 8];
+        afs_array_add_i32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        assert_eq!(out, [11, 22, 33, 44, 55, 66, 77, 88]);
+    }
+
+    #[test]
+    fn array_add_f64_bulk_kernel() {
+        let lhs = [1.5_f64, 2.5, 3.5, 4.5];
+        let rhs = [10.0_f64, 20.0, 30.0, 40.0];
+        let mut out = [0.0_f64; 4];
+        afs_array_add_f64(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        assert_eq!(out, [11.5, 22.5, 33.5, 44.5]);
     }
 }
 
