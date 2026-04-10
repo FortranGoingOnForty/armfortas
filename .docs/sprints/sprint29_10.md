@@ -213,11 +213,12 @@ Landed so far:
 - internal-only `-O0` pair-register `i128` params, returns, and same-module calls
 - external `-O0` pair-register `i128` call/return codegen through real Fortran interface
   declarations, with asm/object determinism coverage
+- linked cross-object `-O0` execution against a foreign `__int128` helper object, with
+  linked-binary determinism coverage
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
 
 Still missing inside the same cleanup item:
-- linked cross-object/runtime interop that executes those external `i128` calls end to end
 - optimized (`-O1+`) pipeline support
 
 ### Planned ABI Jump
@@ -230,9 +231,8 @@ Working assumption from local clang ABI probes on Apple ARM64:
 - `__int128` params consume register pairs `xN/xN+1`
 
 Staged plan:
-1. linked cross-object/runtime coverage for the same pair-register ABI surface
-2. only after the ABI surface is real, widen optimizer support beyond raw `-O0`
+1. widen optimizer support beyond raw `-O0`
 
 Timing:
 - keep landing bounded local `-O0` `i128` slices while they are still clearly separate
-- once the remaining work is mostly ABI-visible, take the dedicated ABI tranche head-on
+- once the ABI surface is fully proven at `-O0`, take optimized-pipeline widening head-on
