@@ -26,6 +26,7 @@ use super::dead_func::DeadFuncElim;
 use super::dead_arg::DeadArgElim;
 use super::const_arg::ConstArgSpecialize;
 use super::return_prop::ReturnPropagate;
+use super::fast_math::FastMathReassoc;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
@@ -197,7 +198,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Gvn));
             pm.add(Box::new(Dce));
         }
-        OptLevel::O3 | OptLevel::Ofast => {
+        OptLevel::O3 => {
             // O2 passes + loop unrolling + interchange.
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
@@ -228,6 +229,38 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
             pm.add(Box::new(Dce));
         }
+        OptLevel::Ofast => {
+            // O3 plus Ofast-only fast-math reassociation.
+            pm.add(Box::new(CallResolve));
+            pm.add(Box::new(Mem2Reg));
+            pm.add(Box::new(ConstFold));
+            pm.add(Box::new(Sroa));
+            pm.add(Box::new(Mem2Reg));
+            pm.add(Box::new(Inline::for_level(OptLevel::O3)));
+            pm.add(Box::new(ConstArgSpecialize));
+            pm.add(Box::new(DeadArgElim));
+            pm.add(Box::new(ReturnPropagate));
+            pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(DeadFuncElim));
+            pm.add(Box::new(Bce));
+            pm.add(Box::new(StrengthReduce));
+            pm.add(Box::new(LocalLsf));
+            pm.add(Box::new(GlobalLsf));
+            pm.add(Box::new(LocalCse));
+            pm.add(Box::new(PreheaderInsert));
+            pm.add(Box::new(LoopPeel));
+            pm.add(Box::new(LoopUnswitch));
+            pm.add(Box::new(Licm));
+            pm.add(Box::new(ConstProp));
+            pm.add(Box::new(Dse));
+            pm.add(Box::new(LoopInterchange));
+            pm.add(Box::new(LoopFission));
+            pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(LoopUnroll));
+            pm.add(Box::new(FastMathReassoc));
+            pm.add(Box::new(Gvn));
+            pm.add(Box::new(Dce));
+        }
     }
     pm
 }
@@ -239,6 +272,7 @@ mod tests {
     #[test]
     fn parse_flags() {
         assert_eq!(OptLevel::parse_flag("O0"), Some(OptLevel::O0));
+        assert_eq!(OptLevel::parse_flag("Os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::parse_flag("O3"), Some(OptLevel::O3));
         assert_eq!(OptLevel::parse_flag("Ofast"), Some(OptLevel::Ofast));
         assert_eq!(OptLevel::parse_flag("O9"), None);
@@ -276,5 +310,21 @@ mod tests {
                 names
             );
         }
+    }
+
+    #[test]
+    fn ofast_enables_fast_math_reassoc_but_o3_does_not() {
+        let o3 = build_pipeline(OptLevel::O3).pass_names();
+        let ofast = build_pipeline(OptLevel::Ofast).pass_names();
+        assert!(
+            !o3.contains(&"fast-math-reassoc"),
+            "O3 should stay strict, got {:?}",
+            o3
+        );
+        assert!(
+            ofast.contains(&"fast-math-reassoc"),
+            "Ofast should include fast-math reassociation, got {:?}",
+            ofast
+        );
     }
 }

@@ -110,7 +110,7 @@ Inquiry: `KIND`, `SELECTED_INT_KIND`, `SELECTED_REAL_KIND`, `HUGE`, `TINY`, `EPS
 | `-O1` | mem2reg, constant folding, local CSE, constant propagation, DCE |
 | `-O2` | `-O1` + strength reduction, LICM |
 | `-O3` | Same as `-O2` (vectorization and IPO deferred — see below) |
-| `-Ofast` | Same as `-O3` (fast-math deferred) |
+| `-Ofast` | `-O3` + fast-math reassociation for float add/sub constant chains |
 
 Correctness invariant: every program that produces correct output at `-O0` must produce identical output at `-O1`, `-O2`, `-O3`. This is enforced by the end-to-end test suite at every level.
 
