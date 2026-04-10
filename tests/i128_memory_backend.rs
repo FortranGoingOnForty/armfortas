@@ -147,6 +147,71 @@ fn simple_local_i128_eqne_emits_pair_compare_ops_at_o0() {
 }
 
 #[test]
+fn simple_local_i128_ordered_compares_emit_signed_and_unsigned_limb_checks_at_o0() {
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_ordered_branch.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+
+    assert!(
+        asm.contains("cset w10, lt"),
+        "backend should use signed high-limb compare for i128 lt/le:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w8, lo"),
+        "backend should use unsigned low-limb compare for strict ordered i128 compares:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w8, ls"),
+        "backend should use unsigned low-limb <= compare for i128 le:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w10, gt"),
+        "backend should use signed high-limb compare for i128 gt/ge:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w8, hi"),
+        "backend should use unsigned low-limb > compare for i128 gt:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("cset w8, hs"),
+        "backend should use unsigned low-limb >= compare for i128 ge:\n{}",
+        asm
+    );
+}
+
+#[test]
+fn simple_local_i128_ordered_branch_runs_at_o0() {
+    let result = capture_from_path(&CaptureRequest {
+        input: fixture("integer16_ordered_branch.f90"),
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    })
+    .expect("ordered i128 branch program should run");
+
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run capture");
+
+    assert_eq!(run.exit_code, 0, "expected successful ordered branch run:\n{:#?}", run);
+    assert!(
+        run.stdout.contains('4'),
+        "ordered i128 branch program should print score 4:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(
