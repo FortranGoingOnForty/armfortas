@@ -25,9 +25,9 @@ Mostly landed:
 - preprocessor emission tracking uses `skip_depth`
 
 Still missing or partial:
-- `integer(16)` / `I128` is only partially staged: raw IR, globals, and local `-O0`
-  non-ABI codegen exist, but ABI-visible params/returns/calls and optimized-pipeline
-  support are still missing
+- `integer(16)` / `I128` is still only partially staged: raw IR, globals, local `-O0`
+  codegen, ABI-visible params/returns/calls, and a restricted `-O1` optimizer lane
+  now exist, but broad optimized-pipeline support is still missing
 - preprocessor expansion is still split across `expand_condition_macros` and
   `expand_macros_inner`
 
@@ -113,7 +113,8 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 
 - `-Os` exists in the IR pipeline but is not exposed by the driver CLI yet
 - `-Ofast` currently reuses the O3 pipeline shape and has no real fast-math consumer
-- `integer(16)` / `I128` still needs ABI-visible codegen and optimized-pipeline support
+- `integer(16)` / `I128` still needs broad optimized-pipeline support beyond the
+  newly landed restricted `-O1` lane
 - preprocessor codepath unification from 29.5 is still unfinished
 - 29.6 still lacks any true NEON/SIMD vectorizer implementation
 
@@ -215,11 +216,18 @@ Landed so far:
   declarations, with asm/object determinism coverage
 - linked cross-object `-O0` execution against a foreign `__int128` helper object, with
   linked-binary determinism coverage
+- restricted `-O1` optimized-pipeline support for non-global `i128` modules through an
+  `i128`-safe pass set (`CallResolve`, `ConstFold`, `SimplifyCfg`, `Dce`)
+- `-O1` source-level coverage proving `integer(16)` constant folding can remove unsupported
+  wide arithmetic before backend selection, with object determinism and linked cross-object
+  execution coverage
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
 
 Still missing inside the same cleanup item:
-- optimized (`-O1+`) pipeline support
+- optimized support beyond the restricted `-O1` lane
+- optimizer/backend widening for `i128` values that survive into block params, promoted SSA
+  values, and other pass shapes introduced by the full O2/O3/Os/Ofast pipelines
 
 ### Planned ABI Jump
 
@@ -231,8 +239,9 @@ Working assumption from local clang ABI probes on Apple ARM64:
 - `__int128` params consume register pairs `xN/xN+1`
 
 Staged plan:
-1. widen optimizer support beyond raw `-O0`
+1. widen optimizer support beyond the current restricted `-O1` lane
 
 Timing:
-- keep landing bounded local `-O0` `i128` slices while they are still clearly separate
-- once the ABI surface is fully proven at `-O0`, take optimized-pipeline widening head-on
+- keep landing bounded `i128` slices while the support boundary is still crisp and testable
+- use the restricted `-O1` lane as the proving ground before widening to the full
+  optimized pipelines
