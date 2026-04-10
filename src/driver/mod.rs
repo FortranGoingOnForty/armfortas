@@ -230,7 +230,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         return Err(format!("internal error: IR verification failed:\n{}", msg));
     }
     let module_has_i128 = ir_module.contains_i128();
-    if module_has_i128 && opts.opt_level != OptLevel::O0 {
+    if ir_module.contains_i128_outside_globals() && opts.opt_level != OptLevel::O0 {
         return Err(
             "integer(16) / i128 optimization is not yet supported; use -O0 --emit-ir for now"
                 .into(),
@@ -265,7 +265,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         return Ok(());
     }
 
-    if module_has_i128 {
+    if module_has_i128 && !ir_module.i128_backend_data_only_supported() {
         return Err(
             "backend does not yet support integer(16) / i128 codegen; use --emit-ir for now"
                 .into(),

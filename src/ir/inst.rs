@@ -410,6 +410,34 @@ impl Module {
                     })
             })
     }
+
+    /// True when `i128` appears anywhere outside module-global storage.
+    ///
+    /// Globals-only `i128` is the first staged backend surface we support:
+    /// the optimizer may ignore it and the emitter can lay it out as raw data.
+    /// Parameters, returns, instruction results, block params, and extern
+    /// signatures still imply unsupported ABI or codegen work.
+    pub fn contains_i128_outside_globals(&self) -> bool {
+        self.extern_funcs.iter().any(|func| sig_contains_i128(self, &func.sig))
+            || self.functions.iter().any(|func| {
+                type_contains_i128(self, &func.return_type)
+                    || func.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                    || func.blocks.iter().any(|block| {
+                        block.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                            || block.insts.iter().any(|inst| type_contains_i128(self, &inst.ty))
+                    })
+            })
+    }
+
+    /// True when every `i128` use in the module is a global data shape that
+    /// the current backend emitter can lay out directly.
+    pub fn i128_backend_data_only_supported(&self) -> bool {
+        !self.contains_i128_outside_globals()
+            && self
+                .globals
+                .iter()
+                .all(|global| global_i128_backend_data_supported(self, global))
+    }
 }
 
 fn sig_contains_i128(module: &Module, sig: &super::types::FuncSig) -> bool {
@@ -427,5 +455,21 @@ fn type_contains_i128(module: &Module, ty: &IrType) -> bool {
             .is_some_and(|def| def.fields.iter().any(|(_, field_ty)| type_contains_i128(module, field_ty))),
         IrType::FuncPtr(sig) => sig_contains_i128(module, sig),
         _ => false,
+    }
+}
+
+fn global_i128_backend_data_supported(module: &Module, global: &Global) -> bool {
+    match &global.ty {
+        IrType::Int(IntWidth::I128) => matches!(
+            global.initializer,
+            Some(GlobalInit::Int(_)) | Some(GlobalInit::Zero) | None
+        ),
+        IrType::Array(elem_ty, _) if matches!(elem_ty.as_ref(), IrType::Int(IntWidth::I128)) => {
+            matches!(
+                global.initializer,
+                Some(GlobalInit::IntArray(_)) | Some(GlobalInit::Zero) | None
+            )
+        }
+        _ => !type_contains_i128(module, &global.ty),
     }
 }

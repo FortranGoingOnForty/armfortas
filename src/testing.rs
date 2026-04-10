@@ -366,7 +366,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         })
         && request.opt_level != OptLevel::O0;
 
-    if module_has_i128 && needs_optimized_pipeline {
+    if ir_module.contains_i128_outside_globals() && needs_optimized_pipeline {
         return Err(CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
@@ -411,7 +411,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     }
 
     let backend_ir = optimized_module.as_ref().unwrap_or(&ir_module);
-    if module_has_i128 {
+    if module_has_i128 && !backend_ir.i128_backend_data_only_supported() {
         return Err(CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
@@ -443,7 +443,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         );
     }
 
-    let asm_text = emit_module_asm(&allocated);
+    let asm_text = emit_module_asm(backend_ir, &allocated);
     if wants(Stage::Asm) {
         stages.insert(Stage::Asm, CapturedStage::Text(asm_text.clone()));
     }
@@ -792,12 +792,17 @@ fn escape_const_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn emit_module_asm(allocated: &[MachineFunction]) -> String {
+fn emit_module_asm(module: &crate::ir::inst::Module, allocated: &[MachineFunction]) -> String {
     let mut asm_text = String::new();
     asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
     for mf in allocated {
         asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
         asm_text.push_str(&emit::emit_function(mf));
+        asm_text.push('\n');
+    }
+
+    if !module.globals.is_empty() {
+        asm_text.push_str(&emit::emit_globals(&module.globals));
         asm_text.push('\n');
     }
 
