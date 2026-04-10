@@ -229,6 +229,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             .join("\n");
         return Err(format!("internal error: IR verification failed:\n{}", msg));
     }
+    let module_has_i128 = ir_module.contains_i128();
+    if module_has_i128 && opts.opt_level != OptLevel::O0 {
+        return Err(
+            "integer(16) / i128 optimization is not yet supported; use -O0 --emit-ir for now"
+                .into(),
+        );
+    }
 
     // 6.5. Run IR optimization pipeline.
     //
@@ -256,6 +263,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         fs::write(&out, &ir_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
         return Ok(());
+    }
+
+    if module_has_i128 {
+        return Err(
+            "backend does not yet support integer(16) / i128 codegen; use --emit-ir for now"
+                .into(),
+        );
     }
 
     // 7. Instruction selection.
@@ -433,6 +447,7 @@ fn find_runtime_lib() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_os_optimization_flag() {
@@ -448,5 +463,59 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
+
+    fn i128_fixture() -> PathBuf {
+        let path = PathBuf::from("tests/fixtures").join("integer16_ir.f90");
+        assert!(path.exists(), "missing test fixture {}", path.display());
+        path
+    }
+
+    #[test]
+    fn emit_ir_allows_integer16_staging_at_o0() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_ir_{}_{}.ir",
+            std::process::id(),
+            "o0"
+        ));
+        let opts = Options {
+            input: i128_fixture(),
+            output: Some(output.clone()),
+            emit_asm: false,
+            emit_obj: false,
+            emit_ir: true,
+            preprocess_only: false,
+            opt_level: OptLevel::O0,
+        };
+
+        compile(&opts).expect("O0 --emit-ir should support integer(16) staging");
+        let ir = fs::read_to_string(&output).expect("missing emitted IR");
+        assert!(ir.contains("i128"), "emitted IR should expose integer(16) as i128:\n{}", ir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn backend_rejects_integer16_codegen_for_now() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_bin_{}_{}",
+            std::process::id(),
+            "o0"
+        ));
+        let opts = Options {
+            input: i128_fixture(),
+            output: Some(output),
+            emit_asm: false,
+            emit_obj: false,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: OptLevel::O0,
+        };
+
+        let err = compile(&opts).expect_err("backend should reject integer(16) until i128 codegen lands");
+        assert!(
+            err.contains("backend does not yet support integer(16) / i128 codegen"),
+            "unexpected backend rejection:\n{}",
+            err
+        );
     }
 }

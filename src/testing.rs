@@ -356,6 +356,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     if wants(Stage::Ir) {
         stages.insert(Stage::Ir, CapturedStage::Text(ir_text.clone()));
     }
+    let module_has_i128 = ir_module.contains_i128();
     let needs_optimized_pipeline =
         request.requested.iter().any(|stage| {
             matches!(
@@ -364,6 +365,16 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             )
         })
         && request.opt_level != OptLevel::O0;
+
+    if module_has_i128 && needs_optimized_pipeline {
+        return Err(CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Ir,
+            detail: "integer(16) / i128 optimization is not yet supported; capture raw IR at O0 for now".into(),
+            stages,
+        });
+    }
 
     let optimized_module = if needs_optimized_pipeline {
         let mut optimized = ir_module.clone();
@@ -400,6 +411,15 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     }
 
     let backend_ir = optimized_module.as_ref().unwrap_or(&ir_module);
+    if module_has_i128 {
+        return Err(CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Ir,
+            detail: "backend does not yet support integer(16) / i128 codegen; capture IR at O0 for now".into(),
+            stages,
+        });
+    }
     let machine_funcs = isel::select_module(backend_ir);
     if wants(Stage::Mir) {
         stages.insert(

@@ -396,4 +396,36 @@ impl Module {
         self.struct_defs.push(def);
         id
     }
+
+    /// True when any live IR surface in the module uses `i128`.
+    pub fn contains_i128(&self) -> bool {
+        self.globals.iter().any(|global| type_contains_i128(self, &global.ty))
+            || self.extern_funcs.iter().any(|func| sig_contains_i128(self, &func.sig))
+            || self.functions.iter().any(|func| {
+                type_contains_i128(self, &func.return_type)
+                    || func.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                    || func.blocks.iter().any(|block| {
+                        block.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                            || block.insts.iter().any(|inst| type_contains_i128(self, &inst.ty))
+                    })
+            })
+    }
+}
+
+fn sig_contains_i128(module: &Module, sig: &super::types::FuncSig) -> bool {
+    type_contains_i128(module, &sig.ret)
+        || sig.params.iter().any(|param| type_contains_i128(module, param))
+}
+
+fn type_contains_i128(module: &Module, ty: &IrType) -> bool {
+    match ty {
+        IrType::Int(IntWidth::I128) => true,
+        IrType::Ptr(inner) | IrType::Array(inner, _) => type_contains_i128(module, inner),
+        IrType::Struct(id) => module
+            .struct_defs
+            .get(*id as usize)
+            .is_some_and(|def| def.fields.iter().any(|(_, field_ty)| type_contains_i128(module, field_ty))),
+        IrType::FuncPtr(sig) => sig_contains_i128(module, sig),
+        _ => false,
+    }
 }
