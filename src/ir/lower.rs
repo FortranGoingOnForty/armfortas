@@ -100,6 +100,8 @@ struct LowerCtx<'a> {
     /// Pre-populated by `collect_optional_params` so call sites can pass
     /// null pointers for absent optional arguments (PRESENT support).
     optional_params: &'a HashMap<String, Vec<bool>>,
+    /// Lowercase names of functions declared ELEMENTAL in this compilation unit.
+    elemental_funcs: &'a HashSet<String>,
     /// Map from Fortran statement label (u64) to the IR basic block that
     /// begins at that label. Pre-populated by `collect_label_blocks` before
     /// lowering so that GOTO can branch forward as well as backward.
@@ -113,6 +115,7 @@ impl<'a> LowerCtx<'a> {
         type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
         alloc_return_funcs: &'a HashSet<String>,
         optional_params: &'a HashMap<String, Vec<bool>>,
+        elemental_funcs: &'a HashSet<String>,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -126,6 +129,7 @@ impl<'a> LowerCtx<'a> {
             is_alloc_return: false,
             alloc_return_funcs,
             optional_params,
+            elemental_funcs,
             label_blocks: HashMap::new(),
         }
     }
@@ -213,12 +217,27 @@ pub fn lower_file(
         collect_optional_params(&unit.node, &mut optional_params);
     }
 
+    let mut elemental_funcs: HashSet<String> = HashSet::new();
+    for unit in units {
+        collect_elemental_funcs(&unit.node, &mut elemental_funcs);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
     let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
     for unit in units {
-        lower_unit(&mut module, unit, st, &globals, type_layouts, &no_host, &alloc_return_funcs, &optional_params);
+        lower_unit(
+            &mut module,
+            unit,
+            st,
+            &globals,
+            type_layouts,
+            &no_host,
+            &alloc_return_funcs,
+            &optional_params,
+            &elemental_funcs,
+        );
     }
     module
 }
@@ -312,6 +331,31 @@ fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<boo
         }
         ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
             for sub in contains { collect_optional_params(&sub.node, out); }
+        }
+        _ => {}
+    }
+}
+
+/// Collect lowercase names of functions declared ELEMENTAL. Whole-array
+/// lowering uses this side table to recognize elemental calls before symbol
+/// resolution has become IR call refs.
+fn collect_elemental_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
+    use crate::ast::unit::Prefix;
+    match unit {
+        ProgramUnit::Function { name, prefix, contains, .. } => {
+            if prefix.iter().any(|p| matches!(p, Prefix::Elemental)) {
+                out.insert(name.to_lowercase());
+            }
+            for sub in contains {
+                collect_elemental_funcs(&sub.node, out);
+            }
+        }
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Subroutine { contains, .. }
+        | ProgramUnit::Module { contains, .. } => {
+            for sub in contains {
+                collect_elemental_funcs(&sub.node, out);
+            }
         }
         _ => {}
     }
@@ -840,6 +884,7 @@ fn lower_unit(
     host_uses: &[crate::ast::decl::SpannedDecl],
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
+    elemental_funcs: &HashSet<String>,
 ) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
@@ -849,7 +894,7 @@ fn lower_unit(
             // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -886,7 +931,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
@@ -920,7 +965,7 @@ fn lower_unit(
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -985,7 +1030,7 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
@@ -1070,7 +1115,7 @@ fn lower_unit(
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1164,7 +1209,7 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
             }
         }
         ProgramUnit::Module { uses, contains, .. } => {
@@ -1175,7 +1220,7 @@ fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs);
             }
         }
         _ => {}
@@ -3747,6 +3792,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                             CharKind::None => {
                                 if !info.dims.is_empty() || info.allocatable {
+                                    if try_lower_elemental_array_assign(b, ctx, name, &info, value) {
+                                        return;
+                                    }
                                     if let Expr::FunctionCall { callee, args: call_args } = &value.node {
                                         if let Expr::Name { name: callee_name } = &callee.node {
                                             let callee_key = callee_name.to_lowercase();
@@ -3784,7 +3832,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 vec![src_desc, stat], IrType::Void);
                                         }
                                     } else {
-                                        lower_array_assign(b, ctx, &info, value);
+                                        lower_array_assign(b, ctx, name, &info, value);
                                     }
                                 } else if info.derived_type.is_some() {
                                     let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
@@ -6145,6 +6193,21 @@ fn whole_array_expr_info(
         .cloned()
 }
 
+fn whole_array_named_info(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<(String, LocalInfo)> {
+    let Expr::Name { name } = &expr.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let info = locals
+        .get(&key)
+        .filter(|info| !info.dims.is_empty() || info.allocatable)
+        .cloned()?;
+    Some((key, info))
+}
+
 #[derive(Clone)]
 enum BulkArrayPlan {
     Fill {
@@ -6286,6 +6349,138 @@ fn expr_is_size_of_array(expr: &crate::ast::expr::SpannedExpr, array_name: &str)
         }
         _ => false,
     }
+}
+
+fn fresh_synth_loop_var(locals: &HashMap<String, LocalInfo>) -> String {
+    let mut idx = 0usize;
+    loop {
+        let name = if idx == 0 {
+            "afs_elem_i".to_string()
+        } else {
+            format!("afs_elem_i{}", idx)
+        };
+        if !locals.contains_key(&name) {
+            return name;
+        }
+        idx += 1;
+    }
+}
+
+fn synth_name_expr(name: &str, span: crate::lexer::Span) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(Expr::Name { name: name.to_string() }, span)
+}
+
+fn synth_int_expr(value: i64, span: crate::lexer::Span) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: value.to_string(),
+            kind: None,
+        },
+        span,
+    )
+}
+
+fn synth_indexed_array_expr(
+    array_name: &str,
+    index_name: &str,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(array_name, span)),
+            args: vec![crate::ast::expr::Argument {
+                keyword: None,
+                value: crate::ast::expr::SectionSubscript::Element(synth_name_expr(index_name, span)),
+            }],
+        },
+        span,
+    )
+}
+
+fn try_lower_elemental_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_name: &str,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_info.allocatable || dest_info.dims.len() != 1 {
+        return false;
+    }
+
+    let Expr::FunctionCall { callee, args } = &value.node else {
+        return false;
+    };
+    let Expr::Name { name: callee_name } = &callee.node else {
+        return false;
+    };
+    if !ctx.elemental_funcs.contains(&callee_name.to_lowercase()) {
+        return false;
+    }
+
+    let (dest_lower, dest_extent) = dest_info.dims[0];
+    let dest_upper = dest_lower + dest_extent - 1;
+    let loop_var = fresh_synth_loop_var(&ctx.locals);
+    let mut saw_array_arg = false;
+    let mut mapped_args = Vec::with_capacity(args.len());
+
+    for arg in args {
+        if arg.keyword.is_some() {
+            return false;
+        }
+        let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value else {
+            return false;
+        };
+
+        if let Some((array_name, array_info)) = whole_array_named_info(&ctx.locals, actual) {
+            if array_info.allocatable
+                || array_info.dims.len() != 1
+                || !bulk_arrays_compatible(dest_info, &array_info)
+            {
+                return false;
+            }
+            saw_array_arg = true;
+            mapped_args.push(crate::ast::expr::Argument {
+                keyword: None,
+                value: crate::ast::expr::SectionSubscript::Element(
+                    synth_indexed_array_expr(&array_name, &loop_var, actual.span),
+                ),
+            });
+        } else {
+            if expr_contains_array_refs(actual, &ctx.locals) {
+                return false;
+            }
+            mapped_args.push(arg.clone());
+        }
+    }
+
+    if !saw_array_arg {
+        return false;
+    }
+
+    let target = synth_indexed_array_expr(dest_name, &loop_var, value.span);
+    let mapped_value = crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(callee_name, callee.span)),
+            args: mapped_args,
+        },
+        value.span,
+    );
+    let body = vec![crate::ast::Spanned::new(
+        Stmt::Assignment {
+            target,
+            value: mapped_value,
+        },
+        value.span,
+    )];
+    let controls = vec![ConcurrentControl {
+        var: loop_var,
+        start: synth_int_expr(dest_lower, value.span),
+        end: synth_int_expr(dest_upper, value.span),
+        step: None,
+    }];
+    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    true
 }
 
 fn bulk_arrays_compatible(dest_info: &LocalInfo, other_info: &LocalInfo) -> bool {
@@ -6659,6 +6854,7 @@ fn lower_forall_nested(
 fn lower_array_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    dest_name: &str,
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) {
@@ -6667,6 +6863,10 @@ fn lower_array_assign(
     if let Expr::ArrayConstructor { values, .. } = &value.node {
         let dest_base = array_base_addr(b, dest_info);
         store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        return;
+    }
+
+    if try_lower_elemental_array_assign(b, ctx, dest_name, dest_info, value) {
         return;
     }
 
@@ -8013,6 +8213,28 @@ end program
 ");
         assert!(ir.contains("call @afs_array_add_i32("));
         assert!(!ir.contains("doconc_check"));
+    }
+
+    #[test]
+    fn lower_whole_array_elemental_assign_uses_do_concurrent_shape() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: a(4), b(4), i
+  do i = 1, 4
+    a(i) = i * 2
+  end do
+  b = shift_scale(a, 5)
+contains
+  elemental function shift_scale(x, y) result(r)
+    integer, intent(in) :: x, y
+    integer :: r
+    r = x * 2 + y
+  end function
+end program
+");
+        assert!(ir.contains("doconc_check"));
+        assert!(ir.contains("call @shift_scale("));
     }
 
     #[test]
