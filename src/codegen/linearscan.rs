@@ -438,17 +438,10 @@ fn emit_callee_store_pairs(
             // off1 is the higher slot (less negative); off2 = off1 - 8.
             let adjacent = off2 == off1 - 8;
             // STP offset must fit in 7-bit signed × 8: range -512..504.
-            let in_range = off2 >= -512 && off2 <= 504;
+            let in_range = (-512..=504).contains(&off2);
             if same_class && adjacent && in_range {
-                let (opcode, low_reg, high_reg) = if restore {
-                    // LDP: low_reg gets off2, high_reg gets off1.
-                    let op = if is_gp1 { ArmOpcode::LdpOffset } else { ArmOpcode::LdpOffset };
-                    (op, reg2, reg1)
-                } else {
-                    // STP: store low_reg at off2, high_reg at off2+8=off1.
-                    let op = if is_gp1 { ArmOpcode::StpOffset } else { ArmOpcode::StpOffset };
-                    (op, reg2, reg1)
-                };
+                let opcode = if restore { ArmOpcode::LdpOffset } else { ArmOpcode::StpOffset };
+                let (low_reg, high_reg) = (reg2, reg1);
                 result.push(MachineInst {
                     opcode,
                     operands: vec![

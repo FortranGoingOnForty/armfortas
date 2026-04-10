@@ -497,7 +497,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             // STP signed-offset range: 7-bit signed × 8 → [-512, 504].
             // Fall back to two individual STR instructions if out of range.
-            if off >= -512 && off <= 504 {
+            if (-512..=504).contains(&off) {
                 format!("stp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
                 format!("str {}, [{}, #{}]\n    str {}, [{}, #{}]",
@@ -515,7 +515,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             // LDP signed-offset range: 7-bit signed × 8 → [-512, 504].
             // Fall back to two individual LDR instructions if out of range.
-            if off >= -512 && off <= 504 {
+            if (-512..=504).contains(&off) {
                 format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
                 format!("ldr {}, [{}, #{}]\n    ldr {}, [{}, #{}]",

@@ -154,8 +154,8 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
             }
             // add xN, xM, xP  (GEP: propagate taint from either source)
             ArmOpcode::AddReg => {
-                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
-                    || op_gp(inst, 2).map_or(false, |n| tainted_regs.contains(&n))
+                if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
+                    || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n))
                 {
                     if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
                 }
@@ -163,28 +163,28 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
             // add xN, xM, #imm  (GEP with constant offset / address arithmetic)
             ArmOpcode::AddImm => {
                 if op_is_fp(inst, 1)
-                    || op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
+                    || op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
                 {
                     if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
                 }
             }
             // mov xN, xM  (register copy — propagates taint to arg reg)
             ArmOpcode::MovReg => {
-                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n)) {
+                if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n)) {
                     if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
                 }
             }
             // mul xN, xM, xP  (index computation in GEP; conservative)
             ArmOpcode::Mul => {
-                if op_gp(inst, 1).map_or(false, |n| tainted_regs.contains(&n))
-                    || op_gp(inst, 2).map_or(false, |n| tainted_regs.contains(&n))
+                if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
+                    || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n))
                 {
                     if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
                 }
             }
             // str xN, [x29, #off] — if xN is tainted, the slot becomes tainted.
             ArmOpcode::StrImm => {
-                if op_gp(inst, 0).map_or(false, |n| tainted_regs.contains(&n))
+                if op_gp(inst, 0).is_some_and(|n| tainted_regs.contains(&n))
                     && op_is_fp(inst, 1)
                 {
                     if let Some(off) = op_fp_offset(inst, 2) { tainted_slots.insert(off); }
