@@ -212,6 +212,86 @@ fn simple_local_i128_ordered_branch_runs_at_o0() {
 }
 
 #[test]
+fn simple_local_i128_select_lowers_to_ir_select_and_pair_csel_at_o0() {
+    let ir = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_select.f90"),
+            requested: BTreeSet::from([Stage::Ir]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Ir,
+    );
+    assert!(
+        ir.contains("select"),
+        "simple integer(16) diamond should lower to IR select:\n{}",
+        ir
+    );
+
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_select.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+    assert_eq!(
+        asm.matches("csel x").count(),
+        2,
+        "wide integer(16) select should lower to one CSEL per limb:\n{}",
+        asm
+    );
+}
+
+#[test]
+fn simple_local_i128_select_runs_at_o0() {
+    let result = capture_from_path(&CaptureRequest {
+        input: fixture("integer16_select.f90"),
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    })
+    .expect("integer(16) select program should run");
+
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run capture");
+
+    assert_eq!(run.exit_code, 0, "expected successful integer(16) select run:\n{:#?}", run);
+    assert!(
+        run.stdout.contains('1'),
+        "integer(16) select program should print score 1:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn simple_local_i128_select_object_snapshot_is_deterministic_at_o0() {
+    let source = fixture("integer16_select.f90");
+    let first = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Obj,
+    );
+    let second = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Obj,
+    );
+
+    assert_eq!(
+        first, second,
+        "integer(16) select object snapshots should be deterministic at O0"
+    );
+}
+
+#[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(

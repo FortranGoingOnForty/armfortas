@@ -445,6 +445,7 @@ impl Module {
     /// - module-global `i128` data
     /// - local `i128` allocas and plain memory traffic around them
     /// - `i128` constants that only flow through those memory ops
+    /// - local `i128` selects that stay entirely within stack-backed values
     ///
     /// It still excludes any ABI-visible or arithmetic use such as function
     /// params/returns, block params, calls, branches carrying `i128`, and any
@@ -531,6 +532,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::ICmp(..) if uses_i128 => true,
+        InstKind::Select(..) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Store(..) => true,
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
             !uses_i128 || inst_ty_has_i128

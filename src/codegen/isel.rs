@@ -459,6 +459,67 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 );
                 return;
             }
+            InstKind::Select(cond, tv, fv) => {
+                let arm_cond = if let Some(&fused_cond) = ctx.fused_arm_cond.get(cond) {
+                    fused_cond
+                } else {
+                    let cond_reg = ctx.lookup_vreg(*cond);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::CmpImm,
+                        operands: vec![MachineOperand::VReg(cond_reg), MachineOperand::Imm(0)],
+                        def: None,
+                    });
+                    ArmCond::Ne
+                };
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                let true_slot = ctx.lookup_wide_slot(*tv);
+                let false_slot = ctx.lookup_wide_slot(*fv);
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    true_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_load_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    false_slot as i64,
+                    PhysReg::Gp(8),
+                    PhysReg::Gp(9),
+                );
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::CselReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(16)),
+                        MachineOperand::PhysReg(PhysReg::Gp(16)),
+                        MachineOperand::PhysReg(PhysReg::Gp(8)),
+                        MachineOperand::Cond(arm_cond),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::CselReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
+                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                        MachineOperand::Cond(arm_cond),
+                    ],
+                    def: None,
+                });
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
             _ => {
                 panic!(
                     "isel: unsupported i128 instruction reached backend despite gating: {:?}",
@@ -2318,6 +2379,24 @@ mod tests {
         assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 3);
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::OrrReg));
+    }
+
+    #[test]
+    fn select_i128_uses_pair_csel_ops() {
+        let mf = select_simple(|b| {
+            let cond = b.const_bool(true);
+            let x = b.const_i128(1);
+            let y = b.const_i128(2);
+            let _s = b.select(cond, x, y);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CmpImm));
+        assert_eq!(
+            insts.iter().filter(|i| i.opcode == ArmOpcode::CselReg).count(),
+            2,
+            "wide i128 selects should lower with one CSEL per limb"
+        );
     }
 
     #[test]
