@@ -14,6 +14,7 @@
 //! cross-block load-store forwarding, and LICM load hoisting.
 
 use crate::ir::inst::*;
+use crate::ir::types::IrType;
 use super::loop_utils::resolve_const_int;
 
 /// Result of an alias query between two pointer values.
@@ -69,13 +70,25 @@ pub fn query(func: &Function, a: ValueId, b: ValueId) -> AliasResult {
         let off_a = trace_offset(func, a);
         let off_b = trace_offset(func, b);
         if let (Some(oa), Some(ob)) = (off_a, off_b) {
-            if oa != ob { return AliasResult::NoAlias; }
+            if oa != ob {
+                if pointer_points_to_aggregate(func, a) || pointer_points_to_aggregate(func, b) {
+                    return AliasResult::MayAlias;
+                }
+                return AliasResult::NoAlias;
+            }
             // Same base + same offset → must alias.
             return AliasResult::MustAlias;
         }
     }
 
     AliasResult::MayAlias
+}
+
+fn pointer_points_to_aggregate(func: &Function, ptr: ValueId) -> bool {
+    matches!(
+        func.value_type(ptr),
+        Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Array(..) | IrType::Struct(_))
+    )
 }
 
 /// Traced pointer base — the root allocation or global.
@@ -284,6 +297,40 @@ mod tests {
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
         assert_eq!(query(&f, gep0, gep1), AliasResult::NoAlias);
+    }
+
+    #[test]
+    fn aggregate_base_and_element_gep_may_alias() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let base = f.next_value_id();
+        f.register_type(base, IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 10))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: base,
+            ty: IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 10))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 10)),
+        });
+
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c1,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+
+        let gep1 = f.next_value_id();
+        f.register_type(gep1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: gep1,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::GetElementPtr(base, vec![c1]),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(query(&f, base, gep1), AliasResult::MayAlias);
     }
 
     #[test]
