@@ -230,13 +230,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         return Err(format!("internal error: IR verification failed:\n{}", msg));
     }
     let module_has_i128 = ir_module.contains_i128();
-    if ir_module.contains_i128_outside_globals() && opts.opt_level != OptLevel::O0 {
-        return Err(
-            "integer(16) / i128 optimization is not yet supported; use -O0 --emit-ir for now"
-                .into(),
-        );
-    }
-
     // 6.5. Run IR optimization pipeline.
     //
     // This is where const_fold, mem2reg, LICM, DSE, loop unrolling, and
@@ -253,7 +246,14 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             OptLevel::Os    => IrOpt::Os,
             OptLevel::Ofast => IrOpt::Ofast,
         };
-        let pm = crate::opt::build_pipeline(ir_opt);
+        let pm = if ir_module.contains_i128_outside_globals() && opts.opt_level != OptLevel::O0 {
+            crate::opt::build_i128_pipeline(ir_opt).ok_or_else(|| {
+                "integer(16) / i128 optimization above -O1 is not yet supported; use -O0 or -O1 for now"
+                    .to_string()
+            })?
+        } else {
+            crate::opt::build_pipeline(ir_opt)
+        };
         pm.run(&mut ir_module);
     }
 
@@ -628,6 +628,30 @@ mod tests {
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
         assert!(asm.contains("bl _add_ext"), "expected external helper call in asm:\n{}", asm);
         assert!(asm.contains("stp x0, x1"), "expected pair-register i128 ABI spill in asm:\n{}", asm);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn backend_allows_integer16_mul_after_o1_const_fold() {
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_i128_mul_{}_{}.s",
+            std::process::id(),
+            "o1"
+        ));
+        let opts = Options {
+            input: i128_reject_fixture(),
+            output: Some(output.clone()),
+            emit_asm: true,
+            emit_obj: false,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: OptLevel::O1,
+        };
+
+        compile(&opts).expect("integer(16) multiply should codegen at O1 after const fold");
+        let asm = fs::read_to_string(&output).expect("missing emitted assembly");
+        assert!(asm.contains("movz x16, #42"), "expected folded i128 constant in asm:\n{}", asm);
+        assert!(!asm.contains("mul "), "expected O1 i128 multiply to fold away before backend:\n{}", asm);
         let _ = fs::remove_file(output);
     }
 }

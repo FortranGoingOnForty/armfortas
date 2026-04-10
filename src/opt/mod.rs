@@ -52,7 +52,7 @@ mod audit_tests;
 // driver actually uses. Audit Cos-2: previously every pass was
 // re-exported behind `#[allow(unused_imports)]`, which masked any
 // future regressions that orphaned a re-export.
-pub use pipeline::{OptLevel, build_pipeline};
+pub use pipeline::{OptLevel, build_i128_pipeline, build_pipeline};
 
 // Test-only re-export so audit_tests can refer to passes by their
 // short name without the full module path.

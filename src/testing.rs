@@ -17,7 +17,7 @@ use crate::codegen::mir::{
 };
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
-use crate::opt::build_pipeline;
+use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
@@ -366,16 +366,6 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         })
         && request.opt_level != OptLevel::O0;
 
-    if ir_module.contains_i128_outside_globals() && needs_optimized_pipeline {
-        return Err(CaptureFailure {
-            input: input.clone(),
-            opt_level: request.opt_level,
-            stage: FailureStage::Ir,
-            detail: "integer(16) / i128 optimization is not yet supported; capture raw IR at O0 for now".into(),
-            stages,
-        });
-    }
-
     let optimized_module = if needs_optimized_pipeline {
         let mut optimized = ir_module.clone();
         let ir_opt = match request.opt_level {
@@ -386,7 +376,17 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             OptLevel::Os => IrOptLevel::Os,
             OptLevel::Ofast => IrOptLevel::Ofast,
         };
-        let pm = build_pipeline(ir_opt);
+        let pm = if ir_module.contains_i128_outside_globals() && request.opt_level != OptLevel::O0 {
+            build_i128_pipeline(ir_opt).ok_or_else(|| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Ir,
+                detail: "integer(16) / i128 optimization above O1 is not yet supported; capture raw IR at O0 or O1 for now".into(),
+                stages: stages.clone(),
+            })?
+        } else {
+            build_pipeline(ir_opt)
+        };
         pm.run(&mut optimized);
         Some(optimized)
     } else {

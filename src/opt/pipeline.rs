@@ -268,6 +268,27 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
     pm
 }
 
+/// Build the restricted optimization pipeline for modules that still contain
+/// non-global `i128` values.
+///
+/// This deliberately supports only the first widened lane: `-O1`.
+/// The passes here must preserve the backend's current supported surface
+/// (no wide block params, no mem2reg promotion, no inlining-created join
+/// params) while still providing real wins like constant folding.
+pub fn build_i128_pipeline(level: OptLevel) -> Option<PassManager> {
+    let mut pm = PassManager::new();
+    match level {
+        OptLevel::O1 => {
+            pm.add(Box::new(CallResolve));
+            pm.add(Box::new(ConstFold));
+            pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(Dce));
+            Some(pm)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +373,20 @@ mod tests {
             "Ofast should include vectorize, got {:?}",
             ofast
         );
+    }
+
+    #[test]
+    fn i128_pipeline_is_available_only_at_o1() {
+        assert!(
+            build_i128_pipeline(OptLevel::O1).is_some(),
+            "O1 should have a restricted i128-safe pipeline"
+        );
+        for lvl in [OptLevel::O0, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+            assert!(
+                build_i128_pipeline(lvl).is_none(),
+                "{:?} should not yet have widened i128 optimization support",
+                lvl
+            );
+        }
     }
 }
