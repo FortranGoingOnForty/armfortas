@@ -6,7 +6,7 @@
 /// A Fortran type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FortranType {
-    Integer { kind: u8 },        // kind in bytes: 1, 2, 4, 8
+    Integer { kind: u8 },        // kind in bytes: 1, 2, 4, 8, 16
     Real { kind: u8 },           // 4 (single), 8 (double), 16 (quad)
     Complex { kind: u8 },        // 4, 8, 16
     Logical { kind: u8 },        // 1, 2, 4, 8

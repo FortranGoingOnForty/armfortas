@@ -241,6 +241,9 @@ pub struct RunCapture {
 pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, CaptureFailure> {
     let mut stages = BTreeMap::new();
     let wants = |stage| request.requested.contains(&stage);
+    let needs_backend = request.requested.iter().any(|stage| {
+        matches!(stage, Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run)
+    });
     let input = request.input.clone();
     let source_form = detect_source_form(&input.to_string_lossy());
 
@@ -386,6 +389,14 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             ir_text.clone()
         };
         stages.insert(Stage::OptIr, CapturedStage::Text(opt_ir_text));
+    }
+
+    if !needs_backend {
+        return Ok(CaptureResult {
+            input,
+            opt_level: request.opt_level,
+            stages,
+        });
     }
 
     let backend_ir = optimized_module.as_ref().unwrap_or(&ir_module);

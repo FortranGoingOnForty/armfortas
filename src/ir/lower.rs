@@ -1239,6 +1239,7 @@ fn lower_unit(
 /// global address + load.
 fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType) -> ValueId {
     match (c, target) {
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I128)) => b.const_int(i, IntWidth::I128),
         (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i),
         (ConstScalar::Int(i), IrType::Int(_)) => b.const_i32(i as i32),
         (ConstScalar::Int(i), IrType::Bool) => b.const_bool(i != 0),
@@ -1246,6 +1247,7 @@ fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType
         (ConstScalar::Int(i), IrType::Float(FloatWidth::F32)) => b.const_f32(i as f32),
         (ConstScalar::Float(f), IrType::Float(FloatWidth::F64)) => b.const_f64(f),
         (ConstScalar::Float(f), IrType::Float(FloatWidth::F32)) => b.const_f32(f as f32),
+        (ConstScalar::Float(f), IrType::Int(IntWidth::I128)) => b.const_int(f as i64, IntWidth::I128),
         (ConstScalar::Float(f), IrType::Int(IntWidth::I64)) => b.const_i64(f as i64),
         (ConstScalar::Float(f), IrType::Int(_)) => b.const_i32(f as i32),
         // Fallback — emit a zero of the target's class.
@@ -2068,11 +2070,7 @@ fn alloc_decls(
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                    let elem_bytes = match &elem_ty {
-                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
-                        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
-                        _ => 8,
-                    };
+                    let elem_bytes = ir_scalar_byte_size(&elem_ty);
                     let total_bytes = total_size * elem_bytes;
                     const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
 
@@ -3022,6 +3020,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 4,
                     IrType::Int(IntWidth::I32) => 9,
                     IrType::Int(IntWidth::I64) => 18,
+                    IrType::Int(IntWidth::I128) => 38,
                     IrType::Float(FloatWidth::F32) => 37,
                     IrType::Float(FloatWidth::F64) => 307,
                     _ => 0,
@@ -3037,6 +3036,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 15,
                     IrType::Int(IntWidth::I32) => 31,
                     IrType::Int(IntWidth::I64) => 63,
+                    IrType::Int(IntWidth::I128) => 127,
                     IrType::Float(FloatWidth::F32) => 24,  // significand bits
                     IrType::Float(FloatWidth::F64) => 53,
                     _ => 0,
@@ -3056,6 +3056,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 16,
                     IrType::Int(IntWidth::I32) => 32,
                     IrType::Int(IntWidth::I64) => 64,
+                    IrType::Int(IntWidth::I128) => 128,
                     _ => 0,
                 };
                 Some(b.const_i32(bits))
@@ -3069,6 +3070,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 2,
                     IrType::Int(IntWidth::I32) => 4,
                     IrType::Int(IntWidth::I64) => 8,
+                    IrType::Int(IntWidth::I128) => 16,
                     IrType::Float(FloatWidth::F32) => 4,
                     IrType::Float(FloatWidth::F64) => 8,
                     IrType::Bool => 4,
@@ -3097,17 +3099,12 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I16) => 2,
                     IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                     IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                    IrType::Int(IntWidth::I128) => 16,
                     IrType::Ptr(_) => 8, // pointers are 8 bytes on ARM64
                     // Arrays use element size * count, but we don't have shape info here.
                     // For now, return element size. Proper impl needs descriptor access.
                     IrType::Array(elem, count) => {
-                        let elem_size = match elem.as_ref() {
-                            IrType::Int(IntWidth::I8) => 1,
-                            IrType::Int(IntWidth::I16) => 2,
-                            IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
-                            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
-                            _ => 4,
-                        };
+                        let elem_size = ir_scalar_byte_size(elem.as_ref());
                         elem_size * (*count as i64)
                     }
                     _ => 8, // default to pointer size for unknown types
@@ -5364,6 +5361,7 @@ fn ir_scalar_byte_size(ty: &IrType) -> i64 {
         IrType::Int(IntWidth::I16) => 2,
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
         IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+        IrType::Int(IntWidth::I128) => 16,
         _ => 8,
     }
 }
@@ -6929,6 +6927,7 @@ fn lower_array_assign(
         let i_val = b.load(i_addr);
         // Compute byte offset: i * elem_size. Use byte-level GEP to avoid double multiplication.
         let elem_bytes = match &dest_info.ty {
+            IrType::Int(IntWidth::I128) => b.const_i64(16),
             IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
             IrType::Int(IntWidth::I16) => b.const_i64(2),
             IrType::Int(IntWidth::I8) => b.const_i64(1),
@@ -7312,6 +7311,7 @@ fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
             TypeInfo::Real { .. } | TypeInfo::DoublePrecision => IrType::Float(FloatWidth::F64),
             _ => IrType::Int(IntWidth::I64),
         },
+        16 => IrType::Int(IntWidth::I128),
         _ => IrType::Int(IntWidth::I32),
     }
 }
@@ -7440,10 +7440,13 @@ fn lower_expr_full(
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
             let val: i64 = text.parse().unwrap_or(0);
-            let is_64bit = kind.as_ref().map(|k| k == "8").unwrap_or(false)
+            let kind = kind.as_deref();
+            if kind == Some("16") {
+                b.const_int(val, IntWidth::I128)
+            } else if kind == Some("8")
                 || val > i32::MAX as i64
-                || val < i32::MIN as i64;
-            if is_64bit {
+                || val < i32::MIN as i64
+            {
                 b.const_i64(val)
             } else {
                 b.const_i32(val as i32)
@@ -7897,7 +7900,9 @@ fn lower_expr_full(
 fn infer_const_expr_ty(e: &Expr) -> IrType {
     match e {
         Expr::IntegerLiteral { kind, .. } => {
-            if kind.as_deref() == Some("8") {
+            if kind.as_deref() == Some("16") {
+                IrType::Int(IntWidth::I128)
+            } else if kind.as_deref() == Some("8") {
                 IrType::Int(IntWidth::I64)
             } else {
                 IrType::Int(IntWidth::I32)

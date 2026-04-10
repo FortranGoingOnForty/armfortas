@@ -383,12 +383,14 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                     IntWidth::I16 => i16::MIN as f64,
                     IntWidth::I32 => i32::MIN as f64,
                     IntWidth::I64 => i64::MIN as f64,
+                    IntWidth::I128 => i64::MIN as f64,
                 };
                 let hi = match w {
                     IntWidth::I8  => i8::MAX  as f64,
                     IntWidth::I16 => i16::MAX as f64,
                     IntWidth::I32 => i32::MAX as f64,
                     IntWidth::I64 => i64::MAX as f64,
+                    IntWidth::I128 => i64::MAX as f64,
                 };
                 if truncd < lo || truncd > hi { return None; }
                 return Some(InstKind::ConstInt(norm(truncd as i64, *w), *w));

@@ -27,6 +27,7 @@ pub enum IntWidth {
     I16,
     I32,
     I64,
+    I128,
 }
 
 impl IntWidth {
@@ -36,6 +37,7 @@ impl IntWidth {
             Self::I16 => 16,
             Self::I32 => 32,
             Self::I64 => 64,
+            Self::I128 => 128,
         }
     }
 
@@ -107,12 +109,14 @@ impl IrType {
     /// Is this a pointer type?
     pub fn is_ptr(&self) -> bool { matches!(self, Self::Ptr(_)) }
 
-    /// Fortran integer(1) → i8, integer(2) → i16, integer(4) → i32, integer(8) → i64.
+    /// Fortran integer(1) → i8, integer(2) → i16, integer(4) → i32,
+    /// integer(8) → i64, integer(16) → i128.
     pub fn int_from_kind(kind: u8) -> Self {
         Self::Int(match kind {
             1 => IntWidth::I8,
             2 => IntWidth::I16,
             8 => IntWidth::I64,
+            16 => IntWidth::I128,
             _ => IntWidth::I32, // default
         })
     }
