@@ -227,8 +227,9 @@ Landed so far:
 
 Still missing inside the same cleanup item:
 - optimized support beyond the full `-O1` lane
-- optimizer/backend widening for `i128` values that survive into block params, promoted SSA
-  values, and other pass shapes introduced by the full O2/O3/Os/Ofast pipelines
+- optimizer/backend widening for the additional `i128` shapes introduced by the full
+  O2/O3/Os/Ofast pipelines, especially second-pass mem2reg after SROA, more aggressive
+  inlining/IPO interactions, and loop/vectorization rewrites
 
 ### Planned ABI Jump
 
