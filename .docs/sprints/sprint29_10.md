@@ -210,11 +210,11 @@ Landed so far:
 - backend emission for `i128` globals
 - local `-O0` stack-backed `i128` memory traffic, add/sub/neg, equality, ordered compares,
   and `select`
+- internal-only `-O0` pair-register `i128` params, returns, and same-module calls
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
 
 Still missing inside the same cleanup item:
-- ABI-visible `i128` params, returns, and call lowering
 - any external/runtime interop surface that passes `i128` across a function boundary
 - optimized (`-O1+`) pipeline support
 
@@ -228,10 +228,8 @@ Working assumption from local clang ABI probes on Apple ARM64:
 - `__int128` params consume register pairs `xN/xN+1`
 
 Staged plan:
-1. internal-only pair-register params and returns
-2. internal call lowering and callsite argument placement
-3. external/runtime interop coverage for the same pair-register ABI surface
-4. only after the ABI surface is real, widen optimizer support beyond raw `-O0`
+1. external/runtime interop coverage for the same pair-register ABI surface
+2. only after the ABI surface is real, widen optimizer support beyond raw `-O0`
 
 Timing:
 - keep landing bounded local `-O0` `i128` slices while they are still clearly separate

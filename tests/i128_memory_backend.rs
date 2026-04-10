@@ -292,6 +292,82 @@ fn simple_local_i128_select_object_snapshot_is_deterministic_at_o0() {
 }
 
 #[test]
+fn simple_internal_i128_call_uses_pair_arg_and_return_regs_at_o0() {
+    let asm = capture_text(
+        CaptureRequest {
+            input: fixture("integer16_internal_call.f90"),
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Asm,
+    );
+
+    assert!(
+        asm.contains("bl _add_one"),
+        "internal integer(16) call should branch to the contained helper:\n{}",
+        asm
+    );
+    assert!(
+        asm.matches("stp x0, x1").count() >= 2,
+        "internal integer(16) ABI should spill pair-register args/results with STP x0, x1:\n{}",
+        asm
+    );
+    assert!(
+        asm.matches("ldp x0, x1").count() >= 2,
+        "internal integer(16) ABI should load pair-register args/results with LDP x0, x1:\n{}",
+        asm
+    );
+}
+
+#[test]
+fn simple_internal_i128_call_runs_at_o0() {
+    let result = capture_from_path(&CaptureRequest {
+        input: fixture("integer16_internal_call.f90"),
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    })
+    .expect("internal integer(16) call program should run");
+
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run capture");
+
+    assert_eq!(run.exit_code, 0, "expected successful internal integer(16) call run:\n{:#?}", run);
+    assert!(
+        run.stdout.contains('1'),
+        "internal integer(16) call program should print score 1:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn simple_internal_i128_call_object_snapshot_is_deterministic_at_o0() {
+    let source = fixture("integer16_internal_call.f90");
+    let first = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Obj,
+    );
+    let second = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O0,
+        },
+        Stage::Obj,
+    );
+
+    assert_eq!(
+        first, second,
+        "internal integer(16) call object snapshots should be deterministic at O0"
+    );
+}
+
+#[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(
