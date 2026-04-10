@@ -51,14 +51,13 @@ pub fn print_module(module: &Module) -> String {
 
     for func in &module.functions {
         writeln!(out).unwrap();
-        write!(out, "{}", print_function(func)).unwrap();
+        write!(out, "{}", print_function_in(module, func)).unwrap();
     }
 
     out
 }
 
-/// Print a function to a string.
-pub fn print_function(func: &Function) -> String {
+fn print_function_in(module: &Module, func: &Function) -> String {
     let mut out = String::new();
     // Print function attributes.
     let mut attrs = Vec::new();
@@ -73,15 +72,28 @@ pub fn print_function(func: &Function) -> String {
     writeln!(out, ") -> {} {{", func.return_type).unwrap();
 
     for block in &func.blocks {
-        write!(out, "{}", print_block_in(block, func)).unwrap();
+        write!(out, "{}", print_block_with_module(block, func, module)).unwrap();
     }
 
     writeln!(out, "  }}").unwrap();
     out
 }
 
+/// Print a function to a string.
+pub fn print_function(func: &Function) -> String {
+    print_function_with_module_opt(None, func)
+}
+
 /// Print a basic block to a string (with function context for named branches).
 pub fn print_block_in(block: &BasicBlock, func: &Function) -> String {
+    print_block_with_module_opt(block, func, None)
+}
+
+fn print_block_with_module(block: &BasicBlock, func: &Function, module: &Module) -> String {
+    print_block_with_module_opt(block, func, Some(module))
+}
+
+fn print_block_with_module_opt(block: &BasicBlock, func: &Function, module: Option<&Module>) -> String {
     let mut out = String::new();
     write!(out, "    {}(", block.name).unwrap();
     for (i, bp) in block.params.iter().enumerate() {
@@ -91,7 +103,7 @@ pub fn print_block_in(block: &BasicBlock, func: &Function) -> String {
     writeln!(out, "):").unwrap();
 
     for inst in &block.insts {
-        writeln!(out, "      {}", print_inst(inst)).unwrap();
+        writeln!(out, "      {}", print_inst_with_module_opt(inst, module)).unwrap();
     }
 
     if let Some(term) = &block.terminator {
@@ -124,6 +136,32 @@ pub fn print_block(block: &BasicBlock) -> String {
 
 /// Print an instruction to a string.
 pub fn print_inst(inst: &Inst) -> String {
+    print_inst_with_module_opt(inst, None)
+}
+
+fn print_function_with_module_opt(module: Option<&Module>, func: &Function) -> String {
+    let mut out = String::new();
+    // Print function attributes.
+    let mut attrs = Vec::new();
+    if func.is_pure { attrs.push("pure"); }
+    if func.is_elemental { attrs.push("elemental"); }
+    let attr_str = if attrs.is_empty() { String::new() } else { format!(" [{}]", attrs.join(", ")) };
+    write!(out, "  func @{}{}(", func.name, attr_str).unwrap();
+    for (i, p) in func.params.iter().enumerate() {
+        if i > 0 { write!(out, ", ").unwrap(); }
+        write!(out, "%{}: {}", p.id.0, p.ty).unwrap();
+    }
+    writeln!(out, ") -> {} {{", func.return_type).unwrap();
+
+    for block in &func.blocks {
+        write!(out, "{}", print_block_with_module_opt(block, func, module)).unwrap();
+    }
+
+    writeln!(out, "  }}").unwrap();
+    out
+}
+
+fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
     let val = format!("%{}", inst.id.0);
     let kind_str = match &inst.kind {
         InstKind::ConstInt(v, w) => format!("const_int {} : {}", v, w),
@@ -187,7 +225,10 @@ pub fn print_inst(inst: &Inst) -> String {
         InstKind::Call(fref, args) => {
             let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();
             let fname = match fref {
-                FuncRef::Internal(idx) => format!("@func_{}", idx),
+                FuncRef::Internal(idx) => module
+                    .and_then(|module| module.functions.get(*idx as usize))
+                    .map(|func| format!("@{}", func.name))
+                    .unwrap_or_else(|| format!("@func_{}", idx)),
                 FuncRef::External(name) => format!("@{}", name),
             };
             format!("call {}({})", fname, args_str.join(", "))
@@ -379,5 +420,33 @@ mod tests {
         assert!(output.contains("header_1(%"));
         assert!(output.contains(": i32)"));
         assert!(output.contains("br header_1("), "expected 'br header_1(' in:\n{}", output);
+    }
+
+    #[test]
+    fn print_internal_calls_with_function_names() {
+        let mut module = Module::new("test".into());
+        let callee_idx = module.add_function(Function::new(
+            "callee".into(),
+            vec![Param {
+                name: "x".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            }],
+            IrType::Int(IntWidth::I32),
+        ));
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller);
+            let arg = b.const_i32(7);
+            let _ = b.call(FuncRef::Internal(callee_idx), vec![arg], IrType::Int(IntWidth::I32));
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let output = print_module(&module);
+        assert!(output.contains("call @callee("), "expected named internal call in:\n{}", output);
+        assert!(!output.contains("@func_0"), "unexpected fallback name in:\n{}", output);
     }
 }

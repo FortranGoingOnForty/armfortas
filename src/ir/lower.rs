@@ -100,6 +100,10 @@ struct LowerCtx<'a> {
     /// Pre-populated by `collect_optional_params` so call sites can pass
     /// null pointers for absent optional arguments (PRESENT support).
     optional_params: &'a HashMap<String, Vec<bool>>,
+    /// Lowercase same-module subprogram name → Module::functions index.
+    /// Used so same-compilation-unit calls lower to FuncRef::Internal instead
+    /// of pretending to be external references.
+    internal_funcs: &'a HashMap<String, u32>,
     /// Lowercase names of functions declared ELEMENTAL in this compilation unit.
     elemental_funcs: &'a HashSet<String>,
     /// Map from Fortran statement label (u64) to the IR basic block that
@@ -115,6 +119,7 @@ impl<'a> LowerCtx<'a> {
         type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
         alloc_return_funcs: &'a HashSet<String>,
         optional_params: &'a HashMap<String, Vec<bool>>,
+        internal_funcs: &'a HashMap<String, u32>,
         elemental_funcs: &'a HashSet<String>,
     ) -> Self {
         Self {
@@ -129,6 +134,7 @@ impl<'a> LowerCtx<'a> {
             is_alloc_return: false,
             alloc_return_funcs,
             optional_params,
+            internal_funcs,
             elemental_funcs,
             label_blocks: HashMap::new(),
         }
@@ -222,6 +228,12 @@ pub fn lower_file(
         collect_elemental_funcs(&unit.node, &mut elemental_funcs);
     }
 
+    let mut internal_funcs: HashMap<String, u32> = HashMap::new();
+    let mut next_internal_idx: u32 = 0;
+    for unit in units {
+        collect_internal_func_names(&unit.node, &mut internal_funcs, &mut next_internal_idx);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
@@ -236,11 +248,51 @@ pub fn lower_file(
             &no_host,
             &alloc_return_funcs,
             &optional_params,
+            &internal_funcs,
             &elemental_funcs,
             false,
         );
     }
     module
+}
+
+fn collect_internal_func_names(
+    unit: &ProgramUnit,
+    out: &mut HashMap<String, u32>,
+    next_idx: &mut u32,
+) {
+    match unit {
+        ProgramUnit::Program { name, contains, .. } => {
+            let fname = name.clone().unwrap_or_else(|| "main".into());
+            let body_name = format!("__prog_{}", fname).to_lowercase();
+            out.insert(body_name, *next_idx);
+            *next_idx += 1;
+            for sub in contains {
+                collect_internal_func_names(&sub.node, out, next_idx);
+            }
+        }
+        ProgramUnit::Subroutine { name, bind, contains, .. }
+        | ProgramUnit::Function { name, bind, contains, .. } => {
+            let idx = *next_idx;
+            *next_idx += 1;
+            out.insert(name.to_lowercase(), idx);
+            if let Some(bind) = bind {
+                if let Some(bind_name) = bind.name.as_deref() {
+                    out.entry(bind_name.trim_matches('\'').trim_matches('"').to_lowercase())
+                        .or_insert(idx);
+                }
+            }
+            for sub in contains {
+                collect_internal_func_names(&sub.node, out, next_idx);
+            }
+        }
+        ProgramUnit::Module { contains, .. } => {
+            for sub in contains {
+                collect_internal_func_names(&sub.node, out, next_idx);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Walk a program unit and any nested `contains` to collect the
@@ -885,6 +937,7 @@ fn lower_unit(
     host_uses: &[crate::ast::decl::SpannedDecl],
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
+    internal_funcs: &HashMap<String, u32>,
     elemental_funcs: &HashSet<String>,
     internal_only: bool,
 ) {
@@ -896,7 +949,7 @@ fn lower_unit(
             // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -933,7 +986,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
@@ -968,7 +1021,7 @@ fn lower_unit(
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -1033,7 +1086,7 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
@@ -1119,7 +1172,7 @@ fn lower_unit(
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1213,7 +1266,7 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
         ProgramUnit::Module { uses, contains, .. } => {
@@ -1224,7 +1277,7 @@ fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, elemental_funcs, false);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, false);
             }
         }
         _ => {}
@@ -3819,7 +3872,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 b.call(FuncRef::External(callee_name.clone()), all_args, IrType::Void);
                                             } else {
                                                 // Non-sret: function returns a temp descriptor.
-                                                let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                                let src_desc = lower_expr_ctx_tl(b, ctx, value);
                                                 b.call(FuncRef::External("afs_assign_allocatable".into()),
                                                     vec![info.addr, src_desc], IrType::Void);
                                                 let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -3828,7 +3881,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             }
                                         } else {
                                             // Indirect callee: fall back to assign path.
-                                            let src_desc = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                            let src_desc = lower_expr_ctx_tl(b, ctx, value);
                                             b.call(FuncRef::External("afs_assign_allocatable".into()),
                                                 vec![info.addr, src_desc], IrType::Void);
                                             let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -3839,7 +3892,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         lower_array_assign(b, ctx, name, &info, value);
                                     }
                                 } else if info.derived_type.is_some() {
-                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
                                     let size = if let Some(ref tn) = info.derived_type {
                                         ctx.type_layouts.get(tn).map(|l| l.size).unwrap_or(8)
                                     } else { 8 };
@@ -3850,7 +3903,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } else if is_complex_ty(&info.ty) {
                                     // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
                                     // Memcpy the 8 or 16 bytes into the destination slot.
-                                    let src = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                    let src = lower_expr_ctx_tl(b, ctx, value);
                                     let bytes = complex_byte_size(&info.ty);
                                     let sz = b.const_i64(bytes);
                                     if info.by_ref {
@@ -3864,11 +3917,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                     }
                                 } else if info.by_ref {
-                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
                                     let ptr = b.load(info.addr);
                                     b.store(val, ptr);
                                 } else {
-                                    let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
                                     b.store(val, info.addr);
                                 }
                             }
@@ -3877,7 +3930,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
                 Expr::FunctionCall { callee, args } => {
                     // Array element assignment: a(i) = val
-                    let arr_val = lower_expr(b, &ctx.locals, value, ctx.st);
+                    let arr_val = lower_expr_ctx(b, ctx, value);
                     if let Expr::Name { name } = &callee.node {
                         let akey = name.to_lowercase();
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
@@ -3892,7 +3945,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
                             if let Some(field) = layout.field(component) {
-                                let val = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+                                let val = lower_expr_ctx_tl(b, ctx, value);
                                 let offset = b.const_i64(field.offset as i64);
                                 let field_ptr = b.gep(base_addr, vec![offset],
                                     IrType::Int(IntWidth::I8));
@@ -4006,7 +4059,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                         }
                     }
-                    b.call(FuncRef::External(name.clone()), arg_vals, IrType::Void);
+                    let func_ref = ctx
+                        .internal_funcs
+                        .get(&key)
+                        .copied()
+                        .map(FuncRef::Internal)
+                        .unwrap_or_else(|| FuncRef::External(name.clone()));
+                    b.call(func_ref, arg_vals, IrType::Void);
                 }
             }
         }
@@ -7420,7 +7479,15 @@ fn lower_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, None)
+    lower_expr_full(b, locals, expr, st, None, None)
+}
+
+fn lower_expr_ctx(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> ValueId {
+    lower_expr_full(b, &ctx.locals, expr, ctx.st, None, Some(ctx.internal_funcs))
 }
 
 fn lower_expr_tl(
@@ -7430,7 +7497,22 @@ fn lower_expr_tl(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, Some(tl))
+    lower_expr_full(b, locals, expr, st, Some(tl), None)
+}
+
+fn lower_expr_ctx_tl(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> ValueId {
+    lower_expr_full(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+    )
 }
 
 fn lower_expr_full(
@@ -7439,6 +7521,7 @@ fn lower_expr_full(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
 ) -> ValueId {
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
@@ -7532,8 +7615,8 @@ fn lower_expr_full(
         }
 
         Expr::BinaryOp { op, left, right } => {
-            let mut lhs = lower_expr(b, locals, left, st);
-            let mut rhs = lower_expr(b, locals, right, st);
+            let mut lhs = lower_expr_full(b, locals, left, st, type_layouts, internal_funcs);
+            let mut rhs = lower_expr_full(b, locals, right, st, type_layouts, internal_funcs);
             let lty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
             let rty = b.func().value_type(rhs).unwrap_or(IrType::Int(IntWidth::I32));
 
@@ -7657,7 +7740,7 @@ fn lower_expr_full(
         }
 
         Expr::UnaryOp { op, operand } => {
-            let val = lower_expr(b, locals, operand, st);
+            let val = lower_expr_full(b, locals, operand, st, type_layouts, internal_funcs);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             match (op, &ty) {
                 (UnaryOp::Minus, IrType::Int(_)) => b.ineg(val),
@@ -7668,7 +7751,7 @@ fn lower_expr_full(
             }
         }
 
-        Expr::ParenExpr { inner } => lower_expr(b, locals, inner, st),
+        Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs),
 
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
@@ -7710,7 +7793,7 @@ fn lower_expr_full(
                         for (i, arg) in args.iter().enumerate() {
                             if i < layout.fields.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                    let val = lower_expr_full(b, locals, e, st, type_layouts);
+                                    let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
                                     let offset = b.const_i64(layout.fields[i].offset as i64);
                                     let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
                                     b.store(val, field_ptr);
@@ -7754,7 +7837,9 @@ fn lower_expr_full(
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => lower_expr(b, locals, e, st),
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            lower_expr_full(b, locals, e, st, type_layouts, internal_funcs)
+                        }
                         _ => b.const_i32(0),
                     }
                 }).collect();
@@ -7772,7 +7857,7 @@ fn lower_expr_full(
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
                             if is_value {
-                                lower_expr(b, locals, e, st)
+                                lower_expr_full(b, locals, e, st, type_layouts, internal_funcs)
                             } else {
                                 lower_arg_by_ref(b, locals, e, st)
                             }
@@ -7795,7 +7880,11 @@ fn lower_expr_full(
                         _ => IrType::Int(IntWidth::I32),
                     })
                     .unwrap_or(IrType::Int(IntWidth::I32));
-                b.call(FuncRef::External(name.clone()), ref_arg_vals, ret_ty)
+                let func_ref = internal_funcs
+                    .and_then(|map| map.get(&key).copied())
+                    .map(FuncRef::Internal)
+                    .unwrap_or_else(|| FuncRef::External(name.clone()));
+                b.call(func_ref, ref_arg_vals, ret_ty)
             } else {
                 b.const_i32(0)
             }
@@ -7879,8 +7968,8 @@ fn lower_expr_full(
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);
             let buf = b.alloca(arr_ty);
 
-            let real_raw = lower_expr_full(b, locals, real, st, type_layouts);
-            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts);
+            let real_raw = lower_expr_full(b, locals, real, st, type_layouts, internal_funcs);
+            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts, internal_funcs);
             let real_val = coerce_to_type(b, real_raw, &elem_ty);
             let imag_val = coerce_to_type(b, imag_raw, &elem_ty);
 
