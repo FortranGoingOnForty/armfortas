@@ -446,10 +446,11 @@ impl Module {
     /// - local `i128` allocas and plain memory traffic around them
     /// - `i128` constants that only flow through those memory ops
     /// - local `i128` selects that stay entirely within stack-backed values
+    /// - direct `i128` params/returns and pair-register calls at O0
     ///
-    /// It still excludes any ABI-visible or arithmetic use such as function
-    /// params/returns, block params, calls, branches carrying `i128`, and any
-    /// integer operation whose result or operands are `i128`.
+    /// It still excludes block params, runtime-call `i128`, optimized-pipeline
+    /// support, and any integer operation whose result or operands are `i128`
+    /// beyond the staged local O0 surface.
     pub fn i128_backend_o0_supported(&self) -> bool {
         self.globals
             .iter()
@@ -457,7 +458,14 @@ impl Module {
             && self
                 .extern_funcs
                 .iter()
-                .all(|func| !sig_contains_i128(self, &func.sig))
+                .all(|func| {
+                    abi_type_i128_backend_o0_supported(self, &func.sig.ret, true)
+                        && func
+                            .sig
+                            .params
+                            .iter()
+                            .all(|param| abi_type_i128_backend_o0_supported(self, param, true))
+                })
             && self
                 .functions
                 .iter()
@@ -511,14 +519,14 @@ fn abi_type_i128_backend_o0_supported(
     }
 }
 
-fn internal_call_i128_backend_o0_supported(
+fn direct_call_i128_backend_o0_supported(
     module: &Module,
     func: &Function,
     callee: &FuncRef,
     args: &[ValueId],
     result_ty: &IrType,
 ) -> bool {
-    matches!(callee, FuncRef::Internal(_))
+    matches!(callee, FuncRef::Internal(_) | FuncRef::External(_))
         && abi_type_i128_backend_o0_supported(module, result_ty, true)
         && args
             .iter()
@@ -567,7 +575,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::ICmp(..) if uses_i128 => true,
         InstKind::Select(..) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Call(callee, args) if inst_ty_has_i128 || uses_i128 => {
-            internal_call_i128_backend_o0_supported(module, func, callee, args, &inst.ty)
+            direct_call_i128_backend_o0_supported(module, func, callee, args, &inst.ty)
         }
         InstKind::RuntimeCall(..) if inst_ty_has_i128 || uses_i128 => false,
         InstKind::Store(..) => true,
