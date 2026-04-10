@@ -27,7 +27,7 @@ fn unique_temp_path(prefix: &str, stem: &str, ext: &str) -> PathBuf {
     ))
 }
 
-fn compile_fortran_object(source: &Path, output: &Path) {
+fn compile_fortran_object(source: &Path, output: &Path, opt_level: OptLevel) {
     let opts = Options {
         input: source.to_path_buf(),
         output: Some(output.to_path_buf()),
@@ -35,7 +35,7 @@ fn compile_fortran_object(source: &Path, output: &Path) {
         emit_obj: true,
         emit_ir: false,
         preprocess_only: false,
-        opt_level: OptLevel::O0,
+        opt_level,
     };
     compile(&opts).unwrap_or_else(|e| {
         panic!(
@@ -44,6 +44,17 @@ fn compile_fortran_object(source: &Path, output: &Path) {
             e
         )
     });
+}
+
+fn opt_label(opt_level: OptLevel) -> &'static str {
+    match opt_level {
+        OptLevel::O0 => "o0",
+        OptLevel::O1 => "o1",
+        OptLevel::O2 => "o2",
+        OptLevel::O3 => "o3",
+        OptLevel::Os => "os",
+        OptLevel::Ofast => "ofast",
+    }
 }
 
 fn compile_c_object(source: &Path, output: &Path) {
@@ -149,17 +160,16 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn external_i128_call_runs_across_objects_at_o0() {
-    let _guard = CROSS_OBJECT_LOCK.lock().unwrap();
+fn run_cross_object_case(opt_level: OptLevel) {
+    let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let program = fixture("integer16_external_call.f90");
     let helper = fixture("integer16_external_call_helper.c");
     let stem = program.file_stem().unwrap().to_str().unwrap();
-    let fortran_obj = unique_temp_path("i128_cross_object", stem, ".o");
+    let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
-    let binary = unique_temp_path("i128_cross_object_bin", stem, "");
+    let binary = unique_temp_path("i128_cross_object_bin", &format!("{}_{}", stem, opt_label(opt_level)), "");
 
-    compile_fortran_object(&program, &fortran_obj);
+    compile_fortran_object(&program, &fortran_obj, opt_level);
     compile_c_object(&helper, &helper_obj);
     link_objects(&[&fortran_obj, &helper_obj], &binary);
 
@@ -182,17 +192,16 @@ fn external_i128_call_runs_across_objects_at_o0() {
     let _ = fs::remove_file(&binary);
 }
 
-#[test]
-fn linked_external_i128_binary_is_deterministic_at_o0() {
-    let _guard = CROSS_OBJECT_LOCK.lock().unwrap();
+fn deterministic_cross_object_case(opt_level: OptLevel) {
+    let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let program = fixture("integer16_external_call.f90");
     let helper = fixture("integer16_external_call_helper.c");
     let stem = program.file_stem().unwrap().to_str().unwrap();
-    let fortran_obj = unique_temp_path("i128_cross_object", stem, ".o");
+    let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
-    let binary = unique_temp_path("i128_cross_object_bin", stem, "");
+    let binary = unique_temp_path("i128_cross_object_bin", &format!("{}_{}", stem, opt_label(opt_level)), "");
 
-    compile_fortran_object(&program, &fortran_obj);
+    compile_fortran_object(&program, &fortran_obj, opt_level);
     compile_c_object(&helper, &helper_obj);
 
     link_objects(&[&fortran_obj, &helper_obj], &binary);
@@ -215,4 +224,24 @@ fn linked_external_i128_binary_is_deterministic_at_o0() {
     let _ = fs::remove_file(&fortran_obj);
     let _ = fs::remove_file(&helper_obj);
     let _ = fs::remove_file(&binary);
+}
+
+#[test]
+fn external_i128_call_runs_across_objects_at_o0() {
+    run_cross_object_case(OptLevel::O0);
+}
+
+#[test]
+fn external_i128_call_runs_across_objects_at_o1() {
+    run_cross_object_case(OptLevel::O1);
+}
+
+#[test]
+fn linked_external_i128_binary_is_deterministic_at_o0() {
+    deterministic_cross_object_case(OptLevel::O0);
+}
+
+#[test]
+fn linked_external_i128_binary_is_deterministic_at_o1() {
+    deterministic_cross_object_case(OptLevel::O1);
 }
