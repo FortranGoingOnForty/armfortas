@@ -206,7 +206,7 @@ fn do_peel(
     };
     func.block_mut(clone_latch).insts.push(Inst {
         id: next_init_id,
-        kind: InstKind::ConstInt(init_const + stride, iv_width),
+        kind: InstKind::ConstInt((init_const + stride) as i128, iv_width),
         ty: iv_ty.clone(),
         span: dummy_span,
     });

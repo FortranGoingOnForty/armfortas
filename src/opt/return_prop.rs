@@ -38,7 +38,7 @@ impl Pass for ReturnPropagate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ScalarConst {
-    Int(i64, IntWidth),
+    Int(i128, IntWidth),
     Float(u64, FloatWidth),
     Bool(bool),
 }

@@ -89,7 +89,9 @@ fn collect_int_consts(func: &Function) -> HashMap<ValueId, (i64, IntWidth)> {
     for block in &func.blocks {
         for inst in &block.insts {
             if let InstKind::ConstInt(v, w) = inst.kind {
-                consts.insert(inst.id, (sext(v, w.bits()), w));
+                if let Ok(v) = i64::try_from(v) {
+                    consts.insert(inst.id, (sext(v, w.bits()), w));
+                }
             }
         }
     }
@@ -320,7 +322,7 @@ impl Pass for StrengthReduce {
                         let span = func.blocks[bi].insts[ii].span;
                         func.blocks[bi].insts.insert(ii, Inst {
                             id: kid,
-                            kind: InstKind::ConstInt(k as i64, int_w),
+                            kind: InstKind::ConstInt(k as i128, int_w),
                             ty: IrType::Int(int_w),
                             span,
                         });

@@ -102,7 +102,7 @@ pub fn extract_affine(
     // Find the instruction that defines this value.
     let inst = find_inst(func, val)?;
     match &inst.kind {
-        InstKind::ConstInt(c, _) => Some(AffineExpr::from_const(*c)),
+        InstKind::ConstInt(c, _) => i64::try_from(*c).ok().map(AffineExpr::from_const),
 
         InstKind::IAdd(a, b) => {
             let ea = extract_affine(func, *a, ivs)?;
@@ -142,7 +142,7 @@ pub fn extract_affine(
 
 fn resolve_const(func: &Function, vid: ValueId) -> Option<i64> {
     let inst = find_inst(func, vid)?;
-    if let InstKind::ConstInt(c, _) = &inst.kind { Some(*c) } else { None }
+    if let InstKind::ConstInt(c, _) = &inst.kind { i64::try_from(*c).ok() } else { None }
 }
 
 fn find_inst(func: &Function, vid: ValueId) -> Option<&Inst> {

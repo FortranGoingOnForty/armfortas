@@ -56,10 +56,11 @@ impl Const {
             InstKind::ConstInt(v, w) => {
                 let bits = w.bits();
                 let signed = if bits >= 64 {
-                    *v
+                    i64::try_from(*v).ok()?
                 } else {
                     let shift = 64 - bits;
-                    (*v << shift) >> shift
+                    let narrow = i64::try_from(*v).ok()?;
+                    (narrow << shift) >> shift
                 };
                 Some(Const::Int(signed, *w))
             }

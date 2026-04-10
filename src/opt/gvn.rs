@@ -38,7 +38,7 @@ impl Pass for Gvn {
 struct Key {
     tag: u32,
     operands: Vec<ValueId>,
-    aux: i64,
+    aux: i128,
     name: Option<String>,
     ty: IrType,
 }
@@ -269,7 +269,7 @@ fn key_of(
     pure_calls: &[PureCallPolicy],
     wrapper_values: &HashMap<ValueId, ValueId>,
 ) -> Option<Key> {
-    let mk = |tag: u32, ops: Vec<ValueId>, aux: i64| -> Option<Key> {
+    let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
         Some(Key { tag, operands: ops, aux, name: None, ty: inst.ty.clone() })
     };
     let mk_named = |tag: u32, name: String| -> Option<Key> {
@@ -297,13 +297,13 @@ fn key_of(
         InstKind::FSqrt(a)    => mk(16, vec![remap(*a)], 0),
         InstKind::FPow(a, b)  => mk(17, vec![remap(*a), remap(*b)], 0),
         InstKind::ICmp(op, a, b) => {
-            let op_val = *op as i64;
+            let op_val = *op as i128;
             match op {
                 CmpOp::Eq | CmpOp::Ne => mk(20, canon(remap(*a), remap(*b)), op_val),
                 _ => mk(20, vec![remap(*a), remap(*b)], op_val),
             }
         }
-        InstKind::FCmp(op, a, b) => mk(21, vec![remap(*a), remap(*b)], *op as i64),
+        InstKind::FCmp(op, a, b) => mk(21, vec![remap(*a), remap(*b)], *op as i128),
         InstKind::And(a, b) => mk(30, canon(remap(*a), remap(*b)), 0),
         InstKind::Or(a, b)  => mk(31, canon(remap(*a), remap(*b)), 0),
         InstKind::Not(a)    => mk(32, vec![remap(*a)], 0),
@@ -319,16 +319,16 @@ fn key_of(
         InstKind::CountTrailingZeros(a) => mk(48, vec![remap(*a)], 0),
         InstKind::PopCount(a)           => mk(49, vec![remap(*a)], 0),
         // Conversions.
-        InstKind::IntToFloat(a, w)   => mk(50, vec![remap(*a)], w.bits() as i64),
-        InstKind::FloatToInt(a, w)   => mk(51, vec![remap(*a)], w.bits() as i64),
-        InstKind::FloatExtend(a, w)  => mk(52, vec![remap(*a)], w.bits() as i64),
-        InstKind::FloatTrunc(a, w)   => mk(53, vec![remap(*a)], w.bits() as i64),
-        InstKind::IntExtend(a, w, s) => mk(54, vec![remap(*a)], w.bits() as i64 * if *s { 1 } else { -1 }),
-        InstKind::IntTrunc(a, w)     => mk(55, vec![remap(*a)], w.bits() as i64),
+        InstKind::IntToFloat(a, w)   => mk(50, vec![remap(*a)], w.bits() as i128),
+        InstKind::FloatToInt(a, w)   => mk(51, vec![remap(*a)], w.bits() as i128),
+        InstKind::FloatExtend(a, w)  => mk(52, vec![remap(*a)], w.bits() as i128),
+        InstKind::FloatTrunc(a, w)   => mk(53, vec![remap(*a)], w.bits() as i128),
+        InstKind::IntExtend(a, w, s) => mk(54, vec![remap(*a)], (w.bits() as i128) * if *s { 1 } else { -1 }),
+        InstKind::IntTrunc(a, w)     => mk(55, vec![remap(*a)], w.bits() as i128),
         // Constants.
-        InstKind::ConstInt(v, w)   => mk(60, vec![], *v * 100 + w.bits() as i64),
-        InstKind::ConstFloat(v, w) => mk(61, vec![], ((*v).to_bits() as i64) ^ (w.bits() as i64)),
-        InstKind::ConstBool(v)     => mk(62, vec![], *v as i64),
+        InstKind::ConstInt(v, w)   => mk(60, vec![], *v * 100 + w.bits() as i128),
+        InstKind::ConstFloat(v, w) => mk(61, vec![], ((*v).to_bits() as i128) ^ (w.bits() as i128)),
+        InstKind::ConstBool(v)     => mk(62, vec![], *v as i128),
         // GlobalAddr.
         InstKind::GlobalAddr(name) => mk_named(70, name.clone()),
         // GEP.
@@ -359,7 +359,7 @@ fn key_of(
                     PureArgPolicy::Unsupported => return None,
                 }
             }
-            mk(90, ops, *idx as i64)
+            mk(90, ops, *idx as i128)
         }
         // Impure: loads, stores, runtime calls, external calls, alloca — not GVN candidates.
         InstKind::Load(..) | InstKind::Store(..) | InstKind::Alloca(..)

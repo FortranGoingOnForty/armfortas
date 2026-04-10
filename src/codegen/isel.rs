@@ -896,7 +896,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             if let Some(idx) = indices.first() {
                 let idx_vreg = ctx.lookup_vreg(*idx);
                 let tmp = mf.new_vreg(RegClass::Gp64);
-                emit_const_int(mf, mb, tmp, elem_size, IntWidth::I64);
+                emit_const_int(mf, mb, tmp, elem_size as i128, IntWidth::I64);
                 let scaled = mf.new_vreg(RegClass::Gp64);
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::Mul,
@@ -1417,7 +1417,8 @@ fn emit_epilogue(mf: &mut MachineFunction, mb: MBlockId) {
 
 /// Emit a constant integer using movz/movk sequence.
 /// Respects width: 32-bit values mask to 32 bits and only emit shifts 0/16.
-fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i64, width: IntWidth) {
+fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i128, width: IntWidth) {
+    debug_assert!(width != IntWidth::I128, "backend should reject i128 before isel");
     let is_32 = matches!(width, IntWidth::I8 | IntWidth::I16 | IntWidth::I32);
     // Mask to the appropriate width to prevent sign-extension artifacts.
     let uval = if is_32 { (val as u32) as u64 } else { val as u64 };

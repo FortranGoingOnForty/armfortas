@@ -33,7 +33,7 @@ use std::collections::HashMap;
 /// Compile-time constant value, normalized for folding.
 #[derive(Debug, Clone, Copy)]
 enum Const {
-    Int(i64, IntWidth),
+    Int(i128, IntWidth),
     Float(f64, FloatWidth),
     Bool(bool),
 }
@@ -68,27 +68,37 @@ impl Const {
     }
 }
 
-/// Sign-extend `v` from `bits` to a full i64. Used so that comparisons
+/// Sign-extend `v` from `bits` to a full i128. Used so that comparisons
 /// and arithmetic on narrower integer types match hardware behavior.
-fn sext(v: i64, bits: u32) -> i64 {
-    if bits >= 64 { v }
+fn sext(v: i128, bits: u32) -> i128 {
+    if bits >= 128 { v }
     else {
-        let shift = 64 - bits;
+        let shift = 128 - bits;
         (v << shift) >> shift
     }
 }
 
-/// Mask `v` down to `bits` low bits. The IR stores integers as i64 but
+/// Mask `v` down to `bits` low bits. The IR stores integers as i128 but
 /// arithmetic must wrap at the declared width.
-fn mask(v: i64, bits: u32) -> i64 {
-    if bits >= 64 { v }
-    else { v & ((1i64 << bits) - 1) }
+fn mask(v: i128, bits: u32) -> i128 {
+    if bits >= 128 { v }
+    else { v & ((1i128 << bits) - 1) }
 }
 
 /// Truncate-then-sign-extend a wide arithmetic result back to its
-/// declared width, normalized to a sign-extended i64.
-fn norm(v: i64, w: IntWidth) -> i64 {
+/// declared width, normalized to a sign-extended i128.
+fn norm(v: i128, w: IntWidth) -> i128 {
     sext(mask(v, w.bits()), w.bits())
+}
+
+fn signed_min(w: IntWidth) -> i128 {
+    match w {
+        IntWidth::I8 => i8::MIN as i128,
+        IntWidth::I16 => i16::MIN as i128,
+        IntWidth::I32 => i32::MIN as i128,
+        IntWidth::I64 => i64::MIN as i128,
+        IntWidth::I128 => i128::MIN,
+    }
 }
 
 /// Round an `f64`-stored value to the precision of its declared
@@ -138,10 +148,9 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         }
         InstKind::IDiv(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
-                if bv == 0 { return None; } // leave divide-by-zero to runtime
-                // i64::MIN / -1 also overflows; bail to keep behavior identical.
-                if av == i64::MIN && bv == -1 { return None; }
                 if let IrType::Int(w) = ty {
+                    if bv == 0 { return None; } // leave divide-by-zero to runtime
+                    if av == signed_min(*w) && bv == -1 { return None; }
                     return Some(InstKind::ConstInt(norm(av / bv, *w), *w));
                 }
             }
@@ -149,9 +158,9 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         }
         InstKind::IMod(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
-                if bv == 0 { return None; }
-                if av == i64::MIN && bv == -1 { return None; }
                 if let IrType::Int(w) = ty {
+                    if bv == 0 { return None; }
+                    if av == signed_min(*w) && bv == -1 { return None; }
                     return Some(InstKind::ConstInt(norm(av % bv, *w), *w));
                 }
             }
@@ -267,7 +276,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::Shl(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    let bits = w.bits() as i64;
+                    let bits = w.bits() as i128;
                     if (0..bits).contains(&bv) {
                         return Some(InstKind::ConstInt(
                             norm(av.wrapping_shl(bv as u32), *w),
@@ -282,10 +291,10 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::LShr(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    let bits = w.bits() as i64;
+                    let bits = w.bits() as i128;
                     if (0..bits).contains(&bv) {
-                        let unsigned = (mask(av, w.bits()) as u64) >> (bv as u32);
-                        return Some(InstKind::ConstInt(norm(unsigned as i64, *w), *w));
+                        let unsigned = (mask(av, w.bits()) as u128) >> (bv as u32);
+                        return Some(InstKind::ConstInt(norm(unsigned as i128, *w), *w));
                     }
                     return None;
                 }
@@ -295,7 +304,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::AShr(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    let bits = w.bits() as i64;
+                    let bits = w.bits() as i128;
                     if (0..bits).contains(&bv) {
                         let signed = sext(av, w.bits()) >> (bv as u32);
                         return Some(InstKind::ConstInt(norm(signed, *w), *w));
@@ -314,19 +323,19 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         // produce a wrong-width constant if we kept reading from `w`.
         InstKind::PopCount(a) => {
             if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
-                let val = mask(av, src_w.bits()) as u64;
-                return Some(InstKind::ConstInt(norm(val.count_ones() as i64, *out_w), *out_w));
+                let val = mask(av, src_w.bits()) as u128;
+                return Some(InstKind::ConstInt(norm(val.count_ones() as i128, *out_w), *out_w));
             }
             None
         }
         InstKind::CountLeadingZeros(a) => {
             if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
                 let bits = src_w.bits();
-                let val = mask(av, bits) as u64;
+                let val = mask(av, bits) as u128;
                 let lz = if val == 0 {
-                    bits as i64
+                    bits as i128
                 } else {
-                    (val.leading_zeros() as i64) - (64 - bits as i64)
+                    (val.leading_zeros() as i128) - (128 - bits as i128)
                 };
                 return Some(InstKind::ConstInt(norm(lz, *out_w), *out_w));
             }
@@ -335,8 +344,8 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::CountTrailingZeros(a) => {
             if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
                 let bits = src_w.bits();
-                let val = mask(av, bits) as u64;
-                let tz = if val == 0 { bits as i64 } else { val.trailing_zeros() as i64 };
+                let val = mask(av, bits) as u128;
+                let tz = if val == 0 { bits as i128 } else { val.trailing_zeros() as i128 };
                 return Some(InstKind::ConstInt(norm(tz, *out_w), *out_w));
             }
             None
@@ -383,17 +392,17 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                     IntWidth::I16 => i16::MIN as f64,
                     IntWidth::I32 => i32::MIN as f64,
                     IntWidth::I64 => i64::MIN as f64,
-                    IntWidth::I128 => i64::MIN as f64,
+                    IntWidth::I128 => return None,
                 };
                 let hi = match w {
                     IntWidth::I8  => i8::MAX  as f64,
                     IntWidth::I16 => i16::MAX as f64,
                     IntWidth::I32 => i32::MAX as f64,
                     IntWidth::I64 => i64::MAX as f64,
-                    IntWidth::I128 => i64::MAX as f64,
+                    IntWidth::I128 => return None,
                 };
                 if truncd < lo || truncd > hi { return None; }
-                return Some(InstKind::ConstInt(norm(truncd as i64, *w), *w));
+                return Some(InstKind::ConstInt(norm(truncd as i128, *w), *w));
             }
             None
         }
@@ -513,7 +522,7 @@ where F: FnOnce(f64) -> f64
 }
 
 fn fold_int_bin<F>(a: Option<Const>, b: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
-where F: FnOnce(i64, i64) -> i64
+where F: FnOnce(i128, i128) -> i128
 {
     if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (a, b) {
         if let IrType::Int(w) = ty {

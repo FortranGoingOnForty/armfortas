@@ -249,7 +249,7 @@ fn update_step_const(func: &Function, index: ValueId, next: ValueId) -> Option<i
 fn resolve_int_scalar(func: &Function, value: ValueId) -> Option<i64> {
     let kind = find_inst_kind(func, value)?;
     match kind {
-        InstKind::ConstInt(v, _) => Some(*v),
+        InstKind::ConstInt(v, _) => i64::try_from(*v).ok(),
         InstKind::IntExtend(src, _, _) | InstKind::IntTrunc(src, _) => {
             resolve_int_scalar(func, *src)
         }

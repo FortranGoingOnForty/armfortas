@@ -512,7 +512,7 @@ fn ensure_i64_const(
     func.register_type(id, ty.clone());
     func.block_mut(block_id).insts.push(Inst {
         id,
-        kind: InstKind::ConstInt(value, IntWidth::I64),
+        kind: InstKind::ConstInt(value as i128, IntWidth::I64),
         ty,
         span,
     });

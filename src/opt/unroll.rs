@@ -583,7 +583,7 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
                 if bi == 0 {
                     let iv_inst = Inst {
                         id: iv_const_id,
-                        kind: InstKind::ConstInt(iv_val, iv_width),
+                        kind: InstKind::ConstInt(iv_val as i128, iv_width),
                         ty: shape.iv_ty.clone(),
                         span: dummy_span(),
                     };
@@ -798,7 +798,7 @@ mod tests {
         let lo_val = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
             id: lo_val, ty: IrType::Int(IntWidth::I64), span: span(),
-            kind: InstKind::ConstInt(lo, IntWidth::I64),
+            kind: InstKind::ConstInt(lo as i128, IntWidth::I64),
         });
         // alloca for the "array" (just a slot we store into)
         let alloca_val = f.next_value_id();
@@ -819,7 +819,7 @@ mod tests {
         let hi_val = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
             id: hi_val, ty: IrType::Int(IntWidth::I64), span: span(),
-            kind: InstKind::ConstInt(hi, IntWidth::I64),
+            kind: InstKind::ConstInt(hi as i128, IntWidth::I64),
         });
         // %cmp = icmp.sle %i, hi
         let cmp_val = f.next_value_id();
@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(f.blocks.len(), 6, "expected entry + 4 iter blocks + exit");
 
         // Each iteration block has a ConstInt for that iteration's IV value.
-        let all_iv_consts: Vec<i64> = f.blocks.iter()
+        let all_iv_consts: Vec<i128> = f.blocks.iter()
             .flat_map(|b| b.insts.iter())
             .filter_map(|i| if let InstKind::ConstInt(v, _) = i.kind { Some(v) } else { None })
             .collect();

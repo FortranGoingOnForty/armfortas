@@ -736,7 +736,7 @@ fn collect_module_globals(
 ///   2. `[(expr, i = lo, hi[, step])]` implied-do iterator
 ///   3. `reshape(constructor, shape)` reshape of (1) or (2)
 ///
-/// Each path produces a flat list of `i64` (for integer types)
+/// Each path produces a flat list of `i128` (for integer types)
 /// or `f64` (for float types) of length `total`. Shorter lists
 /// are zero-padded; longer lists return `None` (a future Maj-3
 /// fix will add a proper diagnostic for shape-mismatch errors).
@@ -762,9 +762,9 @@ fn eval_const_array_init(
         while (out.len() as i64) < total { out.push(0.0); }
         Some(GlobalInit::FloatArray(out))
     } else {
-        let mut out: Vec<i64> = scalars.iter().map(|s| match s {
+        let mut out: Vec<i128> = scalars.iter().map(|s| match s {
             ConstScalar::Int(i) => *i,
-            ConstScalar::Float(f) => *f as i64,
+            ConstScalar::Float(f) => *f as i128,
         }).collect();
         while (out.len() as i64) < total { out.push(0); }
         Some(GlobalInit::IntArray(out))
@@ -1239,15 +1239,15 @@ fn lower_unit(
 /// global address + load.
 fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType) -> ValueId {
     match (c, target) {
-        (ConstScalar::Int(i), IrType::Int(IntWidth::I128)) => b.const_int(i, IntWidth::I128),
-        (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i),
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I128)) => b.const_i128(i),
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i as i64),
         (ConstScalar::Int(i), IrType::Int(_)) => b.const_i32(i as i32),
         (ConstScalar::Int(i), IrType::Bool) => b.const_bool(i != 0),
         (ConstScalar::Int(i), IrType::Float(FloatWidth::F64)) => b.const_f64(i as f64),
         (ConstScalar::Int(i), IrType::Float(FloatWidth::F32)) => b.const_f32(i as f32),
         (ConstScalar::Float(f), IrType::Float(FloatWidth::F64)) => b.const_f64(f),
         (ConstScalar::Float(f), IrType::Float(FloatWidth::F32)) => b.const_f32(f as f32),
-        (ConstScalar::Float(f), IrType::Int(IntWidth::I128)) => b.const_int(f as i64, IntWidth::I128),
+        (ConstScalar::Float(f), IrType::Int(IntWidth::I128)) => b.const_i128(f as i128),
         (ConstScalar::Float(f), IrType::Int(IntWidth::I64)) => b.const_i64(f as i64),
         (ConstScalar::Float(f), IrType::Int(_)) => b.const_i32(f as i32),
         // Fallback — emit a zero of the target's class.
@@ -1264,13 +1264,16 @@ fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType
 fn clamp_const_to_type(v: ConstScalar, target: &IrType) -> ConstScalar {
     match (v, target) {
         (ConstScalar::Int(i), IrType::Int(IntWidth::I8)) => {
-            ConstScalar::Int((i as i8) as i64)
+            ConstScalar::Int((i as i8) as i128)
         }
         (ConstScalar::Int(i), IrType::Int(IntWidth::I16)) => {
-            ConstScalar::Int((i as i16) as i64)
+            ConstScalar::Int((i as i16) as i128)
         }
         (ConstScalar::Int(i), IrType::Int(IntWidth::I32)) => {
-            ConstScalar::Int((i as i32) as i64)
+            ConstScalar::Int((i as i32) as i128)
+        }
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => {
+            ConstScalar::Int((i as i64) as i128)
         }
         (ConstScalar::Int(i), IrType::Bool) => {
             ConstScalar::Int(if i != 0 { 1 } else { 0 })
@@ -1317,7 +1320,7 @@ fn eval_const_global_init(
 /// used for real/double precision.
 #[derive(Debug, Clone, Copy)]
 enum ConstScalar {
-    Int(i64),
+    Int(i128),
     Float(f64),
 }
 
@@ -1333,7 +1336,7 @@ fn eval_const_scalar(
 ) -> Option<ConstScalar> {
     use crate::ast::expr::{UnaryOp, BinaryOp};
     match &e.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().ok().map(ConstScalar::Int),
+        Expr::IntegerLiteral { text, .. } => text.parse::<i128>().ok().map(ConstScalar::Int),
         Expr::RealLiteral { text, .. } => {
             text.replace('d', "e").replace('D', "E").parse::<f64>().ok().map(ConstScalar::Float)
         }
@@ -1393,8 +1396,8 @@ fn eval_const_scalar(
                     }
                     BinaryOp::Pow => {
                         // Integer power with non-negative exponent.
-                        if r < 0 || r > i32::MAX as i64 { return None; }
-                        let mut acc: i64 = 1;
+                        if r < 0 || r > i32::MAX as i128 { return None; }
+                        let mut acc: i128 = 1;
                         for _ in 0..r { acc = acc.wrapping_mul(l); }
                         Some(ConstScalar::Int(acc))
                     }
@@ -1921,7 +1924,7 @@ fn install_globals_as_locals(
                                 by_ref: false,
                                 char_kind: CharKind::None,
                                 derived_type: None,
-                                inline_const: Some(ConstScalar::Int(cv)),
+                                inline_const: Some(ConstScalar::Int(cv as i128)),
                             });
                             installed_from.insert(local_key, mod_key);
                         }
@@ -7439,17 +7442,19 @@ fn lower_expr_full(
 ) -> ValueId {
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
-            let val: i64 = text.parse().unwrap_or(0);
             let kind = kind.as_deref();
             if kind == Some("16") {
-                b.const_int(val, IntWidth::I128)
-            } else if kind == Some("8")
-                || val > i32::MAX as i64
-                || val < i32::MIN as i64
-            {
-                b.const_i64(val)
+                b.const_i128(text.parse::<i128>().unwrap_or(0))
             } else {
-                b.const_i32(val as i32)
+                let val: i64 = text.parse().unwrap_or(0);
+                if kind == Some("8")
+                    || val > i32::MAX as i64
+                    || val < i32::MIN as i64
+                {
+                    b.const_i64(val)
+                } else {
+                    b.const_i32(val as i32)
+                }
             }
         }
         Expr::RealLiteral { text, .. } => {

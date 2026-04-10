@@ -69,7 +69,7 @@ pub struct Inst {
 #[derive(Debug, Clone)]
 pub enum InstKind {
     // ---- Constants ----
-    ConstInt(i64, IntWidth),
+    ConstInt(i128, IntWidth),
     ConstFloat(f64, FloatWidth),
     ConstBool(bool),
     ConstString(Vec<u8>),
@@ -337,7 +337,7 @@ pub struct Global {
 #[derive(Debug, Clone)]
 pub enum GlobalInit {
     Zero,
-    Int(i64),
+    Int(i128),
     Float(f64),
     String(Vec<u8>),
     /// Array literal: a sequence of per-element initializers of
@@ -346,7 +346,7 @@ pub enum GlobalInit {
     /// constructors. The Vec's length is the array's total element
     /// count (product of dims); shorter initializers are padded
     /// with Zero at lowering time.
-    IntArray(Vec<i64>),
+    IntArray(Vec<i128>),
     FloatArray(Vec<f64>),
 }
 

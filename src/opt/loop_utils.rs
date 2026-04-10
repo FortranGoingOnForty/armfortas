@@ -45,7 +45,7 @@ pub fn resolve_const_int(func: &Function, vid: ValueId) -> Option<i64> {
         for inst in &block.insts {
             if inst.id == vid {
                 if let InstKind::ConstInt(v, _) = inst.kind {
-                    return Some(v);
+                    return i64::try_from(v).ok();
                 }
                 return None;
             }

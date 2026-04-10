@@ -65,16 +65,20 @@ impl<'a> FuncBuilder<'a> {
 
     // ---- Constants ----
 
-    pub fn const_int(&mut self, value: i64, width: IntWidth) -> ValueId {
+    pub fn const_int(&mut self, value: i128, width: IntWidth) -> ValueId {
         self.emit(InstKind::ConstInt(value, width), IrType::Int(width))
     }
 
     pub fn const_i32(&mut self, value: i32) -> ValueId {
-        self.const_int(value as i64, IntWidth::I32)
+        self.const_int(value as i128, IntWidth::I32)
     }
 
     pub fn const_i64(&mut self, value: i64) -> ValueId {
-        self.const_int(value, IntWidth::I64)
+        self.const_int(value as i128, IntWidth::I64)
+    }
+
+    pub fn const_i128(&mut self, value: i128) -> ValueId {
+        self.const_int(value, IntWidth::I128)
     }
 
     pub fn const_float(&mut self, value: f64, width: FloatWidth) -> ValueId {

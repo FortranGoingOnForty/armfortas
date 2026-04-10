@@ -46,7 +46,7 @@ enum ParamMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarConst {
-    Int(i64, IntWidth),
+    Int(i128, IntWidth),
     Float(u64, FloatWidth),
     Bool(bool),
 }

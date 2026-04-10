@@ -47,7 +47,7 @@ struct Key {
     tag: u32,
     operands: Vec<ValueId>,
     /// Auxiliary integer (used for things like comparison op, bitwidth, etc.)
-    aux: i64,
+    aux: i128,
     /// Optional name for instructions whose value depends on a
     /// symbol (currently only `GlobalAddr`). Audit Med-2: a hashed
     /// aux risked theoretical SipHash13 collisions merging two
@@ -62,7 +62,7 @@ struct Key {
 /// Build a canonical key for an instruction. Returns `None` if the
 /// instruction is impure or otherwise not a CSE candidate.
 fn key_of(inst: &Inst) -> Option<Key> {
-    let mk = |tag: u32, ops: Vec<ValueId>, aux: i64| -> Option<Key> {
+    let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
         Some(Key { tag, operands: ops, aux, name: None, ty: inst.ty.clone() })
     };
     let mk_named = |tag: u32, name: String| -> Option<Key> {
@@ -90,15 +90,15 @@ fn key_of(inst: &Inst) -> Option<Key> {
         InstKind::ConstInt(v, w)   => {
             let bits = w.bits();
             // Sign-extend at width: low `bits` bits → i64 sign-extended.
-            let signed = if bits >= 64 {
+            let signed = if bits >= 128 {
                 *v
             } else {
-                let shift = 64 - bits;
+                let shift = 128 - bits;
                 (*v << shift) >> shift
             };
             mk(1, vec![], signed)
         }
-        InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i64),
+        InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i128),
         InstKind::ConstBool(b)     => mk(3, vec![], if *b { 1 } else { 0 }),
 
         // Integer arithmetic --------------------------------------------
@@ -121,12 +121,12 @@ fn key_of(inst: &Inst) -> Option<Key> {
 
         // Comparisons ---------------------------------------------------
         InstKind::ICmp(op, a, b) => {
-            let aux = *op as i64;
+            let aux = *op as i128;
             let ops = match op { CmpOp::Eq | CmpOp::Ne => canon(*a, *b), _ => vec![*a, *b] };
             mk(30, ops, aux)
         }
         InstKind::FCmp(op, a, b) => {
-            let aux = *op as i64;
+            let aux = *op as i128;
             let ops = match op { CmpOp::Eq | CmpOp::Ne => canon(*a, *b), _ => vec![*a, *b] };
             mk(31, ops, aux)
         }
@@ -151,12 +151,12 @@ fn key_of(inst: &Inst) -> Option<Key> {
         InstKind::PopCount(a)           => mk(59, vec![*a], 0),
 
         // Conversions ---------------------------------------------------
-        InstKind::IntToFloat(v, fw)     => mk(60, vec![*v], fw.bits() as i64),
-        InstKind::FloatToInt(v, w)      => mk(61, vec![*v], w.bits() as i64),
-        InstKind::FloatExtend(v, fw)    => mk(62, vec![*v], fw.bits() as i64),
-        InstKind::FloatTrunc(v, fw)     => mk(63, vec![*v], fw.bits() as i64),
-        InstKind::IntExtend(v, w, sgn)  => mk(64, vec![*v], (w.bits() as i64) | ((*sgn as i64) << 32)),
-        InstKind::IntTrunc(v, w)        => mk(65, vec![*v], w.bits() as i64),
+        InstKind::IntToFloat(v, fw)     => mk(60, vec![*v], fw.bits() as i128),
+        InstKind::FloatToInt(v, w)      => mk(61, vec![*v], w.bits() as i128),
+        InstKind::FloatExtend(v, fw)    => mk(62, vec![*v], fw.bits() as i128),
+        InstKind::FloatTrunc(v, fw)     => mk(63, vec![*v], fw.bits() as i128),
+        InstKind::IntExtend(v, w, sgn)  => mk(64, vec![*v], (w.bits() as i128) | ((*sgn as i128) << 32)),
+        InstKind::IntTrunc(v, w)        => mk(65, vec![*v], w.bits() as i128),
 
         // Address arithmetic --------------------------------------------
         InstKind::GetElementPtr(base, idxs) => {
@@ -166,10 +166,10 @@ fn key_of(inst: &Inst) -> Option<Key> {
         }
 
         // Aggregates ----------------------------------------------------
-        InstKind::ExtractField(agg, i) => mk(80, vec![*agg], *i as i64),
+        InstKind::ExtractField(agg, i) => mk(80, vec![*agg], *i as i128),
         // InsertField produces a new aggregate value — pure but rarely
         // duplicate; include for completeness.
-        InstKind::InsertField(agg, i, v) => mk(81, vec![*agg, *v], *i as i64),
+        InstKind::InsertField(agg, i, v) => mk(81, vec![*agg, *v], *i as i128),
 
         // Impure / not handled ------------------------------------------
         InstKind::Load(..)
