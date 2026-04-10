@@ -25,6 +25,7 @@ use super::simplify_cfg::SimplifyCfg;
 use super::dead_func::DeadFuncElim;
 use super::dead_arg::DeadArgElim;
 use super::const_arg::ConstArgSpecialize;
+use super::return_prop::ReturnPropagate;
 use super::sroa::Sroa;
 use super::gvn::Gvn;
 use super::global_lsf::GlobalLsf;
@@ -129,6 +130,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O1)));
             pm.add(Box::new(ConstArgSpecialize));
             pm.add(Box::new(DeadArgElim));
+            pm.add(Box::new(ReturnPropagate));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(LocalLsf));
@@ -146,6 +148,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(ConstArgSpecialize));
             pm.add(Box::new(DeadArgElim));
+            pm.add(Box::new(ReturnPropagate));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));
@@ -176,6 +179,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::Os)));
             pm.add(Box::new(ConstArgSpecialize));
             pm.add(Box::new(DeadArgElim));
+            pm.add(Box::new(ReturnPropagate));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));
@@ -203,6 +207,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(Inline::for_level(OptLevel::O3)));
             pm.add(Box::new(ConstArgSpecialize));
             pm.add(Box::new(DeadArgElim));
+            pm.add(Box::new(ReturnPropagate));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(Bce));
