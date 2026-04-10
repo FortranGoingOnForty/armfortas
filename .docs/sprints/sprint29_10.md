@@ -25,7 +25,9 @@ Mostly landed:
 - preprocessor emission tracking uses `skip_depth`
 
 Still missing or partial:
-- `integer(16)` / `I128` is not implemented
+- `integer(16)` / `I128` is only partially staged: raw IR, globals, and local `-O0`
+  non-ABI codegen exist, but ABI-visible params/returns/calls and optimized-pipeline
+  support are still missing
 - preprocessor expansion is still split across `expand_condition_macros` and
   `expand_macros_inner`
 
@@ -111,7 +113,7 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 
 - `-Os` exists in the IR pipeline but is not exposed by the driver CLI yet
 - `-Ofast` currently reuses the O3 pipeline shape and has no real fast-math consumer
-- `integer(16)` / `I128` is still missing
+- `integer(16)` / `I128` still needs ABI-visible codegen and optimized-pipeline support
 - preprocessor codepath unification from 29.5 is still unfinished
 - 29.6 still lacks any true NEON/SIMD vectorizer implementation
 
@@ -200,3 +202,37 @@ Next implementation frontier after this kickoff slice:
 The goal is not just "tests pass". The goal is: when Sprint 29 closes, every promised
 item is either finished, explicitly deferred with a real dependency, or captured by a
 test-backed audit finding.
+
+## Current `i128` Staging Line
+
+Landed so far:
+- raw `i128` IR lowering and true wide constant/global storage
+- backend emission for `i128` globals
+- local `-O0` stack-backed `i128` memory traffic, add/sub/neg, equality, ordered compares,
+  and `select`
+- source-level and selector-level regressions with object determinism coverage for the
+  supported local `-O0` surface
+
+Still missing inside the same cleanup item:
+- ABI-visible `i128` params, returns, and call lowering
+- any external/runtime interop surface that passes `i128` across a function boundary
+- optimized (`-O1+`) pipeline support
+
+### Planned ABI Jump
+
+The next large `i128` step should be treated as a dedicated multi-commit tranche, not as
+background cleanup mixed into unrelated 29.10 work.
+
+Working assumption from local clang ABI probes on Apple ARM64:
+- `__int128` returns use `x0/x1`
+- `__int128` params consume register pairs `xN/xN+1`
+
+Staged plan:
+1. internal-only pair-register params and returns
+2. internal call lowering and callsite argument placement
+3. external/runtime interop coverage for the same pair-register ABI surface
+4. only after the ABI surface is real, widen optimizer support beyond raw `-O0`
+
+Timing:
+- keep landing bounded local `-O0` `i128` slices while they are still clearly separate
+- once the remaining work is mostly ABI-visible, take the dedicated ABI tranche head-on
