@@ -1339,7 +1339,9 @@ fn find_compiler() -> PathBuf {
     for c in &candidates {
         let p = PathBuf::from(c);
         if p.exists() {
-            return p;
+            return fs::canonicalize(&p).unwrap_or_else(|e| {
+                panic!("cannot canonicalize compiler path {}: {}", p.display(), e)
+            });
         }
     }
     panic!("cannot find armfortas binary — run `cargo build` first");
