@@ -36,9 +36,8 @@
 //! - IV's initial value, the loop bound, and the stride are all compile-time
 //!   constants discoverable from instruction operands.
 //! - Stride is exactly 1.
-//! - Trip count ≤ `FULL_UNROLL_MAX` (gate for O2 = 8, extended to 16 at O3
-//!   via the driver; we use a single threshold here and the driver gates the
-//!   pass on opt level).
+//! - Trip count ≤ `FULL_UNROLL_MAX` for ordinary `DO`, or
+//!   `DO_CONCURRENT_FULL_UNROLL_MAX` for lowered `DO CONCURRENT`.
 //! - Body instruction count ≤ `BODY_SIZE_MAX`.
 //! - No instruction defined in the latch is used outside the loop (i.e., no
 //!   values escape the unrolled body — they'll be dead after unrolling). This
@@ -78,6 +77,10 @@ fn dummy_span() -> Span {
 /// Trip counts above this are left for sprint 29.6's partial unroller
 /// which can handle dynamic trip counts with remainder loops.
 const FULL_UNROLL_MAX: i64 = 8;
+
+/// `DO CONCURRENT` is a stronger signal that iterations are independent,
+/// so we allow a slightly larger full-unroll budget.
+const DO_CONCURRENT_FULL_UNROLL_MAX: i64 = 16;
 
 /// Maximum instruction count in the latch block.
 ///
@@ -149,6 +152,20 @@ struct LoopShape {
     iv_bound:    i64,       // inclusive upper bound
     trip_count:  usize,
     exit_args:   Vec<ValueId>, // args from cmp_block's false branch to exit
+}
+
+fn is_do_concurrent_loop(
+    func: &Function,
+    header: BlockId,
+    cmp_block: BlockId,
+    body_blocks: &[BlockId],
+    latch: BlockId,
+) -> bool {
+    std::iter::once(header)
+        .chain(std::iter::once(cmp_block))
+        .chain(body_blocks.iter().copied())
+        .chain(std::iter::once(latch))
+        .any(|bb| func.block(bb).name.starts_with("doconc_"))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,10 +273,16 @@ fn detect_simple_loop(
         .sum();
     if total_insts > BODY_SIZE_MAX { return None; }
 
+    let full_unroll_max = if is_do_concurrent_loop(func, header, cmp_block, &body_blocks, latch) {
+        DO_CONCURRENT_FULL_UNROLL_MAX
+    } else {
+        FULL_UNROLL_MAX
+    };
+
     // ---- trip count ------------------------------------------------------
     let trip_count_i64 = iv_bound - iv_init + 1;
     if trip_count_i64 <= 0 { return None; }
-    if trip_count_i64 > FULL_UNROLL_MAX { return None; }
+    if trip_count_i64 > full_unroll_max { return None; }
 
     Some(LoopShape {
         preheader,
@@ -758,13 +781,13 @@ mod tests {
     /// The loop has 4 blocks: entry (preheader), header, latch, exit.
     /// The latch stores a constant to a fixed alloca (simulating a(i) = 42
     /// where the GEP is not yet computed — we just store to a fixed addr).
-    fn build_counted_loop(lo: i64, hi: i64) -> Module {
+    fn build_counted_loop_with_prefix(lo: i64, hi: i64, prefix: &str) -> Module {
         let mut m = Module::new("test".into());
         let mut f = Function::new("loop_test".into(), vec![], IrType::Void);
 
         // Allocate block IDs.
-        let header_id = f.create_block("header");
-        let latch_id  = f.create_block("latch");
+        let header_id = f.create_block(&format!("{}_check", prefix));
+        let latch_id  = f.create_block(&format!("{}_body", prefix));
         let exit_id   = f.create_block("exit");
         let entry_id  = f.entry; // preheader
 
@@ -843,6 +866,10 @@ mod tests {
         m
     }
 
+    fn build_counted_loop(lo: i64, hi: i64) -> Module {
+        build_counted_loop_with_prefix(lo, hi, "do")
+    }
+
     #[test]
     fn unrolls_trip4() {
         let mut m = build_counted_loop(1, 4);
@@ -872,6 +899,17 @@ mod tests {
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
         assert!(!changed, "should not unroll trip-count-10 loop");
+    }
+
+    #[test]
+    fn unrolls_trip10_do_concurrent() {
+        let mut m = build_counted_loop_with_prefix(1, 10, "doconc");
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(changed, "DO CONCURRENT trip-count-10 loop should fully unroll");
+
+        let f = &m.functions[0];
+        assert_eq!(f.blocks.len(), 12, "expected entry + 10 iter blocks + exit");
     }
 
     #[test]

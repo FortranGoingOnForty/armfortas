@@ -3981,7 +3981,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::DoLoop { name, var, start, end, step, body } => {
-            lower_do_loop(b, ctx, DoLoopFields { name, var, start, end, step, body });
+            lower_do_loop(b, ctx, DoLoopFields { name, var, start, end, step, body, concurrent: false });
         }
 
         Stmt::DoConcurrent { controls, body, locality: _, .. } => {
@@ -3997,6 +3997,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     end: &end_opt,
                     step: &ctrl.step,
                     body,
+                    concurrent: true,
                 });
             }
         }
@@ -4836,11 +4837,17 @@ struct DoLoopFields<'a> {
     end: &'a Option<crate::ast::expr::SpannedExpr>,
     step: &'a Option<crate::ast::expr::SpannedExpr>,
     body: &'a [SpannedStmt],
+    concurrent: bool,
 }
 
 /// Lower DO loop (counted loop with variable, start, end, step).
 fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) {
-    let DoLoopFields { name, var, start, end, step, body } = fields;
+    let DoLoopFields { name, var, start, end, step, body, concurrent } = fields;
+    let (check_name, body_name, incr_name, exit_name, neg_check_name, pos_check_name) = if concurrent {
+        ("doconc_check", "doconc_body", "doconc_incr", "doconc_exit", "doconc_neg_check", "doconc_pos_check")
+    } else {
+        ("do_check", "do_body", "do_incr", "do_exit", "do_neg_check", "do_pos_check")
+    };
     if let (Some(var_name), Some(start_expr), Some(end_expr)) = (var, start, end) {
         // Counted DO loop.
         let key = var_name.to_lowercase();
@@ -4861,10 +4868,10 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
             b.const_i32(1)
         };
 
-        let bb_check = b.create_block("do_check");
-        let bb_body = b.create_block("do_body");
-        let bb_incr = b.create_block("do_incr");
-        let bb_exit = b.create_block("do_exit");
+        let bb_check = b.create_block(check_name);
+        let bb_body = b.create_block(body_name);
+        let bb_incr = b.create_block(incr_name);
+        let bb_exit = b.create_block(exit_name);
 
         b.branch(bb_check, vec![]);
 
@@ -4882,8 +4889,8 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
             // Runtime step: check sign and use appropriate comparison.
             let zero = b.const_i32(0);
             let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
-            let bb_neg_check = b.create_block("do_neg_check");
-            let bb_pos_check = b.create_block("do_pos_check");
+            let bb_neg_check = b.create_block(neg_check_name);
+            let bb_pos_check = b.create_block(pos_check_name);
             b.cond_branch(step_neg, bb_neg_check, vec![], bb_pos_check, vec![]);
 
             b.set_block(bb_neg_check);
@@ -4914,8 +4921,8 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         b.set_block(bb_exit);
     } else {
         // Infinite DO (no variable) — `do ... end do` without loop control.
-        let bb_body = b.create_block("do_body");
-        let bb_exit = b.create_block("do_exit");
+        let bb_body = b.create_block(body_name);
+        let bb_exit = b.create_block(exit_name);
         b.branch(bb_body, vec![]);
 
         ctx.push_loop(name.clone(), bb_body, bb_exit);
@@ -7414,6 +7421,24 @@ end program
 ");
         assert!(ir.contains("const_int 2"));
         assert!(ir.contains("do_incr"));
+    }
+
+    #[test]
+    fn lower_do_concurrent_uses_distinct_blocks() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer :: i, arr(10)
+  do concurrent (i = 1:10)
+    arr(i) = i * 2
+  end do
+end program
+");
+        assert!(ir.contains("doconc_check"));
+        assert!(ir.contains("doconc_body"));
+        assert!(ir.contains("doconc_incr"));
+        assert!(ir.contains("doconc_exit"));
+        assert!(ir.contains("icmp le"));
     }
 
     #[test]
