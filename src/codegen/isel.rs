@@ -696,52 +696,117 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                     PhysReg::Gp(8),
                     PhysReg::Gp(9),
                 );
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::CmpReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp(16)),
-                        MachineOperand::PhysReg(PhysReg::Gp(8)),
-                    ],
-                    def: None,
-                });
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Cset,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
-                        MachineOperand::Cond(cmp_to_arm_cond(*op)),
-                    ],
-                    def: None,
-                });
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::CmpReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp(17)),
-                        MachineOperand::PhysReg(PhysReg::Gp(9)),
-                    ],
-                    def: None,
-                });
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Cset,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp32(11)),
-                        MachineOperand::Cond(cmp_to_arm_cond(*op)),
-                    ],
-                    def: None,
-                });
-                let combine = match op {
-                    CmpOp::Eq => ArmOpcode::AndReg,
-                    CmpOp::Ne => ArmOpcode::OrrReg,
-                    _ => panic!("isel: unsupported i128 compare op reached backend: {:?}", op),
-                };
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: combine,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
-                        MachineOperand::PhysReg(PhysReg::Gp32(10)),
-                        MachineOperand::PhysReg(PhysReg::Gp32(11)),
-                    ],
-                    def: None,
-                });
+                match op {
+                    CmpOp::Eq | CmpOp::Ne => {
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::CmpReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::Cset,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::Cond(cmp_to_arm_cond(*op)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::CmpReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::Cset,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                                MachineOperand::Cond(cmp_to_arm_cond(*op)),
+                            ],
+                            def: None,
+                        });
+                        let combine = match op {
+                            CmpOp::Eq => ArmOpcode::AndReg,
+                            CmpOp::Ne => ArmOpcode::OrrReg,
+                            _ => unreachable!(),
+                        };
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: combine,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                            ],
+                            def: None,
+                        });
+                    }
+                    CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                        let (hi_cond, lo_cond) = i128_ordered_conds(*op);
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::CmpReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::Cset,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::Cond(hi_cond),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::Cset,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                                MachineOperand::Cond(ArmCond::Eq),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::CmpReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::Cset,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(8)),
+                                MachineOperand::Cond(lo_cond),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::AndReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(8)),
+                            ],
+                            def: None,
+                        });
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::OrrReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(10)),
+                                MachineOperand::PhysReg(PhysReg::Gp32(11)),
+                            ],
+                            def: None,
+                        });
+                    }
+                }
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -2117,6 +2182,16 @@ fn cmp_to_arm_cond(op: CmpOp) -> ArmCond {
     }
 }
 
+fn i128_ordered_conds(op: CmpOp) -> (ArmCond, ArmCond) {
+    match op {
+        CmpOp::Lt => (ArmCond::Lt, ArmCond::Lo),
+        CmpOp::Le => (ArmCond::Lt, ArmCond::Ls),
+        CmpOp::Gt => (ArmCond::Gt, ArmCond::Hi),
+        CmpOp::Ge => (ArmCond::Gt, ArmCond::Hs),
+        _ => panic!("ordered i128 compare requires lt/le/gt/ge, got {:?}", op),
+    }
+}
+
 /// Map IR comparison op to ARM64 condition code (for float FCMP).
 fn fcmp_to_arm_cond(op: CmpOp) -> ArmCond {
     match op {
@@ -2228,6 +2303,21 @@ mod tests {
         assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::CmpReg).count() >= 2);
         assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 2);
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
+    }
+
+    #[test]
+    fn select_i128_icmp_lt_uses_high_signed_and_low_unsigned_conds() {
+        let mf = select_simple(|b| {
+            let x = b.const_i128(1);
+            let y = b.const_i128(2);
+            let _c = b.icmp(CmpOp::Lt, x, y);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::CmpReg).count() >= 2);
+        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 3);
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
+        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::OrrReg));
     }
 
     #[test]
