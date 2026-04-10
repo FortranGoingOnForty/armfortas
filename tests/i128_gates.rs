@@ -11,17 +11,17 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
-fn optimized_i128_capture_is_rejected_for_now() {
+fn o2_optimized_i128_capture_is_still_rejected_for_now() {
     let err = capture_from_path(&CaptureRequest {
         input: fixture("integer16_mul.f90"),
         requested: BTreeSet::from([Stage::OptIr]),
         opt_level: OptLevel::O2,
     })
-    .expect_err("optimized i128 capture should be rejected until the opt pipeline is widened");
+    .expect_err("O2 optimized i128 capture should still be rejected until the wider pipeline lands");
 
     assert_eq!(err.stage, FailureStage::Ir);
     assert!(
-        err.detail.contains("integer(16) / i128 optimization is not yet supported"),
+        err.detail.contains("integer(16) / i128 optimization above O1 is not yet supported"),
         "unexpected capture failure:\n{}",
         err
     );
