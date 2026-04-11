@@ -255,10 +255,13 @@ Landed so far:
 - raw IR/runtime-call `integer(16)` printing through `RuntimeCall(PrintInt, ...)`,
   including backend-gate coverage and selector-level proof that the call targets
   `_afs_print_int128` and still marshals the value through the pair-register ABI
+- stack-arg + wide-result direct-call coverage proving Apple ARM64 still returns
+  `integer(16)` in `x0/x1` even when later wide arguments spill to the stack,
+  with internal/external asm checks and linked cross-object execution coverage
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide results, broader formatted `i128` input beyond the
+  especially broader formatted `i128` input beyond the
   newly landed top-level scalar internal/external parser-backed paths, and general `RuntimeCall(..)`-based wide runtime
   surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
