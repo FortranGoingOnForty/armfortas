@@ -237,11 +237,16 @@ Landed so far:
   coverage where the widened `i128` path stays scalar
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
+- list-directed runtime `integer(16)` input through `afs_read_int128`, including
+  raw-IR lowering coverage, asm/object determinism checks, cross-opt runtime
+  execution coverage, and a real corpus program that round-trips wide decimal
+  values beyond `i64`
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide results, formatted/internal I/O `i128`, general
-  `RuntimeCall(..)`-based wide runtime surfaces, and more ambitious
+  especially stack-passed wide results, formatted/internal-input `i128`, full
+  character-buffer/internal I/O `i128`, general `RuntimeCall(..)`-based wide runtime
+  surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
 ### Planned ABI Jump
