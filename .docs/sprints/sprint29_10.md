@@ -248,11 +248,15 @@ Landed so far:
 - formatted internal character-buffer output through `afs_fmt_begin_internal`,
   including wide `integer(16)` coverage and a real source-level corpus program
   that proves internal formatted output survives through `trim(buf)` at runtime
+- formatted external `integer(16)` input through `afs_fmt_read_int128`, including
+  per-unit record caching for multi-item descriptor-indexed reads, source-level
+  IR/asm/object audits, cross-opt runtime execution coverage, and a real corpus
+  program that proves a wide value and trailing scalar survive the same record
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
   especially stack-passed wide results, broader formatted `i128` input beyond the
-  newly landed top-level scalar internal-buffer path, and general `RuntimeCall(..)`-based wide runtime
+  newly landed top-level scalar internal/external parser-backed paths, and general `RuntimeCall(..)`-based wide runtime
   surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
