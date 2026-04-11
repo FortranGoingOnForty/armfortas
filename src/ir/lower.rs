@@ -6242,7 +6242,10 @@ fn lower_array_read_item(
             let has_range = args.iter().any(|arg| {
                 matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
             });
-            if has_range && args.len() == 1 {
+            if has_range && info.allocatable {
+                lower_alloc_section_read(b, ctx, &info, args, mode);
+                true
+            } else if has_range && args.len() == 1 {
                 lower_1d_slice_read(b, ctx, &info, &args[0], mode);
                 true
             } else if has_range && args.len() > 1 && !info.allocatable {
@@ -6751,6 +6754,181 @@ fn lower_section_read_nd(
             }
             let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
             let ptr = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
+            let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+
+    b.set_block(exits[outer]);
+}
+
+fn load_array_desc_i64_field(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    offset: i64,
+) -> ValueId {
+    let off = b.const_i64(offset);
+    let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
+    b.load_typed(ptr, IrType::Int(IntWidth::I64))
+}
+
+fn lower_alloc_section_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    mode: ReadMode,
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        lower_bound: ValueId,
+        mem_stride: ValueId,
+        cum_extent: ValueId,
+    }
+
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let base = array_base_addr(b, info);
+    let one64 = b.const_i64(1);
+    let zero64 = b.const_i64(0);
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_extent = one64;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let dim_base = 24 + (dim_idx as i64) * 24;
+        let lo = load_array_desc_i64_field(b, info.addr, dim_base);
+        let up = load_array_desc_i64_field(b, info.addr, dim_base + 8);
+        let mem_stride = load_array_desc_i64_field(b, info.addr, dim_base + 16);
+        let span = b.isub(up, lo);
+        let extent_raw = b.iadd(span, one64);
+        let is_empty = b.icmp(CmpOp::Lt, up, lo);
+        let extent = b.select(is_empty, zero64, extent_raw);
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => {
+                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => lo,
+                };
+                let end_v = match end {
+                    Some(e) => {
+                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => up,
+                };
+                let stride_v = match stride {
+                    Some(e) => {
+                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => one64,
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                let val = widen_idx_to_i64(b, raw);
+                (val, val, one64, Some(1))
+            }
+        };
+        let counter = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter,
+            start_val,
+            end_val,
+            stride_val,
+            const_stride,
+            lower_bound: lo,
+            mem_stride,
+            cum_extent,
+        });
+        cum_extent = b.imul(cum_extent, extent);
+    }
+
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("read_desc_check_d{}", d)));
+        bodies.push(b.create_block(&format!("read_desc_body_d{}", d)));
+        incrs.push(b.create_block(&format!("read_desc_incr_d{}", d)));
+        exits.push(b.create_block(&format!("read_desc_exit_d{}", d)));
+    }
+
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero64);
+            let bb_neg = b.create_block(&format!("read_alloc_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("read_alloc_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let dim_data: Vec<(ValueId, ValueId, ValueId, ValueId)> = dims
+                .iter()
+                .map(|dim| (dim.counter, dim.lower_bound, dim.mem_stride, dim.cum_extent))
+                .collect();
+            let mut elem_offset: Option<ValueId> = None;
+            for (counter, lower_bound, mem_stride, cum_extent_d) in dim_data {
+                let cnt = b.load(counter);
+                let adjusted = b.isub(cnt, lower_bound);
+                let scaled = b.imul(adjusted, cum_extent_d);
+                let term = b.imul(scaled, mem_stride);
+                elem_offset = Some(match elem_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off_elems = elem_offset.unwrap_or_else(|| b.const_i64(0));
+            let elem_bytes_v = b.const_i64(elem_bytes);
+            let byte_off = b.imul(off_elems, elem_bytes_v);
+            let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
             let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
             b.branch(incrs[0], vec![]);
         } else {
@@ -7979,18 +8157,46 @@ fn lower_array_section(
         match &arg.value {
             crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
                 let start_val = start.as_ref()
-                    .map(|e| lower_expr(b, locals, e, st))
-                    .unwrap_or_else(|| b.const_i64(1)); // default start = 1
-                let end_val = end.as_ref()
-                    .map(|e| lower_expr(b, locals, e, st))
+                    .map(|e| {
+                        let raw = lower_expr(b, locals, e, st);
+                        widen_idx_to_i64(b, raw)
+                    })
                     .unwrap_or_else(|| {
-                        // Default end = upper bound of this dimension.
-                        let dim = b.const_i32((i + 1) as i32);
-                        b.call(FuncRef::External("afs_array_ubound".into()),
-                            vec![info.addr, dim], IrType::Int(IntWidth::I64))
+                        if info.allocatable {
+                            let dim = b.const_i32((i + 1) as i32);
+                            b.call(
+                                FuncRef::External("afs_array_lbound".into()),
+                                vec![info.addr, dim],
+                                IrType::Int(IntWidth::I64),
+                            )
+                        } else {
+                            let lower = info.dims.get(i).copied().map(|(lo, _)| lo).unwrap_or(1);
+                            b.const_i64(lower)
+                        }
+                    });
+                let end_val = end.as_ref()
+                    .map(|e| {
+                        let raw = lower_expr(b, locals, e, st);
+                        widen_idx_to_i64(b, raw)
+                    })
+                    .unwrap_or_else(|| {
+                        if info.allocatable {
+                            let dim = b.const_i32((i + 1) as i32);
+                            b.call(
+                                FuncRef::External("afs_array_ubound".into()),
+                                vec![info.addr, dim],
+                                IrType::Int(IntWidth::I64),
+                            )
+                        } else {
+                            let (lower, extent) = info.dims.get(i).copied().unwrap_or((1, 1));
+                            b.const_i64(lower + extent - 1)
+                        }
                     });
                 let stride_val = stride.as_ref()
-                    .map(|e| lower_expr(b, locals, e, st))
+                    .map(|e| {
+                        let raw = lower_expr(b, locals, e, st);
+                        widen_idx_to_i64(b, raw)
+                    })
                     .unwrap_or_else(|| b.const_i64(1)); // default stride = 1
 
                 // Store start at offset+0, end at offset+8, stride at offset+16.
@@ -8006,7 +8212,8 @@ fn lower_array_section(
             }
             crate::ast::expr::SectionSubscript::Element(e) => {
                 // Single element subscript in a section context — treat as start=end=val, stride=1.
-                let val = lower_expr(b, locals, e, st);
+                let raw = lower_expr(b, locals, e, st);
+                let val = widen_idx_to_i64(b, raw);
                 let off0 = b.const_i64(base_offset);
                 let off8 = b.const_i64(base_offset + 8);
                 let off16 = b.const_i64(base_offset + 16);
