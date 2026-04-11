@@ -92,6 +92,12 @@ Current audit findings:
   `cmp w26, x23` when the IR compared a 32-bit induction value against a 64-bit
   bound; `realworld_ipo_chain.f90` now keeps the compare-width harmonization
   honest through a real helper-chain compile at `-O2+`
+- fixed: module procedures were still missing host association over their own
+  module globals, so small cases like `call bump()` could silently leave a
+  shared module variable unchanged. `module_global_host_assoc.f90` is now a
+  passing audit program with cross-opt equality plus asm/object/run reproducibility,
+  and `tests/module_host_audit.rs` proves the raw IR resolves the shared module
+  global inside the procedure body
 - fixed: descriptor-backed array query intrinsics (`SIZE`, `LBOUND`, `UBOUND`)
   were lowered as raw `i64` runtime results even though Fortran default integer
   queries should materialize as default-kind scalars, and scalar/component
@@ -121,7 +127,6 @@ Current audit findings:
   (`realworld_ipo_chain.f90`), small-loop DO CONCURRENT exploitation
   (`realworld_doconc_square.f90`), and explicit-DO vectorization onto the bulk
   runtime kernels (`realworld_vector_stage.f90`)
-- deferred with living XFAIL: `MODULE-HOST-1` module-global host association
 - deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
   fails after parsing with an `i32`/`i64` IR store mismatch
 - deferred with living XFAIL: `ASHAPE-SIZE-1` dummy-array `SIZE(...)` lowering
@@ -138,7 +143,7 @@ Current audit corpus snapshot:
 - `172` programs with `CHECK`
 - `30` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
-- `4` living `XFAIL`s
+- `3` living `XFAIL`s
 
 ## Brutal Audit Priorities
 

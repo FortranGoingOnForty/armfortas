@@ -11,11 +11,6 @@ starting the full Sprint 29 audit:
   slot-addressing backend issue in some cases and the external whole-array
   fixture still returns `exit -1` under `capture_from_path(...Stage::Run...)`
   even though direct CLI O1/O2/O3 runs succeed.
-- Audit MODULE-HOST-1: module procedures currently miss module-global host
-  association in at least one small reproducer.
-  `test_programs/module_global_host_assoc.f90` now captures the current behavior
-  as a living XFAIL after the brutal audit uncovered that `call bump()` leaves
-  the module variable unchanged instead of writing `99`.
 - Parser gap: typed character array constructors using an explicit type-spec
   inside brackets (for example `[character(len=20) :: "a", "b"]`) still fail
   to parse in at least one real-world-style source shape.
