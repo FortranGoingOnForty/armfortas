@@ -106,17 +106,67 @@ fn loop_index_range(
     preds: &std::collections::HashMap<BlockId, Vec<BlockId>>,
     index: ValueId,
 ) -> Option<(i64, i64)> {
+    let (index, offset) = loop_index_base_and_offset(func, index)?;
     let header = func.block(lp.header);
     let param_idx = header.params.iter().position(|param| param.id == index)?;
     let init = loop_init_const(func, lp, preds, param_idx)?;
     let (bound, dir) = loop_bound_const(func, lp.header, index)?;
     let step = loop_step_const(func, lp, param_idx, index)?;
 
-    match (dir, step.signum()) {
-        (LoopDir::Ascending, 1) | (LoopDir::Descending, -1) => {
-            Some((init.min(bound), init.max(bound)))
+    let (range_lo, range_hi) = match dir {
+        LoopDir::Ascending if step > 0 => {
+            if init > bound {
+                return None;
+            }
+            let trip = bound.checked_sub(init)?;
+            let last = init.checked_add((trip / step).checked_mul(step)?)?;
+            (init.min(last), init.max(last))
         }
-        _ => None,
+        LoopDir::Descending if step < 0 => {
+            if init < bound {
+                return None;
+            }
+            let step_mag = step.checked_neg()?;
+            let trip = init.checked_sub(bound)?;
+            let last = init.checked_sub((trip / step_mag).checked_mul(step_mag)?)?;
+            (init.min(last), init.max(last))
+        }
+        _ => return None,
+    };
+    let adj_lo = range_lo.checked_add(offset)?;
+    let adj_hi = range_hi.checked_add(offset)?;
+    Some((adj_lo.min(adj_hi), adj_lo.max(adj_hi)))
+}
+
+fn loop_index_base_and_offset(func: &Function, value: ValueId) -> Option<(ValueId, i64)> {
+    let value = strip_int_casts(func, value);
+    let Some(kind) = find_inst_kind(func, value) else {
+        return Some((value, 0));
+    };
+
+    match kind {
+        InstKind::IAdd(lhs, rhs) => {
+            if let Some((base, offset)) = loop_index_base_and_offset(func, *lhs) {
+                if let Some(delta) = resolve_int_scalar(func, *rhs) {
+                    return offset.checked_add(delta).map(|next| (base, next));
+                }
+            }
+            if let Some((base, offset)) = loop_index_base_and_offset(func, *rhs) {
+                if let Some(delta) = resolve_int_scalar(func, *lhs) {
+                    return offset.checked_add(delta).map(|next| (base, next));
+                }
+            }
+            Some((value, 0))
+        }
+        InstKind::ISub(lhs, rhs) => {
+            if let Some((base, offset)) = loop_index_base_and_offset(func, *lhs) {
+                if let Some(delta) = resolve_int_scalar(func, *rhs) {
+                    return offset.checked_sub(delta).map(|next| (base, next));
+                }
+            }
+            Some((value, 0))
+        }
+        _ => Some((value, 0)),
     }
 }
 
@@ -603,5 +653,503 @@ mod tests {
             !pass.run(&mut m),
             "loop trip range 1..4 exceeds checked upper bound 3, so CheckBounds must remain"
         );
+    }
+
+    #[test]
+    fn bce_removes_loop_iv_plus_constant_check() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+
+        let init = f.next_value_id();
+        f.register_type(init, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: init,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+
+        let bound = f.next_value_id();
+        f.register_type(bound, IrType::Int(IntWidth::I32));
+        f.block_mut(header).insts.push(Inst {
+            id: bound,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(7, IntWidth::I32),
+        });
+        let cond = f.next_value_id();
+        f.register_type(cond, IrType::Bool);
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            ty: IrType::Bool,
+            span,
+            kind: InstKind::ICmp(CmpOp::Le, iv, bound),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let one = f.next_value_id();
+        f.register_type(one, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: one,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let plus = f.next_value_id();
+        f.register_type(plus, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: plus,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, one),
+        });
+        let plus64 = f.next_value_id();
+        f.register_type(plus64, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: plus64,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::IntExtend(plus, IntWidth::I64, true),
+        });
+        let lo = f.next_value_id();
+        f.register_type(lo, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.register_type(hi, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(8, IntWidth::I64),
+        });
+        let check = f.next_value_id();
+        f.register_type(check, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: check,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![plus64, lo, hi]),
+        });
+        let next_iv = f.next_value_id();
+        f.register_type(next_iv, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: next_iv,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = Bce;
+        assert!(pass.run(&mut m), "iv+1 check should be removed for trip range 2..7 and checked bounds 1..8");
+        let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
+            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+        });
+        assert!(!has_check, "loop body should no longer contain CheckBounds");
+    }
+
+    #[test]
+    fn bce_removes_loop_iv_minus_constant_check() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+
+        let init = f.next_value_id();
+        f.register_type(init, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: init,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+
+        let bound = f.next_value_id();
+        f.register_type(bound, IrType::Int(IntWidth::I32));
+        f.block_mut(header).insts.push(Inst {
+            id: bound,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(7, IntWidth::I32),
+        });
+        let cond = f.next_value_id();
+        f.register_type(cond, IrType::Bool);
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            ty: IrType::Bool,
+            span,
+            kind: InstKind::ICmp(CmpOp::Le, iv, bound),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let one = f.next_value_id();
+        f.register_type(one, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: one,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let minus = f.next_value_id();
+        f.register_type(minus, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: minus,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ISub(iv, one),
+        });
+        let minus64 = f.next_value_id();
+        f.register_type(minus64, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: minus64,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::IntExtend(minus, IntWidth::I64, true),
+        });
+        let lo = f.next_value_id();
+        f.register_type(lo, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.register_type(hi, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(8, IntWidth::I64),
+        });
+        let check = f.next_value_id();
+        f.register_type(check, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: check,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![minus64, lo, hi]),
+        });
+        let next_iv = f.next_value_id();
+        f.register_type(next_iv, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: next_iv,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = Bce;
+        assert!(pass.run(&mut m), "iv-1 check should be removed for trip range 2..7 and checked bounds 1..8");
+        let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
+            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+        });
+        assert!(!has_check, "loop body should no longer contain CheckBounds");
+    }
+
+    #[test]
+    fn bce_keeps_loop_iv_plus_constant_check_when_offset_exceeds_upper_bound() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+
+        let init = f.next_value_id();
+        f.register_type(init, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: init,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+
+        let bound = f.next_value_id();
+        f.register_type(bound, IrType::Int(IntWidth::I32));
+        f.block_mut(header).insts.push(Inst {
+            id: bound,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(7, IntWidth::I32),
+        });
+        let cond = f.next_value_id();
+        f.register_type(cond, IrType::Bool);
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            ty: IrType::Bool,
+            span,
+            kind: InstKind::ICmp(CmpOp::Le, iv, bound),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let two = f.next_value_id();
+        f.register_type(two, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: two,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        let plus = f.next_value_id();
+        f.register_type(plus, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: plus,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, two),
+        });
+        let plus64 = f.next_value_id();
+        f.register_type(plus64, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: plus64,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::IntExtend(plus, IntWidth::I64, true),
+        });
+        let lo = f.next_value_id();
+        f.register_type(lo, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.register_type(hi, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(8, IntWidth::I64),
+        });
+        let check = f.next_value_id();
+        f.register_type(check, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: check,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![plus64, lo, hi]),
+        });
+        let one = f.next_value_id();
+        f.register_type(one, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: one,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let next_iv = f.next_value_id();
+        f.register_type(next_iv, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: next_iv,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = Bce;
+        assert!(
+            !pass.run(&mut m),
+            "iv+2 check must remain when trip range 2..7 would access 9 beyond checked upper bound 8"
+        );
+    }
+
+    #[test]
+    fn bce_removes_loop_iv_plus_constant_check_with_large_step() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let exit = f.create_block("exit");
+
+        let init = f.next_value_id();
+        f.register_type(init, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: init,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(5, IntWidth::I32),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+
+        let bound = f.next_value_id();
+        f.register_type(bound, IrType::Int(IntWidth::I32));
+        f.block_mut(header).insts.push(Inst {
+            id: bound,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(10, IntWidth::I32),
+        });
+        let cond = f.next_value_id();
+        f.register_type(cond, IrType::Bool);
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            ty: IrType::Bool,
+            span,
+            kind: InstKind::ICmp(CmpOp::Le, iv, bound),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let five = f.next_value_id();
+        f.register_type(five, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: five,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(5, IntWidth::I32),
+        });
+        let plus = f.next_value_id();
+        f.register_type(plus, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: plus,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, five),
+        });
+        let plus64 = f.next_value_id();
+        f.register_type(plus64, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: plus64,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::IntExtend(plus, IntWidth::I64, true),
+        });
+        let lo = f.next_value_id();
+        f.register_type(lo, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.register_type(hi, IrType::Int(IntWidth::I64));
+        f.block_mut(body).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(10, IntWidth::I64),
+        });
+        let check = f.next_value_id();
+        f.register_type(check, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: check,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![plus64, lo, hi]),
+        });
+        let step = f.next_value_id();
+        f.register_type(step, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: step,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(6, IntWidth::I32),
+        });
+        let next_iv = f.next_value_id();
+        f.register_type(next_iv, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: next_iv,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(iv, step),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = Bce;
+        assert!(
+            pass.run(&mut m),
+            "iv+5 check should be removed when the trip sequence is only 5 and checked bounds are 1..10"
+        );
+        let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
+            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+        });
+        assert!(!has_check, "loop body should no longer contain CheckBounds");
     }
 }
