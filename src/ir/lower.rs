@@ -4770,29 +4770,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 b.const_i32(5) // default stdin
             };
             if is_list_directed {
-                let null = b.const_i64(0); // null IOSTAT
-                for item in items {
-                    if let Expr::Name { name } = &item.node {
-                        let key = name.to_lowercase();
-                        if let Some(info) = ctx.locals.get(&key) {
-                            let addr = if info.by_ref {
-                                b.load(info.addr)
-                            } else {
-                                info.addr
-                            };
-                            let ty = &info.ty;
-                            let func_name = match ty {
-                                IrType::Int(IntWidth::I128) => "afs_read_int128",
-                                IrType::Int(IntWidth::I64) => "afs_read_int64",
-                                IrType::Int(_) => "afs_read_int",
-                                IrType::Float(FloatWidth::F64) => "afs_read_real64",
-                                IrType::Float(_) => "afs_read_real",
-                                _ => "afs_read_int",
-                            };
-                            b.call(FuncRef::External(func_name.into()), vec![unit, addr, null], IrType::Void);
-                        }
-                    }
-                }
+                lower_list_read_items(b, ctx, items, unit);
             } else {
                 let (fmt_ptr, fmt_len) =
                     lower_string_expr(b, &ctx.locals, &fmt_control.unwrap().value, ctx.st);
@@ -5968,6 +5946,26 @@ fn lower_internal_write_items(
     }
 }
 
+fn lower_list_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+) {
+    let iostat = b.const_i64(0);
+    let mode = ReadMode::Unit { unit, iostat };
+
+    for item in items {
+        if lower_array_read_item(b, ctx, item, mode) {
+            continue;
+        }
+        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+            continue;
+        };
+        let _ = lower_read_into_addr(b, mode, &ty, addr);
+    }
+}
+
 fn lower_internal_read_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -5979,35 +5977,279 @@ fn lower_internal_read_items(
     let pos = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero, pos);
     let iostat = b.alloca(IrType::Int(IntWidth::I32));
+    let mode = ReadMode::Internal { buf_ptr, buf_len, pos, iostat };
 
     for item in items {
+        if lower_array_read_item(b, ctx, item, mode) {
+            continue;
+        }
         let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let func_name = match &ty {
-            IrType::Int(IntWidth::I128) => "afs_read_internal_int128",
-            IrType::Int(IntWidth::I64) => "afs_read_internal_int64",
-            IrType::Int(_) => "afs_read_internal_int",
-            IrType::Float(FloatWidth::F64) => "afs_read_internal_real",
-            IrType::Float(FloatWidth::F32) => {
-                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                b.call(
-                    FuncRef::External("afs_read_internal_real".into()),
-                    vec![buf_ptr, buf_len, pos, tmp, iostat],
-                    IrType::Void,
-                );
-                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                let narrow = b.float_trunc(wide, FloatWidth::F32);
-                b.store(narrow, addr);
-                continue;
+        let _ = lower_read_into_addr(b, mode, &ty, addr);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadMode {
+    Unit {
+        unit: ValueId,
+        iostat: ValueId,
+    },
+    Internal {
+        buf_ptr: ValueId,
+        buf_len: ValueId,
+        pos: ValueId,
+        iostat: ValueId,
+    },
+    FormattedUnit {
+        unit: ValueId,
+        fmt_ptr: ValueId,
+        fmt_len: ValueId,
+        item_idx: ValueId,
+        iostat: ValueId,
+    },
+    FormattedInternal {
+        buf_ptr: ValueId,
+        buf_len: ValueId,
+        fmt_ptr: ValueId,
+        fmt_len: ValueId,
+        item_idx: ValueId,
+        iostat: ValueId,
+    },
+}
+
+fn lower_read_into_addr(
+    b: &mut FuncBuilder,
+    mode: ReadMode,
+    ty: &IrType,
+    addr: ValueId,
+) -> bool {
+    match ty {
+        IrType::Int(IntWidth::I128) => {
+            match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    b.call(FuncRef::External("afs_read_int128".into()), vec![unit, addr, iostat], IrType::Void);
+                }
+                ReadMode::Internal { buf_ptr, buf_len, pos, iostat } => {
+                    b.call(
+                        FuncRef::External("afs_read_internal_int128".into()),
+                        vec![buf_ptr, buf_len, pos, addr, iostat],
+                        IrType::Void,
+                    );
+                }
+                ReadMode::FormattedUnit { unit, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int128".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+                ReadMode::FormattedInternal { buf_ptr, buf_len, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int128_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
             }
-            _ => continue,
-        };
-        b.call(
-            FuncRef::External(func_name.into()),
-            vec![buf_ptr, buf_len, pos, addr, iostat],
-            IrType::Void,
-        );
+            true
+        }
+        IrType::Int(IntWidth::I64) => {
+            match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    b.call(FuncRef::External("afs_read_int64".into()), vec![unit, addr, iostat], IrType::Void);
+                }
+                ReadMode::Internal { buf_ptr, buf_len, pos, iostat } => {
+                    b.call(
+                        FuncRef::External("afs_read_internal_int64".into()),
+                        vec![buf_ptr, buf_len, pos, addr, iostat],
+                        IrType::Void,
+                    );
+                }
+                ReadMode::FormattedUnit { unit, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int64".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+                ReadMode::FormattedInternal { buf_ptr, buf_len, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int64_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+            }
+            true
+        }
+        IrType::Int(_) => {
+            match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    b.call(FuncRef::External("afs_read_int".into()), vec![unit, addr, iostat], IrType::Void);
+                }
+                ReadMode::Internal { buf_ptr, buf_len, pos, iostat } => {
+                    b.call(
+                        FuncRef::External("afs_read_internal_int".into()),
+                        vec![buf_ptr, buf_len, pos, addr, iostat],
+                        IrType::Void,
+                    );
+                }
+                ReadMode::FormattedUnit { unit, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+                ReadMode::FormattedInternal { buf_ptr, buf_len, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+            }
+            true
+        }
+        IrType::Float(FloatWidth::F64) => {
+            match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    b.call(FuncRef::External("afs_read_real64".into()), vec![unit, addr, iostat], IrType::Void);
+                }
+                ReadMode::Internal { buf_ptr, buf_len, pos, iostat } => {
+                    b.call(
+                        FuncRef::External("afs_read_internal_real".into()),
+                        vec![buf_ptr, buf_len, pos, addr, iostat],
+                        IrType::Void,
+                    );
+                }
+                ReadMode::FormattedUnit { unit, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_real".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+                ReadMode::FormattedInternal { buf_ptr, buf_len, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_real_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                }
+            }
+            true
+        }
+        IrType::Float(FloatWidth::F32) => {
+            let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+            let handled = match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    b.call(FuncRef::External("afs_read_real".into()), vec![unit, tmp, iostat], IrType::Void);
+                    true
+                }
+                ReadMode::Internal { buf_ptr, buf_len, pos, iostat } => {
+                    b.call(
+                        FuncRef::External("afs_read_internal_real".into()),
+                        vec![buf_ptr, buf_len, pos, tmp, iostat],
+                        IrType::Void,
+                    );
+                    true
+                }
+                ReadMode::FormattedUnit { unit, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_real".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                    true
+                }
+                ReadMode::FormattedInternal { buf_ptr, buf_len, fmt_ptr, fmt_len, item_idx, iostat } => {
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_real_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                    true
+                }
+            };
+            let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+            let narrow = b.float_trunc(wide, FloatWidth::F32);
+            b.store(narrow, addr);
+            handled
+        }
+        _ => false,
+    }
+}
+
+fn bump_formatted_read_index(b: &mut FuncBuilder, item_idx: ValueId) {
+    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+    let one = b.const_i64(1);
+    let next_idx = b.iadd(current_idx, one);
+    b.store(next_idx, item_idx);
+}
+
+fn lower_array_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+) -> bool {
+    match &item.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let Some(info) = ctx.locals.get(&key).cloned() else {
+                return false;
+            };
+            if info.dims.is_empty() && !info.allocatable {
+                return false;
+            }
+            lower_whole_array_read(b, &info, mode);
+            true
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return false;
+            };
+            let key = name.to_lowercase();
+            let Some(info) = ctx.locals.get(&key).cloned() else {
+                return false;
+            };
+            if info.dims.is_empty() && !info.allocatable {
+                return false;
+            }
+            let has_range = args.iter().any(|arg| {
+                matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+            });
+            if has_range && args.len() == 1 {
+                lower_1d_slice_read(b, ctx, &info, &args[0], mode);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
@@ -6020,6 +6262,9 @@ fn lower_read_target_addr(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = ctx.locals.get(&key)?;
+            if !info.dims.is_empty() || info.allocatable {
+                return None;
+            }
             let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
             Some((addr, info.ty.clone()))
         }
@@ -6070,58 +6315,24 @@ fn lower_formatted_internal_read_items(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let iostat = b.alloca(IrType::Int(IntWidth::I32));
     let zero = b.const_i64(0);
-    let one = b.const_i64(1);
     b.store(zero, item_idx);
+    let mode = ReadMode::FormattedInternal {
+        buf_ptr,
+        buf_len,
+        fmt_ptr,
+        fmt_len,
+        item_idx,
+        iostat,
+    };
 
     for item in items {
+        if lower_array_read_item(b, ctx, item, mode) {
+            continue;
+        }
         let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
-        match &ty {
-            IrType::Int(IntWidth::I128) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int128_internal".into()),
-                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I64) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int64_internal".into()),
-                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(_) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int_internal".into()),
-                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_real_internal".into()),
-                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F32) => {
-                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                b.call(
-                    FuncRef::External("afs_fmt_read_real_internal".into()),
-                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
-                    IrType::Void,
-                );
-                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                let narrow = b.float_trunc(wide, FloatWidth::F32);
-                b.store(narrow, addr);
-            }
-            _ => {}
-        }
-        let next_idx = b.iadd(current_idx, one);
-        b.store(next_idx, item_idx);
+        let _ = lower_read_into_addr(b, mode, &ty, addr);
     }
 }
 
@@ -6136,58 +6347,23 @@ fn lower_formatted_read_items(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let iostat = b.alloca(IrType::Int(IntWidth::I32));
     let zero = b.const_i64(0);
-    let one = b.const_i64(1);
     b.store(zero, item_idx);
+    let mode = ReadMode::FormattedUnit {
+        unit,
+        fmt_ptr,
+        fmt_len,
+        item_idx,
+        iostat,
+    };
 
     for item in items {
+        if lower_array_read_item(b, ctx, item, mode) {
+            continue;
+        }
         let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
-        match &ty {
-            IrType::Int(IntWidth::I128) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int128".into()),
-                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I64) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int64".into()),
-                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(_) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_int".into()),
-                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_fmt_read_real".into()),
-                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F32) => {
-                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                b.call(
-                    FuncRef::External("afs_fmt_read_real".into()),
-                    vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
-                    IrType::Void,
-                );
-                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                let narrow = b.float_trunc(wide, FloatWidth::F32);
-                b.store(narrow, addr);
-            }
-            _ => {}
-        }
-        let next_idx = b.iadd(current_idx, one);
-        b.store(next_idx, item_idx);
+        let _ = lower_read_into_addr(b, mode, &ty, addr);
     }
 }
 
@@ -6360,6 +6536,86 @@ fn lower_1d_slice_write(
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     let elem = b.load_typed(p, info.ty.clone());
     b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let next = b.iadd(i_val, stride_val);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn lower_1d_slice_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    arg: &crate::ast::expr::Argument,
+    mode: ReadMode,
+) {
+    let (start_e, end_e, stride_e) = match &arg.value {
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            (start.as_ref(), end.as_ref(), stride.as_ref())
+        }
+        _ => return,
+    };
+
+    let (decl_lo, decl_ext) = info.dims.first().copied().unwrap_or((1, 0));
+    let decl_hi = decl_lo + decl_ext - 1;
+
+    let start_val = match start_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_lo as i32),
+    };
+    let end_val = match end_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(decl_hi as i32),
+    };
+    let stride_val = match stride_e {
+        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        None => b.const_i32(1),
+    };
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(start_val, i_addr);
+
+    let bb_check = b.create_block("slice_read_check");
+    let bb_body = b.create_block("slice_read_body");
+    let bb_exit = b.create_block("slice_read_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let const_stride = stride_e.and_then(eval_const_int);
+    if let Some(sv) = const_stride {
+        let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+        let done = b.icmp(done_op, i, end_val);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let stride_neg = b.icmp(CmpOp::Lt, stride_val, zero);
+        let bb_neg = b.create_block("slice_read_neg_check");
+        let bb_pos = b.create_block("slice_read_pos_check");
+        b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let done_neg = b.icmp(CmpOp::Lt, i, end_val);
+        b.cond_branch(done_neg, bb_exit, vec![], bb_body, vec![]);
+
+        b.set_block(bb_pos);
+        let done_pos = b.icmp(CmpOp::Gt, i, end_val);
+        b.cond_branch(done_pos, bb_exit, vec![], bb_body, vec![]);
+    }
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let lo_const = b.const_i32(decl_lo as i32);
+    let zero_based = b.isub(i_val, lo_const);
+    let zero_based64 = widen_idx_to_i64(b, zero_based);
+    let step = b.const_i64(elem_bytes);
+    let byte_off = b.imul(zero_based64, step);
+    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let _ = lower_read_into_addr(b, mode, &info.ty, p);
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
     b.branch(bb_check, vec![]);
@@ -6628,6 +6884,43 @@ fn lower_whole_array_write(
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     let elem = b.load_typed(ptr, info.ty.clone());
     b.call(FuncRef::External(writer.into()), vec![unit, elem], IrType::Void);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn lower_whole_array_read(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    mode: ReadMode,
+) {
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let n = array_total_elems_value(b, info);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("read_arr_check");
+    let bb_body = b.create_block("read_arr_body");
+    let bb_exit = b.create_block("read_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    let byte_off = b.imul(i_val, elem_bytes_v);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
     b.store(next, i_addr);
