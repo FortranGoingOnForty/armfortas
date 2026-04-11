@@ -130,8 +130,9 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 - 29.6 still lacks a general native NEON/SIMD loop vectorizer; the current vectorize
   pass rewrites recognized scalar loops onto existing bulk runtime kernels
 - the remaining honest `i128` gaps are now narrower: formatted input beyond
-  scalar lvalues, any remaining `RuntimeCall(..)`-style wide runtime surfaces,
-  and any future legal array/vector-style wide rewrites
+  today's scalar, component, whole-array, and 1-D slice lvalues; any remaining
+  `RuntimeCall(..)`-style wide runtime surfaces; and any future legal
+  array/vector-style wide rewrites
 
 ### 3. Audit and harden everything that claims to be done
 
@@ -144,10 +145,10 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 ## Test Surface Sitrep
 
 Current high-level state:
-- `158` runtime corpus programs
-- `147` programs with `CHECK`
-- `10` diagnostic `ERROR_EXPECTED` programs
-- `21` programs with `IR_CHECK`
+- `160` runtime corpus programs
+- `150` programs with `CHECK`
+- `11` diagnostic `ERROR_EXPECTED` programs
+- `23` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `1` living `XFAIL` program
 
@@ -163,8 +164,9 @@ What is still too weak:
 - too few IR-shape assertions relative to the optimizer surface
 - optimizer-specific binary/IR differentials could still be broader
 - living XFAIL canaries are still underused outside the known append-I/O case
-- the new `i128` and runtime audits are strong on scalar and descriptor-style
-  lvalue surfaces but not yet broad on richer formatted/non-scalar cases
+- the new `i128` and runtime audits are now strong on scalar, component,
+  whole-array, and 1-D slice lvalue surfaces, but not yet broad on richer
+  formatted/non-scalar cases like multi-dimensional sections
 
 ## Brutal Audit Priorities Inside 29.10
 
