@@ -160,10 +160,15 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn run_cross_object_case(opt_level: OptLevel) {
+fn run_cross_object_case_named(
+    program_name: &str,
+    helper_name: &str,
+    opt_level: OptLevel,
+    expected_score: char,
+) {
     let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-    let program = fixture("integer16_external_call.f90");
-    let helper = fixture("integer16_external_call_helper.c");
+    let program = fixture(program_name);
+    let helper = fixture(helper_name);
     let stem = program.file_stem().unwrap().to_str().unwrap();
     let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
@@ -182,8 +187,9 @@ fn run_cross_object_case(opt_level: OptLevel) {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains('1'),
-        "cross-object integer(16) binary should print score 1:\n{}",
+        String::from_utf8_lossy(&run.stdout).contains(expected_score),
+        "cross-object integer(16) binary should print score {}:\n{}",
+        expected_score,
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -192,10 +198,19 @@ fn run_cross_object_case(opt_level: OptLevel) {
     let _ = fs::remove_file(&binary);
 }
 
-fn deterministic_cross_object_case(opt_level: OptLevel) {
+fn run_cross_object_case(opt_level: OptLevel) {
+    run_cross_object_case_named(
+        "integer16_external_call.f90",
+        "integer16_external_call_helper.c",
+        opt_level,
+        '1',
+    );
+}
+
+fn deterministic_cross_object_case_named(program_name: &str, helper_name: &str, opt_level: OptLevel) {
     let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-    let program = fixture("integer16_external_call.f90");
-    let helper = fixture("integer16_external_call_helper.c");
+    let program = fixture(program_name);
+    let helper = fixture(helper_name);
     let stem = program.file_stem().unwrap().to_str().unwrap();
     let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
@@ -224,6 +239,14 @@ fn deterministic_cross_object_case(opt_level: OptLevel) {
     let _ = fs::remove_file(&fortran_obj);
     let _ = fs::remove_file(&helper_obj);
     let _ = fs::remove_file(&binary);
+}
+
+fn deterministic_cross_object_case(opt_level: OptLevel) {
+    deterministic_cross_object_case_named(
+        "integer16_external_call.f90",
+        "integer16_external_call_helper.c",
+        opt_level,
+    );
 }
 
 #[test]
@@ -284,4 +307,118 @@ fn linked_external_i128_binary_is_deterministic_at_os() {
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_ofast() {
     deterministic_cross_object_case(OptLevel::Ofast);
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_o0() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O0,
+        '1',
+    );
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_o1() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O1,
+        '1',
+    );
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_o2() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O2,
+        '1',
+    );
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_o3() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O3,
+        '1',
+    );
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_os() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::Os,
+        '1',
+    );
+}
+
+#[test]
+fn external_stack_i128_call_runs_across_objects_at_ofast() {
+    run_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::Ofast,
+        '1',
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_o0() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O0,
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_o1() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O1,
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_o2() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O2,
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_o3() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::O3,
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_os() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::Os,
+    );
+}
+
+#[test]
+fn linked_external_stack_i128_binary_is_deterministic_at_ofast() {
+    deterministic_cross_object_case_named(
+        "integer16_external_stack_call.f90",
+        "integer16_external_stack_call_helper.c",
+        OptLevel::Ofast,
+    );
 }
