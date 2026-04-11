@@ -4022,11 +4022,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     }
                                 } else if info.by_ref {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(b, val, &info.ty);
                                     let ptr = b.load(info.addr);
-                                    b.store(val, ptr);
+                                    b.store(coerced, ptr);
                                 } else {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
-                                    b.store(val, info.addr);
+                                    let coerced = coerce_to_type(b, val, &info.ty);
+                                    b.store(coerced, info.addr);
                                 }
                             }
                         }
@@ -4050,10 +4052,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
                             if let Some(field) = layout.field(component) {
                                 let val = lower_expr_ctx_tl(b, ctx, value);
+                                let coerced = coerce_to_type(
+                                    b,
+                                    val,
+                                    &type_info_to_ir_type(&field.type_info),
+                                );
                                 let offset = b.const_i64(field.offset as i64);
                                 let field_ptr = b.gep(base_addr, vec![offset],
                                     IrType::Int(IntWidth::I8));
-                                b.store(val, field_ptr);
+                                b.store(coerced, field_ptr);
                             }
                         }
                     }
@@ -8342,21 +8349,33 @@ fn lower_array_intrinsic(
                 // SIZE(array, dim)
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    Some(b.call(FuncRef::External("afs_array_size_dim".into()),
-                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                    let result64 = b.call(
+                        FuncRef::External("afs_array_size_dim".into()),
+                        vec![desc, dim],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else {
                 // SIZE(array)
-                Some(b.call(FuncRef::External("afs_array_size".into()),
-                    vec![desc], IrType::Int(IntWidth::I64)))
+                let result64 = b.call(
+                    FuncRef::External("afs_array_size".into()),
+                    vec![desc],
+                    IrType::Int(IntWidth::I64),
+                );
+                Some(b.int_trunc(result64, IntWidth::I32))
             }
         }
         "lbound" => {
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    Some(b.call(FuncRef::External("afs_array_lbound".into()),
-                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                    let result64 = b.call(
+                        FuncRef::External("afs_array_lbound".into()),
+                        vec![desc, dim],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else { None }
         }
@@ -8364,8 +8383,12 @@ fn lower_array_intrinsic(
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    Some(b.call(FuncRef::External("afs_array_ubound".into()),
-                        vec![desc, dim], IrType::Int(IntWidth::I64)))
+                    let result64 = b.call(
+                        FuncRef::External("afs_array_ubound".into()),
+                        vec![desc, dim],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else { None }
         }
@@ -8937,9 +8960,14 @@ fn lower_expr_full(
                             if i < layout.fields.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                     let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
+                                    let coerced = coerce_to_type(
+                                        b,
+                                        val,
+                                        &type_info_to_ir_type(&layout.fields[i].type_info),
+                                    );
                                     let offset = b.const_i64(layout.fields[i].offset as i64);
                                     let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
-                                    b.store(val, field_ptr);
+                                    b.store(coerced, field_ptr);
                                 }
                             }
                         }
