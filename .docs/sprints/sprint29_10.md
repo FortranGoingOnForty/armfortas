@@ -23,14 +23,13 @@ Mostly landed:
 - `Function::value_type()` is O(1) via the type cache
 - `AcValue::ImpliedDo` is boxed
 - preprocessor emission tracking uses `skip_depth`
+- preprocessor expansion unification is landed
 
 Still missing or partial:
 - `integer(16)` / `I128` is still only partially staged: raw IR, globals, local `-O0`
   codegen, ABI-visible params/returns/calls, and full optimizer-level support through
   `-Ofast` now exist for the current scalar surface, but broader wide-value surface
   area is still missing
-- preprocessor expansion unification is landed; the remaining cleanup is keeping
-  the docs and deferred-item ledger honest as the last wide-value/runtime gaps close
 
 ### 29.6: Loop Optimizations
 
@@ -38,10 +37,14 @@ Partially landed:
 - loop fusion, fission, interchange, peeling, unswitching, and unrolling are
   present and wired into the live optimization pipeline
 - runtime corpus contains real loop-focused programs
+- a real `vectorize` pass exists at `-O3` / `-Ofast`, but today it rewrites
+  recognized scalar loops onto existing bulk runtime kernels rather than emitting
+  native vector IR / codegen
 
 Still missing:
-- there is no actual NEON/SIMD vectorization pass module
-- whole-array vectorization remains lowering + scalar loop code, not vector IR/codegen
+- a general native NEON/SIMD loop vectorizer is still missing
+- whole-array vectorization is still mostly lowering + runtime-kernel redirection,
+  not end-to-end vector IR / codegen
 
 ### 29.7: Function Inlining
 
@@ -75,16 +78,26 @@ Remaining 29.8 work is now audit and hardening work, not missing greenfield impl
 
 ### 29.9: Fortran-Specific & Interprocedural Optimizations
 
-Mostly not landed as optimizer work:
-- PURE/ELEMENTAL flags are preserved on IR functions, but no optimizer pass uses them
-- `DO CONCURRENT` lowers as an ordinary sequential loop
-- no whole-array vectorization pass exists
-- no dead-argument elimination pass exists
-- no constant-argument propagation pass exists
-- no return-value propagation pass exists
-- no whole-program analysis pass exists
+Substantially landed for the single-file / intramodule surface:
+- Fortran-aware no-alias metadata exists and is consumed by LICM, DSE, local LSF,
+  and cross-block LSF
+- PURE call reuse exists in GVN and unused PURE calls are removed by DCE
+- ELEMENTAL whole-array lowering is real
+- `DO CONCURRENT` lowering now preserves masks, multiple controls, and a distinct
+  optimization surface, with exploitation through unroll/bulk-kernel paths
+- whole-array / simple-loop vectorization exists through lowering + runtime-kernel
+  redirection
+- dead-argument elimination, constant-argument specialization, and return propagation
+  are all live in the optimized intramodule pipeline
 
-Partial runway exists:
+Still missing:
+- whole-program analysis across multiple source files
+- cross-module IPO / inlining
+- a general devirtualization pass
+- broader PURE reordering/speculation beyond reuse / elimination
+- a general native vectorizer beyond the current recognized-pattern lowering/runtime path
+
+Supporting runway that made the above possible:
 - statically-known type-bound calls already lower directly to a concrete callee
 - call graph and inlining infrastructure exist
 - base alias analysis exists and can be extended in a Fortran-aware direction
@@ -113,10 +126,12 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 ### 2. Finish the non-29.9 leftovers that still block honest Sprint 29 closure
 
 - `integer(16)` / `I128` still needs broader wide-value support beyond the newly landed
-  scalar + stack-passed direct-call ABI surface
-- preprocessor codepath unification from 29.5 is still unfinished
+  scalar + direct-call / runtime-I/O surface
 - 29.6 still lacks a general native NEON/SIMD loop vectorizer; the current vectorize
   pass rewrites recognized scalar loops onto existing bulk runtime kernels
+- the remaining honest `i128` gaps are now narrower: richer formatted input coverage,
+  remaining `RuntimeCall(..)`-style wide runtime surfaces, and any future legal
+  array/vector-style wide rewrites
 
 ### 3. Audit and harden everything that claims to be done
 
@@ -129,25 +144,27 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 ## Test Surface Sitrep
 
 Current high-level state:
-- `131` runtime corpus programs
-- `121` programs with `CHECK`
+- `156` runtime corpus programs
+- `145` programs with `CHECK`
 - `10` diagnostic `ERROR_EXPECTED` programs
-- `4` programs with `IR_CHECK`
-- `5` programs with `IR_NOT`
-- `0` living `XFAIL` programs
+- `19` programs with `IR_CHECK`
+- `6` programs with `IR_NOT`
+- `1` living `XFAIL` program
 
 What is good:
-- O0/O1/O2/O3/Ofast runtime matrix is green
+- O0/O1/O2/O3/Os/Ofast runtime matrix is green on the currently landed corpus
 - there are explicit determinism regressions for assembly/codegen
-- there are targeted IR/capture tests for opt-level-respecting capture, BCE, and GVN
+- object-level and linked-binary determinism are now pinned in real audit suites
+- there are targeted IR/capture tests for opt-level-respecting capture, BCE, GVN,
+  `i128` staging, and runtime-I/O surfaces
 - optimizer unit tests and audit tests are extensive
 
 What is still too weak:
 - too few IR-shape assertions relative to the optimizer surface
-- almost no object-level assertions
-- linked-binary determinism had not been pinned
-- no living XFAIL audit canaries are present right now
-- 29.9 has almost no direct regression coverage because the passes are not there yet
+- optimizer-specific binary/IR differentials could still be broader
+- living XFAIL canaries are still underused outside the known append-I/O case
+- the new `i128` and runtime audits are strong on scalar surfaces but not yet broad
+  on richer formatted/non-scalar cases
 
 ## Brutal Audit Priorities Inside 29.10
 
@@ -203,6 +220,30 @@ Next implementation frontier after this kickoff slice:
 The goal is not just "tests pass". The goal is: when Sprint 29 closes, every promised
 item is either finished, explicitly deferred with a real dependency, or captured by a
 test-backed audit finding.
+
+## Sitrep: 2026-04-11
+
+Current cleanup status:
+- 29.8 is effectively in hardening mode, not greenfield implementation mode
+- 29.9 is substantially burned down for the intramodule / single-file surface
+- 29.10 is now mostly a disciplined closeout of the remaining `i128` / runtime /
+  audit gaps, not a grab-bag of unrelated new work
+
+What the recent log actually shows:
+- runtime and artifact determinism have been hardened and kept green in CI
+- `i128` moved from raw IR staging to full scalar optimized-pipeline support through
+  `-Ofast`, real runtime I/O, internal/external formatted input, and cross-object ABI coverage
+- one stale deferred item (`stack-passed wide results`) was removed only after the
+  existing stack-arg + cross-object coverage proved Apple ARM64 still returns
+  `integer(16)` in `x0/x1`
+
+What remains honestly inside 29.10 right now:
+1. richer formatted `integer(16)` input coverage beyond the landed top-level scalar paths
+2. broader audit expansion for optimizer/runtime correctness and determinism
+3. any future legal `integer(16)` array/vector-style widening should be treated as a
+   deliberate new tranche, not assumed to be part of the current scalar closeout
+
+As of 2026-04-11, `trunk` CI run `24286254804` is in progress for `Drop stale wide-result defer`.
 
 ## Current `i128` Staging Line
 
@@ -262,8 +303,7 @@ Landed so far:
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
   especially broader formatted `i128` input beyond the
-  newly landed top-level scalar internal/external parser-backed paths, and general `RuntimeCall(..)`-based wide runtime
-  surfaces, and more ambitious
+  newly landed top-level scalar internal/external parser-backed paths, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
 ### Planned ABI Jump
