@@ -92,6 +92,16 @@ Current audit findings:
   `cmp w26, x23` when the IR compared a 32-bit induction value against a 64-bit
   bound; `realworld_ipo_chain.f90` now keeps the compare-width harmonization
   honest through a real helper-chain compile at `-O2+`
+- fixed: descriptor-backed array query intrinsics (`SIZE`, `LBOUND`, `UBOUND`)
+  were lowered as raw `i64` runtime results even though Fortran default integer
+  queries should materialize as default-kind scalars, and scalar/component
+  assignment lowering skipped mixed-width coercion at ordinary store sites;
+  `realworld_shape_guard.f90` now proves the default-kind runtime-shape path
+  through real allocatable metadata, loop bounds, and deterministic objects
+- fixed: backend `MovReg` emission did not handle `x -> w` truncation views, so
+  real-world default-kind array-query assignments could produce invalid asm like
+  `mov w21, x20`; the new runtime-shape audit keeps that truncation surface
+  honest
 - proven: LICM hoists invariant scalar dummy loads out of a real-world affine
   update loop in `realworld_affine_shift.f90` once BCE clears the loop body
 - proven: GVN reduces duplicated branch-join PURE helper calls in
@@ -99,6 +109,9 @@ Current audit findings:
   helper result through the join
 - proven: DSE removes the dead seed store in `realworld_seed_overwrite.f90`
   across the intervening noalias helper call while preserving the real fill
+- proven: SROA scalarizes the fixed tap buffer in `realworld_binomial_blend.f90`
+  and BCE clears the corresponding safe stencil bounds checks at `-O2+`, giving
+  us another living real-world audit kernel for the small-aggregate path
 - proven: loop-legality audit kernels `realworld_inplace_prefix.f90` and
   `realworld_inplace_symmix.f90` stay runtime-correct, cross-opt-equal, and
   deterministic across IR/object/binary surfaces
@@ -113,15 +126,17 @@ Current audit findings:
   fails after parsing with an `i32`/`i64` IR store mismatch
 - deferred with living XFAIL: `ASHAPE-SIZE-1` dummy-array `SIZE(...)` lowering
   still routes dummy arrays into the descriptor runtime path even though ordinary
-  dummy arrays are carried as base pointers today; the living canary is
-  `realworld_assumed_shape_size.f90`
+  dummy arrays are carried as base pointers today. The default-integer query
+  typing bug is now fixed, so the remaining failure is the real descriptor
+  mismatch: `realworld_assumed_shape_size.f90` reaches `afs_array_size` with
+  bogus dummy-array metadata and panics in the runtime
 - separately deferred parser gap: typed character array constructors using an
   explicit type-spec inside `[]`
 
 Current audit corpus snapshot:
-- `181` top-level `test_programs/*.f90` runtime corpus programs
-- `170` programs with `CHECK`
-- `28` programs with `IR_CHECK`
+- `183` top-level `test_programs/*.f90` runtime corpus programs
+- `172` programs with `CHECK`
+- `30` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `4` living `XFAIL`s
 

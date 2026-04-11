@@ -30,6 +30,9 @@ starting the full Sprint 29 audit:
 - Audit ASHAPE-SIZE-1: dummy-array `SIZE(...)` queries still flow into the
   descriptor runtime path even though ordinary dummy arrays are currently
   lowered as base pointers rather than descriptors.
+  The mixed-width query-result bug that originally masked this is now fixed, so
+  the remaining failure is the real one: `afs_array_size` receives bogus
+  dummy-array metadata and panics in the runtime.
   The 29.11 claims audit surfaced this first through the original
   `realworld_ipo_chain.f90` helper loop, and
   `test_programs/realworld_assumed_shape_size.f90` now captures it as a living
