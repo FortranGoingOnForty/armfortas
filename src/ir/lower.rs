@@ -637,27 +637,7 @@ fn collect_module_globals(
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
-    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
-    for decl in decls {
-        if let Decl::TypeDecl { type_spec: _, attrs, entities } = &decl.node {
-            let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
-            if !is_param { continue; }
-            for entity in entities {
-                if let Some(init) = &entity.init {
-                    if let Some(val) = eval_const_scalar(init, &param_consts) {
-                        param_consts.insert(entity.name.to_lowercase(), val);
-                    }
-                }
-            }
-        }
-        if let Decl::ParameterStmt { pairs } = &decl.node {
-            for (name, expr) in pairs {
-                if let Some(val) = eval_const_scalar(expr, &param_consts) {
-                    param_consts.insert(name.to_lowercase(), val);
-                }
-            }
-        }
-    }
+    let param_consts = collect_decl_param_consts(decls);
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let ir_ty = lower_type_spec(type_spec);
@@ -705,7 +685,7 @@ fn collect_module_globals(
                     // IntArray/FloatArray initializer when the
                     // entity.init is an array constructor of
                     // literal values.
-                    let dims = extract_array_dims(specs);
+                    let dims = extract_array_dims(specs, &param_consts);
                     let total: i64 = dims.iter().map(|(_, e)| *e).product();
                     if total <= 0 {
                         continue; // assumed/deferred shape — skip
@@ -1463,6 +1443,40 @@ fn eval_const_scalar(
     }
 }
 
+fn collect_decl_param_consts(
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> HashMap<String, ConstScalar> {
+    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { attrs, entities, .. } => {
+                let is_param = attrs
+                    .iter()
+                    .any(|a| matches!(a, crate::ast::decl::Attribute::Parameter));
+                if !is_param {
+                    continue;
+                }
+                for entity in entities {
+                    if let Some(init) = &entity.init {
+                        if let Some(val) = eval_const_scalar(init, &param_consts) {
+                            param_consts.insert(entity.name.to_lowercase(), val);
+                        }
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    if let Some(val) = eval_const_scalar(expr, &param_consts) {
+                        param_consts.insert(name.to_lowercase(), val);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    param_consts
+}
+
 /// A pending global variable produced by the lowerer for a SAVE'd
 /// scalar local. Flushed into the IR Module after the containing
 /// function finishes lowering.
@@ -2024,30 +2038,7 @@ fn alloc_decls(
     //
     // Parameters can reference earlier parameters (`tau = 2 * pi`),
     // so we walk decls in order and build the map incrementally.
-    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
-    for d in decls {
-        match &d.node {
-            Decl::TypeDecl { attrs, entities, .. } => {
-                let is_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
-                if !is_param { continue; }
-                for entity in entities {
-                    if let Some(init) = &entity.init {
-                        if let Some(val) = eval_const_scalar(init, &param_consts) {
-                            param_consts.insert(entity.name.to_lowercase(), val);
-                        }
-                    }
-                }
-            }
-            Decl::ParameterStmt { pairs } => {
-                for (name, expr) in pairs {
-                    if let Some(val) = eval_const_scalar(expr, &param_consts) {
-                        param_consts.insert(name.to_lowercase(), val);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let param_consts = collect_decl_param_consts(decls);
 
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
@@ -2069,7 +2060,9 @@ fn alloc_decls(
                 let char_len = match type_spec {
                     TypeSpec::Character(Some(sel)) => {
                         match &sel.len {
-                            Some(crate::ast::decl::LenSpec::Expr(e)) => eval_const_int(e),
+                            Some(crate::ast::decl::LenSpec::Expr(e)) => {
+                                eval_const_int_in_scope(e, &param_consts)
+                            }
                             Some(crate::ast::decl::LenSpec::Star) => None, // assumed
                             Some(crate::ast::decl::LenSpec::Colon) => None, // deferred
                             None => Some(1), // default len=1
@@ -2124,7 +2117,7 @@ fn alloc_decls(
                     locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
-                    let dims = extract_array_dims(specs);
+                    let dims = extract_array_dims(specs, &param_consts);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let elem_bytes = ir_scalar_byte_size(&elem_ty);
                     let total_bytes = total_size * elem_bytes;
@@ -2472,12 +2465,18 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
 
 /// Extract compile-time array dimensions from array spec.
 /// Returns (lower_bound, extent) pairs. Runtime expressions default to (1, 1).
-fn extract_array_dims(specs: &[ArraySpec]) -> Vec<(i64, i64)> {
+fn extract_array_dims(
+    specs: &[ArraySpec],
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Vec<(i64, i64)> {
     specs.iter().map(|spec| {
         match spec {
             ArraySpec::Explicit { lower, upper } => {
-                let lo = lower.as_ref().and_then(eval_const_int).unwrap_or(1);
-                let hi = eval_const_int(upper).unwrap_or(1);
+                let lo = lower
+                    .as_ref()
+                    .and_then(|e| eval_const_int_in_scope(e, param_consts))
+                    .unwrap_or(1);
+                let hi = eval_const_int_in_scope(upper, param_consts).unwrap_or(1);
                 (lo, hi - lo + 1)
             }
             ArraySpec::AssumedShape { .. } => (1, 0), // size unknown at compile time
@@ -2496,6 +2495,16 @@ fn eval_const_int(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
             eval_const_int(operand).map(|v| -v)
         }
         _ => None,
+    }
+}
+
+fn eval_const_int_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<i64> {
+    match eval_const_scalar(expr, param_consts)? {
+        ConstScalar::Int(v) => i64::try_from(v).ok(),
+        ConstScalar::Float(_) => None,
     }
 }
 
@@ -3373,6 +3382,7 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
 
 fn arg_dims_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> Vec<(i64, i64)> {
     let key = arg_name.to_lowercase();
+    let param_consts = collect_decl_param_consts(decls);
     for decl in decls {
         if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
@@ -3386,7 +3396,7 @@ fn arg_dims_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
                 if entity.name.to_lowercase() == key {
                     let array_spec = entity.array_spec.as_ref().or(attr_dims);
                     return array_spec
-                        .map(|specs| extract_array_dims(specs))
+                        .map(|specs| extract_array_dims(specs, &param_consts))
                         .unwrap_or_default();
                 }
             }
