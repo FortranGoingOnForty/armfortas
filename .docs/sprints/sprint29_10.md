@@ -252,6 +252,9 @@ Landed so far:
   per-unit record caching for multi-item descriptor-indexed reads, source-level
   IR/asm/object audits, cross-opt runtime execution coverage, and a real corpus
   program that proves a wide value and trailing scalar survive the same record
+- raw IR/runtime-call `integer(16)` printing through `RuntimeCall(PrintInt, ...)`,
+  including backend-gate coverage and selector-level proof that the call targets
+  `_afs_print_int128` and still marshals the value through the pair-register ABI
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,

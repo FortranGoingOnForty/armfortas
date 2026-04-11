@@ -10,7 +10,7 @@ Deferred items that came up while finishing Sprint 29.10 cleanup work:
   but the broader result ABI surface is still narrower than the call-argument
   surface.
 - Audit and widen any remaining `RuntimeCall(..)`-style `integer(16)` runtime entry
-  points beyond the current print/write/read/internal-write/internal-read/format-push/
-  format-read coverage.
+  points beyond the current raw-IR `PrintInt`/print/write/read/internal-write/
+  internal-read/format-push/format-read coverage.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.
