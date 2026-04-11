@@ -5981,40 +5981,80 @@ fn lower_internal_read_items(
     let iostat = b.alloca(IrType::Int(IntWidth::I32));
 
     for item in items {
-        if let Expr::Name { name } = &item.node {
-            let key = name.to_lowercase();
-            if let Some(info) = ctx.locals.get(&key) {
-                let addr = if info.by_ref {
-                    b.load(info.addr)
-                } else {
-                    info.addr
-                };
-                let func_name = match &info.ty {
-                    IrType::Int(IntWidth::I128) => "afs_read_internal_int128",
-                    IrType::Int(IntWidth::I64) => "afs_read_internal_int64",
-                    IrType::Int(_) => "afs_read_internal_int",
-                    IrType::Float(FloatWidth::F64) => "afs_read_internal_real",
-                    IrType::Float(FloatWidth::F32) => {
-                        let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                        b.call(
-                            FuncRef::External("afs_read_internal_real".into()),
-                            vec![buf_ptr, buf_len, pos, tmp, iostat],
-                            IrType::Void,
-                        );
-                        let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                        let narrow = b.float_trunc(wide, FloatWidth::F32);
-                        b.store(narrow, addr);
-                        continue;
-                    }
-                    _ => continue,
-                };
+        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+            continue;
+        };
+        let func_name = match &ty {
+            IrType::Int(IntWidth::I128) => "afs_read_internal_int128",
+            IrType::Int(IntWidth::I64) => "afs_read_internal_int64",
+            IrType::Int(_) => "afs_read_internal_int",
+            IrType::Float(FloatWidth::F64) => "afs_read_internal_real",
+            IrType::Float(FloatWidth::F32) => {
+                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                 b.call(
-                    FuncRef::External(func_name.into()),
-                    vec![buf_ptr, buf_len, pos, addr, iostat],
+                    FuncRef::External("afs_read_internal_real".into()),
+                    vec![buf_ptr, buf_len, pos, tmp, iostat],
                     IrType::Void,
                 );
+                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                let narrow = b.float_trunc(wide, FloatWidth::F32);
+                b.store(narrow, addr);
+                continue;
             }
+            _ => continue,
+        };
+        b.call(
+            FuncRef::External(func_name.into()),
+            vec![buf_ptr, buf_len, pos, addr, iostat],
+            IrType::Void,
+        );
+    }
+}
+
+fn lower_read_target_addr(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+) -> Option<(ValueId, IrType)> {
+    match &item.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let info = ctx.locals.get(&key)?;
+            let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+            Some((addr, info.ty.clone()))
         }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let key = name.to_lowercase();
+            let info = ctx.locals.get(&key)?;
+            if info.dims.is_empty() && !info.allocatable {
+                return None;
+            }
+            if args.iter().any(|arg| {
+                !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_))
+            }) {
+                return None;
+            }
+            let idx64 = compute_flat_elem_offset(b, &ctx.locals, info, args, ctx.st);
+            let base = array_base_addr(b, info);
+            let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
+            Some((elem_ptr, info.ty.clone()))
+        }
+        Expr::ComponentAccess { base, component } => {
+            let (base_addr, type_name) =
+                resolve_component_base(b, &ctx.locals, base, ctx.type_layouts)?;
+            let layout = ctx.type_layouts.get(&type_name)?;
+            let field = layout.field(component)?;
+            if matches!(&field.type_info, crate::sema::symtab::TypeInfo::Derived(_)) {
+                return None;
+            }
+            let offset = b.const_i64(field.offset as i64);
+            let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+            Some((field_ptr, type_info_to_ir_type(&field.type_info)))
+        }
+        _ => None,
     }
 }
 
@@ -6034,61 +6074,54 @@ fn lower_formatted_internal_read_items(
     b.store(zero, item_idx);
 
     for item in items {
-        if let Expr::Name { name } = &item.node {
-            let key = name.to_lowercase();
-            if let Some(info) = ctx.locals.get(&key) {
-                let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
-                let addr = if info.by_ref {
-                    b.load(info.addr)
-                } else {
-                    info.addr
-                };
-                match &info.ty {
-                    IrType::Int(IntWidth::I128) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int128_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Int(IntWidth::I64) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int64_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Int(_) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Float(FloatWidth::F64) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_real_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Float(FloatWidth::F32) => {
-                        let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                        b.call(
-                            FuncRef::External("afs_fmt_read_real_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
-                            IrType::Void,
-                        );
-                        let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                        let narrow = b.float_trunc(wide, FloatWidth::F32);
-                        b.store(narrow, addr);
-                    }
-                    _ => {}
-                }
-                let next_idx = b.iadd(current_idx, one);
-                b.store(next_idx, item_idx);
+        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+            continue;
+        };
+        let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+        match &ty {
+            IrType::Int(IntWidth::I128) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int128_internal".into()),
+                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
             }
+            IrType::Int(IntWidth::I64) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int64_internal".into()),
+                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(_) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int_internal".into()),
+                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F64) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_real_internal".into()),
+                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F32) => {
+                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                b.call(
+                    FuncRef::External("afs_fmt_read_real_internal".into()),
+                    vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                    IrType::Void,
+                );
+                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                let narrow = b.float_trunc(wide, FloatWidth::F32);
+                b.store(narrow, addr);
+            }
+            _ => {}
         }
+        let next_idx = b.iadd(current_idx, one);
+        b.store(next_idx, item_idx);
     }
 }
 
@@ -6107,61 +6140,54 @@ fn lower_formatted_read_items(
     b.store(zero, item_idx);
 
     for item in items {
-        if let Expr::Name { name } = &item.node {
-            let key = name.to_lowercase();
-            if let Some(info) = ctx.locals.get(&key) {
-                let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
-                let addr = if info.by_ref {
-                    b.load(info.addr)
-                } else {
-                    info.addr
-                };
-                match &info.ty {
-                    IrType::Int(IntWidth::I128) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int128".into()),
-                            vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Int(IntWidth::I64) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int64".into()),
-                            vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Int(_) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_int".into()),
-                            vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Float(FloatWidth::F64) => {
-                        b.call(
-                            FuncRef::External("afs_fmt_read_real".into()),
-                            vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
-                            IrType::Void,
-                        );
-                    }
-                    IrType::Float(FloatWidth::F32) => {
-                        let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-                        b.call(
-                            FuncRef::External("afs_fmt_read_real".into()),
-                            vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
-                            IrType::Void,
-                        );
-                        let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                        let narrow = b.float_trunc(wide, FloatWidth::F32);
-                        b.store(narrow, addr);
-                    }
-                    _ => {}
-                }
-                let next_idx = b.iadd(current_idx, one);
-                b.store(next_idx, item_idx);
+        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+            continue;
+        };
+        let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+        match &ty {
+            IrType::Int(IntWidth::I128) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int128".into()),
+                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
             }
+            IrType::Int(IntWidth::I64) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int64".into()),
+                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(_) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_int".into()),
+                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F64) => {
+                b.call(
+                    FuncRef::External("afs_fmt_read_real".into()),
+                    vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F32) => {
+                let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                b.call(
+                    FuncRef::External("afs_fmt_read_real".into()),
+                    vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                    IrType::Void,
+                );
+                let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                let narrow = b.float_trunc(wide, FloatWidth::F32);
+                b.store(narrow, addr);
+            }
+            _ => {}
         }
+        let next_idx = b.iadd(current_idx, one);
+        b.store(next_idx, item_idx);
     }
 }
 
