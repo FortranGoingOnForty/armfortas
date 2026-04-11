@@ -3997,17 +3997,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Write { controls, items } => {
-            // Extract unit (first control). * means stdout (unit 6).
-            let unit = if let Some(ctrl) = controls.first() {
-                if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
-                    b.const_i32(6)
-                } else {
-                    lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
-                }
-            } else {
-                b.const_i32(6)
-            };
-
             // Check for format specifier (second positional control).
             // * means list-directed; a string literal means formatted.
             let fmt_control = controls.iter().skip(1)
@@ -4028,6 +4017,38 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     } else { true }
                 })
                 .unwrap_or(true);
+
+            if let Some(ctrl) = controls.first() {
+                if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
+                    if is_list_directed {
+                        lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
+                    } else {
+                        let (fmt_ptr, fmt_len) = lower_string_expr(b, &ctx.locals, &fmt_control.unwrap().value, ctx.st);
+                        b.call(
+                            FuncRef::External("afs_fmt_begin_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len],
+                            IrType::Void,
+                        );
+                        for item in items {
+                            lower_fmt_push(b, ctx, item);
+                        }
+                        let adv = b.const_i32(if advance { 1 } else { 0 });
+                        b.call(FuncRef::External("afs_fmt_end".into()), vec![adv], IrType::Void);
+                    }
+                    return;
+                }
+            }
+
+            // Extract unit (first control). * means stdout (unit 6).
+            let unit = if let Some(ctrl) = controls.first() {
+                if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
+                    b.const_i32(6)
+                } else {
+                    lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+                }
+            } else {
+                b.const_i32(6)
+            };
 
             if is_list_directed {
                 lower_write_items_adv(b, ctx, items, unit, advance);
@@ -4718,6 +4739,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Read { controls, items } => {
+            let fmt_control = controls.iter().skip(1)
+                .find(|c| c.keyword.is_none())
+                .or_else(|| controls.iter().find(|c| c.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("fmt")).unwrap_or(false)));
+
+            let is_list_directed = match fmt_control {
+                None => true,
+                Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
+            };
+
+            if let Some(ctrl) = controls.first() {
+                if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
+                    if is_list_directed {
+                        lower_internal_read_items(b, ctx, items, buf_ptr, buf_len);
+                        return;
+                    }
+                }
+            }
+
             // READ(unit, *) items — simplified: first control is unit.
             let unit = if let Some(ctrl) = controls.first() {
                 lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
@@ -5809,6 +5848,161 @@ fn lower_write_items_adv(
     }
     if advance {
         b.call(FuncRef::External("afs_write_newline".into()), vec![unit], IrType::Void);
+    }
+}
+
+fn internal_io_buffer(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    control: &crate::ast::stmt::IoControl,
+) -> Option<(ValueId, ValueId)> {
+    if control.keyword.as_deref().map(|k| !k.eq_ignore_ascii_case("unit")).unwrap_or(false) {
+        return None;
+    }
+
+    match &control.value.node {
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            if info.char_kind == CharKind::None {
+                return None;
+            }
+            Some(lower_string_expr(b, &ctx.locals, &control.value, ctx.st))
+        }
+        _ => None,
+    }
+}
+
+fn lower_internal_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+) {
+    let zero = b.const_i64(0);
+    let pos = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, pos);
+
+    for item in items {
+        let is_char = match &item.node {
+            Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
+                .map(|i| i.char_kind != CharKind::None)
+                .unwrap_or(false),
+            Expr::FunctionCall { callee, .. } => {
+                if let Expr::Name { name } = &callee.node {
+                    matches!(name.to_lowercase().as_str(),
+                        "trim" | "adjustl" | "adjustr" | "char")
+                } else { false }
+            }
+            _ => false,
+        };
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
+            b.call(
+                FuncRef::External("afs_write_internal_string".into()),
+                vec![buf_ptr, buf_len, ptr, len, pos],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        let val = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
+        let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        match ty {
+            IrType::Int(IntWidth::I128) => {
+                b.call(
+                    FuncRef::External("afs_write_internal_int128".into()),
+                    vec![buf_ptr, buf_len, val, pos],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(IntWidth::I64) => {
+                b.call(
+                    FuncRef::External("afs_write_internal_int64".into()),
+                    vec![buf_ptr, buf_len, val, pos],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(_) => {
+                let i32_val = if matches!(ty, IrType::Int(IntWidth::I32)) {
+                    val
+                } else {
+                    b.int_extend(val, IntWidth::I32, true)
+                };
+                b.call(
+                    FuncRef::External("afs_write_internal_int".into()),
+                    vec![buf_ptr, buf_len, i32_val, pos],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F64) => {
+                b.call(
+                    FuncRef::External("afs_write_internal_real64".into()),
+                    vec![buf_ptr, buf_len, val, pos],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(_) => {
+                let widened = b.float_extend(val, FloatWidth::F64);
+                b.call(
+                    FuncRef::External("afs_write_internal_real64".into()),
+                    vec![buf_ptr, buf_len, widened, pos],
+                    IrType::Void,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_internal_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+) {
+    let zero = b.const_i64(0);
+    let pos = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, pos);
+    let iostat = b.alloca(IrType::Int(IntWidth::I32));
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            let key = name.to_lowercase();
+            if let Some(info) = ctx.locals.get(&key) {
+                let addr = if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                };
+                let func_name = match &info.ty {
+                    IrType::Int(IntWidth::I128) => "afs_read_internal_int128",
+                    IrType::Int(IntWidth::I64) => "afs_read_internal_int64",
+                    IrType::Int(_) => "afs_read_internal_int",
+                    IrType::Float(FloatWidth::F64) => "afs_read_internal_real",
+                    IrType::Float(FloatWidth::F32) => {
+                        let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                        b.call(
+                            FuncRef::External("afs_read_internal_real".into()),
+                            vec![buf_ptr, buf_len, pos, tmp, iostat],
+                            IrType::Void,
+                        );
+                        let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                        let narrow = b.float_trunc(wide, FloatWidth::F32);
+                        b.store(narrow, addr);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                b.call(
+                    FuncRef::External(func_name.into()),
+                    vec![buf_ptr, buf_len, pos, addr, iostat],
+                    IrType::Void,
+                );
+            }
+        }
     }
 }
 
@@ -8143,6 +8337,48 @@ program test
 end program
 ");
         assert!(ir.contains("afs_read_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_integer16_uses_wide_buffer_writer() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  character(len=96) :: buf
+  integer(16) :: x
+  x = 170141183460469231731687303715884105727_16
+  write(buf, *) x
+end program
+");
+        assert!(ir.contains("afs_write_internal_int128"));
+    }
+
+    #[test]
+    fn lower_internal_read_integer16_uses_wide_buffer_reader() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  character(len=96) :: buf
+  integer(16) :: x
+  read(buf, *) x
+end program
+");
+        assert!(ir.contains("afs_read_internal_int128"));
+    }
+
+    #[test]
+    fn lower_formatted_internal_write_integer16_uses_internal_format_sink() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  character(len=96) :: buf
+  integer(16) :: x
+  x = 170141183460469231731687303715884105727_16
+  write(buf, '(I40)') x
+end program
+");
+        assert!(ir.contains("afs_fmt_begin_internal"));
+        assert!(ir.contains("afs_fmt_push_int128"));
     }
 
     #[test]
