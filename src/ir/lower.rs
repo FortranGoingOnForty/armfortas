@@ -5837,6 +5837,11 @@ fn lower_fmt_push(
         let val = lower_expr(b, &ctx.locals, item, ctx.st);
         let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
         match &ty {
+            IrType::Int(IntWidth::I128) => {
+                let slot = b.alloca(IrType::Int(IntWidth::I128));
+                b.store(val, slot);
+                b.call(FuncRef::External("afs_fmt_push_int128".into()), vec![slot], IrType::Void);
+            }
             IrType::Int(IntWidth::I64) => {
                 b.call(FuncRef::External("afs_fmt_push_int".into()), vec![val], IrType::Void);
             }
@@ -8125,6 +8130,19 @@ program test
 end program
 ");
         assert!(ir.contains("afs_write_int128"));
+    }
+
+    #[test]
+    fn lower_formatted_write_integer16_uses_wide_push() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer(16) :: x
+  x = 170141183460469231731687303715884105727_16
+  write(*, '(I40)') x
+end program
+");
+        assert!(ir.contains("afs_fmt_push_int128"));
     }
 
     #[test]

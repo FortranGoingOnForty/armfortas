@@ -115,3 +115,100 @@ fn integer16_print_object_snapshot_is_deterministic_at_o2() {
         "integer(16) print object snapshots should be deterministic at O2"
     );
 }
+
+#[test]
+fn integer16_formatted_write_uses_wide_push_in_ir_and_asm() {
+    let source = program("integer16_format.f90");
+
+    let opt_ir = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::OptIr]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::OptIr,
+    );
+    assert!(
+        opt_ir.contains("call @afs_fmt_push_int128("),
+        "optimized IR should route formatted integer(16) output through the wide format push:\n{}",
+        opt_ir
+    );
+
+    let asm = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Asm,
+    );
+    assert!(
+        asm.contains("_afs_fmt_push_int128"),
+        "assembly should reference the wide format push symbol:\n{}",
+        asm
+    );
+}
+
+#[test]
+fn integer16_formatted_write_runs_across_all_opt_levels() {
+    for level in [
+        OptLevel::O0,
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
+        let result = capture_from_path(&CaptureRequest {
+            input: program("integer16_format.f90"),
+            requested: BTreeSet::from([Stage::Run]),
+            opt_level: level,
+        })
+        .unwrap_or_else(|e| panic!("formatted integer(16) write should run at {:?}:\n{}", level, e));
+
+        let run = result
+            .get(Stage::Run)
+            .and_then(CapturedStage::as_run)
+            .expect("missing run capture");
+
+        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) write run at {:?}:\n{:#?}", level, run);
+        assert!(
+            run.stdout.contains("170141183460469231731687303715884105727"),
+            "wide positive formatted integer(16) output should survive at {:?}:\n{}",
+            level,
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("-170141183460469231731687303715884105727"),
+            "wide negative formatted integer(16) output should survive at {:?}:\n{}",
+            level,
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn integer16_formatted_write_object_snapshot_is_deterministic_at_o2() {
+    let source = program("integer16_format.f90");
+    let first = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Obj,
+    );
+    let second = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Obj,
+    );
+
+    assert_eq!(
+        first, second,
+        "formatted integer(16) write object snapshots should be deterministic at O2"
+    );
+}
