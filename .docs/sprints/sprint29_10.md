@@ -220,6 +220,9 @@ Landed so far:
   callee loads from `[x29, #16+]`, outgoing caller stack-area stores, optimized internal
   execution coverage, and linked cross-object determinism coverage against clang-built
   foreign helpers
+- list-directed runtime `integer(16)` output through `afs_write_int128`, including wide
+  decimal values beyond `i64`, IR/asm/object audits, cross-opt runtime coverage, and a
+  real corpus program with harness reproducibility checks
 - full `-O1` optimized-pipeline support for non-global `i128` modules, including mem2reg,
   inlining, dead-arg / const-arg / return propagation, and the ordinary O1 cleanup passes
 - `-O1` source-level coverage proving `integer(16)` constant folding can remove unsupported
@@ -237,7 +240,8 @@ Landed so far:
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide results, runtime-call `i128`, and more ambitious
+  especially stack-passed wide results, formatted/internal I/O `i128`, general
+  `RuntimeCall(..)`-based wide runtime surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
 ### Planned ABI Jump
