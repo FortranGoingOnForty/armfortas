@@ -23,6 +23,22 @@ fn io_state() -> &'static Mutex<IoState> {
     STATE.get_or_init(|| Mutex::new(IoState::new()))
 }
 
+#[inline]
+fn read_i128_ptr(src: *const i128) -> Option<i128> {
+    if src.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ptr::read_unaligned(src) })
+    }
+}
+
+#[inline]
+fn write_i128_ptr(dst: *mut i128, value: i128) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
 // ---- Unit status types ----
 
 #[derive(Debug, Clone, PartialEq)]
@@ -603,7 +619,7 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
             Ok(Some(token)) => {
                 match token.parse::<i128>() {
                     Ok(v) => {
-                        if !val.is_null() { unsafe { *val = v; } }
+                        write_i128_ptr(val, v);
                         if !iostat.is_null() { unsafe { *iostat = 0; } }
                     }
                     Err(_) => {
@@ -1286,7 +1302,7 @@ pub extern "C" fn afs_read_internal_int128(
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i128>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
+                write_i128_ptr(val, v);
                 if !iostat.is_null() { unsafe { *iostat = 0; } }
             }
             Err(_) => {
@@ -1700,13 +1716,11 @@ pub extern "C" fn afs_fmt_push_int(val: i64) {
 /// Push an integer(16) value for formatted output.
 #[no_mangle]
 pub extern "C" fn afs_fmt_push_int128(val: *const i128) {
-    if val.is_null() {
-        return;
-    }
     FMT_CTX.with(|ctx| {
         if let Some(ref mut c) = *ctx.borrow_mut() {
-            let wide = unsafe { *val };
-            c.values.push(IoValue::Integer(wide));
+            if let Some(wide) = read_i128_ptr(val) {
+                c.values.push(IoValue::Integer(wide));
+            }
         }
     });
 }
@@ -2018,7 +2032,7 @@ pub extern "C" fn afs_fmt_read_int128(
     {
         Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i128>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
+                write_i128_ptr(val, v);
                 if !iostat.is_null() { unsafe { *iostat = 0; } }
             }
             Err(_) => {
@@ -2144,7 +2158,7 @@ pub extern "C" fn afs_fmt_read_int128_internal(
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
         Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i128>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
+                write_i128_ptr(val, v);
                 if !iostat.is_null() { unsafe { *iostat = 0; } }
             }
             Err(_) => {
@@ -2314,6 +2328,27 @@ mod tests {
     }
 
     #[test]
+    fn internal_i128_read_accepts_unaligned_destination() {
+        let buf = b"170141183460469231731687303715884105727";
+        let mut pos = 0i64;
+        let mut raw = [0u8; 32];
+        let ptr = unsafe { raw.as_mut_ptr().add(1) as *mut i128 };
+        let mut iostat = -99i32;
+
+        afs_read_internal_int128(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            ptr,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 0, "expected internal i128 read to succeed");
+        let value = unsafe { std::ptr::read_unaligned(ptr) };
+        assert_eq!(value, 170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
     fn formatted_write_to_file() {
         let path = "/tmp/afs_fmt_test.dat";
         afs_open_simple(
@@ -2361,6 +2396,27 @@ mod tests {
     }
 
     #[test]
+    fn formatted_write_integer16_accepts_unaligned_pointer() {
+        let mut rendered = [b' '; 64];
+        let mut raw = [0u8; 32];
+        let wide = 170141183460469231731687303715884105727i128;
+        let ptr = unsafe { raw.as_mut_ptr().add(1) as *mut i128 };
+
+        unsafe { std::ptr::write_unaligned(ptr, wide) };
+
+        afs_fmt_begin_internal(rendered.as_mut_ptr(), rendered.len() as i64, "(I40)".as_ptr(), 5);
+        afs_fmt_push_int128(ptr);
+        afs_fmt_end(0);
+
+        let text = String::from_utf8_lossy(&rendered).into_owned();
+        assert!(
+            text.contains("170141183460469231731687303715884105727"),
+            "expected formatted internal write to accept unaligned i128 pointer: {:?}",
+            text
+        );
+    }
+
+    #[test]
     fn formatted_internal_write_pads_buffer() {
         let mut buf = [b'?'; 48];
 
@@ -2398,6 +2454,28 @@ mod tests {
         );
 
         assert_eq!(iostat, 0, "expected formatted internal i128 read to succeed");
+        assert_eq!(value, 170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
+    fn formatted_internal_read_i128_accepts_unaligned_destination() {
+        let buf = b" 170141183460469231731687303715884105727";
+        let mut raw = [0u8; 32];
+        let ptr = unsafe { raw.as_mut_ptr().add(1) as *mut i128 };
+        let mut iostat = -99i32;
+
+        afs_fmt_read_int128_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(I40)".as_ptr(),
+            5,
+            0,
+            ptr,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 0, "expected formatted internal i128 read to succeed");
+        let value = unsafe { std::ptr::read_unaligned(ptr) };
         assert_eq!(value, 170141183460469231731687303715884105727i128);
     }
 

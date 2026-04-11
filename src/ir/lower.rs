@@ -46,6 +46,9 @@ struct LocalInfo {
     dims: Vec<(i64, i64)>,
     /// Is this an allocatable variable?
     allocatable: bool,
+    /// Does this local carry runtime array metadata through a descriptor even
+    /// though it is not allocatable (for example an assumed-shape dummy)?
+    descriptor_arg: bool,
     /// Is this a pass-by-reference parameter? If true, `addr` holds a pointer
     /// to the caller's storage. Reads/writes go through the pointer.
     by_ref: bool,
@@ -100,6 +103,10 @@ struct LowerCtx<'a> {
     /// Pre-populated by `collect_optional_params` so call sites can pass
     /// null pointers for absent optional arguments (PRESENT support).
     optional_params: &'a HashMap<String, Vec<bool>>,
+    /// Per-subroutine/function descriptor-parameter bitmap: maps lowercase
+    /// callee name to a Vec<bool> (one entry per positional parameter,
+    /// true = lower this dummy through an ArrayDescriptor).
+    descriptor_params: &'a HashMap<String, Vec<bool>>,
     /// Lowercase same-module subprogram name → Module::functions index.
     /// Used so same-compilation-unit calls lower to FuncRef::Internal instead
     /// of pretending to be external references.
@@ -119,6 +126,7 @@ impl<'a> LowerCtx<'a> {
         type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
         alloc_return_funcs: &'a HashSet<String>,
         optional_params: &'a HashMap<String, Vec<bool>>,
+        descriptor_params: &'a HashMap<String, Vec<bool>>,
         internal_funcs: &'a HashMap<String, u32>,
         elemental_funcs: &'a HashSet<String>,
     ) -> Self {
@@ -134,6 +142,7 @@ impl<'a> LowerCtx<'a> {
             is_alloc_return: false,
             alloc_return_funcs,
             optional_params,
+            descriptor_params,
             internal_funcs,
             elemental_funcs,
             label_blocks: HashMap::new(),
@@ -141,11 +150,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -223,6 +232,11 @@ pub fn lower_file(
         collect_optional_params(&unit.node, &mut optional_params);
     }
 
+    let mut descriptor_params: HashMap<String, Vec<bool>> = HashMap::new();
+    for unit in units {
+        collect_descriptor_params(&unit.node, &mut descriptor_params);
+    }
+
     let mut elemental_funcs: HashSet<String> = HashSet::new();
     for unit in units {
         collect_elemental_funcs(&unit.node, &mut elemental_funcs);
@@ -251,6 +265,7 @@ pub fn lower_file(
             None,
             &alloc_return_funcs,
             &optional_params,
+            &descriptor_params,
             &internal_funcs,
             &elemental_funcs,
             false,
@@ -392,6 +407,76 @@ fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<boo
     }
 }
 
+fn arg_uses_descriptor_from_decls(
+    arg_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> bool {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                    Some(specs)
+                } else {
+                    None
+                }
+            });
+            for entity in entities {
+                if entity.name.to_lowercase() != key {
+                    continue;
+                }
+                let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
+                    return false;
+                };
+                return specs.iter().any(|spec| {
+                    matches!(
+                        spec,
+                        ArraySpec::AssumedShape { .. }
+                            | ArraySpec::AssumedSize { .. }
+                            | ArraySpec::Deferred
+                            | ArraySpec::AssumedRank
+                    )
+                });
+            }
+        }
+    }
+    false
+}
+
+/// Record which positional dummy arguments are lowered through an
+/// ArrayDescriptor rather than a raw element pointer.
+fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    use crate::ast::unit::DummyArg;
+    let record = |name: &str, args: &[DummyArg], decls: &[crate::ast::decl::SpannedDecl],
+                  out: &mut HashMap<String, Vec<bool>>| {
+        let param_names: Vec<String> = args.iter().filter_map(|a| {
+            if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+        }).collect();
+        if param_names.is_empty() {
+            return;
+        }
+        let flags: Vec<bool> = param_names
+            .iter()
+            .map(|pname| arg_uses_descriptor_from_decls(pname, decls))
+            .collect();
+        out.insert(name.to_lowercase(), flags);
+    };
+    match unit {
+        ProgramUnit::Subroutine { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_descriptor_params(&sub.node, out); }
+        }
+        ProgramUnit::Function { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_descriptor_params(&sub.node, out); }
+        }
+        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+            for sub in contains { collect_descriptor_params(&sub.node, out); }
+        }
+        _ => {}
+    }
+}
+
 /// Collect lowercase names of functions declared ELEMENTAL. Whole-array
 /// lowering uses this side table to recognize elemental calls before symbol
 /// resolution has become IR call refs.
@@ -491,6 +576,7 @@ fn install_common_locals(
                     ty: elem_ty,
                     dims: vec![],
                     allocatable: false,
+                    descriptor_arg: false,
                     by_ref: false,
                     char_kind: CharKind::None,
                     derived_type: None,
@@ -590,6 +676,7 @@ fn install_equivalence_locals(
                         ty: elem_ty.clone(),
                         dims: vec![],
                         allocatable: false,
+                        descriptor_arg: false,
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
@@ -922,6 +1009,7 @@ fn lower_unit(
     host_module: Option<&str>,
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
+    descriptor_params: &HashMap<String, Vec<bool>>,
     internal_funcs: &HashMap<String, u32>,
     elemental_funcs: &HashSet<String>,
     internal_only: bool,
@@ -935,7 +1023,7 @@ fn lower_unit(
             // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -991,6 +1079,7 @@ fn lower_unit(
                     host_module,
                     alloc_return_funcs,
                     optional_params,
+                    descriptor_params,
                     internal_funcs,
                     elemental_funcs,
                     true,
@@ -1007,6 +1096,7 @@ fn lower_unit(
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
                     let fortran_noalias = arg_is_fortran_noalias(n, decls);
+                    let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                     if arg_has_value_attr(n, decls) {
                         // VALUE: pass by value (raw type, not pointer).
                         Some(Param {
@@ -1018,7 +1108,11 @@ fn lower_unit(
                     } else {
                         Some(Param {
                             name: n.clone(),
-                            ty: IrType::Ptr(Box::new(elem_ty)),
+                            ty: if uses_descriptor {
+                                IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)))
+                            } else {
+                                IrType::Ptr(Box::new(elem_ty))
+                            },
                             id: ValueId(i as u32),
                             fortran_noalias,
                         })
@@ -1030,7 +1124,7 @@ fn lower_unit(
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -1038,12 +1132,10 @@ fn lower_unit(
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .map(|p| {
-                    let is_ptr = matches!(&p.ty, IrType::Ptr(_));
-                    let elem_ty = match &p.ty {
-                        IrType::Ptr(inner) => (**inner).clone(),
-                        other => other.clone(),
-                    };
-                    (p.name.to_lowercase(), p.id, elem_ty, !is_ptr)
+                    let pname = p.name.to_lowercase();
+                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let is_value = arg_has_value_attr(&pname, decls);
+                    (pname, p.id, elem_ty, is_value)
                 })
                 .collect();
 
@@ -1056,13 +1148,18 @@ fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
+                        let uses_descriptor = arg_uses_descriptor_from_decls(pname, decls);
+                        let slot = if uses_descriptor {
+                            b.alloca(IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384))))
+                        } else {
+                            b.alloca(IrType::Ptr(Box::new(elem_ty.clone())))
+                        };
                         b.store(*pid, slot);
                         // Check if this is a derived type parameter.
                         let dt_name = arg_derived_type_name(pname, decls);
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         };
                         ctx.locals.insert(pname.clone(), info);
@@ -1114,6 +1211,7 @@ fn lower_unit(
                     host_module,
                     alloc_return_funcs,
                     optional_params,
+                    descriptor_params,
                     internal_funcs,
                     elemental_funcs,
                     true,
@@ -1147,6 +1245,7 @@ fn lower_unit(
                     if let DummyArg::Name(n) = arg {
                         let elem_ty = arg_type_from_decls(n, decls);
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
+                        let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
                             Some(Param {
                                 name: n.clone(),
@@ -1157,7 +1256,11 @@ fn lower_unit(
                         } else {
                             Some(Param {
                                 name: n.clone(),
-                                ty: IrType::Ptr(Box::new(elem_ty)),
+                                ty: if uses_descriptor {
+                                    IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)))
+                                } else {
+                                    IrType::Ptr(Box::new(elem_ty))
+                                },
                                 id: ValueId(i as u32 + 1),
                                 fortran_noalias,
                             })
@@ -1178,6 +1281,7 @@ fn lower_unit(
                     if let DummyArg::Name(n) = arg {
                         let elem_ty = arg_type_from_decls(n, decls);
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
+                        let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
                             Some(Param {
                                 name: n.clone(),
@@ -1188,7 +1292,11 @@ fn lower_unit(
                         } else {
                             Some(Param {
                                 name: n.clone(),
-                                ty: IrType::Ptr(Box::new(elem_ty)),
+                                ty: if uses_descriptor {
+                                    IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)))
+                                } else {
+                                    IrType::Ptr(Box::new(elem_ty))
+                                },
                                 id: ValueId(i as u32),
                                 fortran_noalias,
                             })
@@ -1204,7 +1312,7 @@ fn lower_unit(
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1214,12 +1322,10 @@ fn lower_unit(
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
                 .filter(|p| p.name != "_sret")
                 .map(|p| {
-                    let is_ptr = matches!(&p.ty, IrType::Ptr(_));
-                    let elem_ty = match &p.ty {
-                        IrType::Ptr(inner) => (**inner).clone(),
-                        other => other.clone(),
-                    };
-                    (p.name.to_lowercase(), p.id, elem_ty, !is_ptr)
+                    let pname = p.name.to_lowercase();
+                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let is_value = arg_has_value_attr(&pname, decls);
+                    (pname, p.id, elem_ty, is_value)
                 })
                 .collect();
 
@@ -1232,12 +1338,17 @@ fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let slot = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
+                        let uses_descriptor = arg_uses_descriptor_from_decls(pname, decls);
+                        let slot = if uses_descriptor {
+                            b.alloca(IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384))))
+                        } else {
+                            b.alloca(IrType::Ptr(Box::new(elem_ty.clone())))
+                        };
                         b.store(*pid, slot);
                         let dt_name = arg_derived_type_name(pname, decls);
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         });
                     }
@@ -1255,6 +1366,7 @@ fn lower_unit(
                         ty: elem_ty,
                         dims: vec![],
                         allocatable: true,
+                        descriptor_arg: false,
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
@@ -1317,6 +1429,7 @@ fn lower_unit(
                     host_module,
                     alloc_return_funcs,
                     optional_params,
+                    descriptor_params,
                     internal_funcs,
                     elemental_funcs,
                     true,
@@ -1347,6 +1460,7 @@ fn lower_unit(
                     module_name,
                     alloc_return_funcs,
                     optional_params,
+                    descriptor_params,
                     internal_funcs,
                     elemental_funcs,
                     false,
@@ -1608,6 +1722,7 @@ fn install_host_param_consts(
                 ty,
                 dims: vec![],
                 allocatable: false,
+                descriptor_arg: false,
                 by_ref: false,
                 char_kind: CharKind::None,
                 derived_type: None,
@@ -2016,6 +2131,7 @@ fn install_one_global(
         ty: info.ty.clone(),
         dims: info.dims.clone(),
         allocatable: info.allocatable,
+        descriptor_arg: false,
         by_ref: false,
         char_kind: CharKind::None, derived_type: None, inline_const: None,
     });
@@ -2138,6 +2254,7 @@ fn install_globals_as_locals(
                                 ty,
                                 dims: vec![],
                                 allocatable: false,
+                                descriptor_arg: false,
                                 by_ref: false,
                                 char_kind: CharKind::None,
                                 derived_type: None,
@@ -2235,22 +2352,78 @@ fn alloc_decls(
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size32], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                     locals.insert(key, LocalInfo {
                         addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        dims: vec![], allocatable: true, by_ref: false,
+                        dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false,
                         char_kind: CharKind::Deferred, derived_type: None, inline_const: None,
                     });
                     continue;
                 } else if let Some(len) = char_len {
+                    if let Some(specs) = array_spec {
+                        let dims = extract_array_dims(specs, &param_consts);
+                        let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
+                        let table_ty = IrType::Array(
+                            Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+                            total_size as u64,
+                        );
+                        let addr = b.alloca(table_ty);
+                        let buf_ty = IrType::Array(
+                            Box::new(IrType::Int(IntWidth::I8)),
+                            (total_size * (len + 1)) as u64,
+                        );
+                        let buf = b.alloca(buf_ty);
+                        let zero = b.const_i32(0);
+                        let total_bytes = b.const_i64(total_size * (len + 1));
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![buf, zero, total_bytes],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let space = b.const_i32(b' ' as i32);
+                        let char_bytes = b.const_i64(len);
+                        for idx in 0..total_size {
+                            let slot_idx = b.const_i64(idx);
+                            let slot_ptr = b.gep(
+                                addr,
+                                vec![slot_idx],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let byte_off = b.const_i64(idx * (len + 1));
+                            let elem_ptr = b.gep(buf, vec![byte_off], IrType::Int(IntWidth::I8));
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![elem_ptr, space, char_bytes],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            b.store(elem_ptr, slot_ptr);
+                        }
+                        locals.insert(key, LocalInfo {
+                            addr,
+                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            dims,
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::Fixed(len),
+                            derived_type: None,
+                            inline_const: None,
+                        });
+                        continue;
+                    }
                     if !is_allocatable {
-                        // Fixed-length character(N): alloca N bytes buffer.
-                        let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), len as u64);
+                        // Fixed-length character(N): alloca N+1 bytes so call-boundary
+                        // lowering can rely on a stable trailing NUL while the Fortran
+                        // value still occupies the first N bytes.
+                        let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
                         let addr = b.alloca(buf_ty);
+                        let zero = b.const_i32(0);
+                        let total = b.const_i64(len + 1);
+                        b.call(FuncRef::External("memset".into()), vec![addr, zero, total], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                         // Initialize with spaces.
                         let space = b.const_i32(b' ' as i32);
                         let len_val = b.const_i64(len);
                         b.call(FuncRef::External("memset".into()), vec![addr, space, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                         locals.insert(key, LocalInfo {
                             addr, ty: IrType::Int(IntWidth::I8),
-                            dims: vec![], allocatable: false, by_ref: false,
+                            dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                             char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None,
                         });
                         continue; // skip normal path
@@ -2265,7 +2438,7 @@ fn alloc_decls(
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts);
@@ -2286,12 +2459,12 @@ fn alloc_decls(
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
                     // Derived type variable: allocate struct-sized byte array.
@@ -2305,6 +2478,7 @@ fn alloc_decls(
                             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             dims: vec![],
                             allocatable: false,
+                            descriptor_arg: false,
                             by_ref: false,
                             char_kind: CharKind::None,
                             derived_type: Some(type_name.clone()), inline_const: None,
@@ -2312,7 +2486,7 @@ fn alloc_decls(
                     } else {
                         // Unknown derived type — fall back to 8-byte alloca.
                         let addr = b.alloca(IrType::Int(IntWidth::I64));
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
                     }
                 } else {
                     // Scalar variable. Three sub-cases:
@@ -2343,7 +2517,7 @@ fn alloc_decls(
                             let addr = b.alloca(elem_ty.clone());
                             locals.insert(key, LocalInfo {
                                 addr, ty: elem_ty.clone(),
-                                dims: vec![], allocatable: false, by_ref: false,
+                                dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                                 char_kind: CharKind::None, derived_type: None,
                                 inline_const: Some(value),
                             });
@@ -2366,14 +2540,14 @@ fn alloc_decls(
                         let addr = b.global_addr(&global_name, elem_ty.clone());
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
-                            dims: vec![], allocatable: false, by_ref: false,
+                            dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                             char_kind: CharKind::None, derived_type: None, inline_const: None,
                         });
                     } else {
                         let addr = b.alloca(elem_ty.clone());
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
-                            dims: vec![], allocatable: false, by_ref: false,
+                            dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                             char_kind: CharKind::None, derived_type: None, inline_const: None,
                         });
                     }
@@ -2672,7 +2846,16 @@ fn char_addr_and_len(
             let info = locals.get(&name.to_lowercase())?;
             match &info.char_kind {
                 CharKind::Fixed(n) => {
-                    let ptr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                    if !info.dims.is_empty() {
+                        return None;
+                    }
+                    let ptr = if info.by_ref {
+                        let outer = b.load(info.addr);
+                        b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    } else {
+                        let zero = b.const_i64(0);
+                        b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8))
+                    };
                     Some((ptr, *n))
                 }
                 CharKind::Deferred | CharKind::None => None,
@@ -2681,6 +2864,67 @@ fn char_addr_and_len(
         Expr::StringLiteral { value, .. } => {
             let ptr = b.const_string(value.as_bytes());
             Some((ptr, value.len() as i64))
+        }
+        _ => None,
+    }
+}
+
+fn char_addr_and_runtime_len(
+    b: &mut FuncBuilder,
+    arg_spanned: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<(ValueId, ValueId)> {
+    use crate::ast::expr::Expr;
+    match &arg_spanned.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            match &info.char_kind {
+                CharKind::Fixed(n) => {
+                    if !info.dims.is_empty() {
+                        return None;
+                    }
+                    let ptr = if info.by_ref {
+                        let outer = b.load(info.addr);
+                        b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    } else {
+                        let zero = b.const_i64(0);
+                        b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8))
+                    };
+                    let len = b.const_i64(*n);
+                    Some((ptr, len))
+                }
+                CharKind::Deferred => {
+                    let ptr = b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let eight = b.const_i64(8);
+                    let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I8));
+                    let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+                    Some((ptr, len))
+                }
+                CharKind::None => {
+                    if info.by_ref
+                        && matches!(
+                            info.ty,
+                            IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+                        )
+                    {
+                        let outer = b.load(info.addr);
+                        let ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        let len = b.call(
+                            FuncRef::External("afs_c_strlen".into()),
+                            vec![ptr],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        Some((ptr, len))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            let len = b.const_i64(value.len() as i64);
+            Some((ptr, len))
         }
         _ => None,
     }
@@ -2708,17 +2952,16 @@ fn lower_char_intrinsic(
 
     match name {
         "len" => {
-            let (_, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
-            Some(b.const_i64(declared_len))
+            let (_, len) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
+            Some(len)
         }
         "len_trim" => {
-            let (ptr, declared_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
-            let len_val = b.const_i64(declared_len);
+            let (ptr, len_val) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
             Some(b.call(FuncRef::External("afs_len_trim".into()),
                 vec![ptr, len_val], IrType::Int(IntWidth::I64)))
         }
         "ichar" => {
-            let (ptr, _) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
+            let (ptr, _) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
             let byte = b.load_typed(ptr, IrType::Int(IntWidth::I8));
             Some(b.call(FuncRef::External("afs_ichar".into()),
                 vec![byte], IrType::Int(IntWidth::I32)))
@@ -2744,10 +2987,8 @@ fn lower_char_intrinsic(
             Some(buf)
         }
         "index" => {
-            let (hay_ptr, hay_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
-            let (needle_ptr, needle_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
-            let hay_len_val = b.const_i64(hay_len);
-            let needle_len_val = b.const_i64(needle_len);
+            let (hay_ptr, hay_len_val) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
+            let (needle_ptr, needle_len_val) = char_addr_and_runtime_len(b, arg_spanned(1)?, locals)?;
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -2756,10 +2997,8 @@ fn lower_char_intrinsic(
                 IrType::Int(IntWidth::I64)))
         }
         "scan" => {
-            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
-            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
-            let src_len_val = b.const_i64(src_len);
-            let set_len_val = b.const_i64(set_len);
+            let (src_ptr, src_len_val) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len_val) = char_addr_and_runtime_len(b, arg_spanned(1)?, locals)?;
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -2768,10 +3007,8 @@ fn lower_char_intrinsic(
                 IrType::Int(IntWidth::I64)))
         }
         "verify" => {
-            let (src_ptr, src_len) = char_addr_and_len(b, arg_spanned(0)?, locals)?;
-            let (set_ptr, set_len) = char_addr_and_len(b, arg_spanned(1)?, locals)?;
-            let src_len_val = b.const_i64(src_len);
-            let set_len_val = b.const_i64(set_len);
+            let (src_ptr, src_len_val) = char_addr_and_runtime_len(b, arg_spanned(0)?, locals)?;
+            let (set_ptr, set_len_val) = char_addr_and_runtime_len(b, arg_spanned(1)?, locals)?;
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -4129,12 +4366,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
                 Expr::FunctionCall { callee, args } => {
                     // Array element assignment: a(i) = val
-                    let arr_val = lower_expr_ctx(b, ctx, value);
                     if let Expr::Name { name } = &callee.node {
                         let akey = name.to_lowercase();
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
                             if !info.dims.is_empty() || info.allocatable {
-                                lower_array_store(b, &ctx.locals, &info, args, arr_val, ctx.st);
+                                if matches!(info.char_kind, CharKind::Fixed(_)) {
+                                    lower_char_array_store(b, &ctx.locals, &info, args, value, ctx.st);
+                                } else {
+                                    let arr_val = lower_expr_ctx(b, ctx, value);
+                                    lower_array_store(b, &ctx.locals, &info, args, arr_val, ctx.st);
+                                }
                             }
                         }
                     }
@@ -4275,6 +4516,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             _ => b.const_i32(0),
                         }
                     }).collect();
+                    if let Some(desc_mask) = ctx.descriptor_params.get(&key) {
+                        for (i, a) in args.iter().enumerate() {
+                            if !desc_mask.get(i).copied().unwrap_or(false) {
+                                continue;
+                            }
+                            arg_vals[i] = match &a.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => {
+                                    lower_arg_descriptor(b, &ctx.locals, e, ctx.st)
+                                }
+                                _ => b.const_i64(0),
+                            };
+                        }
+                    }
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
                     if let Some(opt_flags) = ctx.optional_params.get(&key) {
@@ -4444,6 +4698,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         ty: orig_info.ty.clone(),
                         dims: vec![],
                         allocatable: false,
+                        descriptor_arg: false,
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None, inline_const: None,
@@ -4758,7 +5013,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
             }
             lower_stmts(b, ctx, body);
 
@@ -5297,7 +5552,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
             addr
         });
 
@@ -5518,12 +5773,13 @@ fn compute_flat_elem_offset(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
 ) -> ValueId {
-    if info.allocatable {
+    if local_uses_array_descriptor(info) {
         // Runtime descriptor path. Each DimDescriptor is 24 bytes
         // starting at descriptor offset 24:
         //   +0  lower_bound : i64
         //   +8  upper_bound : i64
         //   +16 stride      : i64 (we use 1)
+        let desc = array_descriptor_addr(b, info);
         let mut flat: Option<ValueId> = None;
         let mut cum_stride: Option<ValueId> = None; // i64
         let one64 = b.const_i64(1);
@@ -5539,8 +5795,8 @@ fn compute_flat_elem_offset(
             let dim_base = 24 + (dim_idx as i64) * 24;
             let off_lo = b.const_i64(dim_base);
             let off_up = b.const_i64(dim_base + 8);
-            let p_lo = b.gep(info.addr, vec![off_lo], IrType::Int(IntWidth::I8));
-            let p_up = b.gep(info.addr, vec![off_up], IrType::Int(IntWidth::I8));
+            let p_lo = b.gep(desc, vec![off_lo], IrType::Int(IntWidth::I8));
+            let p_up = b.gep(desc, vec![off_up], IrType::Int(IntWidth::I8));
             let lo = b.load_typed(p_lo, IrType::Int(IntWidth::I64));
             let up = b.load_typed(p_up, IrType::Int(IntWidth::I64));
             emit_bounds_check(b, sub, lo, up);
@@ -5784,6 +6040,7 @@ fn store_ac_implied_do(
         ty: var_ty.clone(),
         dims: vec![],
         allocatable: false,
+        descriptor_arg: false,
         by_ref: false,
         char_kind: CharKind::None,
         derived_type: None, inline_const: None,
@@ -5858,6 +6115,31 @@ fn store_ac_implied_do(
 
     // Continue emitting into exit.
     b.set_block(exit);
+}
+
+fn lower_char_array_store(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    value: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) {
+    let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
+    let base = array_base_addr(b, info);
+    let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
+    let dest_ptr = b.load_typed(elem_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let (src_ptr, src_len) = lower_string_expr(b, locals, value, st);
+    let len = match info.char_kind {
+        CharKind::Fixed(len) => len,
+        _ => 0,
+    };
+    let dest_len = b.const_i64(len);
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_ptr, dest_len, src_ptr, src_len],
+        IrType::Void,
+    );
 }
 
 /// Lower an array element store: compute flat offset, GEP, store.
@@ -7375,13 +7657,7 @@ fn lower_whole_array_write(
 
     // Compile-time-known size for stack arrays; runtime descriptor
     // call for allocatables.
-    let n = if info.allocatable {
-        b.call(FuncRef::External("afs_array_size".into()),
-               vec![info.addr], IrType::Int(IntWidth::I64))
-    } else {
-        let total: i64 = info.dims.iter().map(|(_, ext)| *ext).product();
-        b.const_i64(total.max(0))
-    };
+    let n = array_total_elems_value(b, info);
 
     // Stack-allocated loop counter, like lower_array_assign.
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
@@ -7450,14 +7726,129 @@ fn lower_whole_array_read(
     b.set_block(bb_exit);
 }
 
+fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
+    info.allocatable || info.descriptor_arg
+}
+
+fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.allocatable {
+        info.addr
+    } else if info.descriptor_arg {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn store_byte_aggregate_field(
+    b: &mut FuncBuilder,
+    base: ValueId,
+    offset: i64,
+    field_ty: IrType,
+    val: ValueId,
+) {
+    let field_bytes = field_ty.size_bytes() as i64;
+    debug_assert!(field_bytes > 0 && offset % field_bytes == 0);
+    let slot = b.const_i64(offset / field_bytes);
+    let ptr = b.gep(base, vec![slot], field_ty.clone());
+    let stored = match field_ty {
+        IrType::Int(_) | IrType::Float(_) | IrType::Bool => coerce_to_type(b, val, &field_ty),
+        _ => val,
+    };
+    b.store(stored, ptr);
+}
+
+fn array_data_ptr_for_call(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if local_uses_array_descriptor(info) {
+        let desc = array_descriptor_addr(b, info);
+        b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())))
+    } else if info.by_ref {
+        b.load(info.addr)
+    } else if !info.dims.is_empty() {
+        let zero = b.const_i64(0);
+        b.gep(info.addr, vec![zero], info.ty.clone())
+    } else {
+        info.addr
+    }
+}
+
+fn materialize_array_descriptor_for_info(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let base_ptr = array_data_ptr_for_call(b, info);
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(info.ty.clone())),
+        base_ptr,
+    );
+    let elem_size = b.const_i64(ir_scalar_byte_size(&info.ty));
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
+    let rank = b.const_i32(info.dims.len() as i32);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    let flags = b.const_i32(2);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+
+    for (i, (lower, extent)) in info.dims.iter().copied().enumerate() {
+        let base_offset = 24 + (i as i64) * 24;
+        let lower_val = b.const_i64(lower);
+        store_byte_aggregate_field(b, desc, base_offset, IrType::Int(IntWidth::I64), lower_val);
+        let upper_val = b.const_i64(lower + extent - 1);
+        store_byte_aggregate_field(
+            b,
+            desc,
+            base_offset + 8,
+            IrType::Int(IntWidth::I64),
+            upper_val,
+        );
+        let stride_val = b.const_i64(1);
+        store_byte_aggregate_field(b, desc, base_offset + 16, IrType::Int(IntWidth::I64), stride_val);
+    }
+
+    desc
+}
+
+fn lower_arg_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    _st: &SymbolTable,
+) -> ValueId {
+    if let Expr::Name { name } = &expr.node {
+        let key = name.to_lowercase();
+        if let Some(info) = locals.get(&key) {
+            if info.allocatable {
+                return info.addr;
+            }
+            if info.descriptor_arg {
+                return b.load(info.addr);
+            }
+            if !info.dims.is_empty() {
+                return materialize_array_descriptor_for_info(b, info);
+            }
+        }
+    }
+    b.const_i64(0)
+}
+
 /// Get the data base address for an array variable.
 /// For fixed arrays, this is the alloca address directly.
 /// For allocatable arrays, load base_addr from the descriptor (offset 0).
 fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
-    if info.allocatable {
-        // Load base_addr (first 8 bytes of descriptor) as a pointer.
-        // The descriptor alloca is [i8 x 384], but the first field is a pointer.
-        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    if local_uses_array_descriptor(info) {
+        let desc = array_descriptor_addr(b, info);
+        b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())))
     } else if info.by_ref {
         // Dummy arrays are stored as "slot holding caller base pointer".
         b.load(info.addr)
@@ -7467,10 +7858,11 @@ fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
 }
 
 fn array_total_elems_value(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
-    if info.allocatable {
+    if local_uses_array_descriptor(info) {
+        let desc = array_descriptor_addr(b, info);
         b.call(
             FuncRef::External("afs_array_size".into()),
-            vec![info.addr],
+            vec![desc],
             IrType::Int(IntWidth::I64),
         )
     } else {
@@ -8103,7 +8495,7 @@ fn lower_forall_nested(
             let addr = b.alloca(IrType::Int(IntWidth::I32));
             ctx.locals.insert(key.clone(), LocalInfo {
                 addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
-                allocatable: false, by_ref: false, char_kind: CharKind::None,
+                allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None,
                 derived_type: None, inline_const: None,
             });
             addr
@@ -8355,11 +8747,12 @@ fn lower_array_section(
                         widen_idx_to_i64(b, raw)
                     })
                     .unwrap_or_else(|| {
-                        if info.allocatable {
+                        if local_uses_array_descriptor(info) {
                             let dim = b.const_i32((i + 1) as i32);
+                            let desc = array_descriptor_addr(b, info);
                             b.call(
                                 FuncRef::External("afs_array_lbound".into()),
-                                vec![info.addr, dim],
+                                vec![desc, dim],
                                 IrType::Int(IntWidth::I64),
                             )
                         } else {
@@ -8373,11 +8766,12 @@ fn lower_array_section(
                         widen_idx_to_i64(b, raw)
                     })
                     .unwrap_or_else(|| {
-                        if info.allocatable {
+                        if local_uses_array_descriptor(info) {
                             let dim = b.const_i32((i + 1) as i32);
+                            let desc = array_descriptor_addr(b, info);
                             b.call(
                                 FuncRef::External("afs_array_ubound".into()),
-                                vec![info.addr, dim],
+                                vec![desc, dim],
                                 IrType::Int(IntWidth::I64),
                             )
                         } else {
@@ -8430,8 +8824,13 @@ fn lower_array_section(
 
     // Call afs_create_section(source, result, specs, n_dims).
     let ndims = b.const_i32(n_dims as i32);
+    let source_desc = if local_uses_array_descriptor(info) {
+        array_descriptor_addr(b, info)
+    } else {
+        materialize_array_descriptor_for_info(b, info)
+    };
     b.call(FuncRef::External("afs_create_section".into()),
-        vec![info.addr, result_desc, specs, ndims], IrType::Void);
+        vec![source_desc, result_desc, specs, ndims], IrType::Void);
 
     result_desc
 }
@@ -8444,18 +8843,21 @@ fn lower_array_intrinsic(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
 ) -> Option<ValueId> {
-    // Get the first argument as a descriptor address (for array variables).
-    let first_arg_desc = args.first().and_then(|a| {
+    let first_arg_info = args.first().and_then(|a| {
         if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
             if let Expr::Name { name } = &e.node {
                 let key = name.to_lowercase();
-                locals.get(&key).filter(|i| i.allocatable || !i.dims.is_empty())
-                    .map(|i| i.addr)
+                locals.get(&key).cloned().filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
             } else { None }
         } else { None }
     });
 
-    let desc = first_arg_desc?;
+    let info = first_arg_info?;
+    let desc = if local_uses_array_descriptor(&info) {
+        array_descriptor_addr(b, &info)
+    } else {
+        materialize_array_descriptor_for_info(b, &info)
+    };
 
     match name {
         "size" => {
@@ -8463,20 +8865,45 @@ fn lower_array_intrinsic(
                 // SIZE(array, dim)
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = b.call(
-                        FuncRef::External("afs_array_size_dim".into()),
-                        vec![desc, dim],
-                        IrType::Int(IntWidth::I64),
-                    );
+                    let result64 = if local_uses_array_descriptor(&info) {
+                        let desc = array_descriptor_addr(b, &info);
+                        b.call(
+                            FuncRef::External("afs_array_size_dim".into()),
+                            vec![desc, dim],
+                            IrType::Int(IntWidth::I64),
+                        )
+                    } else {
+                        let raw_dim = match b.func().value_type(dim) {
+                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                            _ => dim,
+                        };
+                        let one = b.const_i32(1);
+                        let zero = b.const_i64(0);
+                        let idx0 = b.isub(raw_dim, one);
+                        let mut result = zero;
+                        for (idx, (_lower, extent)) in info.dims.iter().enumerate() {
+                            let cond_idx = b.const_i32(idx as i32);
+                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                            let extent_val = b.const_i64(*extent);
+                            result = b.select(is_match, extent_val, result);
+                        }
+                        result
+                    };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else {
                 // SIZE(array)
-                let result64 = b.call(
-                    FuncRef::External("afs_array_size".into()),
-                    vec![desc],
-                    IrType::Int(IntWidth::I64),
-                );
+                let result64 = if local_uses_array_descriptor(&info) {
+                    let desc = array_descriptor_addr(b, &info);
+                    b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    )
+                } else {
+                    let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
+                    b.const_i64(total.max(0))
+                };
                 Some(b.int_trunc(result64, IntWidth::I32))
             }
         }
@@ -8484,11 +8911,30 @@ fn lower_array_intrinsic(
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = b.call(
-                        FuncRef::External("afs_array_lbound".into()),
-                        vec![desc, dim],
-                        IrType::Int(IntWidth::I64),
-                    );
+                    let result64 = if local_uses_array_descriptor(&info) {
+                        let desc = array_descriptor_addr(b, &info);
+                        b.call(
+                            FuncRef::External("afs_array_lbound".into()),
+                            vec![desc, dim],
+                            IrType::Int(IntWidth::I64),
+                        )
+                    } else {
+                        let raw_dim = match b.func().value_type(dim) {
+                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                            _ => dim,
+                        };
+                        let one = b.const_i32(1);
+                        let default = b.const_i64(1);
+                        let idx0 = b.isub(raw_dim, one);
+                        let mut result = default;
+                        for (idx, (lower, _extent)) in info.dims.iter().enumerate() {
+                            let cond_idx = b.const_i32(idx as i32);
+                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                            let lower_val = b.const_i64(*lower);
+                            result = b.select(is_match, lower_val, result);
+                        }
+                        result
+                    };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else { None }
@@ -8497,11 +8943,30 @@ fn lower_array_intrinsic(
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = b.call(
-                        FuncRef::External("afs_array_ubound".into()),
-                        vec![desc, dim],
-                        IrType::Int(IntWidth::I64),
-                    );
+                    let result64 = if local_uses_array_descriptor(&info) {
+                        let desc = array_descriptor_addr(b, &info);
+                        b.call(
+                            FuncRef::External("afs_array_ubound".into()),
+                            vec![desc, dim],
+                            IrType::Int(IntWidth::I64),
+                        )
+                    } else {
+                        let raw_dim = match b.func().value_type(dim) {
+                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                            _ => dim,
+                        };
+                        let one = b.const_i32(1);
+                        let default = b.const_i64(0);
+                        let idx0 = b.isub(raw_dim, one);
+                        let mut result = default;
+                        for (idx, (lower, extent)) in info.dims.iter().enumerate() {
+                            let cond_idx = b.const_i32(idx as i32);
+                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                            let upper_val = b.const_i64(lower + extent - 1);
+                            result = b.select(is_match, upper_val, result);
+                        }
+                        result
+                    };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else { None }
             } else { None }
@@ -8555,8 +9020,14 @@ fn lower_array_intrinsic(
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                     if let Expr::Name { name } = &e.node {
                         locals.get(&name.to_lowercase())
-                            .filter(|i| i.allocatable || !i.dims.is_empty())
-                            .map(|i| i.addr)
+                            .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                            .map(|i| {
+                                if local_uses_array_descriptor(i) {
+                                    array_descriptor_addr(b, i)
+                                } else {
+                                    materialize_array_descriptor_for_info(b, i)
+                                }
+                            })
                     } else { None }
                 } else { None }
             })?;
@@ -8586,8 +9057,14 @@ fn lower_array_intrinsic(
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                     if let Expr::Name { name } = &e.node {
                         locals.get(&name.to_lowercase())
-                            .filter(|i| i.allocatable || !i.dims.is_empty())
-                            .map(|i| i.addr)
+                            .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                            .map(|i| {
+                                if local_uses_array_descriptor(i) {
+                                    array_descriptor_addr(b, i)
+                                } else {
+                                    materialize_array_descriptor_for_info(b, i)
+                                }
+                            })
                     } else { None }
                 } else { None }
             })?;
@@ -8727,19 +9204,95 @@ fn resolve_component_base_for_method(
     }
 }
 
+fn lower_char_arg_by_ref(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> Option<ValueId> {
+    use crate::ast::expr::Expr;
+
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if !info.dims.is_empty() {
+                return None;
+            }
+            if info.by_ref
+                && info.char_kind == CharKind::None
+                && matches!(
+                    info.ty,
+                    IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+                )
+            {
+                return Some(info.addr);
+            }
+            let (ptr, _len) = char_addr_and_len(b, expr, locals)?;
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(ptr, slot);
+            Some(slot)
+        }
+        Expr::StringLiteral { value, .. } => {
+            let src = b.const_string(value.as_bytes());
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (value.len() + 1) as u64));
+            let zero = b.const_i32(0);
+            let total = b.const_i64((value.len() + 1) as i64);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![buf, zero, total],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            let len = b.const_i64(value.len() as i64);
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![buf, src, len],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            let zero_idx = b.const_i64(0);
+            let ptr = b.gep(buf, vec![zero_idx], IrType::Int(IntWidth::I8));
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(ptr, slot);
+            Some(slot)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let info = locals.get(&name.to_lowercase())?;
+            if !matches!(info.char_kind, CharKind::Fixed(_)) || info.dims.is_empty() {
+                return None;
+            }
+            let ptr = lower_array_element(b, locals, info, args, st);
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(ptr, slot);
+            Some(slot)
+        }
+        _ => None,
+    }
+}
+
 fn lower_arg_by_ref(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
+    if let Some(ptr_slot) = lower_char_arg_by_ref(b, locals, expr, st) {
+        return ptr_slot;
+    }
     // If it's a simple name, pass its address.
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
             if info.by_ref {
+                if info.descriptor_arg {
+                    return array_data_ptr_for_call(b, info);
+                }
                 // Already a pointer to caller's storage — load and pass it.
                 return b.load(info.addr);
+            }
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                return array_data_ptr_for_call(b, info);
             }
             return info.addr;
         }

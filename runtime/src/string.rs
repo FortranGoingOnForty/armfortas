@@ -216,6 +216,22 @@ pub extern "C" fn afs_adjustr(dest: *mut u8, src: *const u8, len: i64) {
 /// INDEX: find first (or last if back=1) occurrence of substring.
 /// Returns 1-based position, or 0 if not found.
 #[no_mangle]
+pub extern "C" fn afs_c_strlen(src: *const u8) -> i64 {
+    if src.is_null() {
+        return 0;
+    }
+    let mut len: i64 = 0;
+    unsafe {
+        while *src.add(len as usize) != 0 {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// INDEX: find first (or last if back=1) occurrence of substring.
+/// Returns 1-based position, or 0 if not found.
+#[no_mangle]
 pub extern "C" fn afs_index(
     str_ptr: *const u8, str_len: i64,
     sub_ptr: *const u8, sub_len: i64,
@@ -484,6 +500,12 @@ mod tests {
         assert_eq!(afs_len_trim(b"hello   ".as_ptr(), 8), 5);
         assert_eq!(afs_len_trim(b"   ".as_ptr(), 3), 0);
         assert_eq!(afs_len_trim(b"hello".as_ptr(), 5), 5);
+    }
+
+    #[test]
+    fn c_strlen_basic() {
+        let s = b"scan.f90\0";
+        assert_eq!(afs_c_strlen(s.as_ptr()), 8);
     }
 
     #[test]
