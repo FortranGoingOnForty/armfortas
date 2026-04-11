@@ -4752,8 +4752,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
                         lower_internal_read_items(b, ctx, items, buf_ptr, buf_len);
-                        return;
+                    } else {
+                        let (fmt_ptr, fmt_len) =
+                            lower_string_expr(b, &ctx.locals, &fmt_control.unwrap().value, ctx.st);
+                        lower_formatted_internal_read_items(
+                            b, ctx, items, buf_ptr, buf_len, fmt_ptr, fmt_len,
+                        );
                     }
+                    return;
                 }
             }
 
@@ -6001,6 +6007,80 @@ fn lower_internal_read_items(
                     vec![buf_ptr, buf_len, pos, addr, iostat],
                     IrType::Void,
                 );
+            }
+        }
+    }
+}
+
+fn lower_formatted_internal_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+) {
+    let item_idx = b.alloca(IrType::Int(IntWidth::I64));
+    let iostat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero = b.const_i64(0);
+    let one = b.const_i64(1);
+    b.store(zero, item_idx);
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            let key = name.to_lowercase();
+            if let Some(info) = ctx.locals.get(&key) {
+                let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                let addr = if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                };
+                match &info.ty {
+                    IrType::Int(IntWidth::I128) => {
+                        b.call(
+                            FuncRef::External("afs_fmt_read_int128_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                            IrType::Void,
+                        );
+                    }
+                    IrType::Int(IntWidth::I64) => {
+                        b.call(
+                            FuncRef::External("afs_fmt_read_int64_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                            IrType::Void,
+                        );
+                    }
+                    IrType::Int(_) => {
+                        b.call(
+                            FuncRef::External("afs_fmt_read_int_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                            IrType::Void,
+                        );
+                    }
+                    IrType::Float(FloatWidth::F64) => {
+                        b.call(
+                            FuncRef::External("afs_fmt_read_real_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, addr, iostat],
+                            IrType::Void,
+                        );
+                    }
+                    IrType::Float(FloatWidth::F32) => {
+                        let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                        b.call(
+                            FuncRef::External("afs_fmt_read_real_internal".into()),
+                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                            IrType::Void,
+                        );
+                        let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                        let narrow = b.float_trunc(wide, FloatWidth::F32);
+                        b.store(narrow, addr);
+                    }
+                    _ => {}
+                }
+                let next_idx = b.iadd(current_idx, one);
+                b.store(next_idx, item_idx);
             }
         }
     }
@@ -8379,6 +8459,19 @@ end program
 ");
         assert!(ir.contains("afs_fmt_begin_internal"));
         assert!(ir.contains("afs_fmt_push_int128"));
+    }
+
+    #[test]
+    fn lower_formatted_internal_read_integer16_uses_internal_format_reader() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  character(len=64) :: buf
+  integer(16) :: x
+  read(buf, '(I40)') x
+end program
+");
+        assert!(ir.contains("afs_fmt_read_int128_internal"));
     }
 
     #[test]
