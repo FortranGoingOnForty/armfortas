@@ -112,12 +112,11 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 
 ### 2. Finish the non-29.9 leftovers that still block honest Sprint 29 closure
 
-- `-Os` exists in the IR pipeline but is not exposed by the driver CLI yet
-- `-Ofast` currently reuses the O3 pipeline shape and has no real fast-math consumer
-- `integer(16)` / `I128` still needs broad optimized-pipeline support beyond the
-  newly landed full scalar `-Ofast` lane
+- `integer(16)` / `I128` still needs broader wide-value support beyond the newly landed
+  scalar + stack-passed direct-call ABI surface
 - preprocessor codepath unification from 29.5 is still unfinished
-- 29.6 still lacks any true NEON/SIMD vectorizer implementation
+- 29.6 still lacks a general native NEON/SIMD loop vectorizer; the current vectorize
+  pass rewrites recognized scalar loops onto existing bulk runtime kernels
 
 ### 3. Audit and harden everything that claims to be done
 
@@ -217,6 +216,10 @@ Landed so far:
   declarations, with asm/object determinism coverage
 - linked cross-object `-O0` execution against a foreign `__int128` helper object, with
   linked-binary determinism coverage
+- stack-passed direct `i128` args for internal and external calls, including incoming
+  callee loads from `[x29, #16+]`, outgoing caller stack-area stores, optimized internal
+  execution coverage, and linked cross-object determinism coverage against clang-built
+  foreign helpers
 - full `-O1` optimized-pipeline support for non-global `i128` modules, including mem2reg,
   inlining, dead-arg / const-arg / return propagation, and the ordinary O1 cleanup passes
 - `-O1` source-level coverage proving `integer(16)` constant folding can remove unsupported
@@ -234,7 +237,7 @@ Landed so far:
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide args/results, runtime-call `i128`, and more ambitious
+  especially stack-passed wide results, runtime-call `i128`, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
 ### Planned ABI Jump
