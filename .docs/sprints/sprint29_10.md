@@ -26,7 +26,7 @@ Mostly landed:
 
 Still missing or partial:
 - `integer(16)` / `I128` is still only partially staged: raw IR, globals, local `-O0`
-  codegen, ABI-visible params/returns/calls, and full `-O1` optimizer support
+  codegen, ABI-visible params/returns/calls, and full `-O1`/`-O2` optimizer support
   now exist, but broad optimized-pipeline support is still missing
 - preprocessor expansion is still split across `expand_condition_macros` and
   `expand_macros_inner`
@@ -114,7 +114,7 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 - `-Os` exists in the IR pipeline but is not exposed by the driver CLI yet
 - `-Ofast` currently reuses the O3 pipeline shape and has no real fast-math consumer
 - `integer(16)` / `I128` still needs broad optimized-pipeline support beyond the
-  newly landed full `-O1` lane
+  newly landed full `-O2` lane
 - preprocessor codepath unification from 29.5 is still unfinished
 - 29.6 still lacks any true NEON/SIMD vectorizer implementation
 
@@ -222,14 +222,17 @@ Landed so far:
   wide arithmetic before backend selection, and that branchy mem2reg-promoted `integer(16)`
   locals survive SSA joins correctly, with object determinism and linked cross-object
   execution coverage
+- full `-O2` optimized-pipeline support for the current scalar `i128` surface, including
+  SROA-adjacent cleanup, LICM/DSE/LSF/GVN-era pass coverage, and linked cross-object
+  determinism coverage
 - source-level and selector-level regressions with object determinism coverage for the
   supported local `-O0` surface
 
 Still missing inside the same cleanup item:
-- optimized support beyond the full `-O1` lane
+- optimized support beyond the full `-O2` lane
 - optimizer/backend widening for the additional `i128` shapes introduced by the full
-  O2/O3/Os/Ofast pipelines, especially second-pass mem2reg after SROA, more aggressive
-  inlining/IPO interactions, and loop/vectorization rewrites
+  O3/Os/Ofast pipelines, especially more aggressive inlining/IPO interactions and
+  loop/vectorization rewrites
 
 ### Planned ABI Jump
 
@@ -241,9 +244,9 @@ Working assumption from local clang ABI probes on Apple ARM64:
 - `__int128` params consume register pairs `xN/xN+1`
 
 Staged plan:
-1. widen optimizer support beyond the current full `-O1` lane
+1. widen optimizer support beyond the current full `-O2` lane
 
 Timing:
 - keep landing bounded `i128` slices while the support boundary is still crisp and testable
-- use the full `-O1` lane as the proving ground before widening to the full
+- use the full `-O2` lane as the proving ground before widening to the full
   optimized pipelines
