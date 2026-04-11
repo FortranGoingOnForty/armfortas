@@ -577,6 +577,34 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
     }
 }
 
+/// Read an i128 value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        match u.next_read_token() {
+            Ok(Some(token)) => {
+                match token.parse::<i128>() {
+                    Ok(v) => {
+                        if !val.is_null() { unsafe { *val = v; } }
+                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    }
+                    Err(_) => {
+                        if !iostat.is_null() { unsafe { *iostat = 1; } }
+                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
+                    }
+                }
+            }
+            Ok(None) => {
+                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    }
+}
+
 /// Read an f32 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
@@ -1635,6 +1663,27 @@ mod tests {
             "expected full i128 decimal rendering in: {}",
             content
         );
+    }
+
+    #[test]
+    fn read_i128_from_file() {
+        let path = "/tmp/afs_read_i128_test.dat";
+        std::fs::write(path, "170141183460469231731687303715884105727\n").unwrap();
+
+        afs_open_simple(
+            95,
+            path.as_ptr(), path.len() as i64,
+            "old".as_ptr(), 3,
+            "read".as_ptr(), 4,
+        );
+
+        let mut value = 0i128;
+        let mut iostat = -99i32;
+        afs_read_int128(95, &mut value, &mut iostat);
+        afs_close(95, std::ptr::null_mut());
+
+        assert_eq!(iostat, 0, "expected successful i128 read");
+        assert_eq!(value, 170141183460469231731687303715884105727i128);
     }
 
     #[test]
