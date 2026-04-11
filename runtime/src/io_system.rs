@@ -1617,7 +1617,7 @@ pub extern "C" fn afs_io_finalize() {
 //   afs_fmt_end()
 
 use std::cell::RefCell;
-use crate::format::{parse_format, FormatEngine, IoValue};
+use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue};
 
 enum FmtSink {
     Unit(i32),
@@ -1756,6 +1756,265 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             }
         }
     });
+}
+
+fn advance_formatted_cursor(desc: &FormatDesc, input: &[u8], cursor: &mut usize) {
+    match desc {
+        FormatDesc::Skip { count } => {
+            *cursor = (*cursor).saturating_add(*count).min(input.len());
+        }
+        FormatDesc::TabTo { position } => {
+            *cursor = position.saturating_sub(1).min(input.len());
+        }
+        FormatDesc::TabLeft { count } => {
+            *cursor = cursor.saturating_sub(*count);
+        }
+        FormatDesc::TabRight { count } => {
+            *cursor = (*cursor).saturating_add(*count).min(input.len());
+        }
+        FormatDesc::LiteralString(text) => {
+            *cursor = (*cursor).saturating_add(text.len()).min(input.len());
+        }
+        FormatDesc::Newline => {
+            while *cursor < input.len() && input[*cursor] != b'\n' {
+                *cursor += 1;
+            }
+            if *cursor < input.len() {
+                *cursor += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn read_formatted_field(desc: &FormatDesc, input: &[u8], cursor: &mut usize) -> Option<String> {
+    let take_width = |cursor: &mut usize, width: usize| {
+        let start = (*cursor).min(input.len());
+        let end = start.saturating_add(width).min(input.len());
+        *cursor = end;
+        String::from_utf8_lossy(&input[start..end]).into_owned()
+    };
+
+    match desc {
+        FormatDesc::IntegerI { width, .. }
+        | FormatDesc::IntegerB { width, .. }
+        | FormatDesc::IntegerO { width, .. }
+        | FormatDesc::IntegerZ { width, .. }
+        | FormatDesc::RealF { width, .. }
+        | FormatDesc::RealE { width, .. }
+        | FormatDesc::RealEN { width, .. }
+        | FormatDesc::RealES { width, .. }
+        | FormatDesc::RealEX { width, .. }
+        | FormatDesc::RealD { width, .. }
+        | FormatDesc::RealG { width, .. }
+        | FormatDesc::Logical { width } => Some(take_width(cursor, *width)),
+        FormatDesc::Character { width: Some(width) } => Some(take_width(cursor, *width)),
+        FormatDesc::Character { width: None } => {
+            let start = *cursor;
+            *cursor = input.len();
+            Some(String::from_utf8_lossy(&input[start..]).into_owned())
+        }
+        _ => None,
+    }
+}
+
+fn extract_nth_formatted_field(
+    descs: &[FormatDesc],
+    input: &[u8],
+    cursor: &mut usize,
+    remaining_data_index: &mut usize,
+) -> Option<(FormatDesc, String)> {
+    for desc in descs {
+        match desc {
+            FormatDesc::Group { repeat, descriptors } => {
+                for _ in 0..*repeat {
+                    if let Some(found) = extract_nth_formatted_field(
+                        descriptors,
+                        input,
+                        cursor,
+                        remaining_data_index,
+                    ) {
+                        return Some(found);
+                    }
+                }
+            }
+            FormatDesc::UnlimitedRepeat { descriptors } => {
+                let mut loop_guard = 0usize;
+                while *cursor < input.len() && loop_guard < input.len().saturating_add(1) {
+                    let before = *cursor;
+                    if let Some(found) = extract_nth_formatted_field(
+                        descriptors,
+                        input,
+                        cursor,
+                        remaining_data_index,
+                    ) {
+                        return Some(found);
+                    }
+                    if *cursor == before {
+                        break;
+                    }
+                    loop_guard += 1;
+                }
+            }
+            _ => {
+                if let Some(field) = read_formatted_field(desc, input, cursor) {
+                    if *remaining_data_index == 0 {
+                        return Some((desc.clone(), field));
+                    }
+                    *remaining_data_index -= 1;
+                } else {
+                    advance_formatted_cursor(desc, input, cursor);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_nth_formatted_internal_field(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+) -> Result<(FormatDesc, String), i32> {
+    if buf.is_null() || buf_len <= 0 {
+        return Err(-1);
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    let descs = parse_format(&fmt);
+    let mut cursor = 0usize;
+    let mut remaining = data_index.max(0) as usize;
+
+    extract_nth_formatted_field(&descs, input, &mut cursor, &mut remaining).ok_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_int_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
+        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i32>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        },
+        Ok(_) => {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+        }
+        Err(code) => {
+            if !iostat.is_null() { unsafe { *iostat = code; } }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_int64_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut i64,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
+        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i64>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        },
+        Ok(_) => {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+        }
+        Err(code) => {
+            if !iostat.is_null() { unsafe { *iostat = code; } }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_int128_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut i128,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
+        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i128>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        },
+        Ok(_) => {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+        }
+        Err(code) => {
+            if !iostat.is_null() { unsafe { *iostat = code; } }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_real_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut f64,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
+        Ok((FormatDesc::RealF { .. }, field))
+        | Ok((FormatDesc::RealE { .. }, field))
+        | Ok((FormatDesc::RealEN { .. }, field))
+        | Ok((FormatDesc::RealES { .. }, field))
+        | Ok((FormatDesc::RealEX { .. }, field))
+        | Ok((FormatDesc::RealD { .. }, field))
+        | Ok((FormatDesc::RealG { .. }, field)) => {
+            let normalized = field.trim().replace('d', "e").replace('D', "E").replace(',', "");
+            match normalized.parse::<f64>() {
+                Ok(v) => {
+                    if !val.is_null() { unsafe { *val = v; } }
+                    if !iostat.is_null() { unsafe { *iostat = 0; } }
+                }
+                Err(_) => {
+                    if !iostat.is_null() { unsafe { *iostat = 1; } }
+                }
+            }
+        }
+        Ok(_) => {
+            if !iostat.is_null() { unsafe { *iostat = 1; } }
+        }
+        Err(code) => {
+            if !iostat.is_null() { unsafe { *iostat = code; } }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1939,6 +2198,58 @@ mod tests {
             "expected remaining internal buffer to be space padded: {:?}",
             rendered
         );
+    }
+
+    #[test]
+    fn formatted_internal_read_i128_field() {
+        let buf = b" 170141183460469231731687303715884105727";
+        let mut value = 0i128;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_int128_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(I40)".as_ptr(),
+            5,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 0, "expected formatted internal i128 read to succeed");
+        assert_eq!(value, 170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
+    fn formatted_internal_read_tracks_descriptor_index() {
+        let buf = b"  42 7";
+        let mut first = 0i32;
+        let mut second = 0i32;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_int_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(I4,1X,I1)".as_ptr(),
+            10,
+            0,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+
+        afs_fmt_read_int_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(I4,1X,I1)".as_ptr(),
+            10,
+            1,
+            &mut second,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        assert_eq!(first, 42);
+        assert_eq!(second, 7);
     }
 
     #[test]
