@@ -98,6 +98,12 @@ Current audit findings:
   passing audit program with cross-opt equality plus asm/object/run reproducibility,
   and `tests/module_host_audit.rs` proves the raw IR resolves the shared module
   global inside the procedure body
+- fixed: extended `OPEN` lowering built the runtime control block by storing
+  typed fields through a byte-pointer GEP, which first tripped IR verification
+  for `position='append'` and then, after the verifier fix, still wrote fields
+  at scaled-by-element-size offsets. `io_append_log.f90` is now a passing file
+  oracle with append rerun coverage plus asm/object reproducibility and
+  cross-opt equality
 - fixed: descriptor-backed array query intrinsics (`SIZE`, `LBOUND`, `UBOUND`)
   were lowered as raw `i64` runtime results even though Fortran default integer
   queries should materialize as default-kind scalars, and scalar/component
@@ -143,7 +149,7 @@ Current audit corpus snapshot:
 - `172` programs with `CHECK`
 - `30` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
-- `3` living `XFAIL`s
+- `2` living `XFAIL`s
 
 ## Brutal Audit Priorities
 
