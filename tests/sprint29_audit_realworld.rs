@@ -70,6 +70,8 @@ fn realworld_object_snapshots_stay_deterministic_at_o2() {
         "realworld_axpy_reduce.f90",
         "realworld_sasum_cleanup.f90",
         "realworld_three_point_apply.f90",
+        "realworld_affine_shift.f90",
+        "realworld_noalias_reuse.f90",
     ] {
         let source = fixture(name);
         let first = capture_text(
@@ -103,6 +105,8 @@ fn realworld_opt_ir_differs_from_raw_ir_at_o2() {
         "realworld_axpy_reduce.f90",
         "realworld_sasum_cleanup.f90",
         "realworld_three_point_apply.f90",
+        "realworld_affine_shift.f90",
+        "realworld_noalias_reuse.f90",
     ] {
         let source = fixture(name);
         let raw_ir = capture_text(
@@ -138,6 +142,8 @@ fn linked_realworld_binaries_are_deterministic_and_uuid_free() {
         "realworld_axpy_reduce.f90",
         "realworld_sasum_cleanup.f90",
         "realworld_three_point_apply.f90",
+        "realworld_affine_shift.f90",
+        "realworld_noalias_reuse.f90",
     ] {
         let source = fixture(name);
         let stem = source.file_stem().unwrap().to_str().unwrap();
