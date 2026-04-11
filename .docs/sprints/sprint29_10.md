@@ -129,10 +129,11 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
   scalar + direct-call / runtime-I/O surface
 - 29.6 still lacks a general native NEON/SIMD loop vectorizer; the current vectorize
   pass rewrites recognized scalar loops onto existing bulk runtime kernels
-- the remaining honest `i128` gaps are now narrower: formatted input beyond
-  today's scalar, component, whole-array, 1-D slice, and fixed-shape
-  multi-dimensional section lvalues; any remaining `RuntimeCall(..)`-style wide
-  runtime surfaces; and any future legal array/vector-style wide rewrites
+- the remaining honest `i128` gaps are now mostly audit/hardening gaps:
+  descriptor-backed allocatable formatted-section reads are now lowered directly
+  from runtime descriptor bounds/strides, but O0/capture-run coverage still has
+  unresolved backend/harness rough edges; any remaining `RuntimeCall(..)`-style
+  wide runtime surfaces; and any future legal array/vector-style wide rewrites
 
 ### 3. Audit and harden everything that claims to be done
 
@@ -160,6 +161,9 @@ What is good:
   `i128` staging, and runtime-I/O surfaces
 - multi-dimensional formatted `integer(16)` section reads now have real external
   and internal source-level audits with IR/asm/object checks
+- allocatable descriptor-backed formatted `integer(16)` section reads now have
+  dedicated fixture-backed audits covering direct descriptor-bound lowering,
+  reverse-section handling, O1+/high-opt runtime behavior, and deterministic O2 objects
 - optimizer unit tests and audit tests are extensive
 
 What is still too weak:
@@ -167,8 +171,9 @@ What is still too weak:
 - optimizer-specific binary/IR differentials could still be broader
 - living XFAIL canaries are still underused outside the known append-I/O case
 - the new `i128` and runtime audits are now strong on scalar, component,
-  whole-array, 1-D slice, and fixed-shape multi-dimensional section lvalue
-  surfaces, but not yet broad on richer non-scalar/descriptor cases
+  whole-array, 1-D slice, fixed-shape multi-dimensional section lvalue surfaces,
+  and allocatable descriptor-backed section lowering, but still weaker on
+  O0/capture-run audit coverage for the newest descriptor-backed cases
 
 ## Brutal Audit Priorities Inside 29.10
 
@@ -238,6 +243,10 @@ What the recent log actually shows:
 - `i128` moved from raw IR staging to full scalar optimized-pipeline support through
   `-Ofast`, real runtime I/O, internal/external formatted input, descriptor-style
   lvalue destinations, and cross-object ABI coverage
+- the last narrow implementation gap on formatted `integer(16)` input is now closed
+  at the lowering level: allocatable descriptor-backed section reads use direct
+  runtime descriptor iteration instead of faking fixed-shape offsets or materializing
+  a temporary section descriptor on the stack
 - one stale deferred item (`stack-passed wide results`) was removed only after the
   existing stack-arg + cross-object coverage proved Apple ARM64 still returns
   `integer(16)` in `x0/x1`
