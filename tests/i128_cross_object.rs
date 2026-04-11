@@ -237,6 +237,11 @@ fn external_i128_call_runs_across_objects_at_o1() {
 }
 
 #[test]
+fn external_i128_call_runs_across_objects_at_o2() {
+    run_cross_object_case(OptLevel::O2);
+}
+
+#[test]
 fn linked_external_i128_binary_is_deterministic_at_o0() {
     deterministic_cross_object_case(OptLevel::O0);
 }
@@ -244,4 +249,9 @@ fn linked_external_i128_binary_is_deterministic_at_o0() {
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_o1() {
     deterministic_cross_object_case(OptLevel::O1);
+}
+
+#[test]
+fn linked_external_i128_binary_is_deterministic_at_o2() {
+    deterministic_cross_object_case(OptLevel::O2);
 }
