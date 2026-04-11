@@ -252,6 +252,11 @@ fn detect_simple_loop(
     // means the loop has internal control flow we don't handle here.
     let body_blocks = collect_body_chain(func, cmp_block, latch, &nl.body)?;
 
+    let is_do_concurrent = is_do_concurrent_loop(func, header, cmp_block, &body_blocks, latch);
+    if !is_do_concurrent && body_blocks.iter().any(|&bb| block_contains_load(func, bb)) {
+        return None;
+    }
+
     // ---- no loop-defined values escape outside the loop ----------------
     //
     // We must check ALL blocks that will be pruned after unrolling — not just
@@ -273,7 +278,7 @@ fn detect_simple_loop(
         .sum();
     if total_insts > BODY_SIZE_MAX { return None; }
 
-    let full_unroll_max = if is_do_concurrent_loop(func, header, cmp_block, &body_blocks, latch) {
+    let full_unroll_max = if is_do_concurrent {
         DO_CONCURRENT_FULL_UNROLL_MAX
     } else {
         FULL_UNROLL_MAX
@@ -314,8 +319,9 @@ fn detect_simple_loop(
 ///     jump to the next iteration, discarding the iadd result). DCE cleans it.
 ///
 /// (b) 4-block loop — cmp_block's true-successor is a separate body block
-///     distinct from the latch. We walk the chain to the latch (exclusive)
-///     and return those blocks.
+///     distinct from the latch. We walk the chain through the latch and
+///     include it in the clone set because real lowered loops may still
+///     carry side effects there in addition to the IV increment.
 fn collect_body_chain(
     func: &Function,
     cmp_block: BlockId,
@@ -335,13 +341,15 @@ fn collect_body_chain(
         return Some(vec![latch]);
     }
 
-    // Case (b): walk the chain from first to latch (exclusive).
+    // Case (b): walk the chain from first through latch. The latch often
+    // contains only the IV increment, but real fused/lowered loops can keep
+    // user-visible side effects there too, so excluding it is unsound.
     let mut chain = Vec::new();
     let mut cur = first;
     loop {
-        if cur == latch { break; }
         if !loop_body.contains(&cur) { return None; }
         chain.push(cur);
+        if cur == latch { break; }
         let blk = func.block(cur);
         // Each block in the chain must have no params (no join point).
         if !blk.params.is_empty() { return None; }
@@ -504,6 +512,13 @@ fn has_escaping_values(
     }
     let _ = preds;
     false
+}
+
+fn block_contains_load(func: &Function, block: BlockId) -> bool {
+    func.block(block)
+        .insts
+        .iter()
+        .any(|inst| matches!(inst.kind, InstKind::Load(_)))
 }
 
 /// Collect all ValueId operands in a terminator into a Vec.
@@ -997,6 +1012,149 @@ mod tests {
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
         assert!(!changed, "reduction loop with 2 header params should not be unrolled");
+    }
+
+    #[test]
+    fn does_not_unroll_load_bearing_loop() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("load_loop".into(), vec![], IrType::Void);
+
+        let header_id = f.create_block("header");
+        let latch_id = f.create_block("latch");
+        let exit_id = f.create_block("exit");
+        let entry_id = f.entry;
+
+        let lo = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let x_slot = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: x_slot,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I64)),
+        });
+        let y_slot = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: y_slot,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I64)),
+        });
+        let x_init = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: x_init,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(5, IntWidth::I64),
+        });
+        let store_x = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: store_x,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(x_init, x_slot),
+        });
+        let y_init = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: y_init,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let store_y = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: store_y,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(y_init, y_slot),
+        });
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo]));
+
+        let iv = f.next_value_id();
+        f.block_mut(header_id).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(4, IntWidth::I64),
+        });
+        let cmp = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv, hi),
+        });
+        f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
+            cond: cmp,
+            true_dest: latch_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![],
+        });
+
+        let x_val = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: x_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::Load(x_slot),
+        });
+        let y_val = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: y_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::Load(y_slot),
+        });
+        let sum = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: sum,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IAdd(x_val, y_val),
+        });
+        let store_sum = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: store_sum,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(sum, y_slot),
+        });
+        let one = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: one,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let next = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![next]));
+
+        f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "load-bearing loop should stay out of the full-unroll fast path"
+        );
     }
 
     #[test]
