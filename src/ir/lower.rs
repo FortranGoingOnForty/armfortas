@@ -248,6 +248,7 @@ pub fn lower_file(
             type_layouts,
             &no_host,
             &no_host_param_consts,
+            None,
             &alloc_return_funcs,
             &optional_params,
             &internal_funcs,
@@ -918,6 +919,7 @@ fn lower_unit(
     // top-level call from lower_file passes an empty slice.
     host_uses: &[crate::ast::decl::SpannedDecl],
     host_param_consts: &HashMap<String, ConstScalar>,
+    host_module: Option<&str>,
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
     internal_funcs: &HashMap<String, u32>,
@@ -950,7 +952,14 @@ fn lower_unit(
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    host_module,
+                    ctx.st,
+                );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
@@ -971,7 +980,21 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    &visible_param_consts,
+                    host_module,
+                    alloc_return_funcs,
+                    optional_params,
+                    internal_funcs,
+                    elemental_funcs,
+                    true,
+                );
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
@@ -1050,7 +1073,14 @@ fn lower_unit(
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    host_module,
+                    ctx.st,
+                );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
@@ -1073,7 +1103,21 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    &visible_param_consts,
+                    host_module,
+                    alloc_return_funcs,
+                    optional_params,
+                    internal_funcs,
+                    elemental_funcs,
+                    true,
+                );
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
@@ -1228,7 +1272,14 @@ fn lower_unit(
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
                 alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
-                install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    host_module,
+                    ctx.st,
+                );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 init_decls(&mut b, &ctx.locals, decls, st);
@@ -1255,7 +1306,21 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    &visible_param_consts,
+                    host_module,
+                    alloc_return_funcs,
+                    optional_params,
+                    internal_funcs,
+                    elemental_funcs,
+                    true,
+                );
             }
         }
         ProgramUnit::Module { decls, uses, contains, .. } => {
@@ -1266,8 +1331,26 @@ fn lower_unit(
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
+            let module_name = match &unit.node {
+                ProgramUnit::Module { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, false);
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    &visible_param_consts,
+                    module_name,
+                    alloc_return_funcs,
+                    optional_params,
+                    internal_funcs,
+                    elemental_funcs,
+                    false,
+                );
             }
         }
         _ => {}
@@ -1957,6 +2040,7 @@ fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
+    host_module: Option<&str>,
     st: &SymbolTable,
 ) {
     use crate::ast::decl::OnlyItem;
@@ -1971,6 +2055,15 @@ fn install_globals_as_locals(
     //   2. Sort by local-scope key.
     //   3. Install in order, checking for collision before inserting.
     let mut pending: Vec<(String, (String, String))> = Vec::new();
+
+    if let Some(module_name) = host_module {
+        let mod_key = module_name.to_lowercase();
+        for (mk, var) in globals.keys() {
+            if *mk == mod_key {
+                pending.push((var.clone(), (mod_key.clone(), var.clone())));
+            }
+        }
+    }
 
     for decl in uses {
         let Decl::UseStmt { module, nature: _, renames, only } = &decl.node else { continue; };
