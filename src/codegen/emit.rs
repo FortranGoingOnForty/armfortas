@@ -417,10 +417,16 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let src = op_str(&inst.operands[1]);
             // Handle width mismatch: w→x extend or x→w truncate.
             let dest_is_x = dest.starts_with('x');
+            let dest_is_w = dest.starts_with('w');
             let src_is_w = src.starts_with('w');
+            let src_is_x = src.starts_with('x');
             if dest_is_x && src_is_w {
                 // Zero-extend 32→64: use uxtw.
                 format!("uxtw {}, {}", dest, src)
+            } else if dest_is_w && src_is_x {
+                // Truncate 64→32 by reading the source register through its
+                // 32-bit view. `mov wN, xM` is not a valid AArch64 encoding.
+                format!("mov {}, w{}", dest, &src[1..])
             } else {
                 format!("mov {}, {}", dest, src)
             }
@@ -804,5 +810,20 @@ mod tests {
             "negative i128 array element should preserve two's-complement words:\n{}",
             asm
         );
+    }
+
+    #[test]
+    fn emit_mov_reg_truncates_x_source_through_w_view() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp32(21)),
+                MachineOperand::PhysReg(PhysReg::Gp(20)),
+            ],
+            def: None,
+        };
+
+        assert_eq!(emit_inst(&inst, &mf), "mov w21, w20");
     }
 }
