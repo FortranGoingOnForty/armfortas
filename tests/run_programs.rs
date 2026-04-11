@@ -2642,7 +2642,7 @@ fn file_set_exact_allows_rewind_single_output() {
 }
 
 #[test]
-fn file_rerun_mode_append_fixture_tracks_current_compiler_gap() {
+fn file_rerun_mode_append_fixture_passes_and_keeps_append_coverage() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_append_log.f90");
@@ -2652,9 +2652,9 @@ fn file_rerun_mode_append_fixture_tracks_current_compiler_gap() {
     );
 
     match run_test(&compiler, &source, "-O0") {
-        TestOutcome::Xfail(_) => {}
+        TestOutcome::Pass => {}
         other => panic!(
-            "io_append_log.f90 should currently xfail while still exercising FILE_RERUN_MODE(append), got {:?}",
+            "io_append_log.f90 should pass while still exercising FILE_RERUN_MODE(append), got {:?}",
             other
         ),
     }

@@ -2,11 +2,13 @@
 ! Writes one line per run to a persistent log file.
 ! Exercises: explicit append semantics across same-sandbox reruns.
 !
-! XFAIL: append-position open still trips IR verification
 ! CHECK: 7
 ! FILE_EXISTS: afs_append.log
 ! FILE_LINE_COUNT: afs_append.log => 1
 ! FILE_RERUN_MODE: afs_append.log => append
+! REPRO_CHECK: asm
+! REPRO_CHECK: obj
+! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program test_io_append_log
     implicit none
 

@@ -4840,6 +4840,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 .unwrap_or_else(|| b.const_i64(0));
 
             let null = b.const_i64(0);
+            let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+            let recl_i64 = coerce_to_type(b, recl_val, &IrType::Int(IntWidth::I64));
 
             // Check if we have any extended specifiers beyond the basic 7-arg set.
             let has_access = specs.iter().any(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("access")).unwrap_or(false));
@@ -4851,7 +4853,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // Simple case: use 7-arg afs_open_simple (unit + 3 string pairs).
                 b.call(
                     FuncRef::External("afs_open_simple".into()),
-                    vec![unit, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len],
+                    vec![unit_i32, file_ptr, file_len, status_ptr, status_len, action_ptr, action_len],
                     IrType::Void,
                 );
             } else {
@@ -4871,28 +4873,47 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 128);
                 let cb = b.alloca(cb_ty);
 
-                let store_at = |b: &mut crate::ir::builder::FuncBuilder, base, offset: i64, val| {
-                    let off = b.const_i64(offset);
-                    let ptr = b.gep(base, vec![off], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    b.store(val, ptr);
+                let store_at = |b: &mut crate::ir::builder::FuncBuilder,
+                                base,
+                                offset: i64,
+                                field_ty: IrType,
+                                val| {
+                    let field_bytes = field_ty.size_bytes() as i64;
+                    debug_assert!(field_bytes > 0 && offset % field_bytes == 0);
+                    let slot = b.const_i64(offset / field_bytes);
+                    let ptr = b.gep(base, vec![slot], field_ty.clone());
+                    let stored = match field_ty {
+                        IrType::Int(_) | IrType::Float(_) | IrType::Bool => {
+                            coerce_to_type(b, val, &field_ty)
+                        }
+                        _ => val,
+                    };
+                    b.store(stored, ptr);
                 };
 
-                store_at(b, cb, 0, unit);
-                store_at(b, cb, 8, file_ptr);
-                store_at(b, cb, 16, file_len);
-                store_at(b, cb, 24, status_ptr);
-                store_at(b, cb, 32, status_len);
-                store_at(b, cb, 40, action_ptr);
-                store_at(b, cb, 48, action_len);
-                store_at(b, cb, 56, access_ptr);
-                store_at(b, cb, 64, access_len);
-                store_at(b, cb, 72, form_ptr);
-                store_at(b, cb, 80, form_len);
-                store_at(b, cb, 88, recl_val);
-                store_at(b, cb, 96, null);       // iostat = null
-                store_at(b, cb, 104, null);      // newunit = null
-                store_at(b, cb, 112, position_ptr);
-                store_at(b, cb, 120, position_len);
+                let file_ptr_ty = b.func().value_type(file_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let status_ptr_ty = b.func().value_type(status_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let action_ptr_ty = b.func().value_type(action_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let access_ptr_ty = b.func().value_type(access_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let form_ptr_ty = b.func().value_type(form_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let position_ptr_ty = b.func().value_type(position_ptr).unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+                store_at(b, cb, 0, IrType::Int(IntWidth::I32), unit_i32);
+                store_at(b, cb, 8, file_ptr_ty, file_ptr);
+                store_at(b, cb, 16, IrType::Int(IntWidth::I64), file_len);
+                store_at(b, cb, 24, status_ptr_ty, status_ptr);
+                store_at(b, cb, 32, IrType::Int(IntWidth::I64), status_len);
+                store_at(b, cb, 40, action_ptr_ty, action_ptr);
+                store_at(b, cb, 48, IrType::Int(IntWidth::I64), action_len);
+                store_at(b, cb, 56, access_ptr_ty, access_ptr);
+                store_at(b, cb, 64, IrType::Int(IntWidth::I64), access_len);
+                store_at(b, cb, 72, form_ptr_ty, form_ptr);
+                store_at(b, cb, 80, IrType::Int(IntWidth::I64), form_len);
+                store_at(b, cb, 88, IrType::Int(IntWidth::I64), recl_i64);
+                store_at(b, cb, 96, IrType::Int(IntWidth::I64), null);       // iostat = null
+                store_at(b, cb, 104, IrType::Int(IntWidth::I64), null);      // newunit = null
+                store_at(b, cb, 112, position_ptr_ty, position_ptr);
+                store_at(b, cb, 120, IrType::Int(IntWidth::I64), position_len);
 
                 b.call(
                     FuncRef::External("afs_open".into()),
