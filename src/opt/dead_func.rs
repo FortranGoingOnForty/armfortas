@@ -4,9 +4,11 @@
 //! callers. This pass removes them from the module, reducing code
 //! size and symbol table pollution.
 //!
-//! The program entry function (index 0, the `__prog_*` function) is
-//! always kept. Functions called via External refs (runtime, external
-//! linkage) are also kept since the call might come from outside.
+//! The lowered program entry function (`__prog_*`) is always kept.
+//! When no program body exists, function index 0 is kept as the
+//! conservative fallback root. Functions called via External refs
+//! (runtime, external linkage) are also kept since the call might come
+//! from outside.
 
 use std::collections::HashSet;
 use crate::ir::inst::*;
@@ -23,7 +25,16 @@ impl Pass for DeadFuncElim {
 
         // Collect all function indices that are referenced by Internal calls.
         let mut referenced: HashSet<u32> = HashSet::new();
-        referenced.insert(0); // always keep the entry function
+        let mut kept_program_root = false;
+        for (idx, func) in module.functions.iter().enumerate() {
+            if func.name.starts_with("__prog_") {
+                referenced.insert(idx as u32);
+                kept_program_root = true;
+            }
+        }
+        if !kept_program_root {
+            referenced.insert(0);
+        }
 
         for func in &module.functions {
             for block in &func.blocks {
@@ -149,5 +160,24 @@ mod tests {
         let changed = pass.run(&mut m);
         assert!(!changed, "both functions are referenced");
         assert_eq!(m.functions.len(), 2);
+    }
+
+    #[test]
+    fn keeps_program_body_even_when_helper_is_first() {
+        let mut m = Module::new("test".into());
+
+        let mut helper = Function::new("helper".into(), vec![], IrType::Void);
+        helper.block_mut(helper.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(helper);
+
+        let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
+        prog.block_mut(prog.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(prog);
+
+        let pass = DeadFuncElim;
+        let changed = pass.run(&mut m);
+        assert!(changed, "dead helper should be removed while keeping program body");
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "__prog_entry");
     }
 }

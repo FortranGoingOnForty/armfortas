@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use crate::codegen::{emit, isel, linearscan, peephole};
+use crate::codegen::mir::MachineFunction;
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
@@ -143,6 +144,14 @@ impl Options {
             PathBuf::from(stem)
         }
     }
+}
+
+fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
+    allocated
+        .iter()
+        .find(|func| func.name.starts_with("__prog_"))
+        .or_else(|| allocated.iter().find(|func| func.name != "main"))
+        .map(|func| func.name.as_str())
 }
 
 /// Compile a Fortran source file through the full pipeline.
@@ -320,8 +329,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // Emit _main entry point (must be in __TEXT section).
-    if let Some(user_func) = allocated.first() {
-        if user_func.name != "main" {
+    if let Some(user_func) = main_wrapper_target(&allocated) {
+        if user_func != "main" {
             asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
             asm_text.push_str(&format!(
                 "\
@@ -337,7 +346,7 @@ _main:
     ldp x29, x30, [sp], #16
     ret
 ",
-                user_func.name
+                user_func
             ));
         }
     }
@@ -724,5 +733,19 @@ mod tests {
         assert!(asm.contains("movz x16, #42"), "expected folded i128 constant in asm:\n{}", asm);
         assert!(!asm.contains("mul "), "expected O1 i128 multiply to fold away before backend:\n{}", asm);
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn main_wrapper_prefers_program_body_over_earlier_helpers() {
+        let allocated = vec![
+            MachineFunction::new("bump".into()),
+            MachineFunction::new("__prog_audit_entry".into()),
+        ];
+
+        assert_eq!(
+            main_wrapper_target(&allocated),
+            Some("__prog_audit_entry"),
+            "main wrapper should call the lowered program body, not the first helper"
+        );
     }
 }

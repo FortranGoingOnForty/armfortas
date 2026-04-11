@@ -810,8 +810,8 @@ fn emit_module_asm(module: &crate::ir::inst::Module, allocated: &[MachineFunctio
         asm_text.push('\n');
     }
 
-    if let Some(user_func) = allocated.first() {
-        if user_func.name != "main" {
+    if let Some(user_func) = main_wrapper_target(allocated) {
+        if user_func != "main" {
             let _ = write!(
                 asm_text,
                 "\n.section __TEXT,__text,regular,pure_instructions\n\
@@ -826,12 +826,20 @@ _main:\n\
     mov x0, #0\n\
     ldp x29, x30, [sp], #16\n\
     ret\n",
-                user_func.name
+                user_func
             );
         }
     }
 
     asm_text
+}
+
+fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
+    allocated
+        .iter()
+        .find(|func| func.name.starts_with("__prog_"))
+        .or_else(|| allocated.iter().find(|func| func.name != "main"))
+        .map(|func| func.name.as_str())
 }
 
 fn next_temp_root(prefix: &str) -> PathBuf {
