@@ -326,7 +326,16 @@ fn key_of(
         InstKind::IntExtend(a, w, s) => mk(54, vec![remap(*a)], (w.bits() as i128) * if *s { 1 } else { -1 }),
         InstKind::IntTrunc(a, w)     => mk(55, vec![remap(*a)], w.bits() as i128),
         // Constants.
-        InstKind::ConstInt(v, w)   => mk(60, vec![], *v * 100 + w.bits() as i128),
+        InstKind::ConstInt(v, w)   => {
+            let bits = w.bits();
+            let signed = if bits >= 128 {
+                *v
+            } else {
+                let shift = 128 - bits;
+                (*v << shift) >> shift
+            };
+            mk(60, vec![], signed)
+        }
         InstKind::ConstFloat(v, w) => mk(61, vec![], ((*v).to_bits() as i128) ^ (w.bits() as i128)),
         InstKind::ConstBool(v)     => mk(62, vec![], *v as i128),
         // GlobalAddr.
@@ -560,6 +569,26 @@ mod tests {
         m.add_function(f);
         let pass = Gvn;
         assert!(!pass.run(&mut m));
+    }
+
+    #[test]
+    fn gvn_handles_max_i128_constant_keys() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I128));
+        let entry = f.entry;
+        let wide = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(i128::MAX, IntWidth::I128),
+            IrType::Int(IntWidth::I128),
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(wide)));
+        m.add_function(f);
+        let pass = Gvn;
+        assert!(
+            !pass.run(&mut m),
+            "single max-i128 constant should not produce a spurious rewrite"
+        );
     }
 
     #[test]
