@@ -17,20 +17,5 @@ starting the full Sprint 29 audit:
   The full-sprint audit tripped this while building the fpm-inspired
   `realworld_suffix_scan.f90` reproducer, which is currently written in a more
   conservative source form instead of the typed constructor spelling.
-- Audit FPM-SUFFIX-1: the conservative `realworld_suffix_scan.f90` variant now
-  gets past parsing but still fails IR verification with an `i32`/`i64` store
-  type mismatch.
-  This is now a living XFAIL in the real-world audit corpus, so the Sprint 29
-  closeout has a standing canary for the remaining source-scanner gap.
-- Audit ASHAPE-SIZE-1: dummy-array `SIZE(...)` queries still flow into the
-  descriptor runtime path even though ordinary dummy arrays are currently
-  lowered as base pointers rather than descriptors.
-  The mixed-width query-result bug that originally masked this is now fixed, so
-  the remaining failure is the real one: `afs_array_size` receives bogus
-  dummy-array metadata and panics in the runtime.
-  The 29.11 claims audit surfaced this first through the original
-  `realworld_ipo_chain.f90` helper loop, and
-  `test_programs/realworld_assumed_shape_size.f90` now captures it as a living
-  XFAIL canary instead of letting the finding disappear.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.

@@ -1,5 +1,4 @@
 ! Real-world-style assumed-shape SIZE query canary.
-! XFAIL: audit ASHAPE-SIZE-1 (assumed-shape dummy arrays still flow into afs_array_size without a descriptor)
 ! CHECK: 6
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj

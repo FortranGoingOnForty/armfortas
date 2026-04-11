@@ -49,7 +49,7 @@ Each promised item should end the audit in one of three states:
 
 Kickoff items:
 - source-level audit for helper-before-program entry lowering / dead-function root handling
-- living XFAIL for module procedure host-association over module globals
+- source-level audit for module procedure host-association over module globals
 - real-world stdlib-style kernel:
   - tridiagonal sparse matvec (`realworld_tridiag_spmv.f90`)
 - real-world BLAS-style kernel:
@@ -114,6 +114,23 @@ Current audit findings:
   real-world default-kind array-query assignments could produce invalid asm like
   `mov w21, x20`; the new runtime-shape audit keeps that truncation surface
   honest
+- fixed: fpm-style suffix classification in `realworld_suffix_scan.f90` first
+  needed fixed-length character arrays to lower as real element-addressable
+  arrays instead of scalar strings, then needed scalar character dummy intrinsics
+  like `INDEX(name, suffix)` to carry a real runtime length story through
+  `afs_c_strlen`, and finally exposed two optimizer-side bugs: mixed-width GEP
+  offsets were being compared without pointee-size scaling in alias analysis,
+  and SROA was scalarizing aggregates even when a GEP address escaped through
+  the synthesized descriptor. The program is now a passing audit probe with
+  cross-opt equality plus IR/asm/object/run reproducibility
+- fixed: dummy-array `SIZE(...)` queries in `realworld_assumed_shape_size.f90`
+  were not actually using assumed-shape descriptors because bare `(:)` dummy
+  declarations lowered through the `Deferred` array-spec path, and then the
+  synthesized descriptor lost `rank` and `flags` at `-O2+` because mixed-width
+  GEP offsets in alias analysis made descriptor field stores look like they
+  overlapped. Assumed-shape dummies now classify as descriptor-backed, query
+  results are kept in default-kind scalars, and the real-world canary now
+  passes across optimization levels with deterministic artifacts
 - proven: LICM hoists invariant scalar dummy loads out of a real-world affine
   update loop in `realworld_affine_shift.f90` once BCE clears the loop body
 - proven: GVN reduces duplicated branch-join PURE helper calls in
@@ -133,14 +150,6 @@ Current audit findings:
   (`realworld_ipo_chain.f90`), small-loop DO CONCURRENT exploitation
   (`realworld_doconc_square.f90`), and explicit-DO vectorization onto the bulk
   runtime kernels (`realworld_vector_stage.f90`)
-- deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
-  fails after parsing with an `i32`/`i64` IR store mismatch
-- deferred with living XFAIL: `ASHAPE-SIZE-1` dummy-array `SIZE(...)` lowering
-  still routes dummy arrays into the descriptor runtime path even though ordinary
-  dummy arrays are carried as base pointers today. The default-integer query
-  typing bug is now fixed, so the remaining failure is the real descriptor
-  mismatch: `realworld_assumed_shape_size.f90` reaches `afs_array_size` with
-  bogus dummy-array metadata and panics in the runtime
 - separately deferred parser gap: typed character array constructors using an
   explicit type-spec inside `[]`
 
@@ -149,7 +158,7 @@ Current audit corpus snapshot:
 - `172` programs with `CHECK`
 - `30` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
-- `2` living `XFAIL`s
+- `0` living `XFAIL`s
 
 ## Brutal Audit Priorities
 

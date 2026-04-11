@@ -1,11 +1,7 @@
 ! fpm-inspired source suffix classifier shape.
 ! Conservatively written because the typed constructor spelling
 ! `[character(len=20) :: ...]` is still a separate parser-gap note.
-! XFAIL: audit FPM-SUFFIX-1 (fpm-style suffix scan hits i32/i64 IR store mismatch)
-! CHECK: 3
-! CHECK: 2
-! CHECK: 2
-! CHECK: 322
+! CHECK: 3 2 2 322
 ! IR_CHECK: call @classify_sources(
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
