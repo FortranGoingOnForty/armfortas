@@ -176,3 +176,40 @@ fn linked_binary_is_deterministic_for_same_output_path_and_has_no_uuid() {
         let _ = fs::remove_file(&bin_path);
     }
 }
+
+#[test]
+fn linked_runtime_heavy_binary_is_deterministic_for_section_reads() {
+    let compiler = find_compiler();
+    let source = fixture("integer16_format_read_sections.f90");
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+
+    for opt in ["-O0", "-O2", "-Ofast"] {
+        let bin_path = std::env::temp_dir().join(format!(
+            "afs_bin_det_runtime_{}_{}_{}",
+            std::process::id(),
+            stem,
+            opt.trim_start_matches('-')
+        ));
+
+        compile_binary(&compiler, &source, opt, &bin_path);
+        let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
+        assert!(
+            !load_commands.contains("LC_UUID"),
+            "runtime-heavy linked binary at {} should omit LC_UUID:\n{}",
+            opt,
+            load_commands
+        );
+        let first = fs::read(&bin_path).expect("cannot read first binary image");
+
+        compile_binary(&compiler, &source, opt, &bin_path);
+        let second = fs::read(&bin_path).expect("cannot read second binary image");
+
+        assert_eq!(
+            first, second,
+            "runtime-heavy linked binary should be byte-identical when rebuilt at the same output path ({})",
+            opt
+        );
+
+        let _ = fs::remove_file(&bin_path);
+    }
+}
