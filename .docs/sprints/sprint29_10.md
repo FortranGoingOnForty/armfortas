@@ -241,11 +241,19 @@ Landed so far:
   raw-IR lowering coverage, asm/object determinism checks, cross-opt runtime
   execution coverage, and a real corpus program that round-trips wide decimal
   values beyond `i64`
+- list-directed internal character-buffer I/O for scalar integers through
+  `afs_write_internal_*` / `afs_read_internal_*`, including position-tracking
+  runtime helpers, a graduated `io_internal.f90` corpus program, and wide
+  `integer(16)` round-trip coverage with deterministic objects
+- formatted internal character-buffer output through `afs_fmt_begin_internal`,
+  including wide `integer(16)` coverage and a real source-level corpus program
+  that proves internal formatted output survives through `trim(buf)` at runtime
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide results, formatted/internal-input `i128`, full
-  character-buffer/internal I/O `i128`, general `RuntimeCall(..)`-based wide runtime
+  especially stack-passed wide results, formatted/internal-input `i128`, broader
+  internal-input parsing beyond the current list-directed character-buffer path,
+  general `RuntimeCall(..)`-based wide runtime
   surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
