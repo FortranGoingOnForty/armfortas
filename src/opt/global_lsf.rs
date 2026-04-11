@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use crate::ir::inst::*;
+use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, predecessors, terminator_targets};
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
@@ -174,12 +175,33 @@ fn update_memory_state(
             }
             AliasResult::NoAlias => {}
         },
-        InstKind::Call(..) | InstKind::RuntimeCall(..) => {
-            *last_store = None;
-            *clobbered = true;
+        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+            let pointer_args: Vec<ValueId> = args
+                .iter()
+                .copied()
+                .filter(|arg| value_is_pointer(func, *arg))
+                .collect();
+            if pointer_args.iter().any(|arg| {
+                !matches!(alias::query(func, *arg, load_ptr), AliasResult::NoAlias)
+            }) {
+                *last_store = None;
+                *clobbered = true;
+            }
         }
         _ => {}
     }
+}
+
+fn value_is_pointer(func: &Function, value: ValueId) -> bool {
+    if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
+        return true;
+    }
+    if func.params.iter().any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_))) {
+        return true;
+    }
+    func.blocks.iter().flat_map(|block| block.insts.iter()).find(|inst| inst.id == value)
+        .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
+        .unwrap_or(false)
 }
 
 fn paths_to_load_are_clean(
@@ -422,7 +444,7 @@ mod tests {
             id: call,
             ty: IrType::Void,
             span,
-            kind: InstKind::RuntimeCall(RuntimeFunc::PrintNewline, vec![]),
+            kind: InstKind::Call(FuncRef::External("touch".into()), vec![ptr]),
         });
         f.block_mut(clobber).terminator = Some(Terminator::Branch(load_block, vec![]));
 
@@ -537,6 +559,103 @@ mod tests {
         assert!(
             !pass.run(&mut m),
             "a pre-loop store must not be forwarded into a header that can be revisited"
+        );
+    }
+
+    #[test]
+    fn forwards_across_noalias_calling_side_path() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new(
+            "f".into(),
+            vec![
+                Param {
+                    name: "dst".into(),
+                    ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                    id: ValueId(0),
+                    fortran_noalias: true,
+                },
+                Param {
+                    name: "tmp".into(),
+                    ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                    id: ValueId(1),
+                    fortran_noalias: true,
+                },
+            ],
+            IrType::Int(IntWidth::I32),
+        );
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let side = f.create_block("side");
+        let join = f.create_block("join");
+        let exit = f.create_block("exit");
+
+        let stored = f.next_value_id();
+        f.register_type(stored, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: stored,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(42, IntWidth::I32),
+        });
+        let cond = f.next_value_id();
+        f.register_type(cond, IrType::Bool);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: cond,
+            ty: IrType::Bool,
+            span,
+            kind: InstKind::ConstBool(true),
+        });
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(stored, ValueId(0)),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: side,
+            true_args: vec![],
+            false_dest: join,
+            false_args: vec![],
+        });
+
+        let call = f.next_value_id();
+        f.register_type(call, IrType::Void);
+        f.block_mut(side).insts.push(Inst {
+            id: call,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Call(FuncRef::External("touch".into()), vec![ValueId(1)]),
+        });
+        f.block_mut(side).terminator = Some(Terminator::Branch(join, vec![]));
+
+        let load = f.next_value_id();
+        f.register_type(load, IrType::Int(IntWidth::I32));
+        f.block_mut(join).insts.push(Inst {
+            id: load,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::Load(ValueId(0)),
+        });
+        f.block_mut(join).terminator = Some(Terminator::Branch(exit, vec![]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        let pass = GlobalLsf;
+        assert!(
+            pass.run(&mut m),
+            "global LSF should forward across a side path that only calls through a noalias pointer"
+        );
+        let term = m.functions[0].block(exit).terminator.clone().unwrap();
+        assert!(
+            matches!(term, Terminator::Return(Some(v)) if v == stored),
+            "return should use the forwarded stored value after the noalias call side path"
         );
     }
 }
