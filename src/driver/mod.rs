@@ -422,15 +422,6 @@ fn link(obj: &Path, output: &Path) -> Result<(), String> {
 
 /// Find libarmfortas_rt.a in common locations.
 fn find_runtime_lib() -> Result<String, String> {
-    // Check next to the compiler binary.
-    if let Ok(exe) = std::env::current_exe() {
-        let dir = exe.parent().unwrap_or(Path::new("."));
-        let candidate = dir.join("libarmfortas_rt.a");
-        if candidate.exists() {
-            return Ok(candidate.to_str().unwrap().to_string());
-        }
-    }
-
     // Check cargo target directory (for development).
     let candidates = [
         "target/debug/libarmfortas_rt.a",
@@ -440,6 +431,15 @@ fn find_runtime_lib() -> Result<String, String> {
     for c in &candidates {
         if Path::new(c).exists() {
             return Ok(c.to_string());
+        }
+    }
+
+    // Fall back to a runtime shipped next to the compiler binary.
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        let candidate = dir.join("libarmfortas_rt.a");
+        if candidate.exists() {
+            return Ok(candidate.to_str().unwrap().to_string());
         }
     }
 

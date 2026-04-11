@@ -897,15 +897,6 @@ fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
 }
 
 fn find_runtime_lib() -> Result<String, String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("libarmfortas_rt.a");
-            if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-
     let candidates = [
         "target/debug/libarmfortas_rt.a",
         "target/release/libarmfortas_rt.a",
@@ -915,6 +906,15 @@ fn find_runtime_lib() -> Result<String, String> {
     for candidate in candidates {
         if Path::new(candidate).exists() {
             return Ok(candidate.to_string());
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("libarmfortas_rt.a");
+            if candidate.exists() {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
         }
     }
 
