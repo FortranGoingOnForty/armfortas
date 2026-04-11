@@ -79,6 +79,12 @@ Current audit findings:
   `-O2+`; the audit kernels `realworld_sasum_cleanup.f90` and
   `realworld_three_point_apply.f90` now prove the offset-IV case and keep SROA
   honest at the same time
+- fixed: cross-block LSF treated every call as a universal memory clobber, so
+  branch-join reuse through a noalias helper side path stayed as a reload at
+  `-O2+`; `realworld_noalias_reuse.f90` now proves the noalias-call case and
+  also keeps the local same-block reuse path honest
+- proven: LICM hoists invariant scalar dummy loads out of a real-world affine
+  update loop in `realworld_affine_shift.f90` once BCE clears the loop body
 - deferred with living XFAIL: `MODULE-HOST-1` module-global host association
 - deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
   fails after parsing with an `i32`/`i64` IR store mismatch
@@ -86,8 +92,8 @@ Current audit findings:
   explicit type-spec inside `[]`
 
 Current audit corpus snapshot:
-- `169` top-level `test_programs/*.f90` runtime corpus programs
-- `161` programs with `CHECK`
+- `171` top-level `test_programs/*.f90` runtime corpus programs
+- `163` programs with `CHECK`
 - `28` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `3` living `XFAIL`s
