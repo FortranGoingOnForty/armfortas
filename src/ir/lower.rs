@@ -4736,6 +4736,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         };
                         let ty = &info.ty;
                         let func_name = match ty {
+                            IrType::Int(IntWidth::I128) => "afs_read_int128",
                             IrType::Int(IntWidth::I64) => "afs_read_int64",
                             IrType::Int(_) => "afs_read_int",
                             IrType::Float(FloatWidth::F64) => "afs_read_real64",
@@ -8130,6 +8131,18 @@ program test
 end program
 ");
         assert!(ir.contains("afs_write_int128"));
+    }
+
+    #[test]
+    fn lower_read_integer16_uses_wide_reader() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer(16) :: x
+  read(*, *) x
+end program
+");
+        assert!(ir.contains("afs_read_int128"));
     }
 
     #[test]
