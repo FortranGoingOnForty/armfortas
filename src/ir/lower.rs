@@ -238,6 +238,7 @@ pub fn lower_file(
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
     let no_host: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
+    let no_host_param_consts: HashMap<String, ConstScalar> = HashMap::new();
     for unit in units {
         lower_unit(
             &mut module,
@@ -246,6 +247,7 @@ pub fn lower_file(
             &globals,
             type_layouts,
             &no_host,
+            &no_host_param_consts,
             &alloc_return_funcs,
             &optional_params,
             &internal_funcs,
@@ -915,6 +917,7 @@ fn lower_unit(
     // the combined list down to any nested subprogram. The
     // top-level call from lower_file passes an empty slice.
     host_uses: &[crate::ast::decl::SpannedDecl],
+    host_param_consts: &HashMap<String, ConstScalar>,
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
     internal_funcs: &HashMap<String, u32>,
@@ -924,6 +927,7 @@ fn lower_unit(
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
+            let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             // Fortran PROGRAM bodies are never the C entry point — driver/mod.rs
             // always emits a `_main` wrapper. Use a private name so a user-written
             // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
@@ -944,7 +948,8 @@ fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &fname);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -966,7 +971,7 @@ fn lower_unit(
             // uses as their host_uses, so host association threads
             // through Program → contained Subroutine/Function.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
         ProgramUnit::Subroutine { name, decls, body, args, bind, uses, contains, prefix, .. } => {
@@ -974,6 +979,7 @@ fn lower_unit(
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
+            let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
@@ -1033,7 +1039,7 @@ fn lower_unit(
                         let dt_name = arg_derived_type_name(pname, decls);
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: arg_dims_from_decls(pname, decls), allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         };
                         ctx.locals.insert(pname.clone(), info);
@@ -1042,7 +1048,8 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -1066,13 +1073,14 @@ fn lower_unit(
             // Each nested sub inherits this subroutine's combined
             // host_uses + own uses.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
         ProgramUnit::Function { name, decls, body, args, result, return_type, bind, uses, contains, prefix, .. } => {
             let func_name = bind.as_ref()
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
+            let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
 
             // Audit6 BLOCKING-1: functions with allocatable result use the
             // sret (hidden-output-param) convention. The caller allocas a
@@ -1185,7 +1193,7 @@ fn lower_unit(
                         let dt_name = arg_derived_type_name(pname, decls);
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
-                            dims: arg_dims_from_decls(pname, decls), allocatable: false, by_ref: true,
+                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, by_ref: true,
                             char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
                         });
                     }
@@ -1218,7 +1226,8 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(&mut b, &mut ctx.locals, globals, &combined_uses, ctx.st);
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -1246,18 +1255,19 @@ fn lower_unit(
 
             // Lower nested CONTAINS subprograms.
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, true);
             }
         }
-        ProgramUnit::Module { uses, contains, .. } => {
+        ProgramUnit::Module { decls, uses, contains, .. } => {
             // Module globals are installed in pass 1 (collect_module_globals).
             // The module body has no executable statements, but its CONTAINS
             // subprograms (module procedures) must be lowered as top-level
             // functions so they are emitted into the object file.
+            let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             for sub in contains {
-                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, false);
+                lower_unit(module, sub, st, globals, type_layouts, &combined_uses, &visible_param_consts, alloc_return_funcs, optional_params, internal_funcs, elemental_funcs, false);
             }
         }
         _ => {}
@@ -1446,7 +1456,14 @@ fn eval_const_scalar(
 fn collect_decl_param_consts(
     decls: &[crate::ast::decl::SpannedDecl],
 ) -> HashMap<String, ConstScalar> {
-    let mut param_consts: HashMap<String, ConstScalar> = HashMap::new();
+    collect_decl_param_consts_with_host(decls, &HashMap::new())
+}
+
+fn collect_decl_param_consts_with_host(
+    decls: &[crate::ast::decl::SpannedDecl],
+    host_param_consts: &HashMap<String, ConstScalar>,
+) -> HashMap<String, ConstScalar> {
+    let mut param_consts: HashMap<String, ConstScalar> = host_param_consts.clone();
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl { attrs, entities, .. } => {
@@ -1475,6 +1492,46 @@ fn collect_decl_param_consts(
         }
     }
     param_consts
+}
+
+fn const_scalar_ir_type(value: ConstScalar) -> IrType {
+    match value {
+        ConstScalar::Int(v) => {
+            if i32::try_from(v).is_ok() {
+                IrType::Int(IntWidth::I32)
+            } else {
+                IrType::Int(IntWidth::I64)
+            }
+        }
+        ConstScalar::Float(_) => IrType::Float(FloatWidth::F64),
+    }
+}
+
+fn install_host_param_consts(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    host_param_consts: &HashMap<String, ConstScalar>,
+) {
+    for (name, value) in host_param_consts {
+        if locals.contains_key(name) {
+            continue;
+        }
+        let ty = const_scalar_ir_type(*value);
+        let addr = b.alloca(ty.clone());
+        locals.insert(
+            name.clone(),
+            LocalInfo {
+                addr,
+                ty,
+                dims: vec![],
+                allocatable: false,
+                by_ref: false,
+                char_kind: CharKind::None,
+                derived_type: None,
+                inline_const: Some(*value),
+            },
+        );
+    }
 }
 
 /// A pending global variable produced by the lowerer for a SAVE'd
@@ -2009,6 +2066,7 @@ fn alloc_decls(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     pending_globals: &mut Vec<PendingGlobal>,
     func_name: &str,
@@ -2038,7 +2096,7 @@ fn alloc_decls(
     //
     // Parameters can reference earlier parameters (`tau = 2 * pi`),
     // so we walk decls in order and build the map incrementally.
-    let param_consts = collect_decl_param_consts(decls);
+    let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
 
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
@@ -3380,9 +3438,13 @@ fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) 
     IrType::Int(IntWidth::I32) // fallback
 }
 
-fn arg_dims_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> Vec<(i64, i64)> {
+fn arg_dims_from_decls(
+    arg_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
+) -> Vec<(i64, i64)> {
     let key = arg_name.to_lowercase();
-    let param_consts = collect_decl_param_consts(decls);
+    let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
     for decl in decls {
         if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
