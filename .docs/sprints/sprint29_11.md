@@ -74,6 +74,11 @@ Current audit findings:
   which miscompiled `realworld_axpy_reduce.f90` at `-O2/-O3/-Ofast`; the
   unroller is now hardened to keep that shape out while preserving the proven
   `DO CONCURRENT` full-unroll path
+- fixed: BCE only recognized the canonical bare loop IV, so real-world counted
+  loops with safe `iv +/- const` array accesses kept redundant bounds checks at
+  `-O2+`; the audit kernels `realworld_sasum_cleanup.f90` and
+  `realworld_three_point_apply.f90` now prove the offset-IV case and keep SROA
+  honest at the same time
 - deferred with living XFAIL: `MODULE-HOST-1` module-global host association
 - deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
   fails after parsing with an `i32`/`i64` IR store mismatch
@@ -81,9 +86,9 @@ Current audit findings:
   explicit type-spec inside `[]`
 
 Current audit corpus snapshot:
-- `167` top-level `test_programs/*.f90` runtime corpus programs
-- `159` programs with `CHECK`
-- `26` programs with `IR_CHECK`
+- `169` top-level `test_programs/*.f90` runtime corpus programs
+- `161` programs with `CHECK`
+- `28` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `3` living `XFAIL`s
 

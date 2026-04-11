@@ -65,7 +65,12 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
 
 #[test]
 fn realworld_object_snapshots_stay_deterministic_at_o2() {
-    for name in ["realworld_tridiag_spmv.f90", "realworld_axpy_reduce.f90"] {
+    for name in [
+        "realworld_tridiag_spmv.f90",
+        "realworld_axpy_reduce.f90",
+        "realworld_sasum_cleanup.f90",
+        "realworld_three_point_apply.f90",
+    ] {
         let source = fixture(name);
         let first = capture_text(
             CaptureRequest {
@@ -93,7 +98,12 @@ fn realworld_object_snapshots_stay_deterministic_at_o2() {
 
 #[test]
 fn realworld_opt_ir_differs_from_raw_ir_at_o2() {
-    for name in ["realworld_tridiag_spmv.f90", "realworld_axpy_reduce.f90"] {
+    for name in [
+        "realworld_tridiag_spmv.f90",
+        "realworld_axpy_reduce.f90",
+        "realworld_sasum_cleanup.f90",
+        "realworld_three_point_apply.f90",
+    ] {
         let source = fixture(name);
         let raw_ir = capture_text(
             CaptureRequest {
@@ -123,7 +133,12 @@ fn realworld_opt_ir_differs_from_raw_ir_at_o2() {
 fn linked_realworld_binaries_are_deterministic_and_uuid_free() {
     let compiler = find_compiler();
 
-    for name in ["realworld_tridiag_spmv.f90", "realworld_axpy_reduce.f90"] {
+    for name in [
+        "realworld_tridiag_spmv.f90",
+        "realworld_axpy_reduce.f90",
+        "realworld_sasum_cleanup.f90",
+        "realworld_three_point_apply.f90",
+    ] {
         let source = fixture(name);
         let stem = source.file_stem().unwrap().to_str().unwrap();
         for opt in ["-O0", "-O2", "-O3"] {
