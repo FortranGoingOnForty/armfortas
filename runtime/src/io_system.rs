@@ -435,6 +435,15 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
     }
 }
 
+/// Write a 128-bit integer value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        let _ = u.write_str(&format!(" {}", val));
+    }
+}
+
 /// Write a real value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
@@ -1590,6 +1599,28 @@ mod tests {
         // This test just verifies no panic — output goes to test runner's stdout.
         afs_write_int(6, 42);
         afs_write_newline(6);
+    }
+
+    #[test]
+    fn write_i128_to_file() {
+        let path = "/tmp/afs_write_i128_test.dat";
+        afs_open_simple(
+            97,
+            path.as_ptr(), path.len() as i64,
+            "replace".as_ptr(), 7,
+            std::ptr::null(), 0,
+        );
+
+        afs_write_int128(97, 170141183460469231731687303715884105727i128);
+        afs_write_newline(97);
+        afs_close(97, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.contains("170141183460469231731687303715884105727"),
+            "expected full i128 decimal rendering in: {}",
+            content
+        );
     }
 
     #[test]

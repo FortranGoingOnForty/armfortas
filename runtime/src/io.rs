@@ -23,6 +23,12 @@ pub extern "C" fn afs_print_int64(val: i64) {
     io_system::afs_write_int64(6, val);
 }
 
+/// Print a 128-bit integer (list-directed, stdout).
+#[no_mangle]
+pub extern "C" fn afs_print_int128(val: i128) {
+    io_system::afs_write_int128(6, val);
+}
+
 /// Print a single-precision real (list-directed, stdout).
 #[no_mangle]
 pub extern "C" fn afs_print_real(val: f32) {

@@ -5776,6 +5776,7 @@ fn lower_write_items_adv(
             let val = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             let func_name = match &ty {
+                IrType::Int(IntWidth::I128) => "afs_write_int128",
                 IrType::Int(IntWidth::I64) => "afs_write_int64",
                 IrType::Int(_) => "afs_write_int",
                 IrType::Float(FloatWidth::F64) => "afs_write_real64",
@@ -5915,6 +5916,7 @@ fn lower_1d_slice_write(
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let writer = match &info.ty {
+        IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
         IrType::Float(FloatWidth::F64) => "afs_write_real64",
@@ -6006,6 +6008,7 @@ fn lower_section_write_nd(
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let writer = match &info.ty {
+        IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
         IrType::Float(FloatWidth::F64) => "afs_write_real64",
@@ -6199,6 +6202,7 @@ fn lower_whole_array_write(
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let writer = match &info.ty {
+        IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
         IrType::Float(FloatWidth::F64) => "afs_write_real64",
@@ -8108,6 +8112,19 @@ end program
 ");
         assert!(ir.contains("afs_write_int"));
         assert!(ir.contains("afs_write_newline"));
+    }
+
+    #[test]
+    fn lower_print_integer16_uses_wide_writer() {
+        let (_, ir) = lower_and_verify("\
+program test
+  implicit none
+  integer(16) :: x
+  x = 170141183460469231731687303715884105727_16
+  print *, x
+end program
+");
+        assert!(ir.contains("afs_write_int128"));
     }
 
     #[test]
