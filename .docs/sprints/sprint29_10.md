@@ -129,9 +129,9 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
   scalar + direct-call / runtime-I/O surface
 - 29.6 still lacks a general native NEON/SIMD loop vectorizer; the current vectorize
   pass rewrites recognized scalar loops onto existing bulk runtime kernels
-- the remaining honest `i128` gaps are now narrower: richer formatted input coverage,
-  remaining `RuntimeCall(..)`-style wide runtime surfaces, and any future legal
-  array/vector-style wide rewrites
+- the remaining honest `i128` gaps are now narrower: formatted input beyond
+  scalar lvalues, any remaining `RuntimeCall(..)`-style wide runtime surfaces,
+  and any future legal array/vector-style wide rewrites
 
 ### 3. Audit and harden everything that claims to be done
 
@@ -144,10 +144,10 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 ## Test Surface Sitrep
 
 Current high-level state:
-- `156` runtime corpus programs
-- `145` programs with `CHECK`
+- `158` runtime corpus programs
+- `147` programs with `CHECK`
 - `10` diagnostic `ERROR_EXPECTED` programs
-- `19` programs with `IR_CHECK`
+- `21` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `1` living `XFAIL` program
 
@@ -163,8 +163,8 @@ What is still too weak:
 - too few IR-shape assertions relative to the optimizer surface
 - optimizer-specific binary/IR differentials could still be broader
 - living XFAIL canaries are still underused outside the known append-I/O case
-- the new `i128` and runtime audits are strong on scalar surfaces but not yet broad
-  on richer formatted/non-scalar cases
+- the new `i128` and runtime audits are strong on scalar and descriptor-style
+  lvalue surfaces but not yet broad on richer formatted/non-scalar cases
 
 ## Brutal Audit Priorities Inside 29.10
 
@@ -232,13 +232,14 @@ Current cleanup status:
 What the recent log actually shows:
 - runtime and artifact determinism have been hardened and kept green in CI
 - `i128` moved from raw IR staging to full scalar optimized-pipeline support through
-  `-Ofast`, real runtime I/O, internal/external formatted input, and cross-object ABI coverage
+  `-Ofast`, real runtime I/O, internal/external formatted input, descriptor-style
+  lvalue destinations, and cross-object ABI coverage
 - one stale deferred item (`stack-passed wide results`) was removed only after the
   existing stack-arg + cross-object coverage proved Apple ARM64 still returns
   `integer(16)` in `x0/x1`
 
 What remains honestly inside 29.10 right now:
-1. richer formatted `integer(16)` input coverage beyond the landed top-level scalar paths
+1. richer formatted `integer(16)` input coverage beyond scalar lvalues
 2. broader audit expansion for optimizer/runtime correctness and determinism
 3. any future legal `integer(16)` array/vector-style widening should be treated as a
    deliberate new tranche, not assumed to be part of the current scalar closeout
@@ -259,8 +260,10 @@ Landed so far:
   linked-binary determinism coverage
 - stack-passed direct `i128` args for internal and external calls, including incoming
   callee loads from `[x29, #16+]`, outgoing caller stack-area stores, optimized internal
-  execution coverage, and linked cross-object determinism coverage against clang-built
-  foreign helpers
+  execution coverage, linked cross-object determinism coverage against clang-built
+  foreign helpers, and proof that Apple ARM64 still returns wide results via `x0/x1`
+- formatted internal/external `READ` of `integer(16)` now covers top-level scalars,
+  array elements, and derived-type components, with deterministic O2 object coverage
 - list-directed runtime `integer(16)` output through `afs_write_int128`, including wide
   decimal values beyond `i64`, IR/asm/object audits, cross-opt runtime coverage, and a
   real corpus program with harness reproducibility checks
@@ -302,9 +305,9 @@ Landed so far:
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially broader formatted `i128` input beyond the
-  newly landed top-level scalar internal/external parser-backed paths, and more ambitious
-  array/vectorization-style wide rewrites if they ever become legal
+  especially broader formatted `i128` input beyond the newly landed scalar-lvalue
+  internal/external parser-backed paths, and more ambitious array/vectorization-style
+  wide rewrites if they ever become legal
 
 ### Planned ABI Jump
 

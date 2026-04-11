@@ -104,3 +104,103 @@ fn integer16_formatted_read_object_snapshot_is_deterministic_at_o2() {
 
     assert_eq!(first, second);
 }
+
+#[test]
+fn integer16_formatted_read_targets_use_wide_runtime_symbols() {
+    let source = program("integer16_format_read_targets.f90");
+
+    let opt_ir = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::OptIr]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::OptIr,
+    );
+    assert!(
+        opt_ir.contains("call @afs_fmt_read_int128("),
+        "optimized IR should route formatted integer(16) lvalue reads through the wide reader:\n{}",
+        opt_ir
+    );
+    assert!(
+        opt_ir.contains("call @afs_fmt_read_int("),
+        "optimized IR should still route the trailing scalar component read through the scalar reader:\n{}",
+        opt_ir
+    );
+
+    let asm = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Asm]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Asm,
+    );
+    assert!(asm.contains("_afs_fmt_read_int128"));
+    assert!(asm.contains("_afs_fmt_read_int"));
+}
+
+#[test]
+fn integer16_formatted_read_targets_run_across_all_opt_levels() {
+    for level in [
+        OptLevel::O0,
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
+        let result = capture_from_path(&CaptureRequest {
+            input: program("integer16_format_read_targets.f90"),
+            requested: BTreeSet::from([Stage::Run]),
+            opt_level: level,
+        })
+        .unwrap_or_else(|e| panic!("formatted integer(16) lvalue read should run at {:?}:\n{}", level, e));
+
+        let run = result
+            .get(Stage::Run)
+            .and_then(CapturedStage::as_run)
+            .expect("missing run capture");
+
+        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) lvalue read run at {:?}:\n{:#?}", level, run);
+        for needle in [
+            "11",
+            "-170141183460469231731687303715884105727",
+            "33",
+            "9",
+            "170141183460469231731687303715884105727",
+            "7",
+        ] {
+            assert!(
+                run.stdout.contains(needle),
+                "expected stdout to contain '{}' at {:?}:\n{:#?}",
+                needle,
+                level,
+                run
+            );
+        }
+    }
+}
+
+#[test]
+fn integer16_formatted_read_targets_object_snapshot_is_deterministic_at_o2() {
+    let source = program("integer16_format_read_targets.f90");
+    let first = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Obj,
+    );
+    let second = capture_text(
+        CaptureRequest {
+            input: source,
+            requested: BTreeSet::from([Stage::Obj]),
+            opt_level: OptLevel::O2,
+        },
+        Stage::Obj,
+    );
+
+    assert_eq!(first, second);
+}
