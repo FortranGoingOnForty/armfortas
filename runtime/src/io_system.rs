@@ -1475,7 +1475,7 @@ pub extern "C" fn afs_io_finalize() {
 //
 // Usage from codegen:
 //   afs_fmt_begin(unit, fmt_str, fmt_len)
-//   afs_fmt_push_int(val) / afs_fmt_push_real(val) / ...
+//   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real(val) / ...
 //   afs_fmt_end()
 
 use std::cell::RefCell;
@@ -1511,7 +1511,21 @@ pub extern "C" fn afs_fmt_begin(unit: i32, fmt_str: *const u8, fmt_len: i64) {
 pub extern "C" fn afs_fmt_push_int(val: i64) {
     FMT_CTX.with(|ctx| {
         if let Some(ref mut c) = *ctx.borrow_mut() {
-            c.values.push(IoValue::Integer(val));
+            c.values.push(IoValue::Integer(val as i128));
+        }
+    });
+}
+
+/// Push an integer(16) value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_int128(val: *const i128) {
+    if val.is_null() {
+        return;
+    }
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            let wide = unsafe { *val };
+            c.values.push(IoValue::Integer(wide));
         }
     });
 }
@@ -1643,6 +1657,31 @@ mod tests {
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("42"), "expected 42 in: {}", content);
         assert!(content.contains("3.14"), "expected 3.14 in: {}", content);
+    }
+
+    #[test]
+    fn formatted_write_integer16_to_file() {
+        let path = "/tmp/afs_fmt_i128_test.dat";
+        let wide = 170141183460469231731687303715884105727i128;
+        afs_open_simple(
+            96,
+            path.as_ptr(), path.len() as i64,
+            "replace".as_ptr(), 7,
+            std::ptr::null(), 0,
+        );
+
+        afs_fmt_begin(96, "(I40)".as_ptr(), 5);
+        afs_fmt_push_int128(&wide);
+        afs_fmt_end(1);
+
+        afs_close(96, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.contains("170141183460469231731687303715884105727"),
+            "expected full formatted i128 rendering in: {}",
+            content
+        );
     }
 
     #[test]

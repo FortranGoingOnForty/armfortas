@@ -368,7 +368,7 @@ fn parse_real_desc(
 
 /// An I/O value to be formatted.
 pub enum IoValue {
-    Integer(i64),
+    Integer(i128),
     Real(f64),
     Logical(bool),
     Character(Vec<u8>),
@@ -985,5 +985,13 @@ mod tests {
         let descs = parse_format("(DC, D12.5)");
         assert!(matches!(descs[0], FormatDesc::DecimalMode(DecimalSep::Comma)));
         assert!(matches!(descs[1], FormatDesc::RealD { width: 12, decimals: 5 }));
+    }
+
+    #[test]
+    fn format_integer16_full_width() {
+        let descs = parse_format("(I40)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Integer(170141183460469231731687303715884105727i128)]);
+        assert_eq!(out, " 170141183460469231731687303715884105727");
     }
 }
