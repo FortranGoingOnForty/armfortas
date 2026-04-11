@@ -1217,8 +1217,8 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             }
 
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
-            let va = ctx.lookup_vreg(*a);
-            let vb = ctx.lookup_vreg(*b);
+            let va = icmp_operand_vreg(mf, ctx, mb, func, *a, *b);
+            let vb = icmp_operand_vreg(mf, ctx, mb, func, *b, *a);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::CmpReg,
                 operands: vec![MachineOperand::VReg(va), MachineOperand::VReg(vb)],
@@ -2463,6 +2463,52 @@ fn type_to_reg_class(ty: &IrType) -> RegClass {
         IrType::Int(IntWidth::I32) | IrType::Bool => RegClass::Gp32,
         _ => RegClass::Gp64,
     }
+}
+
+fn needs_wide_icmp_operand(ty: Option<&IrType>, other_ty: Option<&IrType>) -> bool {
+    matches!(
+        (ty, other_ty),
+        (Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_)), Some(_))
+            | (Some(_), Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_)))
+    )
+}
+
+fn zero_extend_cmp_type(ty: Option<&IrType>) -> bool {
+    matches!(ty, Some(IrType::Bool))
+}
+
+fn icmp_operand_vreg(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    func: &Function,
+    value: ValueId,
+    other: ValueId,
+) -> VRegId {
+    let value_ty = func.value_type(value);
+    let other_ty = func.value_type(other);
+    let src = ctx.lookup_vreg(value);
+
+    if !needs_wide_icmp_operand(value_ty.as_ref(), other_ty.as_ref()) {
+        return src;
+    }
+
+    if matches!(value_ty, Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_))) {
+        return src;
+    }
+
+    let dest = mf.new_vreg(RegClass::Gp64);
+    let opcode = if zero_extend_cmp_type(value_ty.as_ref()) {
+        ArmOpcode::MovReg
+    } else {
+        ArmOpcode::Sxtw
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+        def: Some(dest),
+    });
+    dest
 }
 
 fn int_width_class(w: &IntWidth) -> RegClass {
