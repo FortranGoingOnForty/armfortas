@@ -27,5 +27,12 @@ starting the full Sprint 29 audit:
   type mismatch.
   This is now a living XFAIL in the real-world audit corpus, so the Sprint 29
   closeout has a standing canary for the remaining source-scanner gap.
+- Audit ASHAPE-SIZE-1: dummy-array `SIZE(...)` queries still flow into the
+  descriptor runtime path even though ordinary dummy arrays are currently
+  lowered as base pointers rather than descriptors.
+  The 29.11 claims audit surfaced this first through the original
+  `realworld_ipo_chain.f90` helper loop, and
+  `test_programs/realworld_assumed_shape_size.f90` now captures it as a living
+  XFAIL canary instead of letting the finding disappear.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.

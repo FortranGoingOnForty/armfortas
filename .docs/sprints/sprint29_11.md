@@ -88,6 +88,10 @@ Current audit findings:
   like `x(n)`, `y(n)`, and `do i = 1, n` could degrade inside real-world helper
   kernels; `realworld_seed_overwrite.f90` now proves that host-param-backed
   dummy extents and loop bounds stay intact
+- fixed: backend `ICmp` lowering could emit mixed-width GP compares like
+  `cmp w26, x23` when the IR compared a 32-bit induction value against a 64-bit
+  bound; `realworld_ipo_chain.f90` now keeps the compare-width harmonization
+  honest through a real helper-chain compile at `-O2+`
 - proven: LICM hoists invariant scalar dummy loads out of a real-world affine
   update loop in `realworld_affine_shift.f90` once BCE clears the loop body
 - proven: GVN reduces duplicated branch-join PURE helper calls in
@@ -98,18 +102,28 @@ Current audit findings:
 - proven: loop-legality audit kernels `realworld_inplace_prefix.f90` and
   `realworld_inplace_symmix.f90` stay runtime-correct, cross-opt-equal, and
   deterministic across IR/object/binary surfaces
+- proven: the 29.9 single-file story now has real-world audit coverage for
+  ELEMENTAL lowering plus DO CONCURRENT bulk redirection
+  (`realworld_elemental_stage.f90`), intramodule IPO helper trimming
+  (`realworld_ipo_chain.f90`), small-loop DO CONCURRENT exploitation
+  (`realworld_doconc_square.f90`), and explicit-DO vectorization onto the bulk
+  runtime kernels (`realworld_vector_stage.f90`)
 - deferred with living XFAIL: `MODULE-HOST-1` module-global host association
 - deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
   fails after parsing with an `i32`/`i64` IR store mismatch
+- deferred with living XFAIL: `ASHAPE-SIZE-1` dummy-array `SIZE(...)` lowering
+  still routes dummy arrays into the descriptor runtime path even though ordinary
+  dummy arrays are carried as base pointers today; the living canary is
+  `realworld_assumed_shape_size.f90`
 - separately deferred parser gap: typed character array constructors using an
   explicit type-spec inside `[]`
 
 Current audit corpus snapshot:
-- `176` top-level `test_programs/*.f90` runtime corpus programs
-- `165` programs with `CHECK`
+- `181` top-level `test_programs/*.f90` runtime corpus programs
+- `170` programs with `CHECK`
 - `28` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
-- `3` living `XFAIL`s
+- `4` living `XFAIL`s
 
 ## Brutal Audit Priorities
 
