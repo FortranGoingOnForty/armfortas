@@ -608,9 +608,12 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
             runtime_call_i128_backend_o0_supported(module, func, rf, args, &inst.ty)
         }
         InstKind::Store(..) => true,
-        InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
-            !uses_i128 || inst_ty_has_i128
-        }
+        // Address-producing ops are safe even when they walk storage that
+        // contains i128. The widened backend already knows how to carry the
+        // actual loads/stores/calls that touch the value; rejecting the byte
+        // cursor itself falsely blocks legal array-constructor and component
+        // lvalue paths.
+        InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => true,
         _ => !inst_ty_has_i128 && !uses_i128,
     }
 }
@@ -662,6 +665,27 @@ mod tests {
         assert!(
             module.i128_backend_o0_supported(),
             "runtime PrintInt with integer(16) should stay inside the supported O0 backend surface"
+        );
+    }
+
+    #[test]
+    fn byte_cursor_gep_into_i128_storage_stays_supported() {
+        let mut module = Module::new("test".into());
+        let mut func = Function::new("main".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let arr = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I128)), 3));
+            let off = b.const_i64(16);
+            let cursor = b.gep(arr, vec![off], IrType::Int(IntWidth::I8));
+            let wide = b.const_i128(170141183460469231731687303715884105727i128);
+            b.store(wide, cursor);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        assert!(
+            module.i128_backend_o0_supported(),
+            "byte-cursor GEPs into i128 storage should stay inside the supported backend surface"
         );
     }
 }
