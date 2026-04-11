@@ -448,7 +448,7 @@ impl Module {
     /// - stack-backed `i128` SSA block params and edge copies introduced
     ///   by mem2reg-style promotion
     /// - local `i128` selects that stay entirely within stack-backed values
-    /// - direct `i128` params/returns and pair-register calls
+    /// - direct `i128` params/returns and stack/register direct calls
     ///
     /// It still excludes runtime-call `i128`, broad optimized-pipeline
     /// support beyond the staged O1 lane, and any integer operation

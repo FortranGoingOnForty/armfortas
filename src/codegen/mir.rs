@@ -234,6 +234,8 @@ pub struct StackFrame {
     pub size: u32,
     /// Offset of the next available local slot.
     next_offset: i32,
+    /// Maximum outgoing stack argument area reserved at the bottom of the frame.
+    outgoing_arg_size: u32,
 }
 
 /// A stack frame slot.
@@ -263,7 +265,7 @@ impl StackFrame {
         // Epilogue: ldp x29, x30, [sp, #FRAME_SIZE - 16]
         //           add sp, sp, #FRAME_SIZE
         //           ret
-        Self { locals: Vec::new(), size: 16, next_offset: 0 }
+        Self { locals: Vec::new(), size: 16, next_offset: 0, outgoing_arg_size: 0 }
     }
 }
 
@@ -287,8 +289,16 @@ impl StackFrame {
 
     /// Frame size = 16 (FP+LR) + locals, 16-byte aligned.
     fn recompute_size(&mut self) {
-        let raw = 16 + self.next_offset as u32; // 16 for FP/LR + locals
+        let raw = 16 + self.next_offset as u32 + self.outgoing_arg_size;
         self.size = (raw + 15) & !15;
+    }
+
+    /// Reserve the maximum outgoing stack argument area this function needs.
+    pub fn reserve_outgoing_args(&mut self, size: u32) {
+        if size > self.outgoing_arg_size {
+            self.outgoing_arg_size = size;
+            self.recompute_size();
+        }
     }
 }
 
@@ -355,6 +365,11 @@ impl MachineFunction {
     pub fn alloc_local(&mut self, size: u32) -> i32 {
         self.frame.alloc_local(size)
     }
+
+    /// Reserve outgoing stack argument space for calls made by this function.
+    pub fn reserve_outgoing_args(&mut self, size: u32) {
+        self.frame.reserve_outgoing_args(size)
+    }
 }
 
 #[cfg(test)]
@@ -415,5 +430,15 @@ mod tests {
     fn frame_size_starts_at_16() {
         let frame = StackFrame::new();
         assert_eq!(frame.size, 16); // just FP+LR
+    }
+
+    #[test]
+    fn reserve_outgoing_args_grows_frame() {
+        let mut frame = StackFrame::new();
+        frame.alloc_local(8);
+        let before = frame.size;
+        frame.reserve_outgoing_args(16);
+        assert!(frame.size >= before + 16);
+        assert_eq!(frame.size % 16, 0);
     }
 }

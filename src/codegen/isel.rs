@@ -45,6 +45,113 @@ fn select_function_with_names(func: &Function, func_names: &[String]) -> Machine
     mf
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbiArgLoc {
+    Gp(u8),
+    Gp32(u8),
+    Fp(u8),
+    Fp32(u8),
+    GpPair(u8),
+    Stack(i64),
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AbiArgState {
+    gp_idx: u8,
+    fp_idx: u8,
+    stack_offset: i64,
+}
+
+fn align_to(value: i64, align: i64) -> i64 {
+    debug_assert!(align > 0 && (align & (align - 1)) == 0);
+    (value + align - 1) & !(align - 1)
+}
+
+fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
+    match ty {
+        IrType::Int(IntWidth::I128) => (16, 16),
+        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => (8, 8),
+        IrType::Float(FloatWidth::F64) => (8, 8),
+        IrType::Float(FloatWidth::F32) => (4, 8),
+        IrType::Int(IntWidth::I8)
+        | IrType::Int(IntWidth::I16)
+        | IrType::Int(IntWidth::I32)
+        | IrType::Bool => (4, 8),
+        _ => (8, 8),
+    }
+}
+
+fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
+    match ty {
+        IrType::Int(IntWidth::I128) => {
+            if state.gp_idx + 2 <= 8 {
+                let reg = state.gp_idx;
+                state.gp_idx += 2;
+                AbiArgLoc::GpPair(reg)
+            } else {
+                state.gp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Float(FloatWidth::F64) => {
+            if state.fp_idx < 8 {
+                let reg = state.fp_idx;
+                state.fp_idx += 1;
+                AbiArgLoc::Fp(reg)
+            } else {
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Float(FloatWidth::F32) => {
+            if state.fp_idx < 8 {
+                let reg = state.fp_idx;
+                state.fp_idx += 1;
+                AbiArgLoc::Fp32(reg)
+            } else {
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Int(IntWidth::I8)
+        | IrType::Int(IntWidth::I16)
+        | IrType::Int(IntWidth::I32)
+        | IrType::Bool => {
+            if state.gp_idx < 8 {
+                let reg = state.gp_idx;
+                state.gp_idx += 1;
+                AbiArgLoc::Gp32(reg)
+            } else {
+                state.gp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        _ => {
+            if state.gp_idx < 8 {
+                let reg = state.gp_idx;
+                state.gp_idx += 1;
+                AbiArgLoc::Gp(reg)
+            } else {
+                state.gp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+    }
+}
+
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function) -> MachineFunction {
     let mut mf = MachineFunction::new(func.name.clone());
@@ -78,25 +185,27 @@ pub fn select_function(func: &Function) -> MachineFunction {
     }
 
     enum IncomingParam {
-        Narrow(VRegId, RegClass),
-        Wide(i32),
+        Narrow(VRegId, RegClass, AbiArgLoc),
+        Wide(i32, AbiArgLoc),
     }
 
     // Phase 2.5: handle incoming parameters.
     // Create a vreg or a wide stack slot for each param.
     // The physical register save happens after the prologue.
     let mut param_info: Vec<IncomingParam> = Vec::new();
+    let mut abi_state = AbiArgState::default();
     for param in &func.params {
+        let loc = classify_abi_arg(&param.ty, &mut abi_state);
         if matches!(param.ty, IrType::Int(IntWidth::I128)) {
             let offset = mf.alloc_local(16);
             ctx.wide_value_slots.insert(param.id, offset);
-            param_info.push(IncomingParam::Wide(offset));
+            param_info.push(IncomingParam::Wide(offset, loc));
             continue;
         }
         let class = type_to_reg_class(&param.ty);
         let vreg = mf.new_vreg(class);
         ctx.value_map.insert(param.id, vreg);
-        param_info.push(IncomingParam::Narrow(vreg, class));
+        param_info.push(IncomingParam::Narrow(vreg, class, loc));
     }
 
     // Phase 3: emit prologue in entry block.
@@ -104,71 +213,94 @@ pub fn select_function(func: &Function) -> MachineFunction {
 
     // Phase 3.5: move incoming argument registers into param vregs.
     // Dispatch by register class: GP args from x0-x7, FP args from d0-d7.
-    let mut gp_idx: u8 = 0;
-    let mut fp_idx: u8 = 0;
     for info in &param_info {
         match info {
-            IncomingParam::Wide(offset) if gp_idx + 1 < 8 => {
+            IncomingParam::Wide(offset, AbiArgLoc::GpPair(reg)) => {
                 emit_store_phys_i128_pair(
                     &mut mf,
                     MBlockId(0),
                     MachineOperand::PhysReg(PhysReg::FP),
                     *offset as i64,
-                    PhysReg::Gp(gp_idx),
-                    PhysReg::Gp(gp_idx + 1),
+                    PhysReg::Gp(*reg),
+                    PhysReg::Gp(*reg + 1),
                 );
-                gp_idx += 2;
             }
-            IncomingParam::Wide(_) => {
-                panic!("isel: stack-passed i128 params are not yet supported");
+            IncomingParam::Wide(offset, AbiArgLoc::Stack(stack_offset)) => {
+                emit_load_phys_i128_pair(
+                    &mut mf,
+                    MBlockId(0),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    16 + *stack_offset,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                emit_store_phys_i128_pair(
+                    &mut mf,
+                    MBlockId(0),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    *offset as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
             }
-            IncomingParam::Narrow(vreg, RegClass::Fp64) if fp_idx < 8 => {
+            IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg)) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
                         MachineOperand::VReg(*vreg),
-                        MachineOperand::PhysReg(PhysReg::Fp(fp_idx)),
+                        MachineOperand::PhysReg(PhysReg::Fp(*reg)),
                     ],
                     def: Some(*vreg),
                 });
-                fp_idx += 1;
             }
-            IncomingParam::Narrow(vreg, RegClass::Fp32) if fp_idx < 8 => {
+            IncomingParam::Narrow(vreg, RegClass::Fp32, AbiArgLoc::Fp32(reg)) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
                         MachineOperand::VReg(*vreg),
-                        MachineOperand::PhysReg(PhysReg::Fp32(fp_idx)),
+                        MachineOperand::PhysReg(PhysReg::Fp32(*reg)),
                     ],
                     def: Some(*vreg),
                 });
-                fp_idx += 1;
             }
-            IncomingParam::Narrow(vreg, RegClass::Gp32) if gp_idx < 8 => {
-                // 32-bit VALUE param: arrives in w-register.
+            IncomingParam::Narrow(vreg, RegClass::Gp32, AbiArgLoc::Gp32(reg)) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
                         MachineOperand::VReg(*vreg),
-                        MachineOperand::PhysReg(PhysReg::Gp32(gp_idx)),
+                        MachineOperand::PhysReg(PhysReg::Gp32(*reg)),
                     ],
                     def: Some(*vreg),
                 });
-                gp_idx += 1;
             }
-            IncomingParam::Narrow(vreg, _) if gp_idx < 8 => {
-                // 64-bit or pointer param: arrives in x-register.
+            IncomingParam::Narrow(vreg, _, AbiArgLoc::Gp(reg)) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
                         MachineOperand::VReg(*vreg),
-                        MachineOperand::PhysReg(PhysReg::Gp(gp_idx)),
+                        MachineOperand::PhysReg(PhysReg::Gp(*reg)),
                     ],
                     def: Some(*vreg),
                 });
-                gp_idx += 1;
             }
-            _ => {} // 9+ args: stack passing not yet implemented
+            IncomingParam::Narrow(vreg, class, AbiArgLoc::Stack(stack_offset)) => {
+                emit_load_stack_arg_into_vreg(
+                    &mut mf,
+                    MBlockId(0),
+                    *vreg,
+                    *class,
+                    16 + *stack_offset,
+                );
+            }
+            IncomingParam::Wide(_, other) => {
+                panic!("isel: unexpected ABI loc {:?} for incoming i128 param", other);
+            }
+            IncomingParam::Narrow(_, class, other) => {
+                panic!(
+                    "isel: unexpected ABI loc {:?} for incoming {:?} param",
+                    other, class
+                );
+            }
         }
     }
 
@@ -268,80 +400,111 @@ fn select_call_inst(
         _ => unreachable!(),
     };
 
-    let mut gp_idx: u8 = 0;
-    let mut fp_idx: u8 = 0;
+    let mut abi_state = AbiArgState::default();
+    let mut arg_locs = Vec::with_capacity(args.len());
     for &arg_val in args {
-        if matches!(func.value_type(arg_val), Some(IrType::Int(IntWidth::I128))) {
-            if gp_idx + 1 >= 8 {
-                panic!("isel: stack-passed i128 call args are not yet supported");
-            }
+        let arg_ty = func
+            .value_type(arg_val)
+            .unwrap_or_else(|| panic!("isel: missing type for call arg %{}", arg_val.0));
+        arg_locs.push((arg_val, classify_abi_arg(&arg_ty, &mut abi_state), arg_ty));
+    }
+    if abi_state.stack_offset > 0 {
+        mf.reserve_outgoing_args(abi_state.stack_offset as u32);
+    }
+
+    for (arg_val, loc, arg_ty) in arg_locs {
+        if matches!(arg_ty, IrType::Int(IntWidth::I128)) {
             let arg_slot = ctx.lookup_wide_slot(arg_val);
-            emit_load_phys_i128_pair(
-                mf,
-                mb,
-                MachineOperand::PhysReg(PhysReg::FP),
-                arg_slot as i64,
-                PhysReg::Gp(gp_idx),
-                PhysReg::Gp(gp_idx + 1),
-            );
-            gp_idx += 2;
+            match loc {
+                AbiArgLoc::GpPair(reg) => {
+                    emit_load_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        arg_slot as i64,
+                        PhysReg::Gp(reg),
+                        PhysReg::Gp(reg + 1),
+                    );
+                }
+                AbiArgLoc::Stack(stack_offset) => {
+                    emit_load_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        arg_slot as i64,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                    emit_store_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::Sp),
+                        stack_offset,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                }
+                other => {
+                    panic!("isel: unexpected ABI loc {:?} for outgoing i128 arg", other);
+                }
+            }
             continue;
         }
 
         let arg_vreg = ctx.lookup_vreg(arg_val);
         let arg_class = mf.vregs.iter().find(|v| v.id == arg_vreg).map(|v| v.class);
-        match arg_class {
-            Some(RegClass::Fp64) => {
-                if fp_idx < 8 {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::FmovReg,
-                        operands: vec![
-                            MachineOperand::PhysReg(PhysReg::Fp(fp_idx)),
-                            MachineOperand::VReg(arg_vreg),
-                        ],
-                        def: None,
-                    });
-                    fp_idx += 1;
-                }
+        match (arg_class, loc) {
+            (Some(RegClass::Fp64), AbiArgLoc::Fp(reg)) => {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::FmovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Fp(reg)),
+                        MachineOperand::VReg(arg_vreg),
+                    ],
+                    def: None,
+                });
             }
-            Some(RegClass::Fp32) => {
-                if fp_idx < 8 {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::FmovReg,
-                        operands: vec![
-                            MachineOperand::PhysReg(PhysReg::Fp32(fp_idx)),
-                            MachineOperand::VReg(arg_vreg),
-                        ],
-                        def: None,
-                    });
-                    fp_idx += 1;
-                }
+            (Some(RegClass::Fp32), AbiArgLoc::Fp32(reg)) => {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::FmovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Fp32(reg)),
+                        MachineOperand::VReg(arg_vreg),
+                    ],
+                    def: None,
+                });
             }
-            Some(RegClass::Gp32) => {
-                if gp_idx < 8 {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::MovReg,
-                        operands: vec![
-                            MachineOperand::PhysReg(PhysReg::Gp32(gp_idx)),
-                            MachineOperand::VReg(arg_vreg),
-                        ],
-                        def: None,
-                    });
-                    gp_idx += 1;
-                }
+            (Some(RegClass::Gp32), AbiArgLoc::Gp32(reg)) => {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp32(reg)),
+                        MachineOperand::VReg(arg_vreg),
+                    ],
+                    def: None,
+                });
             }
-            _ => {
-                if gp_idx < 8 {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::MovReg,
-                        operands: vec![
-                            MachineOperand::PhysReg(PhysReg::Gp(gp_idx)),
-                            MachineOperand::VReg(arg_vreg),
-                        ],
-                        def: None,
-                    });
-                    gp_idx += 1;
-                }
+            (Some(RegClass::Gp64), AbiArgLoc::Gp(reg)) => {
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(reg)),
+                        MachineOperand::VReg(arg_vreg),
+                    ],
+                    def: None,
+                });
+            }
+            (Some(class), AbiArgLoc::Stack(stack_offset)) => {
+                emit_store_stack_arg_from_vreg(mf, mb, arg_vreg, class, stack_offset);
+            }
+            (Some(class), other) => {
+                panic!(
+                    "isel: unexpected ABI loc {:?} for outgoing {:?} arg",
+                    other, class
+                );
+            }
+            (None, _) => {
+                panic!("isel: call arg vreg class missing for %{}", arg_val.0);
             }
         }
     }
@@ -2060,6 +2223,52 @@ fn emit_load_phys_i128_pair(
             MachineOperand::PhysReg(lo),
             MachineOperand::PhysReg(hi),
             base,
+            MachineOperand::Imm(offset),
+        ],
+        def: None,
+    });
+}
+
+fn emit_load_stack_arg_into_vreg(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    dest: VRegId,
+    class: RegClass,
+    offset: i64,
+) {
+    let (opcode, reg_base) = match class {
+        RegClass::Fp64 => (ArmOpcode::LdrFpImm, MachineOperand::PhysReg(PhysReg::FP)),
+        RegClass::Fp32 => (ArmOpcode::LdrFpImm, MachineOperand::PhysReg(PhysReg::FP)),
+        RegClass::Gp32 => (ArmOpcode::LdrImm, MachineOperand::PhysReg(PhysReg::FP)),
+        RegClass::Gp64 => (ArmOpcode::LdrImm, MachineOperand::PhysReg(PhysReg::FP)),
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![
+            MachineOperand::VReg(dest),
+            reg_base,
+            MachineOperand::Imm(offset),
+        ],
+        def: Some(dest),
+    });
+}
+
+fn emit_store_stack_arg_from_vreg(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    src: VRegId,
+    class: RegClass,
+    offset: i64,
+) {
+    let opcode = match class {
+        RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
+        RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![
+            MachineOperand::VReg(src),
+            MachineOperand::PhysReg(PhysReg::Sp),
             MachineOperand::Imm(offset),
         ],
         def: None,
