@@ -393,10 +393,10 @@ fn select_call_inst(
     inst: &Inst,
     func: &Function,
 ) {
-    let (label, args) = match &inst.kind {
-        InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice()),
-        InstKind::Call(FuncRef::Internal(idx), args) => (format!("_func_{}", idx), args.as_slice()),
-        InstKind::RuntimeCall(rf, args) => (runtime_func_symbol(rf), args.as_slice()),
+    let (label, args, runtime_func) = match &inst.kind {
+        InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice(), None),
+        InstKind::Call(FuncRef::Internal(idx), args) => (format!("_func_{}", idx), args.as_slice(), None),
+        InstKind::RuntimeCall(rf, args) => (String::new(), args.as_slice(), Some(rf)),
         _ => unreachable!(),
     };
 
@@ -408,6 +408,9 @@ fn select_call_inst(
             .unwrap_or_else(|| panic!("isel: missing type for call arg %{}", arg_val.0));
         arg_locs.push((arg_val, classify_abi_arg(&arg_ty, &mut abi_state), arg_ty));
     }
+    let label = runtime_func
+        .map(|rf| runtime_func_symbol(rf, &arg_locs))
+        .unwrap_or(label);
     if abi_state.stack_offset > 0 {
         mf.reserve_outgoing_args(abi_state.stack_offset as u32);
     }
@@ -2631,9 +2634,23 @@ fn alloca_size(ty: &IrType) -> u32 {
 /// Get the symbol name for a runtime function.
 /// Get the C-level symbol name for a runtime function.
 /// The emitter adds the Mach-O `_` prefix when emitting assembly.
-fn runtime_func_symbol(rf: &RuntimeFunc) -> String {
+fn runtime_func_symbol(rf: &RuntimeFunc, args: &[(ValueId, AbiArgLoc, IrType)]) -> String {
     match rf {
-        RuntimeFunc::PrintInt => "afs_print_int".into(),
+        RuntimeFunc::PrintInt => {
+            if args
+                .first()
+                .is_some_and(|(_, _, ty)| matches!(ty, IrType::Int(IntWidth::I128)))
+            {
+                "afs_print_int128".into()
+            } else if args
+                .first()
+                .is_some_and(|(_, _, ty)| matches!(ty, IrType::Int(IntWidth::I64)))
+            {
+                "afs_print_int64".into()
+            } else {
+                "afs_print_int".into()
+            }
+        }
         RuntimeFunc::PrintReal => "afs_print_real".into(),
         RuntimeFunc::PrintString => "afs_print_string".into(),
         RuntimeFunc::PrintLogical => "afs_print_logical".into(),
@@ -2841,6 +2858,30 @@ mod tests {
             b.ret_void();
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
+    }
+
+    #[test]
+    fn select_i128_runtime_print_uses_wide_symbol_and_pair_regs() {
+        let mf = select_simple(|b| {
+            let wide = b.const_i128(170141183460469231731687303715884105727i128);
+            b.runtime_call(
+                crate::ir::inst::RuntimeFunc::PrintInt,
+                vec![wide],
+                IrType::Void,
+            );
+            b.ret_void();
+        });
+        let asm = crate::codegen::emit::emit_function(&mf);
+        assert!(
+            asm.contains("bl _afs_print_int128"),
+            "runtime i128 print should call the wide symbol:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("ldp x0, x1"),
+            "runtime i128 print should marshal the value through the pair-register ABI:\n{}",
+            asm
+        );
     }
 
     #[test]

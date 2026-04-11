@@ -542,6 +542,24 @@ fn direct_call_i128_backend_o0_supported(
             .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, true))
 }
 
+fn runtime_call_i128_backend_o0_supported(
+    module: &Module,
+    func: &Function,
+    rf: &RuntimeFunc,
+    args: &[ValueId],
+    result_ty: &IrType,
+) -> bool {
+    match rf {
+        RuntimeFunc::PrintInt => matches!(result_ty, IrType::Void)
+            && args.len() == 1
+            && args
+                .iter()
+                .filter_map(|arg| func.value_type(*arg))
+                .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, true)),
+        _ => false,
+    }
+}
+
 fn function_i128_backend_o0_supported(module: &Module, func: &Function) -> bool {
     if !abi_type_i128_backend_o0_supported(module, &func.return_type, true)
         || func
@@ -586,7 +604,9 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::Call(callee, args) if inst_ty_has_i128 || uses_i128 => {
             direct_call_i128_backend_o0_supported(module, func, callee, args, &inst.ty)
         }
-        InstKind::RuntimeCall(..) if inst_ty_has_i128 || uses_i128 => false,
+        InstKind::RuntimeCall(rf, args) if inst_ty_has_i128 || uses_i128 => {
+            runtime_call_i128_backend_o0_supported(module, func, rf, args, &inst.ty)
+        }
         InstKind::Store(..) => true,
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) | InstKind::GetElementPtr(..) => {
             !uses_i128 || inst_ty_has_i128
@@ -619,5 +639,29 @@ fn terminator_i128_backend_o0_supported(
             .filter_map(|arg| func.value_type(*arg))
             .all(|ty| ssa_type_i128_backend_o0_supported(module, &ty)),
         _ => !term_uses_i128,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::builder::FuncBuilder;
+
+    #[test]
+    fn runtime_print_i128_is_supported_by_backend_gate() {
+        let mut module = Module::new("test".into());
+        let mut func = Function::new("main".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let wide = b.const_i128(170141183460469231731687303715884105727i128);
+            b.runtime_call(RuntimeFunc::PrintInt, vec![wide], IrType::Void);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        assert!(
+            module.i128_backend_o0_supported(),
+            "runtime PrintInt with integer(16) should stay inside the supported O0 backend surface"
+        );
     }
 }
