@@ -1,6 +1,7 @@
 # Noted Items
 
-Deferred items that came up while finishing Sprint 29.10 cleanup work:
+Deferred items that came up while finishing Sprint 29.10 cleanup work and
+starting the full Sprint 29 audit:
 
 - Audit and harden descriptor-backed `integer(16)` formatted section reads at the
   backend/harness boundary.
@@ -15,5 +16,16 @@ Deferred items that came up while finishing Sprint 29.10 cleanup work:
   `test_programs/module_global_host_assoc.f90` now captures the current behavior
   as a living XFAIL after the brutal audit uncovered that `call bump()` leaves
   the module variable unchanged instead of writing `99`.
+- Parser gap: typed character array constructors using an explicit type-spec
+  inside brackets (for example `[character(len=20) :: "a", "b"]`) still fail
+  to parse in at least one real-world-style source shape.
+  The full-sprint audit tripped this while building the fpm-inspired
+  `realworld_suffix_scan.f90` reproducer, which is currently written in a more
+  conservative source form instead of the typed constructor spelling.
+- Audit FPM-SUFFIX-1: the conservative `realworld_suffix_scan.f90` variant now
+  gets past parsing but still fails IR verification with an `i32`/`i64` store
+  type mismatch.
+  This is now a living XFAIL in the real-world audit corpus, so the Sprint 29
+  closeout has a standing canary for the remaining source-scanner gap.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.

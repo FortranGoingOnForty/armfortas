@@ -243,6 +243,13 @@ Current cleanup status:
 - 29.10 is now mostly a disciplined closeout of the remaining `i128` / runtime /
   audit gaps, not a grab-bag of unrelated new work
 
+Closeout:
+- the last narrow implementation gaps have been burned down
+- the remaining work is now decisively audit/hardening work rather than more
+  hidden cleanup implementation
+- 29.10 should be treated as closed for implementation purposes, with the next
+  tranche moving into a dedicated full-Sprint-29 audit
+
 What the recent log actually shows:
 - runtime and artifact determinism have been hardened and kept green in CI
 - `i128` moved from raw IR staging to full scalar optimized-pipeline support through

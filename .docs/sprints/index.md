@@ -1,6 +1,6 @@
 # ARMFORTAS Sprint Index
 
-50 sprints (36 original + 4 cleanup sprints + 5 completeness sprints + 5 deferred optimization sprints). Small bites, clear milestones, testable deliverables at every stage.
+51 sprints (36 original + 4 cleanup sprints + 5 completeness sprints + 6 deferred optimization sprints). Small bites, clear milestones, testable deliverables at every stage.
 
 ## Phase 1: Foundation (Sprints 0-3)
 - [Sprint 0](sprint00.md) — Scaffolding & Learning
@@ -58,6 +58,7 @@
 - [Sprint 29.8](sprint29_8.md) — Advanced IR Optimizations (GVN, SROA, alias analysis, load-store forwarding cross-block, bounds check elim)
 - [Sprint 29.9](sprint29_9.md) — Fortran-Specific & Interprocedural Optimizations (no-alias exploitation, PURE/ELEMENTAL CSE, DO CONCURRENT, IPO)
 - [Sprint 29.10](sprint29_10.md) — Sprint 29 Cleanup & Completion (finish 29.x leftovers one by one, with audit/hardening)
+- [Sprint 29.11](sprint29_11.md) — Full Sprint 29 Audit (real-world reproducers, determinism, binary correctness, and closure)
 
 ## Phase 9: Integration (Sprints 30-32)
 - [Sprint 30](sprint30.md) — Module System & Multi-File Compilation
