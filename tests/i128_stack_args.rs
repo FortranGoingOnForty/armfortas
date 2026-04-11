@@ -45,6 +45,11 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
         "callee should load the incoming stack-passed integer(16) arg from [x29, #16]:\n{}",
         asm
     );
+    assert!(
+        asm.contains("stp x0, x1, [x29, #-360]"),
+        "caller should still receive the returned integer(16) value in x0/x1 even when args spill to the stack:\n{}",
+        asm
+    );
 }
 
 #[test]
@@ -139,6 +144,11 @@ fn external_i128_stack_call_spills_fifth_arg_and_tracks_symbol_at_o0() {
     assert!(
         asm.contains("stp x16, x17, [sp, #0]"),
         "fifth external integer(16) arg should spill to the outgoing stack area:\n{}",
+        asm
+    );
+    assert!(
+        asm.contains("stp x0, x1, [x29, #-360]"),
+        "external integer(16) stack-call should still receive the returned value in x0/x1:\n{}",
         asm
     );
 }
