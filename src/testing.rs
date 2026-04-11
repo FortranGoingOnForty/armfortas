@@ -381,7 +381,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 input: input.clone(),
                 opt_level: request.opt_level,
                 stage: FailureStage::Ir,
-                detail: "integer(16) / i128 optimization above O1 is not yet supported; capture raw IR at O0 or O1 for now".into(),
+                detail: "integer(16) / i128 optimization above O2 is not yet supported; capture raw IR at O0, O1, or O2 for now".into(),
                 stages: stages.clone(),
             })?
         } else {

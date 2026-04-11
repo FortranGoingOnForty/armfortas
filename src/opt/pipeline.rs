@@ -271,14 +271,15 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
 /// Build the restricted optimization pipeline for modules that still contain
 /// non-global `i128` values.
 ///
-/// This deliberately supports only the first widened optimized lane: `-O1`.
+/// This deliberately widens `i128` support one optimization lane at a time.
 /// Now that the backend can carry stack-backed `i128` values through block
 /// params and mem2reg-style joins, the widened `i128` lane can use the full
-/// ordinary O1 pipeline. O2+ still remain gated until broader optimized
-/// `i128` shapes are supported end to end.
+/// ordinary O1 and O2 pipelines. Higher levels remain gated until their pass
+/// shapes are proven end to end.
 pub fn build_i128_pipeline(level: OptLevel) -> Option<PassManager> {
     match level {
         OptLevel::O1 => Some(build_pipeline(OptLevel::O1)),
+        OptLevel::O2 => Some(build_pipeline(OptLevel::O2)),
         _ => None,
     }
 }
@@ -370,12 +371,16 @@ mod tests {
     }
 
     #[test]
-    fn i128_pipeline_is_available_only_at_o1() {
+    fn i128_pipeline_is_available_through_o2() {
         assert!(
             build_i128_pipeline(OptLevel::O1).is_some(),
             "O1 should have the widened i128-safe pipeline"
         );
-        for lvl in [OptLevel::O0, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+        assert!(
+            build_i128_pipeline(OptLevel::O2).is_some(),
+            "O2 should be available once the widened i128 lane is proven"
+        );
+        for lvl in [OptLevel::O0, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
             assert!(
                 build_i128_pipeline(lvl).is_none(),
                 "{:?} should not yet have widened i128 optimization support",

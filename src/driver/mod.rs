@@ -248,7 +248,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         };
         let pm = if ir_module.contains_i128_outside_globals() && opts.opt_level != OptLevel::O0 {
             crate::opt::build_i128_pipeline(ir_opt).ok_or_else(|| {
-                "integer(16) / i128 optimization above -O1 is not yet supported; use -O0 or -O1 for now"
+                "integer(16) / i128 optimization above -O2 is not yet supported; use -O0, -O1, or -O2 for now"
                     .to_string()
             })?
         } else {
