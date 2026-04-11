@@ -113,8 +113,19 @@ impl Unit {
                 r.read_line(&mut line)?;
             }
             UnitStream::FileRaw(f) => {
-                let mut br = BufReader::new(&mut *f);
-                br.read_line(&mut line)?;
+                let mut byte = [0u8; 1];
+                loop {
+                    match f.read(&mut byte)? {
+                        0 => break,
+                        1 => {
+                            line.push(byte[0] as char);
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
             }
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
         }
@@ -2467,6 +2478,37 @@ mod tests {
         assert_eq!(iostat, 0);
         assert_eq!(first, 170141183460469231731687303715884105727i128);
         assert_eq!(second, 42);
+    }
+
+    #[test]
+    fn formatted_readwrite_unit_advances_across_records() {
+        let path = "/tmp/afs_fmt_read_records_rw_test.dat";
+        std::fs::write(
+            path,
+            " 170141183460469231731687303715884105727\n-170141183460469231731687303715884105727\n",
+        )
+        .unwrap();
+
+        afs_open_simple(
+            92,
+            path.as_ptr(), path.len() as i64,
+            "old".as_ptr(), 3,
+            "readwrite".as_ptr(), 9,
+        );
+
+        let mut first = 0i128;
+        let mut second = 0i128;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_int128(92, "(I40)".as_ptr(), 5, 0, &mut first, &mut iostat);
+        assert_eq!(iostat, 0, "expected first formatted readwrite-unit read to succeed");
+
+        afs_fmt_read_int128(92, "(I40)".as_ptr(), 5, 0, &mut second, &mut iostat);
+        afs_close(92, std::ptr::null_mut());
+
+        assert_eq!(iostat, 0, "expected second formatted readwrite-unit read to succeed");
+        assert_eq!(first, 170141183460469231731687303715884105727i128);
+        assert_eq!(second, -170141183460469231731687303715884105727i128);
     }
 
     #[test]
