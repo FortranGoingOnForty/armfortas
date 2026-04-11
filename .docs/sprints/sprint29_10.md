@@ -29,8 +29,8 @@ Still missing or partial:
   codegen, ABI-visible params/returns/calls, and full optimizer-level support through
   `-Ofast` now exist for the current scalar surface, but broader wide-value surface
   area is still missing
-- preprocessor expansion is still split across `expand_condition_macros` and
-  `expand_macros_inner`
+- preprocessor expansion unification is landed; the remaining cleanup is keeping
+  the docs and deferred-item ledger honest as the last wide-value/runtime gaps close
 
 ### 29.6: Loop Optimizations
 
@@ -251,9 +251,8 @@ Landed so far:
 
 Still missing inside the same cleanup item:
 - broader backend/runtime support for `i128` shapes outside the current scalar surface,
-  especially stack-passed wide results, formatted/internal-input `i128`, broader
-  internal-input parsing beyond the current list-directed character-buffer path,
-  general `RuntimeCall(..)`-based wide runtime
+  especially stack-passed wide results, broader formatted `i128` input beyond the
+  newly landed top-level scalar internal-buffer path, and general `RuntimeCall(..)`-based wide runtime
   surfaces, and more ambitious
   array/vectorization-style wide rewrites if they ever become legal
 
