@@ -146,12 +146,12 @@ single-file surface makes that honest; otherwise they remain blocked behind Spri
 ## Test Surface Sitrep
 
 Current high-level state:
-- `162` runtime corpus programs
-- `152` programs with `CHECK`
-- `11` diagnostic `ERROR_EXPECTED` programs
+- `164` runtime corpus programs
+- `156` programs with `CHECK`
+- `10` diagnostic `ERROR_EXPECTED` programs
 - `25` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
-- `1` living `XFAIL` program
+- `2` living `XFAIL` programs
 
 What is good:
 - O0/O1/O2/O3/Os/Ofast runtime matrix is green on the currently landed corpus
@@ -169,11 +169,16 @@ What is good:
 What is still too weak:
 - too few IR-shape assertions relative to the optimizer surface
 - optimizer-specific binary/IR differentials could still be broader
-- living XFAIL canaries are still underused outside the known append-I/O case
+- living XFAIL canaries are still underused outside the known append-I/O and
+  module-host-association cases
 - the new `i128` and runtime audits are now strong on scalar, component,
   whole-array, 1-D slice, fixed-shape multi-dimensional section lvalue surfaces,
   and allocatable descriptor-backed section lowering, but still weaker on
   O0/capture-run audit coverage for the newest descriptor-backed cases
+- the brutal audit just caught a real entry-wrapper bug (`_main` could branch to
+  the first helper instead of the lowered `__prog_*` body) and a new module-host-
+  association XFAIL, which is exactly the sort of gap this sprint still needs to
+  flush out deliberately
 
 ## Brutal Audit Priorities Inside 29.10
 
