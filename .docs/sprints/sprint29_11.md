@@ -83,8 +83,21 @@ Current audit findings:
   branch-join reuse through a noalias helper side path stayed as a reload at
   `-O2+`; `realworld_noalias_reuse.f90` now proves the noalias-call case and
   also keeps the local same-block reuse path honest
+- fixed: contained procedures only partially inherited host-associated
+  `parameter` constants during lowering, so dummy array extents and loop bounds
+  like `x(n)`, `y(n)`, and `do i = 1, n` could degrade inside real-world helper
+  kernels; `realworld_seed_overwrite.f90` now proves that host-param-backed
+  dummy extents and loop bounds stay intact
 - proven: LICM hoists invariant scalar dummy loads out of a real-world affine
   update loop in `realworld_affine_shift.f90` once BCE clears the loop body
+- proven: GVN reduces duplicated branch-join PURE helper calls in
+  `realworld_join_bias_sum.f90` at `-O2+` instead of recomputing the same affine
+  helper result through the join
+- proven: DSE removes the dead seed store in `realworld_seed_overwrite.f90`
+  across the intervening noalias helper call while preserving the real fill
+- proven: loop-legality audit kernels `realworld_inplace_prefix.f90` and
+  `realworld_inplace_symmix.f90` stay runtime-correct, cross-opt-equal, and
+  deterministic across IR/object/binary surfaces
 - deferred with living XFAIL: `MODULE-HOST-1` module-global host association
 - deferred with living XFAIL: `FPM-SUFFIX-1` fpm-style source suffix scan still
   fails after parsing with an `i32`/`i64` IR store mismatch
@@ -92,8 +105,8 @@ Current audit findings:
   explicit type-spec inside `[]`
 
 Current audit corpus snapshot:
-- `171` top-level `test_programs/*.f90` runtime corpus programs
-- `163` programs with `CHECK`
+- `176` top-level `test_programs/*.f90` runtime corpus programs
+- `165` programs with `CHECK`
 - `28` programs with `IR_CHECK`
 - `6` programs with `IR_NOT`
 - `3` living `XFAIL`s
