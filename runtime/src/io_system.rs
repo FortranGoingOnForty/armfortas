@@ -1121,6 +1121,45 @@ pub extern "C" fn afs_write_internal_int(
     write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
+/// Write a formatted i64 to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_int64(
+    buf: *mut u8, buf_len: i64,
+    val: i64,
+    pos: *mut i64,
+) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let s = format!(" {}", val);
+    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+}
+
+/// Write a formatted integer(16) to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_int128(
+    buf: *mut u8, buf_len: i64,
+    val: i128,
+    pos: *mut i64,
+) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let s = format!(" {}", val);
+    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+}
+
+/// Write a formatted real to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_real64(
+    buf: *mut u8, buf_len: i64,
+    val: f64,
+    pos: *mut i64,
+) {
+    if buf.is_null() || buf_len <= 0 { return; }
+    let s = format!(" {}", val);
+    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+}
+
 /// Write a formatted string to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_string(
@@ -1138,21 +1177,97 @@ pub extern "C" fn afs_write_internal_string(
     write_to_buffer(buf, buf_len as usize, start, &data, pos);
 }
 
+fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<String> {
+    if buf.is_null() || buf_len <= 0 {
+        return None;
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let mut idx = if !pos.is_null() {
+        unsafe { (*pos).clamp(0, buf_len) as usize }
+    } else {
+        0
+    };
+
+    while idx < slice.len() && (slice[idx].is_ascii_whitespace() || slice[idx] == b',') {
+        idx += 1;
+    }
+
+    if idx >= slice.len() {
+        if !pos.is_null() {
+            unsafe { *pos = idx as i64; }
+        }
+        return None;
+    }
+
+    let start = idx;
+    while idx < slice.len() && !slice[idx].is_ascii_whitespace() && slice[idx] != b',' {
+        idx += 1;
+    }
+
+    if !pos.is_null() {
+        unsafe { *pos = idx as i64; }
+    }
+
+    Some(String::from_utf8_lossy(&slice[start..idx]).into_owned())
+}
+
 /// Read an integer from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_int(
     buf: *const u8, buf_len: i64,
+    pos: *mut i64,
     val: *mut i32,
     iostat: *mut i32,
 ) {
-    if buf.is_null() || buf_len <= 0 {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
-        return;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let s = &String::from_utf8_lossy(slice);
-    if let Some(token) = s.split_whitespace().next() {
+    if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i32>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    } else {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+    }
+}
+
+/// Read an i64 from a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_read_internal_int64(
+    buf: *const u8, buf_len: i64,
+    pos: *mut i64,
+    val: *mut i64,
+    iostat: *mut i32,
+) {
+    if let Some(token) = next_internal_token(buf, buf_len, pos) {
+        match token.replace(',', "").parse::<i64>() {
+            Ok(v) => {
+                if !val.is_null() { unsafe { *val = v; } }
+                if !iostat.is_null() { unsafe { *iostat = 0; } }
+            }
+            Err(_) => {
+                if !iostat.is_null() { unsafe { *iostat = 1; } }
+            }
+        }
+    } else {
+        if !iostat.is_null() { unsafe { *iostat = -1; } }
+    }
+}
+
+/// Read an integer(16) from a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_read_internal_int128(
+    buf: *const u8, buf_len: i64,
+    pos: *mut i64,
+    val: *mut i128,
+    iostat: *mut i32,
+) {
+    if let Some(token) = next_internal_token(buf, buf_len, pos) {
+        match token.replace(',', "").parse::<i128>() {
             Ok(v) => {
                 if !val.is_null() { unsafe { *val = v; } }
                 if !iostat.is_null() { unsafe { *iostat = 0; } }
@@ -1170,16 +1285,11 @@ pub extern "C" fn afs_read_internal_int(
 #[no_mangle]
 pub extern "C" fn afs_read_internal_real(
     buf: *const u8, buf_len: i64,
+    pos: *mut i64,
     val: *mut f64,
     iostat: *mut i32,
 ) {
-    if buf.is_null() || buf_len <= 0 {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
-        return;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let s = &String::from_utf8_lossy(slice);
-    if let Some(token) = s.split_whitespace().next() {
+    if let Some(token) = next_internal_token(buf, buf_len, pos) {
         let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
         match normalized.parse::<f64>() {
             Ok(v) => {
@@ -1509,9 +1619,14 @@ pub extern "C" fn afs_io_finalize() {
 use std::cell::RefCell;
 use crate::format::{parse_format, FormatEngine, IoValue};
 
+enum FmtSink {
+    Unit(i32),
+    Internal { buf: *mut u8, buf_len: usize },
+}
+
 /// Thread-local state for the current formatted I/O operation.
 struct FmtContext {
-    unit: i32,
+    sink: FmtSink,
     format_str: String,
     values: Vec<IoValue>,
 }
@@ -1527,7 +1642,28 @@ pub extern "C" fn afs_fmt_begin(unit: i32, fmt_str: *const u8, fmt_len: i64) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(FmtContext {
-            unit,
+            sink: FmtSink::Unit(unit),
+            format_str: fmt,
+            values: Vec::new(),
+        });
+    });
+}
+
+/// Begin a formatted internal write operation targeting a character buffer.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal(
+    buf: *mut u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        *ctx.borrow_mut() = Some(FmtContext {
+            sink: FmtSink::Internal {
+                buf,
+                buf_len: buf_len.max(0) as usize,
+            },
             format_str: fmt,
             values: Vec::new(),
         });
@@ -1604,11 +1740,18 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut engine = FormatEngine::new(descriptors);
             let output = engine.format_values(&c.values);
 
-            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(u) = state.get_unit(c.unit) {
-                let _ = u.write_str(&output);
-                if advance != 0 {
-                    let _ = u.write_str("\n");
+            match c.sink {
+                FmtSink::Unit(unit) => {
+                    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(u) = state.get_unit(unit) {
+                        let _ = u.write_str(&output);
+                        if advance != 0 {
+                            let _ = u.write_str("\n");
+                        }
+                    }
+                }
+                FmtSink::Internal { buf, buf_len } => {
+                    write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
                 }
             }
         }
@@ -1687,6 +1830,50 @@ mod tests {
     }
 
     #[test]
+    fn internal_i128_roundtrip_tracks_position() {
+        let mut buf = [b' '; 96];
+        let mut write_pos = 0i64;
+
+        afs_write_internal_int128(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            170141183460469231731687303715884105727i128,
+            &mut write_pos,
+        );
+        afs_write_internal_int128(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            -170141183460469231731687303715884105727i128,
+            &mut write_pos,
+        );
+
+        let mut read_pos = 0i64;
+        let mut first = 0i128;
+        let mut second = 0i128;
+        let mut iostat = -99i32;
+
+        afs_read_internal_int128(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut read_pos,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "expected first internal i128 read to succeed");
+
+        afs_read_internal_int128(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut read_pos,
+            &mut second,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "expected second internal i128 read to succeed");
+        assert_eq!(first, 170141183460469231731687303715884105727i128);
+        assert_eq!(second, -170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
     fn formatted_write_to_file() {
         let path = "/tmp/afs_fmt_test.dat";
         afs_open_simple(
@@ -1730,6 +1917,27 @@ mod tests {
             content.contains("170141183460469231731687303715884105727"),
             "expected full formatted i128 rendering in: {}",
             content
+        );
+    }
+
+    #[test]
+    fn formatted_internal_write_pads_buffer() {
+        let mut buf = [b'?'; 48];
+
+        afs_fmt_begin_internal(buf.as_mut_ptr(), buf.len() as i64, "(I6)".as_ptr(), 4);
+        afs_fmt_push_int(42);
+        afs_fmt_end(0);
+
+        let rendered = String::from_utf8_lossy(&buf).into_owned();
+        assert!(
+            rendered.starts_with("    42"),
+            "expected formatted internal output at start of buffer: {:?}",
+            rendered
+        );
+        assert!(
+            rendered[6..].bytes().all(|b| b == b' '),
+            "expected remaining internal buffer to be space padded: {:?}",
+            rendered
         );
     }
 
