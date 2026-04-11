@@ -274,12 +274,15 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
 /// This deliberately widens `i128` support one optimization lane at a time.
 /// Now that the backend can carry stack-backed `i128` values through block
 /// params and mem2reg-style joins, the widened `i128` lane can use the full
-/// ordinary O1 and O2 pipelines. Higher levels remain gated until their pass
-/// shapes are proven end to end.
+/// ordinary O1/O2/O3/Os/Ofast pipelines. Higher levels remain gated until their
+/// pass shapes are proven end to end.
 pub fn build_i128_pipeline(level: OptLevel) -> Option<PassManager> {
     match level {
         OptLevel::O1 => Some(build_pipeline(OptLevel::O1)),
         OptLevel::O2 => Some(build_pipeline(OptLevel::O2)),
+        OptLevel::O3 => Some(build_pipeline(OptLevel::O3)),
+        OptLevel::Os => Some(build_pipeline(OptLevel::Os)),
+        OptLevel::Ofast => Some(build_pipeline(OptLevel::Ofast)),
         _ => None,
     }
 }
@@ -371,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn i128_pipeline_is_available_through_o2() {
+    fn i128_pipeline_is_available_through_ofast() {
         assert!(
             build_i128_pipeline(OptLevel::O1).is_some(),
             "O1 should have the widened i128-safe pipeline"
@@ -380,7 +383,14 @@ mod tests {
             build_i128_pipeline(OptLevel::O2).is_some(),
             "O2 should be available once the widened i128 lane is proven"
         );
-        for lvl in [OptLevel::O0, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+        for lvl in [OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+            assert!(
+                build_i128_pipeline(lvl).is_some(),
+                "{:?} should be available once the widened i128 lane is proven",
+                lvl
+            );
+        }
+        for lvl in [OptLevel::O0] {
             assert!(
                 build_i128_pipeline(lvl).is_none(),
                 "{:?} should not yet have widened i128 optimization support",
@@ -399,5 +409,20 @@ mod tests {
             wide, full,
             "the widened i128 O1 lane should stay aligned with the ordinary O1 pipeline"
         );
+    }
+
+    #[test]
+    fn i128_pipeline_matches_full_higher_levels() {
+        for lvl in [OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+            let wide = build_i128_pipeline(lvl)
+                .expect("level should expose the widened i128 pipeline")
+                .pass_names();
+            let full = build_pipeline(lvl).pass_names();
+            assert_eq!(
+                wide, full,
+                "the widened i128 lane should stay aligned with the ordinary {:?} pipeline",
+                lvl
+            );
+        }
     }
 }
