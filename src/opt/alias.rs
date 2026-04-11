@@ -145,7 +145,11 @@ fn trace_offset(func: &Function, ptr: ValueId) -> Option<i64> {
             let base_offset = trace_offset(func, *base)?;
             if indices.len() != 1 { return None; }
             let idx = resolve_const_int(func, indices[0])?;
-            Some(base_offset + idx)
+            let step = match &inst.ty {
+                IrType::Ptr(inner) => inner.size_bytes() as i64,
+                _ => return None,
+            };
+            Some(base_offset + idx * step)
         }
         _ => None,
     }
@@ -257,6 +261,51 @@ mod tests {
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
         assert_eq!(query(&f, a, a), AliasResult::MustAlias);
+    }
+
+    #[test]
+    fn mixed_width_geps_same_index_do_not_must_alias() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let base_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+        let base = f.next_value_id();
+        f.register_type(base, IrType::Ptr(Box::new(base_ty.clone())));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: base,
+            ty: IrType::Ptr(Box::new(base_ty)),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)),
+        });
+
+        let four = f.next_value_id();
+        f.register_type(four, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: four,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(4, IntWidth::I64),
+        });
+
+        let gep_i32 = f.next_value_id();
+        f.register_type(gep_i32, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: gep_i32,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::GetElementPtr(base, vec![four]),
+        });
+
+        let gep_i64 = f.next_value_id();
+        f.register_type(gep_i64, IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: gep_i64,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
+            kind: InstKind::GetElementPtr(base, vec![four]),
+        });
+
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(query(&f, gep_i32, gep_i64), AliasResult::NoAlias);
     }
 
     #[test]

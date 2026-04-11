@@ -106,6 +106,9 @@ fn is_eligible(func: &Function, alloca_id: ValueId) -> bool {
                             return false;
                         }
                     }
+                    if gep_result_escapes(func, inst.id) {
+                        return false;
+                    }
                     // This use is fine — constant-index element access.
                 }
                 // Store where the alloca is the VALUE being stored = pointer escape.
@@ -128,6 +131,40 @@ fn is_eligible(func: &Function, alloca_id: ValueId) -> bool {
         }
     }
     true
+}
+
+fn gep_result_escapes(func: &Function, gep_id: ValueId) -> bool {
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let uses = inst_uses(&inst.kind);
+            if !uses.contains(&gep_id) {
+                continue;
+            }
+            match &inst.kind {
+                InstKind::Load(ptr) if *ptr == gep_id => {}
+                InstKind::Store(_, ptr) if *ptr == gep_id => {}
+                _ => return true,
+            }
+        }
+        if let Some(term) = &block.terminator {
+            match term {
+                Terminator::Return(Some(v)) if *v == gep_id => return true,
+                Terminator::Branch(_, args) if args.contains(&gep_id) => return true,
+                Terminator::CondBranch { cond, true_args, false_args, .. } => {
+                    if *cond == gep_id || true_args.contains(&gep_id) || false_args.contains(&gep_id) {
+                        return true;
+                    }
+                }
+                Terminator::Switch { selector, .. } => {
+                    if *selector == gep_id {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Decompose one alloca into individual scalar allocas.
@@ -228,5 +265,67 @@ mod tests {
         m.add_function(f);
         let pass = Sroa;
         assert!(!pass.run(&mut m), "scalar alloca should not be decomposed");
+    }
+
+    #[test]
+    fn sroa_rejects_gep_address_escape() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let arr_ty = IrType::Array(
+            Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+            2,
+        );
+        let arr = f.next_value_id();
+        f.register_type(arr, IrType::Ptr(Box::new(arr_ty.clone())));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: arr,
+            ty: IrType::Ptr(Box::new(arr_ty)),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Array(
+                Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+                2,
+            )),
+        });
+
+        let zero = f.next_value_id();
+        f.register_type(zero, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: zero,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(0, IntWidth::I64),
+        });
+
+        let gep = f.next_value_id();
+        f.register_type(gep, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: gep,
+            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))),
+            span: span(),
+            kind: InstKind::GetElementPtr(arr, vec![zero]),
+        });
+
+        let sink = f.next_value_id();
+        f.register_type(sink, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: sink,
+            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))),
+        });
+
+        let escape_store = f.next_value_id();
+        f.register_type(escape_store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: escape_store,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(gep, sink),
+        });
+
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Sroa.run(&mut m), "GEP addresses that escape should block SROA");
     }
 }
