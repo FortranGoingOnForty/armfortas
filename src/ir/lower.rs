@@ -6245,6 +6245,9 @@ fn lower_array_read_item(
             if has_range && args.len() == 1 {
                 lower_1d_slice_read(b, ctx, &info, &args[0], mode);
                 true
+            } else if has_range && args.len() > 1 && !info.allocatable {
+                lower_section_read_nd(b, ctx, &info, args, mode);
+                true
             } else {
                 false
             }
@@ -6621,6 +6624,153 @@ fn lower_1d_slice_read(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+}
+
+fn lower_section_read_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    mode: ReadMode,
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        decl_lo: i64,
+        cum_stride: i64,
+    }
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_stride: i64 = 1;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let (decl_lo, decl_ext) = info.dims.get(dim_idx).copied().unwrap_or((1, 0));
+        let decl_hi = decl_lo + decl_ext - 1;
+
+        let counter = b.alloca(IrType::Int(IntWidth::I32));
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_lo as i32),
+                };
+                let end_v = match end {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(decl_hi as i32),
+                };
+                let stride_v = match stride {
+                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    None => b.const_i32(1),
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let v = lower_expr(b, &ctx.locals, e, ctx.st);
+                (v, v, b.const_i32(1), Some(1))
+            }
+        };
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter,
+            start_val,
+            end_val,
+            stride_val,
+            const_stride,
+            decl_lo,
+            cum_stride,
+        });
+        cum_stride *= decl_ext.max(1);
+    }
+
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("read_sec_check_d{}", d)));
+        bodies.push(b.create_block(&format!("read_sec_body_d{}", d)));
+        incrs.push(b.create_block(&format!("read_sec_incr_d{}", d)));
+        exits.push(b.create_block(&format!("read_sec_exit_d{}", d)));
+    }
+
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let zero = b.const_i32(0);
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero);
+            let bb_neg = b.create_block(&format!("read_sec_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("read_sec_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let mut byte_offset: Option<ValueId> = None;
+            let dim_data: Vec<(ValueId, i64, i64)> = dims
+                .iter()
+                .map(|dim| (dim.counter, dim.decl_lo, dim.cum_stride))
+                .collect();
+            for (counter, decl_lo, cum_stride_d) in dim_data {
+                let cnt = b.load(counter);
+                let lo_const = b.const_i32(decl_lo as i32);
+                let zero_based = b.isub(cnt, lo_const);
+                let zero_based64 = widen_idx_to_i64(b, zero_based);
+                let stride_const = b.const_i64(cum_stride_d * elem_bytes);
+                let term = b.imul(zero_based64, stride_const);
+                byte_offset = Some(match byte_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
+            let ptr = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
+            let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+
+    b.set_block(exits[outer]);
 }
 
 /// Lower an N-dimensional array section write item, e.g.
