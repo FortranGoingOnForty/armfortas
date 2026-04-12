@@ -82,6 +82,26 @@ fn inline_calls_in_function(
                     if ci == caller_idx { continue; }
                     // Cost check.
                     if cg.inline_cost(ci) > threshold { continue; }
+                    // Argument/parameter type agreement.  When a
+                    // Fortran OPTIONAL parameter is absent at a call
+                    // site, the caller passes `const_i64 0` as a null
+                    // placeholder — that's sound at the call boundary
+                    // because the callee wraps every read in
+                    // PRESENT(), but inlining would map a `load %b`
+                    // from the callee onto a `load <i64 const>` in the
+                    // caller, which fails the IR verifier.  Refuse to
+                    // inline any call whose arg type doesn't match the
+                    // callee param type exactly.  The same check also
+                    // guards any future call-boundary coercion shims.
+                    let callee = &module.functions[ci as usize];
+                    if callee.params.len() != args.len() { continue; }
+                    let mismatched = callee.params.iter().zip(args.iter()).any(|(p, a)| {
+                        match caller.value_type(*a) {
+                            Some(ty) => ty != p.ty,
+                            None => true,
+                        }
+                    });
+                    if mismatched { continue; }
                     sites.push((block.id, inst_idx, ci, args.clone()));
                 }
             }
