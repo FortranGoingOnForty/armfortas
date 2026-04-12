@@ -17,7 +17,7 @@ program complex_real_aimag
   c = (1.0, 2.0) * (3.0, 4.0)
   print *, real(c), aimag(c)
 end program complex_real_aimag
-! CHECK:    3.5000000E0
-! CHECK:   -2.5000000E0
-! CHECK:   -5.0000000E0   1.0000000E1
+! CHECK: 3.5000000E0
+! CHECK: -2.5000000E0
+! CHECK: -5.0000000E0     1.0000000E1
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
