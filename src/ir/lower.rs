@@ -4362,6 +4362,31 @@ fn lower_string_expr(
                         }
                     }
                 }
+                // Character array element: words(i) — return the
+                // element's string pointer and fixed length.
+                if args.len() == 1 {
+                    if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &args[0].value {
+                        if let Some(info) = locals.get(&key) {
+                            if info.char_kind != CharKind::None && (!info.dims.is_empty() || info.allocatable) {
+                                let idx = lower_expr(b, locals, idx_expr, st);
+                                let idx64 = match b.func().value_type(idx) {
+                                    Some(IrType::Int(IntWidth::I64)) => idx,
+                                    _ => b.int_extend(idx, IntWidth::I64, true),
+                                };
+                                let one = b.const_i64(1);
+                                let idx0 = b.isub(idx64, one);
+                                let base = array_base_addr(b, info);
+                                let elem_slot = b.gep(base, vec![idx0], info.ty.clone());
+                                let elem_ptr = b.load_typed(elem_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                let elem_len = match info.char_kind {
+                                    CharKind::Fixed(n) => b.const_i64(n),
+                                    _ => b.const_i64(0),
+                                };
+                                return (elem_ptr, elem_len);
+                            }
+                        }
+                    }
+                }
             }
             // Nested FunctionCall: arr(i)(lo:hi) — substring of a
             // character array element. The outer callee is itself a
@@ -6835,7 +6860,9 @@ fn lower_write_items_adv(
                     matches!(key.as_str(),
                         "trim" | "adjustl" | "adjustr" | "char")
                         || ctx.locals.get(&key)
-                            .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
+                            .map(|i| i.char_kind != CharKind::None
+                                && (i.dims.is_empty()
+                                    || args.iter().all(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Element(_)))))
                             .unwrap_or(false)
                 } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
                     // Nested: arr(i)(lo:hi) — substring of char array element.
@@ -7022,7 +7049,9 @@ fn lower_internal_write_items(
                     matches!(key.as_str(),
                         "trim" | "adjustl" | "adjustr" | "char")
                         || ctx.locals.get(&key)
-                            .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
+                            .map(|i| i.char_kind != CharKind::None
+                                && (i.dims.is_empty()
+                                    || args.iter().all(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Element(_)))))
                             .unwrap_or(false)
                 } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
                     // Nested: arr(i)(lo:hi) — substring of char array element.
