@@ -9220,13 +9220,42 @@ fn lower_pointer_intrinsic(
     if !info.is_pointer {
         return None;
     }
-    // For every pointer shape the base-address slot lives at byte
-    // offset 0 of `info.addr`.  Load it as an i64 and compare to
-    // zero.
+    // Load the pointer's stored target address (byte offset 0).
     let zero_off = b.const_i64(0);
     let base_ptr = b.gep(info.addr, vec![zero_off], IrType::Int(IntWidth::I64));
     let raw = b.load_typed(base_ptr, IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
+
+    if args.len() >= 2 {
+        // Two-argument form: ASSOCIATED(p, target).
+        // True iff p's stored address equals the target's address.
+        // Both values are compared as raw i64 representations.
+        let second = &args[1];
+        let crate::ast::expr::SectionSubscript::Element(tgt_expr) = &second.value else {
+            return Some(b.icmp(CmpOp::Ne, raw, zero));
+        };
+        let Expr::Name { name: tgt_name } = &tgt_expr.node else {
+            return Some(b.icmp(CmpOp::Ne, raw, zero));
+        };
+        let Some(tgt_info) = locals.get(&tgt_name.to_lowercase()) else {
+            return Some(b.icmp(CmpOp::Ne, raw, zero));
+        };
+        // Get the target's address as i64 for comparison.
+        // For a pointer: load the stored address from its slot.
+        // For a plain variable: write info.addr into a scratch
+        // i64 slot and read it back (effectlvely ptrtoint).
+        let tgt_addr = if tgt_info.is_pointer {
+            let off = b.const_i64(0);
+            let tgt_slot = b.gep(tgt_info.addr, vec![off], IrType::Int(IntWidth::I64));
+            b.load_typed(tgt_slot, IrType::Int(IntWidth::I64))
+        } else {
+            let scratch = b.alloca(IrType::Ptr(Box::new(info.ty.clone())));
+            b.store(tgt_info.addr, scratch);
+            b.load_typed(scratch, IrType::Int(IntWidth::I64))
+        };
+        return Some(b.icmp(CmpOp::Eq, raw, tgt_addr));
+    }
+
     Some(b.icmp(CmpOp::Ne, raw, zero))
 }
 
