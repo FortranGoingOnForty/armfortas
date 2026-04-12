@@ -4665,11 +4665,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
 
             // Array-level WHERE: iterate over elements.
-            // Use the first array to determine the iteration count.
+            // Use the first array to determine the iteration count. For
+            // stack arrays `info.addr` is the raw element buffer — calling
+            // afs_array_size on that would read garbage out of the rank
+            // slot. array_total_elems_value picks the right source: it
+            // materialises a descriptor query for descriptor-backed locals
+            // and folds dims to a constant for explicit-shape stack arrays.
             let first_arr_name = &array_names[0];
             let first_arr = ctx.locals.get(first_arr_name).cloned().expect("array must exist");
-            let n = b.call(FuncRef::External("afs_array_size".into()),
-                vec![first_arr.addr], IrType::Int(IntWidth::I64));
+            let n = array_total_elems_value(b, &first_arr);
 
             // Get base addresses for all arrays (loaded once outside the loop).
             let mut array_bases: HashMap<String, ValueId> = HashMap::new();
