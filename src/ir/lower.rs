@@ -5527,6 +5527,25 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             b.call(FuncRef::External("afs_rewind".into()), vec![unit, null], IrType::Void);
         }
 
+        Stmt::Nullify { items } => {
+            // Zero each pointer slot so ASSOCIATED returns false.
+            for item in items {
+                let Expr::Name { name } = &item.node else { continue; };
+                let Some(info) = ctx.locals.get(&name.to_lowercase()) else { continue; };
+                if !info.is_pointer { continue; }
+                // Array pointers use the 384-byte descriptor (allocatable=true);
+                // scalar and DT pointers use an 8-byte slot.
+                let size = if info.allocatable { 384i64 } else { 8i64 };
+                let zero_byte = b.const_i32(0);
+                let sz = b.const_i64(size);
+                b.call(
+                    FuncRef::External("memset".into()),
+                    vec![info.addr, zero_byte, sz],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            }
+        }
+
         Stmt::PointerAssignment { target, value } => {
             // `p => q` or `p => x`: rebind the pointer slot `p` to the
             // address of the RHS designator.  Three shapes:
