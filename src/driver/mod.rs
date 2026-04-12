@@ -67,6 +67,8 @@ impl OptLevel {
 /// Compilation options.
 pub struct Options {
     pub input: PathBuf,
+    /// Additional input files for multi-source mode.
+    pub extra_inputs: Vec<PathBuf>,
     pub output: Option<PathBuf>,
     pub emit_asm: bool,        // -S
     pub emit_obj: bool,        // -c
@@ -79,7 +81,7 @@ pub struct Options {
 
 impl Options {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let mut input = None;
+        let mut inputs = Vec::new();
         let mut output = None;
         let mut emit_asm = false;
         let mut emit_obj = false;
@@ -112,7 +114,6 @@ impl Options {
                     }
                 }
                 arg if arg.starts_with("-I") => {
-                    // -Idir (no space)
                     module_search_paths.push(PathBuf::from(&arg[2..]));
                 }
                 arg if arg.starts_with("-O") => {
@@ -121,16 +122,20 @@ impl Options {
                         .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
                 }
                 arg if !arg.starts_with('-') => {
-                    input = Some(PathBuf::from(arg));
+                    inputs.push(PathBuf::from(arg));
                 }
                 other => return Err(format!("unknown option: {}", other)),
             }
             i += 1;
         }
 
-        let input = input.ok_or("no input file")?;
+        if inputs.is_empty() {
+            return Err("no input file".into());
+        }
+        let input = inputs.remove(0);
         Ok(Self {
             input,
+            extra_inputs: inputs,
             output,
             emit_asm,
             emit_obj,
@@ -491,6 +496,101 @@ fn link(obj: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Link multiple object files with the runtime to produce a binary.
+fn link_multi(objs: &[PathBuf], output: &Path) -> Result<(), String> {
+    let rt_path = find_runtime_lib()?;
+    let sdk = Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
+        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+
+    let mut args: Vec<String> = vec![
+        "-o".into(), output.to_str().unwrap().into(),
+    ];
+    for obj in objs {
+        args.push(obj.to_str().unwrap().into());
+    }
+    args.extend([
+        rt_path,
+        "-lSystem".into(),
+        "-no_uuid".into(),
+        "-syslibroot".into(),
+        sysroot,
+        "-e".into(),
+        "_main".into(),
+    ]);
+    let ld_result = Command::new("ld")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot run linker: {}", e))?;
+    if !ld_result.status.success() {
+        let stderr = String::from_utf8_lossy(&ld_result.stderr);
+        return Err(format!("linker failed:\n{}", stderr));
+    }
+    Ok(())
+}
+
+/// Compile multiple Fortran source files with automatic dependency
+/// resolution, producing a single linked binary.
+///
+/// 1. Scan all files for MODULE/USE dependencies.
+/// 2. Topological sort (error on cycles).
+/// 3. Compile each in order to a temp .o + .amod.
+/// 4. Link all .o files into the output binary.
+pub fn compile_multi(opts: &Options) -> Result<(), String> {
+    let mut all_inputs = vec![opts.input.clone()];
+    all_inputs.extend(opts.extra_inputs.iter().cloned());
+
+    // Scan dependencies.
+    let file_deps: Vec<dep_scan::FileDeps> = all_inputs.iter()
+        .map(|p| dep_scan::scan_file(p))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Topological sort.
+    let order = dep_scan::resolve_compilation_order(&file_deps)?;
+
+    // Compile each file in order.
+    let tmp_dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("cannot create temp dir: {}", e))?;
+
+    let mut object_files: Vec<PathBuf> = Vec::new();
+    for &idx in &order {
+        let src = &file_deps[idx].path;
+        let stem = src.file_stem().unwrap_or_default().to_str().unwrap_or("out");
+        let obj_path = tmp_dir.join(format!("{}.o", stem));
+
+        // Build a single-file Options for this source.
+        let sub_opts = Options {
+            input: src.clone(),
+            extra_inputs: vec![],
+            output: Some(obj_path.clone()),
+            emit_asm: false,
+            emit_obj: true,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: opts.opt_level,
+            module_search_paths: {
+                let mut paths = opts.module_search_paths.clone();
+                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+                paths
+            },
+        };
+        compile(&sub_opts)?;
+        object_files.push(obj_path);
+    }
+
+    // Link all object files.
+    let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+    link_multi(&object_files, &output)?;
+
+    // Cleanup.
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    Ok(())
+}
+
 /// Find libarmfortas_rt.a in common locations.
 fn find_runtime_lib() -> Result<String, String> {
     if let Some(workspace_root) = find_workspace_root() {
@@ -645,6 +745,7 @@ mod tests {
             emit_ir: true,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -669,6 +770,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -695,6 +797,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -719,6 +822,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -743,6 +847,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -768,6 +873,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 
@@ -793,6 +899,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O1,
+            extra_inputs: vec![],
             module_search_paths: vec![],
         };
 

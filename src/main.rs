@@ -29,7 +29,12 @@ fn main() {
         }
     };
 
-    if let Err(e) = driver::compile(&opts) {
+    let result = if opts.extra_inputs.is_empty() {
+        driver::compile(&opts)
+    } else {
+        driver::compile_multi(&opts)
+    };
+    if let Err(e) = result {
         eprintln!("armfortas: {}", e);
         process::exit(1);
     }
