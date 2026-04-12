@@ -5465,15 +5465,32 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Block { decls, body, .. } => {
-            // F2008 BLOCK: declarations create new locals scoped to
-            // the body, then statements execute.  We alloc+init the
-            // decls into the current locals map (no separate scope
-            // yet — a future refinement would push/pop a scope).
+            // F2008 BLOCK: declarations are scoped to the body.
+            // Save any locals that the BLOCK's decls shadow, run
+            // the body, then restore the originals.
+            let block_keys: Vec<String> = decls.iter().flat_map(|d| {
+                if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
+                    entities.iter().map(|e| e.name.to_lowercase()).collect::<Vec<_>>()
+                } else { vec![] }
+            }).collect();
+            let saved: Vec<(String, Option<LocalInfo>)> = block_keys.iter()
+                .map(|k| (k.clone(), ctx.locals.get(k).cloned()))
+                .collect();
             if !decls.is_empty() {
+                // Remove shadowed keys so alloc_decls creates fresh allocas.
+                for k in &block_keys { ctx.locals.remove(k); }
                 alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new());
                 init_decls(b, &ctx.locals, decls, ctx.st);
             }
             lower_stmts(b, ctx, body);
+            // Restore the outer scope's locals.
+            for (k, orig) in saved {
+                if let Some(info) = orig {
+                    ctx.locals.insert(k, info);
+                } else {
+                    ctx.locals.remove(&k);
+                }
+            }
         }
 
         Stmt::Associate { assocs, body, .. } => {
