@@ -4626,11 +4626,36 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                 }
                 Expr::FunctionCall { callee, args } => {
-                    // Array element assignment: a(i) = val
                     if let Expr::Name { name } = &callee.node {
                         let akey = name.to_lowercase();
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
-                            if !info.dims.is_empty() || info.allocatable {
+                            // Substring LHS: s(lo:hi) = rhs where s is a
+                            // scalar character.  Compute the target substring
+                            // pointer+length, get the RHS as (ptr, len), and
+                            // call afs_assign_char_fixed to do the bounded
+                            // copy with space-padding.
+                            if info.char_kind != CharKind::None
+                                && info.dims.is_empty()
+                                && args.len() == 1
+                                && matches!(args[0].value, crate::ast::expr::SectionSubscript::Range { .. })
+                            {
+                                if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[0].value {
+                                    if let Some((base_ptr, base_len)) = char_addr_and_runtime_len(b, callee, &ctx.locals) {
+                                        let (dest_ptr, dest_len) = lower_substring(
+                                            b, &ctx.locals, ctx.st,
+                                            base_ptr, base_len,
+                                            start.as_ref(), end.as_ref(),
+                                        );
+                                        let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                        b.call(
+                                            FuncRef::External("afs_assign_char_fixed".into()),
+                                            vec![dest_ptr, dest_len, src_ptr, src_len],
+                                            IrType::Void,
+                                        );
+                                    }
+                                }
+                            } else if !info.dims.is_empty() || info.allocatable {
+                                // Array element assignment: a(i) = val
                                 if matches!(info.char_kind, CharKind::Fixed(_)) {
                                     lower_char_array_store(b, &ctx.locals, &info, args, value, ctx.st);
                                 } else {
