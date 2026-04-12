@@ -3,6 +3,8 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
+pub mod dep_scan;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
