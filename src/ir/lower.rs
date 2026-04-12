@@ -511,13 +511,25 @@ fn collect_elemental_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
 }
 
 /// Scan a program unit (and its `contains` chain) for `Decl::CommonBlock`
-/// statements and emit one scalar global per (block, variable) pair into
-/// the module. All scopes that declare the same COMMON block share these
+/// statements and emit one scalar global per *slot position* within each
+/// COMMON block. All scopes that declare the same block share these
 /// globals, giving correct F77 §5.5 shared-memory semantics for scalars.
 ///
-/// Naming: `afs_common_<block_name>_<var_name>` (lowercase).
-/// The blank COMMON uses the synthetic block name `__blank__`.
-/// Audit6 BLOCKING-2.
+/// Naming: `afs_common_<block_name>_<slot_index>` (lowercase).
+/// The blank COMMON uses the synthetic block name `__blank__`.  Using
+/// the slot position — not the local variable name — as the disambiguator
+/// matters when a contained subprogram aliases the same block under
+/// different local names: `common /blk/ a, b` in the host and
+/// `common /blk/ x, y` in a contained routine must resolve to the same
+/// two globals, not four separate ones.  The slot's element type comes
+/// from whichever scope the module walker visits first; scopes that
+/// agree on positional types will get correct reads/writes, and
+/// scopes that disagree are an F77 undefined-behavior region we
+/// leave unhandled for now.  Audit6 BLOCKING-2.
+fn common_slot_symbol(block: &str, slot_idx: usize) -> String {
+    format!("afs_common_{}_{}", block, slot_idx)
+}
+
 fn collect_and_emit_common_globals(
     unit: &ProgramUnit,
     module: &mut Module,
@@ -528,8 +540,8 @@ fn collect_and_emit_common_globals(
         for decl in decls {
             if let Decl::CommonBlock { name, vars } = &decl.node {
                 let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
-                for var in vars {
-                    let symbol = format!("afs_common_{}_{}", block_name, var.to_lowercase());
+                for (slot_idx, var) in vars.iter().enumerate() {
+                    let symbol = common_slot_symbol(&block_name, slot_idx);
                     if emitted.contains(&symbol) { continue; }
                     emitted.insert(symbol.clone());
                     let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls);
@@ -573,10 +585,10 @@ fn install_common_locals(
     for decl in decls {
         if let Decl::CommonBlock { name, vars } = &decl.node {
             let block_name = name.as_deref().unwrap_or("__blank__").to_lowercase();
-            for var in vars {
+            for (slot_idx, var) in vars.iter().enumerate() {
                 let key = var.to_lowercase();
                 if locals.contains_key(&key) { continue; }
-                let symbol = format!("afs_common_{}_{}", block_name, key);
+                let symbol = common_slot_symbol(&block_name, slot_idx);
                 let elem_ty = arg_type_from_decls(&key, decls);
                 let addr = b.global_addr(&symbol, elem_ty.clone());
                 locals.insert(key, LocalInfo {
