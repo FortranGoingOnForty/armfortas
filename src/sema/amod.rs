@@ -205,12 +205,7 @@ fn emit_procedure(
     if sym.attrs.elemental { write!(out, ", elemental").unwrap(); }
     writeln!(out).unwrap();
 
-    // @abi line for the procedure.
     let name_lc = name.to_lowercase();
-    let hidden_count = char_len_star_params.get(&name_lc)
-        .map(|flags| flags.iter().filter(|f| **f).count())
-        .unwrap_or(0);
-    writeln!(out, "  @abi cc=aapcs64 hidden_char_lens={}", hidden_count).unwrap();
 
     // Walk into the procedure's child scope for full arg info.
     let proc_scope = st.scopes.iter().find(|s| {
@@ -219,6 +214,23 @@ fn emit_procedure(
             _ => false,
         }
     });
+
+    // Compute hidden char-length count from the scope's arg types.
+    let mut hidden_count = 0usize;
+    if let Some(pscope) = proc_scope {
+        for arg_name in &pscope.arg_order {
+            if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
+                if matches!(arg_sym.type_info, Some(TypeInfo::Character { len: None, .. }))
+                    && !arg_sym.attrs.allocatable
+                {
+                    hidden_count += 1;
+                }
+            }
+        }
+    }
+
+    // @abi line for the procedure.
+    writeln!(out, "  @abi cc=aapcs64 hidden_char_lens={}", hidden_count).unwrap();
 
     let mut reg_idx = 0usize;
     if let Some(pscope) = proc_scope {
@@ -259,18 +271,20 @@ fn emit_procedure(
         }
     }
 
-    // Hidden character-length args.
-    if let Some(flags) = char_len_star_params.get(&name_lc) {
-        let arg_names: Vec<&str> = if let Some(ps) = proc_scope {
-            ps.arg_order.iter().map(|s| s.as_str()).collect()
-        } else {
-            sym.arg_names.iter().map(|s| s.as_str()).collect()
-        };
-        for (i, flag) in flags.iter().enumerate() {
-            if *flag {
-                if let Some(aname) = arg_names.get(i) {
+    // Hidden character-length args — infer from the scope's arg types.
+    // Any arg with TypeInfo::Character { len: None } that isn't
+    // allocatable is an assumed-length (len=*) dummy that gets a
+    // hidden i64 length parameter appended after the normal args.
+    if let Some(pscope) = proc_scope {
+        for arg_name in &pscope.arg_order {
+            if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
+                let is_assumed_len = matches!(
+                    arg_sym.type_info,
+                    Some(TypeInfo::Character { len: None, .. })
+                ) && !arg_sym.attrs.allocatable;
+                if is_assumed_len {
                     let reg = if reg_idx < 8 { format!("x{}", reg_idx) } else { format!("stack+{}", (reg_idx - 8) * 8) };
-                    writeln!(out, "  @arg {}@len : integer(8)", aname).unwrap();
+                    writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
                     writeln!(out, "    @abi pass={} width=8 hidden", reg).unwrap();
                     reg_idx += 1;
                 }
@@ -846,6 +860,28 @@ pub fn extract_module_globals(
                     external: true,
                 },
             );
+        }
+    }
+    out
+}
+
+/// Extract char_len_star_params from a loaded ModuleInterface.
+/// For each procedure with character(len=*) args, produces a
+/// Vec<bool> (per-position, true = assumed-length character).
+pub fn extract_char_len_star_params(
+    iface: &ModuleInterface,
+) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for proc in &iface.procedures {
+        let visible_args: Vec<&AmodArg> = proc.args.iter()
+            .filter(|a| !a.hidden)
+            .collect();
+        let flags: Vec<bool> = visible_args.iter().map(|a| {
+            matches!(a.type_info, Some(TypeInfo::Character { len: None, .. }))
+                && !a.allocatable
+        }).collect();
+        if flags.iter().any(|f| *f) {
+            out.insert(proc.name.to_lowercase(), flags);
         }
     }
     out

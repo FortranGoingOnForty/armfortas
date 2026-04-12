@@ -210,6 +210,7 @@ pub fn lower_file(
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     external_globals: HashMap<(String, String), ModuleGlobalInfo>,
+    external_char_len_star: HashMap<String, Vec<bool>>,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
@@ -257,7 +258,7 @@ pub fn lower_file(
         collect_descriptor_params(&unit.node, &mut descriptor_params);
     }
 
-    let mut char_len_star_params: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut char_len_star_params: HashMap<String, Vec<bool>> = external_char_len_star;
     for unit in units {
         collect_char_len_star_params(&unit.node, &mut char_len_star_params);
     }
@@ -10768,7 +10769,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         let (st, layouts) = { let rr = resolve::resolve_file(&units, &[]).unwrap(); (rr.st, rr.type_layouts) };
-        lower_file(&units, &st, &layouts, HashMap::new()).0
+        lower_file(&units, &st, &layouts, HashMap::new(), HashMap::new()).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {

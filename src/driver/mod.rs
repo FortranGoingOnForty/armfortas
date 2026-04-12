@@ -256,7 +256,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts, external_globals);
+    // Build external char_len_star_params from .amod-loaded modules.
+    let mut external_char_len_star = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
+    }
+
+    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts, external_globals, external_char_len_star);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
