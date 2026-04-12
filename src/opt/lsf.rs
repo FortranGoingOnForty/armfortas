@@ -44,7 +44,7 @@
 //! ```
 
 use super::pass::Pass;
-use super::alias::{self, AliasResult};
+use super::alias::{self, AliasResult, may_reach_through_call_arg};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
@@ -106,9 +106,15 @@ fn lsf_in_function(func: &mut Function) -> bool {
                         .filter(|arg| value_is_pointer(func, *arg))
                         .collect();
                     if !pointer_args.is_empty() {
+                        // Call boundaries use the coarser
+                        // may_reach_through_call_arg predicate: a
+                        // callee that gets a pointer can walk to
+                        // any offset within the same allocation,
+                        // so a precise "different GEP offset →
+                        // NoAlias" answer is unsound here.
                         available.retain(|entry| {
                             pointer_args.iter().all(|arg| {
-                                matches!(alias::query(func, entry.ptr, *arg), AliasResult::NoAlias)
+                                !may_reach_through_call_arg(func, entry.ptr, *arg)
                             })
                         });
                     }
@@ -357,6 +363,104 @@ mod tests {
             "return should use the stored value after forwarding, got {:?}",
             term
         );
+    }
+
+    #[test]
+    fn call_invalidates_store_when_arg_shares_alloca_base_with_entry() {
+        // A call receiving `gep %alloca, [0]` can walk to any
+        // offset within %alloca; a prior store to `gep %alloca, [1]`
+        // must be invalidated even though the precise offsets
+        // differ.  Mirror of contained_dummy_array_ref: caller
+        // stores arr(2)=20, calls touch(arr), then reads arr(2).
+        // The read must see the callee's store, not the caller's
+        // earlier constant.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
+        let alloca = push(&mut f, InstKind::Alloca(arr_ty.clone()),
+                          IrType::Ptr(Box::new(arr_ty)));
+        let c0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I64), IrType::Int(IntWidth::I64));
+        let c1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I64), IrType::Int(IntWidth::I64));
+        let g0 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c0]),
+                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let g1 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c1]),
+                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let v20 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v20, g1), IrType::Void);
+        push(&mut f, InstKind::Call(FuncRef::External("touch".into()), vec![g0]), IrType::Void);
+        let load = push(&mut f, InstKind::Load(g1), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        LocalLsf.run(&mut m);
+        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        if let Terminator::Return(Some(v)) = term {
+            assert_ne!(*v, v20, "LSF forwarded arr[1] load to the caller's pre-call constant across a call that received arr[0]; callee could have walked to arr[1]");
+        } else {
+            panic!("unexpected terminator: {:?}", term);
+        }
+    }
+
+    #[test]
+    fn chained_gep_through_arg_ptr_invalidates_direct_gep_store() {
+        // Mirror of contained_dummy_array_ref at O1.
+        //
+        //   %alloca = alloca [i32 x 2]            ; caller's arr
+        //   %g0     = gep %alloca, [0]            ; arr[0]
+        //   %g1     = gep %alloca, [1]            ; arr[1]
+        //   store %20, %g1                        ; arr[1] = 20 (caller init)
+        //   %chain0 = gep %g0, [0]                ; chained arr[0]
+        //   store %11, %chain0                    ; arr[0] = 11 (inlined touch)
+        //   %chain1 = gep %g0, [1]                ; chained arr[1]
+        //   store %31, %chain1                    ; arr[1] = 31 (inlined touch)
+        //   %load   = load %g1                    ; print arr[1]
+        //   return %load                          ; must be 31, not 20
+        //
+        // If LocalLsf or the alias oracle doesn't see that %chain1
+        // aliases %g1 (both are byte-offset 4 from %alloca), the
+        // load gets forwarded to %20 and the caller prints garbage.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
+        let alloca = push(&mut f, InstKind::Alloca(arr_ty.clone()),
+                          IrType::Ptr(Box::new(arr_ty)));
+        let c0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I64), IrType::Int(IntWidth::I64));
+        let c1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I64), IrType::Int(IntWidth::I64));
+        let g0 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c0]),
+                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let g1 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c1]),
+                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+
+        let v20 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v20, g1), IrType::Void);
+
+        let chain0 = push(&mut f, InstKind::GetElementPtr(g0, vec![c0]),
+                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let v11 = push(&mut f, InstKind::ConstInt(11, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v11, chain0), IrType::Void);
+
+        let chain1 = push(&mut f, InstKind::GetElementPtr(g0, vec![c1]),
+                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let v31 = push(&mut f, InstKind::ConstInt(31, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(&mut f, InstKind::Store(v31, chain1), IrType::Void);
+
+        let load = push(&mut f, InstKind::Load(g1), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        LocalLsf.run(&mut m);
+        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        // The load must either remain or be forwarded to v31 — never
+        // to v20.
+        if let Terminator::Return(Some(v)) = term {
+            assert_ne!(*v, v20, "LSF forwarded load %g1 to the pre-chained-store value v20, shadowing the chained-GEP aliasing store v31");
+        } else {
+            panic!("unexpected terminator: {:?}", term);
+        }
     }
 
     #[test]

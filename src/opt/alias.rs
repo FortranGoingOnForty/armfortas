@@ -28,6 +28,43 @@ pub enum AliasResult {
     NoAlias,
 }
 
+/// True if `entry_ptr` may be reachable through `call_arg` when
+/// a call passes `call_arg` across a function boundary.
+///
+/// At call boundaries the precise offset-based alias check is
+/// unsound: the callee receives the pointer and can walk to any
+/// offset within the same allocation.  `query()` would say
+/// `NoAlias` for `gep %0, [0]` vs `gep %0, [1]` because their
+/// offsets differ, but a callee reading through the former can
+/// still touch the latter.  Load-store forwarding and DSE must
+/// use this coarser predicate when reasoning about calls.
+///
+/// The rule: if both pointers trace to the same underlying
+/// allocation (same alloca, same global, same param slot), they
+/// are considered call-reachable aliases regardless of offset.
+/// Distinct allocations remain NoAlias by Fortran's strong
+/// aliasing guarantee.
+pub fn may_reach_through_call_arg(func: &Function, entry_ptr: ValueId, call_arg: ValueId) -> bool {
+    if entry_ptr == call_arg {
+        return true;
+    }
+    let base_entry = trace_base(func, entry_ptr);
+    let base_arg = trace_base(func, call_arg);
+    match (&base_entry, &base_arg) {
+        (PtrBase::Alloca(a), PtrBase::Alloca(b)) => a == b,
+        (PtrBase::Global(a), PtrBase::Global(b)) => a == b,
+        (PtrBase::Param(a), PtrBase::Param(b)) => {
+            if a == b {
+                return true;
+            }
+            !(param_is_fortran_noalias(func, *a) && param_is_fortran_noalias(func, *b))
+        }
+        (PtrBase::Unknown, _) | (_, PtrBase::Unknown) => true,
+        // Distinct kinds of allocations never alias per Fortran.
+        _ => false,
+    }
+}
+
 /// Query whether two pointer values may alias.
 ///
 /// Both `a` and `b` should be pointer-typed values (results of Alloca,
