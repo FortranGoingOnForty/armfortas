@@ -560,7 +560,7 @@ mod tests {
             "fixture should lower cleanly: {:?}",
             diags
         );
-        lower::lower_file(&units, &st, &type_layouts)
+        lower::lower_file(&units, &st, &type_layouts).0
     }
 
     fn build_pre_gvn_o2_pipeline() -> PassManager {

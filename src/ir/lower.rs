@@ -209,7 +209,7 @@ pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Module {
+) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
 
@@ -296,7 +296,7 @@ pub fn lower_file(
             false,
         );
     }
-    module
+    (module, globals)
 }
 
 fn collect_internal_func_names(
@@ -775,23 +775,12 @@ fn install_equivalence_locals(
 /// reconstruct a `LocalInfo` for it inside each function that
 /// USE-imports the module.
 #[derive(Clone)]
-struct ModuleGlobalInfo {
-    /// Mach-O symbol name (already prefixed with `afs_mod_<mod>_`).
-    symbol: String,
-    /// Element type (for scalars) or array element type (for arrays).
-    ty: IrType,
-    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars
-    /// and for deferred-shape allocatables.
-    dims: Vec<(i64, i64)>,
-    /// True for module-level allocatable arrays. The global is a
-    /// 384-byte zero-init descriptor; runtime allocate() populates
-    /// it. install_globals_as_locals threads this through into
-    /// LocalInfo.allocatable so subscript access goes through the
-    /// runtime descriptor path. Audit MAJOR-5.
-    allocatable: bool,
-    /// True for module-level `character(len=:), allocatable` globals.
-    /// The global is a 32-byte zero-init StringDescriptor.
-    deferred_char: bool,
+pub(crate) struct ModuleGlobalInfo {
+    pub symbol: String,
+    pub ty: IrType,
+    pub dims: Vec<(i64, i64)>,
+    pub allocatable: bool,
+    pub deferred_char: bool,
 }
 
 /// Walk a module's declarations and emit a global per variable.
@@ -10771,7 +10760,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         let (st, layouts) = resolve::resolve_file(&units).unwrap();
-        lower_file(&units, &st, &layouts)
+        lower_file(&units, &st, &layouts).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {

@@ -245,7 +245,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let mut ir_module = lower::lower_file(&units, &st, &type_layouts);
+    let (mut ir_module, _module_globals) = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
