@@ -4509,18 +4509,21 @@ fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalIn
     } else {
         None
     };
+    // Module globals installed via install_globals_as_locals have
+    // `allocatable: true` but their storage lives in the module's
+    // .data section — freeing it at procedure return would destroy
+    // state that the caller still needs.  Detect them by checking
+    // whether info.addr was produced by a GlobalAddr instruction.
+    let global_addrs = collect_global_addr_values(b);
+
     let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (_name, info) in sorted {
         // Skip caller-owned allocatables (sret result variables).
         if skip_addr == Some(info.addr) { continue; }
+        // Skip module globals — they outlive this procedure.
+        if global_addrs.contains(&info.addr) { continue; }
         // Skip pointers: a POINTER variable does not own its target.
-        // Its slot may look allocatable-shaped (pointer-to-array uses
-        // the 384-byte descriptor layout) but the base_addr belongs
-        // to whatever TARGET the pointer is associated with — freeing
-        // it through the pointer would double-free or free stack
-        // storage.  F2018 19.5 distinguishes POINTER deallocation
-        // (explicit DEALLOCATE(p)) from scope exit.
         if info.is_pointer { continue; }
         if info.char_kind == CharKind::Deferred {
             b.call(
