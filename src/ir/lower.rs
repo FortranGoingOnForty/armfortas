@@ -5288,7 +5288,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Block { body, .. } => {
+        Stmt::Block { decls, body, .. } => {
+            // F2008 BLOCK: declarations create new locals scoped to
+            // the body, then statements execute.  We alloc+init the
+            // decls into the current locals map (no separate scope
+            // yet — a future refinement would push/pop a scope).
+            if !decls.is_empty() {
+                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new());
+                init_decls(b, &ctx.locals, decls, ctx.st);
+            }
             lower_stmts(b, ctx, body);
         }
 

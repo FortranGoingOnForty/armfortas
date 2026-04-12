@@ -298,7 +298,7 @@ impl<'a> Parser<'a> {
 
     /// Parse the body of a program unit: uses, implicit, declarations, then executable statements.
     #[allow(clippy::type_complexity)]
-    fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>, Vec<SpannedUnit>), ParseError> {
+    pub(crate) fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>, Vec<SpannedUnit>), ParseError> {
         let mut uses = Vec::new();
         let mut imports = Vec::new();
         let mut implicit = Vec::new();

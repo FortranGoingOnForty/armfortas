@@ -82,7 +82,7 @@ pub enum Stmt {
     ForallStmt { specs: Vec<ForallSpec>, mask: Option<SpannedExpr>, stmt: Box<SpannedStmt> },
 
     // ---- BLOCK / ASSOCIATE ----
-    Block { name: Option<String>, body: Vec<SpannedStmt> },
+    Block { name: Option<String>, decls: Vec<super::decl::SpannedDecl>, body: Vec<SpannedStmt> },
     Associate { name: Option<String>, assocs: Vec<(String, SpannedExpr)>, body: Vec<SpannedStmt> },
 
     // ---- Branch/transfer ----
