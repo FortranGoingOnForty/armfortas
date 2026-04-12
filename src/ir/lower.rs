@@ -4296,13 +4296,11 @@ fn lower_string_expr(
                 match key.as_str() {
                     "trim" => {
                         if let Some(arg) = first_char_arg {
-                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
-                                let len_val = b.const_i64(declared_len);
-                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                            if let Some((src_ptr, len_val)) = char_addr_and_runtime_len(b, arg, locals) {
+                                let buf = b.runtime_call(RuntimeFunc::Allocate, vec![len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                 b.call(FuncRef::External("memcpy".into()),
                                     vec![buf, src_ptr, len_val],
                                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                                // Compute the trimmed length at runtime.
                                 let trimmed_len = b.call(FuncRef::External("afs_len_trim".into()),
                                     vec![src_ptr, len_val], IrType::Int(IntWidth::I64));
                                 return (buf, trimmed_len);
@@ -4311,9 +4309,8 @@ fn lower_string_expr(
                     }
                     "adjustl" => {
                         if let Some(arg) = first_char_arg {
-                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
-                                let len_val = b.const_i64(declared_len);
-                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                            if let Some((src_ptr, len_val)) = char_addr_and_runtime_len(b, arg, locals) {
+                                let buf = b.runtime_call(RuntimeFunc::Allocate, vec![len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                 b.call(FuncRef::External("afs_adjustl".into()),
                                     vec![buf, src_ptr, len_val], IrType::Void);
                                 return (buf, len_val);
@@ -4322,9 +4319,8 @@ fn lower_string_expr(
                     }
                     "adjustr" => {
                         if let Some(arg) = first_char_arg {
-                            if let Some((src_ptr, declared_len)) = char_addr_and_len(b, arg, locals) {
-                                let len_val = b.const_i64(declared_len);
-                                let buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), declared_len as u64));
+                            if let Some((src_ptr, len_val)) = char_addr_and_runtime_len(b, arg, locals) {
+                                let buf = b.runtime_call(RuntimeFunc::Allocate, vec![len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                                 b.call(FuncRef::External("afs_adjustr".into()),
                                     vec![buf, src_ptr, len_val], IrType::Void);
                                 return (buf, len_val);
