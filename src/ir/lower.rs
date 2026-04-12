@@ -1177,10 +1177,11 @@ fn lower_unit(
                         b.store(*pid, slot);
                         // Check if this is a derived type parameter.
                         let dt_name = arg_derived_type_name(pname, decls);
+                        let ck = arg_char_kind_from_decls(pname, decls);
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None, is_pointer: false,
+                            char_kind: ck, derived_type: dt_name, inline_const: None, is_pointer: false,
                         };
                         ctx.locals.insert(pname.clone(), info);
                     }
@@ -3947,6 +3948,41 @@ fn lower_intrinsic_subroutine(
 
 /// Look up a dummy argument's declared type from the declaration list.
 /// Returns the IR type for the argument, defaulting to I32 if not found.
+/// Determine the CharKind for a dummy argument from its declaration.
+///
+/// Returns `CharKind::Fixed(n)` if the declaration is
+/// `character(len=n)`, `CharKind::None` otherwise. Assumed-length
+/// dummies (`character(len=*)`) currently return `CharKind::None`
+/// because the hidden-length ABI parameter that would supply the
+/// runtime length is not yet implemented.
+fn arg_char_kind_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> CharKind {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    match type_spec {
+                        TypeSpec::Character(Some(sel)) => {
+                            match &sel.len {
+                                Some(crate::ast::decl::LenSpec::Expr(e)) => {
+                                    if let Some(n) = eval_const_int_in_scope(e, &HashMap::new()) {
+                                        return CharKind::Fixed(n);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        TypeSpec::Character(None) => return CharKind::Fixed(1),
+                        _ => {}
+                    }
+                    return CharKind::None;
+                }
+            }
+        }
+    }
+    CharKind::None
+}
+
 fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> IrType {
     let key = arg_name.to_lowercase();
     for decl in decls {
@@ -4118,19 +4154,20 @@ fn lower_string_expr(
             let key = name.to_lowercase();
             if let Some(info) = locals.get(&key) {
                 match &info.char_kind {
-                    CharKind::Fixed(len) => {
-                        let len_val = b.const_i64(*len);
-                        (info.addr, len_val)
-                    }
-                    CharKind::Deferred => {
-                        // Load data ptr (offset 0) and len (offset 8) from StringDescriptor.
-                        // StringDescriptor layout: [data(8), len(8), capacity(8), flags(4)]
-                        let ptr = b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        // GEP with byte offset: use Ptr<i8> result so elem_size=1.
-                        let eight = b.const_i64(8);
-                        let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I8));
-                        let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
-                        (ptr, len)
+                    CharKind::Fixed(_) | CharKind::Deferred => {
+                        // Delegate to char_addr_and_runtime_len which
+                        // correctly handles both local buffers (GEP
+                        // to element 0) and by_ref dummies (double
+                        // load through the wrapper alloca).  The
+                        // previous inline path returned info.addr
+                        // raw for Fixed, which is wrong for dummies.
+                        if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
+                            (ptr, len)
+                        } else {
+                            let val = lower_expr(b, locals, expr, st);
+                            let zero = b.const_i64(0);
+                            (val, zero)
+                        }
                     }
                     CharKind::None => {
                         // Not a character variable — shouldn't happen but fall back.
