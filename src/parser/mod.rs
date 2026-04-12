@@ -107,9 +107,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip newlines (which are statement terminators but not significant mid-parse).
+    /// Skip statement boundaries (newlines, comments, and semicolons).
+    /// F2018 §6.3.2: a semicolon separates statements on the same line
+    /// and is semantically equivalent to a newline.
     pub fn skip_newlines(&mut self) {
-        while matches!(self.peek(), TokenKind::Newline | TokenKind::Comment) {
+        while matches!(self.peek(), TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon) {
             self.advance();
         }
     }
