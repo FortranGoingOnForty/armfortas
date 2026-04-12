@@ -5873,6 +5873,53 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             }
 
+            // Array element target: p => arr(i) — compute the
+            // element's address via GEP and store into the pointer slot.
+            if let Expr::FunctionCall { callee, args: val_args } = &value.node {
+                if let Expr::Name { name: arr_name } = &callee.node {
+                    let arr_key = arr_name.to_lowercase();
+                    if let Some(arr_info) = ctx.locals.get(&arr_key).cloned() {
+                        if (!arr_info.dims.is_empty() || arr_info.allocatable)
+                            && val_args.len() == 1
+                            && matches!(val_args[0].value, crate::ast::expr::SectionSubscript::Element(_))
+                        {
+                            if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &val_args[0].value {
+                                let base = array_data_ptr_for_call(b, &arr_info);
+                                let idx = lower_expr(b, &ctx.locals, idx_expr, ctx.st);
+                                let idx64 = match b.func().value_type(idx) {
+                                    Some(IrType::Int(IntWidth::I64)) => idx,
+                                    _ => b.int_extend(idx, IntWidth::I64, true),
+                                };
+                                let one = b.const_i64(1);
+                                let idx0 = b.isub(idx64, one);
+                                let elem_ptr = b.gep(base, vec![idx0], arr_info.ty.clone());
+                                b.store(elem_ptr, tgt_info.addr);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Component access target: p => dt%field — resolve the
+            // field's address and store into the pointer slot.
+            if let Expr::ComponentAccess { base, component } = &value.node {
+                if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(field) = layout.field(component) {
+                            let offset = b.const_i64(field.offset as i64);
+                            let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+                            // Cast ptr<i8> → ptr<tgt_ty> via zero-offset GEP
+                            // so the store type matches the pointer slot.
+                            let zero = b.const_i64(0);
+                            let typed_ptr = b.gep(field_ptr, vec![zero], tgt_info.ty.clone());
+                            b.store(typed_ptr, tgt_info.addr);
+                            return;
+                        }
+                    }
+                }
+            }
+
             let Expr::Name { name: src_name } = &value.node else { return; };
             let src_key = src_name.to_lowercase();
             let Some(src_info) = ctx.locals.get(&src_key).cloned() else { return; };
