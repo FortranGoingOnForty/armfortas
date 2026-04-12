@@ -71,6 +71,8 @@ pub struct Options {
     pub emit_ir: bool,         // --emit-ir
     pub preprocess_only: bool, // -E
     pub opt_level: OptLevel,   // -O0 .. -Ofast
+    /// Directories to search for `.amod` module files (`-I <dir>`).
+    pub module_search_paths: Vec<PathBuf>,
 }
 
 impl Options {
@@ -82,6 +84,7 @@ impl Options {
         let mut emit_ir = false;
         let mut preprocess_only = false;
         let mut opt_level = OptLevel::O0;
+        let mut module_search_paths = Vec::new();
 
         let mut i = 0;
         while i < args.len() {
@@ -98,6 +101,18 @@ impl Options {
                 "-c" => emit_obj = true,
                 "-E" => preprocess_only = true,
                 "--emit-ir" => emit_ir = true,
+                "-I" => {
+                    i += 1;
+                    if i < args.len() {
+                        module_search_paths.push(PathBuf::from(&args[i]));
+                    } else {
+                        return Err("-I requires a directory argument".into());
+                    }
+                }
+                arg if arg.starts_with("-I") => {
+                    // -Idir (no space)
+                    module_search_paths.push(PathBuf::from(&arg[2..]));
+                }
                 arg if arg.starts_with("-O") => {
                     let tail = &arg[1..];
                     opt_level = OptLevel::parse_flag(tail)
@@ -120,6 +135,7 @@ impl Options {
             emit_ir,
             preprocess_only,
             opt_level,
+            module_search_paths,
         })
     }
 
@@ -584,6 +600,7 @@ mod tests {
             emit_ir: true,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("O0 --emit-ir should support integer(16) staging");
@@ -607,6 +624,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         let err = compile(&opts).expect_err("backend should reject integer(16) until i128 codegen lands");
@@ -632,6 +650,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("simple integer(16) memory traffic should codegen at O0");
@@ -655,6 +674,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("simple integer(16) add should codegen at O0");
@@ -678,6 +698,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("internal integer(16) call should codegen at O0");
@@ -702,6 +723,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("external integer(16) call should codegen at O0");
@@ -726,6 +748,7 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O1,
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("integer(16) multiply should codegen at O1 after const fold");
