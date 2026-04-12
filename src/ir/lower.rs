@@ -789,6 +789,9 @@ struct ModuleGlobalInfo {
     /// LocalInfo.allocatable so subscript access goes through the
     /// runtime descriptor path. Audit MAJOR-5.
     allocatable: bool,
+    /// True for module-level `character(len=:), allocatable` globals.
+    /// The global is a 32-byte zero-init StringDescriptor.
+    deferred_char: bool,
 }
 
 /// Walk a module's declarations and emit a global per variable.
@@ -846,6 +849,32 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims: vec![],
                             allocatable: true,
+                            deferred_char: false,
+                        },
+                    );
+                    continue;
+                }
+
+                // Deferred-length allocatable character: 32-byte
+                // StringDescriptor global.
+                let is_deferred_char = matches!(type_spec,
+                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+                );
+                if is_allocatable && is_deferred_char && array_spec.is_none() {
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: desc_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: ir_ty.clone(),
+                            dims: vec![],
+                            allocatable: false,
+                            deferred_char: true,
                         },
                     );
                     continue;
@@ -908,6 +937,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims,
                             allocatable: false,
+                            deferred_char: false,
                         },
                     );
                 } else {
@@ -926,6 +956,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims: vec![],
                             allocatable: false,
+                            deferred_char: false,
                         },
                     );
                 }
@@ -2238,16 +2269,15 @@ fn install_one_global(
     info: &ModuleGlobalInfo,
 ) {
     if locals.contains_key(&local_key) { return; }
-    // For allocatable module arrays the global is a 384-byte
-    // descriptor — global_addr produces a `Ptr<Array<i8, 384>>`
-    // which feeds the runtime allocate/deallocate/subscript
-    // helpers as the descriptor address.
     let addr_ty = if info.allocatable {
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
+    } else if info.deferred_char {
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32)
     } else {
         info.ty.clone()
     };
     let addr = b.global_addr(&info.symbol, addr_ty);
+    let ck = if info.deferred_char { CharKind::Deferred } else { CharKind::None };
     locals.insert(local_key, LocalInfo {
         addr,
         ty: info.ty.clone(),
@@ -2255,7 +2285,7 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
+        char_kind: ck, derived_type: None, inline_const: None, is_pointer: false,
     });
 }
 
