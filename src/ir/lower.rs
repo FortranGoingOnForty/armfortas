@@ -6600,7 +6600,15 @@ fn lower_write_items_adv(
                 if let Some(info) = ctx.locals.get(&key).cloned() {
                     if is_complex_ty(&info.ty) {
                         // Complex variable: pass pointer to [f32/f64 x 2] buffer.
-                        let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                        // For a POINTER complex, the slot holds the
+                        // target buffer address — load it first.
+                        let addr = if info.is_pointer {
+                            b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())))
+                        } else if info.by_ref {
+                            b.load(info.addr)
+                        } else {
+                            info.addr
+                        };
                         let func = if matches!(info.ty, IrType::Array(ref e, 2)
                                 if matches!(e.as_ref(), IrType::Float(FloatWidth::F64))) {
                             "afs_write_complex_f64"
