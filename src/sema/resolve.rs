@@ -460,6 +460,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         sym.type_info = Some(type_info.clone());
                         sym.attrs = sym_attrs.clone();
                     } else {
+                        // Try to fold PARAMETER initializers to a
+                        // compile-time integer so .amod can carry the
+                        // value and consumers can inline it.
+                        let const_value = if sym_attrs.parameter {
+                            entity.init.as_ref().and_then(|e| eval_const_int_expr(e))
+                        } else { None };
                         st.define(Symbol {
                             name: entity.name.clone(),
                             kind,
@@ -468,7 +474,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             defined_at: decl.span,
                             scope: st.current_scope(),
                             arg_names: vec![],
-                            const_value: None,
+                            const_value,
                         })?;
                     }
                 }
@@ -558,6 +564,41 @@ fn process_contains(
 // ---- Helpers ----
 
 /// Extract a compile-time integer kind value from a KindSelector.
+/// Try to evaluate a PARAMETER initializer to a compile-time i64.
+/// Handles integer literals, negation, and simple binary ops on
+/// integer literals.  Returns None for anything more complex.
+fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => {
+            // Strip kind suffix (e.g., "42_8" → "42").
+            let clean = text.split('_').next().unwrap_or(text);
+            clean.parse::<i64>().ok()
+        }
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_const_int_expr(operand)?;
+            match op {
+                crate::ast::expr::UnaryOp::Minus => Some(-v),
+                crate::ast::expr::UnaryOp::Plus => Some(v),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_const_int_expr(left)?;
+            let r = eval_const_int_expr(right)?;
+            match op {
+                crate::ast::expr::BinaryOp::Add => Some(l + r),
+                crate::ast::expr::BinaryOp::Sub => Some(l - r),
+                crate::ast::expr::BinaryOp::Mul => Some(l * r),
+                crate::ast::expr::BinaryOp::Div if r != 0 => Some(l / r),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_int_expr(inner),
+        _ => None,
+    }
+}
+
 fn extract_kind(sel: &Option<decl::KindSelector>) -> Option<u8> {
     use crate::ast::expr::Expr;
     match sel {

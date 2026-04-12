@@ -2359,6 +2359,19 @@ fn install_globals_as_locals(
                 if rename_targets.contains(var) { continue; }
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
             }
+            // Also scan the SymbolTable module scope for symbols not
+            // in the globals map (e.g., PARAMETERs, which are inlined
+            // and don't generate globals).
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                for (sym_key, sym) in &st.scope(mod_scope_id).symbols {
+                    if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) { continue; }
+                    if rename_targets.contains(sym_key) { continue; }
+                    let pair = (mod_key.clone(), sym_key.clone());
+                    if !globals.contains_key(&pair) && !pending.iter().any(|(k, _)| k == sym_key) {
+                        pending.push((sym_key.clone(), pair));
+                    }
+                }
+            }
             for rn in renames {
                 pending.push((
                     rn.local.to_lowercase(),

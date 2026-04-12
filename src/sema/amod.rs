@@ -594,7 +594,20 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (type_and_attrs, "")
     };
 
-    let type_info = parse_type_info(type_str.trim());
+    let mut const_value = None;
+    // For @param with `= value`, strip the value suffix from the
+    // type string before parsing the type.
+    let clean_type_str = if is_param {
+        if let Some(eq_idx) = type_str.rfind(" = ") {
+            let val_str = type_str[eq_idx + 3..].trim();
+            if let Ok(v) = val_str.parse::<i64>() {
+                const_value = Some(v);
+            }
+            &type_str[..eq_idx]
+        } else { type_str }
+    } else { type_str };
+
+    let type_info = parse_type_info(clean_type_str.trim());
     let allocatable = attr_str.contains("allocatable");
     let save = attr_str.contains("save");
     let pointer = attr_str.contains("pointer");
@@ -603,7 +616,6 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let mut ir_symbol = None;
     let mut deferred_char = false;
     let mut dims = Vec::new();
-    let mut const_value = None;
 
     if let Some(ir) = ir_part {
         let parts: Vec<&str> = ir.split_whitespace().collect();
@@ -613,16 +625,6 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         for part in &parts[1..] {
             if *part == "@deferred_char" {
                 deferred_char = true;
-            }
-        }
-        // TODO: parse @dims and const_value from the = N suffix
-    }
-
-    // Check for = value (parameter constant).
-    if is_param {
-        if let Some(eq_idx) = name_type.rfind(" = ") {
-            if let Ok(v) = name_type[eq_idx + 3..].trim().parse::<i64>() {
-                const_value = Some(v);
             }
         }
     }
