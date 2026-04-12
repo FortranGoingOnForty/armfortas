@@ -404,10 +404,13 @@ _main:
                     let amod_text = crate::sema::amod::write_amod(
                         name,
                         opts.input.to_str().unwrap_or(""),
+                        &source,
                         &st,
                         mod_scope_id,
                         &module_globals,
                         &type_layouts,
+                        &ir_module,
+                        &std::collections::HashMap::new(), // char_len_star computed by writer from scope
                     );
                     let amod_path = opts.output_path()
                         .parent()
