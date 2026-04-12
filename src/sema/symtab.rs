@@ -302,6 +302,10 @@ pub struct SymbolAttrs {
     pub intent: Option<Intent>,
     pub external: bool,
     pub intrinsic: bool,
+    /// Procedure declared with the PURE prefix.
+    pub pure: bool,
+    /// Procedure declared with the ELEMENTAL prefix.
+    pub elemental: bool,
 }
 
 impl Default for SymbolAttrs {
@@ -318,6 +322,8 @@ impl Default for SymbolAttrs {
             intent: None,
             external: false,
             intrinsic: false,
+            pure: false,
+            elemental: false,
         }
     }
 }

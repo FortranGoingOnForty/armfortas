@@ -339,9 +339,10 @@ fn validate_stmts(ctx: &mut Ctx, stmts: &[SpannedStmt]) {
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     match &stmt.node {
         // ---- Assignment ----
-        Stmt::Assignment { target, .. } => {
+        Stmt::Assignment { target, value } => {
             validate_assignment_target(ctx, target, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "assignment");
+            if ctx.in_pure { check_pure_expr_calls(ctx, value); }
         }
         Stmt::PointerAssignment { target, value, .. } => {
             validate_pointer_assignment(ctx, target, value, stmt.span);
@@ -545,11 +546,52 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
 /// so this is conservative: we warn if the callee resolves to an
 /// external procedure (whose body we cannot inspect).  I/O, STOP,
 /// and SAVE violations are caught statement-level in validate_stmt.
-fn validate_pure_call(_ctx: &mut Ctx, _callee: &crate::ast::expr::SpannedExpr, _span: Span) {
-    // The per-symbol `pure` attribute is still deferred; until then,
-    // the GVN side-guard in src/opt/gvn.rs (reads_non_argument_memory)
-    // catches the common miscompile path by refusing to hash-cons
-    // any PURE call that touches module state in its body.
+/// Walk an expression tree and check any function calls against the
+/// pure-call constraint.  Catches `r = impure_fn()` which is an
+/// expression-level call, not a `Stmt::Call`.
+fn check_pure_expr_calls(ctx: &mut Ctx, expr: &crate::ast::expr::SpannedExpr) {
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            validate_pure_call(ctx, callee, expr.span);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    check_pure_expr_calls(ctx, e);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_pure_expr_calls(ctx, left);
+            check_pure_expr_calls(ctx, right);
+        }
+        Expr::UnaryOp { operand, .. } => check_pure_expr_calls(ctx, operand),
+        Expr::ParenExpr { inner } => check_pure_expr_calls(ctx, inner),
+        _ => {}
+    }
+}
+
+fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, span: Span) {
+    // F2018 15.7: a PURE procedure may only call PURE, ELEMENTAL,
+    // or intrinsic procedures.  If the callee resolves to a known
+    // symbol that is NOT marked pure/elemental/intrinsic, reject.
+    // Unknown callees (external without an interface) are left
+    // alone — the programmer's responsibility per F2018 §15.4.
+    let Some(name) = extract_base_name(callee) else { return; };
+    let Some(sym) = ctx.lookup(&name) else { return; };
+    match sym.kind {
+        SymbolKind::Function | SymbolKind::Subroutine => {
+            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic {
+                ctx.error(
+                    span,
+                    format!(
+                        "call to '{}' inside a pure procedure: callee is not pure, elemental, or intrinsic (F2018 15.7)",
+                        sym.name
+                    ),
+                );
+            }
+        }
+        SymbolKind::IntrinsicProc => {} // always OK
+        _ => {} // external / unknown — can't check
+    }
 }
 
 /// True if `sym` is declared outside the procedure rooted at

@@ -351,21 +351,23 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
         match &unit.node {
-            ProgramUnit::Subroutine { name, .. } => {
-                // Ignore duplicate if subprogram name already declared (e.g., as a variable).
-                // This is a name collision that sema will validate later.
+            ProgramUnit::Subroutine { name, prefix, .. } => {
+                let mut attrs = SymbolAttrs::default();
+                attrs.pure = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                attrs.elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                if attrs.elemental { attrs.pure = true; } // ELEMENTAL implies PURE
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
                     type_info: None,
-                    attrs: SymbolAttrs::default(),
+                    attrs,
                     defined_at: unit.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
                     const_value: None,
                 });
             }
-            ProgramUnit::Function { name, return_type, result, decls, .. } => {
+            ProgramUnit::Function { name, return_type, result, decls, prefix, .. } => {
                 let ret_type_info = return_type.as_ref().map(type_spec_to_info)
                     .or_else(|| {
                         // Infer return type from result variable's declaration.
@@ -382,11 +384,15 @@ fn process_contains(st: &mut SymbolTable, contains: &[SpannedUnit]) -> Result<()
                         }
                         None
                     });
+                let mut fn_attrs = SymbolAttrs::default();
+                fn_attrs.pure = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                fn_attrs.elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                if fn_attrs.elemental { fn_attrs.pure = true; }
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
                     type_info: ret_type_info,
-                    attrs: SymbolAttrs::default(),
+                    attrs: fn_attrs,
                     defined_at: unit.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
