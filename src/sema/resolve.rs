@@ -9,7 +9,7 @@ use crate::ast::decl::{SpannedDecl, Decl, TypeSpec, Attribute, OnlyItem};
 use super::symtab::*;
 
 /// Walk a list of program units and build the symbol table.
-pub fn resolve_file(units: &[SpannedUnit]) -> Result<(SymbolTable, super::type_layout::TypeLayoutRegistry), SemaError> {
+pub fn resolve_file(units: &[SpannedUnit], module_search_paths: &[std::path::PathBuf]) -> Result<(SymbolTable, super::type_layout::TypeLayoutRegistry), SemaError> {
     let mut st = SymbolTable::new();
     let mut layouts = super::type_layout::TypeLayoutRegistry::new();
 
@@ -495,7 +495,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        resolve_file(&units).unwrap().0
+        resolve_file(&units, &[]).unwrap().0
     }
 
     // ---- Integration tests ----

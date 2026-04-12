@@ -10759,7 +10759,7 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let (st, layouts) = resolve::resolve_file(&units).unwrap();
+        let (st, layouts) = resolve::resolve_file(&units, &[]).unwrap();
         lower_file(&units, &st, &layouts).0
     }
 

@@ -308,7 +308,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Ast, CapturedStage::Text(format!("{:#?}", units)));
     }
 
-    let (st, type_layouts) = resolve::resolve_file(&units).map_err(|e| CaptureFailure {
+    let (st, type_layouts) = resolve::resolve_file(&units, &[]).map_err(|e| CaptureFailure {
         input: input.clone(),
         opt_level: request.opt_level,
         stage: FailureStage::Sema,

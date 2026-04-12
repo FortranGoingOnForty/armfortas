@@ -222,7 +222,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     })?;
 
     // 5. Semantic analysis.
-    let (st, type_layouts) = resolve::resolve_file(&units).map_err(|e| {
+    let (st, type_layouts) = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
         format!(
             "{}:{}:{}: {}",
             opts.input.display(),
