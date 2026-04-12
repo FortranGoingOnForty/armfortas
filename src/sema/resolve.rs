@@ -256,8 +256,12 @@ fn process_uses(
                         });
                     }
                 }
+            } else {
+                return Err(SemaError {
+                    msg: format!("module '{}' not found (searched -I paths and current directory for {}.amod)", module, module.to_lowercase()),
+                    span: use_decl.span,
+                });
             }
-            // If module not found, it might be external — skip for now.
         }
     }
     Ok(())
