@@ -341,9 +341,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // ---- Assignment ----
         Stmt::Assignment { target, .. } => {
             validate_assignment_target(ctx, target, stmt.span);
+            reject_pure_nonlocal_definition(ctx, target, stmt.span, "assignment");
         }
         Stmt::PointerAssignment { target, value, .. } => {
             validate_pointer_assignment(ctx, target, value, stmt.span);
+            reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
 
         // ---- Allocate / Deallocate ----
@@ -539,12 +541,76 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
 }
 
 /// Check if a call in a pure procedure is to a known impure procedure.
-/// NOTE: This is a partial check — full validation requires tracking the
-/// pure attribute in the symbol table, which isn't done yet. Currently we
-/// only catch I/O, STOP, and SAVE violations (in validate_stmt). This stub
-/// exists for when symbol-level pure tracking is added.
+/// Symbol-level pure tracking isn't yet wired into the symbol table,
+/// so this is conservative: we warn if the callee resolves to an
+/// external procedure (whose body we cannot inspect).  I/O, STOP,
+/// and SAVE violations are caught statement-level in validate_stmt.
 fn validate_pure_call(_ctx: &mut Ctx, _callee: &crate::ast::expr::SpannedExpr, _span: Span) {
-    // Deferred: requires pure/impure attribute on Symbol.
+    // The per-symbol `pure` attribute is still deferred; until then,
+    // the GVN side-guard in src/opt/gvn.rs (reads_non_argument_memory)
+    // catches the common miscompile path by refusing to hash-cons
+    // any PURE call that touches module state in its body.
+}
+
+/// True if `sym` is declared outside the procedure rooted at
+/// `procedure_scope` — i.e. it comes from host association, USE
+/// association, or a COMMON block in an enclosing unit.  This is
+/// the F2018 15.7 "accessed by host or use association, or in
+/// common" predicate that makes a variable off-limits for
+/// definition inside a PURE procedure body.
+fn symbol_is_non_local_to_procedure(
+    st: &SymbolTable,
+    sym: &Symbol,
+    procedure_scope: ScopeId,
+) -> bool {
+    // Walk from `sym.scope` up the parent chain.  If we reach
+    // `procedure_scope` (or a descendant we started from), the
+    // symbol lives inside the current procedure — that's OK.
+    // If we reach the top (Global) without crossing the procedure
+    // boundary, the symbol is in an enclosing scope (module,
+    // parent program, parent subroutine).
+    let mut cur = Some(sym.scope);
+    while let Some(sid) = cur {
+        if sid == procedure_scope {
+            return false;
+        }
+        cur = st.scope(sid).parent;
+    }
+    true
+}
+
+/// Reject a PURE-procedure statement that would define a variable
+/// visible via host/use association or a common block.  The
+/// caller supplies the designator's root name; we look it up in
+/// the current scope and check whether its home scope lies
+/// outside the enclosing procedure.  F2018 15.7, C1598.
+fn reject_pure_nonlocal_definition(
+    ctx: &mut Ctx,
+    target: &crate::ast::expr::SpannedExpr,
+    span: Span,
+    stmt_label: &str,
+) {
+    if !ctx.in_pure {
+        return;
+    }
+    let Some(name) = extract_base_name(target) else { return; };
+    let Some(sym) = ctx.lookup(&name) else { return; };
+    // Only variables and COMMON blocks can be "defined"; function
+    // names get definition semantics too but those are the pure
+    // function's own result variable (always local).
+    if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::CommonBlock) {
+        return;
+    }
+    if symbol_is_non_local_to_procedure(ctx.st, sym, ctx.scope_id) {
+        let sym_name = sym.name.clone();
+        ctx.error(
+            span,
+            format!(
+                "{} target '{}' is accessed by host or use association and cannot be defined inside a pure procedure (F2018 15.7)",
+                stmt_label, sym_name
+            ),
+        );
+    }
 }
 
 /// Validate call-site argument intent constraints.
@@ -984,6 +1050,110 @@ pure function square(x) result(y)
 end function
 ");
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn pure_write_to_module_variable_errors() {
+        let errs = errors_from("\
+module m
+  integer :: counter = 0
+contains
+  pure integer function writes_counter() result(r)
+    counter = 99
+    r = counter
+  end function
+end module
+");
+        assert!(
+            errs.iter().any(|e| e.contains("counter") && e.contains("pure") && e.contains("host or use association")),
+            "expected pure+module-write error, got {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn pure_read_of_module_variable_ok() {
+        // F2018 15.7 permits a pure procedure to *reference* a
+        // variable accessed by use association; only definition
+        // is forbidden.  reads_counter is a legal pure function.
+        let errs = errors_from("\
+module m
+  integer :: counter = 0
+contains
+  pure integer function reads_counter() result(r)
+    r = counter
+  end function
+end module
+");
+        assert!(errs.is_empty(), "pure read of module variable should be legal, got {:?}", errs);
+    }
+
+    #[test]
+    fn pure_write_to_host_variable_errors() {
+        let errs = errors_from("\
+program p
+  integer :: host_var
+  host_var = 0
+  call helper()
+contains
+  pure subroutine helper()
+    host_var = 42
+  end subroutine
+end program
+");
+        assert!(
+            errs.iter().any(|e| e.contains("host_var") && e.contains("pure") && e.contains("host or use association")),
+            "expected pure+host-write error, got {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn pure_pointer_reassoc_of_module_pointer_errors() {
+        let errs = errors_from("\
+module m
+  integer, pointer :: module_p
+contains
+  pure subroutine reassoc(t)
+    integer, target, intent(in) :: t
+    module_p => t
+  end subroutine
+end module
+");
+        assert!(
+            errs.iter().any(|e| e.contains("module_p") && e.contains("pure") && e.contains("pointer assignment")),
+            "expected pure+module-pointer error, got {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn pure_local_pointer_reassoc_ok() {
+        // Associating a LOCAL pointer with a module TARGET is
+        // legal — `q => counter` does not modify `counter`.
+        let errs = errors_from("\
+module m
+  integer, target :: counter = 0
+contains
+  pure integer function associates_counter() result(r)
+    integer, pointer :: q
+    q => counter
+    r = 0
+  end function
+end module
+");
+        assert!(errs.is_empty(), "pure local pointer reassoc should be legal, got {:?}", errs);
+    }
+
+    #[test]
+    fn pure_intent_out_dummy_ok() {
+        let errs = errors_from("\
+pure subroutine zero_it(x)
+  integer, intent(out) :: x
+  x = 0
+end subroutine
+");
+        assert!(errs.is_empty(), "pure write to intent(out) dummy should be legal, got {:?}", errs);
     }
 
     // ---- Deferred length character ----
