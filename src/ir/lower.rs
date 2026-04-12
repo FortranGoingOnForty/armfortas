@@ -4262,6 +4262,43 @@ fn lower_string_expr(
                     }
                 }
             }
+            // Nested FunctionCall: arr(i)(lo:hi) — substring of a
+            // character array element. The outer callee is itself a
+            // FunctionCall (the element access) with a Range arg.
+            if let Expr::FunctionCall { callee: inner_callee, args: inner_args } = &callee.node {
+                if let Expr::Name { name: arr_name } = &inner_callee.node {
+                    let akey = arr_name.to_lowercase();
+                    if let Some(info) = locals.get(&akey) {
+                        if matches!(info.char_kind, CharKind::Fixed(_))
+                            && (!info.dims.is_empty() || info.allocatable)
+                            && args.len() == 1
+                        {
+                            if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[0].value {
+                                // Get the char-array element's string pointer and length.
+                                let idx64 = if inner_args.len() == 1 {
+                                    if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &inner_args[0].value {
+                                        let idx = lower_expr(b, locals, idx_expr, st);
+                                        let idx_wide = match b.func().value_type(idx) {
+                                            Some(IrType::Int(IntWidth::I64)) => idx,
+                                            _ => b.int_extend(idx, IntWidth::I64, true),
+                                        };
+                                        let one = b.const_i64(1);
+                                        b.isub(idx_wide, one)
+                                    } else { b.const_i64(0) }
+                                } else { b.const_i64(0) };
+                                let base = array_base_addr(b, info);
+                                let elem_slot = b.gep(base, vec![idx64], info.ty.clone());
+                                let elem_ptr = b.load_typed(elem_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                let elem_len = match info.char_kind {
+                                    CharKind::Fixed(n) => b.const_i64(n),
+                                    _ => b.const_i64(0),
+                                };
+                                return lower_substring(b, locals, st, elem_ptr, elem_len, start.as_ref(), end.as_ref());
+                            }
+                        }
+                    }
+                }
+            }
             let val = lower_expr(b, locals, expr, st);
             let len = b.const_i64(string_literal_len(expr));
             (val, len)
@@ -6577,7 +6614,7 @@ fn lower_write_items_adv(
             Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
                 .map(|i| i.char_kind != CharKind::None)
                 .unwrap_or(false),
-            Expr::FunctionCall { callee, .. } => {
+            Expr::FunctionCall { callee, args } => {
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
@@ -6585,6 +6622,15 @@ fn lower_write_items_adv(
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
                             .unwrap_or(false)
+                } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
+                    // Nested: arr(i)(lo:hi) — substring of char array element.
+                    if let Expr::Name { name } = &inner.node {
+                        let key = name.to_lowercase();
+                        ctx.locals.get(&key)
+                            .map(|i| i.char_kind != CharKind::None && (!i.dims.is_empty() || i.allocatable))
+                            .unwrap_or(false)
+                            && args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+                    } else { false }
                 } else { false }
             }
             _ => false,
@@ -6755,7 +6801,7 @@ fn lower_internal_write_items(
             Expr::Name { name } => ctx.locals.get(&name.to_lowercase())
                 .map(|i| i.char_kind != CharKind::None)
                 .unwrap_or(false),
-            Expr::FunctionCall { callee, .. } => {
+            Expr::FunctionCall { callee, args } => {
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
@@ -6763,6 +6809,15 @@ fn lower_internal_write_items(
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
                             .unwrap_or(false)
+                } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
+                    // Nested: arr(i)(lo:hi) — substring of char array element.
+                    if let Expr::Name { name } = &inner.node {
+                        let key = name.to_lowercase();
+                        ctx.locals.get(&key)
+                            .map(|i| i.char_kind != CharKind::None && (!i.dims.is_empty() || i.allocatable))
+                            .unwrap_or(false)
+                            && args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+                    } else { false }
                 } else { false }
             }
             _ => false,
