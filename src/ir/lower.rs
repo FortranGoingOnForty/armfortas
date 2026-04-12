@@ -35,6 +35,11 @@ enum CharKind {
     Fixed(i64),
     /// Deferred-length character(:), allocatable: addr points to 32-byte StringDescriptor.
     Deferred,
+    /// Assumed-length character(*) dummy parameter.  The runtime
+    /// length is held in a hidden i64 parameter appended after the
+    /// normal positional args.  `len_addr` is the alloca holding
+    /// the hidden param's value so reads can load it at runtime.
+    AssumedLen { len_addr: ValueId },
 }
 
 /// Info about a local variable.
@@ -121,6 +126,10 @@ struct LowerCtx<'a> {
     internal_funcs: &'a HashMap<String, u32>,
     /// Lowercase names of functions declared ELEMENTAL in this compilation unit.
     elemental_funcs: &'a HashSet<String>,
+    /// Per-callee bitmap of which params are character(len=*).
+    /// Call sites append the string length as a hidden i64 arg for
+    /// each flagged position.
+    char_len_star_params: &'a HashMap<String, Vec<bool>>,
     /// Map from Fortran statement label (u64) to the IR basic block that
     /// begins at that label. Pre-populated by `collect_label_blocks` before
     /// lowering so that GOTO can branch forward as well as backward.
@@ -137,6 +146,7 @@ impl<'a> LowerCtx<'a> {
         descriptor_params: &'a HashMap<String, Vec<bool>>,
         internal_funcs: &'a HashMap<String, u32>,
         elemental_funcs: &'a HashSet<String>,
+        char_len_star_params: &'a HashMap<String, Vec<bool>>,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -153,6 +163,7 @@ impl<'a> LowerCtx<'a> {
             descriptor_params,
             internal_funcs,
             elemental_funcs,
+            char_len_star_params,
             label_blocks: HashMap::new(),
         }
     }
@@ -245,6 +256,11 @@ pub fn lower_file(
         collect_descriptor_params(&unit.node, &mut descriptor_params);
     }
 
+    let mut char_len_star_params: HashMap<String, Vec<bool>> = HashMap::new();
+    for unit in units {
+        collect_char_len_star_params(&unit.node, &mut char_len_star_params);
+    }
+
     let mut elemental_funcs: HashSet<String> = HashSet::new();
     for unit in units {
         collect_elemental_funcs(&unit.node, &mut elemental_funcs);
@@ -276,6 +292,7 @@ pub fn lower_file(
             &descriptor_params,
             &internal_funcs,
             &elemental_funcs,
+            &char_len_star_params,
             false,
         );
     }
@@ -377,6 +394,51 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
 /// `Vec<bool>` (index = parameter position, value = is_optional).
 /// Used at call sites to pass null pointers for absent optional args,
 /// enabling PRESENT() intrinsic queries inside the callee.
+/// Collect which positional parameters are `character(len=*)` — assumed
+/// length.  These need hidden-length i64 parameters appended to the
+/// function signature and the call site.
+fn collect_char_len_star_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    use crate::ast::unit::DummyArg;
+    let record = |name: &str, args: &[DummyArg], decls: &[crate::ast::decl::SpannedDecl],
+                  out: &mut HashMap<String, Vec<bool>>| {
+        let param_names: Vec<String> = args.iter().filter_map(|a| {
+            if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+        }).collect();
+        if param_names.is_empty() { return; }
+        let flags: Vec<bool> = param_names.iter().map(|pname| {
+            for d in decls {
+                if let crate::ast::decl::Decl::TypeDecl { type_spec, entities, .. } = &d.node {
+                    if entities.iter().any(|e| e.name.to_lowercase() == *pname) {
+                        if let TypeSpec::Character(Some(sel)) = type_spec {
+                            if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Star)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }).collect();
+        if flags.iter().any(|f| *f) {
+            out.insert(name.to_lowercase(), flags);
+        }
+    };
+    match unit {
+        ProgramUnit::Subroutine { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_char_len_star_params(&sub.node, out); }
+        }
+        ProgramUnit::Function { name, args, decls, contains, .. } => {
+            record(name, args, decls, out);
+            for sub in contains { collect_char_len_star_params(&sub.node, out); }
+        }
+        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+            for sub in contains { collect_char_len_star_params(&sub.node, out); }
+        }
+        _ => {}
+    }
+}
+
 fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
     use crate::ast::decl::Attribute;
     use crate::ast::unit::DummyArg;
@@ -1032,18 +1094,16 @@ fn lower_unit(
     descriptor_params: &HashMap<String, Vec<bool>>,
     internal_funcs: &HashMap<String, u32>,
     elemental_funcs: &HashSet<String>,
+    char_len_star_params: &HashMap<String, Vec<bool>>,
     internal_only: bool,
 ) {
     match &unit.node {
         ProgramUnit::Program { name, decls, body, contains, uses, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
-            // Fortran PROGRAM bodies are never the C entry point — driver/mod.rs
-            // always emits a `_main` wrapper. Use a private name so a user-written
-            // "PROGRAM MAIN" (or unnamed program) never produces a duplicate _main.
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             // Combined USE list for this unit: host_uses inherited
@@ -1102,6 +1162,7 @@ fn lower_unit(
                     descriptor_params,
                     internal_funcs,
                     elemental_funcs,
+                    char_len_star_params,
                     true,
                 );
             }
@@ -1112,7 +1173,7 @@ fn lower_unit(
                 .map(|b| b.name.as_deref().unwrap_or(name).trim_matches('\'').trim_matches('"').to_string())
                 .unwrap_or_else(|| name.clone());
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
-            let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
+            let mut params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
                     let elem_ty = arg_type_from_decls(n, decls);
                     let fortran_noalias = arg_is_fortran_noalias(n, decls);
@@ -1139,18 +1200,42 @@ fn lower_unit(
                     }
                 } else { None }
             }).collect();
+            // Append hidden-length i64 params for character(len=*) dummies.
+            // Per the standard Fortran ABI, these trail the normal params.
+            let mut hidden_len_params: Vec<(String, ValueId)> = Vec::new();
+            let own_cls = char_len_star_params.get(&name.to_lowercase());
+            if let Some(flags) = own_cls {
+                let normal_count = params.len();
+                for (i, (flag, arg)) in flags.iter().zip(args.iter()).enumerate() {
+                    if *flag {
+                        if let DummyArg::Name(n) = arg {
+                            let hid_id = ValueId((normal_count + hidden_len_params.len()) as u32);
+                            params.push(Param {
+                                name: format!("__len_{}", n.to_lowercase()),
+                                ty: IrType::Int(IntWidth::I64),
+                                id: hid_id,
+                                fortran_noalias: false,
+                            });
+                            hidden_len_params.push((n.to_lowercase(), hid_id));
+                        }
+                    }
+                    let _ = i;
+                }
+            }
+
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
 
             // Collect param info: (name, param_id, elem_type, is_value).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
+                .filter(|p| !p.name.starts_with("__len_")) // skip hidden params
                 .map(|p| {
                     let pname = p.name.to_lowercase();
                     let elem_ty = arg_type_from_decls(&pname, decls);
@@ -1161,6 +1246,14 @@ fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+
+                // Set up hidden-length locals for assumed-len char dummies.
+                let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
+                for (hname, hid) in &hidden_len_params {
+                    let slot = b.alloca(IrType::Int(IntWidth::I64));
+                    b.store(*hid, slot);
+                    hidden_len_addrs.insert(hname.clone(), slot);
+                }
 
                 for (pname, pid, elem_ty, is_value) in &param_info {
                     if *is_value {
@@ -1177,7 +1270,11 @@ fn lower_unit(
                         b.store(*pid, slot);
                         // Check if this is a derived type parameter.
                         let dt_name = arg_derived_type_name(pname, decls);
-                        let ck = arg_char_kind_from_decls(pname, decls);
+                        let ck = if let Some(&len_slot) = hidden_len_addrs.get(pname) {
+                            CharKind::AssumedLen { len_addr: len_slot }
+                        } else {
+                            arg_char_kind_from_decls(pname, decls)
+                        };
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
@@ -1235,6 +1332,7 @@ fn lower_unit(
                     descriptor_params,
                     internal_funcs,
                     elemental_funcs,
+                    char_len_star_params,
                     true,
                 );
             }
@@ -1333,7 +1431,7 @@ fn lower_unit(
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1453,6 +1551,7 @@ fn lower_unit(
                     descriptor_params,
                     internal_funcs,
                     elemental_funcs,
+                    char_len_star_params,
                     true,
                 );
             }
@@ -1484,6 +1583,7 @@ fn lower_unit(
                     descriptor_params,
                     internal_funcs,
                     elemental_funcs,
+                    char_len_star_params,
                     false,
                 );
             }
@@ -3029,7 +3129,7 @@ fn char_addr_and_len(
                     };
                     Some((ptr, *n))
                 }
-                CharKind::Deferred | CharKind::None => None,
+                CharKind::AssumedLen { .. } | CharKind::Deferred | CharKind::None => None,
             }
         }
         Expr::StringLiteral { value, .. } => {
@@ -3069,6 +3169,14 @@ fn char_addr_and_runtime_len(
                     let eight = b.const_i64(8);
                     let len_ptr = b.gep(info.addr, vec![eight], IrType::Int(IntWidth::I8));
                     let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+                    Some((ptr, len))
+                }
+                CharKind::AssumedLen { len_addr } => {
+                    // by_ref assumed-length dummy: double-deref for
+                    // the data pointer, load the hidden-length param.
+                    let outer = b.load(info.addr);
+                    let ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let len = b.load(*len_addr);
                     Some((ptr, len))
                 }
                 CharKind::None => {
@@ -4154,13 +4262,10 @@ fn lower_string_expr(
             let key = name.to_lowercase();
             if let Some(info) = locals.get(&key) {
                 match &info.char_kind {
-                    CharKind::Fixed(_) | CharKind::Deferred => {
+                    CharKind::Fixed(_) | CharKind::Deferred | CharKind::AssumedLen { .. } => {
                         // Delegate to char_addr_and_runtime_len which
-                        // correctly handles both local buffers (GEP
-                        // to element 0) and by_ref dummies (double
-                        // load through the wrapper alloca).  The
-                        // previous inline path returned info.addr
-                        // raw for Fixed, which is wrong for dummies.
+                        // correctly handles local buffers, by_ref
+                        // dummies, and assumed-length dummies.
                         if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
                             (ptr, len)
                         } else {
@@ -4571,6 +4676,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     IrType::Void,
                                 );
                             }
+                            CharKind::AssumedLen { len_addr } => {
+                                // Assumed-length dummy assignment: use
+                                // the hidden-length param as the
+                                // destination length.
+                                let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                let outer = b.load(info.addr);
+                                let dest_ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                let dest_len = b.load(*len_addr);
+                                b.call(
+                                    FuncRef::External("afs_assign_char_fixed".into()),
+                                    vec![dest_ptr, dest_len, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
                             CharKind::None => {
                                 if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value) {
@@ -4858,6 +4977,27 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         for flag in opt_flags.iter().skip(arg_vals.len()) {
                             if *flag {
                                 arg_vals.push(b.const_i64(0)); // null → absent
+                            }
+                        }
+                    }
+                    // Hidden character-length ABI: for each callee
+                    // param that is character(len=*), append the
+                    // actual argument's string length as an i64.
+                    if let Some(cls_flags) = ctx.char_len_star_params.get(&key) {
+                        for (i, flag) in cls_flags.iter().enumerate() {
+                            if *flag && i < args.len() {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
+                                    // Try to get (ptr, len) from the actual arg.
+                                    if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, &ctx.locals) {
+                                        arg_vals.push(len);
+                                    } else if let Expr::StringLiteral { value, .. } = &e.node {
+                                        arg_vals.push(b.const_i64(value.len() as i64));
+                                    } else {
+                                        arg_vals.push(b.const_i64(0));
+                                    }
+                                } else {
+                                    arg_vals.push(b.const_i64(0));
+                                }
                             }
                         }
                     }
