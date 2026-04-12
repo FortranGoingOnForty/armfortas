@@ -464,7 +464,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         // compile-time integer so .amod can carry the
                         // value and consumers can inline it.
                         let const_value = if sym_attrs.parameter {
-                            entity.init.as_ref().and_then(|e| eval_const_int_expr(e))
+                            entity.init.as_ref().and_then(|e| eval_const_int_expr(e, st))
                         } else { None };
                         st.define(Symbol {
                             name: entity.name.clone(),
@@ -565,18 +565,25 @@ fn process_contains(
 
 /// Extract a compile-time integer kind value from a KindSelector.
 /// Try to evaluate a PARAMETER initializer to a compile-time i64.
-/// Handles integer literals, negation, and simple binary ops on
-/// integer literals.  Returns None for anything more complex.
-fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
+/// Handles integer literals, negation, binary ops, parenthesized
+/// expressions, and Name references that resolve to PARAMETERs
+/// with known const_value in the current scope chain.
+fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -> Option<i64> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => {
-            // Strip kind suffix (e.g., "42_8" → "42").
             let clean = text.split('_').next().unwrap_or(text);
             clean.parse::<i64>().ok()
         }
+        Expr::Name { name } => {
+            // Look up the name in the current scope chain.
+            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            if sym.attrs.parameter {
+                sym.const_value
+            } else { None }
+        }
         Expr::UnaryOp { op, operand } => {
-            let v = eval_const_int_expr(operand)?;
+            let v = eval_const_int_expr(operand, st)?;
             match op {
                 crate::ast::expr::UnaryOp::Minus => Some(-v),
                 crate::ast::expr::UnaryOp::Plus => Some(v),
@@ -584,8 +591,8 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
             }
         }
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_const_int_expr(left)?;
-            let r = eval_const_int_expr(right)?;
+            let l = eval_const_int_expr(left, st)?;
+            let r = eval_const_int_expr(right, st)?;
             match op {
                 crate::ast::expr::BinaryOp::Add => Some(l + r),
                 crate::ast::expr::BinaryOp::Sub => Some(l - r),
@@ -594,7 +601,7 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<i64> {
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_int_expr(inner),
+        Expr::ParenExpr { inner } => eval_const_int_expr(inner, st),
         _ => None,
     }
 }
