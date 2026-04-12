@@ -421,11 +421,474 @@ fn compile_timestamp() -> String {
 }
 
 // =====================================================================
-// Reader (Phase 3 — placeholder)
+// Reader
 // =====================================================================
 
-/// Read a `.amod` file and return the module's interface.
-/// TODO: implement in Phase 3 (task #392).
-pub fn read_amod(_path: &Path) -> Option<()> {
+/// A procedure argument parsed from an .amod file.
+#[derive(Debug, Clone)]
+pub struct AmodArg {
+    pub name: String,
+    pub type_info: Option<TypeInfo>,
+    pub intent: Option<Intent>,
+    pub optional: bool,
+    pub value: bool,
+    pub allocatable: bool,
+    pub pointer: bool,
+    pub hidden: bool,
+}
+
+/// A procedure parsed from an .amod file.
+#[derive(Debug, Clone)]
+pub struct AmodProc {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub return_type: Option<TypeInfo>,
+    pub pure: bool,
+    pub elemental: bool,
+    pub args: Vec<AmodArg>,
+}
+
+/// A variable or parameter parsed from an .amod file.
+#[derive(Debug, Clone)]
+pub struct AmodVar {
+    pub name: String,
+    pub type_info: Option<TypeInfo>,
+    pub is_parameter: bool,
+    pub allocatable: bool,
+    pub save: bool,
+    pub pointer: bool,
+    pub target: bool,
+    pub ir_symbol: Option<String>,
+    pub deferred_char: bool,
+    pub dims: Vec<(i64, i64)>,
+    pub const_value: Option<i64>,
+}
+
+/// Complete module interface parsed from an .amod file.
+#[derive(Debug)]
+pub struct ModuleInterface {
+    pub module_name: String,
+    pub dependencies: Vec<String>,
+    pub variables: Vec<AmodVar>,
+    pub procedures: Vec<AmodProc>,
+    pub types: Vec<crate::sema::type_layout::TypeLayout>,
+    pub checksum: Option<String>,
+}
+
+/// Read a `.amod` file and return the parsed module interface.
+pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    parse_amod(&content, path)
+}
+
+fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
+    let mut lines = content.lines().peekable();
+
+    // Header: #!amod N
+    let magic = lines.next().ok_or("empty .amod file")?;
+    if !magic.starts_with("#!amod ") {
+        return Err(format!("{}: not an .amod file (missing #!amod magic)", path.display()));
+    }
+    let version: u32 = magic[7..].trim().parse()
+        .map_err(|_| format!("{}: invalid .amod version", path.display()))?;
+    if version > 2 {
+        eprintln!("warning: {}: .amod version {} is newer than this compiler supports; some information may be ignored", path.display(), version);
+    }
+
+    let mut module_name = String::new();
+    let mut checksum = None;
+
+    // Parse # key: value header lines.
+    while let Some(line) = lines.peek() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            if let Some((key, val)) = rest.split_once(": ") {
+                match key {
+                    "module" => module_name = val.trim().to_string(),
+                    "checksum" => checksum = Some(val.trim().to_string()),
+                    _ => {} // skip other metadata
+                }
+            }
+            lines.next();
+        } else if line.is_empty() {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+
+    if module_name.is_empty() {
+        return Err(format!("{}: missing # module: header", path.display()));
+    }
+
+    let mut dependencies = Vec::new();
+    let mut variables = Vec::new();
+    let mut procedures = Vec::new();
+    let mut types = Vec::new();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+
+        if let Some(dep) = trimmed.strip_prefix("@uses ") {
+            dependencies.push(dep.trim().to_string());
+        } else if trimmed.starts_with("@var ") {
+            variables.push(parse_var(trimmed, false));
+        } else if trimmed.starts_with("@param ") {
+            variables.push(parse_var(&trimmed.replacen("@param", "@var", 1), true));
+        } else if trimmed.starts_with("@function ") || trimmed.starts_with("@subroutine ") {
+            let proc = parse_proc(trimmed, &mut lines);
+            procedures.push(proc);
+        } else if trimmed.starts_with("@type ") {
+            let layout = parse_type(trimmed, &mut lines);
+            types.push(layout);
+        } else if trimmed.starts_with("@interface ") {
+            // Skip interface blocks for now — consume until @end interface.
+            while let Some(iline) = lines.next() {
+                if iline.trim().starts_with("@end interface") { break; }
+            }
+        }
+        // Skip unrecognized directives (forward compatibility).
+    }
+
+    Ok(ModuleInterface {
+        module_name,
+        dependencies,
+        variables,
+        procedures,
+        types,
+        checksum,
+    })
+}
+
+fn parse_var(line: &str, is_param: bool) -> AmodVar {
+    // @var name : type[, attrs...] [@ir symbol] [@deferred_char] [@dims ...]
+    let rest = line.strip_prefix("@var ").unwrap_or(line);
+    let (name_type, ir_part) = if let Some(idx) = rest.find(" @ir ") {
+        (&rest[..idx], Some(&rest[idx + 5..]))
+    } else {
+        (rest, None)
+    };
+
+    let (name, type_and_attrs) = name_type.split_once(" : ").unwrap_or((name_type, "unknown"));
+    let name = name.trim().to_string();
+
+    // Split type from attrs on comma.
+    let (type_str, attr_str) = if let Some(idx) = type_and_attrs.find(", ") {
+        (&type_and_attrs[..idx], &type_and_attrs[idx + 2..])
+    } else {
+        (type_and_attrs, "")
+    };
+
+    let type_info = parse_type_info(type_str.trim());
+    let allocatable = attr_str.contains("allocatable");
+    let save = attr_str.contains("save");
+    let pointer = attr_str.contains("pointer");
+    let target = attr_str.contains("target");
+
+    let mut ir_symbol = None;
+    let mut deferred_char = false;
+    let mut dims = Vec::new();
+    let mut const_value = None;
+
+    if let Some(ir) = ir_part {
+        let parts: Vec<&str> = ir.split_whitespace().collect();
+        if !parts.is_empty() {
+            ir_symbol = Some(parts[0].to_string());
+        }
+        for part in &parts[1..] {
+            if *part == "@deferred_char" {
+                deferred_char = true;
+            }
+        }
+        // TODO: parse @dims and const_value from the = N suffix
+    }
+
+    // Check for = value (parameter constant).
+    if is_param {
+        if let Some(eq_idx) = name_type.rfind(" = ") {
+            if let Ok(v) = name_type[eq_idx + 3..].trim().parse::<i64>() {
+                const_value = Some(v);
+            }
+        }
+    }
+
+    AmodVar {
+        name,
+        type_info,
+        is_parameter: is_param,
+        allocatable,
+        save,
+        pointer,
+        target,
+        ir_symbol,
+        deferred_char,
+        dims,
+        const_value,
+    }
+}
+
+fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
+    let is_func = header.starts_with("@function ");
+    let rest = if is_func {
+        header.strip_prefix("@function ").unwrap()
+    } else {
+        header.strip_prefix("@subroutine ").unwrap()
+    };
+
+    // Parse: name [-> return_type][, pure][, elemental]
+    let (name_and_ret, attrs_str) = {
+        let parts: Vec<&str> = rest.splitn(2, ", ").collect();
+        (parts[0], parts.get(1).copied().unwrap_or(""))
+    };
+
+    let (name, return_type) = if let Some(arrow_idx) = name_and_ret.find(" -> ") {
+        let n = &name_and_ret[..arrow_idx];
+        let rt = parse_type_info(name_and_ret[arrow_idx + 4..].trim());
+        (n.trim().to_string(), rt)
+    } else {
+        (name_and_ret.trim().to_string(), None)
+    };
+
+    let pure = attrs_str.contains("pure");
+    let elemental = attrs_str.contains("elemental");
+
+    let kind = if is_func { SymbolKind::Function } else { SymbolKind::Subroutine };
+
+    let mut args = Vec::new();
+
+    // Parse body lines until @end.
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("@end ") { break; }
+        if trimmed.starts_with("@arg ") {
+            args.push(parse_arg(trimmed));
+        }
+        // Skip @abi and @hint lines (informational; reader uses
+        // them for optimization but not for correctness).
+    }
+
+    AmodProc { name, kind, return_type, pure, elemental, args }
+}
+
+fn parse_arg(line: &str) -> AmodArg {
+    // @arg name : type[, intent(in/out/inout)][, optional][, value][, ...]
+    let rest = line.strip_prefix("@arg ").unwrap_or(line);
+
+    let (name, type_and_attrs) = if let Some(idx) = rest.find(" : ") {
+        (&rest[..idx], &rest[idx + 3..])
+    } else {
+        (rest.trim(), "unknown")
+    };
+
+    let name = name.trim().to_string();
+    let hidden = name.contains('@'); // e.g., label@len
+
+    let (type_str, attr_str) = if let Some(idx) = type_and_attrs.find(", ") {
+        (&type_and_attrs[..idx], &type_and_attrs[idx + 2..])
+    } else {
+        (type_and_attrs, "")
+    };
+
+    let type_info = parse_type_info(type_str.trim());
+    let intent = if attr_str.contains("intent(in)") && !attr_str.contains("intent(inout)") {
+        Some(Intent::In)
+    } else if attr_str.contains("intent(out)") {
+        Some(Intent::Out)
+    } else if attr_str.contains("intent(inout)") {
+        Some(Intent::InOut)
+    } else { None };
+
+    let optional = attr_str.contains("optional");
+    let value = attr_str.contains("value");
+    let allocatable = attr_str.contains("allocatable");
+    let pointer = attr_str.contains("pointer");
+
+    AmodArg { name, type_info, intent, optional, value, allocatable, pointer, hidden }
+}
+
+fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> crate::sema::type_layout::TypeLayout {
+    use crate::sema::type_layout::*;
+
+    let name = header.strip_prefix("@type ").unwrap_or("unknown").trim().to_string();
+    let mut size = 0;
+    let mut align = 1;
+    let mut parent = None;
+    let mut fields = Vec::new();
+    let mut bound_procs = Vec::new();
+    let mut final_procs = Vec::new();
+    let mut type_tag = 0u64;
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("@end type") { break; }
+
+        if let Some(rest) = trimmed.strip_prefix("@layout ") {
+            for part in rest.split_whitespace() {
+                if let Some(v) = part.strip_prefix("size=") {
+                    size = v.parse().unwrap_or(0);
+                } else if let Some(v) = part.strip_prefix("align=") {
+                    align = v.parse().unwrap_or(1);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("@extends ") {
+            parent = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@field ") {
+            // @field name : type @offset N @size M
+            if let Some((name_type, offset_part)) = rest.split_once(" @offset ") {
+                let (fname, ftype_str) = name_type.split_once(" : ").unwrap_or((name_type, "unknown"));
+                let (offset_str, size_part) = if let Some(idx) = offset_part.find(" @size ") {
+                    (&offset_part[..idx], &offset_part[idx + 7..])
+                } else {
+                    (offset_part, "0")
+                };
+                let ftype = parse_type_info(ftype_str.trim());
+                fields.push(FieldLayout {
+                    name: fname.trim().to_string(),
+                    offset: offset_str.trim().parse().unwrap_or(0),
+                    size: size_part.trim().parse().unwrap_or(0),
+                    type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
+                });
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
+            let nopass = rest.contains(", nopass");
+            let clean = rest.replace(", nopass", "");
+            let (method, target) = if let Some((m, t)) = clean.split_once(" => ") {
+                (m.trim().to_string(), t.trim().to_string())
+            } else {
+                let m = clean.trim().to_string();
+                (m.clone(), m)
+            };
+            bound_procs.push(BoundProc { method_name: method, target_name: target, nopass });
+        } else if let Some(rest) = trimmed.strip_prefix("@final ") {
+            final_procs.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
+            type_tag = rest.trim().parse().unwrap_or(0);
+        }
+    }
+
+    TypeLayout { name, size, align, fields, bound_procs, final_procs, type_tag, parent }
+}
+
+fn parse_type_info(s: &str) -> Option<TypeInfo> {
+    let s = s.trim();
+    if s == "unknown" || s.is_empty() { return None; }
+    if s == "double precision" { return Some(TypeInfo::DoublePrecision); }
+    if s == "class(*)" { return Some(TypeInfo::ClassStar); }
+    if s == "type(*)" { return Some(TypeInfo::TypeStar); }
+
+    // integer[(K)]
+    if s.starts_with("integer") {
+        let kind = extract_kind(s);
+        return Some(TypeInfo::Integer { kind });
+    }
+    if s.starts_with("real") {
+        let kind = extract_kind(s);
+        return Some(TypeInfo::Real { kind });
+    }
+    if s.starts_with("complex") {
+        let kind = extract_kind(s);
+        return Some(TypeInfo::Complex { kind });
+    }
+    if s.starts_with("logical") {
+        let kind = extract_kind(s);
+        return Some(TypeInfo::Logical { kind });
+    }
+    if s.starts_with("character") {
+        // character(len=N) or character(len=:)
+        if let Some(inner) = s.strip_prefix("character(len=").and_then(|r| r.strip_suffix(')')) {
+            if inner == ":" {
+                return Some(TypeInfo::Character { len: None, kind: None });
+            } else if let Ok(n) = inner.parse::<i64>() {
+                return Some(TypeInfo::Character { len: Some(n), kind: None });
+            }
+        }
+        return Some(TypeInfo::Character { len: None, kind: None });
+    }
+    if let Some(inner) = s.strip_prefix("type(").and_then(|r| r.strip_suffix(')')) {
+        return Some(TypeInfo::Derived(inner.to_string()));
+    }
+    if let Some(inner) = s.strip_prefix("class(").and_then(|r| r.strip_suffix(')')) {
+        return Some(TypeInfo::Class(inner.to_string()));
+    }
+
     None
+}
+
+fn extract_kind(s: &str) -> Option<u8> {
+    if let Some(start) = s.find('(') {
+        if let Some(end) = s.find(')') {
+            return s[start + 1..end].parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_physics_amod() {
+        let amod_text = r#"#!amod 2
+# module: physics
+# source: physics.f90
+# checksum: sha256:abc123
+
+@uses iso_c_binding
+
+@var call_count : integer, save @ir afs_mod_physics_call_count
+
+@param gravity : real = 9
+
+@function kinetic_energy -> real, pure
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg self : class(particle), intent(in)
+    @abi pass=x0 width=8
+  @arg vx : real, intent(in)
+    @abi pass=x1 width=8
+  @hint leaf cost=27
+@end function
+
+@subroutine apply_force
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg p : type(particle), intent(inout)
+    @abi pass=x0 width=8
+  @arg dt : real, intent(in), optional
+    @abi pass=x1 width=8
+  @hint leaf cost=14
+@end subroutine
+
+@type particle
+  @layout size=12 align=4
+  @field x : real @offset 0 @size 4
+  @field y : real @offset 4 @size 4
+  @field mass : real @offset 8 @size 4
+  @binds kinetic_energy
+  @tag 1
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
+        assert_eq!(iface.module_name, "physics");
+        assert_eq!(iface.dependencies, vec!["iso_c_binding"]);
+        assert_eq!(iface.variables.len(), 2); // call_count + gravity
+        assert!(iface.variables.iter().any(|v| v.name == "call_count" && v.ir_symbol.as_deref() == Some("afs_mod_physics_call_count")));
+        assert!(iface.variables.iter().any(|v| v.name == "gravity" && v.is_parameter));
+        assert_eq!(iface.procedures.len(), 2);
+        let ke = iface.procedures.iter().find(|p| p.name == "kinetic_energy").unwrap();
+        assert!(ke.pure);
+        assert_eq!(ke.args.len(), 2);
+        assert_eq!(ke.args[0].name, "self");
+        assert!(matches!(ke.args[0].intent, Some(Intent::In)));
+        let af = iface.procedures.iter().find(|p| p.name == "apply_force").unwrap();
+        assert_eq!(af.args.len(), 2);
+        assert!(af.args[1].optional);
+        assert_eq!(iface.types.len(), 1);
+        let pt = &iface.types[0];
+        assert_eq!(pt.name, "particle");
+        assert_eq!(pt.size, 12);
+        assert_eq!(pt.fields.len(), 3);
+        assert_eq!(pt.bound_procs.len(), 1);
+        assert_eq!(pt.bound_procs[0].method_name, "kinetic_energy");
+    }
 }
