@@ -443,6 +443,13 @@ fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Res
 fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), SemaError> {
     for decl in decls {
         match &decl.node {
+            Decl::AccessDefault { access } => {
+                match access {
+                    Attribute::Private => st.set_default_access(Access::Private),
+                    Attribute::Public => st.set_default_access(Access::Public),
+                    _ => {}
+                }
+            }
             Decl::TypeDecl { type_spec, attrs, entities } => {
                 let type_info = type_spec_to_info(type_spec);
                 let sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));

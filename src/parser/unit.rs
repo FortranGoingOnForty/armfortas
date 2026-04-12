@@ -423,6 +423,23 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // Standalone PRIVATE / PUBLIC access statement.
+            if (text == "private" || text == "public") && self.at_stmt_end_after(1) {
+                let start = self.current_span();
+                let attr = if text == "private" {
+                    crate::ast::decl::Attribute::Private
+                } else {
+                    crate::ast::decl::Attribute::Public
+                };
+                self.advance();
+                let span = span_from_to(start, self.prev_span());
+                decls.push(crate::ast::Spanned::new(
+                    crate::ast::decl::Decl::AccessDefault { access: attr },
+                    span,
+                ));
+                continue;
+            }
+
             // Try as executable statement.
             body.push(self.parse_stmt()?);
         }

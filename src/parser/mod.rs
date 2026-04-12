@@ -142,4 +142,11 @@ impl<'a> Parser<'a> {
     pub fn at_stmt_end(&self) -> bool {
         matches!(self.peek(), TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment)
     }
+
+    /// Check if the token at offset `n` from current position is a statement terminator.
+    pub fn at_stmt_end_after(&self, n: usize) -> bool {
+        let idx = self.pos + n;
+        if idx >= self.tokens.len() { return true; }
+        matches!(self.tokens[idx].kind, TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment)
+    }
 }

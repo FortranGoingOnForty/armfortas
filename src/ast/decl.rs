@@ -20,6 +20,10 @@ pub enum Decl {
         entities: Vec<EntityDecl>,
     },
 
+    /// Standalone `PRIVATE` or `PUBLIC` statement that sets the module's
+    /// default access for all subsequent declarations.
+    AccessDefault { access: Attribute },
+
     /// `implicit none` or `implicit none(type, external)`
     ImplicitNone {
         external: bool,
