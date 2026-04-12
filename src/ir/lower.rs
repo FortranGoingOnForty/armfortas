@@ -2835,6 +2835,45 @@ fn eval_const_int_in_scope(
 
 /// Resolve the raw data pointer and declared length for a character argument expression.
 /// Returns `None` if the argument is not a recognized fixed-length character.
+/// Build (ptr, len) for a substring `base_ptr(start:end)` per F2018 7.4.4.2.
+/// `start` defaults to 1, `end` defaults to the base string's length.
+/// Negative resulting lengths are clamped to 0 to match the standard's
+/// zero-length substring semantics when `start > end`.
+fn lower_substring(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    base_ptr: ValueId,
+    base_len: ValueId,
+    start: Option<&crate::ast::expr::SpannedExpr>,
+    end: Option<&crate::ast::expr::SpannedExpr>,
+) -> (ValueId, ValueId) {
+    let widen = |b: &mut FuncBuilder, e: &crate::ast::expr::SpannedExpr| -> ValueId {
+        let v = lower_expr(b, locals, e, st);
+        match b.func().value_type(v) {
+            Some(IrType::Int(IntWidth::I64)) => v,
+            _ => b.int_extend(v, IntWidth::I64, true),
+        }
+    };
+    let start_val = match start {
+        Some(se) => widen(b, se),
+        None => b.const_i64(1),
+    };
+    let end_val = match end {
+        Some(ee) => widen(b, ee),
+        None => base_len,
+    };
+    let one = b.const_i64(1);
+    let off = b.isub(start_val, one);
+    let sub_ptr = b.gep(base_ptr, vec![off], IrType::Int(IntWidth::I8));
+    let span = b.isub(end_val, start_val);
+    let raw_len = b.iadd(span, one);
+    let zero = b.const_i64(0);
+    let is_pos = b.icmp(CmpOp::Ge, raw_len, zero);
+    let sub_len = b.select(is_pos, raw_len, zero);
+    (sub_ptr, sub_len)
+}
+
 fn char_addr_and_len(
     b: &mut FuncBuilder,
     arg_spanned: &crate::ast::expr::SpannedExpr,
@@ -4038,6 +4077,21 @@ fn lower_string_expr(
                         }
                     }
                     _ => {}
+                }
+
+                // Substring designator on a character variable: `s(lo:hi)`.
+                // Parser produces this as FunctionCall { callee: Name(s),
+                // args: [Range(lo, hi)] } — without this case we fall
+                // through to lower_expr and emit an external call to
+                // `_s`, which fails at link time.
+                if args.len() == 1 {
+                    if let crate::ast::expr::SectionSubscript::Range { start, end, stride: _ } = &args[0].value {
+                        if locals.get(&key).map(|i| i.char_kind != CharKind::None && i.dims.is_empty()).unwrap_or(false) {
+                            if let Some((base_ptr, base_len)) = char_addr_and_runtime_len(b, callee, locals) {
+                                return lower_substring(b, locals, st, base_ptr, base_len, start.as_ref(), end.as_ref());
+                            }
+                        }
+                    }
                 }
             }
             let val = lower_expr(b, locals, expr, st);
@@ -6216,8 +6270,12 @@ fn lower_write_items_adv(
                 .unwrap_or(false),
             Expr::FunctionCall { callee, .. } => {
                 if let Expr::Name { name } = &callee.node {
-                    matches!(name.to_lowercase().as_str(),
+                    let key = name.to_lowercase();
+                    matches!(key.as_str(),
                         "trim" | "adjustl" | "adjustr" | "char")
+                        || ctx.locals.get(&key)
+                            .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
+                            .unwrap_or(false)
                 } else { false }
             }
             _ => false,
@@ -6382,8 +6440,12 @@ fn lower_internal_write_items(
                 .unwrap_or(false),
             Expr::FunctionCall { callee, .. } => {
                 if let Expr::Name { name } = &callee.node {
-                    matches!(name.to_lowercase().as_str(),
+                    let key = name.to_lowercase();
+                    matches!(key.as_str(),
                         "trim" | "adjustl" | "adjustr" | "char")
+                        || ctx.locals.get(&key)
+                            .map(|i| i.char_kind != CharKind::None && i.dims.is_empty())
+                            .unwrap_or(false)
                 } else { false }
             }
             _ => false,
