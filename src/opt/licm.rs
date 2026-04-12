@@ -429,14 +429,15 @@ mod tests {
     }
 
     #[test]
-    fn does_not_hoist_load() {
-        // Load is conservatively non-hoistable.
+    fn does_not_hoist_load_with_aliasing_store_in_loop() {
+        // A load whose pointer aliases with an intervening store in
+        // the same loop must NOT be hoisted: each iteration can see
+        // a different value after the store.
         //
-        // Build entry → header → exit, with a Load in the header
-        // and a conditional exit out of the loop so every block is
-        // reachable (N-6's prune-unreachable no longer has anything
-        // to do, so the pass's `changed` flag reflects only whether
-        // LICM actually hoisted something).
+        // Build entry → header → exit, with a Load followed by a
+        // Store(i_param, addr) in the header.  The alias oracle sees
+        // the same pointer for both, so LICM must leave the load in
+        // place.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
@@ -464,6 +465,15 @@ mod tests {
             id: v,
             kind: InstKind::Load(addr),
             ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        // Intervening aliasing store — writes i_param into the same
+        // slot the load just read.  Makes the load non-invariant.
+        let store = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: store,
+            kind: InstKind::Store(i_param, addr),
+            ty: IrType::Void,
             span: dummy_span(),
         });
         let cond = f.next_value_id();
