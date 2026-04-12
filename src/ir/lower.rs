@@ -3140,8 +3140,31 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
                 if ty.is_int() {
                     Some(b.int_to_float(*arg, FloatWidth::F32))
+                } else if is_complex_ty(&ty) {
+                    // real(z) extracts the real component of a complex number.
+                    // Complex values live as ptr<[f32/f64 x 2]>; load element 0.
+                    let fw = complex_float_width(&ty);
+                    let zero = b.const_i64(0);
+                    let re_ptr = b.gep(*arg, vec![zero], IrType::Int(IntWidth::I8));
+                    Some(b.load_typed(re_ptr, IrType::Float(fw)))
                 } else {
                     Some(*arg)
+                }
+            } else { None }
+        }
+        "aimag" | "dimag" => {
+            // aimag(z) extracts the imaginary component of a complex number.
+            // Complex values live as ptr<[f32/f64 x 2]>; load element 1 at
+            // byte offset 4 (f32) or 8 (f64).
+            if let Some(arg) = args.first() {
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Int(IntWidth::I32));
+                if is_complex_ty(&ty) {
+                    let fw = complex_float_width(&ty);
+                    let offset = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                    let im_ptr = b.gep(*arg, vec![offset], IrType::Int(IntWidth::I8));
+                    Some(b.load_typed(im_ptr, IrType::Float(fw)))
+                } else {
+                    None
                 }
             } else { None }
         }
