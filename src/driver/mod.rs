@@ -245,7 +245,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let (mut ir_module, _module_globals) = lower::lower_file(&units, &st, &type_layouts);
+    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
@@ -396,6 +396,29 @@ _main:
     }
 
     if opts.emit_obj {
+        // Emit .amod files for each MODULE in the compilation unit.
+        for unit in &units {
+            if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+                let mod_key = name.to_lowercase();
+                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                    let amod_text = crate::sema::amod::write_amod(
+                        name,
+                        opts.input.to_str().unwrap_or(""),
+                        &st,
+                        mod_scope_id,
+                        &module_globals,
+                        &type_layouts,
+                    );
+                    let amod_path = opts.output_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(format!("{}.amod", mod_key));
+                    if let Err(e) = fs::write(&amod_path, &amod_text) {
+                        eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 

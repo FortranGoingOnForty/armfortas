@@ -9,3 +9,4 @@ pub mod types;
 pub mod validate;
 pub mod intrinsic_modules;
 pub mod type_layout;
+pub mod amod;
