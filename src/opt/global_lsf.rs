@@ -176,13 +176,18 @@ fn update_memory_state(
             AliasResult::NoAlias => {}
         },
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+            // Call boundaries use the coarser may_reach_through_call_arg
+            // predicate: a callee that gets a pointer can walk to any
+            // offset within the same allocation, so a precise
+            // "different GEP offset → NoAlias" answer is unsound here.
+            // Same fix as LocalLsf (commit e4016f6).
             let pointer_args: Vec<ValueId> = args
                 .iter()
                 .copied()
                 .filter(|arg| value_is_pointer(func, *arg))
                 .collect();
             if pointer_args.iter().any(|arg| {
-                !matches!(alias::query(func, *arg, load_ptr), AliasResult::NoAlias)
+                alias::may_reach_through_call_arg(func, load_ptr, *arg)
             }) {
                 *last_store = None;
                 *clobbered = true;
@@ -657,5 +662,124 @@ mod tests {
             matches!(term, Terminator::Return(Some(v)) if v == stored),
             "return should use the forwarded stored value after the noalias call side path"
         );
+    }
+
+    #[test]
+    fn does_not_forward_across_call_arg_sharing_alloca_base() {
+        // Mirror of contained_dummy_array_ref at the global-LSF
+        // level: the caller stores arr(2)=20, then calls touch(arr),
+        // then reads arr(2) in a successor block.  The call receives
+        // `gep %alloca, [0]` — a pointer into the same allocation
+        // as the `gep %alloca, [1]` the store targets.  A precise
+        // offset-based alias check would say "different offsets →
+        // NoAlias" and keep the pre-call store forwardable; the
+        // correct answer at a call boundary is that the callee can
+        // walk to any offset within the allocation, so the store
+        // must be considered clobbered.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let load_block = f.create_block("load");
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
+        let alloca_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
+        let alloca = f.next_value_id();
+        f.register_type(alloca, alloca_ptr_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: alloca,
+            ty: alloca_ptr_ty,
+            span,
+            kind: InstKind::Alloca(arr_ty),
+        });
+
+        let c0 = f.next_value_id();
+        f.register_type(c0, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c0,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(0, IntWidth::I64),
+        });
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c1,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let g0 = f.next_value_id();
+        f.register_type(g0, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: g0,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span,
+            kind: InstKind::GetElementPtr(alloca, vec![c0]),
+        });
+        let g1 = f.next_value_id();
+        f.register_type(g1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: g1,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span,
+            kind: InstKind::GetElementPtr(alloca, vec![c1]),
+        });
+
+        let v20 = f.next_value_id();
+        f.register_type(v20, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: v20,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(20, IntWidth::I32),
+        });
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(v20, g1),
+        });
+        let call = f.next_value_id();
+        f.register_type(call, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: call,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Call(FuncRef::External("touch".into()), vec![g0]),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(load_block, vec![]));
+
+        let load = f.next_value_id();
+        f.register_type(load, IrType::Int(IntWidth::I32));
+        f.block_mut(load_block).insts.push(Inst {
+            id: load,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::Load(g1),
+        });
+        f.block_mut(load_block).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        GlobalLsf.run(&mut m);
+        let term = m.functions[0].block(load_block).terminator.clone().unwrap();
+        // The load must either remain or be replaced with something
+        // OTHER than v20 — forwarding the pre-call constant across
+        // a call that received a pointer into the same allocation
+        // is the exact bug this test guards against.
+        if let Terminator::Return(Some(v)) = term {
+            assert_ne!(
+                v, v20,
+                "global LSF forwarded the pre-call store to v20 across call(g0), but g0 and g1 share the same alloca base — the callee can walk to g1 from g0"
+            );
+        } else {
+            panic!("unexpected terminator after GlobalLsf: {:?}", term);
+        }
     }
 }

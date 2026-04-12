@@ -69,6 +69,16 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
             }
 
             InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                // Call boundaries use the coarser predicate — same fix
+                // as LocalLsf / GlobalLsf.  A callee that receives a
+                // pointer into an allocation can walk to any offset
+                // within it, so `gep %a,[0]` passed as an arg must
+                // invalidate a pending store to `gep %a,[1]` even
+                // though their precise offsets differ.  Currently the
+                // Fortran programs we compile don't expose a
+                // triggering DSE pattern, but the code is structurally
+                // identical to the other LSF passes so we fix it
+                // defensively.
                 let pointer_args: Vec<ValueId> = args
                     .iter()
                     .copied()
@@ -82,7 +92,7 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
                 if !pointer_args.is_empty() {
                     pending.retain(|entry| {
                         pointer_args.iter().all(|arg| {
-                            matches!(alias::query(func, entry.ptr, *arg), AliasResult::NoAlias)
+                            !alias::may_reach_through_call_arg(func, entry.ptr, *arg)
                         })
                     });
                 }
