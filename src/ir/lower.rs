@@ -2366,6 +2366,83 @@ fn alloc_decls(
                     TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
                 );
 
+                if is_pointer_attr && array_spec.is_some() {
+                    // Pointer to array.  Reuses the 384-byte array
+                    // descriptor layout that allocatables use: the
+                    // pointer slot carries base_addr, elem_size,
+                    // rank, flags, and per-dim bounds so that
+                    // downstream subscript / SIZE / whole-array
+                    // operations pick it up through the existing
+                    // descriptor path.  `=>` fills the slot from a
+                    // materialised descriptor of the target (see
+                    // Stmt::PointerAssignment).  Unassociated state
+                    // is encoded by flags=0, same as an unallocated
+                    // allocatable.
+                    //
+                    // We set `allocatable = true` so that
+                    // `local_uses_array_descriptor` and
+                    // `array_descriptor_addr` treat the slot as a
+                    // descriptor-at-info.addr (no extra indirection).
+                    // `is_pointer = true` is separately used by
+                    // scope-exit deallocation to suppress the
+                    // afs_deallocate_array call — a pointer does
+                    // not own its target.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let addr = b.alloca(desc_ty);
+                    let zero_byte = b.const_i32(0);
+                    let size384 = b.const_i64(384);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![addr, zero_byte, size384],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    // dims is left empty for a deferred-shape pointer;
+                    // the descriptor carries the runtime rank and
+                    // bounds after `=>` binds it to a target.
+                    locals.insert(key, LocalInfo {
+                        addr,
+                        ty: elem_ty.clone(),
+                        dims: vec![],
+                        allocatable: true,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: true,
+                    });
+                    continue;
+                }
+                if is_pointer_attr && matches!(type_spec, TypeSpec::Type(_)) && array_spec.is_none() {
+                    // Pointer to derived type.  Slot holds an 8-byte
+                    // pointer to the target struct; ComponentAccess
+                    // loads the slot and uses that address as the
+                    // struct base.  derived_type is stored so that
+                    // component lookup can find the type layout.
+                    if let TypeSpec::Type(ref type_name) = type_spec {
+                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        let zero_byte = b.const_i32(0);
+                        let eight = b.const_i64(8);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![addr, zero_byte, eight],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        locals.insert(key, LocalInfo {
+                            addr,
+                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: Some(type_name.clone()),
+                            inline_const: None,
+                            is_pointer: true,
+                        });
+                        continue;
+                    }
+                }
                 if is_deferred_char && is_allocatable {
                     // Deferred-length allocatable character: 32-byte StringDescriptor.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
@@ -4258,6 +4335,14 @@ fn insert_implicit_dealloc(b: &mut FuncBuilder, locals: &HashMap<String, LocalIn
     for (_name, info) in sorted {
         // Skip caller-owned allocatables (sret result variables).
         if skip_addr == Some(info.addr) { continue; }
+        // Skip pointers: a POINTER variable does not own its target.
+        // Its slot may look allocatable-shaped (pointer-to-array uses
+        // the 384-byte descriptor layout) but the base_addr belongs
+        // to whatever TARGET the pointer is associated with — freeing
+        // it through the pointer would double-free or free stack
+        // storage.  F2018 19.5 distinguishes POINTER deallocation
+        // (explicit DEALLOCATE(p)) from scope exit.
+        if info.is_pointer { continue; }
         if info.char_kind == CharKind::Deferred {
             b.call(
                 FuncRef::External("afs_dealloc_string".into()),
@@ -5407,43 +5492,68 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::PointerAssignment { target, value } => {
             // `p => q` or `p => x`: rebind the pointer slot `p` to the
-            // address of the RHS designator.  Currently handles scalar
-            // `Name` targets bound to either a TARGET local (take its
-            // addr) or another POINTER local (copy its current
-            // association out of the slot).
-            if let Expr::Name { name: tgt_name } = &target.node {
-                let tgt_key = tgt_name.to_lowercase();
-                let Some(tgt_info) = ctx.locals.get(&tgt_key).cloned() else { return; };
-                if !tgt_info.is_pointer { return; }
-                let addr = match &value.node {
-                    Expr::Name { name: src_name } => {
-                        let src_key = src_name.to_lowercase();
-                        let Some(src_info) = ctx.locals.get(&src_key).cloned() else { return; };
-                        if src_info.is_pointer {
-                            // Copying a pointer-to-pointer: load the
-                            // current association.
-                            b.load_typed(
-                                src_info.addr,
-                                IrType::Ptr(Box::new(src_info.ty.clone())),
-                            )
-                        } else {
-                            // Plain TARGET or ordinary local: the
-                            // alloca address is the associated target.
-                            src_info.addr
-                        }
-                    }
-                    _ => {
-                        // RHS isn't a simple Name — fall back to a
-                        // general expression lowering that returns an
-                        // address.  lower_expr_ctx_tl returns a value;
-                        // for unsupported RHS shapes this degrades to
-                        // a noop association, leaving the slot
-                        // unchanged.
-                        return;
-                    }
+            // address of the RHS designator.  Three shapes:
+            //
+            //   * scalar + derived-type pointer: slot holds an 8-byte
+            //     pointer, `=>` stores the target's address into it.
+            //   * array pointer: slot holds a 384-byte ArrayDescriptor,
+            //     `=>` materialises a descriptor of the target and
+            //     memcpy's it into the slot.
+            //
+            // In both cases the target must be a simple Name for now;
+            // component-access and slice targets are follow-up work.
+            let Expr::Name { name: tgt_name } = &target.node else { return; };
+            let tgt_key = tgt_name.to_lowercase();
+            let Some(tgt_info) = ctx.locals.get(&tgt_key).cloned() else { return; };
+            if !tgt_info.is_pointer { return; }
+
+            let Expr::Name { name: src_name } = &value.node else { return; };
+            let src_key = src_name.to_lowercase();
+            let Some(src_info) = ctx.locals.get(&src_key).cloned() else { return; };
+
+            // Array pointer path: materialise a descriptor from the
+            // target and memcpy 384 bytes into the pointer's slot.
+            // Both explicit-shape stack arrays and descriptor-backed
+            // allocatables are supported via array_data_ptr_for_call.
+            let target_is_array = !src_info.dims.is_empty() || src_info.allocatable || src_info.descriptor_arg;
+            if target_is_array {
+                let src_desc = if local_uses_array_descriptor(&src_info) {
+                    array_descriptor_addr(b, &src_info)
+                } else {
+                    materialize_array_descriptor_for_info(b, &src_info)
                 };
-                b.store(addr, tgt_info.addr);
+                let size = b.const_i64(384);
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![tgt_info.addr, src_desc, size],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+                return;
             }
+
+            // Scalar / derived-type pointer path.
+            let addr = if src_info.is_pointer {
+                // Copy the current association of another pointer
+                // (pointer-to-pointer, including derived-type pointer
+                // chains).
+                b.load_typed(
+                    src_info.addr,
+                    IrType::Ptr(Box::new(src_info.ty.clone())),
+                )
+            } else if src_info.derived_type.is_some() {
+                // Derived-type TARGET.  src_info.addr is a
+                // ptr<[i8 x size]>; the pointer slot expects ptr<i8>.
+                // A zero-offset GEP with element type i8 produces
+                // the element-pointer view and round-trips through
+                // the verifier.
+                let zero = b.const_i64(0);
+                b.gep(src_info.addr, vec![zero], IrType::Int(IntWidth::I8))
+            } else {
+                // Plain TARGET or ordinary scalar local: the alloca
+                // address IS the associated target.
+                src_info.addr
+            };
+            b.store(addr, tgt_info.addr);
         }
 
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
@@ -9028,6 +9138,42 @@ fn lower_array_section(
 }
 
 /// Lower array intrinsics that need descriptor addresses (SIZE, SUM, etc.).
+/// Lower pointer-only intrinsics like `ASSOCIATED(p)`.  Kept
+/// separate from `lower_array_intrinsic` because the argument
+/// filter there rejects scalar and derived-type pointers (they
+/// don't have array dims) — but ASSOCIATED works on every
+/// pointer shape.
+///
+/// Returns `Some(bool_value)` for `ASSOCIATED(p)`, `None` for
+/// any other name or shape so the caller can fall through.
+fn lower_pointer_intrinsic(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+) -> Option<ValueId> {
+    if name != "associated" {
+        return None;
+    }
+    // We handle the one-argument form: ASSOCIATED(p).  The
+    // two-argument form ASSOCIATED(p, target) is deferred.
+    let first = args.first()?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else { return None; };
+    let Expr::Name { name: ptr_name } = &expr.node else { return None; };
+    let info = locals.get(&ptr_name.to_lowercase())?.clone();
+    if !info.is_pointer {
+        return None;
+    }
+    // For every pointer shape the base-address slot lives at byte
+    // offset 0 of `info.addr`.  Load it as an i64 and compare to
+    // zero.
+    let zero_off = b.const_i64(0);
+    let base_ptr = b.gep(info.addr, vec![zero_off], IrType::Int(IntWidth::I64));
+    let raw = b.load_typed(base_ptr, IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
 fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -9340,7 +9486,16 @@ fn resolve_component_base(
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
             let type_name = info.derived_type.as_ref()?.clone();
-            let addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+            // For a derived-type POINTER, info.addr is a pointer slot
+            // whose contents are the associated struct's address.
+            // Dereference once to get the struct base.
+            let addr = if info.is_pointer {
+                b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else if info.by_ref {
+                b.load(info.addr)
+            } else {
+                info.addr
+            };
             Some((addr, type_name))
         }
         Expr::ComponentAccess { base: inner_base, component } => {
@@ -9613,13 +9768,19 @@ fn lower_expr_full(
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
-                } else if info.is_pointer {
-                    // Fortran POINTER: `info.addr` is an alloca ptr<T>.
-                    // Reading the pointer as a value dereferences it:
-                    // load the target address out of the slot, then
-                    // load the value through it.
+                } else if info.is_pointer && info.derived_type.is_none() {
+                    // Scalar Fortran POINTER: `info.addr` is an alloca
+                    // ptr<T>.  Reading the pointer as a value
+                    // dereferences it: load the target address out of
+                    // the slot, then load the value through it.
                     let tgt = b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())));
                     b.load_typed(tgt, info.ty.clone())
+                } else if info.is_pointer && info.derived_type.is_some() {
+                    // Derived-type POINTER used as a bare Name (e.g.
+                    // passed to a subroutine expecting type(t)).  The
+                    // consumer wants the struct address, which is
+                    // what's stored in the pointer slot.
+                    b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                 } else if info.derived_type.is_some() {
                     // Derived type variable: storage is `alloca [i8 x size]`.
                     // Consumers of the value treat it as a pointer to the
@@ -9808,6 +9969,13 @@ fn lower_expr_full(
                         }
                         return lower_array_element(b, locals, info, args, st);
                     }
+                }
+
+                // Check for pointer intrinsics (ASSOCIATED) first —
+                // these work on every pointer shape and don't care
+                // about the array-intrinsic filter.
+                if let Some(result) = lower_pointer_intrinsic(b, locals, &key, args) {
+                    return result;
                 }
 
                 // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
