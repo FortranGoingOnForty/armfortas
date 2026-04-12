@@ -209,9 +209,10 @@ pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    external_globals: HashMap<(String, String), ModuleGlobalInfo>,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
-    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
+    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
 
     // Pass 1: collect module-level variables.
     for unit in units {
@@ -781,6 +782,9 @@ pub(crate) struct ModuleGlobalInfo {
     pub dims: Vec<(i64, i64)>,
     pub allocatable: bool,
     pub deferred_char: bool,
+    /// External modules (from .amod files) — skip emitting Global
+    /// data entries since the storage lives in the other .o file.
+    pub external: bool,
 }
 
 /// Walk a module's declarations and emit a global per variable.
@@ -839,6 +843,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: true,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                     continue;
@@ -864,6 +869,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: true,
+                            external: false,
                         },
                     );
                     continue;
@@ -927,6 +933,7 @@ fn collect_module_globals(
                             dims,
                             allocatable: false,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                 } else {
@@ -946,6 +953,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                 }
@@ -10759,8 +10767,8 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let (st, layouts) = resolve::resolve_file(&units, &[]).unwrap();
-        lower_file(&units, &st, &layouts).0
+        let (st, layouts) = { let rr = resolve::resolve_file(&units, &[]).unwrap(); (rr.st, rr.type_layouts) };
+        lower_file(&units, &st, &layouts, HashMap::new()).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {

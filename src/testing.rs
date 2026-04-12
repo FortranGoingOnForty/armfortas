@@ -308,13 +308,15 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Ast, CapturedStage::Text(format!("{:#?}", units)));
     }
 
-    let (st, type_layouts) = resolve::resolve_file(&units, &[]).map_err(|e| CaptureFailure {
+    let rr = resolve::resolve_file(&units, &[]).map_err(|e| CaptureFailure {
         input: input.clone(),
         opt_level: request.opt_level,
         stage: FailureStage::Sema,
         detail: format!("{}:{}: {}", input.display(), e.span.start.line, e.msg),
         stages: stages.clone(),
     })?;
+    let st = rr.st;
+    let type_layouts = rr.type_layouts;
     let diags = validate::validate_file(&units, &st);
     if wants(Stage::Sema) {
         stages.insert(
@@ -336,7 +338,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         });
     }
 
-    let (ir_module, _module_globals) = lower::lower_file(&units, &st, &type_layouts);
+    let (ir_module, _module_globals) = lower::lower_file(&units, &st, &type_layouts, std::collections::HashMap::new());
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors

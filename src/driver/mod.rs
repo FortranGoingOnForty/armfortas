@@ -163,10 +163,12 @@ impl Options {
 }
 
 fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
+    // Only emit _main if there's a __prog_* function (a Fortran PROGRAM
+    // body).  The previous .or_else fallback picked any non-"main"
+    // function, which incorrectly wrapped module procedures.
     allocated
         .iter()
         .find(|func| func.name.starts_with("__prog_"))
-        .or_else(|| allocated.iter().find(|func| func.name != "main"))
         .map(|func| func.name.as_str())
 }
 
@@ -222,7 +224,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     })?;
 
     // 5. Semantic analysis.
-    let (st, type_layouts) = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
+    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
         format!(
             "{}:{}:{}: {}",
             opts.input.display(),
@@ -231,6 +233,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             e.msg
         )
     })?;
+    let st = resolve_result.st;
+    let type_layouts = resolve_result.type_layouts;
+
+    // Build external globals from .amod-loaded modules.
+    let mut external_globals = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_globals.extend(crate::sema::amod::extract_module_globals(ext_mod));
+    }
+
     let diags = validate::validate_file(&units, &st);
     for d in &diags {
         if d.kind == validate::DiagKind::Error {
@@ -245,7 +256,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts);
+    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts, external_globals);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors

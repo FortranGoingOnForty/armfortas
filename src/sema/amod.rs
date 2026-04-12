@@ -465,7 +465,7 @@ pub struct AmodVar {
 }
 
 /// Complete module interface parsed from an .amod file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModuleInterface {
     pub module_name: String,
     pub dependencies: Vec<String>,
@@ -822,6 +822,58 @@ fn extract_kind(s: &str) -> Option<u8> {
         }
     }
     None
+}
+
+/// Convert a loaded ModuleInterface's variables into ModuleGlobalInfo
+/// entries for the lowering pass.
+pub fn extract_module_globals(
+    iface: &ModuleInterface,
+) -> HashMap<(String, String), crate::ir::lower::ModuleGlobalInfo> {
+    let mod_key = iface.module_name.to_lowercase();
+    let mut out = HashMap::new();
+    for var in &iface.variables {
+        if var.is_parameter { continue; } // PARAMETERs are inlined, no global
+        if let Some(ref ir_sym) = var.ir_symbol {
+            let ir_ty = type_info_to_ir_type(var.type_info.as_ref());
+            out.insert(
+                (mod_key.clone(), var.name.to_lowercase()),
+                crate::ir::lower::ModuleGlobalInfo {
+                    symbol: ir_sym.clone(),
+                    ty: ir_ty,
+                    dims: var.dims.clone(),
+                    allocatable: var.allocatable,
+                    deferred_char: var.deferred_char,
+                    external: true,
+                },
+            );
+        }
+    }
+    out
+}
+
+fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
+    use crate::ir::types::{IrType, IntWidth, FloatWidth};
+    match info {
+        Some(TypeInfo::Integer { kind }) => IrType::Int(match kind {
+            Some(1) => IntWidth::I8,
+            Some(2) => IntWidth::I16,
+            Some(8) => IntWidth::I64,
+            Some(16) => IntWidth::I128,
+            _ => IntWidth::I32,
+        }),
+        Some(TypeInfo::Real { kind }) => IrType::Float(match kind {
+            Some(8) => FloatWidth::F64,
+            _ => FloatWidth::F32,
+        }),
+        Some(TypeInfo::DoublePrecision) => IrType::Float(FloatWidth::F64),
+        Some(TypeInfo::Complex { kind }) => {
+            let fw = match kind { Some(8) => FloatWidth::F64, _ => FloatWidth::F32 };
+            IrType::Array(Box::new(IrType::Float(fw)), 2)
+        }
+        Some(TypeInfo::Logical { .. }) => IrType::Bool,
+        Some(TypeInfo::Character { .. }) => IrType::Int(IntWidth::I8),
+        _ => IrType::Int(IntWidth::I32),
+    }
 }
 
 #[cfg(test)]

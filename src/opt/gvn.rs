@@ -553,14 +553,14 @@ mod tests {
         let tokens = tokenize(&pp.text, 0, SourceForm::FreeForm).expect("tokenize fixture");
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().expect("parse fixture");
-        let (st, type_layouts) = resolve::resolve_file(&units, &[]).expect("resolve fixture");
+        let (st, type_layouts) = { let rr = resolve::resolve_file(&units, &[]).expect("resolve fixture"); (rr.st, rr.type_layouts) };
         let diags = validate::validate_file(&units, &st);
         assert!(
             !diags.iter().any(|diag| diag.kind == validate::DiagKind::Error),
             "fixture should lower cleanly: {:?}",
             diags
         );
-        lower::lower_file(&units, &st, &type_layouts).0
+        lower::lower_file(&units, &st, &type_layouts, std::collections::HashMap::new()).0
     }
 
     fn build_pre_gvn_o2_pipeline() -> PassManager {
