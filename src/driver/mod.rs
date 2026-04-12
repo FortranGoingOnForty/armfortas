@@ -730,15 +730,7 @@ mod tests {
 
         compile(&opts).expect("integer(16) multiply should codegen at O1 after const fold");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        // The O1 pipeline either folds the multiply to a constant
-        // that lingers in the emitted asm, or DCE eliminates the
-        // whole dead-stored local before codegen ever sees it.
-        // Both outcomes prove the claim we're guarding: the i128
-        // backend rejection path at O0 must not fire at O1.  The
-        // sibling fixture-level test in tests/i128_o1.rs already
-        // checks that the OPT_IR has folded the mul away — here
-        // we only need to confirm that no `mul ` survives to the
-        // machine code surface.
+        assert!(asm.contains("movz x16, #42"), "expected folded i128 constant in asm:\n{}", asm);
         assert!(!asm.contains("mul "), "expected O1 i128 multiply to fold away before backend:\n{}", asm);
         let _ = fs::remove_file(output);
     }

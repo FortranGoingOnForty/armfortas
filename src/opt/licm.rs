@@ -509,6 +509,104 @@ mod tests {
     }
 
     #[test]
+    fn hoists_loop_invariant_load_with_no_store_in_loop() {
+        // Positive coverage: when a load's pointer has no aliasing
+        // store (or call) in the loop body, the alias-aware LICM
+        // oracle proves the load is loop-invariant and hoists it
+        // into the preheader.  This is the mirror image of
+        // does_not_hoist_load_with_aliasing_store_in_loop: remove
+        // the store from the header and assert the load moved out.
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+        let addr = f.next_value_id();
+        let entry = f.entry;
+        f.block_mut(entry).insts.push(Inst {
+            id: addr,
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: dummy_span(),
+        });
+        let init = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: init,
+            kind: InstKind::ConstInt(0, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        // Give the slot a known value in the entry block so the
+        // hoisted load doesn't read undef.  LICM's correctness does
+        // not depend on this; we add it for realism.
+        let seed = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: seed,
+            kind: InstKind::ConstInt(99, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        let entry_store = f.next_value_id();
+        f.block_mut(entry).insts.push(Inst {
+            id: entry_store,
+            kind: InstKind::Store(seed, addr),
+            ty: IrType::Void,
+            span: dummy_span(),
+        });
+
+        let header = f.create_block("header");
+        let i_param = f.next_value_id();
+        f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+        let v = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: v,
+            kind: InstKind::Load(addr),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        let cond = f.next_value_id();
+        f.block_mut(header).insts.push(Inst {
+            id: cond,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+
+        let exit = f.create_block("exit");
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: header,
+            true_args: vec![i_param],
+            false_dest: exit,
+            false_args: vec![],
+        });
+        f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![init]));
+
+        m.add_function(f);
+
+        assert!(Licm.run(&mut m), "LICM should report that it hoisted the loop-invariant load");
+
+        // The Load must have moved out of the header — into the
+        // preheader or the entry block (LICM hoists into the
+        // nearest preheader, which for this single-block loop is
+        // either `entry` itself or a synthesised preheader).
+        let f = &m.functions[0];
+        let load_still_in_header = f
+            .block(header)
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::Load(_)));
+        assert!(!load_still_in_header, "invariant load should have left the header");
+        let load_somewhere_else = f
+            .blocks
+            .iter()
+            .filter(|b| b.id != header)
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i.kind, InstKind::Load(_)));
+        assert!(load_somewhere_else, "invariant load should have been placed in a dominating block");
+    }
+
+    #[test]
     fn hoists_load_from_noalias_dummy_across_other_dummy_store() {
         let params = vec![
             Param {
