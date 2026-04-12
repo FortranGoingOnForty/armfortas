@@ -5616,11 +5616,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             let addr = if src_info.is_pointer {
                 // Copy the current association of another pointer
                 // (pointer-to-pointer, including derived-type pointer
-                // chains).
-                b.load_typed(
-                    src_info.addr,
-                    IrType::Ptr(Box::new(src_info.ty.clone())),
-                )
+                // chains).  For scalar pointers (ty = i32) the stored
+                // value is Ptr<i32>; for DT pointers (ty = Ptr<i8>)
+                // the stored value is already Ptr<i8> — wrapping
+                // again would produce Ptr<Ptr<i8>> and fail the
+                // verifier.  Use ty directly when it's already a
+                // pointer.
+                let load_ty = if src_info.ty.is_ptr() {
+                    src_info.ty.clone()
+                } else {
+                    IrType::Ptr(Box::new(src_info.ty.clone()))
+                };
+                b.load_typed(src_info.addr, load_ty)
             } else if src_info.derived_type.is_some() {
                 // Derived-type TARGET.  src_info.addr is a
                 // ptr<[i8 x size]>; the pointer slot expects ptr<i8>.
