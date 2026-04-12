@@ -63,6 +63,14 @@ struct LocalInfo {
     /// loading through `addr`. Audit MAJOR-4: this lets parameters
     /// avoid wasting a `.data` slot per scope.
     inline_const: Option<ConstScalar>,
+    /// Fortran `POINTER` attribute on a scalar local.  When true,
+    /// `addr` is an `alloca ptr<ty>` — a pointer slot that holds
+    /// the address of the associated target (or null when
+    /// unassociated).  Reads/writes go through the slot just like
+    /// `by_ref`, but `by_ref` is reserved for dummy arguments that
+    /// cannot carry a Fortran `POINTER` attribute's semantics
+    /// (reassociation via `=>`, dereference on plain assignment).
+    is_pointer: bool,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -150,11 +158,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -580,7 +588,7 @@ fn install_common_locals(
                     by_ref: false,
                     char_kind: CharKind::None,
                     derived_type: None,
-                    inline_const: None,
+                    inline_const: None, is_pointer: false,
                 });
             }
         }
@@ -680,7 +688,7 @@ fn install_equivalence_locals(
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
-                        inline_const: None,
+                        inline_const: None, is_pointer: false,
                     });
                 }
             }
@@ -1160,7 +1168,7 @@ fn lower_unit(
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
+                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None, is_pointer: false,
                         };
                         ctx.locals.insert(pname.clone(), info);
                     }
@@ -1349,7 +1357,7 @@ fn lower_unit(
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None,
+                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None, is_pointer: false,
                         });
                     }
                 }
@@ -1370,7 +1378,7 @@ fn lower_unit(
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
-                        inline_const: None,
+                        inline_const: None, is_pointer: false,
                     });
                     // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
                 } else {
@@ -1727,6 +1735,7 @@ fn install_host_param_consts(
                 char_kind: CharKind::None,
                 derived_type: None,
                 inline_const: Some(*value),
+                is_pointer: false,
             },
         );
     }
@@ -2133,7 +2142,7 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: CharKind::None, derived_type: None, inline_const: None,
+        char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
     });
 }
 
@@ -2259,6 +2268,7 @@ fn install_globals_as_locals(
                                 char_kind: CharKind::None,
                                 derived_type: None,
                                 inline_const: Some(ConstScalar::Int(cv as i128)),
+                                is_pointer: false,
                             });
                             installed_from.insert(local_key, mod_key);
                         }
@@ -2316,6 +2326,7 @@ fn alloc_decls(
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+            let is_pointer_attr = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
 
             for entity in entities {
                 let key = entity.name.to_lowercase();
@@ -2353,7 +2364,7 @@ fn alloc_decls(
                     locals.insert(key, LocalInfo {
                         addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false,
-                        char_kind: CharKind::Deferred, derived_type: None, inline_const: None,
+                        char_kind: CharKind::Deferred, derived_type: None, inline_const: None, is_pointer: false,
                     });
                     continue;
                 } else if let Some(len) = char_len {
@@ -2404,7 +2415,7 @@ fn alloc_decls(
                             by_ref: false,
                             char_kind: CharKind::Fixed(len),
                             derived_type: None,
-                            inline_const: None,
+                            inline_const: None, is_pointer: false,
                         });
                         continue;
                     }
@@ -2424,7 +2435,7 @@ fn alloc_decls(
                         locals.insert(key, LocalInfo {
                             addr, ty: IrType::Int(IntWidth::I8),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None,
+                            char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None, is_pointer: false,
                         });
                         continue; // skip normal path
                     }
@@ -2438,7 +2449,7 @@ fn alloc_decls(
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts);
@@ -2459,12 +2470,12 @@ fn alloc_decls(
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
                     // Derived type variable: allocate struct-sized byte array.
@@ -2481,13 +2492,44 @@ fn alloc_decls(
                             descriptor_arg: false,
                             by_ref: false,
                             char_kind: CharKind::None,
-                            derived_type: Some(type_name.clone()), inline_const: None,
+                            derived_type: Some(type_name.clone()), inline_const: None, is_pointer: false,
                         });
                     } else {
                         // Unknown derived type — fall back to 8-byte alloca.
                         let addr = b.alloca(IrType::Int(IntWidth::I64));
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
                     }
+                } else if is_pointer_attr && array_spec.is_none() {
+                    // Scalar Fortran POINTER: allocate a pointer slot
+                    // (`alloca ptr<elem_ty>`) that holds the address
+                    // of whatever the pointer is currently associated
+                    // with.  `=>` stores into this slot; plain `=`
+                    // dereferences it; reads load twice.  The slot
+                    // starts null so that ASSOCIATED() returns
+                    // false before the first `=>`.
+                    let addr = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
+                    // Memset the slot to zero so unassociated pointers
+                    // compare null.  Eight bytes matches the ARM64
+                    // pointer width.
+                    let zero_byte = b.const_i32(0);
+                    let eight = b.const_i64(8);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![addr, zero_byte, eight],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    locals.insert(key, LocalInfo {
+                        addr,
+                        ty: elem_ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: true,
+                    });
                 } else {
                     // Scalar variable. Three sub-cases:
                     //   (a) PARAMETER-attributed and folds → inline
@@ -2519,7 +2561,7 @@ fn alloc_decls(
                                 addr, ty: elem_ty.clone(),
                                 dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                                 char_kind: CharKind::None, derived_type: None,
-                                inline_const: Some(value),
+                                inline_const: Some(value), is_pointer: false,
                             });
                             continue;
                         }
@@ -2541,14 +2583,14 @@ fn alloc_decls(
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::None, derived_type: None, inline_const: None,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
                         });
                     } else {
                         let addr = b.alloca(elem_ty.clone());
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::None, derived_type: None, inline_const: None,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
                         });
                     }
                 }
@@ -4411,6 +4453,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     b.call(FuncRef::External("memcpy".into()),
                                         vec![info.addr, val, size_val],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                } else if info.is_pointer {
+                                    // Plain `=` on a POINTER dereferences:
+                                    // load the target address out of the
+                                    // pointer slot, then store through it.
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(b, val, &info.ty);
+                                    let tgt = b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())));
+                                    b.store(coerced, tgt);
                                 } else if is_complex_ty(&info.ty) {
                                     // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
                                     // Memcpy the 8 or 16 bytes into the destination slot.
@@ -4782,7 +4832,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         descriptor_arg: false,
                         by_ref: false,
                         char_kind: CharKind::None,
-                        derived_type: None, inline_const: None,
+                        derived_type: None, inline_const: None, is_pointer: false,
                     });
                 }
             }
@@ -5094,7 +5144,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
             }
             lower_stmts(b, ctx, body);
 
@@ -5341,6 +5391,47 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             } else { b.const_i32(6) };
             let null = b.const_i64(0);
             b.call(FuncRef::External("afs_rewind".into()), vec![unit, null], IrType::Void);
+        }
+
+        Stmt::PointerAssignment { target, value } => {
+            // `p => q` or `p => x`: rebind the pointer slot `p` to the
+            // address of the RHS designator.  Currently handles scalar
+            // `Name` targets bound to either a TARGET local (take its
+            // addr) or another POINTER local (copy its current
+            // association out of the slot).
+            if let Expr::Name { name: tgt_name } = &target.node {
+                let tgt_key = tgt_name.to_lowercase();
+                let Some(tgt_info) = ctx.locals.get(&tgt_key).cloned() else { return; };
+                if !tgt_info.is_pointer { return; }
+                let addr = match &value.node {
+                    Expr::Name { name: src_name } => {
+                        let src_key = src_name.to_lowercase();
+                        let Some(src_info) = ctx.locals.get(&src_key).cloned() else { return; };
+                        if src_info.is_pointer {
+                            // Copying a pointer-to-pointer: load the
+                            // current association.
+                            b.load_typed(
+                                src_info.addr,
+                                IrType::Ptr(Box::new(src_info.ty.clone())),
+                            )
+                        } else {
+                            // Plain TARGET or ordinary local: the
+                            // alloca address is the associated target.
+                            src_info.addr
+                        }
+                    }
+                    _ => {
+                        // RHS isn't a simple Name — fall back to a
+                        // general expression lowering that returns an
+                        // address.  lower_expr_ctx_tl returns a value;
+                        // for unsupported RHS shapes this degrades to
+                        // a noop association, leaving the slot
+                        // unchanged.
+                        return;
+                    }
+                };
+                b.store(addr, tgt_info.addr);
+            }
         }
 
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
@@ -5633,7 +5724,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
             addr
         });
 
@@ -6124,7 +6215,7 @@ fn store_ac_implied_do(
         descriptor_arg: false,
         by_ref: false,
         char_kind: CharKind::None,
-        derived_type: None, inline_const: None,
+        derived_type: None, inline_const: None, is_pointer: false,
     });
 
     // Loop skeleton: check → body → exit. Mirrors the regular DO
@@ -8585,7 +8676,7 @@ fn lower_forall_nested(
             ctx.locals.insert(key.clone(), LocalInfo {
                 addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
                 allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None,
-                derived_type: None, inline_const: None,
+                derived_type: None, inline_const: None, is_pointer: false,
             });
             addr
         });
@@ -9510,6 +9601,13 @@ fn lower_expr_full(
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
+                } else if info.is_pointer {
+                    // Fortran POINTER: `info.addr` is an alloca ptr<T>.
+                    // Reading the pointer as a value dereferences it:
+                    // load the target address out of the slot, then
+                    // load the value through it.
+                    let tgt = b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())));
+                    b.load_typed(tgt, info.ty.clone())
                 } else if info.derived_type.is_some() {
                     // Derived type variable: storage is `alloca [i8 x size]`.
                     // Consumers of the value treat it as a pointer to the
