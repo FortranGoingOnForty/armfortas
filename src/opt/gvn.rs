@@ -62,12 +62,42 @@ impl PureCallPolicy {
         let reusable = func.is_pure
             && !matches!(func.return_type, IrType::Void)
             && !func.return_type.is_ptr()
-            && arg_policies.iter().all(|policy| *policy != PureArgPolicy::Unsupported);
+            && arg_policies.iter().all(|policy| *policy != PureArgPolicy::Unsupported)
+            && !reads_non_argument_memory(func);
         Self {
             reusable,
             arg_policies,
         }
     }
+}
+
+/// True if the function body touches any state outside of its
+/// arguments — e.g. a module global via `GlobalAddr`, an external
+/// call, or a runtime call that reads mutable state.
+///
+/// Per F2018 15.7 a PURE function is free to *read* common blocks
+/// and module variables; it just can't *write* them.  The Fortran
+/// `is_pure` flag therefore doesn't imply "result depends only on
+/// arguments" — a pure recursive accumulator over a module
+/// variable is fully legal, and GVN must not hash-cons such a call
+/// across an intervening store to that variable.
+///
+/// We conservatively reject any callee that contains a `GlobalAddr`
+/// or a non-Internal `Call` / `RuntimeCall`.  The existing
+/// argument-policy machinery already handles the "reads through
+/// argument pointer" case via `ReadOnlyWrapperPtr`.
+fn reads_non_argument_memory(func: &Function) -> bool {
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::GlobalAddr(_) => return true,
+                InstKind::Call(FuncRef::External(_), _) => return true,
+                InstKind::RuntimeCall(_, _) => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 fn is_scalar_type(ty: &IrType) -> bool {
