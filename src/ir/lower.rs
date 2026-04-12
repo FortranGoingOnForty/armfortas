@@ -9510,6 +9510,16 @@ fn lower_expr_full(
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
+                } else if info.derived_type.is_some() {
+                    // Derived type variable: storage is `alloca [i8 x size]`.
+                    // Consumers of the value treat it as a pointer to the
+                    // struct (memcpy for whole-struct assignment, GEP for
+                    // component access). Without this case we fell through
+                    // to load_typed(info.ty) which yanked the first 8 bytes
+                    // of the struct as if they were a pointer, turning
+                    // `b = a` into a memcpy from the garbage address held
+                    // by a's first field slot.
+                    if info.by_ref { b.load(info.addr) } else { info.addr }
                 } else if is_complex_ty(&info.ty) {
                     if info.by_ref {
                         // by-ref complex: info.addr holds ptr-to-ptr-to-buffer.
