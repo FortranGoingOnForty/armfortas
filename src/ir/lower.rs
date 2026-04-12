@@ -9777,6 +9777,34 @@ fn lower_arg_by_ref(
             return info.addr;
         }
     }
+    // Array element: arr(i) passed by ref should pass the address
+    // of the element within arr, NOT a copy.  This enables sequence
+    // association (F2018 §15.5.2.11): a callee that declares a
+    // larger dummy can walk to successive elements from the passed
+    // address.
+    if let Expr::FunctionCall { callee, args } = &expr.node {
+        if let Expr::Name { name } = &callee.node {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                    // Compute the element address via GEP.
+                    if args.len() == 1 {
+                        if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &args[0].value {
+                            let base = array_data_ptr_for_call(b, info);
+                            let idx = lower_expr(b, locals, idx_expr, st);
+                            let idx64 = match b.func().value_type(idx) {
+                                Some(IrType::Int(IntWidth::I64)) => idx,
+                                _ => b.int_extend(idx, IntWidth::I64, true),
+                            };
+                            let one = b.const_i64(1);
+                            let idx0 = b.isub(idx64, one); // Fortran 1-indexed → 0-indexed
+                            return b.gep(base, vec![idx0], info.ty.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Otherwise, evaluate and store to a temp.
     let val = lower_expr(b, locals, expr, st);
     let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
