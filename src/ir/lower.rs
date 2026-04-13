@@ -2358,6 +2358,15 @@ fn install_globals_as_locals(
             for (mk, var) in globals.keys() {
                 if *mk != mod_key { continue; }
                 if rename_targets.contains(var) { continue; }
+                // Skip PRIVATE symbols — only PUBLIC symbols are accessible
+                // via USE without ONLY.
+                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                    if let Some(sym) = st.scope(mod_scope_id).symbols.get(var) {
+                        if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
+                            continue;
+                        }
+                    }
+                }
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
             }
             // Also scan the SymbolTable module scope for symbols not
