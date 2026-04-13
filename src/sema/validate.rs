@@ -993,8 +993,23 @@ fn walk_stmt_for_undeclared(
             chk!(condition); recurse!(action);
         }
         Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } |
-        Stmt::DoConcurrent { body, .. } | Stmt::Block { body, .. } => {
+        Stmt::DoConcurrent { body, .. } => {
             for s in body { recurse!(s); }
+        }
+        Stmt::Block { decls, body, .. } => {
+            // BLOCK introduces a new scope with its own declarations.
+            // Collect them and pass an augmented declared set.
+            let mut block_declared = declared.clone();
+            for d in decls {
+                if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
+                    for e in entities {
+                        block_declared.insert(e.name.to_lowercase());
+                    }
+                }
+            }
+            for s in body {
+                walk_stmt_for_undeclared(st, scope_id, s, &block_declared, undeclared);
+            }
         }
         Stmt::SelectCase { selector, cases, .. } => {
             chk!(selector);
