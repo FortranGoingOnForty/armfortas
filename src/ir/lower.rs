@@ -3955,6 +3955,31 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             } else { None }
         }
 
+        // ---- IEEE arithmetic intrinsics ----
+        "ieee_is_nan" => {
+            // IEEE_IS_NAN(x) → x != x (NaN is the only value that is not equal to itself)
+            if let Some(arg) = args.first() {
+                Some(b.fcmp(CmpOp::Ne, *arg, *arg))
+            } else { None }
+        }
+        "ieee_is_finite" => {
+            // IEEE_IS_FINITE(x) → (x - x) == 0.0
+            // For finite values, x-x is 0.0. For inf, x-x is NaN. For NaN, x-x is NaN.
+            if let Some(arg) = args.first() {
+                let diff = b.fsub(*arg, *arg);
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F64));
+                let zero = match &ty {
+                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                    _ => b.const_f64(0.0),
+                };
+                Some(b.fcmp(CmpOp::Eq, diff, zero))
+            } else { None }
+        }
+        "ieee_support_datatype" | "ieee_support_denormal" => {
+            // These return .TRUE. for supported types on ARM64.
+            Some(b.const_bool(true))
+        }
+
         _ => None,
     }
 }
