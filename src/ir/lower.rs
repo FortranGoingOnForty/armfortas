@@ -5048,16 +5048,28 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
                             if let Some(field) = layout.field(component) {
-                                let val = lower_expr_ctx_tl(b, ctx, value);
-                                let coerced = coerce_to_type(
-                                    b,
-                                    val,
-                                    &type_info_to_ir_type(&field.type_info),
-                                );
                                 let offset = b.const_i64(field.offset as i64);
                                 let field_ptr = b.gep(base_addr, vec![offset],
                                     IrType::Int(IntWidth::I8));
-                                b.store(coerced, field_ptr);
+
+                                // Character field: copy string data with space padding.
+                                if let crate::sema::symtab::TypeInfo::Character { len: Some(flen), .. } = &field.type_info {
+                                    let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                    let dest_len = b.const_i64(*flen);
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![field_ptr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(
+                                        b,
+                                        val,
+                                        &type_info_to_ir_type(&field.type_info),
+                                    );
+                                    b.store(coerced, field_ptr);
+                                }
                             }
                         }
                     }
@@ -7121,6 +7133,16 @@ fn lower_write_items_adv(
                 } else { false }
             }
             Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
+            Expr::ComponentAccess { base, component } => {
+                // Check if the component is a character field.
+                if let Some((_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        layout.field(component)
+                            .map(|f| matches!(f.type_info, crate::sema::symtab::TypeInfo::Character { .. }))
+                            .unwrap_or(false)
+                    } else { false }
+                } else { false }
+            }
             _ => false,
         };
 
@@ -7211,6 +7233,24 @@ fn lower_write_items_adv(
         }
 
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            // Special case: character field in derived type — get ptr and
+            // length directly from the type layout since lower_string_expr
+            // doesn't have access to type_layouts.
+            if let Expr::ComponentAccess { base, component } = &item.node {
+                if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(field) = layout.field(component) {
+                            if let crate::sema::symtab::TypeInfo::Character { len: Some(flen), .. } = &field.type_info {
+                                let offset = b.const_i64(field.offset as i64);
+                                let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+                                let len_val = b.const_i64(*flen);
+                                b.call(FuncRef::External("afs_write_string".into()), vec![unit, field_ptr, len_val], IrType::Void);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
             b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
         } else {
@@ -10863,9 +10903,16 @@ fn lower_expr_full(
                             let offset = b.const_i64(field.offset as i64);
                             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
-                            // If the field is itself a derived type, DON'T load — return the pointer
+                            // If the field is a derived type, DON'T load — return the pointer
                             // (for chained access like x%inner%field).
                             if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
+                                return field_ptr;
+                            }
+
+                            // Character fields: return the pointer to the inline
+                            // character data, not a load. The data is stored
+                            // inline in the struct, not behind a pointer.
+                            if let crate::sema::symtab::TypeInfo::Character { .. } = &field.type_info {
                                 return field_ptr;
                             }
 
