@@ -260,3 +260,87 @@ fn diamond_width_4_o2() {
     let (files, main_src, expected) = gen_diamond(4);
     run_generated_test(files, main_src, expected, "-O2", "diamond4_o2");
 }
+
+// ---- Cross-optimization ABI matrix tests ----
+
+/// Compile modules at one opt level, main at another, link together.
+/// Verifies ABI consistency across optimization levels.
+fn run_cross_opt_test(
+    files: Vec<(String, String)>,
+    main_src: String,
+    expected: &str,
+    mod_opt: &str,
+    main_opt: &str,
+    label: &str,
+) {
+    let compiler = find_compiler();
+    let dir = unique_dir(label);
+
+    for (name, src) in &files {
+        fs::write(dir.join(name), src).unwrap();
+    }
+    fs::write(dir.join("main.f90"), &main_src).unwrap();
+
+    // Compile modules at mod_opt.
+    let mut objects = Vec::new();
+    for (name, _) in &files {
+        let f90 = dir.join(name);
+        let stem = name.trim_end_matches(".f90");
+        let obj = dir.join(format!("{}.o", stem));
+        compile_file(&compiler, &f90, &obj, &dir, mod_opt);
+        objects.push(obj);
+    }
+
+    // Compile main at main_opt.
+    let main_o = dir.join("main.o");
+    compile_file(&compiler, &dir.join("main.f90"), &main_o, &dir, main_opt);
+    objects.push(main_o);
+
+    let binary = dir.join("test_bin");
+    link_files(&objects, &binary);
+    let output = run_binary(&binary);
+
+    assert!(
+        output.contains(expected),
+        "{}: mod@{} + main@{}: expected '{}' in output, got:\n{}",
+        label, mod_opt, main_opt, expected, output
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn abi_matrix_chain5_mod_o0_main_o2() {
+    let (files, main_src, expected) = gen_chain(5);
+    run_cross_opt_test(files, main_src, expected, "-O0", "-O2", "abi_chain5_0_2");
+}
+
+#[test]
+fn abi_matrix_chain5_mod_o2_main_o0() {
+    let (files, main_src, expected) = gen_chain(5);
+    run_cross_opt_test(files, main_src, expected, "-O2", "-O0", "abi_chain5_2_0");
+}
+
+#[test]
+fn abi_matrix_diamond4_mod_o0_main_o2() {
+    let (files, main_src, expected) = gen_diamond(4);
+    run_cross_opt_test(files, main_src, expected, "-O0", "-O2", "abi_dia4_0_2");
+}
+
+#[test]
+fn abi_matrix_diamond4_mod_o2_main_o0() {
+    let (files, main_src, expected) = gen_diamond(4);
+    run_cross_opt_test(files, main_src, expected, "-O2", "-O0", "abi_dia4_2_0");
+}
+
+#[test]
+fn abi_matrix_chain5_mod_o0_main_ofast() {
+    let (files, main_src, expected) = gen_chain(5);
+    run_cross_opt_test(files, main_src, expected, "-O0", "-Ofast", "abi_chain5_0_fast");
+}
+
+#[test]
+fn abi_matrix_chain5_mod_ofast_main_o0() {
+    let (files, main_src, expected) = gen_chain(5);
+    run_cross_opt_test(files, main_src, expected, "-Ofast", "-O0", "abi_chain5_fast_0");
+}
