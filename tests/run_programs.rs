@@ -2028,21 +2028,51 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
             // Compile each in order (dependencies first).
             let mut objects = Vec::new();
+            let mut compile_error: Option<String> = None;
             for name in &ordered_names {
                 let seg_f90 = build_dir.join(name);
                 if !seg_f90.exists() {
-                    return Err(format!(
+                    let msg = format!(
                         "{}: MULTIFILE_LINK references '{}' but no !--- file: segment defines it",
                         filename, name,
-                    ));
+                    );
+                    compile_error = Some(msg);
+                    break;
                 }
                 let seg_o = build_dir.join(format!(
                     "{}.o",
                     Path::new(name).file_stem().unwrap().to_str().unwrap()
                 ));
-                compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir)
-                    .map_err(|e| format!("{} [{}]: {}", filename, opt_flag, e))?;
+                if let Err(e) = compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir) {
+                    compile_error = Some(format!("{} [{}]: {}", filename, opt_flag, e));
+                    break;
+                }
                 objects.push(seg_o);
+            }
+
+            // Handle ERROR_EXPECTED for multi-file tests.
+            if let Some(err_msg) = compile_error {
+                let _ = fs::remove_dir_all(&build_dir);
+                if let Some(expected) = &error_expected {
+                    if err_msg.contains(expected.as_str()) {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "{} [{}]: ERROR_EXPECTED({}) but compile error did not contain it.\n\
+                         Actual error:\n{}",
+                        filename, opt_flag, expected, err_msg,
+                    ));
+                }
+                return Err(err_msg);
+            }
+
+            // ERROR_EXPECTED but compilation succeeded — that's a failure.
+            if error_expected.is_some() {
+                let _ = fs::remove_dir_all(&build_dir);
+                return Err(format!(
+                    "{} [{}]: ERROR_EXPECTED but all segments compiled successfully",
+                    filename, opt_flag,
+                ));
             }
 
             // Link all .o files into a binary.
@@ -3021,5 +3051,29 @@ fn multifile_three_modules_runs_at_o0() {
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
         other => panic!("multifile_three_modules.f90 should pass at -O0, got {:?}", other),
+    }
+}
+
+#[test]
+fn multifile_error_circular_direct_detected() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_direct.f90");
+    assert!(source.exists(), "error_circular_use_direct.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("circular use direct should pass (ERROR_EXPECTED match), got {:?}", other),
+    }
+}
+
+#[test]
+fn multifile_error_circular_indirect_detected() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_indirect.f90");
+    assert!(source.exists(), "error_circular_use_indirect.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("circular use indirect should pass (ERROR_EXPECTED match), got {:?}", other),
     }
 }
