@@ -100,6 +100,11 @@ impl IrType {
         matches!(self, Self::Int(_) | Self::Float(_))
     }
 
+    /// Extract the IntWidth if this is an integer type.
+    pub fn int_width(&self) -> Option<IntWidth> {
+        if let Self::Int(w) = self { Some(*w) } else { None }
+    }
+
     /// Is this an integer type?
     pub fn is_int(&self) -> bool { matches!(self, Self::Int(_)) }
 

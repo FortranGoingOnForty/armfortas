@@ -10549,7 +10549,19 @@ fn lower_expr_full(
                 }
                 IrType::Float(fw)
             } else {
-                lty.clone()
+                // Integer width promotion: widen the narrower operand to
+                // match the wider one. Without this, integer(int64) + 1
+                // produces an IR width mismatch (i64 + i32).
+                let lw = lty.int_width().unwrap_or(IntWidth::I32);
+                let rw = rty.int_width().unwrap_or(IntWidth::I32);
+                let target_w = if lw.bits() >= rw.bits() { lw } else { rw };
+                if lw != target_w {
+                    lhs = b.int_extend(lhs, target_w, true);
+                }
+                if rw != target_w {
+                    rhs = b.int_extend(rhs, target_w, true);
+                }
+                IrType::Int(target_w)
             };
 
             match (op, &result_ty) {
