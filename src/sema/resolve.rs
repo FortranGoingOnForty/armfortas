@@ -642,6 +642,42 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
             }
         }
         Expr::ParenExpr { inner } => eval_const_int_expr(inner, st),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                let first_arg_val = args.first().and_then(|a| {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        eval_const_int_expr(e, st)
+                    } else { None }
+                });
+                match key.as_str() {
+                    "selected_int_kind" => {
+                        let r = first_arg_val?;
+                        Some(if r <= 2 { 1 } else if r <= 4 { 2 }
+                            else if r <= 9 { 4 } else if r <= 18 { 8 }
+                            else if r <= 38 { 16 } else { -1 })
+                    }
+                    "selected_real_kind" => {
+                        let p = first_arg_val?;
+                        Some(if p <= 6 { 4 } else if p <= 15 { 8 } else { -1 })
+                    }
+                    "kind" => {
+                        if let Some(arg) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                match &e.node {
+                                    Expr::RealLiteral { text, .. } => {
+                                        Some(if text.contains('d') || text.contains('D') { 8 } else { 4 })
+                                    }
+                                    Expr::IntegerLiteral { .. } => Some(4),
+                                    _ => None,
+                                }
+                            } else { None }
+                        } else { None }
+                    }
+                    _ => None,
+                }
+            } else { None }
+        }
         _ => None,
     }
 }

@@ -327,6 +327,16 @@ impl Function {
     pub fn value_type(&self, id: ValueId) -> Option<IrType> {
         self.type_cache.get(&id).cloned()
     }
+
+    /// Find the instruction that defines a value, searching all blocks.
+    pub fn find_defining_inst(&self, id: ValueId) -> Option<&Inst> {
+        for block in &self.blocks {
+            for inst in &block.insts {
+                if inst.id == id { return Some(inst); }
+            }
+        }
+        None
+    }
 }
 
 /// A global variable.

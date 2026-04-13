@@ -1829,6 +1829,54 @@ fn eval_const_scalar(
             }
         }
         Expr::ParenExpr { inner } => eval_const_scalar(inner, param_consts),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                let first_arg = args.first().and_then(|a| {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        eval_const_scalar(e, param_consts)
+                    } else { None }
+                });
+                match key.as_str() {
+                    "selected_int_kind" => {
+                        if let Some(ConstScalar::Int(r)) = first_arg {
+                            let r = r as i64;
+                            let kind = if r <= 2 { 1 } else if r <= 4 { 2 }
+                                else if r <= 9 { 4 } else if r <= 18 { 8 }
+                                else if r <= 38 { 16 } else { -1 };
+                            Some(ConstScalar::Int(kind as i128))
+                        } else { None }
+                    }
+                    "selected_real_kind" => {
+                        if let Some(ConstScalar::Int(p)) = first_arg {
+                            let p = p as i64;
+                            let kind = if p <= 6 { 4 } else if p <= 15 { 8 } else { -1 };
+                            Some(ConstScalar::Int(kind as i128))
+                        } else { None }
+                    }
+                    "kind" => {
+                        // kind(expr): return the kind of the argument.
+                        // For compile-time purposes, infer from the literal type.
+                        if let Some(arg_expr) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg_expr.value {
+                                match &e.node {
+                                    Expr::RealLiteral { text, .. } => {
+                                        if text.contains('d') || text.contains('D') {
+                                            Some(ConstScalar::Int(8))
+                                        } else {
+                                            Some(ConstScalar::Int(4))
+                                        }
+                                    }
+                                    Expr::IntegerLiteral { .. } => Some(ConstScalar::Int(4)),
+                                    _ => None,
+                                }
+                            } else { None }
+                        } else { None }
+                    }
+                    _ => None,
+                }
+            } else { None }
+        }
         _ => None,
     }
 }
@@ -3998,6 +4046,37 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             } else { None }
         }
 
+        // ---- Kind selection intrinsics ----
+        "selected_int_kind" => {
+            // selected_int_kind(r): smallest integer kind whose range covers [-10^r, 10^r].
+            if let Some(arg) = args.first() {
+                if let Some(r) = extract_const_int_from_value(b, *arg) {
+                    let kind: i32 = if r <= 2 { 1 }       // i8: ±127
+                        else if r <= 4 { 2 }               // i16: ±32767
+                        else if r <= 9 { 4 }               // i32: ±2.1e9
+                        else if r <= 18 { 8 }              // i64: ±9.2e18
+                        else if r <= 38 { 16 }             // i128: ±1.7e38
+                        else { -1 };                       // no kind available
+                    Some(b.const_i32(kind))
+                } else {
+                    Some(b.const_i32(4)) // non-constant: default to 4
+                }
+            } else { None }
+        }
+        "selected_real_kind" => {
+            // selected_real_kind(p[, r]): smallest real kind with ≥p decimal digits.
+            if let Some(arg) = args.first() {
+                if let Some(p) = extract_const_int_from_value(b, *arg) {
+                    let kind: i32 = if p <= 6 { 4 }       // f32: ~7 digits
+                        else if p <= 15 { 8 }              // f64: ~15 digits
+                        else { -1 };                       // no kind available
+                    Some(b.const_i32(kind))
+                } else {
+                    Some(b.const_i32(8)) // non-constant: default to 8
+                }
+            } else { None }
+        }
+
         // ---- IEEE arithmetic intrinsics ----
         "ieee_is_nan" => {
             // IEEE_IS_NAN(x) → x != x (NaN is the only value that is not equal to itself)
@@ -4021,6 +4100,16 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             Some(b.const_bool(true))
         }
 
+        _ => None,
+    }
+}
+
+/// Extract a compile-time integer constant from a ValueId by
+/// looking up its defining instruction in the function.
+fn extract_const_int_from_value(b: &FuncBuilder, id: ValueId) -> Option<i64> {
+    let inst = b.func().find_defining_inst(id)?;
+    match &inst.kind {
+        InstKind::ConstInt(v, _) => Some(*v as i64),
         _ => None,
     }
 }
