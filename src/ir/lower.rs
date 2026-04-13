@@ -4104,6 +4104,71 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
     }
 }
 
+/// Resolve a generic interface call to a specific procedure.
+/// Returns Some(specific_name) if the callee is a NamedInterface
+/// and a matching specific is found. Returns None otherwise.
+fn resolve_generic_call(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    callee: &str,
+    arg_vals: &[ValueId],
+) -> Option<String> {
+    // Find the generic interface symbol in any scope.
+    let sym = st.find_symbol_any_scope(callee)?;
+    if sym.kind != crate::sema::symtab::SymbolKind::NamedInterface { return None; }
+    if sym.arg_names.is_empty() { return None; }
+
+    if sym.arg_names.len() == 1 {
+        return Some(sym.arg_names[0].clone());
+    }
+
+    // Classify actual argument types.
+    let actual_types: Vec<Option<IrType>> = arg_vals.iter()
+        .map(|v| b.func().value_type(*v))
+        .collect();
+
+    // For each specific procedure, look up its declared argument types
+    // from the symbol table and check if they match the actual types.
+    for specific in &sym.arg_names {
+        // Find the specific's scope to get declared argument types.
+        for scope in st.all_scopes() {
+            let scope_matches = match &scope.kind {
+                crate::sema::symtab::ScopeKind::Function(n) | crate::sema::symtab::ScopeKind::Subroutine(n) => n.to_lowercase() == *specific,
+                _ => false,
+            };
+            if !scope_matches { continue; }
+
+            // Get declared argument types from this scope's symbols.
+            let mut type_match = true;
+            let declared_args: Vec<&crate::sema::symtab::Symbol> = scope.symbols.values()
+                .filter(|s| s.kind == crate::sema::symtab::SymbolKind::Variable
+                    && s.attrs.intent.is_some())
+                .collect();
+
+            if declared_args.len() != actual_types.len() {
+                type_match = false;
+            } else {
+                for (decl_sym, actual_ty) in declared_args.iter().zip(actual_types.iter()) {
+                    if let (Some(ref ti), Some(ref at)) = (&decl_sym.type_info, actual_ty) {
+                        let decl_ir = type_info_to_ir_type(ti);
+                        if decl_ir.is_float() != at.is_float() || decl_ir.is_int() != at.is_int() {
+                            type_match = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if type_match {
+                return Some(specific.clone());
+            }
+        }
+    }
+
+    // Fallback: return the first specific.
+    Some(sym.arg_names[0].clone())
+}
+
 /// Extract a compile-time integer constant from a ValueId by
 /// looking up its defining instruction in the function.
 fn extract_const_int_from_value(b: &FuncBuilder, id: ValueId) -> Option<i64> {
@@ -10966,13 +11031,19 @@ fn lower_expr_full(
                     }
                 }).collect();
 
+                // Resolve generic interface names to specific procedures.
+                let resolved_name = resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
+                    .unwrap_or_else(|| name.clone());
+                let resolved_key = resolved_name.to_lowercase();
+
                 // Look up callee return type from symbol table.
-                // Search all scopes since the current scope may be global after resolve.
-                let ret_ty = callee_return_ir_type(st, &key).unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = callee_return_ir_type(st, &resolved_key)
+                    .or_else(|| callee_return_ir_type(st, &key))
+                    .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = internal_funcs
-                    .and_then(|map| map.get(&key).copied())
+                    .and_then(|map| map.get(&resolved_key).or_else(|| map.get(&key)).copied())
                     .map(FuncRef::Internal)
-                    .unwrap_or_else(|| FuncRef::External(name.clone()));
+                    .unwrap_or_else(|| FuncRef::External(resolved_name));
                 b.call(func_ref, ref_arg_vals, ret_ty)
             } else {
                 b.const_i32(0)

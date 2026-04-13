@@ -156,18 +156,23 @@ impl SymbolTable {
         None
     }
 
-    /// Search ALL scopes for a parameter symbol by name.
+    /// Search ALL scopes for a symbol by name.
     /// Used during lowering when the current scope may not be set correctly.
+    /// Prefers parameter symbols (for kind resolution) but returns any match.
     pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
         let key = name.to_lowercase();
+        let mut fallback: Option<&Symbol> = None;
         for scope in &self.scopes {
             if let Some(sym) = scope.symbols.get(&key) {
                 if sym.attrs.parameter {
                     return Some(sym);
                 }
+                if fallback.is_none() {
+                    fallback = Some(sym);
+                }
             }
         }
-        None
+        fallback
     }
 
     /// Check if a name would be implicitly typed in the current scope.
@@ -216,6 +221,11 @@ impl SymbolTable {
         // If the symbol hasn't been declared yet, we'll apply the access
         // when it is declared (via the default access mechanism or a
         // deferred access list). For now, silently skip.
+    }
+
+    /// Iterate all scopes (for generic interface resolution during lowering).
+    pub fn all_scopes(&self) -> &[Scope] {
+        &self.scopes
     }
 
     /// Check whether implicit none (type) is active in a scope.

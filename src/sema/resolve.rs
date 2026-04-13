@@ -181,17 +181,47 @@ fn resolve_unit(
             process_contains(st, contains, module_search_paths, layouts)?;
             st.pop_scope();
         }
-        ProgramUnit::InterfaceBlock { name: _, is_abstract: _, bodies } => {
+        ProgramUnit::InterfaceBlock { name, is_abstract: _, bodies } => {
             st.push_scope(ScopeKind::Interface);
+            let mut specific_names = Vec::new();
             for body in bodies {
                 match body {
-                    InterfaceBody::Subprogram(sub) => resolve_unit(st, sub, module_search_paths, layouts)?,
-                    InterfaceBody::ModuleProcedure(_names) => {
-                        // Module procedures are resolved by name during type checking.
+                    InterfaceBody::Subprogram(sub) => {
+                        // Extract the specific name from the subprogram.
+                        match &sub.node {
+                            ProgramUnit::Function { name: fn_name, .. } |
+                            ProgramUnit::Subroutine { name: fn_name, .. } => {
+                                specific_names.push(fn_name.to_lowercase());
+                            }
+                            _ => {}
+                        }
+                        resolve_unit(st, sub, module_search_paths, layouts)?;
+                    }
+                    InterfaceBody::ModuleProcedure(names) => {
+                        for n in names {
+                            specific_names.push(n.to_lowercase());
+                        }
                     }
                 }
             }
             st.pop_scope();
+
+            // Register the generic interface name in the enclosing scope.
+            if let Some(generic_name) = name {
+                if !generic_name.is_empty() && !specific_names.is_empty() {
+                    let span = unit.span;
+                    let _ = st.define(Symbol {
+                        name: generic_name.clone(),
+                        kind: SymbolKind::NamedInterface,
+                        type_info: None,
+                        attrs: SymbolAttrs { ..Default::default() },
+                        defined_at: span,
+                        scope: st.current_scope(),
+                        arg_names: specific_names,
+                        const_value: None,
+                    });
+                }
+            }
         }
     }
     Ok(())
