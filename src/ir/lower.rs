@@ -7088,6 +7088,7 @@ fn lower_write_items_adv(
                     } else { false }
                 } else { false }
             }
+            Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
             _ => false,
         };
 
@@ -7278,6 +7279,7 @@ fn lower_internal_write_items(
                     } else { false }
                 } else { false }
             }
+            Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
             _ => false,
         };
 
