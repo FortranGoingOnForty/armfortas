@@ -125,6 +125,10 @@ pub enum InstKind {
     FloatTrunc(ValueId, FloatWidth),
     IntExtend(ValueId, IntWidth, bool),   // bool = signed
     IntTrunc(ValueId, IntWidth),
+    /// Convert a pointer to an integer (address as i64).
+    PtrToInt(ValueId),
+    /// Convert an integer (i64 address) to a pointer.
+    IntToPtr(ValueId, IrType),
 
     // ---- Memory ----
     Alloca(IrType),

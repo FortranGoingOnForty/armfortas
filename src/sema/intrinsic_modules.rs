@@ -12,6 +12,7 @@ use crate::lexer::Span;
 pub fn register_intrinsic_modules(st: &mut SymbolTable) {
     register_iso_c_binding(st);
     register_iso_fortran_env(st);
+    register_ieee_stubs(st);
 }
 
 fn builtin_span() -> Span {
@@ -96,16 +97,24 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     }
 
     // ---- Character and logical kinds ----
-    insert_param(st, m, "c_char", TypeInfo::Character { len: Some(1), kind: Some(1) });
-    insert_param(st, m, "c_bool", TypeInfo::Logical { kind: Some(1) });
+    // c_char is an integer kind parameter (value = 1), not a character type.
+    insert_param_val(st, m, "c_char", ik(4), Some(1));
+    insert_param_val(st, m, "c_bool", TypeInfo::Integer { kind: Some(4) }, Some(1));
 
     // ---- Character constants (c_null_char, etc.) ----
+    // Each constant's value is its ASCII byte code.
     let ck = TypeInfo::Character { len: Some(1), kind: Some(1) };
-    for name in [
-        "c_null_char", "c_alert", "c_backspace", "c_form_feed",
-        "c_new_line", "c_carriage_return", "c_horizontal_tab", "c_vertical_tab",
+    for (name, ascii) in [
+        ("c_null_char", 0i64),
+        ("c_alert", 7),
+        ("c_backspace", 8),
+        ("c_horizontal_tab", 9),
+        ("c_new_line", 10),
+        ("c_vertical_tab", 11),
+        ("c_form_feed", 12),
+        ("c_carriage_return", 13),
     ] {
-        insert_param(st, m, name, ck.clone());
+        insert_param_val(st, m, name, ck.clone(), Some(ascii));
     }
 
     // ---- Pointer types ----
@@ -144,10 +153,66 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "int64", ik4.clone(), Some(8));
     insert_param_val(st, m, "real32", ik4.clone(), Some(4));
     insert_param_val(st, m, "real64", ik4.clone(), Some(8));
+    insert_param_val(st, m, "real128", ik4.clone(), Some(16));
     insert_param_val(st, m, "character_kinds", ik4.clone(), Some(1));
     insert_param_val(st, m, "integer_kinds", ik4.clone(), Some(4));
     insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));
-    insert_param_val(st, m, "real_kinds", ik4, Some(4));
+    insert_param_val(st, m, "real_kinds", ik4.clone(), Some(4));
+
+    // Storage size constants (F2008).
+    insert_param_val(st, m, "file_storage_size", ik4.clone(), Some(8));
+    insert_param_val(st, m, "numeric_storage_size", ik4.clone(), Some(32));
+    // Coarray stat constants (F2008/F2018).
+    insert_param_val(st, m, "stat_stopped_image", ik4.clone(), Some(-3));
+    insert_param_val(st, m, "stat_failed_image", ik4.clone(), Some(-4));
+    insert_param_val(st, m, "stat_locked", ik4.clone(), Some(-5));
+    insert_param_val(st, m, "stat_locked_other_image", ik4.clone(), Some(-6));
+    insert_param_val(st, m, "stat_unlocked", ik4, Some(-7));
+
+    // Inquiry functions — lowered to string constants by the compiler.
+    insert_proc(st, m, "compiler_version");
+    insert_proc(st, m, "compiler_options");
 
     st.pop_scope();
+}
+
+/// Register stub IEEE module scopes so `USE ieee_arithmetic` etc.
+/// don't produce a "module not found" error.  The procedures
+/// themselves are not yet implemented (sprint 30.7).
+fn register_ieee_stubs(st: &mut SymbolTable) {
+    for name in ["ieee_arithmetic", "ieee_exceptions", "ieee_features"] {
+        let m = st.push_scope(ScopeKind::Module(name.into()));
+        // Populate with commonly-referenced symbols so USE ONLY
+        // doesn't fail on standard names.
+        match name {
+            "ieee_arithmetic" => {
+                insert_type(st, m, "ieee_class_type");
+                insert_type(st, m, "ieee_round_type");
+                insert_proc(st, m, "ieee_is_nan");
+                insert_proc(st, m, "ieee_is_finite");
+                insert_proc(st, m, "ieee_value");
+                insert_proc(st, m, "ieee_selected_real_kind");
+                insert_proc(st, m, "ieee_support_datatype");
+                insert_proc(st, m, "ieee_support_denormal");
+            }
+            "ieee_exceptions" => {
+                insert_type(st, m, "ieee_flag_type");
+                insert_type(st, m, "ieee_status_type");
+                insert_proc(st, m, "ieee_get_flag");
+                insert_proc(st, m, "ieee_set_flag");
+                insert_proc(st, m, "ieee_get_halting_mode");
+                insert_proc(st, m, "ieee_set_halting_mode");
+            }
+            "ieee_features" => {
+                for feat in ["ieee_datatype", "ieee_denormal", "ieee_divide",
+                             "ieee_halting", "ieee_inexact_flag", "ieee_inf",
+                             "ieee_invalid_flag", "ieee_nan", "ieee_rounding",
+                             "ieee_sqrt", "ieee_underflow_flag"] {
+                    insert_param(st, m, feat, TypeInfo::Logical { kind: Some(4) });
+                }
+            }
+            _ => {}
+        }
+        st.pop_scope();
+    }
 }

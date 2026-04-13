@@ -287,6 +287,144 @@ struct RunSnapshot {
     files: BTreeMap<String, Vec<u8>>,
 }
 
+// ---- Multi-file test support ----
+
+/// A named source segment extracted from a multi-file test program.
+struct MultifileSegment {
+    /// The declared filename (e.g. "mymod.f90").
+    name: String,
+    /// The Fortran source for this segment.
+    source: String,
+}
+
+/// Split a source file on `!--- file: <name>` markers.
+/// Returns `None` if no markers are present (single-file test).
+fn split_multifile_segments(source: &str) -> Option<Vec<MultifileSegment>> {
+    let mut segments = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("!--- file:") {
+            // Flush previous segment.
+            if let Some(name) = current_name.take() {
+                segments.push(MultifileSegment {
+                    name,
+                    source: current_lines.join("\n") + "\n",
+                });
+                current_lines.clear();
+            }
+            current_name = Some(rest.trim().to_string());
+        } else if current_name.is_some() {
+            current_lines.push(line);
+        }
+        // Lines before any !--- file: marker are annotation-only preamble
+        // (CHECK, MULTIFILE_LINK, etc.) — not included in any segment.
+    }
+
+    // Flush last segment.
+    if let Some(name) = current_name {
+        segments.push(MultifileSegment {
+            name,
+            source: current_lines.join("\n") + "\n",
+        });
+    }
+
+    if segments.is_empty() { None } else { Some(segments) }
+}
+
+/// Extract `! MULTIFILE_LINK: a.f90 b.f90 ...` — the link order.
+/// If absent, segments are linked in declaration order.
+fn extract_multifile_link(source: &str) -> Option<Vec<String>> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("! MULTIFILE_LINK:") {
+            let names: Vec<String> = rest.split_whitespace().map(|s| s.to_string()).collect();
+            if !names.is_empty() {
+                return Some(names);
+            }
+        }
+    }
+    None
+}
+
+/// Find the static runtime library.
+fn find_runtime() -> PathBuf {
+    for dir in &["target/release", "target/debug"] {
+        let p = PathBuf::from(dir).join("libarmfortas_rt.a");
+        if p.exists() { return p; }
+    }
+    panic!("libarmfortas_rt.a not found — run `cargo build` first");
+}
+
+/// Get the macOS SDK path for linking.
+fn sdk_path() -> String {
+    let out = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("xcrun failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Compile a single .f90 to .o with -c.
+fn compile_to_object(
+    compiler: &Path,
+    source: &Path,
+    output: &Path,
+    opt_flag: &str,
+    search_dir: &Path,
+) -> Result<(), String> {
+    let result = Command::new(compiler)
+        .args([
+            source.to_str().unwrap(),
+            "-c",
+            opt_flag,
+            "-o",
+            output.to_str().unwrap(),
+            &format!("-I{}", search_dir.display()),
+        ])
+        .output()
+        .map_err(|e| format!("cannot launch compiler for {}: {}", source.display(), e))?;
+    if !result.status.success() {
+        return Err(format!(
+            "compile {} failed:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&result.stderr),
+        ));
+    }
+    Ok(())
+}
+
+/// Link object files with the runtime into a binary.
+fn link_objects(objects: &[PathBuf], output: &Path) -> Result<(), String> {
+    let runtime = find_runtime();
+    let sdk = sdk_path();
+    let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
+    for o in objects {
+        args.push(o.to_str().unwrap().into());
+    }
+    args.push(runtime.to_str().unwrap().into());
+    args.extend([
+        "-lSystem".into(),
+        "-syslibroot".into(),
+        sdk,
+        "-arch".into(),
+        "arm64".into(),
+    ]);
+    let result = Command::new("ld")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot launch linker: {}", e))?;
+    if !result.status.success() {
+        return Err(format!(
+            "link failed:\n{}",
+            String::from_utf8_lossy(&result.stderr),
+        ));
+    }
+    Ok(())
+}
+
 fn unique_temp_path(prefix: &str, stem: &str, tag: &str, ext: &str) -> PathBuf {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
@@ -1856,6 +1994,9 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
     // Try the compile/run/check pipeline. Any failure path returns
     // an Err with a message; success returns Ok.
+    let multifile_segments = split_multifile_segments(&source_text);
+    let multifile_link_order = extract_multifile_link(&source_text);
+
     let inner = || -> Result<(), String> {
         // Use a per-(file,level) binary path so concurrent jobs
         // and successive runs at different levels don't stomp each other.
@@ -1863,52 +2004,131 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         let level = opt_flag.trim_start_matches('-');
         let binary = unique_temp_path("test_bin", stem, level, "");
 
-        let compile = Command::new(compiler)
-            .args([
-                source.to_str().unwrap(),
-                opt_flag,
-                "-o",
-                binary.to_str().unwrap(),
-            ])
-            .output()
-            .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+        // ---- Multi-file path: split, compile each to .o, link ----
+        if let Some(segments) = &multifile_segments {
+            let build_dir = unique_temp_path("multifile_build", stem, level, "");
+            fs::create_dir_all(&build_dir).map_err(|e| {
+                format!("{}: cannot create multifile build dir: {}", filename, e)
+            })?;
 
-        // ERROR_EXPECTED branch: compilation MUST fail with the
-        // expected stderr substring. CHECKs are ignored.
-        if let Some(expected) = &error_expected {
-            if compile.status.success() {
-                let _ = fs::remove_file(&binary);
-                return Err(format!(
-                    "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
-                    filename, opt_flag, expected,
-                ));
+            // Write each segment to its own .f90.
+            for seg in segments {
+                let seg_path = build_dir.join(&seg.name);
+                fs::write(&seg_path, &seg.source).map_err(|e| {
+                    format!("{}: cannot write segment {}: {}", filename, seg.name, e)
+                })?;
             }
-            let stderr = String::from_utf8_lossy(&compile.stderr);
-            if !stderr.contains(expected.as_str()) {
-                return Err(format!(
-                    "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
-                     Full stderr:\n{}",
-                    filename, opt_flag, expected, stderr,
+
+            // Determine compilation order from MULTIFILE_LINK or declaration order.
+            let ordered_names: Vec<&str> = if let Some(link_order) = &multifile_link_order {
+                link_order.iter().map(|s| s.as_str()).collect()
+            } else {
+                segments.iter().map(|s| s.name.as_str()).collect()
+            };
+
+            // Compile each in order (dependencies first).
+            let mut objects = Vec::new();
+            let mut compile_error: Option<String> = None;
+            for name in &ordered_names {
+                let seg_f90 = build_dir.join(name);
+                if !seg_f90.exists() {
+                    let msg = format!(
+                        "{}: MULTIFILE_LINK references '{}' but no !--- file: segment defines it",
+                        filename, name,
+                    );
+                    compile_error = Some(msg);
+                    break;
+                }
+                let seg_o = build_dir.join(format!(
+                    "{}.o",
+                    Path::new(name).file_stem().unwrap().to_str().unwrap()
                 ));
+                if let Err(e) = compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir) {
+                    compile_error = Some(format!("{} [{}]: {}", filename, opt_flag, e));
+                    break;
+                }
+                objects.push(seg_o);
             }
-            if let Some(expected_span) = error_span {
-                if !diagnostic_contains_span(&stderr, expected_span) {
+
+            // Handle ERROR_EXPECTED for multi-file tests.
+            if let Some(err_msg) = compile_error {
+                let _ = fs::remove_dir_all(&build_dir);
+                if let Some(expected) = &error_expected {
+                    if err_msg.contains(expected.as_str()) {
+                        return Ok(());
+                    }
                     return Err(format!(
-                        "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
-                         Full stderr:\n{}",
-                        filename, opt_flag, expected_span.line, expected_span.col, stderr,
+                        "{} [{}]: ERROR_EXPECTED({}) but compile error did not contain it.\n\
+                         Actual error:\n{}",
+                        filename, opt_flag, expected, err_msg,
                     ));
                 }
+                return Err(err_msg);
             }
-            return Ok(());
-        }
 
-        if !compile.status.success() {
-            let stderr = String::from_utf8_lossy(&compile.stderr);
-            return Err(format!(
-                "{} [{}]: compilation failed:\n{}",
-                filename, opt_flag, stderr,
-            ));
+            // ERROR_EXPECTED but compilation succeeded — that's a failure.
+            if error_expected.is_some() {
+                let _ = fs::remove_dir_all(&build_dir);
+                return Err(format!(
+                    "{} [{}]: ERROR_EXPECTED but all segments compiled successfully",
+                    filename, opt_flag,
+                ));
+            }
+
+            // Link all .o files into a binary.
+            link_objects(&objects, &binary)
+                .map_err(|e| format!("{} [{}]: {}", filename, opt_flag, e))?;
+
+            let _ = fs::remove_dir_all(&build_dir);
+        } else {
+            // ---- Single-file path ----
+            let compile = Command::new(compiler)
+                .args([
+                    source.to_str().unwrap(),
+                    opt_flag,
+                    "-o",
+                    binary.to_str().unwrap(),
+                ])
+                .output()
+                .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+
+            // ERROR_EXPECTED branch: compilation MUST fail with the
+            // expected stderr substring. CHECKs are ignored.
+            if let Some(expected) = &error_expected {
+                if compile.status.success() {
+                    let _ = fs::remove_file(&binary);
+                    return Err(format!(
+                        "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
+                        filename, opt_flag, expected,
+                    ));
+                }
+                let stderr = String::from_utf8_lossy(&compile.stderr);
+                if !stderr.contains(expected.as_str()) {
+                    return Err(format!(
+                        "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
+                         Full stderr:\n{}",
+                        filename, opt_flag, expected, stderr,
+                    ));
+                }
+                if let Some(expected_span) = error_span {
+                    if !diagnostic_contains_span(&stderr, expected_span) {
+                        return Err(format!(
+                            "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
+                             Full stderr:\n{}",
+                            filename, opt_flag, expected_span.line, expected_span.col, stderr,
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+
+            if !compile.status.success() {
+                let stderr = String::from_utf8_lossy(&compile.stderr);
+                return Err(format!(
+                    "{} [{}]: compilation failed:\n{}",
+                    filename, opt_flag, stderr,
+                ));
+            }
         }
 
         // Per-(file,level) sandbox directory. Test programs that touch the
@@ -2771,5 +2991,89 @@ fn phase_triangulation_clean_keeps_compile_phases_free_of_runtime_files() {
             "io_flush_stress.f90 should pass with PHASE_TRIANGULATE(clean) coverage, got {:?}",
             other
         ),
+    }
+}
+
+#[test]
+fn split_multifile_segments_parses_markers() {
+    let src = "\
+! CHECK: 42
+! MULTIFILE_LINK: mod.f90 main.f90
+!--- file: mod.f90
+module m
+  integer :: x = 42
+end module
+!--- file: main.f90
+program p
+  use m
+  print *, x
+end program
+";
+    let segs = split_multifile_segments(src).unwrap();
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0].name, "mod.f90");
+    assert!(segs[0].source.contains("module m"));
+    assert_eq!(segs[1].name, "main.f90");
+    assert!(segs[1].source.contains("program p"));
+}
+
+#[test]
+fn split_multifile_segments_returns_none_for_single_file() {
+    let src = "program t\n  print *, 1\nend program\n";
+    assert!(split_multifile_segments(src).is_none());
+}
+
+#[test]
+fn extract_multifile_link_parses_order() {
+    let src = "! MULTIFILE_LINK: a.f90 b.f90 c.f90\n! CHECK: ok\n";
+    let order = extract_multifile_link(src).unwrap();
+    assert_eq!(order, vec!["a.f90", "b.f90", "c.f90"]);
+}
+
+#[test]
+fn multifile_basic_module_runs_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("multifile_basic_module.f90");
+    assert!(source.exists(), "multifile_basic_module.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("multifile_basic_module.f90 should pass at -O0, got {:?}", other),
+    }
+}
+
+#[test]
+fn multifile_three_modules_runs_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("multifile_three_modules.f90");
+    assert!(source.exists(), "multifile_three_modules.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("multifile_three_modules.f90 should pass at -O0, got {:?}", other),
+    }
+}
+
+#[test]
+fn multifile_error_circular_direct_detected() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_direct.f90");
+    assert!(source.exists(), "error_circular_use_direct.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("circular use direct should pass (ERROR_EXPECTED match), got {:?}", other),
+    }
+}
+
+#[test]
+fn multifile_error_circular_indirect_detected() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_indirect.f90");
+    assert!(source.exists(), "error_circular_use_indirect.f90 missing");
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("circular use indirect should pass (ERROR_EXPECTED match), got {:?}", other),
     }
 }

@@ -3,6 +3,8 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
+pub mod dep_scan;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,23 +67,28 @@ impl OptLevel {
 /// Compilation options.
 pub struct Options {
     pub input: PathBuf,
+    /// Additional input files for multi-source mode.
+    pub extra_inputs: Vec<PathBuf>,
     pub output: Option<PathBuf>,
     pub emit_asm: bool,        // -S
     pub emit_obj: bool,        // -c
     pub emit_ir: bool,         // --emit-ir
     pub preprocess_only: bool, // -E
     pub opt_level: OptLevel,   // -O0 .. -Ofast
+    /// Directories to search for `.amod` module files (`-I <dir>`).
+    pub module_search_paths: Vec<PathBuf>,
 }
 
 impl Options {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let mut input = None;
+        let mut inputs = Vec::new();
         let mut output = None;
         let mut emit_asm = false;
         let mut emit_obj = false;
         let mut emit_ir = false;
         let mut preprocess_only = false;
         let mut opt_level = OptLevel::O0;
+        let mut module_search_paths = Vec::new();
 
         let mut i = 0;
         while i < args.len() {
@@ -98,28 +105,44 @@ impl Options {
                 "-c" => emit_obj = true,
                 "-E" => preprocess_only = true,
                 "--emit-ir" => emit_ir = true,
+                "-I" => {
+                    i += 1;
+                    if i < args.len() {
+                        module_search_paths.push(PathBuf::from(&args[i]));
+                    } else {
+                        return Err("-I requires a directory argument".into());
+                    }
+                }
+                arg if arg.starts_with("-I") => {
+                    module_search_paths.push(PathBuf::from(&arg[2..]));
+                }
                 arg if arg.starts_with("-O") => {
                     let tail = &arg[1..];
                     opt_level = OptLevel::parse_flag(tail)
                         .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
                 }
                 arg if !arg.starts_with('-') => {
-                    input = Some(PathBuf::from(arg));
+                    inputs.push(PathBuf::from(arg));
                 }
                 other => return Err(format!("unknown option: {}", other)),
             }
             i += 1;
         }
 
-        let input = input.ok_or("no input file")?;
+        if inputs.is_empty() {
+            return Err("no input file".into());
+        }
+        let input = inputs.remove(0);
         Ok(Self {
             input,
+            extra_inputs: inputs,
             output,
             emit_asm,
             emit_obj,
             emit_ir,
             preprocess_only,
             opt_level,
+            module_search_paths,
         })
     }
 
@@ -147,10 +170,12 @@ impl Options {
 }
 
 fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
+    // Only emit _main if there's a __prog_* function (a Fortran PROGRAM
+    // body).  The previous .or_else fallback picked any non-"main"
+    // function, which incorrectly wrapped module procedures.
     allocated
         .iter()
         .find(|func| func.name.starts_with("__prog_"))
-        .or_else(|| allocated.iter().find(|func| func.name != "main"))
         .map(|func| func.name.as_str())
 }
 
@@ -206,7 +231,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     })?;
 
     // 5. Semantic analysis.
-    let (st, type_layouts) = resolve::resolve_file(&units).map_err(|e| {
+    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
         format!(
             "{}:{}:{}: {}",
             opts.input.display(),
@@ -215,6 +240,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             e.msg
         )
     })?;
+    let st = resolve_result.st;
+    let type_layouts = resolve_result.type_layouts;
+
+    // Build external globals from .amod-loaded modules.
+    let mut external_globals = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_globals.extend(crate::sema::amod::extract_module_globals(ext_mod));
+    }
+
     let diags = validate::validate_file(&units, &st);
     for d in &diags {
         if d.kind == validate::DiagKind::Error {
@@ -229,7 +263,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
-    let mut ir_module = lower::lower_file(&units, &st, &type_layouts);
+    // Build external char_len_star_params from .amod-loaded modules.
+    let mut external_char_len_star = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
+    }
+
+    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts, external_globals, external_char_len_star);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
@@ -380,6 +420,32 @@ _main:
     }
 
     if opts.emit_obj {
+        // Emit .amod files for each MODULE in the compilation unit.
+        for unit in &units {
+            if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+                let mod_key = name.to_lowercase();
+                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                    let amod_text = crate::sema::amod::write_amod(
+                        name,
+                        opts.input.to_str().unwrap_or(""),
+                        &source,
+                        &st,
+                        mod_scope_id,
+                        &module_globals,
+                        &type_layouts,
+                        &ir_module,
+                        &std::collections::HashMap::new(), // char_len_star computed by writer from scope
+                    );
+                    let amod_path = opts.output_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(format!("{}.amod", mod_key));
+                    if let Err(e) = fs::write(&amod_path, &amod_text) {
+                        eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -426,6 +492,101 @@ fn link(obj: &Path, output: &Path) -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&ld_result.stderr);
         return Err(format!("linker failed:\n{}", stderr));
     }
+
+    Ok(())
+}
+
+/// Link multiple object files with the runtime to produce a binary.
+fn link_multi(objs: &[PathBuf], output: &Path) -> Result<(), String> {
+    let rt_path = find_runtime_lib()?;
+    let sdk = Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
+        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+
+    let mut args: Vec<String> = vec![
+        "-o".into(), output.to_str().unwrap().into(),
+    ];
+    for obj in objs {
+        args.push(obj.to_str().unwrap().into());
+    }
+    args.extend([
+        rt_path,
+        "-lSystem".into(),
+        "-no_uuid".into(),
+        "-syslibroot".into(),
+        sysroot,
+        "-e".into(),
+        "_main".into(),
+    ]);
+    let ld_result = Command::new("ld")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot run linker: {}", e))?;
+    if !ld_result.status.success() {
+        let stderr = String::from_utf8_lossy(&ld_result.stderr);
+        return Err(format!("linker failed:\n{}", stderr));
+    }
+    Ok(())
+}
+
+/// Compile multiple Fortran source files with automatic dependency
+/// resolution, producing a single linked binary.
+///
+/// 1. Scan all files for MODULE/USE dependencies.
+/// 2. Topological sort (error on cycles).
+/// 3. Compile each in order to a temp .o + .amod.
+/// 4. Link all .o files into the output binary.
+pub fn compile_multi(opts: &Options) -> Result<(), String> {
+    let mut all_inputs = vec![opts.input.clone()];
+    all_inputs.extend(opts.extra_inputs.iter().cloned());
+
+    // Scan dependencies.
+    let file_deps: Vec<dep_scan::FileDeps> = all_inputs.iter()
+        .map(|p| dep_scan::scan_file(p))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Topological sort.
+    let order = dep_scan::resolve_compilation_order(&file_deps)?;
+
+    // Compile each file in order.
+    let tmp_dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("cannot create temp dir: {}", e))?;
+
+    let mut object_files: Vec<PathBuf> = Vec::new();
+    for &idx in &order {
+        let src = &file_deps[idx].path;
+        let stem = src.file_stem().unwrap_or_default().to_str().unwrap_or("out");
+        let obj_path = tmp_dir.join(format!("{}.o", stem));
+
+        // Build a single-file Options for this source.
+        let sub_opts = Options {
+            input: src.clone(),
+            extra_inputs: vec![],
+            output: Some(obj_path.clone()),
+            emit_asm: false,
+            emit_obj: true,
+            emit_ir: false,
+            preprocess_only: false,
+            opt_level: opts.opt_level,
+            module_search_paths: {
+                let mut paths = opts.module_search_paths.clone();
+                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+                paths
+            },
+        };
+        compile(&sub_opts)?;
+        object_files.push(obj_path);
+    }
+
+    // Link all object files.
+    let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+    link_multi(&object_files, &output)?;
+
+    // Cleanup.
+    let _ = fs::remove_dir_all(&tmp_dir);
 
     Ok(())
 }
@@ -584,6 +745,8 @@ mod tests {
             emit_ir: true,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("O0 --emit-ir should support integer(16) staging");
@@ -607,6 +770,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         let err = compile(&opts).expect_err("backend should reject integer(16) until i128 codegen lands");
@@ -632,6 +797,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("simple integer(16) memory traffic should codegen at O0");
@@ -655,6 +822,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("simple integer(16) add should codegen at O0");
@@ -678,6 +847,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("internal integer(16) call should codegen at O0");
@@ -702,6 +873,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O0,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("external integer(16) call should codegen at O0");
@@ -726,6 +899,8 @@ mod tests {
             emit_ir: false,
             preprocess_only: false,
             opt_level: OptLevel::O1,
+            extra_inputs: vec![],
+            module_search_paths: vec![],
         };
 
         compile(&opts).expect("integer(16) multiply should codegen at O1 after const fold");

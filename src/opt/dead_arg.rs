@@ -174,6 +174,8 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::FloatTrunc(a, _)
         | InstKind::IntExtend(a, _, _)
         | InstKind::IntTrunc(a, _)
+        | InstKind::PtrToInt(a)
+        | InstKind::IntToPtr(a, _)
         | InstKind::Load(a)
         | InstKind::ExtractField(a, _) => *a == param_id,
 

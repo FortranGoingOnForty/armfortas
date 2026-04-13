@@ -1262,16 +1262,22 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::And(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::AndReg, *a, *b),
         InstKind::Or(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::OrrReg, *a, *b),
         InstKind::Not(a) => {
-            // NOT = ORN dest, XZR, src  (MVN alias)
-            let class = type_to_reg_class(&inst.ty);
-            let dest = ctx.get_vreg(mf, inst.id, class);
+            // Logical NOT: CMP src, #0; CSET dest, EQ
+            // If src == 0 (false), EQ is true → dest = 1 (true).
+            // If src != 0 (true), EQ is false → dest = 0 (false).
+            // This correctly handles any truthy value, not just 0/1.
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
             let va = ctx.lookup_vreg(*a);
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::OrnReg,
+                opcode: ArmOpcode::CmpImm,
+                operands: vec![MachineOperand::VReg(va), MachineOperand::Imm(0)],
+                def: None,
+            });
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Cset,
                 operands: vec![
                     MachineOperand::VReg(dest),
-                    MachineOperand::PhysReg(PhysReg::Xzr),
-                    MachineOperand::VReg(va),
+                    MachineOperand::Cond(ArmCond::Eq),
                 ],
                 def: Some(dest),
             });
@@ -1710,6 +1716,35 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
             // Truncate: just MOV — the 32-bit register naturally truncates.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        InstKind::PtrToInt(a) => {
+            // Pointer is already an i64 in a GP register — just mov.
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        InstKind::IntToPtr(a, _) => {
+            // Integer already in a GP register — treat as pointer via mov.
+            let src = ctx.lookup_vreg(*a);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::MovReg,
                 operands: vec![

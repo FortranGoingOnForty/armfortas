@@ -19,11 +19,16 @@ impl<'a> Parser<'a> {
             "real" => { self.advance(); Some(self.parse_kind_selector().map(TypeSpec::Real)) }
             "doubleprecision" | "double" => {
                 self.advance();
-                // Handle "double precision" as two tokens in free-form.
+                // Handle "double precision" / "double complex" as two tokens.
                 if self.peek_text().eq_ignore_ascii_case("precision") {
                     self.advance();
+                    Some(Ok(TypeSpec::DoublePrecision))
+                } else if self.peek_text().eq_ignore_ascii_case("complex") {
+                    self.advance();
+                    Some(Ok(TypeSpec::DoubleComplex))
+                } else {
+                    Some(Ok(TypeSpec::DoublePrecision))
                 }
-                Some(Ok(TypeSpec::DoublePrecision))
             }
             "complex" => { self.advance(); Some(self.parse_kind_selector().map(TypeSpec::Complex)) }
             "doublecomplex" => { self.advance(); Some(Ok(TypeSpec::DoubleComplex)) }
@@ -59,8 +64,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if self.peek_text().eq_ignore_ascii_case("precision") {
                     self.advance();
+                    Some(Ok(TypeSpec::DoublePrecision))
+                } else if self.peek_text().eq_ignore_ascii_case("complex") {
+                    self.advance();
+                    Some(Ok(TypeSpec::DoubleComplex))
+                } else {
+                    Some(Ok(TypeSpec::DoublePrecision))
                 }
-                Some(Ok(TypeSpec::DoublePrecision))
             }
             "complex" => { self.advance(); Some(Ok(TypeSpec::Complex(None))) }
             "logical" => { self.advance(); Some(Ok(TypeSpec::Logical(None))) }

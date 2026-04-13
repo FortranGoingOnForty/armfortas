@@ -116,6 +116,15 @@ impl<'a> Parser<'a> {
         // No PROGRAM keyword — implicit main program.
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
 
+        // Consume the END [PROGRAM] if present — parse_unit_body breaks
+        // *before* consuming the terminator, so we must advance past it
+        // or parse_file will re-enter parse_program_unit at the same
+        // position forever.
+        self.skip_newlines();
+        if self.peek() != &TokenKind::Eof {
+            let _ = self.consume_end("program");
+        }
+
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Program {
             name: None, uses, imports, implicit, decls, body, contains: ifaces,
@@ -421,6 +430,52 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume 'equivalence'
                 decls.push(self.parse_equivalence_stmt()?);
                 continue;
+            }
+
+            // PRIVATE / PUBLIC access statements.
+            if text == "private" || text == "public" {
+                let start = self.current_span();
+                let attr = if text == "private" {
+                    crate::ast::decl::Attribute::Private
+                } else {
+                    crate::ast::decl::Attribute::Public
+                };
+                if self.at_stmt_end_after(1) {
+                    // Standalone: sets default access for the module.
+                    self.advance();
+                    let span = span_from_to(start, self.prev_span());
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::AccessDefault { access: attr },
+                        span,
+                    ));
+                    continue;
+                }
+                // PUBLIC :: name-list or PRIVATE :: name-list
+                let next_pos = self.pos + 1;
+                let has_colons = next_pos < self.tokens.len()
+                    && self.tokens[next_pos].kind == TokenKind::ColonColon;
+                let ident_pos = if has_colons { next_pos + 1 } else { next_pos };
+                if ident_pos < self.tokens.len()
+                    && self.tokens[ident_pos].kind == TokenKind::Identifier
+                {
+                    self.advance(); // consume PUBLIC/PRIVATE
+                    if has_colons { self.advance(); } // consume ::
+                    let mut names = Vec::new();
+                    loop {
+                        if self.peek() == &TokenKind::Identifier {
+                            names.push(self.advance().clone().text);
+                        } else { break; }
+                        if !self.eat(&TokenKind::Comma) { break; }
+                    }
+                    if !names.is_empty() {
+                        let span = span_from_to(start, self.prev_span());
+                        decls.push(crate::ast::Spanned::new(
+                            crate::ast::decl::Decl::AccessList { access: attr, names },
+                            span,
+                        ));
+                        continue;
+                    }
+                }
             }
 
             // Try as executable statement.

@@ -209,14 +209,48 @@ pub fn lower_file(
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Module {
+    external_globals: HashMap<(String, String), ModuleGlobalInfo>,
+    external_char_len_star: HashMap<String, Vec<bool>>,
+) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
-    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = HashMap::new();
+    let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
 
     // Pass 1: collect module-level variables.
     for unit in units {
         if let ProgramUnit::Module { name, decls, .. } = &unit.node {
-            collect_module_globals(&mut module, &mut globals, name, decls);
+            collect_module_globals(&mut module, &mut globals, name, decls, st);
+        }
+    }
+
+    // Pass 1.1: propagate transitively-visible globals through USE chains.
+    // When module A USEs module B, all of B's public globals should
+    // also be accessible as (A, var_name) in the globals map. Without
+    // this, `program p; use A` can't see B's variables even though A
+    // re-exports them via USE association.
+    for unit in units {
+        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            // Collect USE'd module names.
+            let used_modules: Vec<String> = uses.iter().filter_map(|u| {
+                if let Decl::UseStmt { module, .. } = &u.node {
+                    Some(module.to_lowercase())
+                } else { None }
+            }).collect();
+            // For each USE'd module, copy its globals into this module's namespace.
+            let mut to_add = Vec::new();
+            for used_mod in &used_modules {
+                for ((mk, var), info) in globals.iter() {
+                    if mk == used_mod {
+                        let new_key = (mod_key.clone(), var.clone());
+                        if !globals.contains_key(&new_key) {
+                            to_add.push((new_key, info.clone()));
+                        }
+                    }
+                }
+            }
+            for (key, info) in to_add {
+                globals.insert(key, info);
+            }
         }
     }
 
@@ -256,7 +290,7 @@ pub fn lower_file(
         collect_descriptor_params(&unit.node, &mut descriptor_params);
     }
 
-    let mut char_len_star_params: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut char_len_star_params: HashMap<String, Vec<bool>> = external_char_len_star;
     for unit in units {
         collect_char_len_star_params(&unit.node, &mut char_len_star_params);
     }
@@ -296,7 +330,7 @@ pub fn lower_file(
             false,
         );
     }
-    module
+    (module, globals)
 }
 
 fn collect_internal_func_names(
@@ -606,7 +640,7 @@ fn collect_and_emit_common_globals(
                     let symbol = common_slot_symbol(&block_name, slot_idx);
                     if emitted.contains(&symbol) { continue; }
                     emitted.insert(symbol.clone());
-                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls);
+                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls, None);
                     module.add_global(Global {
                         name: symbol,
                         ty: elem_ty,
@@ -651,7 +685,7 @@ fn install_common_locals(
                 let key = var.to_lowercase();
                 if locals.contains_key(&key) { continue; }
                 let symbol = common_slot_symbol(&block_name, slot_idx);
-                let elem_ty = arg_type_from_decls(&key, decls);
+                let elem_ty = arg_type_from_decls(&key, decls, None);
                 let addr = b.global_addr(&symbol, elem_ty.clone());
                 locals.insert(key, LocalInfo {
                     addr,
@@ -710,13 +744,13 @@ fn install_equivalence_locals(
                     match &expr.node {
                         Expr::Name { name } => {
                             let key = name.to_lowercase();
-                            let ty = arg_type_from_decls(&key, decls);
+                            let ty = arg_type_from_decls(&key, decls, None);
                             members.push((key, ty, 0));
                         }
                         Expr::FunctionCall { callee, args } => {
                             if let Expr::Name { name } = &callee.node {
                                 let key = name.to_lowercase();
-                                let ty = arg_type_from_decls(&key, decls);
+                                let ty = arg_type_from_decls(&key, decls, None);
                                 let idx = if let Some(sub) = args.first() {
                                     if let SectionSubscript::Element(e) = &sub.value {
                                         eval_const_int(e).unwrap_or(1)
@@ -775,23 +809,15 @@ fn install_equivalence_locals(
 /// reconstruct a `LocalInfo` for it inside each function that
 /// USE-imports the module.
 #[derive(Clone)]
-struct ModuleGlobalInfo {
-    /// Mach-O symbol name (already prefixed with `afs_mod_<mod>_`).
-    symbol: String,
-    /// Element type (for scalars) or array element type (for arrays).
-    ty: IrType,
-    /// Per-dimension `(lower_bound, extent)` pairs. Empty for scalars
-    /// and for deferred-shape allocatables.
-    dims: Vec<(i64, i64)>,
-    /// True for module-level allocatable arrays. The global is a
-    /// 384-byte zero-init descriptor; runtime allocate() populates
-    /// it. install_globals_as_locals threads this through into
-    /// LocalInfo.allocatable so subscript access goes through the
-    /// runtime descriptor path. Audit MAJOR-5.
-    allocatable: bool,
-    /// True for module-level `character(len=:), allocatable` globals.
-    /// The global is a 32-byte zero-init StringDescriptor.
-    deferred_char: bool,
+pub struct ModuleGlobalInfo {
+    pub symbol: String,
+    pub ty: IrType,
+    pub dims: Vec<(i64, i64)>,
+    pub allocatable: bool,
+    pub deferred_char: bool,
+    /// External modules (from .amod files) — skip emitting Global
+    /// data entries since the storage lives in the other .o file.
+    pub external: bool,
 }
 
 /// Walk a module's declarations and emit a global per variable.
@@ -808,6 +834,7 @@ fn collect_module_globals(
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
@@ -815,7 +842,7 @@ fn collect_module_globals(
     let param_consts = collect_decl_param_consts(decls);
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
-            let ir_ty = lower_type_spec(type_spec);
+            let ir_ty = lower_type_spec_st(type_spec, Some(st));
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
@@ -850,6 +877,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: true,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                     continue;
@@ -875,6 +903,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: true,
+                            external: false,
                         },
                     );
                     continue;
@@ -938,6 +967,7 @@ fn collect_module_globals(
                             dims,
                             allocatable: false,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                 } else {
@@ -957,6 +987,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: false,
+                            external: false,
                         },
                     );
                 }
@@ -1149,7 +1180,7 @@ fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -1206,7 +1237,7 @@ fn lower_unit(
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let mut params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
-                    let elem_ty = arg_type_from_decls(n, decls);
+                    let elem_ty = arg_type_from_decls(n, decls, Some(st));
                     let fortran_noalias = arg_is_fortran_noalias(n, decls);
                     let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                     if arg_has_value_attr(n, decls) {
@@ -1269,7 +1300,7 @@ fn lower_unit(
                 .filter(|p| !p.name.starts_with("__len_")) // skip hidden params
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })
@@ -1317,7 +1348,7 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -1393,7 +1424,7 @@ fn lower_unit(
                 // Real args shifted by 1 so _sret is param 0.
                 let real: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
-                        let elem_ty = arg_type_from_decls(n, decls);
+                        let elem_ty = arg_type_from_decls(n, decls, Some(st));
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
@@ -1422,14 +1453,14 @@ fn lower_unit(
                 (params, IrType::Void)
             } else {
                 let ret_ty = return_type.as_ref()
-                    .map(lower_type_spec)
+                    .map(|ts| lower_type_spec_st(ts, Some(st)))
                     .unwrap_or_else(|| {
                         let result_name = result.as_deref().unwrap_or(name.as_str());
-                        arg_type_from_decls(result_name, decls)
+                        arg_type_from_decls(result_name, decls, Some(st))
                     });
                 let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
-                        let elem_ty = arg_type_from_decls(n, decls);
+                        let elem_ty = arg_type_from_decls(n, decls, Some(st));
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
@@ -1473,7 +1504,7 @@ fn lower_unit(
                 .filter(|p| p.name != "_sret")
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })
@@ -1510,7 +1541,7 @@ fn lower_unit(
                     // The sret param (ValueId 0) IS the descriptor address.
                     // Pre-insert the result variable as an allocatable backed by that
                     // descriptor so alloc_decls skips it (locals.contains_key → continue).
-                    let elem_ty = arg_type_from_decls(&result_name, decls);
+                    let elem_ty = arg_type_from_decls(&result_name, decls, Some(st));
                     ctx.locals.insert(result_name.clone(), LocalInfo {
                         addr: ValueId(0),
                         ty: elem_ty,
@@ -1532,7 +1563,7 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -2359,7 +2390,29 @@ fn install_globals_as_locals(
             for (mk, var) in globals.keys() {
                 if *mk != mod_key { continue; }
                 if rename_targets.contains(var) { continue; }
+                // Skip PRIVATE symbols — only PUBLIC symbols are accessible
+                // via USE without ONLY.
+                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                    if let Some(sym) = st.scope(mod_scope_id).symbols.get(var) {
+                        if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
+                            continue;
+                        }
+                    }
+                }
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
+            }
+            // Also scan the SymbolTable module scope for symbols not
+            // in the globals map (e.g., PARAMETERs, which are inlined
+            // and don't generate globals).
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                for (sym_key, sym) in &st.scope(mod_scope_id).symbols {
+                    if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) { continue; }
+                    if rename_targets.contains(sym_key) { continue; }
+                    let pair = (mod_key.clone(), sym_key.clone());
+                    if !globals.contains_key(&pair) && !pending.iter().any(|(k, _)| k == sym_key) {
+                        pending.push((sym_key.clone(), pair));
+                    }
+                }
             }
             for rn in renames {
                 pending.push((
@@ -2397,22 +2450,43 @@ fn install_globals_as_locals(
                 if let Some(sym) = st.scope(mod_scope_id).symbols.get(&var_key) {
                     if sym.attrs.parameter {
                         if let Some(cv) = sym.const_value {
-                            let ty = IrType::Int(IntWidth::I32);
-                            // Create a dummy alloca (never loaded from; inline_const
-                            // short-circuits at every use site via materialize_const_scalar).
-                            let addr = b.alloca(ty.clone());
-                            locals.insert(local_key.clone(), LocalInfo {
-                                addr,
-                                ty,
-                                dims: vec![],
-                                allocatable: false,
-                                descriptor_arg: false,
-                                by_ref: false,
-                                char_kind: CharKind::None,
-                                derived_type: None,
-                                inline_const: Some(ConstScalar::Int(cv as i128)),
-                                is_pointer: false,
-                            });
+                            // Check if this is a character constant (e.g. c_null_char).
+                            let is_char = matches!(sym.type_info, Some(crate::sema::symtab::TypeInfo::Character { .. }));
+                            if is_char {
+                                // Emit a 1-byte global string constant with the ASCII value.
+                                let byte = [cv as u8];
+                                let ptr = b.const_string(&byte);
+                                let ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                                locals.insert(local_key.clone(), LocalInfo {
+                                    addr: ptr,
+                                    ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(1),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                });
+                            } else {
+                                let ty = IrType::Int(IntWidth::I32);
+                                // Create a dummy alloca (never loaded from; inline_const
+                                // short-circuits at every use site via materialize_const_scalar).
+                                let addr = b.alloca(ty.clone());
+                                locals.insert(local_key.clone(), LocalInfo {
+                                    addr,
+                                    ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::None,
+                                    derived_type: None,
+                                    inline_const: Some(ConstScalar::Int(cv as i128)),
+                                    is_pointer: false,
+                                });
+                            }
                             installed_from.insert(local_key, mod_key);
                         }
                     }
@@ -2433,6 +2507,7 @@ fn alloc_decls(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     pending_globals: &mut Vec<PendingGlobal>,
     func_name: &str,
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Attribute;
 
@@ -2463,7 +2538,7 @@ fn alloc_decls(
 
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
-            let elem_ty = lower_type_spec(type_spec);
+            let elem_ty = lower_type_spec_st(type_spec, Some(st));
 
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
@@ -3352,6 +3427,16 @@ fn lower_char_intrinsic(
                 vec![buf, src_ptr, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             Some(buf)
         }
+        "compiler_version" => {
+            let version = b"armfortas 0.1.0";
+            Some(b.const_string(version))
+        }
+        "compiler_options" => {
+            // Return a placeholder — the actual options string would
+            // need to be threaded from the driver. Empty for now.
+            let opts = b"";
+            Some(b.const_string(opts))
+        }
         _ => None,
     }
 }
@@ -3913,6 +3998,29 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             } else { None }
         }
 
+        // ---- IEEE arithmetic intrinsics ----
+        "ieee_is_nan" => {
+            // IEEE_IS_NAN(x) → x != x (NaN is the only value that is not equal to itself)
+            args.first().map(|arg| b.fcmp(CmpOp::Ne, *arg, *arg))
+        }
+        "ieee_is_finite" => {
+            // IEEE_IS_FINITE(x) → (x - x) == 0.0
+            // For finite values, x-x is 0.0. For inf, x-x is NaN. For NaN, x-x is NaN.
+            if let Some(arg) = args.first() {
+                let diff = b.fsub(*arg, *arg);
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Float(FloatWidth::F64));
+                let zero = match &ty {
+                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                    _ => b.const_f64(0.0),
+                };
+                Some(b.fcmp(CmpOp::Eq, diff, zero))
+            } else { None }
+        }
+        "ieee_support_datatype" | "ieee_support_denormal" => {
+            // These return .TRUE. for supported types on ARM64.
+            Some(b.const_bool(true))
+        }
+
         _ => None,
     }
 }
@@ -4073,10 +4181,22 @@ fn lower_intrinsic_subroutine(
         "c_f_pointer" => {
             // call c_f_pointer(cptr, fptr [, shape])
             // Store the C pointer value into the Fortran pointer variable.
-            // cptr is passed by value (it's a c_ptr), fptr is passed by reference.
+            // cptr is i64 (c_ptr), fptr is a by-reference Fortran pointer.
+            // Convert i64 address to pointer type before storing.
             let cptr = nth_arg_val(b, ctx, args, 0, 0);
             let fptr = nth_arg_ref(b, ctx, args, 1);
-            b.store(cptr, fptr);
+            // fptr is Ptr<Ptr<T>> (by-ref pointer variable).
+            // We need to store a Ptr<T> into it. Extract T from
+            // the double-pointer type and build Ptr<T> via int_to_ptr.
+            let inner_pointee = b.func().value_type(fptr)
+                .and_then(|ty| if let IrType::Ptr(inner) = ty {
+                    if let IrType::Ptr(elem) = inner.as_ref() {
+                        Some(elem.as_ref().clone())
+                    } else { Some(inner.as_ref().clone()) }
+                } else { None })
+                .unwrap_or(IrType::Int(IntWidth::I8));
+            let ptr_val = b.int_to_ptr(cptr, inner_pointee);
+            b.store(ptr_val, fptr);
             true
         }
 
@@ -4101,13 +4221,10 @@ fn arg_char_kind_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDe
                 if entity.name.to_lowercase() == key {
                     match type_spec {
                         TypeSpec::Character(Some(sel)) => {
-                            match &sel.len {
-                                Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                                    if let Some(n) = eval_const_int_in_scope(e, &HashMap::new()) {
-                                        return CharKind::Fixed(n);
-                                    }
+                            if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
+                                if let Some(n) = eval_const_int_in_scope(e, &HashMap::new()) {
+                                    return CharKind::Fixed(n);
                                 }
-                                _ => {}
                             }
                         }
                         TypeSpec::Character(None) => return CharKind::Fixed(1),
@@ -4121,13 +4238,13 @@ fn arg_char_kind_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDe
     CharKind::None
 }
 
-fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> IrType {
+fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl], st: Option<&SymbolTable>) -> IrType {
     let key = arg_name.to_lowercase();
     for decl in decls {
         if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    return lower_type_spec(type_spec);
+                    return lower_type_spec_st(type_spec, st);
                 }
             }
         }
@@ -4375,6 +4492,18 @@ fn lower_string_expr(
                             return (buf, one);
                         }
                     }
+                    "compiler_version" => {
+                        let s = b"armfortas 0.1.0";
+                        let ptr = b.const_string(s);
+                        let len = b.const_i64(s.len() as i64);
+                        return (ptr, len);
+                    }
+                    "compiler_options" => {
+                        let s = b"";
+                        let ptr = b.const_string(s);
+                        let len = b.const_i64(s.len() as i64);
+                        return (ptr, len);
+                    }
                     _ => {}
                 }
 
@@ -4616,14 +4745,37 @@ fn ensure_termination(b: &mut FuncBuilder, result_addr: Option<ValueId>) {
 }
 
 /// Extract the kind value from a KindSelector, defaulting if absent.
+/// Resolves named constants (e.g., c_double, real64) via the symbol table.
 fn extract_kind(sel: &Option<crate::ast::decl::KindSelector>, default: u8) -> u8 {
+    extract_kind_with_st(sel, default, None)
+}
+
+fn extract_kind_with_st(
+    sel: &Option<crate::ast::decl::KindSelector>,
+    default: u8,
+    st: Option<&SymbolTable>,
+) -> u8 {
     use crate::ast::decl::KindSelector;
     use crate::ast::expr::Expr;
     match sel {
         Some(KindSelector::Expr(e)) | Some(KindSelector::Star(e)) => {
-            if let Expr::IntegerLiteral { text, .. } = &e.node {
-                text.parse().unwrap_or(default)
-            } else { default }
+            match &e.node {
+                Expr::IntegerLiteral { text, .. } => text.parse().unwrap_or(default),
+                Expr::Name { name } => {
+                    if let Some(st) = st {
+                        let key = name.to_lowercase();
+                        // Search all scopes for the named constant — the
+                        // current scope may not be set correctly during lowering
+                        // (sema has already popped all scopes by this point).
+                        st.find_symbol_any_scope(&key)
+                            .and_then(|sym| sym.const_value.map(|v| v as u8))
+                            .unwrap_or(default)
+                    } else {
+                        default
+                    }
+                }
+                _ => default,
+            }
         }
         None => default,
     }
@@ -4631,12 +4783,16 @@ fn extract_kind(sel: &Option<crate::ast::decl::KindSelector>, default: u8) -> u8
 
 /// Lower a Fortran type specifier to an IR type.
 fn lower_type_spec(ts: &TypeSpec) -> IrType {
+    lower_type_spec_st(ts, None)
+}
+
+fn lower_type_spec_st(ts: &TypeSpec, st: Option<&SymbolTable>) -> IrType {
     match ts {
-        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind(sel, 4)),
-        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind(sel, 4)),
+        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind_with_st(sel, 4, st)),
+        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind_with_st(sel, 4, st)),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
         TypeSpec::Complex(sel) => {
-            let fw = match extract_kind(sel, 4) {
+            let fw = match extract_kind_with_st(sel, 4, st) {
                 8 => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
@@ -4645,9 +4801,15 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
         TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
         TypeSpec::Logical(_) => IrType::Bool,
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        TypeSpec::Type(_) | TypeSpec::Class(_) => {
-            // Derived types are passed as byte pointers (struct layout resolved elsewhere).
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+        TypeSpec::Type(name) | TypeSpec::Class(name) => {
+            // c_ptr and c_funptr are opaque address types — i64 on ARM64.
+            let lower_name = name.to_lowercase();
+            if lower_name == "c_ptr" || lower_name == "c_funptr" {
+                IrType::Int(IntWidth::I64)
+            } else {
+                // User-defined derived types are byte pointers (struct layout resolved elsewhere).
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+            }
         }
         _ => IrType::Int(IntWidth::I32), // fallback
     }
@@ -4881,16 +5043,28 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
                             if let Some(field) = layout.field(component) {
-                                let val = lower_expr_ctx_tl(b, ctx, value);
-                                let coerced = coerce_to_type(
-                                    b,
-                                    val,
-                                    &type_info_to_ir_type(&field.type_info),
-                                );
                                 let offset = b.const_i64(field.offset as i64);
                                 let field_ptr = b.gep(base_addr, vec![offset],
                                     IrType::Int(IntWidth::I8));
-                                b.store(coerced, field_ptr);
+
+                                // Character field: copy string data with space padding.
+                                if let crate::sema::symtab::TypeInfo::Character { len: Some(flen), .. } = &field.type_info {
+                                    let (src_ptr, src_len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                    let dest_len = b.const_i64(*flen);
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![field_ptr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(
+                                        b,
+                                        val,
+                                        &type_info_to_ir_type(&field.type_info),
+                                    );
+                                    b.store(coerced, field_ptr);
+                                }
                             }
                         }
                     }
@@ -5534,7 +5708,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             if !decls.is_empty() {
                 // Remove shadowed keys so alloc_decls creates fresh allocas.
                 for k in &block_keys { ctx.locals.remove(k); }
-                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new());
+                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), "", ctx.st);
                 init_decls(b, &ctx.locals, decls, ctx.st);
             }
             lower_stmts(b, ctx, body);
@@ -5868,8 +6042,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         _ => b.int_extend(v, IntWidth::I64, true),
                                     }
                                 } else {
-                                    let total = array_total_elems_value(b, &arr_info);
-                                    total
+                                    
+                                    array_total_elems_value(b, &arr_info)
                                 };
                                 // Build a descriptor in the pointer's slot.
                                 let desc = tgt_info.addr;
@@ -6935,7 +7109,8 @@ fn lower_write_items_adv(
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
-                        "trim" | "adjustl" | "adjustr" | "char")
+                        "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None
                                 && (i.dims.is_empty()
@@ -6949,6 +7124,17 @@ fn lower_write_items_adv(
                             .map(|i| i.char_kind != CharKind::None && (!i.dims.is_empty() || i.allocatable))
                             .unwrap_or(false)
                             && args.iter().any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+                    } else { false }
+                } else { false }
+            }
+            Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
+            Expr::ComponentAccess { base, component } => {
+                // Check if the component is a character field.
+                if let Some((_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        layout.field(component)
+                            .map(|f| matches!(f.type_info, crate::sema::symtab::TypeInfo::Character { .. }))
+                            .unwrap_or(false)
                     } else { false }
                 } else { false }
             }
@@ -7042,6 +7228,24 @@ fn lower_write_items_adv(
         }
 
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            // Special case: character field in derived type — get ptr and
+            // length directly from the type layout since lower_string_expr
+            // doesn't have access to type_layouts.
+            if let Expr::ComponentAccess { base, component } = &item.node {
+                if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(field) = layout.field(component) {
+                            if let crate::sema::symtab::TypeInfo::Character { len: Some(flen), .. } = &field.type_info {
+                                let offset = b.const_i64(field.offset as i64);
+                                let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+                                let len_val = b.const_i64(*flen);
+                                b.call(FuncRef::External("afs_write_string".into()), vec![unit, field_ptr, len_val], IrType::Void);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
             b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
         } else {
@@ -7124,7 +7328,8 @@ fn lower_internal_write_items(
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
-                        "trim" | "adjustl" | "adjustr" | "char")
+                        "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None
                                 && (i.dims.is_empty()
@@ -7141,6 +7346,7 @@ fn lower_internal_write_items(
                     } else { false }
                 } else { false }
             }
+            Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
             _ => false,
         };
 
@@ -7643,7 +7849,8 @@ fn lower_fmt_push(
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
                 matches!(name.to_lowercase().as_str(),
-                    "trim" | "adjustl" | "adjustr" | "char")
+                    "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
             } else { false }
         }
         _ => false,
@@ -10423,7 +10630,19 @@ fn lower_expr_full(
                 }
                 IrType::Float(fw)
             } else {
-                lty.clone()
+                // Integer width promotion: widen the narrower operand to
+                // match the wider one. Without this, integer(int64) + 1
+                // produces an IR width mismatch (i64 + i32).
+                let lw = lty.int_width().unwrap_or(IntWidth::I32);
+                let rw = rty.int_width().unwrap_or(IntWidth::I32);
+                let target_w = if lw.bits() >= rw.bits() { lw } else { rw };
+                if lw != target_w {
+                    lhs = b.int_extend(lhs, target_w, true);
+                }
+                if rw != target_w {
+                    rhs = b.int_extend(rhs, target_w, true);
+                }
+                IrType::Int(target_w)
             };
 
             match (op, &result_ty) {
@@ -10586,6 +10805,46 @@ fn lower_expr_full(
                     return b.const_bool(true);
                 }
 
+                // c_loc(x) / c_funloc(f): return the address of the argument
+                // as an i64 integer (matching type(c_ptr) which lowers to i64).
+                // Must be handled before generic intrinsic lowering because
+                // intrinsic args are loaded by value, but c_loc needs the address.
+                if key == "c_loc" || key == "c_funloc" {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let addr = lower_arg_by_ref(b, locals, e, st);
+                            // Convert pointer to integer (c_ptr is i64).
+                            return b.ptr_to_int(addr);
+                        }
+                    }
+                }
+
+                // abs(z) for complex: sqrt(re² + im²).
+                // Must be handled before generic intrinsic lowering because
+                // complex values are pointers to [f32/f64 x 2] buffers.
+                if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs") && args.len() == 1 {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
+                            let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let re_ptr = b.gep(val, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr = b.gep(val, vec![esz], IrType::Int(IntWidth::I8));
+                                let re = b.load_typed(re_ptr, elem.clone());
+                                let im = b.load_typed(im_ptr, elem);
+                                let re2 = b.fmul(re, re);
+                                let im2 = b.fmul(im, im);
+                                let sum = b.fadd(re2, im2);
+                                return b.fsqrt(sum);
+                            }
+                        }
+                    }
+                }
+
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
@@ -10639,9 +10898,16 @@ fn lower_expr_full(
                             let offset = b.const_i64(field.offset as i64);
                             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
-                            // If the field is itself a derived type, DON'T load — return the pointer
+                            // If the field is a derived type, DON'T load — return the pointer
                             // (for chained access like x%inner%field).
                             if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
+                                return field_ptr;
+                            }
+
+                            // Character fields: return the pointer to the inline
+                            // character data, not a load. The data is stored
+                            // inline in the struct, not behind a pointer.
+                            if let crate::sema::symtab::TypeInfo::Character { .. } = &field.type_info {
                                 return field_ptr;
                             }
 
@@ -10770,8 +11036,8 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let (st, layouts) = resolve::resolve_file(&units).unwrap();
-        lower_file(&units, &st, &layouts)
+        let (st, layouts) = { let rr = resolve::resolve_file(&units, &[]).unwrap(); (rr.st, rr.type_layouts) };
+        lower_file(&units, &st, &layouts, HashMap::new(), HashMap::new()).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {

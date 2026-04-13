@@ -28,8 +28,10 @@ fn emit_i128_words(out: &mut String, value: i128) {
 /// carry the element count explicitly. Zero-initialized arrays
 /// fall back to `.space byte_size`.
 ///
-/// Symbols are emitted as `.private_extern` (not `.globl`) per
-/// audit Maj-1 so they can't collide across translation units.
+/// Module globals (`afs_mod_*` and `afs_common_*`) are emitted as
+/// `.globl` so other translation units can reference them via USE.
+/// Non-module globals (SAVE-promoted locals) stay `.private_extern`
+/// to prevent cross-TU collisions (audit Maj-1).
 pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
     use crate::ir::inst::GlobalInit;
     use crate::ir::types::{IrType, IntWidth, FloatWidth};
@@ -46,7 +48,14 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         } else {
             format!("_{}", g.name)
         };
-        writeln!(out, ".private_extern {}", symbol).unwrap();
+        // Module globals need external linkage for multi-file.
+        let is_module_global = g.name.starts_with("afs_mod_")
+            || g.name.starts_with("afs_common_");
+        if is_module_global {
+            writeln!(out, ".globl {}", symbol).unwrap();
+        } else {
+            writeln!(out, ".private_extern {}", symbol).unwrap();
+        }
 
         // Array globals carry `Array<elem_ty, count>`.  Pick the
         // directive from the element type so `.long` / `.quad` /
@@ -191,12 +200,14 @@ pub fn emit_function(mf: &MachineFunction) -> String {
                 ConstPoolEntry::F32(v) => {
                     writeln!(out, ".p2align 2").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    writeln!(out, "    .single {}", v).unwrap();
+                    // Emit as hex integer to avoid decimal expansion issues
+                    // with large/small floats that the assembler can't parse.
+                    writeln!(out, "    .long 0x{:08x}", v.to_bits()).unwrap();
                 }
                 ConstPoolEntry::F64(v) => {
                     writeln!(out, ".p2align 3").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    writeln!(out, "    .double {}", v).unwrap();
+                    writeln!(out, "    .quad 0x{:016x}", v.to_bits()).unwrap();
                 }
                 ConstPoolEntry::I64(v) => {
                     writeln!(out, ".p2align 3").unwrap();

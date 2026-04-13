@@ -209,6 +209,8 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         InstKind::FloatTrunc(a, w)    => InstKind::FloatTrunc(r(a), *w),
         InstKind::IntExtend(a, w, s)  => InstKind::IntExtend(r(a), *w, *s),
         InstKind::IntTrunc(a, w)      => InstKind::IntTrunc(r(a), *w),
+        InstKind::PtrToInt(a)         => InstKind::PtrToInt(r(a)),
+        InstKind::IntToPtr(a, ty)     => InstKind::IntToPtr(r(a), ty.clone()),
         InstKind::Alloca(t)  => InstKind::Alloca(t.clone()),
         InstKind::Load(a)    => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),

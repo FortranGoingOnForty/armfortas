@@ -355,6 +355,8 @@ fn key_of(
         InstKind::FloatTrunc(a, w)   => mk(53, vec![remap(*a)], w.bits() as i128),
         InstKind::IntExtend(a, w, s) => mk(54, vec![remap(*a)], (w.bits() as i128) * if *s { 1 } else { -1 }),
         InstKind::IntTrunc(a, w)     => mk(55, vec![remap(*a)], w.bits() as i128),
+        InstKind::PtrToInt(a)        => mk(56, vec![remap(*a)], 0),
+        InstKind::IntToPtr(a, _)     => mk(57, vec![remap(*a)], 0),
         // Constants.
         InstKind::ConstInt(v, w)   => {
             let bits = w.bits();
@@ -553,14 +555,14 @@ mod tests {
         let tokens = tokenize(&pp.text, 0, SourceForm::FreeForm).expect("tokenize fixture");
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().expect("parse fixture");
-        let (st, type_layouts) = resolve::resolve_file(&units).expect("resolve fixture");
+        let (st, type_layouts) = { let rr = resolve::resolve_file(&units, &[]).expect("resolve fixture"); (rr.st, rr.type_layouts) };
         let diags = validate::validate_file(&units, &st);
         assert!(
             !diags.iter().any(|diag| diag.kind == validate::DiagKind::Error),
             "fixture should lower cleanly: {:?}",
             diags
         );
-        lower::lower_file(&units, &st, &type_layouts)
+        lower::lower_file(&units, &st, &type_layouts, std::collections::HashMap::new(), std::collections::HashMap::new()).0
     }
 
     fn build_pre_gvn_o2_pipeline() -> PassManager {

@@ -37,6 +37,8 @@ fn compile_fortran_object(source: &Path, output: &Path, opt_level: OptLevel) {
         emit_ir: false,
         preprocess_only: false,
         opt_level,
+        extra_inputs: vec![],
+        module_search_paths: vec![],
     };
     compile(&opts).unwrap_or_else(|e| {
         panic!(

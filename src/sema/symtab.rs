@@ -156,6 +156,20 @@ impl SymbolTable {
         None
     }
 
+    /// Search ALL scopes for a parameter symbol by name.
+    /// Used during lowering when the current scope may not be set correctly.
+    pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
+        let key = name.to_lowercase();
+        for scope in &self.scopes {
+            if let Some(sym) = scope.symbols.get(&key) {
+                if sym.attrs.parameter {
+                    return Some(sym);
+                }
+            }
+        }
+        None
+    }
+
     /// Check if a name would be implicitly typed in the current scope.
     /// Returns the implicit type if applicable, or None if implicit none.
     pub fn implicit_type(&self, name: &str) -> Option<ImplicitType> {
@@ -190,6 +204,18 @@ impl SymbolTable {
     /// Set the default accessibility for the current scope.
     pub fn set_default_access(&mut self, access: Access) {
         self.scopes[self.current].default_access = access;
+    }
+
+    /// Set the access level on a specific symbol in the current scope.
+    /// Used for `PUBLIC :: name` and `PRIVATE :: name` statements.
+    pub fn set_symbol_access(&mut self, name: &str, access: Access) {
+        let key = name.to_lowercase();
+        if let Some(sym) = self.scopes[self.current].symbols.get_mut(&key) {
+            sym.attrs.access = access;
+        }
+        // If the symbol hasn't been declared yet, we'll apply the access
+        // when it is declared (via the default access mechanism or a
+        // deferred access list). For now, silently skip.
     }
 
     /// Get the default accessibility for a scope.

@@ -286,6 +286,15 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::IntTrunc(val, width), IrType::Int(width))
     }
 
+    pub fn ptr_to_int(&mut self, val: ValueId) -> ValueId {
+        self.emit(InstKind::PtrToInt(val), IrType::Int(IntWidth::I64))
+    }
+
+    pub fn int_to_ptr(&mut self, val: ValueId, pointee: IrType) -> ValueId {
+        let ptr_ty = IrType::Ptr(Box::new(pointee));
+        self.emit(InstKind::IntToPtr(val, ptr_ty.clone()), ptr_ty)
+    }
+
     // ---- Memory ----
 
     pub fn alloca(&mut self, ty: IrType) -> ValueId {
