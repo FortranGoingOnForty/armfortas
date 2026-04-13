@@ -1262,18 +1262,22 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::And(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::AndReg, *a, *b),
         InstKind::Or(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::OrrReg, *a, *b),
         InstKind::Not(a) => {
-            // NOT = ORN dest, ZR, src  (MVN alias)
-            // Must match register width: wzr for 32-bit, xzr for 64-bit.
-            let class = type_to_reg_class(&inst.ty);
-            let dest = ctx.get_vreg(mf, inst.id, class);
+            // Logical NOT: CMP src, #0; CSET dest, EQ
+            // If src == 0 (false), EQ is true → dest = 1 (true).
+            // If src != 0 (true), EQ is false → dest = 0 (false).
+            // This correctly handles any truthy value, not just 0/1.
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp32);
             let va = ctx.lookup_vreg(*a);
-            let zr = if class == RegClass::Gp32 { PhysReg::Wzr } else { PhysReg::Xzr };
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::OrnReg,
+                opcode: ArmOpcode::CmpImm,
+                operands: vec![MachineOperand::VReg(va), MachineOperand::Imm(0)],
+                def: None,
+            });
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Cset,
                 operands: vec![
                     MachineOperand::VReg(dest),
-                    MachineOperand::PhysReg(zr),
-                    MachineOperand::VReg(va),
+                    MachineOperand::Cond(ArmCond::Eq),
                 ],
                 def: Some(dest),
             });
