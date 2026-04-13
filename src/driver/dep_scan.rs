@@ -50,7 +50,7 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
 
         // USE <name> [, ...]
         if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
-            let rest = if trimmed.starts_with("use,") {
+            let mut rest = if trimmed.starts_with("use,") {
                 // USE, intrinsic :: name
                 if let Some(idx) = trimmed.find("::") {
                     trimmed[idx + 2..].trim()
@@ -60,6 +60,10 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
             } else {
                 trimmed[4..].trim()
             };
+            // Strip leading :: (USE :: module_name syntax).
+            if rest.starts_with("::") {
+                rest = rest[2..].trim();
+            }
             if let Some(name) = rest.split(|c: char| c == ',' || c == ':' || c.is_whitespace()).next() {
                 let clean = name.trim();
                 if !clean.is_empty() && clean != "only" {
