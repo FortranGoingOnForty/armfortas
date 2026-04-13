@@ -619,9 +619,25 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         if !parts.is_empty() {
             ir_symbol = Some(parts[0].to_string());
         }
-        for part in &parts[1..] {
-            if *part == "@deferred_char" {
+        let mut i = 1;
+        while i < parts.len() {
+            if parts[i] == "@deferred_char" {
                 deferred_char = true;
+                i += 1;
+            } else if parts[i] == "@dims" {
+                // Parse dimension pairs: @dims 1:5 1:10 ...
+                i += 1;
+                while i < parts.len() && parts[i].contains(':') && !parts[i].starts_with('@') {
+                    let pair = parts[i];
+                    if let Some((lo_s, ext_s)) = pair.split_once(':') {
+                        let lo = lo_s.parse::<i64>().unwrap_or(1);
+                        let ext = ext_s.parse::<i64>().unwrap_or(1);
+                        dims.push((lo, ext));
+                    }
+                    i += 1;
+                }
+            } else {
+                i += 1;
             }
         }
     }
