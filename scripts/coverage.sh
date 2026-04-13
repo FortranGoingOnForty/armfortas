@@ -13,6 +13,9 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# Ensure cargo bin dir is in PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
 MODE="${1:-}"
 
 if command -v cargo-llvm-cov &>/dev/null; then
