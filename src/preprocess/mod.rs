@@ -218,7 +218,9 @@ impl Preprocessor {
             // Also join Fortran &-continued lines (free-form).
             // A line ending with & in the code portion (not inside strings or after !)
             // continues on the next line.
-            if !self.fixed_form {
+            // Skip for preprocessor directives (#if, #define, etc.) where ! and &
+            // have C semantics, not Fortran semantics.
+            if !self.fixed_form && !logical_line.trim_start().starts_with('#') {
                 while has_trailing_continuation(&logical_line) {
                     // Remove the trailing & from the code portion.
                     let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
