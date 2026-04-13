@@ -10784,6 +10784,32 @@ fn lower_expr_full(
                     }
                 }
 
+                // abs(z) for complex: sqrt(re² + im²).
+                // Must be handled before generic intrinsic lowering because
+                // complex values are pointers to [f32/f64 x 2] buffers.
+                if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs") && args.len() == 1 {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
+                            let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let re_ptr = b.gep(val, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr = b.gep(val, vec![esz], IrType::Int(IntWidth::I8));
+                                let re = b.load_typed(re_ptr, elem.clone());
+                                let im = b.load_typed(im_ptr, elem);
+                                let re2 = b.fmul(re, re);
+                                let im2 = b.fmul(im, im);
+                                let sum = b.fadd(re2, im2);
+                                return b.fsqrt(sum);
+                            }
+                        }
+                    }
+                }
+
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
