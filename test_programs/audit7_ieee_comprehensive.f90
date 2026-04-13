@@ -1,9 +1,6 @@
 ! Comprehensive IEEE arithmetic tests: ieee_is_nan and ieee_is_finite
 ! for both real32 and real64, including NaN, Inf, zero, and normal values.
-! CHECK: 8
-! CHECK: passed
-! CHECK: 0
-! CHECK: failed
+! CHECK: 8  passed,  0  failed
 program test_ieee
   use ieee_arithmetic, only: ieee_is_nan, ieee_is_finite
   use iso_fortran_env, only: real32, real64

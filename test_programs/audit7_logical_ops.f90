@@ -1,9 +1,6 @@
 ! Comprehensive logical operator tests: .and., .or., .eqv., .neqv.
 ! Exercises all four binary logical operators with various truth values.
-! CHECK: 6
-! CHECK: pass
-! CHECK: 0
-! CHECK: fail
+! CHECK: 6 pass 0 fail
 program test_logical_ops
   implicit none
   logical :: a, b, c
