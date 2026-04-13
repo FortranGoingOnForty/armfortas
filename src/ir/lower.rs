@@ -10838,8 +10838,17 @@ fn lower_expr_full(
                 (BinaryOp::Gt, IrType::Float(_)) => b.fcmp(CmpOp::Gt, lhs, rhs),
                 (BinaryOp::Ge, IrType::Int(_)) => b.icmp(CmpOp::Ge, lhs, rhs),
                 (BinaryOp::Ge, IrType::Float(_)) => b.fcmp(CmpOp::Ge, lhs, rhs),
-                (BinaryOp::And, _) => b.and(lhs, rhs),
-                (BinaryOp::Or, _) => b.or(lhs, rhs),
+                (BinaryOp::And, _) => {
+                    // Coerce to Bool if not already (Fortran .AND. on integers).
+                    let lbool = coerce_to_type(b, lhs, &IrType::Bool);
+                    let rbool = coerce_to_type(b, rhs, &IrType::Bool);
+                    b.and(lbool, rbool)
+                }
+                (BinaryOp::Or, _) => {
+                    let lbool = coerce_to_type(b, lhs, &IrType::Bool);
+                    let rbool = coerce_to_type(b, rhs, &IrType::Bool);
+                    b.or(lbool, rbool)
+                }
                 (BinaryOp::Eqv, _) => {
                     // a .eqv. b = .not. (a .xor. b)
                     let both = b.and(lhs, rhs);

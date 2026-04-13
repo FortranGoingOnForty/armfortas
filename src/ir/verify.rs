@@ -398,7 +398,10 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 // the real access path. Skip the check in that
                 // specific case to avoid spurious errors.
                 let pointee_is_byte = matches!(inner, IrType::Int(IntWidth::I8));
-                if !pointee_is_byte && vty != *inner {
+                // Also skip when both are pointer types (different pointees
+                // but same machine-level size on ARM64).
+                let both_ptrs = matches!(inner, IrType::Ptr(_)) && matches!(&vty, IrType::Ptr(_));
+                if !pointee_is_byte && !both_ptrs && vty != *inner {
                     errors.push(VerifyError {
                         msg: format!(
                             "store %{}: value type {} doesn't match pointee type {}",
