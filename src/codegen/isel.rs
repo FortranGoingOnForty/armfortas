@@ -1720,6 +1720,35 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             });
         }
 
+        InstKind::PtrToInt(a) => {
+            // Pointer is already an i64 in a GP register — just mov.
+            let src = ctx.lookup_vreg(*a);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        InstKind::IntToPtr(a, _) => {
+            // Integer already in a GP register — treat as pointer via mov.
+            let src = ctx.lookup_vreg(*a);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                ],
+                def: Some(dest),
+            });
+        }
+
         // Remaining: ExtractField, InsertField — placeholder.
         _ => {
             let class = type_to_reg_class(&inst.ty);

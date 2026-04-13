@@ -355,6 +355,8 @@ fn key_of(
         InstKind::FloatTrunc(a, w)   => mk(53, vec![remap(*a)], w.bits() as i128),
         InstKind::IntExtend(a, w, s) => mk(54, vec![remap(*a)], (w.bits() as i128) * if *s { 1 } else { -1 }),
         InstKind::IntTrunc(a, w)     => mk(55, vec![remap(*a)], w.bits() as i128),
+        InstKind::PtrToInt(a)        => mk(56, vec![remap(*a)], 0),
+        InstKind::IntToPtr(a, _)     => mk(57, vec![remap(*a)], 0),
         // Constants.
         InstKind::ConstInt(v, w)   => {
             let bits = w.bits();

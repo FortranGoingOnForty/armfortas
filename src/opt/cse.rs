@@ -157,6 +157,8 @@ fn key_of(inst: &Inst) -> Option<Key> {
         InstKind::FloatTrunc(v, fw)     => mk(63, vec![*v], fw.bits() as i128),
         InstKind::IntExtend(v, w, sgn)  => mk(64, vec![*v], (w.bits() as i128) | ((*sgn as i128) << 32)),
         InstKind::IntTrunc(v, w)        => mk(65, vec![*v], w.bits() as i128),
+        InstKind::PtrToInt(v)           => mk(66, vec![*v], 0),
+        InstKind::IntToPtr(v, _)        => mk(67, vec![*v], 0),
 
         // Address arithmetic --------------------------------------------
         InstKind::GetElementPtr(base, idxs) => {

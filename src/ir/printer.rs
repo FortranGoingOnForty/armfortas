@@ -212,6 +212,8 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::FloatTrunc(v, w) => format!("float_trunc %{} : {}", v.0, w),
         InstKind::IntExtend(v, w, s) => format!("int_extend %{} : {} {}", v.0, w, if *s { "signed" } else { "unsigned" }),
         InstKind::IntTrunc(v, w) => format!("int_trunc %{} : {}", v.0, w),
+        InstKind::PtrToInt(v) => format!("ptr_to_int %{}", v.0),
+        InstKind::IntToPtr(v, ty) => format!("int_to_ptr %{} : {}", v.0, ty),
 
         InstKind::Alloca(ty) => format!("alloca {}", ty),
         InstKind::Load(a) => format!("load %{}", a.0),

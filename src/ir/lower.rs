@@ -4762,9 +4762,15 @@ fn lower_type_spec_st(ts: &TypeSpec, st: Option<&SymbolTable>) -> IrType {
         TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
         TypeSpec::Logical(_) => IrType::Bool,
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        TypeSpec::Type(_) | TypeSpec::Class(_) => {
-            // Derived types are passed as byte pointers (struct layout resolved elsewhere).
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+        TypeSpec::Type(name) | TypeSpec::Class(name) => {
+            // c_ptr and c_funptr are opaque address types — i64 on ARM64.
+            let lower_name = name.to_lowercase();
+            if lower_name == "c_ptr" || lower_name == "c_funptr" {
+                IrType::Int(IntWidth::I64)
+            } else {
+                // User-defined derived types are byte pointers (struct layout resolved elsewhere).
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+            }
         }
         _ => IrType::Int(IntWidth::I32), // fallback
     }
@@ -10704,6 +10710,20 @@ fn lower_expr_full(
                     }
                     // If we can't resolve it (non-standard usage), assume present.
                     return b.const_bool(true);
+                }
+
+                // c_loc(x) / c_funloc(f): return the address of the argument
+                // as an i64 integer (matching type(c_ptr) which lowers to i64).
+                // Must be handled before generic intrinsic lowering because
+                // intrinsic args are loaded by value, but c_loc needs the address.
+                if key == "c_loc" || key == "c_funloc" {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let addr = lower_arg_by_ref(b, locals, e, st);
+                            // Convert pointer to integer (c_ptr is i64).
+                            return b.ptr_to_int(addr);
+                        }
+                    }
                 }
 
                 // Try intrinsic lowering first (intrinsics use values, not references).

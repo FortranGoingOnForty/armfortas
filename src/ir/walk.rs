@@ -53,7 +53,8 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
 
         InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
         InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => vec![*v],
+        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) |
+        InstKind::PtrToInt(v) | InstKind::IntToPtr(v, _) => vec![*v],
 
         InstKind::Load(a) => vec![*a],
         InstKind::Store(v, a) => vec![*v, *a],
@@ -137,7 +138,8 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
 
         InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
         InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => r(v),
+        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) |
+        InstKind::PtrToInt(v) | InstKind::IntToPtr(v, _) => r(v),
 
         InstKind::Load(a) => r(a),
         InstKind::Store(v, a) => { r(v); r(a); }
