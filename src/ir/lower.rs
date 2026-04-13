@@ -222,6 +222,38 @@ pub fn lower_file(
         }
     }
 
+    // Pass 1.1: propagate transitively-visible globals through USE chains.
+    // When module A USEs module B, all of B's public globals should
+    // also be accessible as (A, var_name) in the globals map. Without
+    // this, `program p; use A` can't see B's variables even though A
+    // re-exports them via USE association.
+    for unit in units {
+        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            // Collect USE'd module names.
+            let used_modules: Vec<String> = uses.iter().filter_map(|u| {
+                if let Decl::UseStmt { module, .. } = &u.node {
+                    Some(module.to_lowercase())
+                } else { None }
+            }).collect();
+            // For each USE'd module, copy its globals into this module's namespace.
+            let mut to_add = Vec::new();
+            for used_mod in &used_modules {
+                for ((mk, var), info) in globals.iter() {
+                    if mk == used_mod {
+                        let new_key = (mod_key.clone(), var.clone());
+                        if !globals.contains_key(&new_key) {
+                            to_add.push((new_key, info.clone()));
+                        }
+                    }
+                }
+            }
+            for (key, info) in to_add {
+                globals.insert(key, info);
+            }
+        }
+    }
+
     // Pass 1.5: walk every program unit (and its `contains` chain)
     // and collect the names of functions whose result variable is
     // declared `allocatable`. Audit6 BLOCKING-1: these need a hidden
