@@ -432,21 +432,50 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // Standalone PRIVATE / PUBLIC access statement.
-            if (text == "private" || text == "public") && self.at_stmt_end_after(1) {
+            // PRIVATE / PUBLIC access statements.
+            if text == "private" || text == "public" {
                 let start = self.current_span();
                 let attr = if text == "private" {
                     crate::ast::decl::Attribute::Private
                 } else {
                     crate::ast::decl::Attribute::Public
                 };
-                self.advance();
-                let span = span_from_to(start, self.prev_span());
-                decls.push(crate::ast::Spanned::new(
-                    crate::ast::decl::Decl::AccessDefault { access: attr },
-                    span,
-                ));
-                continue;
+                if self.at_stmt_end_after(1) {
+                    // Standalone: sets default access for the module.
+                    self.advance();
+                    let span = span_from_to(start, self.prev_span());
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::AccessDefault { access: attr },
+                        span,
+                    ));
+                    continue;
+                }
+                // PUBLIC :: name-list or PRIVATE :: name-list
+                let next_pos = self.pos + 1;
+                let has_colons = next_pos < self.tokens.len()
+                    && self.tokens[next_pos].kind == TokenKind::ColonColon;
+                let ident_pos = if has_colons { next_pos + 1 } else { next_pos };
+                if ident_pos < self.tokens.len()
+                    && self.tokens[ident_pos].kind == TokenKind::Identifier
+                {
+                    self.advance(); // consume PUBLIC/PRIVATE
+                    if has_colons { self.advance(); } // consume ::
+                    let mut names = Vec::new();
+                    loop {
+                        if self.peek() == &TokenKind::Identifier {
+                            names.push(self.advance().clone().text);
+                        } else { break; }
+                        if !self.eat(&TokenKind::Comma) { break; }
+                    }
+                    if !names.is_empty() {
+                        let span = span_from_to(start, self.prev_span());
+                        decls.push(crate::ast::Spanned::new(
+                            crate::ast::decl::Decl::AccessList { access: attr, names },
+                            span,
+                        ));
+                        continue;
+                    }
+                }
             }
 
             // Try as executable statement.

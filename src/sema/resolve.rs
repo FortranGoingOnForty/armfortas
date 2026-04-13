@@ -461,6 +461,16 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     _ => {}
                 }
             }
+            Decl::AccessList { access, names } => {
+                let acc = match access {
+                    Attribute::Private => Access::Private,
+                    Attribute::Public => Access::Public,
+                    _ => continue,
+                };
+                for name in names {
+                    st.set_symbol_access(name, acc);
+                }
+            }
             Decl::TypeDecl { type_spec, attrs, entities } => {
                 let type_info = type_spec_to_info(type_spec, st);
                 let sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));

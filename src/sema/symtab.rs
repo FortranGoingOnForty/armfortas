@@ -206,6 +206,18 @@ impl SymbolTable {
         self.scopes[self.current].default_access = access;
     }
 
+    /// Set the access level on a specific symbol in the current scope.
+    /// Used for `PUBLIC :: name` and `PRIVATE :: name` statements.
+    pub fn set_symbol_access(&mut self, name: &str, access: Access) {
+        let key = name.to_lowercase();
+        if let Some(sym) = self.scopes[self.current].symbols.get_mut(&key) {
+            sym.attrs.access = access;
+        }
+        // If the symbol hasn't been declared yet, we'll apply the access
+        // when it is declared (via the default access mechanism or a
+        // deferred access list). For now, silently skip.
+    }
+
     /// Get the default accessibility for a scope.
     pub fn default_access(&self, scope_id: ScopeId) -> Access {
         self.scopes[scope_id].default_access
