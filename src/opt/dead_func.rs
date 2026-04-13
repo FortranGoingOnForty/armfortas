@@ -65,6 +65,14 @@ impl Pass for DeadFuncElim {
             }
         }
 
+        // Keep all module-visible functions — they may be called from other
+        // translation units even if nobody calls them in this TU.
+        for (i, func) in module.functions.iter().enumerate() {
+            if !func.internal_only {
+                referenced.insert(i as u32);
+            }
+        }
+
         // Remove unreferenced functions (iterate in reverse to preserve indices).
         let dead: Vec<usize> = (0..n)
             .filter(|i| !referenced.contains(&(*i as u32)))
@@ -119,14 +127,15 @@ mod tests {
     }
 
     #[test]
-    fn removes_uncalled_function() {
+    fn removes_uncalled_internal_function() {
         let mut m = Module::new("test".into());
         // func 0: main (entry, kept)
         let mut main_f = Function::new("main".into(), vec![], IrType::Void);
         main_f.block_mut(main_f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(main_f);
-        // func 1: dead (never called)
+        // func 1: dead internal function (never called, internal_only)
         let mut dead_f = Function::new("dead".into(), vec![], IrType::Void);
+        dead_f.internal_only = true;
         dead_f.block_mut(dead_f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(dead_f);
 
@@ -163,10 +172,37 @@ mod tests {
     }
 
     #[test]
+    fn keeps_module_visible_function_even_without_callers() {
+        let mut m = Module::new("test".into());
+        // func 0: __prog_entry (kept as program root)
+        let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
+        prog.block_mut(prog.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(prog);
+        // func 1: module-visible function, no internal callers
+        let mut visible = Function::new("get".into(), vec![], IrType::Void);
+        visible.internal_only = false; // module-public
+        visible.block_mut(visible.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(visible);
+        // func 2: internal-only function, no callers (should be removed)
+        let mut internal = Function::new("helper".into(), vec![], IrType::Void);
+        internal.internal_only = true;
+        internal.block_mut(internal.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(internal);
+
+        let pass = DeadFuncElim;
+        let changed = pass.run(&mut m);
+        assert!(changed, "internal-only helper should be removed");
+        assert_eq!(m.functions.len(), 2);
+        assert_eq!(m.functions[0].name, "__prog_entry");
+        assert_eq!(m.functions[1].name, "get");
+    }
+
+    #[test]
     fn keeps_program_body_even_when_helper_is_first() {
         let mut m = Module::new("test".into());
 
         let mut helper = Function::new("helper".into(), vec![], IrType::Void);
+        helper.internal_only = true;
         helper.block_mut(helper.entry).terminator = Some(Terminator::Return(None));
         m.add_function(helper);
 
