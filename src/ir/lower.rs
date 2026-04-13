@@ -4151,10 +4151,22 @@ fn lower_intrinsic_subroutine(
         "c_f_pointer" => {
             // call c_f_pointer(cptr, fptr [, shape])
             // Store the C pointer value into the Fortran pointer variable.
-            // cptr is passed by value (it's a c_ptr), fptr is passed by reference.
+            // cptr is i64 (c_ptr), fptr is a by-reference Fortran pointer.
+            // Convert i64 address to pointer type before storing.
             let cptr = nth_arg_val(b, ctx, args, 0, 0);
             let fptr = nth_arg_ref(b, ctx, args, 1);
-            b.store(cptr, fptr);
+            // fptr is Ptr<Ptr<T>> (by-ref pointer variable).
+            // We need to store a Ptr<T> into it. Extract T from
+            // the double-pointer type and build Ptr<T> via int_to_ptr.
+            let inner_pointee = b.func().value_type(fptr)
+                .and_then(|ty| if let IrType::Ptr(inner) = ty {
+                    if let IrType::Ptr(elem) = inner.as_ref() {
+                        Some(elem.as_ref().clone())
+                    } else { Some(inner.as_ref().clone()) }
+                } else { None })
+                .unwrap_or(IrType::Int(IntWidth::I8));
+            let ptr_val = b.int_to_ptr(cptr, inner_pointee);
+            b.store(ptr_val, fptr);
             true
         }
 
