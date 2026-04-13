@@ -1033,6 +1033,8 @@ fn check_expr_names(
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
+            // Skip format specifier * (appears in WRITE(*, *) / READ(*, *)).
+            if key == "*" { return; }
             if declared.contains(&key) { return; }
             if st.lookup_in(scope_id, &key).is_some() { return; }
             if is_intrinsic_name(&key) { return; }
