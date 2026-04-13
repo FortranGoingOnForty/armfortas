@@ -2408,22 +2408,43 @@ fn install_globals_as_locals(
                 if let Some(sym) = st.scope(mod_scope_id).symbols.get(&var_key) {
                     if sym.attrs.parameter {
                         if let Some(cv) = sym.const_value {
-                            let ty = IrType::Int(IntWidth::I32);
-                            // Create a dummy alloca (never loaded from; inline_const
-                            // short-circuits at every use site via materialize_const_scalar).
-                            let addr = b.alloca(ty.clone());
-                            locals.insert(local_key.clone(), LocalInfo {
-                                addr,
-                                ty,
-                                dims: vec![],
-                                allocatable: false,
-                                descriptor_arg: false,
-                                by_ref: false,
-                                char_kind: CharKind::None,
-                                derived_type: None,
-                                inline_const: Some(ConstScalar::Int(cv as i128)),
-                                is_pointer: false,
-                            });
+                            // Check if this is a character constant (e.g. c_null_char).
+                            let is_char = matches!(sym.type_info, Some(crate::sema::symtab::TypeInfo::Character { .. }));
+                            if is_char {
+                                // Emit a 1-byte global string constant with the ASCII value.
+                                let byte = [cv as u8];
+                                let ptr = b.const_string(&byte);
+                                let ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                                locals.insert(local_key.clone(), LocalInfo {
+                                    addr: ptr,
+                                    ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(1),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                });
+                            } else {
+                                let ty = IrType::Int(IntWidth::I32);
+                                // Create a dummy alloca (never loaded from; inline_const
+                                // short-circuits at every use site via materialize_const_scalar).
+                                let addr = b.alloca(ty.clone());
+                                locals.insert(local_key.clone(), LocalInfo {
+                                    addr,
+                                    ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::None,
+                                    derived_type: None,
+                                    inline_const: Some(ConstScalar::Int(cv as i128)),
+                                    is_pointer: false,
+                                });
+                            }
                             installed_from.insert(local_key, mod_key);
                         }
                     }

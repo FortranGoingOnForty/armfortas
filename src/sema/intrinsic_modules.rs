@@ -101,12 +101,19 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     insert_param(st, m, "c_bool", TypeInfo::Logical { kind: Some(1) });
 
     // ---- Character constants (c_null_char, etc.) ----
+    // Each constant's value is its ASCII byte code.
     let ck = TypeInfo::Character { len: Some(1), kind: Some(1) };
-    for name in [
-        "c_null_char", "c_alert", "c_backspace", "c_form_feed",
-        "c_new_line", "c_carriage_return", "c_horizontal_tab", "c_vertical_tab",
+    for (name, ascii) in [
+        ("c_null_char", 0i64),
+        ("c_alert", 7),
+        ("c_backspace", 8),
+        ("c_horizontal_tab", 9),
+        ("c_new_line", 10),
+        ("c_vertical_tab", 11),
+        ("c_form_feed", 12),
+        ("c_carriage_return", 13),
     ] {
-        insert_param(st, m, name, ck.clone());
+        insert_param_val(st, m, name, ck.clone(), Some(ascii));
     }
 
     // ---- Pointer types ----
