@@ -218,6 +218,11 @@ impl SymbolTable {
         // deferred access list). For now, silently skip.
     }
 
+    /// Check whether implicit none (type) is active in a scope.
+    pub fn is_implicit_none(&self, scope_id: ScopeId) -> bool {
+        self.scopes[scope_id].implicit_rules.none_type
+    }
+
     /// Get the default accessibility for a scope.
     pub fn default_access(&self, scope_id: ScopeId) -> Access {
         self.scopes[scope_id].default_access

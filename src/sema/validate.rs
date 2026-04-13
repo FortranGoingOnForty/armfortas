@@ -186,6 +186,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     match &unit.node {
         ProgramUnit::Program { decls, body, contains, .. } => {
             validate_decls(ctx, decls);
+            check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
             for sub in contains {
@@ -212,6 +213,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
 
             validate_decls(ctx, decls);
+            check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
             for sub in contains {
@@ -234,6 +236,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
 
             validate_decls(ctx, decls);
+            check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
             for sub in contains {
@@ -884,6 +887,220 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
         Expr::ComponentAccess { base, .. } => extract_base_name(base),
         _ => None,
     }
+}
+
+// ---- IMPLICIT NONE enforcement ----
+
+/// Check that all variable references in a statement list are declared
+/// when IMPLICIT NONE is active in the current scope.
+fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast::decl::SpannedDecl]) {
+    if !ctx.st.is_implicit_none(ctx.scope_id) { return; }
+
+    // Collect declared names in this scope (from declarations).
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for e in entities {
+                    declared.insert(e.name.to_lowercase());
+                }
+            }
+            // COMMON block variables are also declared.
+            Decl::CommonBlock { vars, .. } => {
+                for v in vars {
+                    declared.insert(v.to_lowercase());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Also scan for INTERFACE blocks — function/subroutine names
+    // declared in interfaces are valid in the current scope.
+    // The interface bodies are stored as program units in the
+    // ifaces/contains lists, not in decls. But the symbol table
+    // should have them via resolve. We also check decls for
+    // EXTERNAL statements.
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            if attrs.iter().any(|a| matches!(a, Attribute::External)) {
+                for e in entities {
+                    declared.insert(e.name.to_lowercase());
+                }
+            }
+        }
+    }
+
+    let mut undeclared = Vec::new();
+    for stmt in stmts {
+        walk_stmt_for_undeclared(ctx.st, ctx.scope_id, stmt, &declared, &mut undeclared);
+    }
+
+    // Deduplicate by name (only report each undeclared name once).
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, span) in &undeclared {
+        let key = name.to_lowercase();
+        if reported.insert(key) {
+            ctx.error(*span, &format!(
+                "variable '{}' used but not declared (IMPLICIT NONE is active)", name
+            ));
+        }
+    }
+}
+
+fn walk_stmt_for_undeclared(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    stmt: &SpannedStmt,
+    declared: &std::collections::HashSet<String>,
+    undeclared: &mut Vec<(String, Span)>,
+) {
+    macro_rules! chk {
+        ($e:expr) => { check_expr_names(st, scope_id, $e, declared, undeclared) };
+    }
+    macro_rules! recurse {
+        ($s:expr) => { walk_stmt_for_undeclared(st, scope_id, $s, declared, undeclared) };
+    }
+    match &stmt.node {
+        Stmt::Assignment { target, value } => {
+            chk!(target); chk!(value);
+        }
+        Stmt::PointerAssignment { target, value, .. } => {
+            chk!(target); chk!(value);
+        }
+        Stmt::Print { items, .. } => {
+            for item in items { chk!(item); }
+        }
+        Stmt::Write { items, controls, .. } => {
+            for item in items { chk!(item); }
+            for ctrl in controls { chk!(&ctrl.value); }
+        }
+        Stmt::Read { items, controls, .. } => {
+            for item in items { chk!(item); }
+            for ctrl in controls { chk!(&ctrl.value); }
+        }
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            chk!(condition);
+            for s in then_body { recurse!(s); }
+            for (cond, body) in else_ifs {
+                chk!(cond);
+                for s in body { recurse!(s); }
+            }
+            if let Some(body) = else_body {
+                for s in body { recurse!(s); }
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            chk!(condition); recurse!(action);
+        }
+        Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } |
+        Stmt::DoConcurrent { body, .. } | Stmt::Block { body, .. } => {
+            for s in body { recurse!(s); }
+        }
+        Stmt::SelectCase { selector, cases, .. } => {
+            chk!(selector);
+            for case in cases {
+                for s in &case.body { recurse!(s); }
+            }
+        }
+        Stmt::Call { args, .. } => {
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    chk!(e);
+                }
+            }
+        }
+        Stmt::Labeled { stmt: inner, .. } => { recurse!(inner); }
+        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+            chk!(mask);
+            for s in body { recurse!(s); }
+            for (m, b) in elsewhere {
+                if let Some(m) = m { chk!(m); }
+                for s in b { recurse!(s); }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression and collect undeclared Name references.
+fn check_expr_names(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    expr: &crate::ast::expr::SpannedExpr,
+    declared: &std::collections::HashSet<String>,
+    undeclared: &mut Vec<(String, Span)>,
+) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if declared.contains(&key) { return; }
+            if st.lookup_in(scope_id, &key).is_some() { return; }
+            if is_intrinsic_name(&key) { return; }
+            undeclared.push((name.clone(), expr.span));
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_names(st, scope_id, left, declared, undeclared);
+            check_expr_names(st, scope_id, right, declared, undeclared);
+        }
+        Expr::UnaryOp { operand, .. } => {
+            check_expr_names(st, scope_id, operand, declared, undeclared);
+        }
+        Expr::FunctionCall { callee, args } => {
+            // Don't check the callee name — it could be an interface-declared
+            // function, external function, or module procedure that isn't in
+            // the local symbol table.
+            // But DO check nested callees (e.g., arr(i)%method).
+            if !matches!(&callee.node, Expr::Name { .. }) {
+                check_expr_names(st, scope_id, callee, declared, undeclared);
+            }
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    check_expr_names(st, scope_id, e, declared, undeclared);
+                }
+            }
+        }
+        Expr::ComponentAccess { base, .. } => {
+            check_expr_names(st, scope_id, base, declared, undeclared);
+        }
+        Expr::ParenExpr { inner } => {
+            check_expr_names(st, scope_id, inner, declared, undeclared);
+        }
+        _ => {}
+    }
+}
+
+fn is_intrinsic_name(name: &str) -> bool {
+    matches!(name,
+        "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
+        "cos" | "sin" | "tan" | "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
+        "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
+        "int" | "nint" | "real" | "dble" | "cmplx" | "conjg" |
+        "aimag" | "char" | "ichar" | "achar" | "iachar" |
+        "len" | "len_trim" | "trim" | "adjustl" | "adjustr" |
+        "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
+        "kind" | "selected_int_kind" | "selected_real_kind" |
+        "size" | "shape" | "lbound" | "ubound" | "allocated" | "associated" |
+        "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
+        "sum" | "product" | "maxval" | "minval" | "count" | "any" | "all" |
+        "matmul" | "dot_product" | "transpose" |
+        "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
+        "maxexponent" | "minexponent" | "digits" | "bit_size" |
+        "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
+        "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
+        "ishft" | "ishftc" | "mvbits" | "transfer" |
+        "new_line" | "null" | "move_alloc" |
+        "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
+        "command_argument_count" | "get_command_argument" | "get_environment_variable" |
+        "execute_command_line" | "compiler_version" | "compiler_options" |
+        "c_loc" | "c_funloc" | "c_f_pointer" | "c_associated" | "c_sizeof" |
+        "ieee_is_nan" | "ieee_is_finite" | "ieee_value" |
+        "ieee_support_datatype" | "ieee_support_denormal" |
+        "ieee_selected_real_kind" |
+        // Statement-like names that can appear in expression context
+        "float" | "dfloat" | "sngl" | "idint" | "ifix" | "idnint" |
+        "dprod" | "dmax1" | "dmin1" | "max0" | "min0" | "max1" | "min1" |
+        "amax0" | "amin0" | "amax1" | "amin1"
+    )
 }
 
 #[cfg(test)]
