@@ -116,6 +116,15 @@ impl<'a> Parser<'a> {
         // No PROGRAM keyword — implicit main program.
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
 
+        // Consume the END [PROGRAM] if present — parse_unit_body breaks
+        // *before* consuming the terminator, so we must advance past it
+        // or parse_file will re-enter parse_program_unit at the same
+        // position forever.
+        self.skip_newlines();
+        if self.peek() != &TokenKind::Eof {
+            let _ = self.consume_end("program");
+        }
+
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(ProgramUnit::Program {
             name: None, uses, imports, implicit, decls, body, contains: ifaces,
