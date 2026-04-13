@@ -12,7 +12,7 @@ use super::symtab::*;
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
     /// return them to the driver for globals extraction.
-    static LOADED_EXTERNAL_MODULES: RefCell<Vec<super::amod::ModuleInterface>> = RefCell::new(Vec::new());
+    static LOADED_EXTERNAL_MODULES: RefCell<Vec<super::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Walk a list of program units and build the symbol table.
@@ -315,13 +315,15 @@ fn load_external_module(
     // Populate variables and parameters.
     for var in &iface.variables {
         let kind = if var.is_parameter { SymbolKind::Parameter } else { SymbolKind::Variable };
-        let mut attrs = SymbolAttrs::default();
-        attrs.access = Access::Public;
-        attrs.allocatable = var.allocatable;
-        attrs.save = var.save;
-        attrs.pointer = var.pointer;
-        attrs.target = var.target;
-        attrs.parameter = var.is_parameter;
+        let attrs = SymbolAttrs {
+            access: Access::Public,
+            allocatable: var.allocatable,
+            save: var.save,
+            pointer: var.pointer,
+            target: var.target,
+            parameter: var.is_parameter,
+            ..Default::default()
+        };
         let _ = st.define(Symbol {
             name: var.name.clone(),
             kind,
@@ -336,10 +338,12 @@ fn load_external_module(
 
     // Populate procedures.
     for proc in &iface.procedures {
-        let mut attrs = SymbolAttrs::default();
-        attrs.access = Access::Public;
-        attrs.pure = proc.pure;
-        attrs.elemental = proc.elemental;
+        let attrs = SymbolAttrs {
+            access: Access::Public,
+            pure: proc.pure,
+            elemental: proc.elemental,
+            ..Default::default()
+        };
         let arg_names: Vec<String> = proc.args.iter()
             .filter(|a| !a.hidden)
             .map(|a| a.name.clone())
@@ -360,8 +364,10 @@ fn load_external_module(
     for layout in &iface.types {
         type_layouts.insert(layout.clone());
         // Also add a DerivedType symbol.
-        let mut attrs = SymbolAttrs::default();
-        attrs.access = Access::Public;
+        let attrs = SymbolAttrs {
+            access: Access::Public,
+            ..Default::default()
+        };
         let _ = st.define(Symbol {
             name: layout.name.clone(),
             kind: SymbolKind::DerivedType,
@@ -535,10 +541,13 @@ fn process_contains(
         // Register the subprogram name in the current scope before descending.
         match &unit.node {
             ProgramUnit::Subroutine { name, prefix, .. } => {
-                let mut attrs = SymbolAttrs::default();
-                attrs.pure = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
-                attrs.elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
-                if attrs.elemental { attrs.pure = true; } // ELEMENTAL implies PURE
+                let elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                let pure = elemental || prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                let attrs = SymbolAttrs {
+                    pure,
+                    elemental,
+                    ..Default::default()
+                };
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
@@ -567,10 +576,13 @@ fn process_contains(
                         }
                         None
                     });
-                let mut fn_attrs = SymbolAttrs::default();
-                fn_attrs.pure = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
-                fn_attrs.elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
-                if fn_attrs.elemental { fn_attrs.pure = true; }
+                let fn_elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                let fn_pure = fn_elemental || prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                let fn_attrs = SymbolAttrs {
+                    pure: fn_pure,
+                    elemental: fn_elemental,
+                    ..Default::default()
+                };
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,

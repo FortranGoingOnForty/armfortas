@@ -4,7 +4,7 @@
 //! Used by the multi-source driver mode to determine compilation
 //! order via topological sort.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Information extracted from a single source file.
@@ -32,8 +32,8 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
         if trimmed.starts_with('!') || trimmed.is_empty() { continue; }
 
         // MODULE <name> — but not "module procedure" or "module function"
-        if trimmed.starts_with("module ") {
-            let rest = trimmed[7..].trim();
+        if let Some(rest) = trimmed.strip_prefix("module ") {
+            let rest = rest.trim();
             if rest.starts_with("procedure") || rest.starts_with("function")
                 || rest.starts_with("subroutine")
             {
@@ -50,15 +50,17 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
 
         // USE <name> [, ...]
         if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
-            let mut rest = if trimmed.starts_with("use,") {
+            let mut rest = if let Some(after_comma) = trimmed.strip_prefix("use,") {
                 // USE, intrinsic :: name
                 if let Some(idx) = trimmed.find("::") {
                     trimmed[idx + 2..].trim()
                 } else {
-                    &trimmed[4..]
+                    after_comma
                 }
+            } else if let Some(after_use) = trimmed.strip_prefix("use ") {
+                after_use.trim()
             } else {
-                trimmed[4..].trim()
+                unreachable!()
             };
             // Strip leading :: (USE :: module_name syntax).
             if rest.starts_with("::") {
@@ -125,8 +127,8 @@ pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, Strin
 
     // Kahn's algorithm for topological sort.
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate().take(n) {
+        if deg == 0 {
             queue.push_back(i);
         }
     }

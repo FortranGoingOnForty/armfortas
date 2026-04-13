@@ -809,7 +809,7 @@ fn install_equivalence_locals(
 /// reconstruct a `LocalInfo` for it inside each function that
 /// USE-imports the module.
 #[derive(Clone)]
-pub(crate) struct ModuleGlobalInfo {
+pub struct ModuleGlobalInfo {
     pub symbol: String,
     pub ty: IrType,
     pub dims: Vec<(i64, i64)>,
@@ -4001,9 +4001,7 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         // ---- IEEE arithmetic intrinsics ----
         "ieee_is_nan" => {
             // IEEE_IS_NAN(x) → x != x (NaN is the only value that is not equal to itself)
-            if let Some(arg) = args.first() {
-                Some(b.fcmp(CmpOp::Ne, *arg, *arg))
-            } else { None }
+            args.first().map(|arg| b.fcmp(CmpOp::Ne, *arg, *arg))
         }
         "ieee_is_finite" => {
             // IEEE_IS_FINITE(x) → (x - x) == 0.0
@@ -4223,13 +4221,10 @@ fn arg_char_kind_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDe
                 if entity.name.to_lowercase() == key {
                     match type_spec {
                         TypeSpec::Character(Some(sel)) => {
-                            match &sel.len {
-                                Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                                    if let Some(n) = eval_const_int_in_scope(e, &HashMap::new()) {
-                                        return CharKind::Fixed(n);
-                                    }
+                            if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
+                                if let Some(n) = eval_const_int_in_scope(e, &HashMap::new()) {
+                                    return CharKind::Fixed(n);
                                 }
-                                _ => {}
                             }
                         }
                         TypeSpec::Character(None) => return CharKind::Fixed(1),
@@ -5713,7 +5708,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             if !decls.is_empty() {
                 // Remove shadowed keys so alloc_decls creates fresh allocas.
                 for k in &block_keys { ctx.locals.remove(k); }
-                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new(), ctx.st);
+                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), "", ctx.st);
                 init_decls(b, &ctx.locals, decls, ctx.st);
             }
             lower_stmts(b, ctx, body);
@@ -6047,8 +6042,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         _ => b.int_extend(v, IntWidth::I64, true),
                                     }
                                 } else {
-                                    let total = array_total_elems_value(b, &arr_info);
-                                    total
+                                    
+                                    array_total_elems_value(b, &arr_info)
                                 };
                                 // Build a descriptor in the pointer's slot.
                                 let desc = tgt_info.addr;

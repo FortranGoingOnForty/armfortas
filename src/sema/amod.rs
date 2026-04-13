@@ -190,7 +190,7 @@ fn emit_procedure(
     st: &SymbolTable,
     mod_scope_id: ScopeId,
     ir_module: &IrModule,
-    char_len_star_params: &HashMap<String, Vec<bool>>,
+    _char_len_star_params: &HashMap<String, Vec<bool>>,
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
     let kind_str = if is_func { "function" } else { "subroutine" };
@@ -555,7 +555,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             types.push(layout);
         } else if trimmed.starts_with("@interface ") {
             // Skip interface blocks for now — consume until @end interface.
-            while let Some(iline) = lines.next() {
+            for iline in lines.by_ref() {
                 if iline.trim().starts_with("@end interface") { break; }
             }
         }
@@ -687,7 +687,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let mut args = Vec::new();
 
     // Parse body lines until @end.
-    while let Some(line) = lines.next() {
+    for line in lines.by_ref() {
         let trimmed = line.trim();
         if trimmed.starts_with("@end ") { break; }
         if trimmed.starts_with("@arg ") {
@@ -748,7 +748,7 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let mut final_procs = Vec::new();
     let mut type_tag = 0u64;
 
-    while let Some(line) = lines.next() {
+    for line in lines.by_ref() {
         let trimmed = line.trim();
         if trimmed.starts_with("@end type") { break; }
 
