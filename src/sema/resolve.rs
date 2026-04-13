@@ -210,6 +210,13 @@ fn process_uses(
                 load_external_module(st, module, module_search_paths, type_layouts)
             });
             if let Some(mod_scope) = mod_scope {
+                // Reject self-USE: a module cannot USE itself.
+                if mod_scope == st.current_scope() {
+                    return Err(SemaError {
+                        msg: format!("module '{}' cannot USE itself", module),
+                        span: use_decl.span,
+                    });
+                }
                 if let Some(only_items) = only {
                     // USE ... ONLY: import specific names.
                     for item in only_items {
