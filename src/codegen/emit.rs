@@ -200,12 +200,14 @@ pub fn emit_function(mf: &MachineFunction) -> String {
                 ConstPoolEntry::F32(v) => {
                     writeln!(out, ".p2align 2").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    writeln!(out, "    .single {}", v).unwrap();
+                    // Emit as hex integer to avoid decimal expansion issues
+                    // with large/small floats that the assembler can't parse.
+                    writeln!(out, "    .long 0x{:08x}", v.to_bits()).unwrap();
                 }
                 ConstPoolEntry::F64(v) => {
                     writeln!(out, ".p2align 3").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    writeln!(out, "    .double {}", v).unwrap();
+                    writeln!(out, "    .quad 0x{:016x}", v.to_bits()).unwrap();
                 }
                 ConstPoolEntry::I64(v) => {
                     writeln!(out, ".p2align 3").unwrap();
