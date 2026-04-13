@@ -3384,6 +3384,16 @@ fn lower_char_intrinsic(
                 vec![buf, src_ptr, len_val], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             Some(buf)
         }
+        "compiler_version" => {
+            let version = b"armfortas 0.1.0";
+            Some(b.const_string(version))
+        }
+        "compiler_options" => {
+            // Return a placeholder — the actual options string would
+            // need to be threaded from the driver. Empty for now.
+            let opts = b"";
+            Some(b.const_string(opts))
+        }
         _ => None,
     }
 }
@@ -4406,6 +4416,18 @@ fn lower_string_expr(
                             let one = b.const_i64(1);
                             return (buf, one);
                         }
+                    }
+                    "compiler_version" => {
+                        let s = b"armfortas 0.1.0";
+                        let ptr = b.const_string(s);
+                        let len = b.const_i64(s.len() as i64);
+                        return (ptr, len);
+                    }
+                    "compiler_options" => {
+                        let s = b"";
+                        let ptr = b.const_string(s);
+                        let len = b.const_i64(s.len() as i64);
+                        return (ptr, len);
                     }
                     _ => {}
                 }
@@ -6967,7 +6989,8 @@ fn lower_write_items_adv(
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
-                        "trim" | "adjustl" | "adjustr" | "char")
+                        "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None
                                 && (i.dims.is_empty()
@@ -7156,7 +7179,8 @@ fn lower_internal_write_items(
                 if let Expr::Name { name } = &callee.node {
                     let key = name.to_lowercase();
                     matches!(key.as_str(),
-                        "trim" | "adjustl" | "adjustr" | "char")
+                        "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
                         || ctx.locals.get(&key)
                             .map(|i| i.char_kind != CharKind::None
                                 && (i.dims.is_empty()
@@ -7675,7 +7699,8 @@ fn lower_fmt_push(
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
                 matches!(name.to_lowercase().as_str(),
-                    "trim" | "adjustl" | "adjustr" | "char")
+                    "trim" | "adjustl" | "adjustr" | "char"
+                        | "compiler_version" | "compiler_options")
             } else { false }
         }
         _ => false,
