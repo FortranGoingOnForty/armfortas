@@ -1262,15 +1262,17 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         InstKind::And(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::AndReg, *a, *b),
         InstKind::Or(a, b) => emit_binop(mf, ctx, mb, inst, ArmOpcode::OrrReg, *a, *b),
         InstKind::Not(a) => {
-            // NOT = ORN dest, XZR, src  (MVN alias)
+            // NOT = ORN dest, ZR, src  (MVN alias)
+            // Must match register width: wzr for 32-bit, xzr for 64-bit.
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
             let va = ctx.lookup_vreg(*a);
+            let zr = if class == RegClass::Gp32 { PhysReg::Wzr } else { PhysReg::Xzr };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::OrnReg,
                 operands: vec![
                     MachineOperand::VReg(dest),
-                    MachineOperand::PhysReg(PhysReg::Xzr),
+                    MachineOperand::PhysReg(zr),
                     MachineOperand::VReg(va),
                 ],
                 def: Some(dest),
