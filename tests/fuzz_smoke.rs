@@ -75,6 +75,9 @@ fn fuzz_parser_with_fortran_fragments(count: usize) {
         "use iso_c_binding, only: c_int\n",
         "", "!\n", "! comment\n",
         "end\n",
+        "do concurrent (i = 1:10)\nend do\n",
+        "block\n  integer :: local\nend block\n",
+        "associate (a => 1)\nend associate\n",
     ];
 
     let mut state: u64 = 0xDEADBEEF;

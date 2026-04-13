@@ -97,8 +97,9 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     }
 
     // ---- Character and logical kinds ----
-    insert_param(st, m, "c_char", TypeInfo::Character { len: Some(1), kind: Some(1) });
-    insert_param(st, m, "c_bool", TypeInfo::Logical { kind: Some(1) });
+    // c_char is an integer kind parameter (value = 1), not a character type.
+    insert_param_val(st, m, "c_char", ik(4), Some(1));
+    insert_param_val(st, m, "c_bool", TypeInfo::Integer { kind: Some(4) }, Some(1));
 
     // ---- Character constants (c_null_char, etc.) ----
     // Each constant's value is its ASCII byte code.
@@ -156,7 +157,17 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "character_kinds", ik4.clone(), Some(1));
     insert_param_val(st, m, "integer_kinds", ik4.clone(), Some(4));
     insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));
-    insert_param_val(st, m, "real_kinds", ik4, Some(4));
+    insert_param_val(st, m, "real_kinds", ik4.clone(), Some(4));
+
+    // Storage size constants (F2008).
+    insert_param_val(st, m, "file_storage_size", ik4.clone(), Some(8));
+    insert_param_val(st, m, "numeric_storage_size", ik4.clone(), Some(32));
+    // Coarray stat constants (F2008/F2018).
+    insert_param_val(st, m, "stat_stopped_image", ik4.clone(), Some(-3));
+    insert_param_val(st, m, "stat_failed_image", ik4.clone(), Some(-4));
+    insert_param_val(st, m, "stat_locked", ik4.clone(), Some(-5));
+    insert_param_val(st, m, "stat_locked_other_image", ik4.clone(), Some(-6));
+    insert_param_val(st, m, "stat_unlocked", ik4, Some(-7));
 
     // Inquiry functions — lowered to string constants by the compiler.
     insert_proc(st, m, "compiler_version");

@@ -47,7 +47,7 @@ pub fn write_amod(
     writeln!(out, "#!amod 2").unwrap();
     writeln!(out, "# module: {}", mod_key).unwrap();
     writeln!(out, "# source: {}", source_path).unwrap();
-    writeln!(out, "# checksum: sha256:{}", sha256_hex(source_content)).unwrap();
+    writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
     writeln!(out, "# abi: arm64-apple-darwin").unwrap();
@@ -414,11 +414,8 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
     }
 }
 
-fn sha256_hex(content: &str) -> String {
-    // Simple SHA-256 — use a runtime implementation or a basic
-    // hash for now.  For MVP we emit a placeholder; the real
-    // implementation will use the system's crypto library.
-    // TODO: wire up actual SHA-256.
+fn fnv1a_hex(content: &str) -> String {
+    // FNV-1a 64-bit hash for source content fingerprinting.
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in content.bytes() {
         hash ^= byte as u64;
