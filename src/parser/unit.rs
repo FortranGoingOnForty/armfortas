@@ -387,6 +387,76 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // PROCEDURE(interface_name) [, attrs] :: name [=> null()]
+            // Procedure pointer / procedure component declarations.
+            if text == "procedure" {
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len()
+                    && self.tokens[next_pos].kind == TokenKind::LParen
+                {
+                    let start = self.current_span();
+                    self.advance(); // consume 'procedure'
+                    self.advance(); // consume '('
+                    let iface_name = if self.peek() == &TokenKind::Identifier {
+                        self.advance().clone().text
+                    } else { String::new() };
+                    self.expect(&TokenKind::RParen)?;
+
+                    // Parse attributes: , pointer, nopass, pass, deferred, etc.
+                    let mut attrs = Vec::new();
+                    while self.eat(&TokenKind::Comma) {
+                        let attr_text = self.peek_text().to_lowercase();
+                        match attr_text.as_str() {
+                            "pointer" => { self.advance(); attrs.push(crate::ast::decl::Attribute::Pointer); }
+                            "nopass" | "pass" | "deferred" | "non_overridable" => { self.advance(); /* skip type-bound attrs for now */ }
+                            _ => { self.advance(); } // skip unknown attrs for now
+                        }
+                    }
+
+                    // :: separator
+                    if self.peek() == &TokenKind::ColonColon { self.advance(); }
+
+                    // Entity name
+                    let entity_name = if self.peek() == &TokenKind::Identifier {
+                        self.advance().clone().text
+                    } else { String::new() };
+
+                    // Optional => null() initializer
+                    if self.eat(&TokenKind::Arrow) {
+                        // Consume null() or whatever follows
+                        if self.peek_text().eq_ignore_ascii_case("null") {
+                            self.advance();
+                            if self.peek() == &TokenKind::LParen {
+                                self.advance();
+                                let _ = self.expect(&TokenKind::RParen);
+                            }
+                        }
+                    }
+
+                    // For now, emit as a variable declaration with Pointer attribute.
+                    // The interface name is stored but the full procedure pointer
+                    // semantics (calling through pointer) are deferred.
+                    let span = span_from_to(start, self.prev_span());
+                    let mut all_attrs = attrs;
+                    all_attrs.push(crate::ast::decl::Attribute::External);
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::TypeDecl {
+                            type_spec: crate::ast::decl::TypeSpec::Type(iface_name),
+                            attrs: all_attrs,
+                            entities: vec![crate::ast::decl::EntityDecl {
+                                name: entity_name,
+                                array_spec: None,
+                                init: None,
+                                char_len: None,
+                                ptr_init: None,
+                            }],
+                        },
+                        span,
+                    ));
+                    continue;
+                }
+            }
+
             // Try as type declaration.
             if let Some(ts_result) = self.try_parse_type_spec() {
                 let ts = ts_result?;
