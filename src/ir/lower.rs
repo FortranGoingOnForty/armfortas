@@ -218,7 +218,7 @@ pub fn lower_file(
     // Pass 1: collect module-level variables.
     for unit in units {
         if let ProgramUnit::Module { name, decls, .. } = &unit.node {
-            collect_module_globals(&mut module, &mut globals, name, decls);
+            collect_module_globals(&mut module, &mut globals, name, decls, st);
         }
     }
 
@@ -608,7 +608,7 @@ fn collect_and_emit_common_globals(
                     let symbol = common_slot_symbol(&block_name, slot_idx);
                     if emitted.contains(&symbol) { continue; }
                     emitted.insert(symbol.clone());
-                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls);
+                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls, None);
                     module.add_global(Global {
                         name: symbol,
                         ty: elem_ty,
@@ -653,7 +653,7 @@ fn install_common_locals(
                 let key = var.to_lowercase();
                 if locals.contains_key(&key) { continue; }
                 let symbol = common_slot_symbol(&block_name, slot_idx);
-                let elem_ty = arg_type_from_decls(&key, decls);
+                let elem_ty = arg_type_from_decls(&key, decls, None);
                 let addr = b.global_addr(&symbol, elem_ty.clone());
                 locals.insert(key, LocalInfo {
                     addr,
@@ -712,13 +712,13 @@ fn install_equivalence_locals(
                     match &expr.node {
                         Expr::Name { name } => {
                             let key = name.to_lowercase();
-                            let ty = arg_type_from_decls(&key, decls);
+                            let ty = arg_type_from_decls(&key, decls, None);
                             members.push((key, ty, 0));
                         }
                         Expr::FunctionCall { callee, args } => {
                             if let Expr::Name { name } = &callee.node {
                                 let key = name.to_lowercase();
-                                let ty = arg_type_from_decls(&key, decls);
+                                let ty = arg_type_from_decls(&key, decls, None);
                                 let idx = if let Some(sub) = args.first() {
                                     if let SectionSubscript::Element(e) = &sub.value {
                                         eval_const_int(e).unwrap_or(1)
@@ -802,6 +802,7 @@ fn collect_module_globals(
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
@@ -809,7 +810,7 @@ fn collect_module_globals(
     let param_consts = collect_decl_param_consts(decls);
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
-            let ir_ty = lower_type_spec(type_spec);
+            let ir_ty = lower_type_spec_st(type_spec, Some(st));
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
@@ -1147,7 +1148,7 @@ fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &fname, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -1204,7 +1205,7 @@ fn lower_unit(
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let mut params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                 if let DummyArg::Name(n) = arg {
-                    let elem_ty = arg_type_from_decls(n, decls);
+                    let elem_ty = arg_type_from_decls(n, decls, Some(st));
                     let fortran_noalias = arg_is_fortran_noalias(n, decls);
                     let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                     if arg_has_value_attr(n, decls) {
@@ -1267,7 +1268,7 @@ fn lower_unit(
                 .filter(|p| !p.name.starts_with("__len_")) // skip hidden params
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })
@@ -1315,7 +1316,7 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -1391,7 +1392,7 @@ fn lower_unit(
                 // Real args shifted by 1 so _sret is param 0.
                 let real: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
-                        let elem_ty = arg_type_from_decls(n, decls);
+                        let elem_ty = arg_type_from_decls(n, decls, Some(st));
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
@@ -1420,14 +1421,14 @@ fn lower_unit(
                 (params, IrType::Void)
             } else {
                 let ret_ty = return_type.as_ref()
-                    .map(lower_type_spec)
+                    .map(|ts| lower_type_spec_st(ts, Some(st)))
                     .unwrap_or_else(|| {
                         let result_name = result.as_deref().unwrap_or(name.as_str());
-                        arg_type_from_decls(result_name, decls)
+                        arg_type_from_decls(result_name, decls, Some(st))
                     });
                 let params: Vec<Param> = args.iter().enumerate().filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
-                        let elem_ty = arg_type_from_decls(n, decls);
+                        let elem_ty = arg_type_from_decls(n, decls, Some(st));
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         if arg_has_value_attr(n, decls) {
@@ -1471,7 +1472,7 @@ fn lower_unit(
                 .filter(|p| p.name != "_sret")
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls);
+                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })
@@ -1508,7 +1509,7 @@ fn lower_unit(
                     // The sret param (ValueId 0) IS the descriptor address.
                     // Pre-insert the result variable as an allocatable backed by that
                     // descriptor so alloc_decls skips it (locals.contains_key → continue).
-                    let elem_ty = arg_type_from_decls(&result_name, decls);
+                    let elem_ty = arg_type_from_decls(&result_name, decls, Some(st));
                     ctx.locals.insert(result_name.clone(), LocalInfo {
                         addr: ValueId(0),
                         ty: elem_ty,
@@ -1530,7 +1531,7 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
-                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name);
+                alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -2465,6 +2466,7 @@ fn alloc_decls(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     pending_globals: &mut Vec<PendingGlobal>,
     func_name: &str,
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Attribute;
 
@@ -2495,7 +2497,7 @@ fn alloc_decls(
 
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
-            let elem_ty = lower_type_spec(type_spec);
+            let elem_ty = lower_type_spec_st(type_spec, Some(st));
 
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
@@ -4188,13 +4190,13 @@ fn arg_char_kind_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDe
     CharKind::None
 }
 
-fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> IrType {
+fn arg_type_from_decls(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl], st: Option<&SymbolTable>) -> IrType {
     let key = arg_name.to_lowercase();
     for decl in decls {
         if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    return lower_type_spec(type_spec);
+                    return lower_type_spec_st(type_spec, st);
                 }
             }
         }
@@ -4695,14 +4697,37 @@ fn ensure_termination(b: &mut FuncBuilder, result_addr: Option<ValueId>) {
 }
 
 /// Extract the kind value from a KindSelector, defaulting if absent.
+/// Resolves named constants (e.g., c_double, real64) via the symbol table.
 fn extract_kind(sel: &Option<crate::ast::decl::KindSelector>, default: u8) -> u8 {
+    extract_kind_with_st(sel, default, None)
+}
+
+fn extract_kind_with_st(
+    sel: &Option<crate::ast::decl::KindSelector>,
+    default: u8,
+    st: Option<&SymbolTable>,
+) -> u8 {
     use crate::ast::decl::KindSelector;
     use crate::ast::expr::Expr;
     match sel {
         Some(KindSelector::Expr(e)) | Some(KindSelector::Star(e)) => {
-            if let Expr::IntegerLiteral { text, .. } = &e.node {
-                text.parse().unwrap_or(default)
-            } else { default }
+            match &e.node {
+                Expr::IntegerLiteral { text, .. } => text.parse().unwrap_or(default),
+                Expr::Name { name } => {
+                    if let Some(st) = st {
+                        let key = name.to_lowercase();
+                        // Search all scopes for the named constant — the
+                        // current scope may not be set correctly during lowering
+                        // (sema has already popped all scopes by this point).
+                        st.find_symbol_any_scope(&key)
+                            .and_then(|sym| sym.const_value.map(|v| v as u8))
+                            .unwrap_or(default)
+                    } else {
+                        default
+                    }
+                }
+                _ => default,
+            }
         }
         None => default,
     }
@@ -4710,12 +4735,16 @@ fn extract_kind(sel: &Option<crate::ast::decl::KindSelector>, default: u8) -> u8
 
 /// Lower a Fortran type specifier to an IR type.
 fn lower_type_spec(ts: &TypeSpec) -> IrType {
+    lower_type_spec_st(ts, None)
+}
+
+fn lower_type_spec_st(ts: &TypeSpec, st: Option<&SymbolTable>) -> IrType {
     match ts {
-        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind(sel, 4)),
-        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind(sel, 4)),
+        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind_with_st(sel, 4, st)),
+        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind_with_st(sel, 4, st)),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
         TypeSpec::Complex(sel) => {
-            let fw = match extract_kind(sel, 4) {
+            let fw = match extract_kind_with_st(sel, 4, st) {
                 8 => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
@@ -5613,7 +5642,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             if !decls.is_empty() {
                 // Remove shadowed keys so alloc_decls creates fresh allocas.
                 for k in &block_keys { ctx.locals.remove(k); }
-                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new());
+                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), &String::new(), ctx.st);
                 init_decls(b, &ctx.locals, decls, ctx.st);
             }
             lower_stmts(b, ctx, body);

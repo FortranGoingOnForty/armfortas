@@ -156,6 +156,20 @@ impl SymbolTable {
         None
     }
 
+    /// Search ALL scopes for a parameter symbol by name.
+    /// Used during lowering when the current scope may not be set correctly.
+    pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
+        let key = name.to_lowercase();
+        for scope in &self.scopes {
+            if let Some(sym) = scope.symbols.get(&key) {
+                if sym.attrs.parameter {
+                    return Some(sym);
+                }
+            }
+        }
+        None
+    }
+
     /// Check if a name would be implicitly typed in the current scope.
     /// Returns the implicit type if applicable, or None if implicit none.
     pub fn implicit_type(&self, name: &str) -> Option<ImplicitType> {

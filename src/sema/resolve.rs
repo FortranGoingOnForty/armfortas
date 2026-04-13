@@ -137,7 +137,7 @@ fn resolve_unit(
             st.define(Symbol {
                 name: result_name.into(),
                 kind: SymbolKind::Variable,
-                type_info: return_type.as_ref().map(type_spec_to_info),
+                type_info: return_type.as_ref().map(|ts| type_spec_to_info(ts, st)),
                 attrs: SymbolAttrs::default(),
                 defined_at: unit.span,
                 scope: st.current_scope(),
@@ -455,7 +455,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 }
             }
             Decl::TypeDecl { type_spec, attrs, entities } => {
-                let type_info = type_spec_to_info(type_spec);
+                let type_info = type_spec_to_info(type_spec, st);
                 let sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));
 
                 for entity in entities {
@@ -534,7 +534,7 @@ fn process_contains(
                 });
             }
             ProgramUnit::Function { name, return_type, result, decls, prefix, .. } => {
-                let ret_type_info = return_type.as_ref().map(type_spec_to_info)
+                let ret_type_info = return_type.as_ref().map(|ts| type_spec_to_info(ts, st))
                     .or_else(|| {
                         // Infer return type from result variable's declaration.
                         let result_name = result.as_deref().unwrap_or(name.as_str());
@@ -543,7 +543,7 @@ fn process_contains(
                             if let decl::Decl::TypeDecl { type_spec, entities, .. } = &d.node {
                                 for e in entities {
                                     if e.name.to_lowercase() == key {
-                                        return Some(type_spec_to_info(type_spec));
+                                        return Some(type_spec_to_info(type_spec, st));
                                     }
                                 }
                             }
@@ -617,13 +617,21 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
     }
 }
 
-fn extract_kind(sel: &Option<decl::KindSelector>) -> Option<u8> {
+fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8> {
     use crate::ast::expr::Expr;
     match sel {
         Some(decl::KindSelector::Expr(e)) | Some(decl::KindSelector::Star(e)) => {
-            if let Expr::IntegerLiteral { text, .. } = &e.node {
-                text.parse().ok()
-            } else { None }
+            match &e.node {
+                Expr::IntegerLiteral { text, .. } => text.parse().ok(),
+                Expr::Name { name } => {
+                    // Resolve named constant (e.g., c_double, real64, int64).
+                    let key = name.to_lowercase();
+                    st.lookup(&key).and_then(|sym| {
+                        sym.const_value.map(|v| v as u8)
+                    })
+                }
+                _ => None,
+            }
         }
         None => None,
     }
@@ -649,14 +657,14 @@ fn extract_char_len(sel: &Option<decl::CharSelector>) -> Option<i64> {
     }
 }
 
-fn type_spec_to_info(ts: &TypeSpec) -> TypeInfo {
+fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
     match ts {
-        TypeSpec::Integer(sel) => TypeInfo::Integer { kind: extract_kind(sel) },
-        TypeSpec::Real(sel) => TypeInfo::Real { kind: extract_kind(sel) },
+        TypeSpec::Integer(sel) => TypeInfo::Integer { kind: extract_kind(sel, st) },
+        TypeSpec::Real(sel) => TypeInfo::Real { kind: extract_kind(sel, st) },
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
-        TypeSpec::Complex(sel) => TypeInfo::Complex { kind: extract_kind(sel) },
+        TypeSpec::Complex(sel) => TypeInfo::Complex { kind: extract_kind(sel, st) },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
-        TypeSpec::Logical(sel) => TypeInfo::Logical { kind: extract_kind(sel) },
+        TypeSpec::Logical(sel) => TypeInfo::Logical { kind: extract_kind(sel, st) },
         TypeSpec::Character(sel) => TypeInfo::Character { len: extract_char_len(sel), kind: None },
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
