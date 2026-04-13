@@ -1,6 +1,6 @@
 ! Derived type with character field: assignment and printing.
 ! CHECK: 30
-! CHECK: Alice
+! CHECK: Fortran
 program t
   implicit none
   type :: person
@@ -9,7 +9,7 @@ program t
   end type
   type(person) :: p
   p%age = 30
-  p%name = "Alice"
+  p%name = "Fortran"
   print *, p%age
   print *, p%name
 end program
