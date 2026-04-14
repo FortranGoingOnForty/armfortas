@@ -369,7 +369,19 @@ fn walk_contained_host_refs(
     unit: &ProgramUnit,
     out: &mut HashMap<String, Vec<String>>,
 ) {
-    let (host_decls, contains): (&[crate::ast::decl::SpannedDecl], &[SpannedUnit]) = match unit {
+    // Nested CONTAINS: a contained proc may reference not just its
+    // immediate host's locals but also its host's host's locals and
+    // so on. Thread an accumulated ancestor-decls chain so every
+    // nested contained subprogram can find every name it depends on.
+    walk_contained_host_refs_inner(unit, &[], out);
+}
+
+fn walk_contained_host_refs_inner<'a>(
+    unit: &'a ProgramUnit,
+    ancestor_decls: &[&'a [crate::ast::decl::SpannedDecl]],
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    let (my_decls, contains): (&[crate::ast::decl::SpannedDecl], &[SpannedUnit]) = match unit {
         ProgramUnit::Program { decls, contains, .. } => (decls, contains),
         ProgramUnit::Subroutine { decls, contains, .. } => (decls, contains),
         ProgramUnit::Function { decls, contains, .. } => (decls, contains),
@@ -378,22 +390,67 @@ fn walk_contained_host_refs(
             // host association closures). Recurse into each so any
             // nested contains still gets analyzed against its own host.
             for sub in contains {
-                walk_contained_host_refs(&sub.node, out);
+                walk_contained_host_refs_inner(&sub.node, ancestor_decls, out);
             }
             return;
         }
         _ => return,
     };
+    // Extend the ancestor chain with THIS unit's decls before
+    // recursing into any nested contains.
+    let mut next_ancestors: Vec<&[crate::ast::decl::SpannedDecl]> = ancestor_decls.to_vec();
+    next_ancestors.push(my_decls);
+
+    // First pass: recurse so every nested sub's own refs are in
+    // `out`. We then fold each proc's contained procs' refs into
+    // its own list, because transitive forwarding requires the
+    // intermediate level to carry the outer-scope vars as hidden
+    // params even when it doesn't reference them directly.
     for sub in contains {
-        if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } = &sub.node {
+        walk_contained_host_refs_inner(&sub.node, &next_ancestors, out);
+    }
+    for sub in contains {
+        if let ProgramUnit::Subroutine { name, contains: sub_contains, .. }
+        | ProgramUnit::Function { name, contains: sub_contains, .. } = &sub.node {
             let mut refs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-            collect_host_references(&sub.node, host_decls, &mut refs_set);
+            // Direct references in this sub's body, against each
+            // layer of the ancestor chain (so host-of-host names
+            // get collected).
+            for anc in &next_ancestors {
+                collect_host_references(&sub.node, anc, &mut refs_set);
+            }
+            // Transitive: every name that a nested contained proc
+            // needs from an ANCESTOR scope must also be forwarded
+            // through this sub. We filter the nested proc's refs
+            // to the union of the ancestor names so we don't accidentally
+            // pull in sub-local names — those resolve against this
+            // sub's own decls when the nested proc is lowered.
+            let mut ancestor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for anc in &next_ancestors {
+                for decl in *anc {
+                    if let Decl::TypeDecl { entities, .. } = &decl.node {
+                        for e in entities {
+                            ancestor_names.insert(e.name.to_lowercase());
+                        }
+                    }
+                }
+            }
+            for nested in sub_contains {
+                if let ProgramUnit::Subroutine { name: nested_name, .. }
+                | ProgramUnit::Function { name: nested_name, .. } = &nested.node {
+                    if let Some(nested_refs) = out.get(&nested_name.to_lowercase()) {
+                        for r in nested_refs {
+                            if ancestor_names.contains(r) {
+                                refs_set.insert(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
             let mut refs: Vec<String> = refs_set.into_iter().collect();
-            // Deterministic order across runs — sorted lowercase.
             refs.sort();
             out.insert(name.to_lowercase(), refs);
         }
-        walk_contained_host_refs(&sub.node, out);
     }
 }
 
@@ -1630,10 +1687,13 @@ fn lower_unit(
                 module.add_global(pg.global);
             }
 
-            // Lower CONTAINS subprograms. They receive `decls` as their
-            // host_decls so the closure-passing ABI can resolve each
-            // host-referenced variable's type/dims from the host's
-            // declarations.
+            // Lower CONTAINS subprograms. Their host_decls chain is
+            // this unit's decls PLUS whatever we inherited from our
+            // own host (via `host_decls`). That way a nested contained
+            // proc can resolve names from any ancestor scope when
+            // build_host_ref_params looks up types.
+            let mut child_host_decls: Vec<crate::ast::decl::SpannedDecl> = decls.to_vec();
+            child_host_decls.extend(host_decls.iter().cloned());
             for sub in contains {
                 lower_unit(
                     module,
@@ -1643,7 +1703,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
-                    decls,
+                    &child_host_decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -1838,8 +1898,12 @@ fn lower_unit(
             // Lower nested CONTAINS subprograms (this was a latent
             // bug — the previous code only walked Program::contains).
             // Each nested sub inherits this subroutine's combined
-            // host_uses + own uses, and uses our `decls` as host_decls
-            // so the closure-passing ABI can resolve host-ref metadata.
+            // host_uses + own uses, and its host_decls chain is our
+            // `decls` followed by whatever host_decls we inherited —
+            // so a two-level-nested contained proc can look up host
+            // variables that live two scopes above it.
+            let mut child_host_decls: Vec<crate::ast::decl::SpannedDecl> = decls.to_vec();
+            child_host_decls.extend(host_decls.iter().cloned());
             for sub in contains {
                 lower_unit(
                     module,
@@ -1849,7 +1913,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
-                    decls,
+                    &child_host_decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -2115,8 +2179,10 @@ fn lower_unit(
                 module.add_global(pg.global);
             }
 
-            // Lower nested CONTAINS subprograms. `decls` becomes the
-            // host_decls for closure-passing host association.
+            // Lower nested CONTAINS subprograms with the accumulated
+            // host_decls chain (our decls + inherited).
+            let mut child_host_decls: Vec<crate::ast::decl::SpannedDecl> = decls.to_vec();
+            child_host_decls.extend(host_decls.iter().cloned());
             for sub in contains {
                 lower_unit(
                     module,
@@ -2126,7 +2192,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
-                    decls,
+                    &child_host_decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,

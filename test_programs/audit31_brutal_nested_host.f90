@@ -1,11 +1,11 @@
-! XFAIL: nested CONTAINS host write not propagated — Task #485
+! audit31 Finding 4: `inner` inside `outer` inside `program` used
+! to lose `host_var` writes because the closure-passing walker
+! only collected refs against the IMMEDIATE host. Pass the full
+! ancestor decl chain into walk_contained_host_refs, and fold
+! each proc's nested-contained refs into its own so intermediate
+! levels carry the outer-scope vars as hidden params for
+! forwarding. Task #485.
 ! CHECK: 20
-! audit31: host association breaks in nested CONTAINS.
-! 'outer' correctly sees host_var (10) from program scope.
-! 'inner' inside 'outer' reads host_var but its writes don't propagate
-! back to the program scope.
-! Expected final: 20
-! Actual final:   10
 program audit31_nested_host
   implicit none
   integer :: host_var = 10
