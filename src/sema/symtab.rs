@@ -192,7 +192,27 @@ impl SymbolTable {
                 }
             }
         }
-        fallback
+        if fallback.is_some() {
+            return fallback;
+        }
+        // Second pass: resolve USE renames. `use m, only: a => add`
+        // installs a UseAssociation with local_name="a" and
+        // original_name="add" but no symbol named "a" on the
+        // enclosing scope. Direct-symbol scans miss the rename; walk
+        // every scope's UseAssociations and follow the source to pick
+        // up the underlying symbol (NamedInterface for generic
+        // dispatch, Function for ordinary calls, etc.).
+        for scope in &self.scopes {
+            for assoc in &scope.use_associations {
+                if assoc.local_name.to_lowercase() == key {
+                    let orig_key = assoc.original_name.to_lowercase();
+                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&orig_key) {
+                        return Some(sym);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Check if a name would be implicitly typed in the current scope.
