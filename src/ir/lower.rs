@@ -3508,6 +3508,22 @@ fn init_decls(
                     if info.inline_const.is_some() {
                         continue;
                     }
+                    // Complex scalar init: ComplexLiteral lowers to an
+                    // address of a [f32/f64 x 2] buffer. Copying a
+                    // pointer into the slot (whose pointee is the
+                    // 2-element array) would fail IR verification — do
+                    // a byte memcpy of the inline buffer instead.
+                    if is_complex_ty(&info.ty) && !info.is_pointer {
+                        let src = lower_expr(b, locals, init_expr, st);
+                        let bytes = complex_byte_size(&info.ty);
+                        let sz = b.const_i64(bytes);
+                        b.call(
+                            FuncRef::External("memcpy".into()),
+                            vec![info.addr, src, sz],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        continue;
+                    }
                     let val = lower_expr(b, locals, init_expr, st);
                     let coerced = coerce_to_type(b, val, &info.ty);
                     b.store(coerced, info.addr);
@@ -11634,6 +11650,13 @@ fn lower_expr_full(
                 if !info.dims.is_empty() {
                     // Array name without subscripts — return the base address.
                     info.addr
+                } else if info.is_pointer && is_complex_ty(&info.ty) {
+                    // Complex POINTER: slot holds ptr<[f32/f64 x 2]>.
+                    // Consumers of complex values want the *address* of
+                    // the 2-element buffer (same ABI as an ordinary
+                    // complex variable), so load once to get the
+                    // associated buffer and return that.
+                    b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())))
                 } else if info.is_pointer && info.derived_type.is_none() {
                     // Scalar Fortran POINTER: `info.addr` is an alloca
                     // ptr<T>.  Reading the pointer as a value

@@ -1094,7 +1094,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "cos" | "sin" | "tan" | "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
         "int" | "nint" | "real" | "dble" | "cmplx" | "conjg" |
-        "aimag" | "char" | "ichar" | "achar" | "iachar" |
+        "aimag" | "dimag" | "char" | "ichar" | "achar" | "iachar" |
         "len" | "len_trim" | "trim" | "adjustl" | "adjustr" |
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
         "kind" | "selected_int_kind" | "selected_real_kind" |
