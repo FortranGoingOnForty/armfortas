@@ -416,26 +416,41 @@ impl<'a> Parser<'a> {
                     // :: separator
                     if self.peek() == &TokenKind::ColonColon { self.advance(); }
 
-                    // Entity name
-                    let entity_name = if self.peek() == &TokenKind::Identifier {
-                        self.advance().clone().text
-                    } else { String::new() };
+                    // Comma-separated entity list. Each entity may
+                    // carry its own optional `=> null()` initializer.
+                    // Previously the parser stopped after the first
+                    // name, dropping `g` in `procedure(...) :: f, g`
+                    // and tripping the next-token check on the comma.
+                    let mut entities = Vec::new();
+                    loop {
+                        let entity_name = if self.peek() == &TokenKind::Identifier {
+                            self.advance().clone().text
+                        } else { String::new() };
 
-                    // Optional => null() initializer
-                    if self.eat(&TokenKind::Arrow) {
-                        // Consume null() or whatever follows
-                        if self.peek_text().eq_ignore_ascii_case("null") {
-                            self.advance();
-                            if self.peek() == &TokenKind::LParen {
+                        if self.eat(&TokenKind::Arrow) {
+                            if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                let _ = self.expect(&TokenKind::RParen);
+                                if self.peek() == &TokenKind::LParen {
+                                    self.advance();
+                                    let _ = self.expect(&TokenKind::RParen);
+                                }
                             }
                         }
+
+                        entities.push(crate::ast::decl::EntityDecl {
+                            name: entity_name,
+                            array_spec: None,
+                            init: None,
+                            char_len: None,
+                            ptr_init: None,
+                        });
+
+                        if !self.eat(&TokenKind::Comma) { break; }
                     }
 
-                    // For now, emit as a variable declaration with Pointer attribute.
-                    // The interface name is stored but the full procedure pointer
-                    // semantics (calling through pointer) are deferred.
+                    // Emit as a variable declaration with Pointer attribute.
+                    // The interface name is stored but the full procedure
+                    // pointer call semantics are deferred.
                     let span = span_from_to(start, self.prev_span());
                     let mut all_attrs = attrs;
                     all_attrs.push(crate::ast::decl::Attribute::External);
@@ -443,13 +458,7 @@ impl<'a> Parser<'a> {
                         crate::ast::decl::Decl::TypeDecl {
                             type_spec: crate::ast::decl::TypeSpec::Type(iface_name),
                             attrs: all_attrs,
-                            entities: vec![crate::ast::decl::EntityDecl {
-                                name: entity_name,
-                                array_spec: None,
-                                init: None,
-                                char_len: None,
-                                ptr_init: None,
-                            }],
+                            entities,
                         },
                         span,
                     ));
