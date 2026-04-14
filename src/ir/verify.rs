@@ -96,6 +96,27 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
+    // 3a. Every defined value must have an entry in the function's
+    // type cache. A miss here means rebuild_type_cache was never
+    // run after an IR-mutating pass (or the pass forgot to set
+    // inst.ty). Without the cache entry, check_type_consistency
+    // silently skips every check on that instruction — a single
+    // stale cache turns the whole verifier into a no-op. This was
+    // a latent soundness hole: wrong-width iadd, bogus pointee
+    // mismatches, and non-integer ops all sailed through. Flag it
+    // explicitly so the bug points at the actual cache bug, not
+    // the downstream codegen symptom.
+    for val in &defined {
+        if func.value_type(*val).is_none() {
+            errors.push(VerifyError {
+                msg: format!(
+                    "value %{} is defined but has no entry in the type cache (call rebuild_type_cache)",
+                    val.0,
+                ),
+            });
+        }
+    }
+
     // 4. No duplicate ValueIds.
     let mut seen_values = HashSet::new();
     for p in &func.params {
@@ -317,6 +338,19 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
         InstKind::IMod(a, b) => {
             let ta = func.value_type(*a);
             let tb = func.value_type(*b);
+            // Report missing types so the upstream cache-miss (already
+            // flagged as error #3a) doesn't let width/type-category
+            // mismatches sail through silently.
+            if ta.is_none() {
+                errors.push(VerifyError {
+                    msg: format!("integer op %{}: operand %{} has no type", inst.id.0, a.0),
+                });
+            }
+            if tb.is_none() {
+                errors.push(VerifyError {
+                    msg: format!("integer op %{}: operand %{} has no type", inst.id.0, b.0),
+                });
+            }
             if let (Some(ta), Some(tb)) = (&ta, &tb) {
                 if !ta.is_int() {
                     errors.push(VerifyError {
@@ -608,6 +642,51 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.msg.contains("width mismatch")),
             "expected width mismatch, got: {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn type_consistency_survives_stale_cache() {
+        // Width-mismatched iadd inserted directly into a block (i.e.
+        // bypassing the builder) used to slip past the type checker
+        // because the type cache hadn't been refreshed and value_type
+        // returned None for both operands. With on-demand fallback
+        // the verifier walks the instruction list and still rejects
+        // the bogus IR. Audit MAJOR: silent verifier short-circuit.
+        use crate::lexer::{Position, Span};
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 0, col: 0 },
+            end: Position { line: 0, col: 0 },
+        };
+        // %1: i32, %2: i64 — distinct widths, no cache update.
+        func.blocks[0].insts.push(Inst {
+            id: ValueId(1),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span,
+        });
+        func.blocks[0].insts.push(Inst {
+            id: ValueId(2),
+            kind: InstKind::ConstInt(2, IntWidth::I64),
+            ty: IrType::Int(IntWidth::I64),
+            span,
+        });
+        func.blocks[0].insts.push(Inst {
+            id: ValueId(3),
+            kind: InstKind::IAdd(ValueId(1), ValueId(2)),
+            ty: IrType::Int(IntWidth::I32),
+            span,
+        });
+        func.blocks[0].terminator = Some(Terminator::Return(None));
+        // Note: type_cache is the constructor-time snapshot — it
+        // does NOT contain the manually-inserted instructions.
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("width mismatch")),
+            "expected width mismatch even without cache: {:?}",
             errs,
         );
     }

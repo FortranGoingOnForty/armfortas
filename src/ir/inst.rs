@@ -325,7 +325,27 @@ impl Function {
 
     /// Get the type of a value by ID. O(1) via cache.
     pub fn value_type(&self, id: ValueId) -> Option<IrType> {
-        self.type_cache.get(&id).cloned()
+        if let Some(ty) = self.type_cache.get(&id) {
+            return Some(ty.clone());
+        }
+        // Cache miss — the authoritative source is the instruction or
+        // parameter that defines the value. An earlier version of the
+        // verifier silently skipped checks whenever the cache lagged
+        // behind optimiser passes, which hid width mismatches and
+        // pointer-type bugs for entire compilation units. Recompute
+        // on-demand so consumers always get a consistent answer.
+        for p in &self.params {
+            if p.id == id { return Some(p.ty.clone()); }
+        }
+        for block in &self.blocks {
+            for bp in &block.params {
+                if bp.id == id { return Some(bp.ty.clone()); }
+            }
+            for inst in &block.insts {
+                if inst.id == id { return Some(inst.ty.clone()); }
+            }
+        }
+        None
     }
 
     /// Find the instruction that defines a value, searching all blocks.
