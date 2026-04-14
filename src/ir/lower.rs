@@ -3724,7 +3724,28 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
         }
         // Bool ↔ Int via int_extend. Bool is i1 in our model.
         (IrType::Bool, IrType::Int(iw)) => b.int_extend(val, *iw, false),
-        (IrType::Int(_), IrType::Bool) => b.int_trunc(val, IntWidth::I8),
+        // Int → Bool: compare against zero to produce a true Bool
+        // rather than truncating to i8 (which the verifier would
+        // then reject on any .and./.or. operand). Common path:
+        // LOGICAL fields in derived types load as i8 and need to
+        // reach Bool before a logical op (audit31 Finding 13).
+        (IrType::Int(_), IrType::Bool) => {
+            let zero = match &src {
+                IrType::Int(IntWidth::I64) => b.const_i64(0),
+                IrType::Int(IntWidth::I16) => b.const_i32(0),
+                IrType::Int(IntWidth::I8) => b.const_i32(0),
+                _ => b.const_i32(0),
+            };
+            // Widen to i32 first if the source is narrower so
+            // icmp gets matching operand widths.
+            let widened = match &src {
+                IrType::Int(IntWidth::I8) | IrType::Int(IntWidth::I16) => {
+                    b.int_extend(val, IntWidth::I32, false)
+                }
+                _ => val,
+            };
+            b.icmp(CmpOp::Ne, widened, zero)
+        }
         // Ptr<Array<T, N>> → Ptr<T>: pointer to array used as pointer to element.
         // Common for character arrays (Ptr<[i8 x 20]> → Ptr<i8>).
         (IrType::Ptr(_), IrType::Ptr(_)) => {
@@ -4270,14 +4291,28 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             args.first().map(|a| b.fsqrt(*a))
         }
         // ---- Bit manipulation (inline) ----
+        // Mixed-kind bit ops (e.g. iand(c_long, c_int)) must unify
+        // widths to the wider operand before the IR-level bit_and,
+        // or the verifier rejects "operand width mismatch". F2018
+        // §16.9.104 doesn't require same kinds; gfortran silently
+        // promotes. Audit31 Finding 14.
         "iand" => {
-            if args.len() >= 2 { Some(b.bit_and(args[0], args[1])) } else { None }
+            if args.len() >= 2 {
+                let (l, r) = unify_int_widths(b, args[0], args[1]);
+                Some(b.bit_and(l, r))
+            } else { None }
         }
         "ior" => {
-            if args.len() >= 2 { Some(b.bit_or(args[0], args[1])) } else { None }
+            if args.len() >= 2 {
+                let (l, r) = unify_int_widths(b, args[0], args[1]);
+                Some(b.bit_or(l, r))
+            } else { None }
         }
         "ieor" => {
-            if args.len() >= 2 { Some(b.bit_xor(args[0], args[1])) } else { None }
+            if args.len() >= 2 {
+                let (l, r) = unify_int_widths(b, args[0], args[1]);
+                Some(b.bit_xor(l, r))
+            } else { None }
         }
         "not" => {
             args.first().map(|a| b.bit_not(*a))
@@ -8206,6 +8241,41 @@ fn compute_flat_elem_offset(
     }
 
     flat_offset.unwrap_or_else(|| b.const_i64(0))
+}
+
+/// Widen a pair of integer operands to match the wider one. Used
+/// for mixed-kind bit-manipulation intrinsics (iand/ior/ieor) which
+/// F2018 allows between different integer kinds but the IR verifier
+/// requires same-width operands. Sign-extends the narrower operand
+/// since the intrinsics themselves are kind-neutral; gfortran picks
+/// the wider result type so zero-extending would produce a different
+/// bit pattern for negative narrow operands.
+fn unify_int_widths(b: &mut FuncBuilder, lhs: ValueId, rhs: ValueId) -> (ValueId, ValueId) {
+    let lty = b.func().value_type(lhs);
+    let rty = b.func().value_type(rhs);
+    let lw = match lty.as_ref() {
+        Some(IrType::Int(w)) => Some(w.bits()),
+        Some(IrType::Bool) => Some(8),
+        _ => None,
+    };
+    let rw = match rty.as_ref() {
+        Some(IrType::Int(w)) => Some(w.bits()),
+        Some(IrType::Bool) => Some(8),
+        _ => None,
+    };
+    let (Some(lw), Some(rw)) = (lw, rw) else { return (lhs, rhs); };
+    if lw == rw { return (lhs, rhs); }
+    let target = if lw >= rw { lw } else { rw };
+    let to_iw = match target {
+        8 => IntWidth::I8,
+        16 => IntWidth::I16,
+        32 => IntWidth::I32,
+        64 => IntWidth::I64,
+        _ => return (lhs, rhs),
+    };
+    let l = if lw < rw { b.int_extend(lhs, to_iw, true) } else { lhs };
+    let r = if rw < lw { b.int_extend(rhs, to_iw, true) } else { rhs };
+    (l, r)
 }
 
 /// Widen an i32 (or smaller) index value to i64 for pointer
