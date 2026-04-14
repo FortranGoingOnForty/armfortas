@@ -182,12 +182,39 @@ fn resolve_unit(
             st.pop_scope();
         }
         ProgramUnit::InterfaceBlock { name, is_abstract: _, bodies } => {
+            // Collect each subprogram's name and return type BEFORE
+            // pushing the Interface scope — the subprogram body gets
+            // its own scope via resolve_unit, and we need to surface
+            // the *declared* callable back into the enclosing scope
+            // (otherwise IMPLICIT NONE rejects the call at the use
+            // site, and generic dispatch can't see the body types).
+            let mut outer_refs: Vec<(String, SymbolKind, Option<crate::sema::symtab::TypeInfo>, Vec<String>)> = Vec::new();
+            for body in bodies {
+                if let InterfaceBody::Subprogram(sub) = body {
+                    match &sub.node {
+                        ProgramUnit::Function { name: fn_name, return_type, args, .. } => {
+                            let arg_names = args.iter().filter_map(|a| {
+                                if let DummyArg::Name(n) = a { Some(n.clone()) } else { None }
+                            }).collect();
+                            let ti = return_type.as_ref().map(|ts| type_spec_to_info(ts, st));
+                            outer_refs.push((fn_name.clone(), SymbolKind::Function, ti, arg_names));
+                        }
+                        ProgramUnit::Subroutine { name: fn_name, args, .. } => {
+                            let arg_names = args.iter().filter_map(|a| {
+                                if let DummyArg::Name(n) = a { Some(n.clone()) } else { None }
+                            }).collect();
+                            outer_refs.push((fn_name.clone(), SymbolKind::Subroutine, None, arg_names));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             st.push_scope(ScopeKind::Interface);
             let mut specific_names = Vec::new();
             for body in bodies {
                 match body {
                     InterfaceBody::Subprogram(sub) => {
-                        // Extract the specific name from the subprogram.
                         match &sub.node {
                             ProgramUnit::Function { name: fn_name, .. } |
                             ProgramUnit::Subroutine { name: fn_name, .. } => {
@@ -205,6 +232,23 @@ fn resolve_unit(
                 }
             }
             st.pop_scope();
+
+            // Surface each declared procedure to the enclosing scope
+            // so callers under IMPLICIT NONE can resolve the name,
+            // and so BIND(C) external prototypes are callable.
+            for (fn_name, kind, ti, arg_names) in outer_refs {
+                let span = unit.span;
+                let _ = st.define(Symbol {
+                    name: fn_name,
+                    kind,
+                    type_info: ti,
+                    attrs: SymbolAttrs { external: true, ..Default::default() },
+                    defined_at: span,
+                    scope: st.current_scope(),
+                    arg_names,
+                    const_value: None,
+                });
+            }
 
             // Register the generic interface name in the enclosing scope.
             if let Some(generic_name) = name {

@@ -1063,13 +1063,15 @@ fn check_expr_names(
             check_expr_names(st, scope_id, operand, declared, undeclared);
         }
         Expr::FunctionCall { callee, args } => {
-            // Don't check the callee name — it could be an interface-declared
-            // function, external function, or module procedure that isn't in
-            // the local symbol table.
-            // But DO check nested callees (e.g., arr(i)%method).
-            if !matches!(&callee.node, Expr::Name { .. }) {
-                check_expr_names(st, scope_id, callee, declared, undeclared);
-            }
+            // Under IMPLICIT NONE the callee name must resolve to a
+            // declared identifier: a host/module procedure visible
+            // via `lookup_in`, an EXTERNAL dummy (already in
+            // `declared`), or an intrinsic. The `declared` set and
+            // lookup path in the bare-Name arm handle all three;
+            // reuse it so `foo(3)` with no declaration of `foo` is
+            // rejected at compile time instead of falling through to
+            // a link error.
+            check_expr_names(st, scope_id, callee, declared, undeclared);
             for arg in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                     check_expr_names(st, scope_id, e, declared, undeclared);
