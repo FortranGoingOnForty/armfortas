@@ -32,15 +32,15 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments
 
-  test-armfortas:
-    name: "Tests: armfortas unit"
+  test-armfortas-lib:
+    name: "Tests: armfortas library unit"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p armfortas --bin armfortas
+      - run: cargo test -p armfortas --lib --release
 
   test-end-to-end:
     name: "Tests: end-to-end (compile + run Fortran programs)"
@@ -50,8 +50,29 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --workspace
-      - run: cargo test --test run_programs -- --nocapture
+      - run: cargo build --workspace --release
+      - run: cargo test --release --test run_programs -- --nocapture
+
+  # All integration suites in tests/*.rs: audit reproducers, multi-file
+  # compilation, cross-TU ABI matrix, module host association, optimizer
+  # audits, IPO/IPA, pure-call reuse, LICM, SROA, mem2reg, vectorizer,
+  # incremental compilation, determinism, etc. Leaving these out of CI
+  # is how audits found miscompiles we should have caught on PR.
+  # --tests builds every target under tests/ including run_programs —
+  # paying the cost of compiling the compiler once is cheaper than
+  # fragmenting into 20+ per-target jobs, and keeping them together
+  # makes regressions in *any* suite block the merge.
+  test-integration:
+    name: "Tests: integration suites"
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: cargo test -p armfortas --tests --release -- --nocapture
 
   test-afs-as-unit:
     name: "Tests: afs-as unit"
