@@ -201,16 +201,26 @@ impl<'a> Parser<'a> {
         let args = self.parse_dummy_arg_list()?;
         self.expect(&TokenKind::RParen)?;
 
-        // RESULT clause.
-        let result = if self.peek_text().eq_ignore_ascii_case("result") {
-            self.advance();
-            self.expect(&TokenKind::LParen)?;
-            let r = self.advance().clone().text;
-            self.expect(&TokenKind::RParen)?;
-            Some(r)
-        } else { None };
-
-        let bind = self.try_parse_bind()?;
+        // RESULT and BIND clauses may appear in either order
+        // (F2008 R1229). Scan for both repeatedly so either
+        // `result(r) bind(C)` or `bind(C) result(r)` parses.
+        let mut result: Option<String> = None;
+        let mut bind: Option<BindInfo> = None;
+        loop {
+            if result.is_none() && self.peek_text().eq_ignore_ascii_case("result") {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let r = self.advance().clone().text;
+                self.expect(&TokenKind::RParen)?;
+                result = Some(r);
+                continue;
+            }
+            if bind.is_none() && self.peek_text().eq_ignore_ascii_case("bind") {
+                bind = self.try_parse_bind()?;
+                continue;
+            }
+            break;
+        }
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["function"])?;
