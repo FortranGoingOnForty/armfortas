@@ -600,19 +600,70 @@ impl<'a> Lexer<'a> {
                 let save_col = self.col;
 
                 self.advance(); // &
-                // Check if rest of line is whitespace and/or comment, then newline.
-                let mut is_cont = true;
-                while !self.at_end() && self.peek() != b'\n' {
-                    match self.peek() {
-                        b' ' | b'\t' | b'\r' => { self.advance(); }
-                        b'!' => {
-                            // Comment after & — skip to newline.
-                            while !self.at_end() && self.peek() != b'\n' {
-                                self.advance();
+                // String-continuation check. A lone `&` ending the
+                // current physical line (optionally with trailing
+                // whitespace and/or a `!comment`) continues the
+                // string on the next line. Anything else — notably a
+                // closing quote before the newline — means the `&`
+                // is a literal character of the string.
+                //
+                // Scan from the current pos without committing: find
+                // the earliest of quote, `!`, or newline. Only newline
+                // (possibly preceded by whitespace or a comment) keeps
+                // is_cont true.
+                let mut is_cont = false;
+                let mut scan = self.pos;
+                let src_bytes = self.src;
+                while scan < src_bytes.len() {
+                    let c = src_bytes[scan];
+                    if c == b' ' || c == b'\t' || c == b'\r' {
+                        scan += 1;
+                        continue;
+                    }
+                    if c == b'\n' {
+                        is_cont = true;
+                        break;
+                    }
+                    if c == b'!' {
+                        // Potential continuation-with-trailing-comment,
+                        // but only if the closing quote doesn't appear
+                        // before the newline. Inside a string, an `!`
+                        // before the close quote is a literal character,
+                        // not a comment — treating it as a comment
+                        // would chew through the close quote and trip
+                        // the unterminated-string error.
+                        let mut peek = scan;
+                        let mut saw_quote = false;
+                        while peek < src_bytes.len() && src_bytes[peek] != b'\n' {
+                            if src_bytes[peek] == quote {
+                                // Allow doubled-quote escapes.
+                                if peek + 1 < src_bytes.len() && src_bytes[peek + 1] == quote {
+                                    peek += 2;
+                                    continue;
+                                }
+                                saw_quote = true;
+                                break;
                             }
+                            peek += 1;
+                        }
+                        if saw_quote {
+                            is_cont = false;
                             break;
                         }
-                        _ => { is_cont = false; break; }
+                        scan = peek;
+                        is_cont = scan < src_bytes.len();
+                        break;
+                    }
+                    // Any other character (including the closing
+                    // quote) terminates the scan — not a continuation.
+                    break;
+                }
+                // Drive the scanner forward if we decided it's a
+                // continuation; otherwise leave self.pos where it is
+                // so the fall-through path restores state.
+                if is_cont {
+                    while self.pos < scan {
+                        self.advance();
                     }
                 }
                 if is_cont && !self.at_end() {
