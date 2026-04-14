@@ -4488,7 +4488,7 @@ fn lower_intrinsic_subroutine(
     ) -> ValueId {
         if n < args.len() {
             if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
-                return lower_expr(b, &ctx.locals, e, ctx.st);
+                return lower_expr_ctx(b, ctx, e);
             }
         }
         b.const_i32(default)
@@ -5768,7 +5768,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
                     b.const_i32(6)
                 } else {
-                    lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+                    lower_expr_ctx(b, ctx, &ctrl.value)
                 }
             } else {
                 b.const_i32(6)
@@ -5897,7 +5897,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::IfStmt { condition, action } => {
-            let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
+            let cond = lower_expr_ctx(b, ctx, condition);
             let bb_then = b.create_block("if_then");
             let bb_end = b.create_block("if_end");
             b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
@@ -5928,7 +5928,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             ctx.push_loop(name.clone(), bb_header, bb_exit);
 
             b.set_block(bb_header);
-            let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
+            let cond = lower_expr_ctx(b, ctx, condition);
             b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
 
             b.set_block(bb_body);
@@ -5956,7 +5956,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
             if array_names.is_empty() {
                 // No arrays — fall back to scalar IF-THEN-ELSE.
-                let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+                let cond = lower_expr_ctx_tl(b, ctx, mask);
                 let bb_then = b.create_block("where_then");
                 let bb_else = if !elsewhere.is_empty() {
                     Some(b.create_block("where_else"))
@@ -6052,7 +6052,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
 
             // Evaluate mask with element-level bindings.
-            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+            let cond = lower_expr_ctx_tl(b, ctx, mask);
 
             let bb_then = b.create_block("where_then");
             let bb_else = b.create_block("where_else");
@@ -6094,7 +6094,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::WhereStmt { mask, stmt } => {
             // Single-line WHERE: where (cond) assignment
-            let cond = lower_expr_tl(b, &ctx.locals, mask, ctx.st, ctx.type_layouts);
+            let cond = lower_expr_ctx_tl(b, ctx, mask);
             let bb_then = b.create_block("where_stmt");
             let bb_end = b.create_block("where_stmt_end");
             b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
@@ -6379,7 +6379,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 .collect();
 
             for (name, expr) in assocs {
-                let val = lower_expr(b, &ctx.locals, expr, ctx.st);
+                let val = lower_expr_ctx(b, ctx, expr);
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
@@ -6425,7 +6425,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         Stmt::Open { specs } => {
             // Extract UNIT and FILE from specs. Simplified: first spec is unit, second is file.
             let unit = if let Some(s) = specs.first() {
-                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+                lower_expr_ctx(b, ctx, &s.value)
             } else { b.const_i32(6) };
 
             // Find FILE= spec.
@@ -6461,7 +6461,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             // Find RECL= spec.
             let recl_val = specs.iter()
                 .find(|s| s.keyword.as_deref().map(|k| k.eq_ignore_ascii_case("recl")).unwrap_or(false))
-                .map(|s| lower_expr(b, &ctx.locals, &s.value, ctx.st))
+                .map(|s| lower_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| b.const_i64(0));
 
             let null = b.const_i64(0);
@@ -6550,7 +6550,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Close { specs } => {
             let unit = if let Some(s) = specs.first() {
-                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+                lower_expr_ctx(b, ctx, &s.value)
             } else { b.const_i32(6) };
             let null = b.const_i64(0);
             b.call(FuncRef::External("afs_close".into()), vec![unit, null], IrType::Void);
@@ -6583,7 +6583,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
             // READ(unit, *) items — simplified: first control is unit.
             let unit = if let Some(ctrl) = controls.first() {
-                lower_expr(b, &ctx.locals, &ctrl.value, ctx.st)
+                lower_expr_ctx(b, ctx, &ctrl.value)
             } else {
                 b.const_i32(5) // default stdin
             };
@@ -6618,7 +6618,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Flush { specs } => {
             let unit = if let Some(s) = specs.first() {
-                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+                lower_expr_ctx(b, ctx, &s.value)
             } else { b.const_i32(6) };
             let null = b.const_i64(0);
             b.call(FuncRef::External("afs_flush".into()), vec![unit, null], IrType::Void);
@@ -6626,7 +6626,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
         Stmt::Rewind { specs } => {
             let unit = if let Some(s) = specs.first() {
-                lower_expr(b, &ctx.locals, &s.value, ctx.st)
+                lower_expr_ctx(b, ctx, &s.value)
             } else { b.const_i32(6) };
             let null = b.const_i64(0);
             b.call(FuncRef::External("afs_rewind".into()), vec![unit, null], IrType::Void);
@@ -6679,14 +6679,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             if let crate::ast::expr::SectionSubscript::Range { start, end, stride: _ } = &val_args[0].value {
                                 let base = array_data_ptr_for_call(b, &arr_info);
                                 let lo = if let Some(se) = start {
-                                    let v = lower_expr(b, &ctx.locals, se, ctx.st);
+                                    let v = lower_expr_ctx(b, ctx, se);
                                     match b.func().value_type(v) {
                                         Some(IrType::Int(IntWidth::I64)) => v,
                                         _ => b.int_extend(v, IntWidth::I64, true),
                                     }
                                 } else { b.const_i64(1) };
                                 let hi = if let Some(ee) = end {
-                                    let v = lower_expr(b, &ctx.locals, ee, ctx.st);
+                                    let v = lower_expr_ctx(b, ctx, ee);
                                     match b.func().value_type(v) {
                                         Some(IrType::Int(IntWidth::I64)) => v,
                                         _ => b.int_extend(v, IntWidth::I64, true),
@@ -6739,7 +6739,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         {
                             if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &val_args[0].value {
                                 let base = array_data_ptr_for_call(b, &arr_info);
-                                let idx = lower_expr(b, &ctx.locals, idx_expr, ctx.st);
+                                let idx = lower_expr_ctx(b, ctx, idx_expr);
                                 let idx64 = match b.func().value_type(idx) {
                                     Some(IrType::Int(IntWidth::I64)) => idx,
                                     _ => b.int_extend(idx, IntWidth::I64, true),
@@ -6930,9 +6930,9 @@ fn try_lower_select(
     if !is_pure_expr(&else_val_expr.node) { return false; }
 
     // Lower condition, then both value expressions, then emit Select + Store.
-    let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
-    let tv = lower_expr(b, &ctx.locals, then_val_expr, ctx.st);
-    let fv = lower_expr(b, &ctx.locals, else_val_expr, ctx.st);
+    let cond = lower_expr_ctx(b, ctx, condition);
+    let tv = lower_expr_ctx(b, ctx, then_val_expr);
+    let fv = lower_expr_ctx(b, ctx, else_val_expr);
     let selected = b.select(cond, tv, fv);
     b.store(selected, info.addr);
     true
@@ -6954,7 +6954,7 @@ fn lower_if(
 
     let bb_end = b.create_block("if_end");
 
-    let cond = lower_expr(b, &ctx.locals, condition, ctx.st);
+    let cond = lower_expr_ctx(b, ctx, condition);
     let bb_then = b.create_block("if_then");
     let bb_next = if !else_ifs.is_empty() || else_body.is_some() {
         b.create_block("if_else")
@@ -6974,7 +6974,7 @@ fn lower_if(
     let mut current_else = bb_next;
     for (i, (ei_cond, ei_body)) in else_ifs.iter().enumerate() {
         b.set_block(current_else);
-        let ei_cond_val = lower_expr(b, &ctx.locals, ei_cond, ctx.st);
+        let ei_cond_val = lower_expr_ctx(b, ctx, ei_cond);
         let bb_ei_then = b.create_block(&format!("elseif_{}_then", i));
         let bb_ei_next = if i + 1 < else_ifs.len() || else_body.is_some() {
             b.create_block(&format!("elseif_{}_else", i))
@@ -7125,12 +7125,12 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         });
 
         // Initialize loop variable.
-        let init_val = lower_expr(b, &ctx.locals, start_expr, ctx.st);
+        let init_val = lower_expr_ctx(b, ctx, start_expr);
         b.store(init_val, var_addr);
 
-        let end_val = lower_expr(b, &ctx.locals, end_expr, ctx.st);
+        let end_val = lower_expr_ctx(b, ctx, end_expr);
         let step_val = if let Some(step_expr) = step {
-            lower_expr(b, &ctx.locals, step_expr, ctx.st)
+            lower_expr_ctx(b, ctx, step_expr)
         } else {
             b.const_i32(1)
         };
@@ -7211,7 +7211,7 @@ fn lower_select_case(
     selector: &crate::ast::expr::SpannedExpr,
     cases: &[CaseBlock],
 ) {
-    let sel_val = lower_expr(b, &ctx.locals, selector, ctx.st);
+    let sel_val = lower_expr_ctx(b, ctx, selector);
     let bb_end = b.create_block("select_end");
 
     // For simplicity, lower as a chain of if-else comparisons.
@@ -7248,16 +7248,16 @@ fn lower_select_case(
         for sel in &case.selectors {
             let cond = match sel {
                 CaseSelector::Value(expr) => {
-                    let val = lower_expr(b, &ctx.locals, expr, ctx.st);
+                    let val = lower_expr_ctx(b, ctx, expr);
                     b.icmp(CmpOp::Eq, sel_val, val)
                 }
                 CaseSelector::Range { low, high } => {
                     let low_ok = if let Some(lo) = low {
-                        let lo_val = lower_expr(b, &ctx.locals, lo, ctx.st);
+                        let lo_val = lower_expr_ctx(b, ctx, lo);
                         Some(b.icmp(CmpOp::Ge, sel_val, lo_val))
                     } else { None };
                     let high_ok = if let Some(hi) = high {
-                        let hi_val = lower_expr(b, &ctx.locals, hi, ctx.st);
+                        let hi_val = lower_expr_ctx(b, ctx, hi);
                         Some(b.icmp(CmpOp::Le, sel_val, hi_val))
                     } else { None };
                     match (low_ok, high_ok) {
@@ -7835,7 +7835,7 @@ fn lower_write_items_adv(
             }
             // Complex literal in print position: detect ptr<[f32/f64 x 2]>
             if matches!(item.node, Expr::ComplexLiteral { .. }) {
-                let addr = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
+                let addr = lower_expr_ctx_tl(b, ctx, item);
                 // Default to f32 — if literal had f64 components lower_expr would
                 // have allocated [f64 x 2]. Check the original node to be precise.
                 let func = if let Expr::ComplexLiteral { real, imag } = &item.node {
@@ -7899,7 +7899,7 @@ fn lower_write_items_adv(
             let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
             b.call(FuncRef::External("afs_write_string".into()), vec![unit, ptr, len], IrType::Void);
         } else {
-            let val = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
+            let val = lower_expr_ctx_tl(b, ctx, item);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             let func_name = match &ty {
                 IrType::Int(IntWidth::I128) => "afs_write_int128",
@@ -8010,7 +8010,7 @@ fn lower_internal_write_items(
             continue;
         }
 
-        let val = lower_expr_tl(b, &ctx.locals, item, ctx.st, ctx.type_layouts);
+        let val = lower_expr_ctx_tl(b, ctx, item);
         let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
         match ty {
             IrType::Int(IntWidth::I128) => {
@@ -8510,7 +8510,7 @@ fn lower_fmt_push(
         let (ptr, len) = lower_string_expr(b, &ctx.locals, item, ctx.st);
         b.call(FuncRef::External("afs_fmt_push_string".into()), vec![ptr, len], IrType::Void);
     } else {
-        let val = lower_expr(b, &ctx.locals, item, ctx.st);
+        let val = lower_expr_ctx(b, ctx, item);
         let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
         match &ty {
             IrType::Int(IntWidth::I128) => {
@@ -8582,15 +8582,15 @@ fn lower_1d_slice_write(
     let decl_hi = decl_lo + decl_ext - 1;
 
     let start_val = match start_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(decl_lo as i32),
     };
     let end_val = match end_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(decl_hi as i32),
     };
     let stride_val = match stride_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(1),
     };
 
@@ -8681,15 +8681,15 @@ fn lower_1d_slice_read(
     let decl_hi = decl_lo + decl_ext - 1;
 
     let start_val = match start_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(decl_lo as i32),
     };
     let end_val = match end_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(decl_hi as i32),
     };
     let stride_val = match stride_e {
-        Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+        Some(e) => lower_expr_ctx(b, ctx, e),
         None => b.const_i32(1),
     };
 
@@ -8775,22 +8775,22 @@ fn lower_section_read_nd(
         let (start_val, end_val, stride_val, const_stride) = match &arg.value {
             SectionSubscript::Range { start, end, stride } => {
                 let start_v = match start {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(decl_lo as i32),
                 };
                 let end_v = match end {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(decl_hi as i32),
                 };
                 let stride_v = match stride {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(1),
                 };
                 let cs = stride.as_ref().and_then(eval_const_int);
                 (start_v, end_v, stride_v, cs)
             }
             SectionSubscript::Element(e) => {
-                let v = lower_expr(b, &ctx.locals, e, ctx.st);
+                let v = lower_expr_ctx(b, ctx, e);
                 (v, v, b.const_i32(1), Some(1))
             }
         };
@@ -8940,21 +8940,21 @@ fn lower_alloc_section_read(
             SectionSubscript::Range { start, end, stride } => {
                 let start_v = match start {
                     Some(e) => {
-                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        let raw = lower_expr_ctx(b, ctx, e);
                         widen_idx_to_i64(b, raw)
                     }
                     None => lo,
                 };
                 let end_v = match end {
                     Some(e) => {
-                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        let raw = lower_expr_ctx(b, ctx, e);
                         widen_idx_to_i64(b, raw)
                     }
                     None => up,
                 };
                 let stride_v = match stride {
                     Some(e) => {
-                        let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                        let raw = lower_expr_ctx(b, ctx, e);
                         widen_idx_to_i64(b, raw)
                     }
                     None => one64,
@@ -8963,7 +8963,7 @@ fn lower_alloc_section_read(
                 (start_v, end_v, stride_v, cs)
             }
             SectionSubscript::Element(e) => {
-                let raw = lower_expr(b, &ctx.locals, e, ctx.st);
+                let raw = lower_expr_ctx(b, ctx, e);
                 let val = widen_idx_to_i64(b, raw);
                 (val, val, one64, Some(1))
             }
@@ -9126,22 +9126,22 @@ fn lower_section_write_nd(
         let (start_val, end_val, stride_val, const_stride) = match &arg.value {
             SectionSubscript::Range { start, end, stride } => {
                 let start_v = match start {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(decl_lo as i32),
                 };
                 let end_v = match end {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(decl_hi as i32),
                 };
                 let stride_v = match stride {
-                    Some(e) => lower_expr(b, &ctx.locals, e, ctx.st),
+                    Some(e) => lower_expr_ctx(b, ctx, e),
                     None => b.const_i32(1),
                 };
                 let cs = stride.as_ref().and_then(eval_const_int);
                 (start_v, end_v, stride_v, cs)
             }
             SectionSubscript::Element(e) => {
-                let v = lower_expr(b, &ctx.locals, e, ctx.st);
+                let v = lower_expr_ctx(b, ctx, e);
                 // Single-element dimension: start == end, stride 1.
                 (v, v, b.const_i32(1), Some(1))
             }
@@ -9907,7 +9907,7 @@ fn emit_bulk_array_plan(
     let dest_base = array_base_addr(b, dest_info);
     match plan {
         BulkArrayPlan::Fill { kernel, scalar } => {
-            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            let scalar = lower_expr_ctx_tl(b, ctx, &scalar);
             b.call(FuncRef::External(kernel.into()), vec![dest_base, n, scalar], IrType::Void);
         }
         BulkArrayPlan::ArrayBinary { kernel, lhs, rhs } => {
@@ -9921,7 +9921,7 @@ fn emit_bulk_array_plan(
         }
         BulkArrayPlan::ArrayScalar { kernel, array, scalar } => {
             let array_base = array_base_addr(b, &array);
-            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            let scalar = lower_expr_ctx_tl(b, ctx, &scalar);
             b.call(
                 FuncRef::External(kernel.into()),
                 vec![dest_base, array_base, scalar, n],
@@ -9929,7 +9929,7 @@ fn emit_bulk_array_plan(
             );
         }
         BulkArrayPlan::ScalarArray { kernel, scalar, array } => {
-            let scalar = lower_expr_tl(b, &ctx.locals, &scalar, ctx.st, ctx.type_layouts);
+            let scalar = lower_expr_ctx_tl(b, ctx, &scalar);
             let array_base = array_base_addr(b, &array);
             b.call(
                 FuncRef::External(kernel.into()),
@@ -10107,7 +10107,7 @@ fn lower_forall_nested(
     if specs.is_empty() {
         // Innermost level: apply mask and execute body.
         if let Some(mask_expr) = mask {
-            let cond = lower_expr_tl(b, &ctx.locals, mask_expr, ctx.st, ctx.type_layouts);
+            let cond = lower_expr_ctx_tl(b, ctx, mask_expr);
             let bb_body = b.create_block("forall_body");
             let bb_skip = b.create_block("forall_skip");
             b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
@@ -10140,11 +10140,11 @@ fn lower_forall_nested(
             addr
         });
 
-        let init_val = lower_expr(b, &ctx.locals, &spec.start, ctx.st);
+        let init_val = lower_expr_ctx(b, ctx, &spec.start);
         b.store(init_val, var_addr);
-        let end_val = lower_expr(b, &ctx.locals, &spec.end, ctx.st);
+        let end_val = lower_expr_ctx(b, ctx, &spec.end);
         let step_val = spec.step.as_ref()
-            .map(|s| lower_expr(b, &ctx.locals, s, ctx.st))
+            .map(|s| lower_expr_ctx(b, ctx, s))
             .unwrap_or_else(|| b.const_i32(1));
 
         let bb_check = b.create_block("forall_check");
@@ -10232,7 +10232,7 @@ fn lower_array_assign(
     } else {
         // a = scalar: broadcast scalar to all elements.
         // Generate a loop with stack-allocated counter.
-        let scalar = lower_expr_tl(b, &ctx.locals, value, ctx.st, ctx.type_layouts);
+        let scalar = lower_expr_ctx_tl(b, ctx, value);
         let dest_base = array_base_addr(b, dest_info);
         let n = array_total_elems_value(b, dest_info);
 
