@@ -3535,9 +3535,28 @@ fn init_decls(
                         continue;
                     }
 
-                    // Only initialize plain scalar slots; characters,
-                    // allocatables, and derived types are handled
-                    // elsewhere.
+                    // Fixed-length character initializer: copy the
+                    // literal bytes into the stack buffer with
+                    // space-padding to the declared length. Previously
+                    // the character arm was unconditionally skipped,
+                    // leaving every `character(len=N) :: s = 'hello'`
+                    // zero-initialized and silently blank at runtime
+                    // (audit31 Finding 3).
+                    if let CharKind::Fixed(len) = info.char_kind {
+                        let (src_ptr, src_len) = lower_string_expr(b, locals, init_expr, st);
+                        let dest_len = b.const_i64(len);
+                        b.call(
+                            FuncRef::External("afs_assign_char_fixed".into()),
+                            vec![info.addr, dest_len, src_ptr, src_len],
+                            IrType::Void,
+                        );
+                        continue;
+                    }
+                    // Other non-plain-scalar shapes are handled
+                    // elsewhere (allocatables, derived types) or not
+                    // at all (deferred-length character, which gets
+                    // its store through afs_assign_char_deferred at
+                    // the declaration's assignment lowering).
                     if !info.dims.is_empty()
                         || info.allocatable
                         || !matches!(info.char_kind, CharKind::None)

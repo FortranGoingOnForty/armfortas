@@ -1,10 +1,11 @@
-! XFAIL: character initializer silently blank — Task #484
-! CHECK: [hello]
-! audit31: character variable/parameter initializer is lost.
-! Expected: '[hello]'
-! Actual:   '[     ]' (blank, correct length)
-! Literal strings passed directly to print DO work.
-! Integer initializers work. Only character is broken.
+! audit31 Finding 3: character variable/parameter initializer used
+! to be silently dropped. init_decls had a catch-all `continue` for
+! any char_kind != None, so `character(len=5) :: a = 'hello'` left
+! the stack buffer zero-initialised. Added a Fixed-len path that
+! calls afs_assign_char_fixed to copy the literal with
+! space-padding to the declared length. Task #484.
+! CHECK: hello
+! CHECK: world
 program audit31_char_init
   implicit none
   character(len=5)           :: a = 'hello'
