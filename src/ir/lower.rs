@@ -2015,6 +2015,33 @@ fn lower_unit(
                         inline_const: None, is_pointer: false,
                     });
                     // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
+                } else if let Some(dt_name) = derived_type_name_for_return(return_type) {
+                    // Derived-type FUNCTION result: allocate a struct-shaped
+                    // buffer ([i8 x layout.size]) and register the result
+                    // variable with `derived_type = Some(name)` so component
+                    // access (e.g. `vec_add%x = ...`) lands on the buffer.
+                    // Without this, the generic `b.alloca(ir_ret_ty)` path
+                    // allocates a `ptr<ptr<i8>>` slot, ComponentAccess can't
+                    // resolve the type name, and every assignment to the
+                    // result variable is silently dropped.
+                    let layout = type_layouts.get(&dt_name);
+                    let size = layout.map(|l| l.size as u64).unwrap_or(8);
+                    let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), size);
+                    let result_addr = b.alloca(buf_ty);
+                    ctx.locals.insert(result_name.clone(), LocalInfo {
+                        addr: result_addr,
+                        ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: Some(dt_name),
+                        inline_const: None,
+                        is_pointer: false,
+                    });
+                    ctx.result_addr = Some(result_addr);
+                    ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 } else {
                     let result_addr = b.alloca(ir_ret_ty.clone());
                     ctx.insert_scalar(result_name, result_addr, ir_ret_ty.clone());
@@ -2047,6 +2074,15 @@ fn lower_unit(
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, skip);
                     if is_alloc_return {
                         b.ret(None);
+                    } else if derived_type_name_for_return(return_type).is_some() {
+                        // Derived-type result: return the buffer
+                        // address as a Ptr(i8) (the declared return
+                        // type). A zero-offset GEP through `i8`
+                        // reshapes Ptr(Array(i8, N)) into Ptr(i8).
+                        let result_addr = ctx.result_addr.expect("derived-return function has result_addr");
+                        let zero = b.const_i64(0);
+                        let byte_ptr = b.gep(result_addr, vec![zero], IrType::Int(IntWidth::I8));
+                        b.ret(Some(byte_ptr));
                     } else {
                         let result_addr = ctx.result_addr.expect("non-sret function has result_addr");
                         let rv = b.load(result_addr);
@@ -4855,16 +4891,20 @@ fn arg_matches_declared(
     if let TypeInfo::Derived(decl_name) = decl_ti {
         // Walk through any pointer wrappers — the caller passes an
         // address to the struct and dispatch has to look through it.
+        // Derived-type arguments arrive in two shapes:
+        //   * A local alloca:            Ptr(Array(i8, N))  → peel → Array
+        //   * A function call result:    Ptr(i8)           → peel → Int(I8)
+        // Both are valid struct-reference encodings. The sema layer
+        // already rejected mismatched derived-type assignments
+        // before reaching lowering, so we can trust any pointer
+        // shape at this point.
         let mut peeled = actual_ir.clone();
         while let IrType::Ptr(inner) = peeled { peeled = *inner; }
-        // Matches any struct-shaped buffer of the right size. The
-        // defining instruction's spill slot (if derived-type local,
-        // by_ref) records the actual derived-type name via the
-        // LocalInfo — but we don't have `ctx.locals` here, so trust
-        // the IR type. The sema layer already rejected mismatched
-        // derived-type assignments before reaching lowering.
         let _ = decl_name;
-        return matches!(peeled, IrType::Array(_, _));
+        return matches!(
+            peeled,
+            IrType::Array(_, _) | IrType::Int(IntWidth::I8)
+        );
     }
     let decl_ir = type_info_to_ir_type(decl_ti);
     let _ = arg_val;
@@ -5189,6 +5229,23 @@ fn arg_derived_type_name(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]
         }
     }
     None
+}
+
+/// Extract the derived-type name from a function `return_type`
+/// declaration. Returns `Some("vec")` for `type(vec) function f()` and
+/// `None` for intrinsic-typed returns. Used by the Function lowering
+/// arm to decide whether the result variable needs derived-type
+/// storage and metadata.
+fn derived_type_name_for_return(return_type: &Option<TypeSpec>) -> Option<String> {
+    if let Some(TypeSpec::Type(name)) = return_type {
+        let lower = name.to_lowercase();
+        if lower == "c_ptr" || lower == "c_funptr" {
+            return None;
+        }
+        Some(name.clone())
+    } else {
+        None
+    }
 }
 
 /// Does the named variable in `decls` carry the ALLOCATABLE attribute
@@ -11301,6 +11358,15 @@ fn is_type_or_extends(actual_type: &str, target_type: &str, tl: &crate::sema::ty
 /// Convert TypeInfo to IR type for field loads.
 fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     use crate::sema::symtab::TypeInfo;
+    // Derived types lower to a byte pointer — the compiler treats
+    // values of derived types as addresses into struct-shaped
+    // buffers. Without this case, size_of_type for a small derived
+    // type (e.g. one real field → 4 bytes) would fall into the
+    // Int(I32) arm and the generic dispatcher would compare pointers
+    // as integers.
+    if matches!(ti, TypeInfo::Derived(_)) {
+        return IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    }
     let (size, _) = crate::sema::type_layout::size_of_type(ti);
     match size {
         1 => IrType::Int(IntWidth::I8),
