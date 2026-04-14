@@ -427,13 +427,13 @@ impl<'a> Parser<'a> {
                             self.advance().clone().text
                         } else { String::new() };
 
-                        if self.eat(&TokenKind::Arrow) {
-                            if self.peek_text().eq_ignore_ascii_case("null") {
+                        if self.eat(&TokenKind::Arrow)
+                            && self.peek_text().eq_ignore_ascii_case("null")
+                        {
+                            self.advance();
+                            if self.peek() == &TokenKind::LParen {
                                 self.advance();
-                                if self.peek() == &TokenKind::LParen {
-                                    self.advance();
-                                    let _ = self.expect(&TokenKind::RParen);
-                                }
+                                let _ = self.expect(&TokenKind::RParen);
                             }
                         }
 

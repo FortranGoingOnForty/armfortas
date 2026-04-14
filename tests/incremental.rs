@@ -179,13 +179,13 @@ fn consumer_object_changes_when_amod_changes() {
     let main_o = dir.join("main.o");
     fs::write(&main_f90, main_src).unwrap();
     compile(&compiler, &main_f90, &main_o, &dir);
-    let obj1 = fs::read(&main_o).unwrap();
+    let _obj1 = fs::read(&main_o).unwrap();
 
     // Recompile module with changed public interface.
     compile_module(&compiler, &dir, "m", mod_v2);
     // Recompile consumer against new .amod.
     compile(&compiler, &main_f90, &main_o, &dir);
-    let obj2 = fs::read(&main_o).unwrap();
+    let _obj2 = fs::read(&main_o).unwrap();
 
     // The consumer .o may or may not change (depends on whether the
     // consumer references the new symbol). But the .amod definitely

@@ -940,7 +940,7 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     for (name, span) in &undeclared {
         let key = name.to_lowercase();
         if reported.insert(key) {
-            ctx.error(*span, &format!(
+            ctx.error(*span, format!(
                 "variable '{}' used but not declared (IMPLICIT NONE is active)", name
             ));
         }

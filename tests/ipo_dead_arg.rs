@@ -94,9 +94,12 @@ fn o2_elides_dead_dummy_arg_from_recursive_internal_helper() {
         call_arg_counts_for(raw_helper, "@helper"),
     ]
     .concat();
+    // dead-arg-elim rewrites @helper in-place (no clone, no rename)
+    // so the optimized IR still calls @helper — with one fewer
+    // argument per site.
     let opt_call_counts = [
-        call_arg_counts_for(opt_main, "@func_"),
-        call_arg_counts_for(opt_helper, "@func_"),
+        call_arg_counts_for(opt_main, "@helper"),
+        call_arg_counts_for(opt_helper, "@helper"),
     ]
     .concat();
 

@@ -121,8 +121,12 @@ fn o2_specializes_constant_dummy_and_trims_internal_calls() {
         "raw caller should pass both helper arguments at O0:\n{}",
         raw_main
     );
+    // const-arg-specialize rewrites @compute in-place (no clone, no
+    // rename) and dead_arg_elim drops the trimmed parameter. The
+    // optimized caller therefore still calls @compute but with one
+    // fewer argument per site.
     assert_eq!(
-        call_arg_counts_for(opt_main, "@func_"),
+        call_arg_counts_for(opt_main, "@compute"),
         vec![1, 1],
         "optimized caller should trim the specialized constant arg:\n{}",
         opt_main
