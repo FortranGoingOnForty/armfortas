@@ -475,6 +475,17 @@ pub struct AmodVar {
     pub const_value: Option<i64>,
 }
 
+/// A generic named interface parsed from an .amod file. Each entry
+/// maps the interface name (e.g. `add`) to the ordered list of
+/// specific procedure names it dispatches to. Used by importing
+/// compilation units to reconstruct a `NamedInterface` symbol so
+/// generic resolution works across .amod boundaries.
+#[derive(Debug, Clone)]
+pub struct AmodInterface {
+    pub name: String,
+    pub specifics: Vec<String>,
+}
+
 /// Complete module interface parsed from an .amod file.
 #[derive(Debug, Clone)]
 pub struct ModuleInterface {
@@ -483,6 +494,7 @@ pub struct ModuleInterface {
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
     pub types: Vec<crate::sema::type_layout::TypeLayout>,
+    pub interfaces: Vec<AmodInterface>,
     pub checksum: Option<String>,
 }
 
@@ -536,6 +548,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     let mut variables = Vec::new();
     let mut procedures = Vec::new();
     let mut types = Vec::new();
+    let mut interfaces = Vec::new();
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -553,11 +566,19 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         } else if trimmed.starts_with("@type ") {
             let layout = parse_type(trimmed, &mut lines);
             types.push(layout);
-        } else if trimmed.starts_with("@interface ") {
-            // Skip interface blocks for now — consume until @end interface.
+        } else if let Some(name) = trimmed.strip_prefix("@interface ") {
+            // Generic interface block: header is `@interface <name>`,
+            // body lists `@specific <proc>` until `@end interface`.
+            let iface_name = name.trim().to_string();
+            let mut specifics = Vec::new();
             for iline in lines.by_ref() {
-                if iline.trim().starts_with("@end interface") { break; }
+                let t = iline.trim();
+                if t.starts_with("@end interface") { break; }
+                if let Some(spec) = t.strip_prefix("@specific ") {
+                    specifics.push(spec.trim().to_string());
+                }
             }
+            interfaces.push(AmodInterface { name: iface_name, specifics });
         }
         // Skip unrecognized directives (forward compatibility).
     }
@@ -568,6 +589,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         variables,
         procedures,
         types,
+        interfaces,
         checksum,
     })
 }

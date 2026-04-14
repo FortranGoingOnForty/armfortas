@@ -178,6 +178,50 @@ fn use_rename() {
     );
 }
 
+/// Generic interface resolved across .amod boundaries: the consumer
+/// reconstructs the NamedInterface from the @interface block and
+/// dispatches each specific at the call site.
+#[test]
+fn generic_interface_cross_module() {
+    multifile_test(
+        "module mgen\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n",
+        "program p\n  use mgen\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n",
+        "3",
+    );
+}
+
+/// Generic interface reachable transitively through an intermediate
+/// module that re-exports via `USE`. The middle module's .amod has
+/// only `@uses base`; the consumer must recursively load base and
+/// re-expose its symbols (including the NamedInterface) so generic
+/// dispatch walks the chain.
+#[test]
+fn generic_interface_transitive_use() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let base_f90 = dir.join("base.f90");
+    let middle_f90 = dir.join("middle.f90");
+    let main_f90 = dir.join("main.f90");
+    let base_o = dir.join("base.o");
+    let middle_o = dir.join("middle.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(&base_f90, "module base\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n").unwrap();
+    std::fs::write(&middle_f90, "module middle\n  use base\nend module\n").unwrap();
+    std::fs::write(&main_f90, "program p\n  use middle\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n").unwrap();
+
+    compile_file(&compiler, &base_f90, &base_o, None);
+    compile_file(&compiler, &middle_f90, &middle_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &middle_o, &base_o], &binary);
+    let output = run_binary(&binary);
+    assert!(output.contains("3"), "expected '3' in output, got:\n{}", output);
+    assert!(output.contains("4.0000000E0"), "expected real add result in output, got:\n{}", output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn module_private_default() {
     // priv_val should not be accessible; only pub_val.

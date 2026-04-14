@@ -342,6 +342,30 @@ fn load_external_module(
     // Create a synthetic module scope.
     let scope_id = st.push_scope(ScopeKind::Module(iface.module_name.clone()));
 
+    // Recursively resolve `@uses` dependencies so transitive USE
+    // chains see re-exported symbols. Each dep becomes a
+    // UseAssociation on this scope, exactly like `use foo` inside a
+    // real source module, which makes lookup_in_guarded walk into
+    // the dep's symbols. Without this, `USE amod_middle` where
+    // middle does `use amod_base` never sees amod_base's symbols.
+    for dep in &iface.dependencies {
+        if let Some(dep_scope) = load_external_module(st, dep, search_paths, type_layouts) {
+            st.enter_scope(scope_id);
+            // Re-export every public symbol of the dep by name, like
+            // a bare `use <dep>` in source. The transitive lookup in
+            // SymbolTable::lookup_in_guarded handles onward chaining.
+            for (name, sym) in st.scope(dep_scope).symbols.iter().map(|(n, s)| (n.clone(), s.clone())).collect::<Vec<_>>() {
+                if matches!(sym.attrs.access, Access::Private) { continue; }
+                st.add_use_association(crate::sema::symtab::UseAssociation {
+                    local_name: name.clone(),
+                    original_name: name,
+                    source_scope: dep_scope,
+                    is_submodule_access: false,
+                });
+            }
+        }
+    }
+
     // Populate variables and parameters.
     for var in &iface.variables {
         let kind = if var.is_parameter { SymbolKind::Parameter } else { SymbolKind::Variable };
@@ -366,7 +390,12 @@ fn load_external_module(
         });
     }
 
-    // Populate procedures.
+    // Populate procedures. Each proc is defined as a symbol in the
+    // module scope AND given its own Function/Subroutine scope whose
+    // symbols carry the argument type_info. The dedicated scope is
+    // what `resolve_generic_call` walks to match argument types at
+    // call sites — without it, cross-TU generic dispatch sees no
+    // candidates and fails.
     for proc in &iface.procedures {
         let attrs = SymbolAttrs {
             access: Access::Public,
@@ -385,9 +414,40 @@ fn load_external_module(
             attrs,
             defined_at: dummy_span,
             scope: scope_id,
-            arg_names,
+            arg_names: arg_names.clone(),
             const_value: None,
         });
+        // Synthesise a Function/Subroutine scope for this procedure
+        // so arg types survive to generic dispatch.
+        let proc_scope_kind = match &proc.kind {
+            crate::sema::symtab::SymbolKind::Function => ScopeKind::Function(proc.name.clone()),
+            crate::sema::symtab::SymbolKind::Subroutine => ScopeKind::Subroutine(proc.name.clone()),
+            _ => continue,
+        };
+        let proc_scope = st.push_scope(proc_scope_kind);
+        st.scope_mut(proc_scope).arg_order = arg_names.clone();
+        for arg in &proc.args {
+            if arg.hidden { continue; }
+            let arg_attrs = SymbolAttrs {
+                intent: arg.intent,
+                optional: arg.optional,
+                value: arg.value,
+                allocatable: arg.allocatable,
+                pointer: arg.pointer,
+                ..Default::default()
+            };
+            let _ = st.define(Symbol {
+                name: arg.name.clone(),
+                kind: crate::sema::symtab::SymbolKind::Variable,
+                type_info: arg.type_info.clone(),
+                attrs: arg_attrs,
+                defined_at: dummy_span,
+                scope: proc_scope,
+                arg_names: vec![],
+                const_value: None,
+            });
+        }
+        st.pop_scope();
     }
 
     // Register type layouts.
@@ -406,6 +466,27 @@ fn load_external_module(
             defined_at: dummy_span,
             scope: scope_id,
             arg_names: vec![],
+            const_value: None,
+        });
+    }
+
+    // Register named generic interfaces. The specifics list rides
+    // in `arg_names` to match how intra-file INTERFACE blocks are
+    // stored by process_decls — `resolve_generic_call` reads it
+    // when dispatching a call through the generic name.
+    for iface_def in &iface.interfaces {
+        let attrs = SymbolAttrs {
+            access: Access::Public,
+            ..Default::default()
+        };
+        let _ = st.define(Symbol {
+            name: iface_def.name.clone(),
+            kind: SymbolKind::NamedInterface,
+            type_info: None,
+            attrs,
+            defined_at: dummy_span,
+            scope: scope_id,
+            arg_names: iface_def.specifics.clone(),
             const_value: None,
         });
     }
