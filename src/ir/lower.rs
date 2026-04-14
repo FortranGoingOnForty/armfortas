@@ -76,6 +76,14 @@ struct LocalInfo {
     /// cannot carry a Fortran `POINTER` attribute's semantics
     /// (reassociation via `=>`, dereference on plain assignment).
     is_pointer: bool,
+    /// Per-dimension runtime upper bound (i64 value id) for arrays
+    /// whose bounds are not compile-time constants — most commonly
+    /// explicit-shape dummies like `xs(n)` where `n` is a dummy
+    /// argument. When `Some`, bounds checks and cumulative-stride
+    /// computation consult this value instead of `dims[i].1`.
+    /// Empty vec (or an all-`None` vec) means the compile-time
+    /// `dims` is authoritative. Parallel to `dims`.
+    runtime_dim_upper: Vec<Option<ValueId>>,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -175,11 +183,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
     }
 
     fn insert_param_by_ref(&mut self, name: String, addr: ValueId, ty: IrType) {
-        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+        self.locals.insert(name, LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: true, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
     }
 
     fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
@@ -752,7 +760,7 @@ fn install_common_locals(
                     by_ref: false,
                     char_kind: CharKind::None,
                     derived_type: None,
-                    inline_const: None, is_pointer: false,
+                    inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                 });
             }
         }
@@ -852,7 +860,7 @@ fn install_equivalence_locals(
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
-                        inline_const: None, is_pointer: false,
+                        inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                     });
                 }
             }
@@ -1100,7 +1108,7 @@ fn collect_implicit_locals(
                     char_kind: CharKind::Fixed(1),
                     derived_type: None,
                     inline_const: None,
-                    is_pointer: false,
+                    is_pointer: false, runtime_dim_upper: vec![],
                 });
                 continue;
             }
@@ -1775,11 +1783,21 @@ fn lower_unit(
                         let info = LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
-                            char_kind: ck, derived_type: dt_name, inline_const: None, is_pointer: false,
+                            char_kind: ck, derived_type: dt_name, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         };
                         ctx.locals.insert(pname.clone(), info);
                     }
                 }
+                // Explicit-shape dummies whose upper bound is itself
+                // a (non-const) dummy argument — e.g. `xs(n)` — need
+                // the bound evaluated at runtime on function entry.
+                // arg_dims_from_decls falls back to (1, 1) when the
+                // bound isn't const-foldable, which would produce
+                // spurious bounds-check failures. Walk every by_ref
+                // dummy, lower its bound expressions now (all other
+                // dummies are already in ctx.locals), and stash the
+                // i64 result into runtime_dim_upper.
+                install_runtime_dim_bounds(&mut b, &mut ctx.locals, decls, &visible_param_consts, ctx.st);
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
@@ -1991,10 +2009,11 @@ fn lower_unit(
                         ctx.locals.insert(pname.clone(), LocalInfo {
                             addr: slot, ty: elem_ty.clone(),
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts), allocatable: false, descriptor_arg: uses_descriptor, by_ref: true,
-                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None, is_pointer: false,
+                            char_kind: CharKind::None, derived_type: dt_name, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                     }
                 }
+                install_runtime_dim_bounds(&mut b, &mut ctx.locals, decls, &visible_param_consts, ctx.st);
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
 
@@ -2012,7 +2031,7 @@ fn lower_unit(
                         by_ref: false,
                         char_kind: CharKind::None,
                         derived_type: None,
-                        inline_const: None, is_pointer: false,
+                        inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                     });
                     // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
                 } else if let Some(dt_name) = derived_type_name_for_return(return_type) {
@@ -2038,7 +2057,7 @@ fn lower_unit(
                         char_kind: CharKind::None,
                         derived_type: Some(dt_name),
                         inline_const: None,
-                        is_pointer: false,
+                        is_pointer: false, runtime_dim_upper: vec![],
                     });
                     ctx.result_addr = Some(result_addr);
                     ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
@@ -2466,7 +2485,7 @@ fn install_host_param_consts(
                 char_kind: CharKind::None,
                 derived_type: None,
                 inline_const: Some(*value),
-                is_pointer: false,
+                is_pointer: false, runtime_dim_upper: vec![],
             },
         );
     }
@@ -2872,7 +2891,7 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: ck, derived_type: None, inline_const: None, is_pointer: false,
+        char_kind: ck, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
     });
 }
 
@@ -3023,7 +3042,7 @@ fn install_globals_as_locals(
                                     char_kind: CharKind::Fixed(1),
                                     derived_type: None,
                                     inline_const: None,
-                                    is_pointer: false,
+                                    is_pointer: false, runtime_dim_upper: vec![],
                                 });
                             } else {
                                 let ty = IrType::Int(IntWidth::I32);
@@ -3040,7 +3059,7 @@ fn install_globals_as_locals(
                                     char_kind: CharKind::None,
                                     derived_type: None,
                                     inline_const: Some(ConstScalar::Int(cv as i128)),
-                                    is_pointer: false,
+                                    is_pointer: false, runtime_dim_upper: vec![],
                                 });
                             }
                             installed_from.insert(local_key, mod_key);
@@ -3171,7 +3190,7 @@ fn alloc_decls(
                         char_kind: CharKind::None,
                         derived_type: None,
                         inline_const: None,
-                        is_pointer: true,
+                        is_pointer: true, runtime_dim_upper: vec![],
                     });
                     continue;
                 }
@@ -3200,7 +3219,7 @@ fn alloc_decls(
                             char_kind: CharKind::None,
                             derived_type: Some(type_name.clone()),
                             inline_const: None,
-                            is_pointer: true,
+                            is_pointer: true, runtime_dim_upper: vec![],
                         });
                         continue;
                     }
@@ -3215,7 +3234,7 @@ fn alloc_decls(
                     locals.insert(key, LocalInfo {
                         addr, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false,
-                        char_kind: CharKind::Deferred, derived_type: None, inline_const: None, is_pointer: false,
+                        char_kind: CharKind::Deferred, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                     });
                     continue;
                 } else if let Some(len) = char_len {
@@ -3266,7 +3285,7 @@ fn alloc_decls(
                             by_ref: false,
                             char_kind: CharKind::Fixed(len),
                             derived_type: None,
-                            inline_const: None, is_pointer: false,
+                            inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                         continue;
                     }
@@ -3286,7 +3305,7 @@ fn alloc_decls(
                         locals.insert(key, LocalInfo {
                             addr, ty: IrType::Int(IntWidth::I8),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None, is_pointer: false,
+                            char_kind: CharKind::Fixed(len), derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                         continue; // skip normal path
                     }
@@ -3300,7 +3319,7 @@ fn alloc_decls(
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts);
@@ -3321,12 +3340,12 @@ fn alloc_decls(
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                     } else {
                         // Small array: stack allocation.
                         let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
                     // Derived type variable: allocate struct-sized byte array.
@@ -3343,12 +3362,12 @@ fn alloc_decls(
                             descriptor_arg: false,
                             by_ref: false,
                             char_kind: CharKind::None,
-                            derived_type: Some(type_name.clone()), inline_const: None, is_pointer: false,
+                            derived_type: Some(type_name.clone()), inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                     } else {
                         // Unknown derived type — fall back to 8-byte alloca.
                         let addr = b.alloca(IrType::Int(IntWidth::I64));
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                     }
                 } else if is_pointer_attr && array_spec.is_none() {
                     // Scalar Fortran POINTER: allocate a pointer slot
@@ -3379,7 +3398,7 @@ fn alloc_decls(
                         char_kind: CharKind::None,
                         derived_type: None,
                         inline_const: None,
-                        is_pointer: true,
+                        is_pointer: true, runtime_dim_upper: vec![],
                     });
                 } else {
                     // Scalar variable. Three sub-cases:
@@ -3412,7 +3431,7 @@ fn alloc_decls(
                                 addr, ty: elem_ty.clone(),
                                 dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
                                 char_kind: CharKind::None, derived_type: None,
-                                inline_const: Some(value), is_pointer: false,
+                                inline_const: Some(value), is_pointer: false, runtime_dim_upper: vec![],
                             });
                             continue;
                         }
@@ -3434,14 +3453,14 @@ fn alloc_decls(
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                     } else {
                         let addr = b.alloca(elem_ty.clone());
                         locals.insert(key, LocalInfo {
                             addr, ty: elem_ty.clone(),
                             dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false,
-                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false,
+                            char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                         });
                     }
                 }
@@ -5214,6 +5233,88 @@ fn arg_dims_from_decls(
     Vec::new()
 }
 
+/// Post-pass run after normal dummy-arg locals are registered. For
+/// every by_ref dummy whose declared array_spec is `ArraySpec::Explicit`
+/// with a non-const upper bound (typically another dummy, e.g. `xs(n)`),
+/// lower the bound expression and store the i64 result into the dummy's
+/// `runtime_dim_upper`. Subsequent bounds checks and stride computation
+/// consult this value instead of the (1, 1) fallback that
+/// `arg_dims_from_decls` emits when a bound is not compile-time
+/// resolvable.
+fn install_runtime_dim_bounds(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) {
+    use crate::ast::decl::{Attribute, ArraySpec};
+    for decl in decls {
+        let Decl::TypeDecl { attrs, entities, .. } = &decl.node else { continue; };
+        let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
+        });
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            let Some(info) = locals.get(&key) else { continue; };
+            if !info.by_ref { continue; }
+            if info.descriptor_arg { continue; }
+            let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else { continue; };
+
+            let mut runtime = Vec::with_capacity(specs.len());
+            let mut any_runtime = false;
+            for (_dim_idx, spec) in specs.iter().enumerate() {
+                let upper_expr = match spec {
+                    ArraySpec::Explicit { upper, .. } => Some(upper),
+                    _ => None,
+                };
+                let Some(upper_expr) = upper_expr else {
+                    runtime.push(None);
+                    continue;
+                };
+                // Skip compile-time-resolvable bounds — the static
+                // path through `info.dims` already has the right value.
+                // That covers both literals and PARAMETER references
+                // (e.g. `xs(n)` where n is a module parameter).
+                if matches!(upper_expr.node, Expr::IntegerLiteral { .. }) {
+                    runtime.push(None);
+                    continue;
+                }
+                if eval_const_scalar(upper_expr, visible_param_consts).is_some() {
+                    runtime.push(None);
+                    continue;
+                }
+                // Only emit runtime bounds when the referenced name
+                // is a dummy already in `locals`. Anything else (host
+                // globals, uninstalled host_param_consts, unresolved
+                // names) would lower to const_i32(0) here and poison
+                // the bounds check.
+                let resolvable = match &upper_expr.node {
+                    Expr::Name { name } => locals.contains_key(&name.to_lowercase()),
+                    _ => true, // arithmetic on dummies — best-effort
+                };
+                if !resolvable {
+                    runtime.push(None);
+                    continue;
+                }
+                let val = lower_expr(b, locals, upper_expr, st);
+                let as_i64 = match b.func().value_type(val) {
+                    Some(IrType::Int(IntWidth::I64)) => val,
+                    Some(IrType::Int(_)) => b.int_extend(val, IntWidth::I64, true),
+                    _ => val,
+                };
+                runtime.push(Some(as_i64));
+                any_runtime = true;
+            }
+            if any_runtime {
+                if let Some(slot) = locals.get_mut(&key) {
+                    slot.runtime_dim_upper = runtime;
+                }
+            }
+        }
+    }
+}
+
 /// Check if a dummy argument is a derived type, returning the type name if so.
 fn arg_derived_type_name(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> Option<String> {
     let key = arg_name.to_lowercase();
@@ -5455,6 +5556,7 @@ fn install_host_ref_locals(
             derived_type: info.derived_type.clone(),
             inline_const: None,
             is_pointer: info.is_pointer,
+            runtime_dim_upper: vec![],
         });
     }
 }
@@ -6583,7 +6685,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         descriptor_arg: false,
                         by_ref: false,
                         char_kind: CharKind::None,
-                        derived_type: None, inline_const: None, is_pointer: false,
+                        derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                     });
                 }
             }
@@ -6920,7 +7022,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
-                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+                ctx.locals.insert(name.to_lowercase(), LocalInfo { addr, ty, dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
             }
             lower_stmts(b, ctx, body);
 
@@ -7657,7 +7759,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let key = var_name.to_lowercase();
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
             let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false });
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
             addr
         });
 
@@ -7928,9 +8030,13 @@ fn compute_flat_elem_offset(
         return flat.unwrap_or_else(|| b.const_i64(0));
     }
 
-    // Static-shape path: fold strides at compile time.
+    // Static-shape path: fold strides at compile time, but fall back
+    // to runtime values for any dim whose upper bound is non-const
+    // (e.g. `xs(n)` where `n` is a dummy arg). See
+    // `install_runtime_dim_bounds`.
     let mut flat_offset: Option<ValueId> = None;
-    let mut stride: i64 = 1;
+    let mut stride_static: i64 = 1;
+    let mut stride_dynamic: Option<ValueId> = None;
 
     for (dim_idx, arg) in args.iter().enumerate() {
         let subscript = match &arg.value {
@@ -7944,17 +8050,30 @@ fn compute_flat_elem_offset(
         } else {
             (1, 1)
         };
-        let upper = lower + extent - 1;
         let lower_val = b.const_i64(lower);
-        let upper_val = b.const_i64(upper);
+
+        let runtime_upper = info
+            .runtime_dim_upper
+            .get(dim_idx)
+            .and_then(|u| *u);
+
+        let upper_val = match runtime_upper {
+            Some(v) => v,
+            None => b.const_i64(lower + extent - 1),
+        };
         emit_bounds_check(b, subscript64, lower_val, upper_val);
         let adjusted = b.isub(subscript64, lower_val);
 
-        let dim_offset = if stride == 1 {
-            adjusted
-        } else {
-            let stride_val = b.const_i64(stride);
-            b.imul(adjusted, stride_val)
+        // Accumulate the offset. If we have any runtime stride on
+        // the cumulative product, we're in runtime-stride territory
+        // for the rest of the dims too.
+        let dim_offset = match (&stride_dynamic, stride_static) {
+            (None, 1) => adjusted,
+            (None, s) => {
+                let sval = b.const_i64(s);
+                b.imul(adjusted, sval)
+            }
+            (Some(sdyn), _) => b.imul(adjusted, *sdyn),
         };
 
         flat_offset = Some(match flat_offset {
@@ -7962,7 +8081,34 @@ fn compute_flat_elem_offset(
             None => dim_offset,
         });
 
-        stride *= extent;
+        // Update the cumulative stride for the NEXT dim.
+        //   stride_next = stride * (upper - lower + 1)
+        match runtime_upper {
+            Some(up) => {
+                // Transition to (or stay in) runtime-stride.
+                let span = b.isub(up, lower_val);
+                let one64 = b.const_i64(1);
+                let ext = b.iadd(span, one64);
+                let new_dyn = match stride_dynamic {
+                    Some(prev) => b.imul(prev, ext),
+                    None if stride_static == 1 => ext,
+                    None => {
+                        let sprev = b.const_i64(stride_static);
+                        b.imul(sprev, ext)
+                    }
+                };
+                stride_dynamic = Some(new_dyn);
+                stride_static = 1; // retired; dynamic path takes over
+            }
+            None => {
+                if stride_dynamic.is_some() {
+                    let ext = b.const_i64(extent);
+                    stride_dynamic = Some(b.imul(stride_dynamic.unwrap(), ext));
+                } else {
+                    stride_static *= extent;
+                }
+            }
+        }
     }
 
     flat_offset.unwrap_or_else(|| b.const_i64(0))
@@ -8148,7 +8294,7 @@ fn store_ac_implied_do(
         descriptor_arg: false,
         by_ref: false,
         char_kind: CharKind::None,
-        derived_type: None, inline_const: None, is_pointer: false,
+        derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
     });
 
     // Loop skeleton: check → body → exit. Mirrors the regular DO
@@ -10672,7 +10818,7 @@ fn lower_forall_nested(
             ctx.locals.insert(key.clone(), LocalInfo {
                 addr, ty: IrType::Int(IntWidth::I32), dims: vec![],
                 allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None,
-                derived_type: None, inline_const: None, is_pointer: false,
+                derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
             });
             addr
         });
