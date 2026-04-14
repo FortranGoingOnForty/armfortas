@@ -130,6 +130,10 @@ struct LowerCtx<'a> {
     /// Call sites append the string length as a hidden i64 arg for
     /// each flagged position.
     char_len_star_params: &'a HashMap<String, Vec<bool>>,
+    /// Per-callee list of host-associated variable names the callee
+    /// needs threaded in as hidden trailing pointer args. See the
+    /// closure-passing ABI documented on `lower_file::contained_host_refs`.
+    contained_host_refs: &'a HashMap<String, Vec<String>>,
     /// Map from Fortran statement label (u64) to the IR basic block that
     /// begins at that label. Pre-populated by `collect_label_blocks` before
     /// lowering so that GOTO can branch forward as well as backward.
@@ -147,6 +151,7 @@ impl<'a> LowerCtx<'a> {
         internal_funcs: &'a HashMap<String, u32>,
         elemental_funcs: &'a HashSet<String>,
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
+        contained_host_refs: &'a HashMap<String, Vec<String>>,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -164,6 +169,7 @@ impl<'a> LowerCtx<'a> {
             internal_funcs,
             elemental_funcs,
             char_len_star_params,
+            contained_host_refs,
             label_blocks: HashMap::new(),
         }
     }
@@ -306,6 +312,18 @@ pub fn lower_file(
         collect_internal_func_names(&unit.node, &mut internal_funcs, &mut next_internal_idx);
     }
 
+    // Host association: for every contained procedure, compute the set
+    // of host-local variables it references. Each such variable becomes
+    // a hidden trailing pointer parameter in the callee signature; call
+    // sites inside the host (or sibling contained procs) append the
+    // address of the matching variable from their own locals. This is
+    // the standard closure-passing ABI for Fortran contained
+    // subprograms (F2018 §19.5). Keyed by lowercase callee name.
+    let mut contained_host_refs: HashMap<String, Vec<String>> = HashMap::new();
+    for unit in units {
+        walk_contained_host_refs(&unit.node, &mut contained_host_refs);
+    }
+
     // Pass 2: lower each unit. Modules already had their globals
     // installed in pass 1; lower_unit's Module arm is a no-op.
     // Top-level units have no host, so an empty host_uses slice.
@@ -320,6 +338,7 @@ pub fn lower_file(
             type_layouts,
             &no_host,
             &no_host_param_consts,
+            &no_host,
             None,
             &alloc_return_funcs,
             &optional_params,
@@ -327,10 +346,47 @@ pub fn lower_file(
             &internal_funcs,
             &elemental_funcs,
             &char_len_star_params,
+            &contained_host_refs,
             false,
         );
     }
     (module, globals)
+}
+
+/// Recursively walk `unit` and, for every contained subprogram, record
+/// the ordered list of immediate-host-local variable names it reads or
+/// writes. Subprograms with no host-local references get an empty
+/// entry (still inserted, so call sites can cheaply check membership).
+fn walk_contained_host_refs(
+    unit: &ProgramUnit,
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    let (host_decls, contains): (&[crate::ast::decl::SpannedDecl], &[SpannedUnit]) = match unit {
+        ProgramUnit::Program { decls, contains, .. } => (decls, contains),
+        ProgramUnit::Subroutine { decls, contains, .. } => (decls, contains),
+        ProgramUnit::Function { decls, contains, .. } => (decls, contains),
+        ProgramUnit::Module { contains, .. } => {
+            // Module procedures access module globals directly (not via
+            // host association closures). Recurse into each so any
+            // nested contains still gets analyzed against its own host.
+            for sub in contains {
+                walk_contained_host_refs(&sub.node, out);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for sub in contains {
+        if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } = &sub.node {
+            let mut refs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+            collect_host_references(&sub.node, host_decls, &mut refs_set);
+            let mut refs: Vec<String> = refs_set.into_iter().collect();
+            // Deterministic order across runs — sorted lowercase.
+            refs.sort();
+            out.insert(name.to_lowercase(), refs);
+        }
+        walk_contained_host_refs(&sub.node, out);
+    }
 }
 
 fn collect_internal_func_names(
@@ -829,6 +885,141 @@ pub struct ModuleGlobalInfo {
 /// Array variables with non-literal initializers or dynamic dims
 /// are currently rejected by falling through to scalar emission —
 /// that's a known gap tracked for follow-up.
+/// Collect names that a contained subprogram references but doesn't
+/// declare locally (host-associated names).
+fn collect_host_references(
+    sub: &ProgramUnit,
+    host_decls: &[crate::ast::decl::SpannedDecl],
+    refs: &mut std::collections::HashSet<String>,
+) {
+    // Collect host-declared names.
+    let mut host_names = std::collections::HashSet::new();
+    for d in host_decls {
+        if let Decl::TypeDecl { entities, .. } = &d.node {
+            for e in entities {
+                host_names.insert(e.name.to_lowercase());
+            }
+        }
+    }
+    // Collect names declared locally in the subprogram.
+    let (sub_decls, sub_body, sub_args): (
+        &[crate::ast::decl::SpannedDecl],
+        &[crate::ast::stmt::SpannedStmt],
+        Vec<String>,
+    ) = match sub {
+        ProgramUnit::Subroutine { decls, body, args, .. }
+        | ProgramUnit::Function { decls, body, args, .. } => {
+            let arg_names: Vec<String> = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
+            (decls, body, arg_names)
+        }
+        _ => return,
+    };
+    let mut sub_locals = std::collections::HashSet::new();
+    for n in sub_args { sub_locals.insert(n); }
+    for d in sub_decls {
+        if let Decl::TypeDecl { entities, .. } = &d.node {
+            for e in entities {
+                sub_locals.insert(e.name.to_lowercase());
+            }
+        }
+    }
+    // Walk the body looking for Name refs in host but not sub.
+    for stmt in sub_body {
+        collect_host_refs_stmt(stmt, &host_names, &sub_locals, refs);
+    }
+}
+
+fn collect_host_refs_stmt(
+    stmt: &crate::ast::stmt::SpannedStmt,
+    host_names: &std::collections::HashSet<String>,
+    sub_locals: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        Stmt::Assignment { target, value } => {
+            collect_host_refs_expr(target, host_names, sub_locals, refs);
+            collect_host_refs_expr(value, host_names, sub_locals, refs);
+        }
+        Stmt::Print { items, .. } => {
+            for e in items { collect_host_refs_expr(e, host_names, sub_locals, refs); }
+        }
+        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+            for e in items { collect_host_refs_expr(e, host_names, sub_locals, refs); }
+        }
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            collect_host_refs_expr(condition, host_names, sub_locals, refs);
+            for s in then_body { collect_host_refs_stmt(s, host_names, sub_locals, refs); }
+            for (c, b) in else_ifs {
+                collect_host_refs_expr(c, host_names, sub_locals, refs);
+                for s in b { collect_host_refs_stmt(s, host_names, sub_locals, refs); }
+            }
+            if let Some(b) = else_body {
+                for s in b { collect_host_refs_stmt(s, host_names, sub_locals, refs); }
+            }
+        }
+        Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. }
+        | Stmt::DoConcurrent { body, .. } | Stmt::Block { body, .. } => {
+            for s in body { collect_host_refs_stmt(s, host_names, sub_locals, refs); }
+        }
+        Stmt::Call { args, .. } => {
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_host_refs_expr(e, host_names, sub_locals, refs);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_host_refs_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    host_names: &std::collections::HashSet<String>,
+    sub_locals: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if host_names.contains(&key) && !sub_locals.contains(&key) {
+                refs.insert(key);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_host_refs_expr(left, host_names, sub_locals, refs);
+            collect_host_refs_expr(right, host_names, sub_locals, refs);
+        }
+        Expr::UnaryOp { operand, .. } => {
+            collect_host_refs_expr(operand, host_names, sub_locals, refs);
+        }
+        Expr::FunctionCall { callee, args } => {
+            // Fortran parses `arr(i)` as a function call: the "callee"
+            // is the array name. When the callee resolves to a host
+            // variable (not a function name), it's a host-associated
+            // array access. Always walk the callee name so both array
+            // subscripts and real function calls pull host refs from
+            // their subexpression tree.
+            collect_host_refs_expr(callee, host_names, sub_locals, refs);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_host_refs_expr(e, host_names, sub_locals, refs);
+                }
+            }
+        }
+        Expr::ComponentAccess { base, .. } => {
+            collect_host_refs_expr(base, host_names, sub_locals, refs);
+        }
+        Expr::ParenExpr { inner } => {
+            collect_host_refs_expr(inner, host_names, sub_locals, refs);
+        }
+        _ => {}
+    }
+}
+
 fn collect_module_globals(
     module: &mut Module,
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
@@ -1150,6 +1341,11 @@ fn lower_unit(
     // top-level call from lower_file passes an empty slice.
     host_uses: &[crate::ast::decl::SpannedDecl],
     host_param_consts: &HashMap<String, ConstScalar>,
+    // `host_decls`: decls of the immediate enclosing program unit.
+    // Used by contained subprograms to resolve element type, dims,
+    // and character-kind for each host-associated variable the
+    // closure-passing ABI threads in as a hidden pointer param.
+    host_decls: &[crate::ast::decl::SpannedDecl],
     host_module: Option<&str>,
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
@@ -1157,6 +1353,10 @@ fn lower_unit(
     internal_funcs: &HashMap<String, u32>,
     elemental_funcs: &HashSet<String>,
     char_len_star_params: &HashMap<String, Vec<bool>>,
+    // `contained_host_refs`: per-callee ordered list of host-local
+    // names it reads or writes. Drives both callee signature
+    // (hidden trailing pointer params) and call-site arg list.
+    contained_host_refs: &HashMap<String, Vec<String>>,
     internal_only: bool,
 ) {
     match &unit.node {
@@ -1165,14 +1365,9 @@ fn lower_unit(
             let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params, contained_host_refs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
-            // Combined USE list for this unit: host_uses inherited
-            // from the program ancestry + this unit's own uses.
-            // Programs themselves have no host, so host_uses is
-            // typically empty here, but a Program declared inside
-            // a Module (rare but legal) would inherit module uses.
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
 
@@ -1206,9 +1401,10 @@ fn lower_unit(
                 module.add_global(pg.global);
             }
 
-            // Lower CONTAINS subprograms with this unit's combined
-            // uses as their host_uses, so host association threads
-            // through Program → contained Subroutine/Function.
+            // Lower CONTAINS subprograms. They receive `decls` as their
+            // host_decls so the closure-passing ABI can resolve each
+            // host-referenced variable's type/dims from the host's
+            // declarations.
             for sub in contains {
                 lower_unit(
                     module,
@@ -1218,6 +1414,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
+                    decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -1225,6 +1422,7 @@ fn lower_unit(
                     internal_funcs,
                     elemental_funcs,
                     char_len_star_params,
+                    contained_host_refs,
                     true,
                 );
             }
@@ -1285,19 +1483,35 @@ fn lower_unit(
                 }
             }
 
+            // Host-association closure params. Trailing pointer params,
+            // one per host-local variable this contained proc reads or
+            // writes. Order matches contained_host_refs[name].
+            let host_ref_infos = build_host_ref_params(
+                name,
+                host_decls,
+                host_param_consts,
+                contained_host_refs,
+                params.len() as u32,
+                st,
+                &mut params,
+            );
+
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params, contained_host_refs);
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
 
             // Collect param info: (name, param_id, elem_type, is_value).
+            // Skip hidden params: __len_* (character-length) and __host_*
+            // (host-association closure pointers) — they are installed
+            // by separate paths below.
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
-                .filter(|p| !p.name.starts_with("__len_")) // skip hidden params
+                .filter(|p| !p.name.starts_with("__len_") && !p.name.starts_with("__host_"))
                 .map(|p| {
                     let pname = p.name.to_lowercase();
                     let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
@@ -1348,6 +1562,12 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                // Install host-association by_ref locals before alloc_decls
+                // so any same-named callee local (shouldn't occur per F
+                // scoping rules) is short-circuited, and so init_decls has
+                // them available for initialization expressions that
+                // reference host vars.
+                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
                 alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
@@ -1378,7 +1598,8 @@ fn lower_unit(
             // Lower nested CONTAINS subprograms (this was a latent
             // bug — the previous code only walked Program::contains).
             // Each nested sub inherits this subroutine's combined
-            // host_uses + own uses.
+            // host_uses + own uses, and uses our `decls` as host_decls
+            // so the closure-passing ABI can resolve host-ref metadata.
             for sub in contains {
                 lower_unit(
                     module,
@@ -1388,6 +1609,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
+                    decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -1395,6 +1617,7 @@ fn lower_unit(
                     internal_funcs,
                     elemental_funcs,
                     char_len_star_params,
+                    contained_host_refs,
                     true,
                 );
             }
@@ -1487,21 +1710,37 @@ fn lower_unit(
                 (params, ret_ty)
             };
 
+            // Host-association closure params for contained functions.
+            // Trailing pointer params, one per host-local variable the
+            // body reads or writes. See `build_host_ref_params`.
+            let mut func_params = func_params;
+            let host_ref_infos = build_host_ref_params(
+                name,
+                host_decls,
+                host_param_consts,
+                contained_host_refs,
+                func_params.len() as u32,
+                st,
+                &mut func_params,
+            );
+
             let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
             // Propagate PURE/ELEMENTAL from AST prefix.
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             func.internal_only = internal_only;
-            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params);
+            let mut ctx = LowerCtx::new(st, globals, type_layouts, alloc_return_funcs, optional_params, descriptor_params, internal_funcs, elemental_funcs, char_len_star_params, contained_host_refs);
             ctx.is_alloc_return = is_alloc_return;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
 
-            // Build param_info skipping the sret param (it's not a Fortran variable).
+            // Build param_info skipping the sret param (not a Fortran
+            // variable) and __host_* closure-passing pointers (installed
+            // via install_host_ref_locals below).
             let param_info: Vec<(String, ValueId, IrType, bool)> = func.params.iter()
-                .filter(|p| p.name != "_sret")
+                .filter(|p| p.name != "_sret" && !p.name.starts_with("__host_"))
                 .map(|p| {
                     let pname = p.name.to_lowercase();
                     let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
@@ -1563,6 +1802,7 @@ fn lower_unit(
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
                 alloc_decls(&mut b, &mut ctx.locals, decls, &visible_param_consts, type_layouts, &mut pending_globals, &func_name, st);
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
@@ -1597,7 +1837,8 @@ fn lower_unit(
                 module.add_global(pg.global);
             }
 
-            // Lower nested CONTAINS subprograms.
+            // Lower nested CONTAINS subprograms. `decls` becomes the
+            // host_decls for closure-passing host association.
             for sub in contains {
                 lower_unit(
                     module,
@@ -1607,6 +1848,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
+                    decls,
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -1614,6 +1856,7 @@ fn lower_unit(
                     internal_funcs,
                     elemental_funcs,
                     char_len_star_params,
+                    contained_host_refs,
                     true,
                 );
             }
@@ -1630,6 +1873,10 @@ fn lower_unit(
                 ProgramUnit::Module { name, .. } => Some(name.as_str()),
                 _ => None,
             };
+            // Module procedures don't have host-local closure association;
+            // they resolve module-level names through globals. Pass an
+            // empty host_decls slice.
+            let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
             for sub in contains {
                 lower_unit(
                     module,
@@ -1639,6 +1886,7 @@ fn lower_unit(
                     type_layouts,
                     &combined_uses,
                     &visible_param_consts,
+                    &no_host_decls,
                     module_name,
                     alloc_return_funcs,
                     optional_params,
@@ -1646,6 +1894,7 @@ fn lower_unit(
                     internal_funcs,
                     elemental_funcs,
                     char_len_star_params,
+                    contained_host_refs,
                     false,
                 );
             }
@@ -4479,6 +4728,217 @@ fn arg_derived_type_name(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]
     None
 }
 
+/// Does the named variable in `decls` carry the ALLOCATABLE attribute
+/// (either on the type-decl attrs or the entity)? Used by host-association
+/// closure-passing to decide whether the hidden pointer param should
+/// carry a descriptor (384 bytes) or a raw element pointer.
+fn decl_is_allocatable(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::Attribute;
+    let key = name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Does the named variable in `decls` carry the POINTER attribute?
+fn decl_is_pointer(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::Attribute;
+    let key = name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Metadata for one host-associated variable threaded into a contained
+/// procedure via closure passing. Assembled from the host's declaration
+/// list once per (callee, host-var) pair; the contained proc uses it to
+/// allocate a spill slot and insert a by_ref LocalInfo so all name
+/// references inside the body go through the host's storage via the
+/// hidden pointer parameter.
+#[derive(Clone)]
+struct HostRefParamInfo {
+    /// Lowercase host-var name (also the name inside the contained
+    /// proc, since Fortran host association preserves the identifier).
+    name: String,
+    /// SSA value id of the hidden parameter carrying the pointer.
+    id: ValueId,
+    /// Element type of the host variable (scalar type, or the element
+    /// type of an array).
+    elem_ty: IrType,
+    /// Array bounds. Empty for scalars.
+    dims: Vec<(i64, i64)>,
+    char_kind: CharKind,
+    derived_type: Option<String>,
+    /// True when the host var is represented by a 384-byte
+    /// ArrayDescriptor (assumed-shape, deferred, allocatable array).
+    descriptor_arg: bool,
+    allocatable: bool,
+    is_pointer: bool,
+}
+
+/// Build the ordered list of host-association hidden parameters for
+/// `callee_name` against `host_decls`. The order must match
+/// `contained_host_refs[callee_name]` exactly so call sites and the
+/// callee agree on positional assignment. `starting_id` is the next
+/// free SSA value id after any other params (normal + hidden-length).
+fn build_host_ref_params(
+    callee_name: &str,
+    host_decls: &[crate::ast::decl::SpannedDecl],
+    host_param_consts: &HashMap<String, ConstScalar>,
+    contained_host_refs: &HashMap<String, Vec<String>>,
+    starting_id: u32,
+    st: &SymbolTable,
+    out_params: &mut Vec<Param>,
+) -> Vec<HostRefParamInfo> {
+    let refs = match contained_host_refs.get(&callee_name.to_lowercase()) {
+        Some(r) if !r.is_empty() => r,
+        _ => return Vec::new(),
+    };
+    if host_decls.is_empty() {
+        // No host decls visible — nothing we can resolve. Refuse
+        // silently so modules with module procedures still lower.
+        return Vec::new();
+    }
+    let host_visible = collect_decl_param_consts_with_host(host_decls, host_param_consts);
+    let mut infos = Vec::with_capacity(refs.len());
+    for (idx, hname) in refs.iter().enumerate() {
+        let elem_ty = arg_type_from_decls(hname, host_decls, Some(st));
+        let uses_desc = arg_uses_descriptor_from_decls(hname, host_decls);
+        let alloc = decl_is_allocatable(hname, host_decls);
+        let ptr_is_pointer = decl_is_pointer(hname, host_decls);
+        let descriptor_arg = uses_desc || alloc;
+        let ptr_ty = if descriptor_arg {
+            IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)))
+        } else {
+            IrType::Ptr(Box::new(elem_ty.clone()))
+        };
+        let pid = ValueId(starting_id + idx as u32);
+        out_params.push(Param {
+            name: format!("__host_{}", hname),
+            ty: ptr_ty,
+            id: pid,
+            fortran_noalias: false,
+        });
+        infos.push(HostRefParamInfo {
+            name: hname.clone(),
+            id: pid,
+            elem_ty,
+            dims: arg_dims_from_decls(hname, host_decls, &host_visible),
+            char_kind: arg_char_kind_from_decls(hname, host_decls),
+            derived_type: arg_derived_type_name(hname, host_decls),
+            descriptor_arg,
+            allocatable: alloc,
+            is_pointer: ptr_is_pointer,
+        });
+    }
+    infos
+}
+
+/// Append trailing pointer args to `arg_vals` matching the callee's
+/// host-association closure signature. For each host-local variable the
+/// callee references, look up its address in the caller's locals and
+/// push it. For caller locals flagged `by_ref` (i.e. the caller is a
+/// sibling contained proc forwarding the same host var), load the
+/// spill slot to recover the original host address. For caller-owned
+/// allocas or descriptor-backed arrays, push the address directly.
+fn append_host_closure_args(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    callee_key: &str,
+    arg_vals: &mut Vec<ValueId>,
+) {
+    append_host_closure_args_raw(
+        b,
+        &ctx.locals,
+        Some(ctx.contained_host_refs),
+        callee_key,
+        arg_vals,
+    );
+}
+
+fn append_host_closure_args_raw(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    callee_key: &str,
+    arg_vals: &mut Vec<ValueId>,
+) {
+    let refs = match contained_host_refs.and_then(|m| m.get(callee_key)) {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+    for hname in refs {
+        let info = match locals.get(hname) {
+            Some(i) => i.clone(),
+            None => {
+                // Should never happen: the host-refs analysis only
+                // records names declared in the host, and every host
+                // scope installs those as locals. Push a null to keep
+                // the ABI alignment consistent rather than panic.
+                let zero = b.const_i64(0);
+                arg_vals.push(zero);
+                continue;
+            }
+        };
+        // Caller-side address resolution: for by_ref locals (we are
+        // a sibling forwarding), load the spill slot to get the host
+        // address. For normal allocas (we are the host), the alloca
+        // id IS the address.
+        let addr = if info.by_ref {
+            b.load(info.addr)
+        } else {
+            info.addr
+        };
+        arg_vals.push(addr);
+    }
+}
+
+/// After a contained proc's normal params are installed, set up a
+/// by_ref LocalInfo for each host-association hidden pointer. The
+/// slot holds the address passed by the caller; reads/writes through
+/// `name` inside the body route through `info.addr → load → element`.
+fn install_host_ref_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    infos: &[HostRefParamInfo],
+) {
+    for info in infos {
+        let slot_ty = if info.descriptor_arg {
+            IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)))
+        } else {
+            IrType::Ptr(Box::new(info.elem_ty.clone()))
+        };
+        let slot = b.alloca(slot_ty);
+        b.store(info.id, slot);
+        locals.insert(info.name.clone(), LocalInfo {
+            addr: slot,
+            ty: info.elem_ty.clone(),
+            dims: info.dims.clone(),
+            allocatable: info.allocatable,
+            descriptor_arg: info.descriptor_arg,
+            by_ref: true,
+            char_kind: info.char_kind.clone(),
+            derived_type: info.derived_type.clone(),
+            inline_const: None,
+            is_pointer: info.is_pointer,
+        });
+    }
+}
+
 /// Check if a callee has VALUE-attributed arguments via its scope in the symbol table.
 /// Returns a Vec<bool> per argument position — true if that arg is VALUE.
 /// Returns None if callee scope not found or no VALUE args.
@@ -5410,6 +5870,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                         }
                     }
+                    // Host-association closure-passing ABI: if the
+                    // callee is a contained procedure, append one
+                    // address per host-local variable it reads or
+                    // writes. Caller must hold the matching variable
+                    // in its own locals — this is guaranteed by the
+                    // host-refs analysis that drove the callee
+                    // signature, since both caller and callee share
+                    // the same enclosing host.
+                    append_host_closure_args(b, ctx, &key, &mut arg_vals);
                     let func_ref = ctx
                         .internal_funcs
                         .get(&key)
@@ -10584,7 +11053,7 @@ fn lower_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, None, None)
+    lower_expr_full(b, locals, expr, st, None, None, None)
 }
 
 fn lower_expr_ctx(
@@ -10592,7 +11061,7 @@ fn lower_expr_ctx(
     ctx: &LowerCtx,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> ValueId {
-    lower_expr_full(b, &ctx.locals, expr, ctx.st, None, Some(ctx.internal_funcs))
+    lower_expr_full(b, &ctx.locals, expr, ctx.st, None, Some(ctx.internal_funcs), Some(ctx.contained_host_refs))
 }
 
 fn lower_expr_tl(
@@ -10602,7 +11071,7 @@ fn lower_expr_tl(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, Some(tl), None)
+    lower_expr_full(b, locals, expr, st, Some(tl), None, None)
 }
 
 fn lower_expr_ctx_tl(
@@ -10617,6 +11086,7 @@ fn lower_expr_ctx_tl(
         ctx.st,
         Some(ctx.type_layouts),
         Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
     )
 }
 
@@ -10627,6 +11097,7 @@ fn lower_expr_full(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
 ) -> ValueId {
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
@@ -10749,8 +11220,8 @@ fn lower_expr_full(
         }
 
         Expr::BinaryOp { op, left, right } => {
-            let mut lhs = lower_expr_full(b, locals, left, st, type_layouts, internal_funcs);
-            let mut rhs = lower_expr_full(b, locals, right, st, type_layouts, internal_funcs);
+            let mut lhs = lower_expr_full(b, locals, left, st, type_layouts, internal_funcs, contained_host_refs);
+            let mut rhs = lower_expr_full(b, locals, right, st, type_layouts, internal_funcs, contained_host_refs);
             let lty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
             let rty = b.func().value_type(rhs).unwrap_or(IrType::Int(IntWidth::I32));
 
@@ -10895,7 +11366,7 @@ fn lower_expr_full(
         }
 
         Expr::UnaryOp { op, operand } => {
-            let val = lower_expr_full(b, locals, operand, st, type_layouts, internal_funcs);
+            let val = lower_expr_full(b, locals, operand, st, type_layouts, internal_funcs, contained_host_refs);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             match (op, &ty) {
                 (UnaryOp::Minus, IrType::Int(_)) => b.ineg(val),
@@ -10906,7 +11377,7 @@ fn lower_expr_full(
             }
         }
 
-        Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs),
+        Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs, contained_host_refs),
 
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
@@ -10955,7 +11426,7 @@ fn lower_expr_full(
                         for (i, arg) in args.iter().enumerate() {
                             if i < layout.fields.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                    let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
+                                    let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs);
                                     let coerced = coerce_to_type(
                                         b,
                                         val,
@@ -11021,7 +11492,7 @@ fn lower_expr_full(
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs") && args.len() == 1 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
-                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs);
+                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs);
                             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                             if is_complex_ty(&ty) {
                                 let fw = complex_float_width(&ty);
@@ -11045,7 +11516,7 @@ fn lower_expr_full(
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
-                            lower_expr_full(b, locals, e, st, type_layouts, internal_funcs)
+                            lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs)
                         }
                         _ => b.const_i32(0),
                     }
@@ -11059,12 +11530,12 @@ fn lower_expr_full(
                 let callee_value_args = callee_value_arg_mask(st, &key);
 
                 // Pass args: by value for VALUE, by reference otherwise.
-                let ref_arg_vals: Vec<ValueId> = args.iter().enumerate().map(|(i, a)| {
+                let mut ref_arg_vals: Vec<ValueId> = args.iter().enumerate().map(|(i, a)| {
                     let is_value = callee_value_args.as_ref().map(|mask| i < mask.len() && mask[i]).unwrap_or(false);
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
                             if is_value {
-                                lower_expr_full(b, locals, e, st, type_layouts, internal_funcs)
+                                lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs)
                             } else {
                                 lower_arg_by_ref(b, locals, e, st)
                             }
@@ -11077,6 +11548,21 @@ fn lower_expr_full(
                 let resolved_name = resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
                     .unwrap_or_else(|| name.clone());
                 let resolved_key = resolved_name.to_lowercase();
+
+                // Host-association closure-passing ABI: append trailing
+                // pointer args for each host-local the callee references.
+                // Prefer the generic-resolved name's map entry; fall back
+                // to the unresolved key so calls that don't go through
+                // generic dispatch still thread host vars.
+                let closure_key = if contained_host_refs
+                    .map(|m| m.contains_key(&resolved_key))
+                    .unwrap_or(false)
+                {
+                    &resolved_key
+                } else {
+                    &key
+                };
+                append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut ref_arg_vals);
 
                 // Look up callee return type from symbol table.
                 let ret_ty = callee_return_ir_type(st, &resolved_key)
@@ -11177,8 +11663,8 @@ fn lower_expr_full(
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);
             let buf = b.alloca(arr_ty);
 
-            let real_raw = lower_expr_full(b, locals, real, st, type_layouts, internal_funcs);
-            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts, internal_funcs);
+            let real_raw = lower_expr_full(b, locals, real, st, type_layouts, internal_funcs, contained_host_refs);
+            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts, internal_funcs, contained_host_refs);
             let real_val = coerce_to_type(b, real_raw, &elem_ty);
             let imag_val = coerce_to_type(b, imag_raw, &elem_ty);
 
