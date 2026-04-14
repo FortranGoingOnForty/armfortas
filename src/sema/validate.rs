@@ -1086,7 +1086,7 @@ fn check_expr_names(
     }
 }
 
-fn is_intrinsic_name(name: &str) -> bool {
+pub fn is_intrinsic_name(name: &str) -> bool {
     matches!(name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
         "cos" | "sin" | "tan" | "exp" | "log" | "log10" | "sqrt" | "dsqrt" |

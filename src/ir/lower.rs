@@ -1020,6 +1020,226 @@ fn collect_host_refs_expr(
     }
 }
 
+/// Lookup marker for `collect_implicit_locals` — identifies which
+/// kind of enclosing program unit owns the body being walked so the
+/// helper can locate the matching `Scope` (and thus the right
+/// `ImplicitRules`) in the pre-resolved symbol table.
+#[derive(Clone, Copy)]
+enum UnitScope<'a> {
+    Program(&'a str),
+    Subroutine(&'a str),
+    Function(&'a str),
+}
+
+/// Materialise locals for any bare `Name` reference in `body` that
+/// isn't explicitly declared, doesn't come from a USE/host import,
+/// and isn't an intrinsic or sibling procedure. This is the Fortran
+/// default-typing rule (F2018 §8.7): under IMPLICIT NONE we stay
+/// silent (validate.rs reports an error); otherwise the name's first
+/// letter selects a type, we emit an alloca, and register it as a
+/// scalar local so subsequent assignments and reads land on storage
+/// instead of silently dropping into `const_int 0`.
+fn collect_implicit_locals(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    body: &[crate::ast::stmt::SpannedStmt],
+    unit: UnitScope,
+) {
+    use crate::sema::symtab::{ScopeKind, ImplicitType};
+    let scope = ctx.st.all_scopes().iter().find(|s| match (&s.kind, unit) {
+        (ScopeKind::Program(n), UnitScope::Program(name)) => n.eq_ignore_ascii_case(name),
+        (ScopeKind::Subroutine(n), UnitScope::Subroutine(name)) => n.eq_ignore_ascii_case(name),
+        (ScopeKind::Function(n), UnitScope::Function(name)) => n.eq_ignore_ascii_case(name),
+        _ => false,
+    });
+    let Some(scope) = scope else { return; };
+    if scope.implicit_rules.none_type { return; }
+
+    let mut candidates: Vec<String> = Vec::new();
+    for stmt in body {
+        collect_name_refs_stmt(stmt, &mut candidates);
+    }
+
+    for name in candidates {
+        let key = name.to_lowercase();
+        if ctx.locals.contains_key(&key) { continue; }
+        if crate::sema::validate::is_intrinsic_name(&key) { continue; }
+        if ctx.internal_funcs.contains_key(&key) { continue; }
+        if ctx.globals.keys().any(|(_m, v)| v == &key) { continue; }
+        // Names that resolve to symbols already known to the sema
+        // layer (e.g. module procedures, use-associated symbols whose
+        // globals we don't synthesise, interface generics) are
+        // skipped so we don't shadow them with a bogus implicit alloca.
+        if ctx.st.find_symbol_any_scope(&key).is_some() { continue; }
+
+        let itype = match scope.implicit_rules.type_for(&key) {
+            Some(t) => t,
+            None => continue,
+        };
+        let ir_ty = match itype {
+            ImplicitType::Integer => IrType::Int(IntWidth::I32),
+            ImplicitType::Real => IrType::Float(FloatWidth::F32),
+            ImplicitType::DoublePrecision => IrType::Float(FloatWidth::F64),
+            ImplicitType::Complex => {
+                // Default complex is single precision — stored as [f32 x 2].
+                IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2)
+            }
+            ImplicitType::Logical => IrType::Bool,
+            ImplicitType::Character => {
+                // Default implicit character is CHARACTER(1). Emit a
+                // fixed-1-byte buffer with a CharKind::Fixed(1) kind so
+                // the lowering treats it as a character scalar.
+                let slot = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1));
+                ctx.locals.insert(key.clone(), LocalInfo {
+                    addr: slot,
+                    ty: IrType::Int(IntWidth::I8),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::Fixed(1),
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                });
+                continue;
+            }
+        };
+        let slot = b.alloca(ir_ty.clone());
+        ctx.insert_scalar(key, slot, ir_ty);
+    }
+}
+
+fn collect_name_refs_stmt(
+    stmt: &crate::ast::stmt::SpannedStmt,
+    out: &mut Vec<String>,
+) {
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        Stmt::Assignment { target, value }
+        | Stmt::PointerAssignment { target, value } => {
+            collect_name_refs_expr(target, out);
+            collect_name_refs_expr(value, out);
+        }
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            collect_name_refs_expr(condition, out);
+            for s in then_body { collect_name_refs_stmt(s, out); }
+            for (c, b) in else_ifs {
+                collect_name_refs_expr(c, out);
+                for s in b { collect_name_refs_stmt(s, out); }
+            }
+            if let Some(b) = else_body {
+                for s in b { collect_name_refs_stmt(s, out); }
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            collect_name_refs_expr(condition, out);
+            collect_name_refs_stmt(action, out);
+        }
+        Stmt::DoLoop { var, start, end, step, body, .. } => {
+            if let Some(v) = var { out.push(v.clone()); }
+            if let Some(e) = start { collect_name_refs_expr(e, out); }
+            if let Some(e) = end { collect_name_refs_expr(e, out); }
+            if let Some(s) = step { collect_name_refs_expr(s, out); }
+            for s in body { collect_name_refs_stmt(s, out); }
+        }
+        Stmt::DoWhile { condition, body, .. } => {
+            collect_name_refs_expr(condition, out);
+            for s in body { collect_name_refs_stmt(s, out); }
+        }
+        Stmt::DoConcurrent { body, .. }
+        | Stmt::Block { body, .. }
+        | Stmt::Associate { body, .. } => {
+            for s in body { collect_name_refs_stmt(s, out); }
+        }
+        Stmt::Print { items, .. } => {
+            for e in items { collect_name_refs_expr(e, out); }
+        }
+        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+            for e in items { collect_name_refs_expr(e, out); }
+        }
+        Stmt::Call { args, .. } => {
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_name_refs_expr(e, out);
+                }
+            }
+        }
+        Stmt::Return { value: Some(e) } => collect_name_refs_expr(e, out),
+        Stmt::Labeled { stmt, .. } => collect_name_refs_stmt(stmt, out),
+        Stmt::SelectCase { selector, cases, .. } => {
+            collect_name_refs_expr(selector, out);
+            for case in cases {
+                for s in &case.body { collect_name_refs_stmt(s, out); }
+            }
+        }
+        Stmt::Allocate { items, .. } | Stmt::Deallocate { items, .. } | Stmt::Nullify { items } => {
+            for e in items { collect_name_refs_expr(e, out); }
+        }
+        _ => {}
+    }
+}
+
+fn collect_name_refs_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    out: &mut Vec<String>,
+) {
+    match &expr.node {
+        Expr::Name { name } => out.push(name.clone()),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_name_refs_expr(left, out);
+            collect_name_refs_expr(right, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_name_refs_expr(operand, out),
+        Expr::ParenExpr { inner } => collect_name_refs_expr(inner, out),
+        Expr::FunctionCall { callee, args } => {
+            // `arr(i)` and `f(i)` alias at this AST level. Walk both —
+            // the filter in collect_implicit_locals rejects intrinsics
+            // and internal procs so real function calls don't become
+            // implicit locals.
+            collect_name_refs_expr(callee, out);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_name_refs_expr(e, out);
+                }
+                if let crate::ast::expr::SectionSubscript::Range { start, end, stride } = &arg.value {
+                    if let Some(e) = start { collect_name_refs_expr(e, out); }
+                    if let Some(e) = end { collect_name_refs_expr(e, out); }
+                    if let Some(e) = stride { collect_name_refs_expr(e, out); }
+                }
+            }
+        }
+        Expr::ComponentAccess { base, .. } => collect_name_refs_expr(base, out),
+        Expr::ArrayConstructor { values, .. } => {
+            for v in values {
+                collect_name_refs_acvalue(v, out);
+            }
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            collect_name_refs_expr(real, out);
+            collect_name_refs_expr(imag, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_name_refs_acvalue(
+    v: &crate::ast::expr::AcValue,
+    out: &mut Vec<String>,
+) {
+    match v {
+        crate::ast::expr::AcValue::Expr(e) => collect_name_refs_expr(e, out),
+        crate::ast::expr::AcValue::ImpliedDo(inner) => {
+            for iv in &inner.values {
+                collect_name_refs_acvalue(iv, out);
+            }
+            collect_name_refs_expr(&inner.start, out);
+            collect_name_refs_expr(&inner.end, out);
+            if let Some(s) = &inner.step { collect_name_refs_expr(s, out); }
+        }
+    }
+}
+
 fn collect_module_globals(
     module: &mut Module,
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
@@ -1387,6 +1607,7 @@ fn lower_unit(
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
+                collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
                 init_decls(&mut b, &ctx.locals, decls, st);
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -1580,6 +1801,7 @@ fn lower_unit(
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
+                collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Subroutine(name));
                 init_decls(&mut b, &ctx.locals, decls, st);
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
@@ -1815,6 +2037,7 @@ fn lower_unit(
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
+                collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
                 init_decls(&mut b, &ctx.locals, decls, st);
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
