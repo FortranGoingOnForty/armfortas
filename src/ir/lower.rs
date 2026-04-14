@@ -4655,6 +4655,45 @@ fn resolve_generic_call(
     None
 }
 
+/// Generic SUBROUTINE call-site resolver. Mirror of the generic
+/// function-call logic in `lower_expr_full`. If `name` is a
+/// NamedInterface, use the actual arg types to pick a specific;
+/// otherwise pass the name through unchanged. Failed resolution
+/// emits a compile-time diagnostic and exits, same as the
+/// function-call path, so silent miscompiles don't slip through.
+fn resolve_subroutine_call_name(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    orig_name: &str,
+    key: &str,
+    arg_vals: &[ValueId],
+    span: crate::lexer::Span,
+) -> (String, String) {
+    if let Some(sym) = st.find_symbol_any_scope(key) {
+        if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
+            match resolve_generic_call(st, b, key, arg_vals) {
+                Some(resolved) => {
+                    let rk = resolved.to_lowercase();
+                    return (resolved, rk);
+                }
+                None => {
+                    let specifics = sym.arg_names.join(", ");
+                    eprintln!(
+                        "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                        span.start.line,
+                        span.start.col,
+                        orig_name,
+                        specifics,
+                    );
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    (orig_name.to_string(), key.to_string())
+}
+
 /// Kind-aware equality for generic dispatch: an IR value matches a
 /// declared parameter type when both category AND width agree. For
 /// pointers the pointee type is compared recursively so that a `real`
@@ -6073,6 +6112,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             _ => b.const_i32(0),
                         }
                     }).collect();
+                    // Generic SUBROUTINE dispatch: if the callee name
+                    // resolves to a NamedInterface symbol, replace it
+                    // with the specific matched by the actual argument
+                    // types. On failure, emit a diagnostic — the same
+                    // rule as generic function-call resolution.
+                    let (resolved_name, key) = resolve_subroutine_call_name(
+                        ctx.st, b, name, &key, &arg_vals, callee.span,
+                    );
                     if let Some(desc_mask) = ctx.descriptor_params.get(&key) {
                         for (i, a) in args.iter().enumerate() {
                             if !desc_mask.get(i).copied().unwrap_or(false) {
@@ -6130,7 +6177,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .get(&key)
                         .copied()
                         .map(FuncRef::Internal)
-                        .unwrap_or_else(|| FuncRef::External(name.clone()));
+                        .unwrap_or_else(|| FuncRef::External(resolved_name));
                     b.call(func_ref, arg_vals, IrType::Void);
                 }
             }
