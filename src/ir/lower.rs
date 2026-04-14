@@ -4601,10 +4601,6 @@ fn resolve_generic_call(
     if sym.kind != crate::sema::symtab::SymbolKind::NamedInterface { return None; }
     if sym.arg_names.is_empty() { return None; }
 
-    if sym.arg_names.len() == 1 {
-        return Some(sym.arg_names[0].clone());
-    }
-
     // Classify actual argument types.
     let actual_types: Vec<Option<IrType>> = arg_vals.iter()
         .map(|v| b.func().value_type(*v))
@@ -4612,44 +4608,71 @@ fn resolve_generic_call(
 
     // For each specific procedure, look up its declared argument types
     // from the symbol table and check if they match the actual types.
+    // Match on the full IR type (category AND width) so real vs double
+    // precision resolve to the right specific. Also require the arity
+    // to match exactly before attempting per-arg checks.
     for specific in &sym.arg_names {
-        // Find the specific's scope to get declared argument types.
-        for scope in st.all_scopes() {
-            let scope_matches = match &scope.kind {
-                crate::sema::symtab::ScopeKind::Function(n) | crate::sema::symtab::ScopeKind::Subroutine(n) => n.to_lowercase() == *specific,
-                _ => false,
-            };
-            if !scope_matches { continue; }
+        let scope = st.all_scopes().iter().find(|s| match &s.kind {
+            crate::sema::symtab::ScopeKind::Function(n)
+            | crate::sema::symtab::ScopeKind::Subroutine(n) => n.to_lowercase() == *specific,
+            _ => false,
+        });
+        let Some(scope) = scope else { continue; };
 
-            // Get declared argument types from this scope's symbols.
-            let mut type_match = true;
-            let declared_args: Vec<&crate::sema::symtab::Symbol> = scope.symbols.values()
-                .filter(|s| s.kind == crate::sema::symtab::SymbolKind::Variable
-                    && s.attrs.intent.is_some())
-                .collect();
+        // Use the ordered argument list from the scope, not the
+        // arbitrary symbols-map iteration order (which doesn't honor
+        // declaration order and was previously confusing position with
+        // hash order on multi-arg specifics).
+        let declared_args: Vec<&crate::sema::symtab::Symbol> = scope.arg_order.iter()
+            .filter_map(|n| scope.symbols.get(n))
+            .collect();
 
-            if declared_args.len() != actual_types.len() {
+        if declared_args.len() != actual_types.len() { continue; }
+
+        let mut type_match = true;
+        for (decl_sym, actual_ty) in declared_args.iter().zip(actual_types.iter()) {
+            let (Some(ti), Some(at)) = (decl_sym.type_info.as_ref(), actual_ty.as_ref()) else {
+                // Missing type info on either side — can't prove a
+                // match, be conservative and reject this specific.
                 type_match = false;
-            } else {
-                for (decl_sym, actual_ty) in declared_args.iter().zip(actual_types.iter()) {
-                    if let (Some(ref ti), Some(ref at)) = (&decl_sym.type_info, actual_ty) {
-                        let decl_ir = type_info_to_ir_type(ti);
-                        if decl_ir.is_float() != at.is_float() || decl_ir.is_int() != at.is_int() {
-                            type_match = false;
-                            break;
-                        }
-                    }
-                }
+                break;
+            };
+            let decl_ir = type_info_to_ir_type(ti);
+            if !ir_types_dispatch_equal(&decl_ir, at) {
+                type_match = false;
+                break;
             }
+        }
 
-            if type_match {
-                return Some(specific.clone());
-            }
+        if type_match {
+            return Some(specific.clone());
         }
     }
 
-    // Fallback: return the first specific.
-    Some(sym.arg_names[0].clone())
+    // No specific matched the actual argument types. Return None so
+    // the caller can report a diagnostic instead of silently dispatching
+    // to an arbitrary specific (which mis-interprets bits across kinds).
+    None
+}
+
+/// Kind-aware equality for generic dispatch: an IR value matches a
+/// declared parameter type when both category AND width agree. For
+/// pointers the pointee type is compared recursively so that a `real`
+/// scalar and a `real, dimension(:)` array argument dispatch to
+/// different specifics even though both arrive as `Ptr(Float)` at the
+/// call site.
+fn ir_types_dispatch_equal(decl: &IrType, actual: &IrType) -> bool {
+    match (decl, actual) {
+        (IrType::Int(a), IrType::Int(c)) => a == c,
+        (IrType::Float(a), IrType::Float(c)) => a == c,
+        (IrType::Bool, IrType::Bool) => true,
+        // Callers pass by-reference for non-VALUE dummies, so the
+        // actual IR type is often Ptr(T) while the declared is T.
+        (decl, IrType::Ptr(p)) => ir_types_dispatch_equal(decl, p),
+        (IrType::Ptr(p), actual) => ir_types_dispatch_equal(p, actual),
+        (IrType::Array(e1, _), IrType::Array(e2, _)) => ir_types_dispatch_equal(e1, e2),
+        _ => false,
+    }
 }
 
 /// Resolve a kind suffix (literal integer or named constant) to a kind width.
@@ -11768,8 +11791,32 @@ fn lower_expr_full(
                 }).collect();
 
                 // Resolve generic interface names to specific procedures.
-                let resolved_name = resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
-                    .unwrap_or_else(|| name.clone());
+                // For a NamedInterface callee, failing to resolve means
+                // the call is ill-typed (wrong arity, wrong kind, or no
+                // matching specific). Emit a compile-time diagnostic
+                // instead of silently falling back to the generic name,
+                // which would either mismatch the callee ABI or produce
+                // an unresolved link-time symbol.
+                let resolved_name = match resolve_generic_call(st, b, &key, &intrinsic_arg_vals) {
+                    Some(n) => n,
+                    None => {
+                        if let Some(sym) = st.find_symbol_any_scope(&key) {
+                            if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
+                                let specifics = sym.arg_names.join(", ");
+                                eprintln!(
+                                    "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                                    expr.span.start.line,
+                                    expr.span.start.col,
+                                    name,
+                                    specifics,
+                                );
+                                let _ = std::io::stderr().flush();
+                                std::process::exit(1);
+                            }
+                        }
+                        name.clone()
+                    }
+                };
                 let resolved_key = resolved_name.to_lowercase();
 
                 // Host-association closure-passing ABI: append trailing
