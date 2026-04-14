@@ -4873,6 +4873,72 @@ fn resolve_operator_overload(
     Some((resolved, arg_vals))
 }
 
+/// Reorder a call's actual-arg list so keyword arguments land in
+/// the positions declared by the callee. Per F2003 §12.4.1.2:
+/// positional args come first (matching the callee's first N
+/// params), then any keyword arg can appear in any order but each
+/// must reference a param past the last positional. When the
+/// callee's signature isn't resolvable (e.g. external BIND(C)),
+/// the original list passes through unchanged.
+fn reorder_args_by_keyword(
+    args: &[crate::ast::expr::Argument],
+    callee_key: &str,
+    st: &SymbolTable,
+) -> Vec<crate::ast::expr::Argument> {
+    // Fast path: no keyword args anywhere → pass through.
+    if args.iter().all(|a| a.keyword.is_none()) {
+        return args.to_vec();
+    }
+    // Look up the callee's declared param order. NamedInterface
+    // symbols live in scope.symbols keyed by lowercase name and
+    // carry the specifics in arg_names; we want the actual
+    // procedure's arg_order, which lives on its scope.
+    use crate::sema::symtab::ScopeKind;
+    let arg_order: Vec<String> = {
+        let mut found: Option<Vec<String>> = None;
+        for scope in st.all_scopes() {
+            if let ScopeKind::Function(n) | ScopeKind::Subroutine(n) = &scope.kind {
+                if n.eq_ignore_ascii_case(callee_key) {
+                    found = Some(scope.arg_order.clone());
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(v) if !v.is_empty() => v,
+            _ => return args.to_vec(), // no signature info → no reorder
+        }
+    };
+    // Build slot list the size of the callee's declared params.
+    // Positional actuals fill slots 0..K. Keyword actuals look up
+    // their slot by name. Unused slots stay None (OPTIONAL args
+    // get their runtime null treatment in the subsequent per-call
+    // hidden-arg logic).
+    let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; arg_order.len()];
+    let mut last_positional = 0usize;
+    for a in args {
+        if let Some(kw) = &a.keyword {
+            let key = kw.to_lowercase();
+            if let Some(idx) = arg_order.iter().position(|n| n.to_lowercase() == key) {
+                slots[idx] = Some(a.clone());
+                continue;
+            }
+            // Unknown keyword — leave it at the end to preserve
+            // error-reporting locality; sema should have rejected
+            // this earlier.
+            slots.push(Some(a.clone()));
+            continue;
+        }
+        if last_positional < slots.len() {
+            slots[last_positional] = Some(a.clone());
+            last_positional += 1;
+        } else {
+            slots.push(Some(a.clone()));
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
 /// Generic SUBROUTINE call-site resolver. Mirror of the generic
 /// function-call logic in `lower_expr_full`. If `name` is a
 /// NamedInterface, use the actual arg types to pick a specific;
@@ -6469,6 +6535,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
                     // Not an intrinsic — general subroutine call.
+                    // Keyword-argument reordering (F2003 §12.4.1.2).
+                    // `call sub(b=10, a=20)` must bind by name, not
+                    // position. reorder_args_by_keyword permutes the
+                    // actual-arg list to match the callee's declared
+                    // param order; the rest of the call-site code
+                    // then runs positionally against that reordered
+                    // list.
+                    let reordered = reorder_args_by_keyword(args, &key, ctx.st);
+                    let args: &[crate::ast::expr::Argument] = &reordered;
                     let mut arg_vals: Vec<ValueId> = args.iter().map(|a| {
                         match &a.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
@@ -12245,6 +12320,12 @@ fn lower_expr_full(
                         }
                     }
                 }
+
+                // Keyword-argument reordering for function calls
+                // (symmetric with the Stmt::Call path). Binds by name
+                // when the callee's arg_order is resolvable.
+                let reordered_fn = reorder_args_by_keyword(args, &key, st);
+                let args: &[crate::ast::expr::Argument] = &reordered_fn;
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
