@@ -650,6 +650,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         }
         ArmOpcode::Sxtw => format!("sxtw {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::Sxth => format!("sxth {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::Sxtb => format!("sxtb {}, {}",
+            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
         ArmOpcode::Brk => {

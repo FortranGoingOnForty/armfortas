@@ -121,6 +121,8 @@ pub enum ArmOpcode {
 
     // ---- Extend ----
     Sxtw,        // SXTW Xd, Wn (sign-extend 32→64)
+    Sxth,        // SXTH Wd|Xd, Wn (sign-extend 16→32 or 16→64)
+    Sxtb,        // SXTB Wd|Xd, Wn (sign-extend 8→32 or 8→64)
 
     // ---- Special ----
     Nop,

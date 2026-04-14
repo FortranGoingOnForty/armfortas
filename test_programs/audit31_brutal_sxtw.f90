@@ -1,8 +1,9 @@
-! XFAIL: codegen emits illegal sxtw Wd, Wn — Task #493
-! CHECK: ok
-! audit31 sxtw codegen repro
-! Failure mode: compiler emits "sxtw w21, w20" (illegal — sxtw dest must be 64-bit).
-! Extracted from fortsh io/suggestions.f90 character indexing pattern.
+! audit31 Finding 12: character indexing in some pattern made
+! IntExtend emit an illegal `sxtw Wd, Wn` because isel always
+! used SXTW regardless of source width. isel now picks by the
+! SOURCE width (SXTB for 8, SXTH for 16, SXTW only for 32→64)
+! and emits MOV for same-width "extends". Task #493.
+! CHECK: DEFGH
 module audit31_sxtw_mod
   implicit none
 contains

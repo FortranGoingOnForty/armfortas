@@ -1686,12 +1686,49 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
         // ---- Integer extend/truncate ----
         InstKind::IntExtend(a, _target_width, signed) => {
             let src = ctx.lookup_vreg(*a);
-            let class = type_to_reg_class(&inst.ty);
-            let dest = ctx.get_vreg(mf, inst.id, class);
-            if *signed {
-                // SXTW Xd, Wn — sign-extend 32-bit to 64-bit.
+            // Pick the opcode based on the SOURCE width, not the
+            // target. ARM64 has distinct SXTB/SXTH/SXTW instructions
+            // for 8/16/32-bit sources; using SXTW on anything other
+            // than a 32-bit source (or with a non-X dest) yields
+            // "invalid operand for instruction" at the assembler.
+            let src_ty = func.value_type(*a);
+            let src_width = match src_ty.as_ref() {
+                Some(IrType::Int(IntWidth::I8)) => 8,
+                Some(IrType::Int(IntWidth::I16)) => 16,
+                Some(IrType::Int(IntWidth::I32)) | Some(IrType::Bool) => 32,
+                Some(IrType::Int(IntWidth::I64)) => 64,
+                _ => 32, // conservative default
+            };
+            let dest_width = match &inst.ty {
+                IrType::Int(IntWidth::I8) | IrType::Int(IntWidth::I16)
+                | IrType::Int(IntWidth::I32) | IrType::Bool => 32,
+                IrType::Int(IntWidth::I64) => 64,
+                _ => 32,
+            };
+            // Dest register class follows the declared target
+            // bit-width, with one exception: SXTW requires an
+            // X-register destination, so promote to Gp64 when
+            // source is 32 AND target is 64.
+            let dest_class = if dest_width == 64 { RegClass::Gp64 } else { RegClass::Gp32 };
+            let dest = ctx.get_vreg(mf, inst.id, dest_class);
+
+            if !*signed {
+                // Zero-extend: MOV (ARM64 implicitly zero-extends W→X).
                 mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Sxtw,
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(dest),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: Some(dest),
+                });
+            } else if src_width >= dest_width {
+                // Same-width or wider source (bogus from lowering's
+                // perspective but observed in practice when a
+                // function-result intrinsic mis-resolves). Emit MOV
+                // rather than an illegal SXTW Wd, Wn.
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
                     operands: vec![
                         MachineOperand::VReg(dest),
                         MachineOperand::VReg(src),
@@ -1699,9 +1736,14 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                     def: Some(dest),
                 });
             } else {
-                // Zero-extend: MOV Xd, Wn (ARM64 implicitly zero-extends W→X).
+                let opcode = match src_width {
+                    8 => ArmOpcode::Sxtb,
+                    16 => ArmOpcode::Sxth,
+                    32 => ArmOpcode::Sxtw,
+                    _ => ArmOpcode::MovReg, // unreachable given the bool above
+                };
                 mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::MovReg,
+                    opcode,
                     operands: vec![
                         MachineOperand::VReg(dest),
                         MachineOperand::VReg(src),
