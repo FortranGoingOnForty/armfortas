@@ -488,6 +488,9 @@ fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Res
 }
 
 fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), SemaError> {
+    // Collect AccessList entries — they must be applied AFTER all TypeDecls
+    // because the list may reference symbols declared later in the module.
+    let mut pending_access: Vec<(Access, Vec<String>)> = Vec::new();
     for decl in decls {
         match &decl.node {
             Decl::AccessDefault { access } => {
@@ -503,9 +506,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     Attribute::Public => Access::Public,
                     _ => continue,
                 };
-                for name in names {
-                    st.set_symbol_access(name, acc);
-                }
+                pending_access.push((acc, names.clone()));
             }
             Decl::TypeDecl { type_spec, attrs, entities } => {
                 let type_info = type_spec_to_info(type_spec, st);
@@ -556,6 +557,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 })?;
             }
             _ => {}
+        }
+    }
+    // Apply deferred access-list overrides after all symbols are declared.
+    for (access, names) in &pending_access {
+        for name in names {
+            st.set_symbol_access(name, *access);
         }
     }
     Ok(())

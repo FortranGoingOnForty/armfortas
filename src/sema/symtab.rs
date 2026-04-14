@@ -124,6 +124,17 @@ impl SymbolTable {
 
     /// Look up a name starting from a specific scope.
     pub fn lookup_in(&self, scope_id: ScopeId, name: &str) -> Option<&Symbol> {
+        let mut visited: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
+        self.lookup_in_guarded(scope_id, name, &mut visited)
+    }
+
+    fn lookup_in_guarded(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+        visited: &mut std::collections::HashSet<ScopeId>,
+    ) -> Option<&Symbol> {
+        if !visited.insert(scope_id) { return None; }
         let key = name.to_lowercase();
         let scope = &self.scopes[scope_id];
 
@@ -132,24 +143,33 @@ impl SymbolTable {
             return Some(sym);
         }
 
-        // 2. USE association.
+        // 2. Direct USE association.
         for assoc in &scope.use_associations {
             if assoc.local_name.to_lowercase() == key {
-                // Look up the original name in the source module's scope.
                 if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name.to_lowercase()) {
-                    // Check accessibility.
                     if sym.attrs.access != Access::Private || assoc.is_submodule_access {
                         return Some(sym);
                     }
                 }
             }
         }
+        // 2b. Transitive USE: look through each USE'd module's own
+        // public symbols and its transitive USE chain. Only applies
+        // to bare `USE M` (local_name == original_name); renamed
+        // USE associations are intentional restrictions.
+        for assoc in &scope.use_associations {
+            if assoc.local_name != assoc.original_name { continue; }
+            if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, name, visited) {
+                if sym.attrs.access != Access::Private {
+                    return Some(sym);
+                }
+            }
+        }
 
         // 3. Host association — look in parent scope.
         if let Some(parent) = scope.parent {
-            // Skip global scope for host association (global is not a "host").
             if self.scopes[parent].kind != ScopeKind::Global {
-                return self.lookup_in(parent, name);
+                return self.lookup_in_guarded(parent, name, visited);
             }
         }
 

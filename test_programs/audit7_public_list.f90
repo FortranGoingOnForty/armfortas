@@ -1,6 +1,6 @@
 ! Module with PRIVATE default and explicit public :: list.
 ! Regression test for parsing public :: name1, name2 access-spec list.
-! CHECK: 0 0
+! CHECK: 1 2
 module public_list_mod
   implicit none
   private
