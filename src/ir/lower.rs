@@ -4180,6 +4180,22 @@ fn resolve_generic_call(
     Some(sym.arg_names[0].clone())
 }
 
+/// Resolve a kind suffix (literal integer or named constant) to a kind width.
+/// Returns 4 as the default when unresolvable.
+fn real_kind_to_width(kind_str: &str, st: &SymbolTable) -> u8 {
+    // Try parsing as a literal integer first.
+    if let Ok(n) = kind_str.parse::<u8>() {
+        return n;
+    }
+    // Otherwise look up the named constant in the symbol table.
+    if let Some(sym) = st.find_symbol_any_scope(&kind_str.to_lowercase()) {
+        if let Some(v) = sym.const_value {
+            return v as u8;
+        }
+    }
+    4 // default
+}
+
 /// Extract a compile-time integer constant from a ValueId by
 /// looking up its defining instruction in the function.
 fn extract_const_int_from_value(b: &FuncBuilder, id: ValueId) -> Option<i64> {
@@ -10629,9 +10645,15 @@ fn lower_expr_full(
                 }
             }
         }
-        Expr::RealLiteral { text, .. } => {
+        Expr::RealLiteral { text, kind } => {
             let val: f64 = text.replace('d', "e").replace('D', "E").parse().unwrap_or(0.0);
-            if text.to_lowercase().contains('d') {
+            // Determine width from kind suffix (_dp, _8), 'd' exponent, or default.
+            let is_f64 = if let Some(kind_str) = kind {
+                real_kind_to_width(kind_str, st) == 8
+            } else {
+                text.to_lowercase().contains('d')
+            };
+            if is_f64 {
                 b.const_f64(val)
             } else {
                 b.const_f32(val as f32)
