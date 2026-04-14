@@ -506,20 +506,43 @@ fn validate_pointer_assignment(
     value: &crate::ast::expr::SpannedExpr,
     span: Span,
 ) {
-    // For component access (p%ptr_field => x), the final component determines
-    // pointer-ness, but we only have the base name. Check the base for now.
-    if let Some(name) = extract_base_name(target) {
-        let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
-        if !is_pointer {
-            ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
+    // Component-access target (`p%ptr_field => x`): the attribute
+    // lives on the final component, which the sema registry doesn't
+    // expose per-field. Skip the base-name check rather than issue
+    // a wrong-entity diagnostic (previous code reported the base as
+    // the target even when the real target was a pointer component).
+    if !expr_selects_component(target) {
+        if let Some(name) = extract_base_name(target) {
+            let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
+            if !is_pointer {
+                ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
+            }
         }
     }
 
     // RHS must have target attribute or be a pointer (or null()/function call).
+    // A component-access RHS (e.g. `=> p%buf`) likewise can't be
+    // attribute-checked without a per-field registry — skip.
+    if expr_selects_component(value) { return; }
     if let Some(name) = extract_base_name(value) {
         // Skip if the value is a function call — could be null() or pointer-valued function.
         if matches!(value.node, Expr::FunctionCall { .. }) {
             return;
+        }
+        // Dummy procedure arguments are valid RHS targets per F2003
+        // (their addresses are implicitly available). The generic
+        // target/pointer check below doesn't see the "dummy
+        // procedure" attribute directly; accept any Function/
+        // Subroutine symbol and any variable declared via
+        // `procedure(iface)` (parsed with Attribute::External).
+        if let Some(sym) = ctx.lookup(&name) {
+            use crate::sema::symtab::SymbolKind;
+            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) {
+                return;
+            }
+            if sym.attrs.external {
+                return;
+            }
         }
         let ok = ctx.lookup(&name).map(|s| s.attrs.target || s.attrs.pointer).unwrap_or(true);
         if !ok {
@@ -529,7 +552,20 @@ fn validate_pointer_assignment(
 }
 
 /// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
+///
+/// For a component access like `pools(i)%tokens(n)`, the target is
+/// the `tokens` field — not the `pools` base. We don't currently
+/// carry per-field attributes in the sema type registry, so checking
+/// would require more infrastructure. For now, skip the check
+/// whenever the item selects into a component; the lowering path
+/// already requires the leaf to be allocatable (it uses the
+/// descriptor ABI) and a mismatch would surface as a verifier or
+/// runtime error rather than silent miscompile. Bare-name ALLOCATE
+/// targets still get the attribute check on their symbol.
 fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr, stmt_name: &str) {
+    if expr_selects_component(item) {
+        return;
+    }
     let base_name = extract_base_name(item);
     if let Some(ref name) = base_name {
         let ok = ctx.lookup(name)
@@ -541,6 +577,20 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
                 stmt_name.to_uppercase(), name
             ));
         }
+    }
+}
+
+/// Does this expression select into a derived-type component
+/// anywhere in its path? e.g. `pools(i)%tokens(n)` → true,
+/// `pools(i)` → false, `pools` → false. Used by the
+/// ALLOCATE / pointer-assignment validators to bail out of the
+/// bare-name attribute check when the real target lives on a
+/// component that the registry doesn't expose attributes for.
+fn expr_selects_component(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::ComponentAccess { .. } => true,
+        Expr::FunctionCall { callee, .. } => expr_selects_component(callee),
+        _ => false,
     }
 }
 

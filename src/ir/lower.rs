@@ -5348,7 +5348,7 @@ fn install_runtime_dim_bounds(
 
             let mut runtime = Vec::with_capacity(specs.len());
             let mut any_runtime = false;
-            for (_dim_idx, spec) in specs.iter().enumerate() {
+            for spec in specs.iter() {
                 let upper_expr = match spec {
                     ArraySpec::Explicit { upper, .. } => Some(upper),
                     _ => None,

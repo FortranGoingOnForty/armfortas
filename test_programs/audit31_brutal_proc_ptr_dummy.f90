@@ -1,10 +1,11 @@
-! XFAIL: proc-ptr from dummy rejected by sema — Task #489
-! CHECK: 1
-! audit31: procedure-pointer assignment from a dummy procedure rejected.
-! Fortran 2003 allows a dummy procedure to be the RHS of a proc-pointer '=>'.
-! fortsh/execution/trap_dispatch.f90 depends on this.
-! Expected: compile cleanly.
-! Actual:   "error: pointer assignment source 'proc' must have target or pointer attribute"
+! audit31 Finding 8: `cb => proc` where proc is a `procedure(iface)`
+! dummy argument used to fail with "pointer assignment source
+! must have target or pointer attribute". F2003 allows a dummy
+! procedure as the RHS of a procedure-pointer '=>'; relax the
+! sema check to accept symbols carrying attrs.external (which is
+! how `procedure(iface) :: proc` is lowered) in addition to the
+! Function/Subroutine kinds. Task #489.
+! CHECK: ok
 module audit31_procptr_dummy
   implicit none
   abstract interface
@@ -19,3 +20,9 @@ contains
     cb => proc
   end subroutine
 end module
+
+program audit31_procptr_dummy_driver
+  use audit31_procptr_dummy
+  implicit none
+  print *, 'ok'
+end program
