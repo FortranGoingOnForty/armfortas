@@ -1,7 +1,8 @@
 //! End-to-end test harness for ARMFORTAS.
 //!
-//! Discovers `.f90` files in `test_programs/`, compiles each with `armfortas`,
-//! runs the binary, and checks stdout against `! CHECK:` annotations.
+//! Discovers Fortran source files in `test_programs/`, compiles each with
+//! `armfortas`, runs the binary, and checks stdout against `! CHECK:`
+//! annotations.
 //!
 //! Each `! CHECK:` line specifies a substring that must appear in the output,
 //! in order. Whitespace is trimmed for comparison.
@@ -331,7 +332,11 @@ fn split_multifile_segments(source: &str) -> Option<Vec<MultifileSegment>> {
         });
     }
 
-    if segments.is_empty() { None } else { Some(segments) }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
 }
 
 /// Extract `! MULTIFILE_LINK: a.f90 b.f90 ...` — the link order.
@@ -353,7 +358,9 @@ fn extract_multifile_link(source: &str) -> Option<Vec<String>> {
 fn find_runtime() -> PathBuf {
     for dir in &["target/release", "target/debug"] {
         let p = PathBuf::from(dir).join("libarmfortas_rt.a");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     panic!("libarmfortas_rt.a not found — run `cargo build` first");
 }
@@ -1497,6 +1504,16 @@ fn find_test_programs() -> PathBuf {
     panic!("cannot find test_programs/ directory");
 }
 
+fn is_test_program_source(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("f90" | "f95" | "f03" | "f08" | "f18" | "f23" | "f" | "for" | "ftn" | "fpp")
+    )
+}
+
 fn compile_stage_bytes(
     compiler: &Path,
     source: &Path,
@@ -2007,9 +2024,8 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // ---- Multi-file path: split, compile each to .o, link ----
         if let Some(segments) = &multifile_segments {
             let build_dir = unique_temp_path("multifile_build", stem, level, "");
-            fs::create_dir_all(&build_dir).map_err(|e| {
-                format!("{}: cannot create multifile build dir: {}", filename, e)
-            })?;
+            fs::create_dir_all(&build_dir)
+                .map_err(|e| format!("{}: cannot create multifile build dir: {}", filename, e))?;
 
             // Write each segment to its own .f90.
             for seg in segments {
@@ -2043,7 +2059,8 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "{}.o",
                     Path::new(name).file_stem().unwrap().to_str().unwrap()
                 ));
-                if let Err(e) = compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir) {
+                if let Err(e) = compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir)
+                {
                     compile_error = Some(format!("{} [{}]: {}", filename, opt_flag, e));
                     break;
                 }
@@ -2399,11 +2416,14 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
         .expect("cannot read test_programs/")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "f90").unwrap_or(false))
+        .filter(|p| is_test_program_source(p))
         .collect();
     sources.sort();
 
-    assert!(!sources.is_empty(), "no .f90 files found in test_programs/");
+    assert!(
+        !sources.is_empty(),
+        "no Fortran sources found in test_programs/"
+    );
 
     let mut failures = Vec::new();
     let mut passed = 0;
@@ -2491,6 +2511,15 @@ fn test_programs_end_to_end_ofast() {
     if let Err(msg) = run_all_at("-Ofast") {
         panic!("Test failures at -Ofast:\n\n{}", msg);
     }
+}
+
+#[test]
+fn test_program_source_filter_accepts_fixed_form_extensions() {
+    assert!(is_test_program_source(Path::new("hello.f")));
+    assert!(is_test_program_source(Path::new("legacy.for")));
+    assert!(is_test_program_source(Path::new("solver.ftn")));
+    assert!(is_test_program_source(Path::new("main.f90")));
+    assert!(!is_test_program_source(Path::new("notes.txt")));
 }
 
 /// Determinism regression: compile a program twice at -O2 and
@@ -3038,7 +3067,10 @@ fn multifile_basic_module_runs_at_o0() {
     assert!(source.exists(), "multifile_basic_module.f90 missing");
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("multifile_basic_module.f90 should pass at -O0, got {:?}", other),
+        other => panic!(
+            "multifile_basic_module.f90 should pass at -O0, got {:?}",
+            other
+        ),
     }
 }
 
@@ -3050,7 +3082,10 @@ fn multifile_three_modules_runs_at_o0() {
     assert!(source.exists(), "multifile_three_modules.f90 missing");
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("multifile_three_modules.f90 should pass at -O0, got {:?}", other),
+        other => panic!(
+            "multifile_three_modules.f90 should pass at -O0, got {:?}",
+            other
+        ),
     }
 }
 
@@ -3062,7 +3097,10 @@ fn multifile_error_circular_direct_detected() {
     assert!(source.exists(), "error_circular_use_direct.f90 missing");
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("circular use direct should pass (ERROR_EXPECTED match), got {:?}", other),
+        other => panic!(
+            "circular use direct should pass (ERROR_EXPECTED match), got {:?}",
+            other
+        ),
     }
 }
 
@@ -3074,6 +3112,9 @@ fn multifile_error_circular_indirect_detected() {
     assert!(source.exists(), "error_circular_use_indirect.f90 missing");
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
-        other => panic!("circular use indirect should pass (ERROR_EXPECTED match), got {:?}", other),
+        other => panic!(
+            "circular use indirect should pass (ERROR_EXPECTED match), got {:?}",
+            other
+        ),
     }
 }

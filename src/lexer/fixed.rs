@@ -8,7 +8,10 @@
 //!
 //! Produces the same Token types as the free-form lexer.
 
-use super::{Token, TokenKind, Span, Position, LexError, is_known_dot_op};
+use super::{
+    is_keyword, is_known_dot_op, unexpected_char_message, LexError, Position, Span, Token,
+    TokenKind,
+};
 
 /// Tokenize fixed-form Fortran source.
 pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
@@ -29,7 +32,12 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
                     span: *span,
                 });
             }
-            FixedLine::Statement { label, body, start_line, file_id: fid } => {
+            FixedLine::Statement {
+                label,
+                body,
+                start_line,
+                file_id: fid,
+            } => {
                 // Emit label as integer literal if present.
                 if let Some(label_text) = label {
                     let label_trimmed = label_text.trim();
@@ -39,8 +47,14 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
                             text: label_trimmed.to_string(),
                             span: Span {
                                 file_id: *fid,
-                                start: Position { line: *start_line, col: 1 },
-                                end: Position { line: *start_line, col: 6 },
+                                start: Position {
+                                    line: *start_line,
+                                    col: 1,
+                                },
+                                end: Position {
+                                    line: *start_line,
+                                    col: 6,
+                                },
                             },
                         });
                     }
@@ -55,8 +69,14 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
                     text: "\n".into(),
                     span: Span {
                         file_id: *fid,
-                        start: Position { line: *start_line, col: 1 },
-                        end: Position { line: *start_line, col: 1 },
+                        start: Position {
+                            line: *start_line,
+                            col: 1,
+                        },
+                        end: Position {
+                            line: *start_line,
+                            col: 1,
+                        },
                     },
                 });
             }
@@ -75,8 +95,14 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
         text: String::new(),
         span: Span {
             file_id,
-            start: Position { line: src.lines().count() as u32 + 1, col: 1 },
-            end: Position { line: src.lines().count() as u32 + 1, col: 1 },
+            start: Position {
+                line: src.lines().count() as u32 + 1,
+                col: 1,
+            },
+            end: Position {
+                line: src.lines().count() as u32 + 1,
+                col: 1,
+            },
         },
     });
 
@@ -110,7 +136,14 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
             tokens.push(Token {
                 kind: TokenKind::Comment,
                 text: stripped[pos..].to_string(),
-                span: Span { file_id, start, end: Position { line, col: col + (bytes.len() - pos) as u32 } },
+                span: Span {
+                    file_id,
+                    start,
+                    end: Position {
+                        line,
+                        col: col + (bytes.len() - pos) as u32,
+                    },
+                },
             });
             break;
         }
@@ -147,7 +180,8 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
 
         // BOZ literal: B/O/Z followed by quote.
         if matches!(ch, b'B' | b'b' | b'O' | b'o' | b'Z' | b'z')
-            && pos + 1 < bytes.len() && matches!(bytes[pos + 1], b'\'' | b'"')
+            && pos + 1 < bytes.len()
+            && matches!(bytes[pos + 1], b'\'' | b'"')
         {
             let (tok, consumed) = lex_fixed_boz(&stripped, pos, file_id, line)?;
             tokens.push(tok);
@@ -155,9 +189,10 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
             continue;
         }
 
-        // Letter — keyword or identifier with keyword-splitting.
+        // Letter — keyword or identifier with fixed-form prefix splitting.
         if ch.is_ascii_alphabetic() || ch == b'_' {
-            let (tok, consumed) = lex_fixed_ident_or_keyword(&stripped, pos, file_id, line);
+            let (tok, consumed) =
+                lex_fixed_ident_or_keyword(&stripped, pos, file_id, line, &tokens);
             tokens.push(tok);
             pos += consumed;
             continue;
@@ -204,10 +239,13 @@ fn protect_hollerith(body: &str) -> String {
 
         // Check for Hollerith: digits followed by H, not preceded by a letter/digit.
         if bytes[i].is_ascii_digit() {
-            let preceded_by_alnum = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let preceded_by_alnum =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             if !preceded_by_alnum {
                 let digit_start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
                 if i < bytes.len() && (bytes[i] == b'H' || bytes[i] == b'h') {
                     if let Ok(count) = body[digit_start..i].parse::<usize>() {
                         i += 1; // skip H
@@ -268,7 +306,12 @@ fn strip_whitespace_outside_strings(body: &str) -> String {
 }
 
 /// Lex a string literal in whitespace-stripped body.
-fn lex_fixed_string(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Token, usize), LexError> {
+fn lex_fixed_string(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+) -> Result<(Token, usize), LexError> {
     let bytes = text.as_bytes();
     let quote = bytes[pos];
     let mut end = pos + 1;
@@ -295,25 +338,40 @@ fn lex_fixed_string(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
     if !closed {
         let col = (pos as u32) + 7;
         return Err(LexError {
-            span: Span { file_id, start: Position { line, col }, end: Position { line, col } },
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position { line, col },
+            },
             msg: "unterminated string literal in fixed-form body".into(),
         });
     }
 
     let col = (pos as u32) + 7;
-    Ok((Token {
-        kind: TokenKind::StringLiteral,
-        text: tok_text,
-        span: Span {
-            file_id,
-            start: Position { line, col },
-            end: Position { line, col: col + (end - pos) as u32 },
+    Ok((
+        Token {
+            kind: TokenKind::StringLiteral,
+            text: tok_text,
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position {
+                    line,
+                    col: col + (end - pos) as u32,
+                },
+            },
         },
-    }, end - pos))
+        end - pos,
+    ))
 }
 
 /// Lex a dot-operator (.AND., .EQ., .TRUE., .myop.) in whitespace-stripped body.
-fn lex_fixed_dot_op(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Token, usize), LexError> {
+fn lex_fixed_dot_op(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+) -> Result<(Token, usize), LexError> {
     let bytes = text.as_bytes();
     let mut end = pos + 1; // skip first dot
     let mut name = String::new();
@@ -330,7 +388,14 @@ fn lex_fixed_dot_op(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
     let lower = name.to_lowercase();
     let col = (pos as u32) + 7;
     let tok_text = format!(".{}.", name);
-    let span = Span { file_id, start: Position { line, col }, end: Position { line, col: col + (end - pos) as u32 } };
+    let span = Span {
+        file_id,
+        start: Position { line, col },
+        end: Position {
+            line,
+            col: col + (end - pos) as u32,
+        },
+    };
 
     if lower == "true" || lower == "false" {
         // Check for kind suffix.
@@ -343,7 +408,14 @@ fn lex_fixed_dot_op(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
                 end += 1;
             }
         }
-        return Ok((Token { kind: TokenKind::LogicalLiteral, text: full_text, span }, end - pos));
+        return Ok((
+            Token {
+                kind: TokenKind::LogicalLiteral,
+                text: full_text,
+                span,
+            },
+            end - pos,
+        ));
     }
 
     let kind = if is_known_dot_op(&lower) {
@@ -352,7 +424,14 @@ fn lex_fixed_dot_op(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(
         TokenKind::DefinedOp(name.to_lowercase())
     };
 
-    Ok((Token { kind, text: tok_text, span }, end - pos))
+    Ok((
+        Token {
+            kind,
+            text: tok_text,
+            span,
+        },
+        end - pos,
+    ))
 }
 
 /// Lex a number (integer or real) in whitespace-stripped body.
@@ -370,7 +449,11 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 
     // Decimal point — but not if followed by letter (dot-op like .EQ.).
     if end < bytes.len() && bytes[end] == b'.' {
-        let after_dot = if end + 1 < bytes.len() { bytes[end + 1] } else { 0 };
+        let after_dot = if end + 1 < bytes.len() {
+            bytes[end + 1]
+        } else {
+            0
+        };
         let dot_is_numeric = after_dot.is_ascii_digit()
             || tok_text.is_empty() // leading dot
             || {
@@ -397,9 +480,15 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
     // Exponent — only consume e/d if followed by digit or +/- then digit.
     // This prevents `10DO` from being lexed as real `10D` + identifier `O`.
     if end < bytes.len() && matches!(bytes[end], b'e' | b'E' | b'd' | b'D') {
-        let after_ed = if end + 1 < bytes.len() { bytes[end + 1] } else { 0 };
+        let after_ed = if end + 1 < bytes.len() {
+            bytes[end + 1]
+        } else {
+            0
+        };
         let has_exponent_digits = after_ed.is_ascii_digit()
-            || (matches!(after_ed, b'+' | b'-') && end + 2 < bytes.len() && bytes[end + 2].is_ascii_digit());
+            || (matches!(after_ed, b'+' | b'-')
+                && end + 2 < bytes.len()
+                && bytes[end + 2].is_ascii_digit());
 
         if has_exponent_digits {
             is_real = true;
@@ -427,32 +516,52 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
     }
 
     let col = (pos as u32) + 7;
-    let kind = if is_real { TokenKind::RealLiteral } else { TokenKind::IntegerLiteral };
-    (Token {
-        kind,
-        text: tok_text,
-        span: Span { file_id, start: Position { line, col }, end: Position { line, col: col + (end - pos) as u32 } },
-    }, end - pos)
+    let kind = if is_real {
+        TokenKind::RealLiteral
+    } else {
+        TokenKind::IntegerLiteral
+    };
+    (
+        Token {
+            kind,
+            text: tok_text,
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position {
+                    line,
+                    col: col + (end - pos) as u32,
+                },
+            },
+        },
+        end - pos,
+    )
 }
 
-/// Lex an identifier or keyword in whitespace-stripped body.
+/// Lex an identifier or keyword in whitespace-stripped fixed-form body.
 ///
-/// Lex an identifier in whitespace-stripped fixed-form body.
+/// Fixed-form removes spaces from the statement body, so common source like
+/// `PROGRAM HELLO` and `INTEGER I, N` reaches us as `PROGRAMHELLO` and
+/// `INTEGERI,N`.  The parser does not have enough context to recover those
+/// boundaries reliably from a single opaque identifier token, so the fixed-form
+/// lexer splits a small set of keyword prefixes when we are at a statement
+/// boundary or another keyword-following context.
 ///
-/// Emits the full alphanumeric run as a single Identifier token. The parser
-/// handles keyword recognition from context — this matches how gfortran,
-/// flang, and LFortran handle fixed-form. Keyword prefix splitting (e.g.,
-/// splitting INTEGERI into INTEGER+I) is a parser concern because the lexer
-/// can't distinguish INDEX (intrinsic) from INTEGERI (keyword+ident) without
-/// statement context.
-///
-/// The one exception is the DO/assignment ambiguity, which genuinely must be
-/// resolved at lex time: DO10I=1,10 (loop) vs DO10I=1.10 (assignment) changes
-/// whether digits after DO are a label or part of a variable name.
-fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
+/// The DO/assignment ambiguity still needs special handling before the generic
+/// prefix splitter because `DO10I=1,10` is a loop while `DO10I=1.10` is an
+/// assignment.
+fn lex_fixed_ident_or_keyword(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+    prior_tokens: &[Token],
+) -> (Token, usize) {
     let bytes = text.as_bytes();
     let mut run_end = pos;
-    while run_end < bytes.len() && (bytes[run_end].is_ascii_alphanumeric() || bytes[run_end] == b'_') {
+    while run_end < bytes.len()
+        && (bytes[run_end].is_ascii_alphanumeric() || bytes[run_end] == b'_')
+    {
         run_end += 1;
     }
     let run = &text[pos..run_end];
@@ -465,10 +574,11 @@ fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -
         && run.as_bytes()[2].is_ascii_digit()
         && is_do_loop_context(text, pos + 2)
     {
-            // IS a DO loop — emit just "DO" (2 chars). Subsequent calls
-            // will pick up the label (digits) and variable (letters) separately.
-            let col = (pos as u32) + 7;
-            return (Token {
+        // IS a DO loop — emit just "DO" (2 chars). Subsequent calls
+        // will pick up the label (digits) and variable (letters) separately.
+        let col = (pos as u32) + 7;
+        return (
+            Token {
                 kind: TokenKind::Identifier,
                 text: run[..2].to_string(),
                 span: Span {
@@ -476,24 +586,109 @@ fn lex_fixed_ident_or_keyword(text: &str, pos: usize, file_id: u32, line: u32) -
                     start: Position { line, col },
                     end: Position { line, col: col + 2 },
                 },
-            }, 2);
+            },
+            2,
+        );
+    }
+
+    if let Some(prefix_len) = split_fixed_keyword_prefix(text, pos, run, prior_tokens) {
+        return make_ident_token(&run[..prefix_len], pos, file_id, line);
     }
 
     // Emit the entire alphanumeric run as one identifier.
     make_ident_token(run, pos, file_id, line)
 }
 
+fn split_fixed_keyword_prefix(
+    text: &str,
+    pos: usize,
+    run: &str,
+    prior_tokens: &[Token],
+) -> Option<usize> {
+    if !allow_fixed_keyword_split(prior_tokens) || run.len() <= 4 {
+        return None;
+    }
+
+    let trailing = text.as_bytes().get(pos + run.len()).copied();
+    if matches!(trailing, Some(b'=') | Some(b'%')) {
+        return None;
+    }
+
+    for prefix_len in (4..run.len()).rev() {
+        let prefix = &run[..prefix_len];
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let suffix = &run[prefix_len..];
+        let suffix_first = suffix.as_bytes()[0];
+
+        let is_fixed_keyword = prefix_lower == "endtype" || is_keyword(prefix).is_some();
+        if !is_fixed_keyword {
+            continue;
+        }
+
+        if suffix_first.is_ascii_digit() && !matches!(prefix_lower.as_str(), "goto" | "call") {
+            continue;
+        }
+
+        return Some(prefix_len);
+    }
+
+    None
+}
+
+fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
+    let Some(prev) = prior_tokens.last() else {
+        return true;
+    };
+
+    match prev.kind {
+        TokenKind::Comma | TokenKind::ColonColon => true,
+        TokenKind::Identifier => matches!(
+            prev.text.to_ascii_lowercase().as_str(),
+            "integer"
+                | "real"
+                | "doubleprecision"
+                | "doublecomplex"
+                | "complex"
+                | "character"
+                | "logical"
+                | "type"
+                | "class"
+                | "implicit"
+                | "program"
+                | "module"
+                | "submodule"
+                | "subroutine"
+                | "function"
+                | "entry"
+                | "call"
+                | "pure"
+                | "impure"
+                | "elemental"
+                | "recursive"
+                | "end"
+                | "endtype"
+        ),
+        _ => false,
+    }
+}
+
 fn make_ident_token(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
     let col = (pos as u32) + 7;
-    (Token {
-        kind: TokenKind::Identifier,
-        text: text.to_string(),
-        span: Span {
-            file_id,
-            start: Position { line, col },
-            end: Position { line, col: col + text.len() as u32 },
+    (
+        Token {
+            kind: TokenKind::Identifier,
+            text: text.to_string(),
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position {
+                    line,
+                    col: col + text.len() as u32,
+                },
+            },
         },
-    }, text.len())
+        text.len(),
+    )
 }
 
 /// Check if the rest of the statement after DO+digits looks like a DO loop.
@@ -546,8 +741,12 @@ fn find_top_level_char(bytes: &[u8], start: usize, target: u8) -> Option<usize> 
         }
 
         match b {
-            b'(' => { depth += 1; }
-            b')' => { depth -= 1; }
+            b'(' => {
+                depth += 1;
+            }
+            b')' => {
+                depth -= 1;
+            }
             c if c == target && depth == 0 => return Some(i),
             _ => {}
         }
@@ -557,7 +756,12 @@ fn find_top_level_char(bytes: &[u8], start: usize, target: u8) -> Option<usize> 
 }
 
 /// Lex a BOZ literal in fixed-form body.
-fn lex_fixed_boz(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Token, usize), LexError> {
+fn lex_fixed_boz(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+) -> Result<(Token, usize), LexError> {
     let bytes = text.as_bytes();
     let mut end = pos;
     let mut tok_text = String::new();
@@ -574,7 +778,17 @@ fn lex_fixed_boz(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Tok
     }
     if end >= bytes.len() {
         return Err(LexError {
-            span: Span { file_id, start: Position { line, col: (pos as u32) + 7 }, end: Position { line, col: (pos as u32) + 7 } },
+            span: Span {
+                file_id,
+                start: Position {
+                    line,
+                    col: (pos as u32) + 7,
+                },
+                end: Position {
+                    line,
+                    col: (pos as u32) + 7,
+                },
+            },
             msg: "unterminated BOZ literal".into(),
         });
     }
@@ -582,18 +796,37 @@ fn lex_fixed_boz(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Tok
     end += 1;
 
     let col = (pos as u32) + 7;
-    Ok((Token {
-        kind: TokenKind::BozLiteral,
-        text: tok_text,
-        span: Span { file_id, start: Position { line, col }, end: Position { line, col: col + (end - pos) as u32 } },
-    }, end - pos))
+    Ok((
+        Token {
+            kind: TokenKind::BozLiteral,
+            text: tok_text,
+            span: Span {
+                file_id,
+                start: Position { line, col },
+                end: Position {
+                    line,
+                    col: col + (end - pos) as u32,
+                },
+            },
+        },
+        end - pos,
+    ))
 }
 
 /// Lex an operator or punctuation in whitespace-stripped body.
-fn lex_fixed_punct(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(Token, usize), LexError> {
+fn lex_fixed_punct(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+) -> Result<(Token, usize), LexError> {
     let bytes = text.as_bytes();
     let ch = bytes[pos];
-    let next = if pos + 1 < bytes.len() { bytes[pos + 1] } else { 0 };
+    let next = if pos + 1 < bytes.len() {
+        bytes[pos + 1]
+    } else {
+        0
+    };
     let col = (pos as u32) + 7;
     let start = Position { line, col };
 
@@ -624,25 +857,49 @@ fn lex_fixed_punct(text: &str, pos: usize, file_id: u32, line: u32) -> Result<(T
         b'&' => (TokenKind::Ampersand, "&", 1),
         _ => {
             return Err(LexError {
-                span: Span { file_id, start, end: start },
-                msg: format!("unexpected character in fixed-form body: '{}'", ch as char),
+                span: Span {
+                    file_id,
+                    start,
+                    end: start,
+                },
+                msg: unexpected_char_message(text, pos, "unexpected character in fixed-form body"),
             });
         }
     };
 
-    Ok((Token {
-        kind,
-        text: tok_text.into(),
-        span: Span { file_id, start, end: Position { line, col: col + consumed as u32 } },
-    }, consumed))
+    Ok((
+        Token {
+            kind,
+            text: tok_text.into(),
+            span: Span {
+                file_id,
+                start,
+                end: Position {
+                    line,
+                    col: col + consumed as u32,
+                },
+            },
+        },
+        consumed,
+    ))
 }
 
 // ---- Line preprocessing ----
 
 enum FixedLine {
-    Comment { text: String, span: Span },
-    Statement { label: Option<String>, body: String, start_line: u32, file_id: u32 },
-    Blank { span: Span },
+    Comment {
+        text: String,
+        span: Span,
+    },
+    Statement {
+        label: Option<String>,
+        body: String,
+        start_line: u32,
+        file_id: u32,
+    },
+    Blank {
+        span: Span,
+    },
 }
 
 /// Preprocess fixed-form lines: identify comments, extract labels, join
@@ -661,8 +918,14 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
             result.push(FixedLine::Blank {
                 span: Span {
                     file_id,
-                    start: Position { line: line_num, col: 1 },
-                    end: Position { line: line_num, col: 1 },
+                    start: Position {
+                        line: line_num,
+                        col: 1,
+                    },
+                    end: Position {
+                        line: line_num,
+                        col: 1,
+                    },
                 },
             });
             i += 1;
@@ -677,8 +940,14 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
                 text: line.to_string(),
                 span: Span {
                     file_id,
-                    start: Position { line: line_num, col: 1 },
-                    end: Position { line: line_num, col: line.len() as u32 },
+                    start: Position {
+                        line: line_num,
+                        col: 1,
+                    },
+                    end: Position {
+                        line: line_num,
+                        col: line.len() as u32,
+                    },
                 },
             });
             i += 1;
@@ -717,8 +986,14 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
                     text: next.to_string(),
                     span: Span {
                         file_id,
-                        start: Position { line: (i + 1) as u32, col: 1 },
-                        end: Position { line: (i + 1) as u32, col: next.len() as u32 },
+                        start: Position {
+                            line: (i + 1) as u32,
+                            col: 1,
+                        },
+                        end: Position {
+                            line: (i + 1) as u32,
+                            col: next.len() as u32,
+                        },
                     },
                 });
                 i += 1;
@@ -736,7 +1011,11 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
         }
 
         result.push(FixedLine::Statement {
-            label: if label.trim().is_empty() { None } else { Some(label) },
+            label: if label.trim().is_empty() {
+                None
+            } else {
+                Some(label)
+            },
             body: full_body,
             start_line,
             file_id,
@@ -823,15 +1102,22 @@ mod tests {
     }
 
     fn fixed_kinds(src: &str) -> Vec<TokenKind> {
-        fixed_toks(src).into_iter()
+        fixed_toks(src)
+            .into_iter()
             .map(|t| t.kind)
             .filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline))
             .collect()
     }
 
     fn fixed_texts(src: &str) -> Vec<String> {
-        fixed_toks(src).into_iter()
-            .filter(|t| !matches!(t.kind, TokenKind::Eof | TokenKind::Newline | TokenKind::Comment))
+        fixed_toks(src)
+            .into_iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Eof | TokenKind::Newline | TokenKind::Comment
+                )
+            })
             .map(|t| t.text)
             .collect()
     }
@@ -876,8 +1162,14 @@ mod tests {
     fn statement_without_label() {
         // No label means the first token should be the identifier X, not a label number.
         let toks = fixed_toks("      X = 42\n");
-        let first_meaningful = toks.iter()
-            .find(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof | TokenKind::Comment))
+        let first_meaningful = toks
+            .iter()
+            .find(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Newline | TokenKind::Eof | TokenKind::Comment
+                )
+            })
             .unwrap();
         assert_eq!(first_meaningful.kind, TokenKind::Identifier);
         assert_eq!(first_meaningful.text, "X");
@@ -892,7 +1184,11 @@ mod tests {
         // Body should be "X = 42" + spaces, NOT including JUNK.
         let texts = fixed_texts(&line);
         assert!(texts.contains(&"X".to_string()));
-        assert!(!texts.iter().any(|t| t.contains("JUNK")), "got: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains("JUNK")),
+            "got: {:?}",
+            texts
+        );
     }
 
     // ---- Continuation lines ----
@@ -903,7 +1199,10 @@ mod tests {
         let kinds = fixed_kinds(src);
         assert!(kinds.contains(&TokenKind::Plus));
         // Should have both integer literals.
-        let int_count = kinds.iter().filter(|k| **k == TokenKind::IntegerLiteral).count();
+        let int_count = kinds
+            .iter()
+            .filter(|k| **k == TokenKind::IntegerLiteral)
+            .count();
         assert_eq!(int_count, 2, "expected 2 integer literals, got {:?}", kinds);
     }
 
@@ -912,7 +1211,10 @@ mod tests {
         // Any non-space, non-zero character in column 6 is continuation.
         let src = "      X = 1 +\n     $  2\n";
         let kinds = fixed_kinds(src);
-        let int_count = kinds.iter().filter(|k| **k == TokenKind::IntegerLiteral).count();
+        let int_count = kinds
+            .iter()
+            .filter(|k| **k == TokenKind::IntegerLiteral)
+            .count();
         assert_eq!(int_count, 2);
     }
 
@@ -931,7 +1233,10 @@ mod tests {
         // Tab followed by digit 1-9 is continuation.
         let src = "\tX = 1 +\n\t1  2\n";
         let kinds = fixed_kinds(src);
-        let int_count = kinds.iter().filter(|k| **k == TokenKind::IntegerLiteral).count();
+        let int_count = kinds
+            .iter()
+            .filter(|k| **k == TokenKind::IntegerLiteral)
+            .count();
         assert_eq!(int_count, 2, "got: {:?}", kinds);
     }
 
@@ -950,11 +1255,20 @@ C     Hello World
       END
 ";
         let tokens = tokenize_fixed(src, 0).unwrap();
-        let ident_count = tokens.iter().filter(|t| t.kind == TokenKind::Identifier).count();
-        assert!(ident_count >= 8, "expected 8+ identifiers, got {}", ident_count);
+        let ident_count = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Identifier)
+            .count();
+        assert!(
+            ident_count >= 8,
+            "expected 8+ identifiers, got {}",
+            ident_count
+        );
 
         // Should have a label "10".
-        assert!(tokens.iter().any(|t| t.kind == TokenKind::IntegerLiteral && t.text == "10"));
+        assert!(tokens
+            .iter()
+            .any(|t| t.kind == TokenKind::IntegerLiteral && t.text == "10"));
     }
 
     // ---- Mode detection ----
@@ -962,19 +1276,43 @@ C     Hello World
     #[test]
     fn detect_free_form() {
         use super::super::detect_source_form;
-        assert_eq!(detect_source_form("test.f90"), super::super::SourceForm::FreeForm);
-        assert_eq!(detect_source_form("test.f95"), super::super::SourceForm::FreeForm);
-        assert_eq!(detect_source_form("test.f03"), super::super::SourceForm::FreeForm);
-        assert_eq!(detect_source_form("test.f08"), super::super::SourceForm::FreeForm);
-        assert_eq!(detect_source_form("test.f18"), super::super::SourceForm::FreeForm);
+        assert_eq!(
+            detect_source_form("test.f90"),
+            super::super::SourceForm::FreeForm
+        );
+        assert_eq!(
+            detect_source_form("test.f95"),
+            super::super::SourceForm::FreeForm
+        );
+        assert_eq!(
+            detect_source_form("test.f03"),
+            super::super::SourceForm::FreeForm
+        );
+        assert_eq!(
+            detect_source_form("test.f08"),
+            super::super::SourceForm::FreeForm
+        );
+        assert_eq!(
+            detect_source_form("test.f18"),
+            super::super::SourceForm::FreeForm
+        );
     }
 
     #[test]
     fn detect_fixed_form() {
         use super::super::detect_source_form;
-        assert_eq!(detect_source_form("test.f"), super::super::SourceForm::FixedForm);
-        assert_eq!(detect_source_form("test.for"), super::super::SourceForm::FixedForm);
-        assert_eq!(detect_source_form("test.ftn"), super::super::SourceForm::FixedForm);
+        assert_eq!(
+            detect_source_form("test.f"),
+            super::super::SourceForm::FixedForm
+        );
+        assert_eq!(
+            detect_source_form("test.for"),
+            super::super::SourceForm::FixedForm
+        );
+        assert_eq!(
+            detect_source_form("test.ftn"),
+            super::super::SourceForm::FixedForm
+        );
     }
 
     // ---- Unified token stream ----
@@ -984,16 +1322,20 @@ C     Hello World
         let free_src = "integer :: x\nx = 42\n";
         let fixed_src = "      integer :: x\n      x = 42\n";
 
-        let free_kinds: Vec<_> = super::super::Lexer::tokenize(free_src, 0).unwrap()
-            .into_iter().map(|t| t.kind)
+        let free_kinds: Vec<_> = super::super::Lexer::tokenize(free_src, 0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.kind)
             .filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline))
             .collect();
 
         let fixed_kinds = fixed_kinds(fixed_src);
 
-        assert_eq!(free_kinds, fixed_kinds,
+        assert_eq!(
+            free_kinds, fixed_kinds,
             "free-form and fixed-form produced different tokens:\n  free:  {:?}\n  fixed: {:?}",
-            free_kinds, fixed_kinds);
+            free_kinds, fixed_kinds
+        );
     }
 
     // ---- Blank lines ----
@@ -1002,7 +1344,13 @@ C     Hello World
     fn blank_lines_handled() {
         let src = "      X = 1\n\n      Y = 2\n";
         let kinds = fixed_kinds(src);
-        assert!(kinds.iter().filter(|k| **k == TokenKind::Identifier).count() >= 2);
+        assert!(
+            kinds
+                .iter()
+                .filter(|k| **k == TokenKind::Identifier)
+                .count()
+                >= 2
+        );
     }
 
     // ---- Hollerith ----
@@ -1039,7 +1387,9 @@ C     Hello World
             env!("CARGO_MANIFEST_DIR"),
             "/../.refs/llvm/flang/test/Driver/Inputs/fixed-form-test.f"
         );
-        if !std::path::Path::new(path).exists() { return; }
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
         let src = std::fs::read_to_string(path).unwrap();
         let tokens = tokenize_fixed(&src, 0);
         assert!(tokens.is_ok(), "failed: {:?}", tokens.err());
@@ -1051,7 +1401,9 @@ C     Hello World
             env!("CARGO_MANIFEST_DIR"),
             "/../.refs/gcc/gcc/testsuite/gfortran.dg/nested_forall_1.f"
         );
-        if !std::path::Path::new(path).exists() { return; }
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
         let src = std::fs::read_to_string(path).unwrap();
         let tokens = tokenize_fixed(&src, 0);
         assert!(tokens.is_ok(), "failed: {:?}", tokens.err());
@@ -1065,25 +1417,35 @@ C     Hello World
 
     #[test]
     fn whitespace_stripped_goto() {
-        // GOTO100 → single identifier (parser handles keyword+number split).
-        // This matches gfortran behavior: the lexer doesn't split keywords in
-        // fixed-form. The parser recognizes GOTO from statement context.
+        // GO TO 100 collapses to GOTO100 in fixed-form source.
         let texts = fixed_texts("      GOTO100\n");
-        assert_eq!(texts, vec!["GOTO100"], "got: {:?}", texts);
+        assert_eq!(texts, vec!["GOTO", "100"], "got: {:?}", texts);
     }
 
     #[test]
     fn whitespace_stripped_integer_decl() {
-        // INTEGERI → single identifier (parser splits INTEGER+I from context).
+        // INTEGER I collapses to INTEGERI and must still parse as a declaration.
         let texts = fixed_texts("      INTEGERI\n");
-        assert_eq!(texts, vec!["INTEGERI"], "got: {:?}", texts);
+        assert_eq!(texts, vec!["INTEGER", "I"], "got: {:?}", texts);
     }
 
     #[test]
     fn whitespace_stripped_doubleprecision() {
-        // DOUBLEPRECISIONX → single identifier (parser handles).
+        // DOUBLE PRECISION X collapses to DOUBLEPRECISIONX.
         let texts = fixed_texts("      DOUBLEPRECISIONX\n");
-        assert_eq!(texts, vec!["DOUBLEPRECISIONX"], "got: {:?}", texts);
+        assert_eq!(texts, vec!["DOUBLEPRECISION", "X"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn whitespace_stripped_program_name() {
+        let texts = fixed_texts("      PROGRAMHELLO\n");
+        assert_eq!(texts, vec!["PROGRAM", "HELLO"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn whitespace_stripped_typed_function() {
+        let texts = fixed_texts("      INTEGERFUNCTIONF(X)\n");
+        assert_eq!(texts, vec!["INTEGER", "FUNCTION", "F", "(", "X", ")"]);
     }
 
     #[test]
@@ -1091,7 +1453,11 @@ C     Hello World
         // INDEX must NOT be split into IN+DEX — this was the showstopper bug.
         let _kinds = fixed_kinds("      X=INDEX(A,'B')\n");
         let texts = fixed_texts("      X=INDEX(A,'B')\n");
-        assert!(texts.contains(&"INDEX".to_string()), "INDEX was incorrectly split, got: {:?}", texts);
+        assert!(
+            texts.contains(&"INDEX".to_string()),
+            "INDEX was incorrectly split, got: {:?}",
+            texts
+        );
     }
 
     #[test]
@@ -1112,58 +1478,86 @@ C     Hello World
     fn whitespace_stripped_assignment() {
         // X=42 → identifier, =, integer
         let kinds = fixed_kinds("      X=42\n");
-        assert_eq!(kinds, vec![
-            TokenKind::Identifier, TokenKind::Assign, TokenKind::IntegerLiteral,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::IntegerLiteral,
+            ]
+        );
     }
 
     #[test]
     fn whitespace_stripped_expression() {
         // A+B*C → identifier, +, identifier, *, identifier
         let kinds = fixed_kinds("      A+B*C\n");
-        assert_eq!(kinds, vec![
-            TokenKind::Identifier, TokenKind::Plus,
-            TokenKind::Identifier, TokenKind::Star,
-            TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier,
+                TokenKind::Star,
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
     fn whitespace_stripped_with_parens() {
         // X=REAL(I) → identifier, =, identifier, (, identifier, )
         let kinds = fixed_kinds("      X=REAL(I)\n");
-        assert_eq!(kinds, vec![
-            TokenKind::Identifier, TokenKind::Assign,
-            TokenKind::Identifier, TokenKind::LParen,
-            TokenKind::Identifier, TokenKind::RParen,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::Identifier,
+                TokenKind::LParen,
+                TokenKind::Identifier,
+                TokenKind::RParen,
+            ]
+        );
     }
 
     #[test]
     fn whitespace_stripped_dot_op() {
         // A.AND.B → identifier, .and., identifier
         let kinds = fixed_kinds("      A.AND.B\n");
-        assert_eq!(kinds, vec![
-            TokenKind::Identifier,
-            TokenKind::DotOp("and".into()),
-            TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::DotOp("and".into()),
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
     fn whitespace_stripped_real_literal() {
         // X=1.0D0 → identifier, =, real
         let kinds = fixed_kinds("      X=1.0D0\n");
-        assert_eq!(kinds, vec![
-            TokenKind::Identifier, TokenKind::Assign, TokenKind::RealLiteral,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::RealLiteral,
+            ]
+        );
     }
 
     #[test]
     fn whitespace_stripped_comparison() {
         // 1.EQ.2 → integer, .eq., integer
         let kinds = fixed_kinds("      IF(I.EQ.1)STOP\n");
-        assert!(kinds.contains(&TokenKind::DotOp("eq".into())), "got: {:?}", kinds);
+        assert!(
+            kinds.contains(&TokenKind::DotOp("eq".into())),
+            "got: {:?}",
+            kinds
+        );
     }
 
     #[test]
@@ -1172,7 +1566,11 @@ C     Hello World
         let kinds = fixed_kinds("      X='HELLO WORLD'\n");
         assert!(kinds.contains(&TokenKind::StringLiteral));
         let texts = fixed_texts("      X='HELLO WORLD'\n");
-        assert!(texts.iter().any(|t| t.contains("HELLO WORLD")), "got: {:?}", texts);
+        assert!(
+            texts.iter().any(|t| t.contains("HELLO WORLD")),
+            "got: {:?}",
+            texts
+        );
     }
 
     // ---- Continuation over blank lines ----
@@ -1181,8 +1579,15 @@ C     Hello World
     fn continuation_over_blank_line() {
         let src = "      X = 1 +\n\n     +  2\n";
         let kinds = fixed_kinds(src);
-        let int_count = kinds.iter().filter(|k| **k == TokenKind::IntegerLiteral).count();
-        assert_eq!(int_count, 2, "blank line should not break continuation, got: {:?}", kinds);
+        let int_count = kinds
+            .iter()
+            .filter(|k| **k == TokenKind::IntegerLiteral)
+            .count();
+        assert_eq!(
+            int_count, 2,
+            "blank line should not break continuation, got: {:?}",
+            kinds
+        );
     }
 
     // ---- DO/assignment ambiguity ----
@@ -1191,20 +1596,34 @@ C     Hello World
     fn do_loop_with_comma() {
         // DO10I=1,10 → DO loop: DO + 10 + I + = + 1 + , + 10
         let kinds = fixed_kinds("      DO10I=1,10\n");
-        assert!(kinds.contains(&TokenKind::Comma),
-            "DO loop must have comma, got: {:?}", kinds);
+        assert!(
+            kinds.contains(&TokenKind::Comma),
+            "DO loop must have comma, got: {:?}",
+            kinds
+        );
         let texts = fixed_texts("      DO10I=1,10\n");
-        assert_eq!(texts[0], "DO", "first token should be DO keyword, got: {:?}", texts);
+        assert_eq!(
+            texts[0], "DO",
+            "first token should be DO keyword, got: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn do_assignment_no_comma() {
         // DO10I=1.10 → assignment: DO10I + = + 1.10 (no comma → not a loop)
         let kinds = fixed_kinds("      DO10I=1.10\n");
-        assert!(!kinds.contains(&TokenKind::Comma),
-            "assignment should have no comma, got: {:?}", kinds);
+        assert!(
+            !kinds.contains(&TokenKind::Comma),
+            "assignment should have no comma, got: {:?}",
+            kinds
+        );
         let texts = fixed_texts("      DO10I=1.10\n");
-        assert_eq!(texts[0], "DO10I", "should be single identifier, got: {:?}", texts);
+        assert_eq!(
+            texts[0], "DO10I",
+            "should be single identifier, got: {:?}",
+            texts
+        );
     }
 
     #[test]
@@ -1236,16 +1655,28 @@ C     Hello World
     fn hollerith_in_source() {
         // 3HABC in a statement should produce a string literal.
         let kinds = fixed_kinds("      X=3HABC\n");
-        assert!(kinds.contains(&TokenKind::StringLiteral), "got: {:?}", kinds);
+        assert!(
+            kinds.contains(&TokenKind::StringLiteral),
+            "got: {:?}",
+            kinds
+        );
         let texts = fixed_texts("      X=3HABC\n");
-        assert!(texts.iter().any(|t| t.contains("ABC")), "Hollerith content missing, got: {:?}", texts);
+        assert!(
+            texts.iter().any(|t| t.contains("ABC")),
+            "Hollerith content missing, got: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn hollerith_with_spaces_in_source() {
         // 6H HELLO preserves the space.
         let texts = fixed_texts("      X=6H HELLO\n");
-        assert!(texts.iter().any(|t| t.contains(" HELLO")), "space lost, got: {:?}", texts);
+        assert!(
+            texts.iter().any(|t| t.contains(" HELLO")),
+            "space lost, got: {:?}",
+            texts
+        );
     }
 
     #[test]
@@ -1261,7 +1692,11 @@ C     Hello World
         let kinds = fixed_kinds("      X = 'IT''S'\n");
         assert!(kinds.contains(&TokenKind::StringLiteral));
         let texts = fixed_texts("      X = 'IT''S'\n");
-        assert!(texts.iter().any(|t| t.contains("IT''S")), "got: {:?}", texts);
+        assert!(
+            texts.iter().any(|t| t.contains("IT''S")),
+            "got: {:?}",
+            texts
+        );
     }
 
     #[test]
@@ -1283,5 +1718,4 @@ C     Hello World
         assert!(is_keyword("continue").is_some());
         assert!(is_keyword("CONTINUE").is_some());
     }
-
 }

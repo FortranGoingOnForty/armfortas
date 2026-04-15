@@ -4,12 +4,12 @@
 //! WHERE, FORALL, BLOCK, ASSOCIATE, EXIT, CYCLE, STOP, RETURN, GOTO,
 //! CALL, PRINT, and legacy control flow.
 
-use crate::ast::Spanned;
-use crate::ast::stmt::*;
-use crate::ast::expr::{SpannedExpr, Expr};
-use crate::lexer::TokenKind;
-use super::{Parser, ParseError};
 use super::expr::span_from_to;
+use super::{ParseError, Parser};
+use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::stmt::*;
+use crate::ast::Spanned;
+use crate::lexer::TokenKind;
 
 impl<'a> Parser<'a> {
     /// Parse a single statement.
@@ -27,16 +27,21 @@ impl<'a> Parser<'a> {
                 let next_kind = &self.tokens[next_pos].kind;
                 // Only treat as a label if the following token starts a statement.
                 // Reject if followed by a comma (e.g. computed-GOTO label list handled elsewhere).
-                if matches!(next_kind,
-                    TokenKind::Identifier
-                    | TokenKind::IntegerLiteral
-                    | TokenKind::LParen)
-                {
+                if matches!(
+                    next_kind,
+                    TokenKind::Identifier | TokenKind::IntegerLiteral | TokenKind::LParen
+                ) {
                     let label_text = self.advance().clone().text;
                     let label: u64 = label_text.parse().unwrap_or(0);
                     let inner = self.parse_stmt()?;
                     let span = span_from_to(start, self.prev_span());
-                    return Ok(Spanned::new(Stmt::Labeled { label, stmt: Box::new(inner) }, span));
+                    return Ok(Spanned::new(
+                        Stmt::Labeled {
+                            label,
+                            stmt: Box::new(inner),
+                        },
+                        span,
+                    ));
                 }
             }
         }
@@ -61,9 +66,18 @@ impl<'a> Parser<'a> {
             "forall" => self.parse_forall_construct(start),
             "block" => self.parse_block_construct(start),
             "associate" => self.parse_associate(start),
-            "exit" => { self.advance(); self.parse_exit(start) }
-            "cycle" => { self.advance(); self.parse_cycle(start) }
-            "stop" => { self.advance(); self.parse_stop(start, false) }
+            "exit" => {
+                self.advance();
+                self.parse_exit(start)
+            }
+            "cycle" => {
+                self.advance();
+                self.parse_cycle(start)
+            }
+            "stop" => {
+                self.advance();
+                self.parse_stop(start, false)
+            }
             "error" => {
                 self.advance();
                 if self.peek_text().eq_ignore_ascii_case("stop") {
@@ -73,24 +87,75 @@ impl<'a> Parser<'a> {
                     Err(self.error("expected 'stop' after 'error'".into()))
                 }
             }
-            "return" => { self.advance(); self.parse_return(start) }
+            "return" => {
+                self.advance();
+                self.parse_return(start)
+            }
             "goto" | "go" => self.parse_goto(start),
-            "call" => { self.advance(); self.parse_call(start) }
-            "print" => { self.advance(); self.parse_print(start) }
-            "write" => { self.advance(); self.parse_write(start) }
-            "read" => { self.advance(); self.parse_read(start) }
-            "open" => { self.advance(); self.parse_io_paren_stmt(start, "open") }
-            "close" => { self.advance(); self.parse_io_paren_stmt(start, "close") }
-            "inquire" => { self.advance(); self.parse_inquire(start) }
-            "rewind" => { self.advance(); self.parse_io_paren_stmt(start, "rewind") }
-            "backspace" => { self.advance(); self.parse_io_paren_stmt(start, "backspace") }
-            "endfile" => { self.advance(); self.parse_io_paren_stmt(start, "endfile") }
-            "flush" => { self.advance(); self.parse_io_paren_stmt(start, "flush") }
-            "wait" => { self.advance(); self.parse_io_paren_stmt(start, "wait") }
-            "allocate" => { self.advance(); self.parse_allocate(start, false) }
-            "deallocate" => { self.advance(); self.parse_allocate(start, true) }
-            "nullify" => { self.advance(); self.parse_nullify(start) }
-            "namelist" => { self.advance(); self.parse_namelist(start) }
+            "call" => {
+                self.advance();
+                self.parse_call(start)
+            }
+            "print" => {
+                self.advance();
+                self.parse_print(start)
+            }
+            "write" => {
+                self.advance();
+                self.parse_write(start)
+            }
+            "read" => {
+                self.advance();
+                self.parse_read(start)
+            }
+            "open" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "open")
+            }
+            "close" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "close")
+            }
+            "inquire" => {
+                self.advance();
+                self.parse_inquire(start)
+            }
+            "rewind" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "rewind")
+            }
+            "backspace" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "backspace")
+            }
+            "endfile" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "endfile")
+            }
+            "flush" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "flush")
+            }
+            "wait" => {
+                self.advance();
+                self.parse_io_paren_stmt(start, "wait")
+            }
+            "allocate" => {
+                self.advance();
+                self.parse_allocate(start, false)
+            }
+            "deallocate" => {
+                self.advance();
+                self.parse_allocate(start, true)
+            }
+            "nullify" => {
+                self.advance();
+                self.parse_nullify(start)
+            }
+            "namelist" => {
+                self.advance();
+                self.parse_namelist(start)
+            }
             "continue" => {
                 self.advance();
                 let span = span_from_to(start, self.prev_span());
@@ -101,11 +166,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a block of statements until a terminating keyword.
-    pub fn parse_stmt_block(&mut self, terminators: &[&str]) -> Result<Vec<SpannedStmt>, ParseError> {
+    pub fn parse_stmt_block(
+        &mut self,
+        terminators: &[&str],
+    ) -> Result<Vec<SpannedStmt>, ParseError> {
         let mut stmts = Vec::new();
         loop {
             self.skip_newlines();
-            if self.peek() == &TokenKind::Eof { break; }
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
             let text = self.peek_text().to_lowercase();
 
             // Check for combined end-keyword: "endif", "enddo", "endselect", etc.
@@ -116,13 +186,18 @@ impl<'a> Parser<'a> {
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
-                } else { String::new() };
+                } else {
+                    String::new()
+                };
                 if terminators.iter().any(|t| next == *t) || next.is_empty() {
                     break;
                 }
             }
             // Check for "else", "elsewhere", "case", "contains" which terminate inner blocks.
-            if matches!(text.as_str(), "else" | "elseif" | "elsewhere" | "case" | "contains" | "default") {
+            if matches!(
+                text.as_str(),
+                "else" | "elseif" | "elsewhere" | "case" | "contains" | "default"
+            ) {
                 break;
             }
             stmts.push(self.parse_stmt()?);
@@ -153,16 +228,27 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Comma)?;
             let pos: u64 = self.advance().clone().text.parse().unwrap_or(0);
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::ArithmeticIf { expr: condition, neg, zero, pos }, span));
+            return Ok(Spanned::new(
+                Stmt::ArithmeticIf {
+                    expr: condition,
+                    neg,
+                    zero,
+                    pos,
+                },
+                span,
+            ));
         }
 
         // Single-line IF: if (cond) action
         let action = self.parse_stmt()?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::IfStmt {
-            condition,
-            action: Box::new(action),
-        }, span))
+        Ok(Spanned::new(
+            Stmt::IfStmt {
+                condition,
+                action: Box::new(action),
+            },
+            span,
+        ))
     }
 
     fn parse_if_construct(
@@ -180,12 +266,16 @@ impl<'a> Parser<'a> {
             let text = self.peek_text().to_lowercase();
 
             if text == "elseif" || text == "else" {
-                if text == "elseif" || (text == "else" && {
-                    let next = if self.pos + 1 < self.tokens.len() {
-                        self.tokens[self.pos + 1].text.to_lowercase()
-                    } else { String::new() };
-                    next == "if"
-                }) {
+                if text == "elseif"
+                    || (text == "else" && {
+                        let next = if self.pos + 1 < self.tokens.len() {
+                            self.tokens[self.pos + 1].text.to_lowercase()
+                        } else {
+                            String::new()
+                        };
+                        next == "if"
+                    })
+                {
                     // ELSE IF
                     self.advance(); // else
                     if self.peek_text().eq_ignore_ascii_case("if") {
@@ -216,9 +306,16 @@ impl<'a> Parser<'a> {
         self.consume_end("if")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::IfConstruct {
-            name, condition, then_body, else_ifs, else_body,
-        }, span))
+        Ok(Spanned::new(
+            Stmt::IfConstruct {
+                name,
+                condition,
+                then_body,
+                else_ifs,
+                else_body,
+            },
+            span,
+        ))
     }
 
     // ---- DO ----
@@ -256,7 +353,14 @@ impl<'a> Parser<'a> {
         }
         self.consume_end("select")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::SelectCase { name: None, selector, cases }, span))
+        Ok(Spanned::new(
+            Stmt::SelectCase {
+                name: None,
+                selector,
+                cases,
+            },
+            span,
+        ))
     }
 
     fn parse_select_type(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
@@ -270,7 +374,9 @@ impl<'a> Parser<'a> {
                 // assoc => expr
                 let assoc = if let Expr::Name { name } = &expr.node {
                     Some(name.clone())
-                } else { None };
+                } else {
+                    None
+                };
                 let sel = self.parse_expr()?;
                 (assoc, sel)
             } else {
@@ -314,7 +420,15 @@ impl<'a> Parser<'a> {
         }
         self.consume_end("select")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::SelectType { name: None, selector, assoc_name, guards }, span))
+        Ok(Spanned::new(
+            Stmt::SelectType {
+                name: None,
+                selector,
+                assoc_name,
+                guards,
+            },
+            span,
+        ))
     }
 
     /// Parse the body of a SELECT TYPE guard — stops at TYPE IS, CLASS IS, CLASS DEFAULT, or END SELECT.
@@ -322,15 +436,23 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         loop {
             self.skip_newlines();
-            if self.peek() == &TokenKind::Eof { break; }
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
             let text = self.peek_text().to_lowercase();
             // Break on guard keywords or end.
-            if text == "type" || text == "class" || text == "endselect" { break; }
+            if text == "type" || text == "class" || text == "endselect" {
+                break;
+            }
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
-                } else { String::new() };
-                if next == "select" || next.is_empty() { break; }
+                } else {
+                    String::new()
+                };
+                if next == "select" || next.is_empty() {
+                    break;
+                }
             }
             stmts.push(self.parse_stmt()?);
         }
@@ -343,8 +465,12 @@ impl<'a> Parser<'a> {
         loop {
             if self.peek() == &TokenKind::Identifier {
                 names.push(self.advance().clone().text);
-            } else { break; }
-            if !self.eat(&TokenKind::Comma) { break; }
+            } else {
+                break;
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         Ok(names)
     }
@@ -361,21 +487,32 @@ impl<'a> Parser<'a> {
             if self.peek() == &TokenKind::Colon {
                 self.advance();
                 let high = self.parse_expr()?;
-                selectors.push(CaseSelector::Range { low: None, high: Some(high) });
+                selectors.push(CaseSelector::Range {
+                    low: None,
+                    high: Some(high),
+                });
             } else {
                 let val = self.parse_expr()?;
                 if self.eat(&TokenKind::Colon) {
                     if matches!(self.peek(), TokenKind::Comma | TokenKind::RParen) {
-                        selectors.push(CaseSelector::Range { low: Some(val), high: None });
+                        selectors.push(CaseSelector::Range {
+                            low: Some(val),
+                            high: None,
+                        });
                     } else {
                         let high = self.parse_expr()?;
-                        selectors.push(CaseSelector::Range { low: Some(val), high: Some(high) });
+                        selectors.push(CaseSelector::Range {
+                            low: Some(val),
+                            high: Some(high),
+                        });
                     }
                 } else {
                     selectors.push(CaseSelector::Value(val));
                 }
             }
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         self.expect(&TokenKind::RParen)?;
         Ok(selectors)
@@ -386,7 +523,9 @@ impl<'a> Parser<'a> {
     fn parse_exit(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         let name = if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Exit { name }, span))
     }
@@ -394,15 +533,23 @@ impl<'a> Parser<'a> {
     fn parse_cycle(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         let name = if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Cycle { name }, span))
     }
 
-    fn parse_stop(&mut self, start: crate::lexer::Span, is_error: bool) -> Result<SpannedStmt, ParseError> {
+    fn parse_stop(
+        &mut self,
+        start: crate::lexer::Span,
+        is_error: bool,
+    ) -> Result<SpannedStmt, ParseError> {
         let code = if !self.at_stmt_end() && !self.peek_text().eq_ignore_ascii_case("quiet") {
             Some(self.parse_expr()?)
-        } else { None };
+        } else {
+            None
+        };
 
         // Check for QUIET= specifier.
         let mut quiet = false;
@@ -428,7 +575,9 @@ impl<'a> Parser<'a> {
     fn parse_return(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         let value = if !self.at_stmt_end() {
             Some(self.parse_expr()?)
-        } else { None };
+        } else {
+            None
+        };
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Return { value }, span))
     }
@@ -451,7 +600,9 @@ impl<'a> Parser<'a> {
             loop {
                 let l: u64 = self.advance().clone().text.parse().unwrap_or(0);
                 labels.push(l);
-                if !self.eat(&TokenKind::Comma) { break; }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
             self.expect(&TokenKind::RParen)?;
             self.eat(&TokenKind::Comma);
@@ -467,11 +618,27 @@ impl<'a> Parser<'a> {
         let span = span_from_to(start, self.prev_span());
         // The expression parser handles the (args) part as FunctionCall.
         // Extract the args from the FunctionCall if present.
-        if let Expr::FunctionCall { callee: inner, args } = callee.node {
-            Ok(Spanned::new(Stmt::Call { callee: *inner, args }, span))
+        if let Expr::FunctionCall {
+            callee: inner,
+            args,
+        } = callee.node
+        {
+            Ok(Spanned::new(
+                Stmt::Call {
+                    callee: *inner,
+                    args,
+                },
+                span,
+            ))
         } else {
             // Call with no arguments: call sub
-            Ok(Spanned::new(Stmt::Call { callee, args: Vec::new() }, span))
+            Ok(Spanned::new(
+                Stmt::Call {
+                    callee,
+                    args: Vec::new(),
+                },
+                span,
+            ))
         }
     }
 
@@ -487,14 +654,19 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Comma) {
             loop {
                 items.push(self.parse_expr()?);
-                if !self.eat(&TokenKind::Comma) { break; }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
         }
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Print { format, items }, span))
     }
 
-    fn parse_assignment_or_call(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+    fn parse_assignment_or_call(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedStmt, ParseError> {
         let target = self.parse_expr()?;
 
         if self.eat(&TokenKind::Assign) {
@@ -506,17 +678,24 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Arrow) {
             let value = self.parse_expr()?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::PointerAssignment { target, value }, span));
+            return Ok(Spanned::new(
+                Stmt::PointerAssignment { target, value },
+                span,
+            ));
         }
 
-        // Bare expression as statement (e.g., function call without CALL keyword).
-        let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::Call { callee: target, args: Vec::new() }, span))
+        Err(ParseError {
+            span: target.span,
+            msg: "unexpected expression statement; expected assignment (=) or pointer assignment (=>); subroutine calls require CALL".into(),
+        })
     }
 
     // ---- WHERE / FORALL / BLOCK / ASSOCIATE stubs ----
 
-    fn parse_where_construct(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+    fn parse_where_construct(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'where'
         self.expect(&TokenKind::LParen)?;
         let mask = self.parse_expr()?;
@@ -527,7 +706,13 @@ impl<'a> Parser<'a> {
             // Check if this looks like a statement, not a newline.
             let action = self.parse_stmt()?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::WhereStmt { mask, stmt: Box::new(action) }, span));
+            return Ok(Spanned::new(
+                Stmt::WhereStmt {
+                    mask,
+                    stmt: Box::new(action),
+                },
+                span,
+            ));
         }
 
         let body = self.parse_stmt_block(&["where"])?;
@@ -539,16 +724,29 @@ impl<'a> Parser<'a> {
                 let m = self.parse_expr()?;
                 self.expect(&TokenKind::RParen)?;
                 Some(m)
-            } else { None };
+            } else {
+                None
+            };
             let ew_body = self.parse_stmt_block(&["where"])?;
             elsewhere.push((ew_mask, ew_body));
         }
         self.consume_end("where")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::WhereConstruct { name: None, mask, body, elsewhere }, span))
+        Ok(Spanned::new(
+            Stmt::WhereConstruct {
+                name: None,
+                mask,
+                body,
+                elsewhere,
+            },
+            span,
+        ))
     }
 
-    fn parse_forall_construct(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+    fn parse_forall_construct(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'forall'
         self.expect(&TokenKind::LParen)?;
         let mut specs = Vec::new();
@@ -558,43 +756,85 @@ impl<'a> Parser<'a> {
             let fs_start = self.parse_expr()?;
             self.expect(&TokenKind::Colon)?;
             let end = self.parse_expr()?;
-            let step = if self.eat(&TokenKind::Colon) { Some(self.parse_expr()?) } else { None };
-            specs.push(ForallSpec { var, start: fs_start, end, step });
-            if !self.eat(&TokenKind::Comma) { break; }
+            let step = if self.eat(&TokenKind::Colon) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            specs.push(ForallSpec {
+                var,
+                start: fs_start,
+                end,
+                step,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
             // Check if next is a control or mask.
             if self.peek() != &TokenKind::Identifier || {
                 let np = self.pos + 1;
                 np >= self.tokens.len() || self.tokens[np].kind != TokenKind::Assign
-            } { break; }
+            } {
+                break;
+            }
         }
-        let mask = if self.peek() != &TokenKind::RParen { Some(self.parse_expr()?) } else { None };
+        let mask = if self.peek() != &TokenKind::RParen {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::RParen)?;
 
         // Single-line FORALL or block.
         if !self.at_stmt_end() {
             let action = self.parse_stmt()?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::ForallStmt { specs, mask, stmt: Box::new(action) }, span));
+            return Ok(Spanned::new(
+                Stmt::ForallStmt {
+                    specs,
+                    mask,
+                    stmt: Box::new(action),
+                },
+                span,
+            ));
         }
 
         let body = self.parse_stmt_block(&["forall"])?;
         self.consume_end("forall")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::ForallConstruct { name: None, specs, mask, body }, span))
+        Ok(Spanned::new(
+            Stmt::ForallConstruct {
+                name: None,
+                specs,
+                mask,
+                body,
+            },
+            span,
+        ))
     }
 
-    fn parse_block_construct(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+    fn parse_block_construct(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume 'block'
-        // F2008: a BLOCK construct can have a specification part
-        // (declarations) before its execution part (statements).
-        // Reuse parse_unit_body which already handles the full
-        // interleaving of type-decls, PARAMETER, COMMON, DATA,
-        // derived-type defs, and executable statements.
-        let (_uses, _imports, implicit, decls, body, _ifaces) =
-            self.parse_unit_body(&["block"])?;
+                        // F2008: a BLOCK construct can have a specification part
+                        // (declarations) before its execution part (statements).
+                        // Reuse parse_unit_body which already handles the full
+                        // interleaving of type-decls, PARAMETER, COMMON, DATA,
+                        // derived-type defs, and executable statements.
+        let (_uses, _imports, implicit, decls, body, _ifaces) = self.parse_unit_body(&["block"])?;
         self.consume_end("block")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::Block { name: None, implicit, decls, body }, span))
+        Ok(Spanned::new(
+            Stmt::Block {
+                name: None,
+                implicit,
+                decls,
+                body,
+            },
+            span,
+        ))
     }
 
     fn parse_associate(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
@@ -606,18 +846,31 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Arrow)?;
             let expr = self.parse_expr()?;
             assocs.push((name, expr));
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         self.expect(&TokenKind::RParen)?;
         let body = self.parse_stmt_block(&["associate"])?;
         self.consume_end("associate")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::Associate { name: None, assocs, body }, span))
+        Ok(Spanned::new(
+            Stmt::Associate {
+                name: None,
+                assocs,
+                body,
+            },
+            span,
+        ))
     }
 
     // ---- Helpers ----
 
-    fn parse_named_construct(&mut self, start: crate::lexer::Span, name: String) -> Result<SpannedStmt, ParseError> {
+    fn parse_named_construct(
+        &mut self,
+        start: crate::lexer::Span,
+        name: String,
+    ) -> Result<SpannedStmt, ParseError> {
         let text = self.peek_text().to_lowercase();
         match text.as_str() {
             "if" => {
@@ -636,9 +889,9 @@ impl<'a> Parser<'a> {
                 let mut stmt = self.parse_do_body(start)?;
                 // Inject name into the statement.
                 match &mut stmt.node {
-                    Stmt::DoLoop { name: n, .. } |
-                    Stmt::DoWhile { name: n, .. } |
-                    Stmt::DoConcurrent { name: n, .. } => *n = Some(name),
+                    Stmt::DoLoop { name: n, .. }
+                    | Stmt::DoWhile { name: n, .. }
+                    | Stmt::DoConcurrent { name: n, .. } => *n = Some(name),
                     _ => {}
                 }
                 Ok(stmt)
@@ -657,33 +910,53 @@ impl<'a> Parser<'a> {
                         let selectors = self.parse_case_selectors()?;
                         let body = self.parse_stmt_block(&["select"])?;
                         cases.push(CaseBlock { selectors, body });
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
                 self.consume_end("select")?;
                 let span = span_from_to(start, self.prev_span());
-                Ok(Spanned::new(Stmt::SelectCase { name: Some(name), selector, cases }, span))
+                Ok(Spanned::new(
+                    Stmt::SelectCase {
+                        name: Some(name),
+                        selector,
+                        cases,
+                    },
+                    span,
+                ))
             }
             "where" => {
                 let mut s = self.parse_where_construct(start)?;
-                if let Stmt::WhereConstruct { name: n, .. } = &mut s.node { *n = Some(name); }
+                if let Stmt::WhereConstruct { name: n, .. } = &mut s.node {
+                    *n = Some(name);
+                }
                 Ok(s)
             }
             "forall" => {
                 let mut s = self.parse_forall_construct(start)?;
-                if let Stmt::ForallConstruct { name: n, .. } = &mut s.node { *n = Some(name); }
+                if let Stmt::ForallConstruct { name: n, .. } = &mut s.node {
+                    *n = Some(name);
+                }
                 Ok(s)
             }
             "block" => {
                 let mut s = self.parse_block_construct(start)?;
-                if let Stmt::Block { name: n, .. } = &mut s.node { *n = Some(name); }
+                if let Stmt::Block { name: n, .. } = &mut s.node {
+                    *n = Some(name);
+                }
                 Ok(s)
             }
             "associate" => {
                 let mut s = self.parse_associate(start)?;
-                if let Stmt::Associate { name: n, .. } = &mut s.node { *n = Some(name); }
+                if let Stmt::Associate { name: n, .. } = &mut s.node {
+                    *n = Some(name);
+                }
                 Ok(s)
             }
-            _ => Err(self.error(format!("expected construct keyword after '{}:', got '{}'", name, text))),
+            _ => Err(self.error(format!(
+                "expected construct keyword after '{}:', got '{}'",
+                name, text
+            ))),
         }
     }
 
@@ -699,7 +972,14 @@ impl<'a> Parser<'a> {
             let body = self.parse_stmt_block(&["do"])?;
             self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoWhile { name: None, condition, body }, span));
+            return Ok(Spanned::new(
+                Stmt::DoWhile {
+                    name: None,
+                    condition,
+                    body,
+                },
+                span,
+            ));
         }
 
         // DO CONCURRENT
@@ -713,15 +993,32 @@ impl<'a> Parser<'a> {
                 let ctrl_start = self.parse_expr()?;
                 self.expect(&TokenKind::Colon)?;
                 let end = self.parse_expr()?;
-                let step = if self.eat(&TokenKind::Colon) { Some(self.parse_expr()?) } else { None };
-                controls.push(ConcurrentControl { var, start: ctrl_start, end, step });
-                if !self.eat(&TokenKind::Comma) { break; }
+                let step = if self.eat(&TokenKind::Colon) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                controls.push(ConcurrentControl {
+                    var,
+                    start: ctrl_start,
+                    end,
+                    step,
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
                 if self.peek() != &TokenKind::Identifier || {
                     let np = self.pos + 1;
                     np >= self.tokens.len() || self.tokens[np].kind != TokenKind::Assign
-                } { break; }
+                } {
+                    break;
+                }
             }
-            let mask = if self.peek() != &TokenKind::RParen { Some(self.parse_expr()?) } else { None };
+            let mask = if self.peek() != &TokenKind::RParen {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::RParen)?;
 
             // Parse optional locality specs: LOCAL(...), SHARED(...), DEFAULT(NONE), REDUCE(op:...)
@@ -731,7 +1028,9 @@ impl<'a> Parser<'a> {
                 match kw.as_str() {
                     "local" => {
                         self.advance();
-                        if self.peek_text().eq_ignore_ascii_case("_init") || self.peek_text().eq_ignore_ascii_case("init") {
+                        if self.peek_text().eq_ignore_ascii_case("_init")
+                            || self.peek_text().eq_ignore_ascii_case("init")
+                        {
                             // Check for LOCAL_INIT — might be lexed as LOCAL followed by _INIT
                             // or as LOCAL_INIT as one token.
                             let next = self.peek_text().to_lowercase();
@@ -786,7 +1085,16 @@ impl<'a> Parser<'a> {
             let body = self.parse_stmt_block(&["do"])?;
             self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoConcurrent { name: None, controls, mask, locality, body }, span));
+            return Ok(Spanned::new(
+                Stmt::DoConcurrent {
+                    name: None,
+                    controls,
+                    mask,
+                    locality,
+                    body,
+                },
+                span,
+            ));
         }
 
         // Infinite DO
@@ -794,10 +1102,25 @@ impl<'a> Parser<'a> {
             let body = self.parse_stmt_block(&["do"])?;
             self.consume_end("do")?;
             let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::DoLoop {
-                name: None, var: None, start: None, end: None, step: None, body,
-            }, span));
+            return Ok(Spanned::new(
+                Stmt::DoLoop {
+                    name: None,
+                    var: None,
+                    start: None,
+                    end: None,
+                    step: None,
+                    body,
+                },
+                span,
+            ));
         }
+
+        // Classic labeled DO (F77): DO 10 I = 1, N
+        let terminating_label = if self.peek() == &TokenKind::IntegerLiteral {
+            Some(self.advance().clone().text.parse().unwrap_or(0))
+        } else {
+            None
+        };
 
         // Counted DO
         let var = self.advance().clone().text;
@@ -805,13 +1128,57 @@ impl<'a> Parser<'a> {
         let do_start = self.parse_expr()?;
         self.expect(&TokenKind::Comma)?;
         let do_end = self.parse_expr()?;
-        let step = if self.eat(&TokenKind::Comma) { Some(self.parse_expr()?) } else { None };
-        let body = self.parse_stmt_block(&["do"])?;
-        self.consume_end("do")?;
+        let step = if self.eat(&TokenKind::Comma) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let body = if let Some(label) = terminating_label {
+            self.parse_labeled_do_body(label)?
+        } else {
+            let body = self.parse_stmt_block(&["do"])?;
+            self.consume_end("do")?;
+            body
+        };
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::DoLoop {
-            name: None, var: Some(var), start: Some(do_start), end: Some(do_end), step, body,
-        }, span))
+        Ok(Spanned::new(
+            Stmt::DoLoop {
+                name: None,
+                var: Some(var),
+                start: Some(do_start),
+                end: Some(do_end),
+                step,
+                body,
+            },
+            span,
+        ))
+    }
+
+    fn parse_labeled_do_body(&mut self, label: u64) -> Result<Vec<SpannedStmt>, ParseError> {
+        let mut body = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek() == &TokenKind::Eof {
+                return Err(
+                    self.error(format!("expected statement with terminating label {}", label))
+                );
+            }
+
+            let is_terminator = self.peek() == &TokenKind::IntegerLiteral
+                && self.tokens[self.pos]
+                    .text
+                    .parse::<u64>()
+                    .ok()
+                    .map(|current| current == label)
+                    .unwrap_or(false);
+
+            let stmt = self.parse_stmt()?;
+            body.push(stmt);
+            if is_terminator {
+                break;
+            }
+        }
+        Ok(body)
     }
 
     // ---- I/O statements ----
@@ -845,10 +1212,15 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_expr()?
             };
-            let controls = vec![IoControl { keyword: None, value: format }];
+            let controls = vec![IoControl {
+                keyword: None,
+                value: format,
+            }];
             let items = if self.eat(&TokenKind::Comma) {
                 self.parse_io_expr_list()?
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
             let span = span_from_to(start, self.prev_span());
             Ok(Spanned::new(Stmt::Read { controls, items }, span))
         }
@@ -866,27 +1238,36 @@ impl<'a> Parser<'a> {
 
     /// Parse a generic I/O statement with parenthesized specifiers:
     /// OPEN/CLOSE/REWIND/BACKSPACE/ENDFILE/FLUSH
-    fn parse_io_paren_stmt(&mut self, start: crate::lexer::Span, kind: &str) -> Result<SpannedStmt, ParseError> {
+    fn parse_io_paren_stmt(
+        &mut self,
+        start: crate::lexer::Span,
+        kind: &str,
+    ) -> Result<SpannedStmt, ParseError> {
         self.expect(&TokenKind::LParen)?;
         let specs = self.parse_io_control_list()?;
         self.expect(&TokenKind::RParen)?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(match kind {
-            "open" => Stmt::Open { specs },
-            "close" => Stmt::Close { specs },
-            "rewind" => Stmt::Rewind { specs },
-            "backspace" => Stmt::Backspace { specs },
-            "endfile" => Stmt::Endfile { specs },
-            "flush" => Stmt::Flush { specs },
-            "wait" => Stmt::Wait { specs },
-            _ => unreachable!(),
-        }, span))
+        Ok(Spanned::new(
+            match kind {
+                "open" => Stmt::Open { specs },
+                "close" => Stmt::Close { specs },
+                "rewind" => Stmt::Rewind { specs },
+                "backspace" => Stmt::Backspace { specs },
+                "endfile" => Stmt::Endfile { specs },
+                "flush" => Stmt::Flush { specs },
+                "wait" => Stmt::Wait { specs },
+                _ => unreachable!(),
+            },
+            span,
+        ))
     }
 
     /// Parse a comma-separated list of keyword=value or positional I/O control specifiers.
     fn parse_io_control_list(&mut self) -> Result<Vec<IoControl>, ParseError> {
         let mut controls = Vec::new();
-        if self.peek() == &TokenKind::RParen { return Ok(controls); }
+        if self.peek() == &TokenKind::RParen {
+            return Ok(controls);
+        }
         loop {
             // Check for keyword=value.
             if self.peek() == &TokenKind::Identifier {
@@ -900,8 +1281,13 @@ impl<'a> Parser<'a> {
                     } else {
                         self.parse_expr()?
                     };
-                    controls.push(IoControl { keyword: Some(kw), value: val });
-                    if !self.eat(&TokenKind::Comma) { break; }
+                    controls.push(IoControl {
+                        keyword: Some(kw),
+                        value: val,
+                    });
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -912,15 +1298,22 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_expr()?
             };
-            controls.push(IoControl { keyword: None, value: val });
-            if !self.eat(&TokenKind::Comma) { break; }
+            controls.push(IoControl {
+                keyword: None,
+                value: val,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         Ok(controls)
     }
 
     /// Parse I/O item list after the control list (for WRITE/READ/INQUIRE).
     fn parse_io_item_list(&mut self) -> Result<Vec<SpannedExpr>, ParseError> {
-        if self.at_stmt_end() { return Ok(Vec::new()); }
+        if self.at_stmt_end() {
+            return Ok(Vec::new());
+        }
         self.parse_io_expr_list()
     }
 
@@ -932,13 +1325,17 @@ impl<'a> Parser<'a> {
                 let save = self.pos;
                 if let Ok(implied) = self.try_parse_io_implied_do() {
                     items.push(implied);
-                    if !self.eat(&TokenKind::Comma) { break; }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
                     continue;
                 }
                 self.pos = save;
             }
             items.push(self.parse_expr()?);
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         Ok(items)
     }
@@ -961,25 +1358,29 @@ impl<'a> Parser<'a> {
                     let end = self.parse_expr()?;
                     let step = if self.eat(&TokenKind::Comma) {
                         Some(Box::new(self.parse_expr()?))
-                    } else { None };
+                    } else {
+                        None
+                    };
                     self.expect(&TokenKind::RParen)?;
 
                     // Build as a synthetic expression — a FunctionCall-like node
                     // that sema can recognize as an I/O implied-do.
                     let span = span_from_to(start, self.prev_span());
-                    use crate::ast::expr::{Expr, AcValue, ImpliedDoLoop};
-                    let values: Vec<AcValue> = inner_items.into_iter()
-                        .map(AcValue::Expr).collect();
-                    return Ok(Spanned::new(Expr::ArrayConstructor {
-                        type_spec: None,
-                        values: vec![AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
-                            values,
-                            var,
-                            start: loop_start,
-                            end,
-                            step: step.map(|s| *s),
-                        }))],
-                    }, span));
+                    use crate::ast::expr::{AcValue, Expr, ImpliedDoLoop};
+                    let values: Vec<AcValue> = inner_items.into_iter().map(AcValue::Expr).collect();
+                    return Ok(Spanned::new(
+                        Expr::ArrayConstructor {
+                            type_spec: None,
+                            values: vec![AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
+                                values,
+                                var,
+                                start: loop_start,
+                                end,
+                                step: step.map(|s| *s),
+                            }))],
+                        },
+                        span,
+                    ));
                 }
             }
             inner_items.push(self.parse_expr()?);
@@ -990,7 +1391,11 @@ impl<'a> Parser<'a> {
 
     // ---- ALLOCATE / DEALLOCATE ----
 
-    fn parse_allocate(&mut self, start: crate::lexer::Span, is_dealloc: bool) -> Result<SpannedStmt, ParseError> {
+    fn parse_allocate(
+        &mut self,
+        start: crate::lexer::Span,
+        is_dealloc: bool,
+    ) -> Result<SpannedStmt, ParseError> {
         self.expect(&TokenKind::LParen)?;
         let mut items = Vec::new();
         let mut opts = Vec::new();
@@ -1002,7 +1407,7 @@ impl<'a> Parser<'a> {
             if let Some(ts_result) = self.try_parse_type_spec() {
                 if ts_result.is_ok() && self.peek() == &TokenKind::ColonColon {
                     self.advance(); // consume ::
-                    // Continue to parse items normally below.
+                                    // Continue to parse items normally below.
                 } else {
                     // Not a typed allocate — restore.
                     self.pos = save;
@@ -1016,18 +1421,27 @@ impl<'a> Parser<'a> {
                 let text = self.peek_text().to_lowercase();
                 if matches!(text.as_str(), "stat" | "errmsg" | "source" | "mold") {
                     let next_pos = self.pos + 1;
-                    if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::Assign {
+                    if next_pos < self.tokens.len()
+                        && self.tokens[next_pos].kind == TokenKind::Assign
+                    {
                         let kw = self.advance().clone().text;
                         self.advance(); // =
                         let val = self.parse_expr()?;
-                        opts.push(IoControl { keyword: Some(kw), value: val });
-                        if !self.eat(&TokenKind::Comma) { break; }
+                        opts.push(IoControl {
+                            keyword: Some(kw),
+                            value: val,
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                         continue;
                     }
                 }
             }
             items.push(self.parse_expr()?);
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
 
         self.expect(&TokenKind::RParen)?;
@@ -1046,7 +1460,9 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         loop {
             items.push(self.parse_expr()?);
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         self.expect(&TokenKind::RParen)?;
         let span = span_from_to(start, self.prev_span());
@@ -1064,12 +1480,18 @@ impl<'a> Parser<'a> {
             let mut vars = Vec::new();
             loop {
                 vars.push(self.advance().clone().text);
-                if !self.eat(&TokenKind::Comma) { break; }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
                 // Check for next group starting with /
-                if self.peek() == &TokenKind::Slash { break; }
+                if self.peek() == &TokenKind::Slash {
+                    break;
+                }
             }
             groups.push((name, vars));
-            if self.at_stmt_end() || self.peek() != &TokenKind::Slash { break; }
+            if self.at_stmt_end() || self.peek() != &TokenKind::Slash {
+                break;
+            }
         }
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Namelist { groups }, span))
@@ -1087,7 +1509,10 @@ impl<'a> Parser<'a> {
             self.advance();
             self.eat_ident(keyword);
         } else {
-            return Err(self.error(format!("expected 'end {}' or 'end{}', got '{}'", keyword, keyword, text)));
+            return Err(self.error(format!(
+                "expected 'end {}' or 'end{}', got '{}'",
+                keyword, keyword, text
+            )));
         }
         // Skip optional construct name after end, but only on the same line.
         if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
@@ -1133,11 +1558,19 @@ mod tests {
     #[test]
     fn if_construct() {
         let s = parse_one("if (x > 0) then\n  y = 1\nend if\n");
-        if let Stmt::IfConstruct { then_body, else_ifs, else_body, .. } = &s.node {
+        if let Stmt::IfConstruct {
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } = &s.node
+        {
             assert_eq!(then_body.len(), 1);
             assert!(else_ifs.is_empty());
             assert!(else_body.is_none());
-        } else { panic!("not IfConstruct"); }
+        } else {
+            panic!("not IfConstruct");
+        }
     }
 
     #[test]
@@ -1145,16 +1578,27 @@ mod tests {
         let s = parse_one("if (x > 0) then\n  y = 1\nelse\n  y = 2\nend if\n");
         if let Stmt::IfConstruct { else_body, .. } = &s.node {
             assert!(else_body.is_some());
-        } else { panic!("not IfConstruct"); }
+        } else {
+            panic!("not IfConstruct");
+        }
     }
 
     #[test]
     fn if_elseif() {
-        let s = parse_one("if (x > 0) then\n  y = 1\nelse if (x < 0) then\n  y = 2\nelse\n  y = 0\nend if\n");
-        if let Stmt::IfConstruct { else_ifs, else_body, .. } = &s.node {
+        let s = parse_one(
+            "if (x > 0) then\n  y = 1\nelse if (x < 0) then\n  y = 2\nelse\n  y = 0\nend if\n",
+        );
+        if let Stmt::IfConstruct {
+            else_ifs,
+            else_body,
+            ..
+        } = &s.node
+        {
             assert_eq!(else_ifs.len(), 1);
             assert!(else_body.is_some());
-        } else { panic!("not IfConstruct"); }
+        } else {
+            panic!("not IfConstruct");
+        }
     }
 
     // ---- DO ----
@@ -1162,13 +1606,23 @@ mod tests {
     #[test]
     fn do_counted() {
         let s = parse_one("do i = 1, 10\n  x = i\nend do\n");
-        if let Stmt::DoLoop { var, start, end, step, body, .. } = &s.node {
+        if let Stmt::DoLoop {
+            var,
+            start,
+            end,
+            step,
+            body,
+            ..
+        } = &s.node
+        {
             assert_eq!(var.as_deref(), Some("i"));
             assert!(start.is_some());
             assert!(end.is_some());
             assert!(step.is_none());
             assert_eq!(body.len(), 1);
-        } else { panic!("not DoLoop"); }
+        } else {
+            panic!("not DoLoop");
+        }
     }
 
     #[test]
@@ -1176,7 +1630,21 @@ mod tests {
         let s = parse_one("do i = 10, 1, -1\n  x = i\nend do\n");
         if let Stmt::DoLoop { step, .. } = &s.node {
             assert!(step.is_some());
-        } else { panic!("not DoLoop"); }
+        } else {
+            panic!("not DoLoop");
+        }
+    }
+
+    #[test]
+    fn do_with_terminating_label() {
+        let s = parse_one("do 10 i = 1, 3\n  x = i\n10 continue\n");
+        if let Stmt::DoLoop { var, body, .. } = &s.node {
+            assert_eq!(var.as_deref(), Some("i"));
+            assert_eq!(body.len(), 2);
+            assert!(matches!(body[1].node, Stmt::Labeled { label: 10, .. }));
+        } else {
+            panic!("not DoLoop");
+        }
     }
 
     #[test]
@@ -1190,7 +1658,9 @@ mod tests {
         let s = parse_one("do\n  if (done) exit\nend do\n");
         if let Stmt::DoLoop { var, .. } = &s.node {
             assert!(var.is_none());
-        } else { panic!("not DoLoop"); }
+        } else {
+            panic!("not DoLoop");
+        }
     }
 
     // ---- SELECT CASE ----
@@ -1201,7 +1671,9 @@ mod tests {
         if let Stmt::SelectCase { cases, .. } = &s.node {
             assert_eq!(cases.len(), 3);
             assert!(matches!(cases[2].selectors[0], CaseSelector::Default));
-        } else { panic!("not SelectCase"); }
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     #[test]
@@ -1209,7 +1681,9 @@ mod tests {
         let s = parse_one("select case (x)\ncase (1:10)\n  y = 1\nend select\n");
         if let Stmt::SelectCase { cases, .. } = &s.node {
             assert!(matches!(cases[0].selectors[0], CaseSelector::Range { .. }));
-        } else { panic!("not SelectCase"); }
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     // ---- Simple statements ----
@@ -1225,7 +1699,9 @@ mod tests {
         let s = parse_one("exit outer\n");
         if let Stmt::Exit { name } = &s.node {
             assert_eq!(name.as_deref(), Some("outer"));
-        } else { panic!("not Exit"); }
+        } else {
+            panic!("not Exit");
+        }
     }
 
     #[test]
@@ -1263,7 +1739,9 @@ mod tests {
         let s = parse_one("goto 100\n");
         if let Stmt::Goto { label } = &s.node {
             assert_eq!(*label, 100);
-        } else { panic!("not Goto"); }
+        } else {
+            panic!("not Goto");
+        }
     }
 
     #[test]
@@ -1277,7 +1755,9 @@ mod tests {
         let s = parse_one("print *, x, y\n");
         if let Stmt::Print { items, .. } = &s.node {
             assert_eq!(items.len(), 2);
-        } else { panic!("not Print"); }
+        } else {
+            panic!("not Print");
+        }
     }
 
     #[test]
@@ -1295,7 +1775,9 @@ mod tests {
             assert_eq!(*neg, 10);
             assert_eq!(*zero, 20);
             assert_eq!(*pos, 30);
-        } else { panic!("not ArithmeticIf, got {:?}", s.node); }
+        } else {
+            panic!("not ArithmeticIf, got {:?}", s.node);
+        }
     }
 
     // ---- Named constructs ----
@@ -1306,7 +1788,9 @@ mod tests {
         if let Stmt::DoLoop { name, var, .. } = &s.node {
             assert_eq!(name.as_deref(), Some("outer"));
             assert_eq!(var.as_deref(), Some("i"));
-        } else { panic!("not DoLoop, got {:?}", s.node); }
+        } else {
+            panic!("not DoLoop, got {:?}", s.node);
+        }
     }
 
     #[test]
@@ -1314,7 +1798,9 @@ mod tests {
         let s = parse_one("check: if (x > 0) then\n  y = 1\nend if check\n");
         if let Stmt::IfConstruct { name, .. } = &s.node {
             assert_eq!(name.as_deref(), Some("check"));
-        } else { panic!("not IfConstruct, got {:?}", s.node); }
+        } else {
+            panic!("not IfConstruct, got {:?}", s.node);
+        }
     }
 
     // ---- Nesting ----
@@ -1338,7 +1824,9 @@ end if
             assert!(!then_body.is_empty());
             // DO inside IF.
             assert!(matches!(then_body[0].node, Stmt::DoLoop { .. }));
-        } else { panic!("not IfConstruct"); }
+        } else {
+            panic!("not IfConstruct");
+        }
     }
 
     // ---- Additional construct tests ----
@@ -1348,7 +1836,9 @@ end if
         let s = parse_one("where (a > 0)\n  b = 1\nelsewhere\n  b = 0\nend where\n");
         if let Stmt::WhereConstruct { elsewhere, .. } = &s.node {
             assert_eq!(elsewhere.len(), 1);
-        } else { panic!("not WhereConstruct"); }
+        } else {
+            panic!("not WhereConstruct");
+        }
     }
 
     #[test]
@@ -1356,7 +1846,9 @@ end if
         let s = parse_one("go to (10, 20, 30), i\n");
         if let Stmt::ComputedGoto { labels, .. } = &s.node {
             assert_eq!(labels, &[10, 20, 30]);
-        } else { panic!("not ComputedGoto"); }
+        } else {
+            panic!("not ComputedGoto");
+        }
     }
 
     #[test]
@@ -1371,7 +1863,9 @@ end if
         if let Stmt::Associate { assocs, .. } = &s.node {
             assert_eq!(assocs.len(), 1);
             assert_eq!(assocs[0].0, "n");
-        } else { panic!("not Associate"); }
+        } else {
+            panic!("not Associate");
+        }
     }
 
     // ---- Missing test coverage from audit ----
@@ -1405,7 +1899,9 @@ end if
         let s = parse_one("go to 100\n");
         if let Stmt::Goto { label } = &s.node {
             assert_eq!(*label, 100);
-        } else { panic!("not Goto"); }
+        } else {
+            panic!("not Goto");
+        }
     }
 
     #[test]
@@ -1413,23 +1909,35 @@ end if
         let s = parse_one("select case (x)\ncase (1, 2, 3)\n  y = 1\nend select\n");
         if let Stmt::SelectCase { cases, .. } = &s.node {
             assert_eq!(cases[0].selectors.len(), 3);
-        } else { panic!("not SelectCase"); }
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     #[test]
     fn case_open_range_low() {
         let s = parse_one("select case (x)\ncase (:10)\n  y = 1\nend select\n");
         if let Stmt::SelectCase { cases, .. } = &s.node {
-            assert!(matches!(cases[0].selectors[0], CaseSelector::Range { low: None, .. }));
-        } else { panic!("not SelectCase"); }
+            assert!(matches!(
+                cases[0].selectors[0],
+                CaseSelector::Range { low: None, .. }
+            ));
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     #[test]
     fn case_open_range_high() {
         let s = parse_one("select case (x)\ncase (10:)\n  y = 1\nend select\n");
         if let Stmt::SelectCase { cases, .. } = &s.node {
-            assert!(matches!(cases[0].selectors[0], CaseSelector::Range { high: None, .. }));
-        } else { panic!("not SelectCase"); }
+            assert!(matches!(
+                cases[0].selectors[0],
+                CaseSelector::Range { high: None, .. }
+            ));
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     #[test]
@@ -1465,8 +1973,13 @@ end if
         let s = parse_one("if (a > 0) then\n  if (b > 0) then\n    x = 1\n  end if\nend if\n");
         if let Stmt::IfConstruct { then_body, .. } = &s.node {
             assert_eq!(then_body.len(), 1, "outer IF should have 1 stmt in body");
-            assert!(matches!(then_body[0].node, Stmt::IfConstruct { .. }), "inner should be IfConstruct");
-        } else { panic!("not IfConstruct"); }
+            assert!(
+                matches!(then_body[0].node, Stmt::IfConstruct { .. }),
+                "inner should be IfConstruct"
+            );
+        } else {
+            panic!("not IfConstruct");
+        }
     }
 
     #[test]
@@ -1474,8 +1987,13 @@ end if
         let s = parse_one("do i = 1, 10\n  do j = 1, 10\n    x = i + j\n  end do\nend do\n");
         if let Stmt::DoLoop { body, .. } = &s.node {
             assert_eq!(body.len(), 1, "outer DO should have 1 stmt in body");
-            assert!(matches!(body[0].node, Stmt::DoLoop { .. }), "inner should be DoLoop");
-        } else { panic!("not DoLoop"); }
+            assert!(
+                matches!(body[0].node, Stmt::DoLoop { .. }),
+                "inner should be DoLoop"
+            );
+        } else {
+            panic!("not DoLoop");
+        }
     }
 
     #[test]
@@ -1483,8 +2001,13 @@ end if
         let s = parse_one("select case (x)\ncase (1)\n  select case (y)\n  case (2)\n    z = 1\n  end select\nend select\n");
         if let Stmt::SelectCase { cases, .. } = &s.node {
             assert!(!cases.is_empty());
-            assert!(matches!(cases[0].body[0].node, Stmt::SelectCase { .. }), "inner should be SelectCase");
-        } else { panic!("not SelectCase"); }
+            assert!(
+                matches!(cases[0].body[0].node, Stmt::SelectCase { .. }),
+                "inner should be SelectCase"
+            );
+        } else {
+            panic!("not SelectCase");
+        }
     }
 
     // ======================================================================
@@ -1499,18 +2022,26 @@ end if
         if let Stmt::Write { controls, items } = &s.node {
             assert_eq!(controls.len(), 2); // unit=*, fmt=*
             assert_eq!(items.len(), 3);
-        } else { panic!("not Write, got {:?}", s.node); }
+        } else {
+            panic!("not Write, got {:?}", s.node);
+        }
     }
 
     #[test]
     fn write_with_keywords() {
         let s = parse_one("write(unit=10, fmt='(A)', iostat=ios) msg\n");
         if let Stmt::Write { controls, items } = &s.node {
-            assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("unit")));
+            assert!(controls
+                .iter()
+                .any(|c| c.keyword.as_deref() == Some("unit")));
             assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("fmt")));
-            assert!(controls.iter().any(|c| c.keyword.as_deref() == Some("iostat")));
+            assert!(controls
+                .iter()
+                .any(|c| c.keyword.as_deref() == Some("iostat")));
             assert_eq!(items.len(), 1);
-        } else { panic!("not Write"); }
+        } else {
+            panic!("not Write");
+        }
     }
 
     // ---- READ ----
@@ -1521,7 +2052,9 @@ end if
         if let Stmt::Read { controls, items } = &s.node {
             assert_eq!(controls.len(), 2);
             assert_eq!(items.len(), 1);
-        } else { panic!("not Read"); }
+        } else {
+            panic!("not Read");
+        }
     }
 
     #[test]
@@ -1530,18 +2063,23 @@ end if
         if let Stmt::Read { controls, items } = &s.node {
             assert_eq!(controls.len(), 1); // format=*
             assert_eq!(items.len(), 2);
-        } else { panic!("not Read"); }
+        } else {
+            panic!("not Read");
+        }
     }
 
     // ---- OPEN ----
 
     #[test]
     fn open_stmt() {
-        let s = parse_one("open(unit=10, file='data.txt', status='old', action='read', iostat=ios)\n");
+        let s =
+            parse_one("open(unit=10, file='data.txt', status='old', action='read', iostat=ios)\n");
         if let Stmt::Open { specs } = &s.node {
             assert!(specs.len() >= 4);
             assert!(specs.iter().any(|s| s.keyword.as_deref() == Some("file")));
-        } else { panic!("not Open"); }
+        } else {
+            panic!("not Open");
+        }
     }
 
     #[test]
@@ -1549,7 +2087,9 @@ end if
         let s = parse_one("open(10, file='data.txt')\n");
         if let Stmt::Open { specs } = &s.node {
             assert!(specs.len() >= 2);
-        } else { panic!("not Open"); }
+        } else {
+            panic!("not Open");
+        }
     }
 
     // ---- CLOSE ----
@@ -1559,7 +2099,9 @@ end if
         let s = parse_one("close(10)\n");
         if let Stmt::Close { specs } = &s.node {
             assert_eq!(specs.len(), 1);
-        } else { panic!("not Close"); }
+        } else {
+            panic!("not Close");
+        }
     }
 
     #[test]
@@ -1567,7 +2109,9 @@ end if
         let s = parse_one("close(unit=10, status='delete', iostat=ios)\n");
         if let Stmt::Close { specs } = &s.node {
             assert!(specs.iter().any(|s| s.keyword.as_deref() == Some("status")));
-        } else { panic!("not Close"); }
+        } else {
+            panic!("not Close");
+        }
     }
 
     // ---- INQUIRE ----
@@ -1612,7 +2156,9 @@ end if
         if let Stmt::Allocate { items, opts } = &s.node {
             assert_eq!(items.len(), 2);
             assert!(opts.is_empty());
-        } else { panic!("not Allocate"); }
+        } else {
+            panic!("not Allocate");
+        }
     }
 
     #[test]
@@ -1622,7 +2168,9 @@ end if
             assert_eq!(items.len(), 1);
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("stat")));
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("errmsg")));
-        } else { panic!("not Allocate"); }
+        } else {
+            panic!("not Allocate");
+        }
     }
 
     #[test]
@@ -1630,7 +2178,9 @@ end if
         let s = parse_one("allocate(x, source=template)\n");
         if let Stmt::Allocate { opts, .. } = &s.node {
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("source")));
-        } else { panic!("not Allocate"); }
+        } else {
+            panic!("not Allocate");
+        }
     }
 
     #[test]
@@ -1639,7 +2189,9 @@ end if
         if let Stmt::Deallocate { items, opts } = &s.node {
             assert_eq!(items.len(), 2);
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("stat")));
-        } else { panic!("not Deallocate"); }
+        } else {
+            panic!("not Deallocate");
+        }
     }
 
     // ---- NULLIFY ----
@@ -1649,7 +2201,9 @@ end if
         let s = parse_one("nullify(ptr1, ptr2)\n");
         if let Stmt::Nullify { items } = &s.node {
             assert_eq!(items.len(), 2);
-        } else { panic!("not Nullify"); }
+        } else {
+            panic!("not Nullify");
+        }
     }
 
     // ---- NAMELIST ----
@@ -1661,7 +2215,9 @@ end if
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].0, "input_data");
             assert_eq!(groups[0].1.len(), 3);
-        } else { panic!("not Namelist"); }
+        } else {
+            panic!("not Namelist");
+        }
     }
 
     #[test]
@@ -1671,7 +2227,9 @@ end if
             assert_eq!(groups.len(), 2);
             assert_eq!(groups[0].0, "in");
             assert_eq!(groups[1].0, "out");
-        } else { panic!("not Namelist"); }
+        } else {
+            panic!("not Namelist");
+        }
     }
 
     // ---- Audit fixes ----
@@ -1693,7 +2251,9 @@ end if
         let s = parse_one("write(*, *) (a(i), i=1,10)\n");
         if let Stmt::Write { items, .. } = &s.node {
             assert_eq!(items.len(), 1, "implied-do should produce 1 item");
-        } else { panic!("not Write"); }
+        } else {
+            panic!("not Write");
+        }
     }
 
     #[test]
@@ -1708,7 +2268,9 @@ end if
         let s = parse_one("allocate(y, mold=template)\n");
         if let Stmt::Allocate { opts, .. } = &s.node {
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("mold")));
-        } else { panic!("not Allocate"); }
+        } else {
+            panic!("not Allocate");
+        }
     }
 
     #[test]

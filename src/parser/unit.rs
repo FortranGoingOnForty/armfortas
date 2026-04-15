@@ -3,13 +3,13 @@
 //! Parses top-level Fortran compilation units: programs, modules,
 //! subroutines, functions, and interface blocks.
 
-use crate::ast::Spanned;
-use crate::ast::unit::*;
+use super::expr::span_from_to;
+use super::{ParseError, Parser};
 use crate::ast::decl::SpannedDecl;
 use crate::ast::stmt::SpannedStmt;
+use crate::ast::unit::*;
+use crate::ast::Spanned;
 use crate::lexer::TokenKind;
-use super::{Parser, ParseError};
-use super::expr::span_from_to;
 
 impl<'a> Parser<'a> {
     /// Parse a complete Fortran source file — one or more program units.
@@ -17,7 +17,9 @@ impl<'a> Parser<'a> {
         let mut units = Vec::new();
         loop {
             self.skip_newlines();
-            if self.peek() == &TokenKind::Eof { break; }
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
             units.push(self.parse_program_unit()?);
         }
         Ok(units)
@@ -33,16 +35,33 @@ impl<'a> Parser<'a> {
         loop {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
-                "pure" => { self.advance(); prefixes.push(Prefix::Pure); }
-                "impure" => { self.advance(); prefixes.push(Prefix::Impure); }
-                "elemental" => { self.advance(); prefixes.push(Prefix::Elemental); }
-                "recursive" => { self.advance(); prefixes.push(Prefix::Recursive); }
-                "non_recursive" => { self.advance(); prefixes.push(Prefix::NonRecursive); }
+                "pure" => {
+                    self.advance();
+                    prefixes.push(Prefix::Pure);
+                }
+                "impure" => {
+                    self.advance();
+                    prefixes.push(Prefix::Impure);
+                }
+                "elemental" => {
+                    self.advance();
+                    prefixes.push(Prefix::Elemental);
+                }
+                "recursive" => {
+                    self.advance();
+                    prefixes.push(Prefix::Recursive);
+                }
+                "non_recursive" => {
+                    self.advance();
+                    prefixes.push(Prefix::NonRecursive);
+                }
                 "module" => {
                     // "module" could be prefix or the MODULE keyword itself.
                     let next = if self.pos + 1 < self.tokens.len() {
                         self.tokens[self.pos + 1].text.to_lowercase()
-                    } else { String::new() };
+                    } else {
+                        String::new()
+                    };
                     if matches!(next.as_str(), "subroutine" | "function" | "procedure") {
                         self.advance();
                         prefixes.push(Prefix::Module);
@@ -69,7 +88,8 @@ impl<'a> Parser<'a> {
             "subroutine" => self.parse_subroutine(start, prefixes),
             "function" => self.parse_function(start, prefixes, return_type),
             "blockdata" | "block" => {
-                if text == "block" && self.pos + 1 < self.tokens.len()
+                if text == "block"
+                    && self.pos + 1 < self.tokens.len()
                     && self.tokens[self.pos + 1].text.eq_ignore_ascii_case("data")
                 {
                     self.parse_block_data(start)
@@ -100,7 +120,9 @@ impl<'a> Parser<'a> {
         self.advance(); // consume 'program'
         let name = if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
@@ -109,10 +131,24 @@ impl<'a> Parser<'a> {
         self.consume_end("program")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Program { name, uses, imports, implicit, decls, body, contains }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Program {
+                name,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains,
+            },
+            span,
+        ))
     }
 
-    fn parse_implicit_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
+    fn parse_implicit_program(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedUnit, ParseError> {
         // No PROGRAM keyword — implicit main program.
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
 
@@ -126,9 +162,18 @@ impl<'a> Parser<'a> {
         }
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Program {
-            name: None, uses, imports, implicit, decls, body, contains: ifaces,
-        }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Program {
+                name: None,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains: ifaces,
+            },
+            span,
+        ))
     }
 
     fn parse_module(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
@@ -142,7 +187,17 @@ impl<'a> Parser<'a> {
         self.consume_end("module")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Module { name, uses, imports, implicit, decls, contains }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Module {
+                name,
+                uses,
+                imports,
+                implicit,
+                decls,
+                contains,
+            },
+            span,
+        ))
     }
 
     fn parse_submodule(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
@@ -151,20 +206,37 @@ impl<'a> Parser<'a> {
         let parent = self.advance().clone().text;
         let ancestor = if self.eat(&TokenKind::Colon) {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         self.expect(&TokenKind::RParen)?;
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body, _ifaces) = self.parse_unit_body(&["submodule"])?;
+        let (uses, _imports, _implicit, decls, _body, _ifaces) =
+            self.parse_unit_body(&["submodule"])?;
         let contains = self.parse_contains_section()?;
         self.consume_end("submodule")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Submodule { parent, ancestor, name, uses, decls, contains }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Submodule {
+                parent,
+                ancestor,
+                name,
+                uses,
+                decls,
+                contains,
+            },
+            span,
+        ))
     }
 
-    fn parse_subroutine(&mut self, start: crate::lexer::Span, prefix: Vec<Prefix>) -> Result<SpannedUnit, ParseError> {
+    fn parse_subroutine(
+        &mut self,
+        start: crate::lexer::Span,
+        prefix: Vec<Prefix>,
+    ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'subroutine'
         let name = self.advance().clone().text;
 
@@ -172,20 +244,35 @@ impl<'a> Parser<'a> {
             let a = self.parse_dummy_arg_list()?;
             self.expect(&TokenKind::RParen)?;
             a
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
 
         let bind = self.try_parse_bind()?;
         self.skip_newlines();
 
-        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["subroutine"])?;
+        let (uses, imports, implicit, decls, body, ifaces) =
+            self.parse_unit_body(&["subroutine"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces);
         self.consume_end("subroutine")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Subroutine {
-            name, args, bind, prefix, uses, imports, implicit, decls, body, contains,
-        }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Subroutine {
+                name,
+                args,
+                bind,
+                prefix,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains,
+            },
+            span,
+        ))
     }
 
     fn parse_function(
@@ -229,9 +316,23 @@ impl<'a> Parser<'a> {
         self.consume_end("function")?;
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::Function {
-            name, args, result, return_type, bind, prefix, uses, imports, implicit, decls, body, contains,
-        }, span))
+        Ok(Spanned::new(
+            ProgramUnit::Function {
+                name,
+                args,
+                result,
+                return_type,
+                bind,
+                prefix,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains,
+            },
+            span,
+        ))
     }
 
     fn parse_block_data(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
@@ -239,10 +340,13 @@ impl<'a> Parser<'a> {
         self.advance(); // consume 'data'
         let name = if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body, _ifaces) = self.parse_unit_body(&["blockdata", "block"])?;
+        let (uses, _imports, _implicit, decls, _body, _ifaces) =
+            self.parse_unit_body(&["blockdata", "block"])?;
         // End block data.
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
@@ -255,19 +359,29 @@ impl<'a> Parser<'a> {
         }
 
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::BlockData { name, uses, decls }, span))
+        Ok(Spanned::new(
+            ProgramUnit::BlockData { name, uses, decls },
+            span,
+        ))
     }
 
-    fn parse_interface_block(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
+    fn parse_interface_block(
+        &mut self,
+        start: crate::lexer::Span,
+    ) -> Result<SpannedUnit, ParseError> {
         let is_abstract = if self.peek_text().eq_ignore_ascii_case("abstract") {
             self.advance();
             true
-        } else { false };
+        } else {
+            false
+        };
         self.advance(); // consume 'interface'
 
         // Optional name or operator/assignment interface.
         // Check operator/assignment BEFORE generic identifier — they lex as identifiers.
-        let name = if self.peek_text().eq_ignore_ascii_case("operator") || self.peek_text().eq_ignore_ascii_case("assignment") {
+        let name = if self.peek_text().eq_ignore_ascii_case("operator")
+            || self.peek_text().eq_ignore_ascii_case("assignment")
+        {
             let op_kw = self.advance().clone().text;
             self.expect(&TokenKind::LParen)?;
             let op = self.advance().clone().text;
@@ -275,19 +389,25 @@ impl<'a> Parser<'a> {
             Some(format!("{}({})", op_kw, op))
         } else if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
-        } else { None };
+        } else {
+            None
+        };
         self.skip_newlines();
 
         let mut bodies = Vec::new();
         loop {
             self.skip_newlines();
             let text = self.peek_text().to_lowercase();
-            if text == "endinterface" || text == "end" { break; }
+            if text == "endinterface" || text == "end" {
+                break;
+            }
 
             if text == "module" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
-                } else { String::new() };
+                } else {
+                    String::new()
+                };
                 if next == "procedure" {
                     self.advance(); // module
                     self.advance(); // procedure
@@ -295,7 +415,9 @@ impl<'a> Parser<'a> {
                     let mut names = Vec::new();
                     loop {
                         names.push(self.advance().clone().text);
-                        if !self.eat(&TokenKind::Comma) { break; }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
                     bodies.push(InterfaceBody::ModuleProcedure(names));
                     self.skip_newlines();
@@ -310,14 +432,34 @@ impl<'a> Parser<'a> {
 
         self.consume_end("interface")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(ProgramUnit::InterfaceBlock { name, is_abstract, bodies }, span))
+        Ok(Spanned::new(
+            ProgramUnit::InterfaceBlock {
+                name,
+                is_abstract,
+                bodies,
+            },
+            span,
+        ))
     }
 
     // ---- Helpers ----
 
     /// Parse the body of a program unit: uses, implicit, declarations, then executable statements.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn parse_unit_body(&mut self, terminators: &[&str]) -> Result<(Vec<SpannedDecl>, Vec<ImportStmt>, Vec<SpannedDecl>, Vec<SpannedDecl>, Vec<SpannedStmt>, Vec<SpannedUnit>), ParseError> {
+    pub(crate) fn parse_unit_body(
+        &mut self,
+        terminators: &[&str],
+    ) -> Result<
+        (
+            Vec<SpannedDecl>,
+            Vec<ImportStmt>,
+            Vec<SpannedDecl>,
+            Vec<SpannedDecl>,
+            Vec<SpannedStmt>,
+            Vec<SpannedUnit>,
+        ),
+        ParseError,
+    > {
         let mut uses = Vec::new();
         let mut imports = Vec::new();
         let mut implicit = Vec::new();
@@ -331,7 +473,9 @@ impl<'a> Parser<'a> {
             if self.peek_text().eq_ignore_ascii_case("use") {
                 self.advance();
                 uses.push(self.parse_use_stmt()?);
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
         // Phase 1.5: IMPORT statements.
@@ -340,7 +484,9 @@ impl<'a> Parser<'a> {
             if self.peek_text().eq_ignore_ascii_case("import") {
                 self.advance();
                 imports.push(self.parse_import()?);
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
         // Phase 2: IMPLICIT statements.
@@ -349,7 +495,9 @@ impl<'a> Parser<'a> {
             if self.peek_text().eq_ignore_ascii_case("implicit") {
                 self.advance();
                 implicit.push(self.parse_implicit()?);
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
         // Phase 3: Declarations and executable statements.
@@ -357,29 +505,46 @@ impl<'a> Parser<'a> {
         // We'll parse everything as statements and let sema separate them.
         loop {
             self.skip_newlines();
-            if self.peek() == &TokenKind::Eof { break; }
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
             let text = self.peek_text().to_lowercase();
 
             // Check for end of unit.
-            if terminators.iter().any(|t| text == format!("end{}", t)) { break; }
+            if terminators.iter().any(|t| text == format!("end{}", t)) {
+                break;
+            }
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
-                } else { String::new() };
-                if terminators.iter().any(|t| next == *t) || next.is_empty() || self.at_stmt_end() {
+                } else {
+                    String::new()
+                };
+                if terminators.iter().any(|t| next == *t)
+                    || next.is_empty()
+                    || self.at_stmt_end_after(1)
+                {
                     break;
                 }
             }
-            if text == "contains" { break; }
+            if text == "contains" {
+                break;
+            }
 
             // Check for derived type definition: type [, attrs] :: name
             if text == "type" {
                 let next_pos = self.pos + 1;
                 let next_text = if next_pos < self.tokens.len() {
                     self.tokens[next_pos].text.to_lowercase()
-                } else { String::new() };
+                } else {
+                    String::new()
+                };
                 // type :: or type , → derived type definition (not type(name) specifier).
-                if next_text == "::" || self.tokens.get(next_pos).is_some_and(|t| t.kind == TokenKind::Comma || t.kind == TokenKind::ColonColon) {
+                if next_text == "::"
+                    || self.tokens.get(next_pos).is_some_and(|t| {
+                        t.kind == TokenKind::Comma || t.kind == TokenKind::ColonColon
+                    })
+                {
                     self.advance(); // consume 'type'
                     decls.push(self.parse_derived_type_def()?);
                     continue;
@@ -401,15 +566,15 @@ impl<'a> Parser<'a> {
             // Procedure pointer / procedure component declarations.
             if text == "procedure" {
                 let next_pos = self.pos + 1;
-                if next_pos < self.tokens.len()
-                    && self.tokens[next_pos].kind == TokenKind::LParen
-                {
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::LParen {
                     let start = self.current_span();
                     self.advance(); // consume 'procedure'
                     self.advance(); // consume '('
                     let iface_name = if self.peek() == &TokenKind::Identifier {
                         self.advance().clone().text
-                    } else { String::new() };
+                    } else {
+                        String::new()
+                    };
                     self.expect(&TokenKind::RParen)?;
 
                     // Parse attributes: , pointer, nopass, pass, deferred, etc.
@@ -417,14 +582,23 @@ impl<'a> Parser<'a> {
                     while self.eat(&TokenKind::Comma) {
                         let attr_text = self.peek_text().to_lowercase();
                         match attr_text.as_str() {
-                            "pointer" => { self.advance(); attrs.push(crate::ast::decl::Attribute::Pointer); }
-                            "nopass" | "pass" | "deferred" | "non_overridable" => { self.advance(); /* skip type-bound attrs for now */ }
-                            _ => { self.advance(); } // skip unknown attrs for now
+                            "pointer" => {
+                                self.advance();
+                                attrs.push(crate::ast::decl::Attribute::Pointer);
+                            }
+                            "nopass" | "pass" | "deferred" | "non_overridable" => {
+                                self.advance(); /* skip type-bound attrs for now */
+                            }
+                            _ => {
+                                self.advance();
+                            } // skip unknown attrs for now
                         }
                     }
 
                     // :: separator
-                    if self.peek() == &TokenKind::ColonColon { self.advance(); }
+                    if self.peek() == &TokenKind::ColonColon {
+                        self.advance();
+                    }
 
                     // Comma-separated entity list. Each entity may
                     // carry its own optional `=> null()` initializer.
@@ -435,7 +609,9 @@ impl<'a> Parser<'a> {
                     loop {
                         let entity_name = if self.peek() == &TokenKind::Identifier {
                             self.advance().clone().text
-                        } else { String::new() };
+                        } else {
+                            String::new()
+                        };
 
                         if self.eat(&TokenKind::Arrow)
                             && self.peek_text().eq_ignore_ascii_case("null")
@@ -455,7 +631,9 @@ impl<'a> Parser<'a> {
                             ptr_init: None,
                         });
 
-                        if !self.eat(&TokenKind::Comma) { break; }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
 
                     // Emit as a variable declaration with Pointer attribute.
@@ -496,16 +674,13 @@ impl<'a> Parser<'a> {
             // followed by `(` (for PARAMETER and DATA) or `/` (for
             // COMMON); an expression-statement use as an LHS is
             // followed by `=`. This is a single-token lookahead.
-            let next_tok = self.tokens.get(self.pos + 1)
-                .map(|t| t.kind.clone());
+            let next_tok = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
             if text == "parameter" && next_tok.as_ref() == Some(&TokenKind::LParen) {
                 self.advance(); // consume 'parameter'
                 decls.push(self.parse_parameter_stmt()?);
                 continue;
             }
-            if text == "common"
-                && matches!(next_tok.as_ref(), Some(TokenKind::Slash))
-            {
+            if text == "common" && matches!(next_tok.as_ref(), Some(TokenKind::Slash)) {
                 self.advance(); // consume 'common'
                 decls.push(self.parse_common_block()?);
                 continue;
@@ -548,18 +723,27 @@ impl<'a> Parser<'a> {
                     && self.tokens[ident_pos].kind == TokenKind::Identifier
                 {
                     self.advance(); // consume PUBLIC/PRIVATE
-                    if has_colons { self.advance(); } // consume ::
+                    if has_colons {
+                        self.advance();
+                    } // consume ::
                     let mut names = Vec::new();
                     loop {
                         if self.peek() == &TokenKind::Identifier {
                             names.push(self.advance().clone().text);
-                        } else { break; }
-                        if !self.eat(&TokenKind::Comma) { break; }
+                        } else {
+                            break;
+                        }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
                     if !names.is_empty() {
                         let span = span_from_to(start, self.prev_span());
                         decls.push(crate::ast::Spanned::new(
-                            crate::ast::decl::Decl::AccessList { access: attr, names },
+                            crate::ast::decl::Decl::AccessList {
+                                access: attr,
+                                names,
+                            },
                             span,
                         ));
                         continue;
@@ -585,7 +769,9 @@ impl<'a> Parser<'a> {
         let mut units = Vec::new();
         loop {
             self.skip_newlines();
-            if self.peek() == &TokenKind::Eof { break; }
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
             let text = self.peek_text().to_lowercase();
             // Only break on END that closes the parent unit — not on inner subprograms'
             // END keywords (those are consumed by parse_program_unit).
@@ -593,15 +779,24 @@ impl<'a> Parser<'a> {
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
-                } else { String::new() };
+                } else {
+                    String::new()
+                };
                 // Bare "end" or "end program/module/submodule" closes the parent.
-                if next.is_empty() || self.at_stmt_end()
-                    || matches!(next.as_str(), "program" | "module" | "submodule" | "subroutine" | "function")
+                if next.is_empty()
+                    || self.at_stmt_end_after(1)
+                    || matches!(
+                        next.as_str(),
+                        "program" | "module" | "submodule" | "subroutine" | "function"
+                    )
                 {
                     break;
                 }
             }
-            if matches!(text.as_str(), "endprogram" | "endmodule" | "endsubmodule" | "endsubroutine" | "endfunction") {
+            if matches!(
+                text.as_str(),
+                "endprogram" | "endmodule" | "endsubmodule" | "endsubroutine" | "endfunction"
+            ) {
                 break;
             }
             units.push(self.parse_program_unit()?);
@@ -611,14 +806,18 @@ impl<'a> Parser<'a> {
 
     fn parse_dummy_arg_list(&mut self) -> Result<Vec<DummyArg>, ParseError> {
         let mut args = Vec::new();
-        if self.peek() == &TokenKind::RParen { return Ok(args); }
+        if self.peek() == &TokenKind::RParen {
+            return Ok(args);
+        }
         loop {
             if self.eat(&TokenKind::Star) {
                 args.push(DummyArg::Star);
             } else {
                 args.push(DummyArg::Name(self.advance().clone().text));
             }
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         Ok(args)
     }
@@ -629,15 +828,23 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
-                "all" => { self.advance(); return Ok(ImportStmt::All); }
-                "none" => { self.advance(); return Ok(ImportStmt::None); }
+                "all" => {
+                    self.advance();
+                    return Ok(ImportStmt::All);
+                }
+                "none" => {
+                    self.advance();
+                    return Ok(ImportStmt::None);
+                }
                 "only" => {
                     self.advance();
                     self.expect(&TokenKind::Colon)?;
                     let mut names = Vec::new();
                     loop {
                         names.push(self.advance().clone().text);
-                        if !self.eat(&TokenKind::Comma) { break; }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
                     return Ok(ImportStmt::Only(names));
                 }
@@ -650,7 +857,9 @@ impl<'a> Parser<'a> {
         if !self.at_stmt_end() {
             loop {
                 names.push(self.advance().clone().text);
-                if !self.eat(&TokenKind::Comma) { break; }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
         }
         Ok(ImportStmt::Default(names))
@@ -670,8 +879,12 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.expect(&TokenKind::Assign)?;
                 Some(self.advance().clone().text)
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.expect(&TokenKind::RParen)?;
         Ok(Some(BindInfo { name }))
     }
@@ -698,20 +911,42 @@ mod tests {
 
     #[test]
     fn simple_program() {
-        let u = parse_unit("program hello\n  implicit none\n  integer :: x\n  x = 42\nend program hello\n");
-        if let ProgramUnit::Program { name, decls, body, .. } = &u.node {
+        let u = parse_unit(
+            "program hello\n  implicit none\n  integer :: x\n  x = 42\nend program hello\n",
+        );
+        if let ProgramUnit::Program {
+            name, decls, body, ..
+        } = &u.node
+        {
             assert_eq!(name.as_deref(), Some("hello"));
             assert!(!decls.is_empty());
             assert!(!body.is_empty());
-        } else { panic!("not Program"); }
+        } else {
+            panic!("not Program");
+        }
     }
 
     #[test]
     fn program_with_contains() {
-        let u = parse_unit("program main\n  x = 1\ncontains\n  subroutine sub()\n  end subroutine\nend program\n");
+        let u = parse_unit(
+            "program main\n  x = 1\ncontains\n  subroutine sub()\n  end subroutine\nend program\n",
+        );
         if let ProgramUnit::Program { contains, .. } = &u.node {
             assert_eq!(contains.len(), 1);
-        } else { panic!("not Program"); }
+        } else {
+            panic!("not Program");
+        }
+    }
+
+    #[test]
+    fn program_with_bare_end() {
+        let u = parse_unit("program main\n  integer :: x\n  x = 1\nend\n");
+        if let ProgramUnit::Program { name, body, .. } = &u.node {
+            assert_eq!(name.as_deref(), Some("main"));
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("not Program");
+        }
     }
 
     // ---- SUBROUTINE ----
@@ -722,35 +957,47 @@ mod tests {
         if let ProgramUnit::Subroutine { name, args, .. } = &u.node {
             assert_eq!(name, "foo");
             assert_eq!(args.len(), 2);
-        } else { panic!("not Subroutine"); }
+        } else {
+            panic!("not Subroutine");
+        }
     }
 
     #[test]
     fn pure_elemental_subroutine() {
-        let u = parse_unit("pure elemental subroutine bar(x)\n  real, intent(in) :: x\nend subroutine\n");
+        let u = parse_unit(
+            "pure elemental subroutine bar(x)\n  real, intent(in) :: x\nend subroutine\n",
+        );
         if let ProgramUnit::Subroutine { prefix, .. } = &u.node {
             assert!(prefix.contains(&Prefix::Pure));
             assert!(prefix.contains(&Prefix::Elemental));
-        } else { panic!("not Subroutine"); }
+        } else {
+            panic!("not Subroutine");
+        }
     }
 
     // ---- FUNCTION ----
 
     #[test]
     fn simple_function() {
-        let u = parse_unit("function square(x) result(y)\n  real :: x, y\n  y = x * x\nend function\n");
+        let u =
+            parse_unit("function square(x) result(y)\n  real :: x, y\n  y = x * x\nend function\n");
         if let ProgramUnit::Function { name, result, .. } = &u.node {
             assert_eq!(name, "square");
             assert_eq!(result.as_deref(), Some("y"));
-        } else { panic!("not Function"); }
+        } else {
+            panic!("not Function");
+        }
     }
 
     #[test]
     fn typed_function() {
-        let u = parse_unit("real function add(a, b)\n  real :: a, b\n  add = a + b\nend function\n");
+        let u =
+            parse_unit("real function add(a, b)\n  real :: a, b\n  add = a + b\nend function\n");
         if let ProgramUnit::Function { return_type, .. } = &u.node {
             assert!(return_type.is_some());
-        } else { panic!("not Function"); }
+        } else {
+            panic!("not Function");
+        }
     }
 
     #[test]
@@ -758,7 +1005,9 @@ mod tests {
         let u = parse_unit("recursive function fact(n) result(f)\n  integer :: n, f\n  if (n <= 1) then\n    f = 1\n  else\n    f = n * fact(n - 1)\n  end if\nend function\n");
         if let ProgramUnit::Function { prefix, .. } = &u.node {
             assert!(prefix.contains(&Prefix::Recursive));
-        } else { panic!("not Function"); }
+        } else {
+            panic!("not Function");
+        }
     }
 
     // ---- MODULE ----
@@ -769,7 +1018,9 @@ mod tests {
         if let ProgramUnit::Module { name, contains, .. } = &u.node {
             assert_eq!(name, "my_mod");
             assert_eq!(contains.len(), 1);
-        } else { panic!("not Module"); }
+        } else {
+            panic!("not Module");
+        }
     }
 
     #[test]
@@ -777,17 +1028,23 @@ mod tests {
         let u = parse_unit("module b\n  use a\n  implicit none\nend module\n");
         if let ProgramUnit::Module { uses, .. } = &u.node {
             assert_eq!(uses.len(), 1);
-        } else { panic!("not Module"); }
+        } else {
+            panic!("not Module");
+        }
     }
 
     // ---- INTERFACE ----
 
     #[test]
     fn interface_explicit() {
-        let u = parse_unit("interface\n  subroutine ext(x)\n    real :: x\n  end subroutine\nend interface\n");
+        let u = parse_unit(
+            "interface\n  subroutine ext(x)\n    real :: x\n  end subroutine\nend interface\n",
+        );
         if let ProgramUnit::InterfaceBlock { bodies, .. } = &u.node {
             assert_eq!(bodies.len(), 1);
-        } else { panic!("not InterfaceBlock"); }
+        } else {
+            panic!("not InterfaceBlock");
+        }
     }
 
     #[test]
@@ -796,7 +1053,9 @@ mod tests {
         if let ProgramUnit::InterfaceBlock { name, bodies, .. } = &u.node {
             assert_eq!(name.as_deref(), Some("sort"));
             assert_eq!(bodies.len(), 2);
-        } else { panic!("not InterfaceBlock"); }
+        } else {
+            panic!("not InterfaceBlock");
+        }
     }
 
     // ---- MULTI-UNIT FILES ----
@@ -818,15 +1077,20 @@ mod tests {
         if let ProgramUnit::Subroutine { bind, .. } = &u.node {
             assert!(bind.is_some(), "should have BindInfo");
             assert!(bind.as_ref().unwrap().name.is_none(), "no name= specified");
-        } else { panic!("not Subroutine"); }
+        } else {
+            panic!("not Subroutine");
+        }
     }
 
     #[test]
     fn subroutine_bind_c_with_name() {
-        let u = parse_unit("subroutine foo(x) bind(c, name='c_foo')\n  real :: x\nend subroutine\n");
+        let u =
+            parse_unit("subroutine foo(x) bind(c, name='c_foo')\n  real :: x\nend subroutine\n");
         if let ProgramUnit::Subroutine { bind, .. } = &u.node {
             assert!(bind.is_some());
             assert_eq!(bind.as_ref().unwrap().name.as_deref(), Some("'c_foo'"));
-        } else { panic!("not Subroutine"); }
+        } else {
+            panic!("not Subroutine");
+        }
     }
 }
