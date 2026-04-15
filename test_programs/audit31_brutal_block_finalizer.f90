@@ -1,8 +1,11 @@
-! XFAIL: BLOCK-scope finalizer does not fire — Task #496
+! audit31 Finding 15: locally declared derived-type vars inside a
+! BLOCK never ran their FINAL subroutines because the Stmt::Block
+! lowering just restored the shadowed outer locals and returned.
+! F2018 §7.5.6.3 / §9.7.3.2 require finalization and implicit
+! deallocation at END BLOCK. Gather the block-introduced keys and
+! route them through insert_implicit_dealloc before the restore
+! step. Task #496.
 ! CHECK: finalizer id= 9
-! audit31: BLOCK-scope finalizer doesn't fire at END BLOCK.
-! Fortran 2018 §7.5.6 specifies finalization at END BLOCK.
-! Expected output includes "finalizer id= 9" between "inside" and "after".
 program audit31_block_finalizer
   implicit none
   type :: counted_t

@@ -7235,6 +7235,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 init_decls(b, &ctx.locals, decls, ctx.st);
             }
             lower_stmts(b, ctx, body);
+            // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
+            // locals that have FINAL subroutines and deallocate
+            // block-scoped allocatables.  Only do this for keys that were
+            // newly introduced by the block (not shadowed outer locals).
+            if b.func().block(b.current_block()).terminator.is_none() {
+                let block_only: HashMap<String, LocalInfo> = block_keys.iter()
+                    .filter(|k| ctx.locals.contains_key(*k))
+                    .filter(|k| !saved.iter().any(|(sk, so)| sk == *k && so.is_some()))
+                    .filter_map(|k| ctx.locals.get(k).map(|v| (k.clone(), v.clone())))
+                    .collect();
+                if !block_only.is_empty() {
+                    insert_implicit_dealloc(b, &block_only, ctx.type_layouts, None);
+                }
+            }
             // Restore the outer scope's locals.
             for (k, orig) in saved {
                 if let Some(info) = orig {
