@@ -1,0 +1,1933 @@
+I'll perform a brutal second-pass audit of the optimizer fixes. Let me start by gathering the current state of the code and the original audit report.
+
+=== MESSAGE BREAK ===
+
+Now let me read the current state of all modified files.
+
+=== MESSAGE BREAK ===
+
+Note: dce.rs has its own private `inst_uses` and `terminator_uses` — they're duplicated from util.rs. Let me now read cse.rs and licm.rs.
+
+=== MESSAGE BREAK ===
+
+Now let me also look at the verifier and IR types/inst to understand what could cause issues.
+
+=== MESSAGE BREAK ===
+
+Now let me check `cse.rs` substitute_in_inst more carefully. I noticed that the closure is used with `mut r: impl FnMut(&mut ValueId)`, but the body calls `r(a)` then `r(b)` — let me check if this is fine.
+
+Actually, looking at `substitute_in_inst` and `substitute_in_terminator` carefully — they take `mut r: impl FnMut(&mut ValueId)`. But `for_each_operand_mut` in util.rs also takes `mut r: impl FnMut(&mut ValueId)`. The issue is when `substitute_uses_batch` passes a closure to these — let me trace it.
+
+=== MESSAGE BREAK ===
+
+Build is clean. Let me look at the closure types.
+
+=== MESSAGE BREAK ===
+
+All 78 opt tests pass. Let me investigate the closure issue I noticed in cse.rs more carefully. Looking at `substitute_in_inst`:
+
+```rust
+fn substitute_in_inst(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)) {
+```
+
+And then it uses it like `r(a); r(b);`. With `FnMut` taking `mut r:`, this should work. But the calling site in `substitute_uses_batch`:
+
+```rust
+let r = |v: &mut ValueId| {
+    if let Some(&new) = rewrites.get(v) {
+        *v = new;
+    }
+};
+for block in &mut func.blocks {
+    for inst in &mut block.insts {
+        substitute_in_inst(&mut inst.kind, r);
+    }
+```
+
+This `r` is a non-`Copy` closure passed by *move* — but it's used in a loop! Let me check if it's actually `Copy`. A closure that doesn't capture any mutable references is `Copy` if all captured values are `Copy`. `rewrites` is captured by reference (`&HashMap`), and references are `Copy`, so the closure should be `Copy`. Let me verify the build does compile cleanly with this.
+
+The build did compile. Good. But this is fragile — if you change the closure to capture by move or capture mutable state, the loop breaks. Worth noting as a maintainability concern.
+
+Now, let me think hard about each fix and look for adversarial cases.
+
+=== MESSAGE BREAK ===
+
+Now let me look closely at potential issues. Let me re-read the const_fold Select fix. There's a subtle issue with this:
+
+```rust
+(IrType::Float(FloatWidth::F32), Const::Float(v, _)) => {
+    Some(InstKind::ConstFloat(v as f32 as f64, FloatWidth::F32))
+}
+```
+
+`v` is f64. If the source const was already f32-rounded, this is a no-op. But what if the source was f64? Then we round-truncate. **However, this can also produce a different result than the runtime would produce** — runtime would generate Select via SCSEL, which carries the float as-is, *not rounding*. This is probably fine because Select on incompatible widths shouldn't happen, but the cast `v as f32 as f64` may quietly drop the trace of the bug.
+
+Actually wait — if the chosen constant has FloatWidth::F64 but inst.ty is F32, that's already a verifier-uncatchable bug *upstream*. Folding rounds it; not folding hides it. The fix is at least conservative.
+
+Let me look more carefully at the **DCE outer fixpoint termination**.
+
+Looking at `dce_function`:
+```rust
+let mut outer_changed = true;
+while outer_changed {
+    outer_changed = false;
+    // Inner: instruction-level mark-and-sweep loop until stable
+    ...
+    // Outer: block-parameter cleanup.
+    if remove_dead_block_params(func) {
+        any_change = true;
+        outer_changed = true;
+    }
+}
+```
+
+The outer loop terminates because `remove_dead_block_params` only removes things — never adds. But wait, can it loop forever? Each iteration removes at least one block param, and the count is finite, so it terminates. Good.
+
+But there's a more subtle issue! Look at `remove_dead_block_params`:
+
+```rust
+let live = collect_live_uses(func);
+
+let mut by_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
+for block in func.blocks.iter() {
+    if block.id == func.entry { continue; }
+    for (idx, p) in block.params.iter().enumerate() {
+        if !live.contains(&p.id) {
+            by_block.entry(block.id).or_default().push(idx);
+        }
+    }
+}
+if by_block.is_empty() { return false; }
+
+for (target_block, mut idxs) in by_block {
+    idxs.sort_by(|a, b| b.cmp(a));
+    for idx in idxs {
+        // Remove the parameter at `idx` from `target_block`.
+        if let Some(blk) = func.blocks.iter_mut().find(|b| b.id == target_block) {
+            if idx < blk.params.len() {
+                blk.params.remove(idx);
+            }
+        }
+        // Drop the corresponding arg slot from every predecessor's
+        // terminator that branches into `target_block`.
+        for src in func.blocks.iter_mut() {
+            if let Some(term) = &mut src.terminator {
+                drop_branch_arg(term, target_block, idx);
+            }
+        }
+    }
+}
+true
+```
+
+**BUG!** This always returns `true` even if `by_block` had entries that were no-ops (e.g., the indices ended up out of range). More importantly:
+
+**CRITICAL: Outer DCE loop infinite termination?** No — it always returns `true` if `by_block` was non-empty, even if removing the params introduced *no* actual change to the function (impossible in practice since by_block was non-empty). OK so termination is safe.
+
+**However**, there's a **SUBTLE issue** with how we collect dead params. We collect all dead params first based on live set, but then we process them removing args from all predecessors. If the predecessor itself happens to have a dead block param too (which we plan to remove), and the dead param's use is via a branch arg passed from the same predecessor — actually let me think...
+
+Actually, here's a real problem. Consider this case:
+
+```
+entry:
+  br A(c0)
+A(p0:i32):              <- dead param (p0 unused inside A)
+  br B(p0)              <- branch arg references p0
+B(p1:i32):              <- p1 is live (used in some compute)
+  use(p1)
+  ret
+```
+
+When we collect live uses, `p0` is *used* in `Branch(B, [p0])` of A's terminator → so `p0` ends up in `live`. So p0 is NOT considered dead. 
+
+But wait — what if both `p0` and `p1` are unused? Then `p0` is in live (from A's branch to B), so `p0` is NOT removed in the first round. But `p1` IS dead. So `p1` is removed in the first round. Then drop_branch_arg removes the corresponding arg from A's branch, which removes the `p0` use. Now in the next outer iteration, `p0` IS dead and gets removed. So the outer fixpoint converges.
+
+OK so two-stage cleanup needed. Good — that's why it's a fixpoint.
+
+Now another concern: **what if the block has multiple predecessors and one of them branches to the same target via different terminator types?** Like, `entry` does `CondBranch { true_dest: A, false_dest: A, true_args: [v0], false_args: [v1] }`. Both arms go to A. This branches to A twice! The current `drop_branch_arg` handles `CondBranch` correctly:
+
+```rust
+if *true_dest == target && idx < true_args.len() {
+    true_args.remove(idx);
+}
+if *false_dest == target && idx < false_args.len() {
+    false_args.remove(idx);
+}
+```
+
+It uses `if` (not `else if`) — so if both branches go to the same target, both arg lists get adjusted. 
+
+Now let me think: **what if a self-loop block has its own branch arg referencing itself?** Like header(p0:i32) does CondBranch(... false_dest: header, false_args: [p0_dependent_value]). The verifier requires SSA — so a self-reference like `false_args: [p0]` is valid. If p0 is "dead inside the block but used as a branch arg in the self-loop terminator", then `p0` would be in the live set (via the terminator), so it doesn't get removed. That's fine.
+
+**Now, here's a real concern: cycles in branch arg removal.** Consider this scenario:
+```
+entry: br A(c0, c1)
+A(p0, p1):     <- both unused
+  br B(p1, p0)  <- branch arg uses p0 and p1, swapped
+B(p2, p3):
+  br A(p3, p2)  <- this is a back-edge to A, swapping
+  // (assume both p2 and p3 used somewhere, or also unused)
+```
+
+In the first round, are p0 and p1 dead? They appear as args in the terminator `br B(p1, p0)` — so they're in the live set. So neither is removed in round 1. Now consider p2, p3 — same logic, they're in the live set via `br A(p3, p2)`. So nothing happens. Good.
+
+But what if we add `use(p2)` in B but not `use(p3)`, so p2 is live independent of args, p3 is only in the terminator. Then p3 is in `live` (from the terminator). p0 and p1 are also in live. Nothing removed.
+
+OK, the logic is conservative. Let me think of a real cycle case…
+
+**Actually wait** — let me look at what `collect_live_uses` does more carefully:
+
+```rust
+fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
+    let mut live = HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            for v in inst_uses(&inst.kind) {
+                live.insert(v);
+            }
+        }
+        if let Some(term) = &block.terminator {
+            for v in terminator_uses(term) {
+                live.insert(v);
+            }
+        }
+    }
+    live
+}
+```
+
+This computes the **transitive closure** of "used somewhere". So if `p0` is referenced in `br B(p0)`, that counts as a use even though it's never **actually consumed** by anything live downstream. This means cycles of dead block params (where each only feeds into the others) **never get cleaned up**. Classic dead-cycle problem.
+
+This is a real **MEDIUM bug**: a cycle of dead block params will never be removed by this DCE. Example:
+```
+A(p:i32): br A(p)    // self-loop with arg
+```
+
+If A is reachable but p is otherwise dead, the standard fixpoint never removes p. This is the dead-arg-cycle problem. Though it's mostly an "incomplete DCE" issue rather than a soundness one.
+
+Now let me think about a more dangerous scenario: **what if the outer fixpoint causes the verifier to produce stale state**? The DCE pass uses a private `prune_unreachable` that doesn't catch... Wait — let me see if there's an issue with `prune_unreachable` happening **after** the block-param fixpoint.
+
+```rust
+fn dce_function(func: &mut Function) -> bool {
+    let mut any_change = false;
+    let mut outer_changed = true;
+    while outer_changed {
+        ... // inner + remove_dead_block_params
+    }
+    if prune_unreachable(func) { any_change = true; }
+    any_change
+}
+```
+
+So unreachability is pruned at the very end. What if the outer fixpoint processed an unreachable block's branch into a live target, removing live args from predecessors? Wait, the unreachable block's branch IS a "terminator use" — so its operands are kept alive falsely. If we have an unreachable block whose terminator uses some `ValueId`, that `ValueId` ends up in `live` even though it's truly dead. 
+
+Order matters: if we **prune unreachable BEFORE** the DCE loop, we'd correctly drop those operands from `live`. By doing it after, we're conservative (wasteful but not wrong).
+
+But wait — this could matter for **block param removal**! If an unreachable block has a `Branch(target, [p0])`, then p0 is "live". If `target` has p0 as a parameter that's otherwise dead, we won't remove it. After we then prune the unreachable block, p0 becomes dead — but DCE has already exited. So p0 stays.
+
+This is **another medium bug**: unreachable blocks block dead-param cleanup. Tests don't cover this.
+
+Let me check for the C-A fix more carefully now. The fix removes the placeholder machinery — `substitute_uses` is called, then nothing happens. The original instruction stays in place. Then DCE removes it next round.
+
+**Adversarial case**: what if `substitute_uses` is called but the original instruction has the same `ValueId` as a use in the new substitution? Let me think...
+
+`Rewrite::Identity { pass_through: var_id }`: `substitute_uses(func, old_id, var_id)`. This replaces all uses of `old_id` with `var_id` everywhere. The original instruction at `(bi, ii)` keeps its `kind` (the IMul/IAdd/etc.) but its uses are now... wait no — `substitute_uses` rewrites operand slots. So if the original instruction was `IMul(x, one)` with `old_id = mul_id`, then... let me trace:
+
+- Before: `mul_id = IMul(x, one_id)`, `Return(Some(mul_id))`
+- `substitute_uses(func, mul_id, x)` — rewrites operand slots that equal `mul_id` to `x`. 
+- The IMul instruction's own operands are `x` and `one_id`, neither of which equals `mul_id`, so unchanged.
+- The terminator `Return(Some(mul_id))` becomes `Return(Some(x))`. Good.
+
+So now `mul_id`'s instruction still defines `mul_id` with kind `IMul(x, one_id)`. Nothing references `mul_id` anymore. DCE removes it.
+
+**But there's a subtle case**: what if the **same instruction** uses its own old_id? That can't happen in SSA. Good.
+
+**Adversarial: what if two strength-reduce identities chain?** From the test:
+```
+%mul1 = imul x, 1   ; identity → x
+%mul2 = imul mul1, 1 ; identity → mul1
+```
+
+The pass processes rewrites in **descending** order: mul2 first, mul1 second.
+- mul2 first: `substitute_uses(func, mul2_id, mul1_id)`. Now any reference to mul2 → mul1.
+- mul1 second: `substitute_uses(func, mul1_id, x)`. Now any reference to mul1 → x.
+
+So if `Return(Some(mul2_id))` was originally there, after mul2 processing it becomes `Return(Some(mul1_id))`, and after mul1 processing it becomes `Return(Some(x))`. 
+
+But! There's a subtle issue with **non-identity rewrites between identity rewrites**. Consider:
+
+```
+%a = imul x, 1   (identity → x)
+%b = imul a, 8   (becomes shl: ShlByConst { var: a, k: 3 })
+%c = imul b, 1   (identity → b)
+ret c
+```
+
+Reverse order: c, b, a.
+- c: `substitute_uses(c, b)`. All uses of c → b. Return now Some(b).
+- b: `ShlByConst { var: a, k: 3 }`. Inserts a `ConstInt(3, ...)` at the same index, then sets the original instruction (now at `ii+1`) to `Shl(a, kid)`.
+
+Wait! Look at this:
+```rust
+Rewrite::ShlByConst { var, k } => {
+    let int_w = if let IrType::Int(w) = ty { w } else { unreachable!() };
+    let kid = func.next_value_id();
+    let span = func.blocks[bi].insts[ii].span;
+    func.blocks[bi].insts.insert(ii, Inst {
+        id: kid,
+        kind: InstKind::ConstInt(k as i64, int_w),
+        ty: IrType::Int(int_w),
+        span,
+    });
+    // The original instruction shifted to ii+1.
+    func.blocks[bi].insts[ii + 1].kind = InstKind::Shl(var, kid);
+}
+```
+
+Inserting at `ii` shifts everything after it by +1, including the **already-processed** `c` rewrite at `ii+1` (since c comes after b in instruction order, but we processed c first because we sorted descending — c is at higher `ii`, so we processed c at its original `ii_c > ii_b`).
+
+So c was at `ii_c`, b at `ii_b`, with `ii_c > ii_b`. We processed c first. The `c` rewrite was Identity, so no instructions inserted, just `substitute_uses`. The instruction at `ii_c` is unchanged.
+
+Now we process b at `ii_b < ii_c`. We insert a constant at `ii_b`, shifting everything from `ii_b` onwards. The instruction that was at `ii_c` is now at `ii_c + 1`. **But we don't reference `ii_c` again, we already processed c.** So this is fine.
+
+OK so the descending order is correct. But:
+
+**Now process a (the first imul, identity → x)**. `a` is at `ii_a < ii_b`. `ii_a` was its original position. Has anything before `ii_a` been modified? Well, nothing was inserted at indices `< ii_a`. So `ii_a` is still valid. 
+
+But wait! `substitute_uses` rewrites operand slots throughout. After processing b (which inserted a const at `ii_b` and made the instruction at `ii_b + 1` into `Shl(a, kid)`), the instruction now at `ii_b + 1` is `Shl(a, kid)`. Then `substitute_uses(func, a_id, x_id)` rewrites all uses of `a` → `x`. So the `Shl(a, kid)` becomes `Shl(x, kid)`. 
+
+OK so the chained case works. Let me go further.
+
+**Adversarial: what about a DEAD identity rewrite where the instruction has been already substituted?** Like:
+```
+%a = imul x, 1 (identity)
+%b = imul a, 1 (identity, processed first)
+ret b
+```
+
+Reverse order: b, a.
+- b: `substitute_uses(func, b_id, a_id)`. Now Return is `Some(a_id)`. Note that b's instruction is still `IMul(a, one1)` — unchanged.
+- a: `substitute_uses(func, a_id, x_id)`. Now Return is `Some(x_id)`. AND the IMul instruction at b's position, which had operands `(a, one1)`, becomes `(x, one1)`.
+
+OK so it correctly chains. Good.
+
+Now let me think about a more subtle adversarial pattern: **what if the IMul instruction itself has an operand that gets rewritten?** Specifically:
+
+```
+%a = imul x, 1 (identity → x)
+%b = imul a, 1 (identity → a)
+```
+
+Wait this is the same case. Skip.
+
+**What about: what if the rewrite makes a rewrite invalid?** For example:
+```
+%c = const 0
+%d = const -1
+%mul = imul c, d (c=0 → ConstInt(0, w), but the rewrite scan treats c as 0, so it becomes ConstInt(0, w))
+%mul2 = imul mul, x (mul is now const(0), so this becomes const(0))
+```
+
+But `consts` is built ONCE at the start of the pass:
+
+```rust
+let consts = collect_int_consts(func);
+```
+
+So if `mul` was `IMul(c, d)` initially, `consts` does NOT include `mul` (because `collect_int_consts` only picks up `ConstInt` kinds, and `mul` is `IMul`). So `mul2`'s `rewrite_for` doesn't see `mul` as a constant. After applying both rewrites, `mul` becomes `ConstInt(0, w)` (KindOnly), and `mul2` doesn't get its rewrite even though it should now be `IMul(const(0), x)` → const(0).
+
+This is a missed optimization, fixed by re-running the pass. Not a correctness bug.
+
+**Now back to the C-A fix specifically**: the fix removes the placeholder code path. The question is whether DCE actually removes the orphan. The test `audit_interaction_strength_reduce_orphans_get_dced` does test this through the full pipeline. Let me check whether IMul has a side effect — nope, it doesn't. So DCE should remove it.
+
+But here's a concern: **what if the orphaned instruction has a constant operand that's used nowhere else?** Like:
+```
+%one = const 1
+%mul = imul x, one  (identity → x; mul kind unchanged)
+ret x  (after rewrite)
+```
+
+After SR: `mul` is still `IMul(x, one)`, but no one uses it. DCE: `mul` is dead → removed. Now `one` has no uses → also removed. 
+
+**Adversarial: what if two operations chain and the chain breaks via Identity?**
+
+```
+%a = imul x, 1   (identity → x)
+%b = imul a, 2   (NOT identity, can be ShlByConst k=1)
+ret b
+```
+
+Reverse order: b, a.
+
+- b first: `ShlByConst { var: a, k: 1 }`. Inserts `ConstInt(1, w)` at b's position. b becomes `Shl(a, kid)`.
+
+But wait — `var` here is `a` (i.e., the result of the first imul). The original `b = imul(a, 2)`, so `var=a`. After `ShlByConst`, b becomes `Shl(a, kid)`.
+
+- a next: `substitute_uses(func, a_id, x_id)`. Now the `Shl(a, kid)` becomes `Shl(x, kid)`. 
+
+So this works. Now let me think harder about C-C.
+
+**C-C adversarial**: the new code:
+```rust
+return match (ty, *k) {
+    (IrType::Int(w), Const::Int(v, _)) => {
+        Some(InstKind::ConstInt(norm(v, *w), *w))
+    }
+    (IrType::Float(FloatWidth::F32), Const::Float(v, _)) => {
+        Some(InstKind::ConstFloat(v as f32 as f64, FloatWidth::F32))
+    }
+    (IrType::Float(FloatWidth::F64), Const::Float(v, _)) => {
+        Some(InstKind::ConstFloat(v, FloatWidth::F64))
+    }
+    (IrType::Bool, Const::Bool(b)) => {
+        Some(InstKind::ConstBool(b))
+    }
+    _ => None,
+};
+```
+
+OK so this handles Int, F32, F64, Bool. What about a Select on a `Ptr` type? `Select(cond, ptr1, ptr2)` where `inst.ty = Ptr(_)`. The chosen branch's constant would have to be... well, no constant kinds for pointers. So `consts.get(&chosen)` returns None and the wider check never fires. Good.
+
+What about `Select` on a struct/array type? Same — no constant kinds. None.
+
+**But what if `ty` is `IrType::Int(I32)` and the chosen const is `Const::Bool(b)`?** Falls through to `_ => None`. Good.
+
+**What if `ty` is Int(I8) but the const is `Const::Int(255, I32)`?** Hits the first arm. `norm(255, I8)` = sext(mask(255, 8), 8) = sext(0xff, 8) = -1. So we'd produce `ConstInt(-1, I8)`. **Is this correct?** The Select declared type is I8, and conceptually the chosen constant should already match the I8 type — having a different width is itself a verifier-uncatchable bug upstream. The `norm` call is conservative in the face of that bug — it truncates to I8 width. **However**, this could **mask** an upstream bug. If the chosen Int(255, I32) was actually an erroneous constant that should have been `Int(0xFF as i8, I8)` = -1, then `norm` happens to produce the same answer. But if the upstream bug was a real ValueId mismatch (Select picking the wrong branch), then... well, type-checking the operands doesn't help with that anyway. Conservative is fine.
+
+**Adversarial**: what if `ty` is Int(I64) and the const is `Const::Int(v, I8)`? The original i64 should sign-extend the i8 value. `norm(v, I64)` = sext(mask(v, 64), 64) = `v` unchanged (assuming v already sign-extended). But the i8 value might be stored as `0xff` (255) — not sign-extended to i64 (which would be -1). Then `norm(255, I64)` = 255, **not -1**. So we'd produce `ConstInt(255, I64)` instead of `ConstInt(-1, I64)`.
+
+**Wait but how would a const ever be stored as 255 in i8?** Let me trace... `ConstInt(255, IntWidth::I8)`. The `Const::from_inst` extracts `(255, I8)`. Then `consts.get(&chosen)` returns `Const::Int(255, I8)`. We pass `(255, I8)` into the match. We hit `(IrType::Int(I64), Const::Int(255, _))`. We call `norm(255, I64)` = 255.
+
+But the **runtime** value of the i8 const 255 is... actually, looking at how the lowerer creates ConstInt, narrow widths should already be sign-extended in storage. Let me verify.
+
+=== MESSAGE BREAK ===
+
+Now let me check the const_prop pass to understand how it interacts with the new DCE block-param removal.
+
+=== MESSAGE BREAK ===
+
+Now I need to investigate several adversarial scenarios. Let me look at the lower.rs ISHFT path that was mentioned in the audit (M-B/C interaction):
+
+=== MESSAGE BREAK ===
+
+I can see the ISHFT lowering uses Select(is_left, Shl, LShr). With a known constant negative shift, the M-B/C fix means the Shl arm won't fold to 0, but the Select itself will fold to LShr correctly. Let me verify this in the audit test scenarios.
+
+Looking at the ISHFT case adversarial scenario:
+1. `ishft(a, -3)` lowers to `select(is_ge_0, shl(a, -3), lshr(a, neg(-3)))`
+2. `is_ge_0` folds to `false` (since -3 < 0)
+3. `Select` then folds to the false arm (`lshr(a, 3)`)
+4. The Shl(a, -3) is now dead and DCE removes it
+
+But wait — let's check the order of operations carefully. const_fold processes instructions in order. The Shl is encountered first, then LShr, then Select. The Shl would NOT fold (negative count → bail). The LShr would fold. The Select would fold to the chosen branch. This seems okay.
+
+But what if `a` and the shift count are constants and the Select picks the Shl branch (which didn't fold)? The Select fold uses `consts.get(&chosen)` — and `chosen` is the Shl ValueId, which is NOT in `consts` because it didn't fold. So Select can't fold either. This is a missed optimization, not a correctness bug. Let me verify by reading the Select fold code:
+
+```rust
+InstKind::Select(c, t, f) => {
+    if let Some(Const::Bool(cv)) = get(c) {
+        let chosen = if cv { *t } else { *f };
+        if let Some(k) = consts.get(&chosen) {
+```
+
+Yes — if the chosen branch isn't in `consts`, Select doesn't fold. This is a real but minor issue: we lose folding when the unrewritten side blocks it. However, the chosen side IS the LShr, which DID fold. So the Select successfully picks the folded LShr value. Good — this only matters if `is_ge_0` were `true` and we picked the Shl branch (positive constant shift): the Shl folds correctly, then Select folds to the result. Also fine.
+
+Let me now construct adversarial tests for things I'm worried about.
+
+Adversarial scenario 1: M-7 — what if a loop has BOTH a self-loop on header AND a separate latch?
+
+Looking at the M-7 fix: `let mut stack: Vec<BlockId> = latches.iter().filter(|&&l| l != header).copied().collect();`
+
+If there are TWO back edges into header — one from header itself (self-loop) and one from another block B — then `latches = [header, B]`. The filter removes `header`, leaving stack = `[B]`. The body BFS from B walks back. Body initial: `{header, header, B}` = `{header, B}`. The BFS from B walks `preds(B)`. If B's predecessors are inside the loop body, fine. But if B's predecessors include the preheader or external blocks, the body analysis is INcomplete because we never visit B's preds directly via BFS — we BFS from B which is already in body. Wait — we do `stack.pop() → b = B`, then for each pred of B, if pred != header, insert into body and push.
+
+So preds of B that aren't the header get added. Good. But what about the self-loop's body contribution? The header's self-loop edge means everything in the body that reaches header via the self-loop... wait, no. The self-loop just means header → header. The body for that loop alone is just `{header}`. When merged with the other latch's loop, we get `{header, B, ...preds_of_B_excl_header...}`. That's correct: the loop body should include header, B, and everything between them.
+
+Actually, this looks correct. **But there's a subtle issue**: the back-edge from `header → header` is silently dropped from the body computation. Are we guaranteed that LICM will still treat header as part of the loop? Yes — body always includes header. So is_hoist_candidate, loop_defs, all still see header. **Phew, looks correct.**
+
+But wait, here's a real issue: after the filter, if `latches = [header]` only (pure self-loop), the stack is empty and we never enter the BFS at all. But body is `{header}` (header inserted at line 284, latches inserted at line 286 → just header again). So body = `{header}`. find_preheader runs: header_preds includes the previous block (entry, say), and the self-edge from header. The outside list filters out body=`{header}`, so outside has one entry (the entry block). The preheader exists and the self-loop is correctly handled. 
+
+Adversarial scenario 2: C-A — strength_reduce identity now leaves the orphan instruction in place. Does DCE actually remove it?
+
+The orphan is a non-side-effecting instruction (e.g., `IMul(x, one)`) whose result `ValueId` is no longer referenced anywhere because `substitute_uses` rewrote everything. DCE's `collect_live_uses` walks all instructions and terminators looking for uses; it would not see the old `mul.id` referenced anywhere. The orphan IMul instruction is NOT in `has_side_effect` (Store, Call, RuntimeCall, Alloca only). So DCE removes it next round. Good.
+
+**However**, here's a subtle interaction: the DCE inner loop walks `block.insts.retain(|inst| ...)`. It needs `live` to NOT contain the orphan id. Live IS computed correctly. But wait — the orphan IMul still has its operands `(x, one)`. The orphan's `inst_uses` returns `[x, one]`, which adds x and one to the live set. So `one` (the constant 1) stays live as long as the orphan stays. But the orphan WILL be removed in the same DCE round (since IMul has no side effects, and its id isn't used elsewhere). After removal, `one` becomes unused too, and the next inner iteration removes it.
+
+So after DCE: orphan IMul gone, the constant `one` gone. Good. **Verified.**
+
+Adversarial scenario 3: C-A + ShlByConst interaction
+
+The ShlByConst path creates a new `ConstInt(k)` instruction at index `ii`, shifting the original to `ii+1`, then rewrites it to `Shl(var, kid)`. This is in the same `match rw` arm. The rewrites are applied in reverse order so this insertion doesn't shift other rewrites' indices. Good.
+
+But what about Identity's `substitute_uses` followed by ShlByConst at a higher index? In reverse order, ShlByConst (higher) runs first, inserting a const, shifting indices in that block by +1 starting at `ii`. Then Identity (lower index) runs. Identity's `(bi, ii)` was captured before, so `ii` still refers to the *original* index — but wait, the ShlByConst inserted at a higher `ii`, so the lower `ii` for Identity is unaffected. **Correct.**
+
+But what if the ShlByConst is at a *lower* index than the Identity? Then ShlByConst is processed second (lower in reverse order). It inserts a const at the lower index — but Identity already ran with its `ii` at a higher index. After the ShlByConst insert, that `ii` is now off-by-one... but Identity already ran and used `substitute_uses`, which only operates on `func` (no index dependence). So Identity is fine. ShlByConst is also fine because its own `ii` is captured. **Correct.**
+
+Adversarial scenario 4: C-C — Select with unusual type combinations
+
+`(IrType::Bool, Const::Int(_))` — the match falls into `_ => None`. Good — bails.
+`(IrType::Int(I8), Const::Int(v, I64))` — this matches `(IrType::Int(w), Const::Int(v, _))` and re-norms `v` at I8 width. **But wait**: if the chosen const is, say, `Const::Int(257, I64)`, then `norm(257, I8) = 1`. Is that correct? Yes — it's the same operation as if the value was truncated to I8 normally. As long as the verifier ensures the Select and its operands all have the same type, this never actually happens in practice. The bail is just defense-in-depth.
+
+But hold on — looking at the Const::Int recovery:
+
+```rust
+(IrType::Int(w), Const::Int(v, _)) => {
+    Some(InstKind::ConstInt(norm(v, *w), *w))
+}
+```
+
+The `*w` here is `inst.ty`'s int width — but what if `inst.ty` is `IrType::Int(I64)` and the chosen branch is a `Const::Int(255, I8)` whose stored `i64` value is 255 (NOT sign-extended)? Then `norm(255, I64) = 255`. But the *correct* value would be the sign-extended `-1`. So **if the Select declares I64 but the chosen branch is actually I8**, the result is wrong.
+
+Wait, that's a real issue. Let me think more carefully. In the Const enum, `Const::Int(v, w)` stores `v` in *normalized* form (since norm() is applied during folding). For an i8 value of -1, the stored `v` is -1 (normalized via norm: mask 0xff = 255, sext = -1). Let me double-check this:
+
+Looking at all the places `Const::Int` is created via `from_inst`:
+```rust
+InstKind::ConstInt(v, w) => Some(Const::Int(*v, *w)),
+```
+
+This just copies `v` from the IR. If the IR has a `ConstInt(255, I8)` (not normalized), then `Const::Int(255, I8)`. Looking at the constant fold tests, the `audit_const_fold_icmp_uses_each_operand_width` test creates exactly this:
+```rust
+let b = push(&mut f, InstKind::ConstInt(255, IntWidth::I8), IrType::Int(IntWidth::I8));
+```
+
+So yes — the IR may store unnormalized values. And the Const::Int captures whatever's in the IR. So in Select's fold:
+
+```rust
+(IrType::Int(w), Const::Int(v, _)) => {
+    Some(InstKind::ConstInt(norm(v, *w), *w))
+}
+```
+
+This calls `norm(v, *w)` where `*w` is `inst.ty`'s width and `v` is the chosen branch's stored value (which may have been at a different width). If `inst.ty == I64` and chosen is `(255, I8)`, the result is `norm(255, I64) = 255`, NOT `-1`.
+
+**This is wrong if the type assumption (Select declared I64, chosen I8) is permitted.**
+
+But the verifier doesn't check that the Select's type matches the operand types beyond `is_int()`. Could lower.rs ever produce such a Select? Probably not currently, but the audit said:
+
+> "What if `inst.ty` is `Bool` but `*k` is `Const::Int(_)` (some weird edge case)?"
+
+— the bail handles that. But the *width drift* case for Int → Int with different widths is not handled correctly. **The norm should re-normalize at the chosen branch's source width FIRST then again at inst.ty's width.** Or more simply, sign-extend at source width then mask/sext at dest width.
+
+Actually wait — let's think again. If `Const::Int(v, src_w)` has `v = 255` and `src_w = I8`, then `sext(255, 8) = -1`. The "true" value of the constant is -1. The Select declares I64. So the result should be `ConstInt(-1, I64)` (or the correct sign-extension).
+
+The current code does `norm(255, I64)`. `norm` is `sext(mask(v, 64), 64) = sext(255 & u64::MAX, 64) = 255`. Wrong.
+
+**But** is this scenario even constructable? For Select to fold, both arms must be in `consts` (which they are if they're folded constants), and the Select itself is constructed by lowering. The lowering presumably ensures all three Select operands have the same type. The verifier doesn't enforce it for Select directly though (no type-consistency check for Select).
+
+Let me confirm by looking at type consistency in verify.rs — the only checks I saw were for IAdd/etc. and Load/Store. **Select is not type-checked.**
+
+So a future bug — or even a current bug — could create a Select with width-mismatched arms. The C-C "fix" only handles the type-category mismatch (Int vs Float vs Bool), not width drift within Int. **This is still a latent C-C bug**, just more constrained.
+
+Let me check if this is exploitable today... The audit's C-C test only tests same-width Select. Let me check how lower.rs creates Selects. The IR builder's select() probably enforces types. Let me check:
+
+=== MESSAGE BREAK ===
+
+The `select` builder takes `inst.ty = type_of(true_val)`. So if the true and false branches have mismatched types, the IR is malformed. The verifier doesn't catch it but the builder won't create it either.
+
+**Still**, the C-C fix's `norm` is insufficient for width drift. If a future pass introduces width drift, the result is wrong. Worth noting as latent.
+
+Adversarial scenario 5: Med-6 — what about INeg(i64::MIN)?
+
+`INeg(i64::MIN)` overflows: `(-i64::MIN) = i64::MIN` due to two's-complement wraparound. In Rust, this is `wrapping_neg()` which returns `i64::MIN` (no panic). For narrower widths via norm(), it correctly wraps too (`i8::MIN.wrapping_neg() = i8::MIN`). **Not a trap, but a wrong-direction wrap that matches AArch64 NEG. Fine.**
+
+What about Shl with dynamic operand at runtime — can it trap on AArch64? No, LSL doesn't trap. IDiv on i64::MIN/-1 traps via SDIV (overflow exception). The fold handles this by bailing. But what about hoisting `idiv x, y` where x = i64::MIN at runtime? LICM excludes IDiv now. **Fixed.**
+
+What about INeg(i64::MIN) being hoisted? INeg wrapping_neg() at AArch64 is just `NEG`, which doesn't trap. So not a trap concern. But check `is_hoist_candidate`: INeg is not in the excluded list, so it CAN be hoisted. That's safe — INeg doesn't trap.
+
+What about Load? Excluded. Store? Excluded. Call? Excluded. RuntimeCall? Excluded. FAdd / FMul / FSub on signaling NaN — these can raise floating-point exceptions, but Fortran doesn't normally enable those. Skipping for now.
+
+What about Alloca? Excluded. **Med-6 looks correct for trap-prone exclusion.**
+
+But I'm not sure about IMod. The fix excludes IMod. Good. What about UDiv/UMod? They don't exist in this IR — only IDiv/IMod. Good.
+
+What about FloatToInt? It can produce wrong results for out-of-range or NaN, but it doesn't TRAP on AArch64 (FCVTZS just saturates/produces undefined). It's not excluded. Hoisting it is technically safe — won't crash. Good.
+
+Adversarial scenario 6: Med-5 — DCE block param removal corner cases
+
+Looking at `remove_dead_block_params`:
+
+```rust
+let live = collect_live_uses(func);
+let mut by_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
+for block in func.blocks.iter() {
+    if block.id == func.entry { continue; }
+    for (idx, p) in block.params.iter().enumerate() {
+        if !live.contains(&p.id) {
+            by_block.entry(block.id).or_default().push(idx);
+        }
+    }
+}
+```
+
+What if a block has multiple params, some dead, some live, and a live param is referenced by a dead param's branch arg in a predecessor? Wait, branch args reference values defined in the predecessor block, not the target's params. The target's params are defined by the target. So the dependency only flows one way: branch arg → target param.
+
+But here's a tricky case: consider a block B with params (p0, p1), where p0 is dead and p1 is live. In a predecessor's branch, the args are (a0, a1) where a0 is defined by some instruction. After we remove p0 and drop a0 from the branch arg list, the instruction defining a0 may become dead. This is what the test `audit_dce_removes_one_of_two_block_params_keeps_correct_arg` checks. The outer fixpoint loop handles this. 
+
+But what if the predecessor's branch arg `a0` is itself a *block parameter of the predecessor*? Then removing `a0` from the branch args means dropping a use of `a0`. If `a0` had only that one use, `a0` becomes dead, which means removing the predecessor's block param `a0`, which means... cascading. The outer loop handles this iteratively. Good.
+
+What about the iteration order — could the outer loop fail to converge? Each iteration either removes at least one block param OR removes at least one instruction. Both are monotonic decreases. The function is bounded by the original IR size, so the loop terminates in O(N²) at worst. **No infinite loop.**
+
+But wait — the inner DCE loop also runs to fixpoint, and the outer loop wraps it. The outer changes only when remove_dead_block_params returns true. **Convergence is fine.**
+
+Adversarial scenario 7: Med-5 — Switch with block params
+
+The `drop_branch_arg` code says:
+```rust
+// Switch targets cannot have block params per the verifier;
+// nothing to update.
+_ => {}
+```
+
+The verifier DOES check this (verify.rs lines 408–422). But what if `dce_function` runs on a function whose verifier check would fail? The DCE pass doesn't run the verifier. If the IR happens to have a Switch with a block-param target, DCE would silently miss it. Probably OK in practice but it's defense-in-shallow.
+
+More importantly: **the dead-param check itself is gated on `block.id != func.entry`**, but Switch targets might be the entry... no, that's impossible since the entry has no predecessors normally. Actually, **the entry COULD be a Switch target** (the entry just has no params). **Not a real bug.**
+
+Adversarial scenario 8: Med-5 — what about a self-loop block (loop header) where a block param is "dead" within its own block but referenced via the back-edge?
+
+Consider:
+```
+header(p):
+  br header(p)  ; back-edge passes p to itself
+```
+
+`p` is "used" in the branch arg via `terminator_uses` → `[p]`. So `p` is live. **Won't be removed.** Good.
+
+But: `p` is dead in the sense that nothing in the body actually consumes its value — it's just a self-passing identity. Even though it's "live", no instruction reads it. This is a missed optimization (passing constant zeros around the loop), but not a correctness issue.
+
+Adversarial scenario 9: Med-5 — interaction with `audit_pipeline_o2_e2e_loop_through_passmanager`
+
+Looking at the test loop:
+```
+header(i_param: i32) { 
+  k = const 5;
+  i2 = iadd i_param, k;
+  lim = const 10;
+  done = icmp ge i_param, lim;
+  cbr done, exit, latch(i2)
+}
+latch(i_in: i32) { ...; br header(next) }
+```
+
+After O2:
+- LICM hoists `k = const 5` and `lim = const 10` to entry
+- CSE / const_fold work on what's left
+- DCE runs
+
+Is `i_param` live? It's used by `i2 = iadd i_param, k`, by `done = icmp ge i_param, lim`, and by `false_args: vec![i2]` (no, that's i2). Actually wait, the test passes `i2` not `i_param` in the false_args. So `i_param` is used by iadd and icmp. Both still in the header.
+
+`i_in` in latch — used by `next = iadd i_in, one`. Live. Good.
+
+After LICM hoists k and lim — does anything mess up the IR? Let me think... 
+- LICM moves `k = const 5` from header to entry. 
+- header now references k (defined in entry, which dominates). Fine.
+- lim same.
+- `i2 = iadd i_param, k` — i_param still header param, k now in entry. Good — entry dominates header.
+- `done = icmp ge i_param, lim` — same.
+
+The test passes. Good.
+
+Adversarial scenario 10: Min-1 — chase-pointer cycle
+
+The chase-pointer logic is:
+```rust
+let keys: Vec<ValueId> = rewrite_map.keys().copied().collect();
+for k in keys {
+    let mut cur = rewrite_map[&k];
+    while let Some(&next) = rewrite_map.get(&cur) {
+        cur = next;
+    }
+    rewrite_map.insert(k, cur);
+}
+```
+
+CSE only inserts `(later_id → earlier_id)` because `key_of` is checked when iterating block insts in order, and on a duplicate, the LATER instruction's id is the key, the EARLIER (already-seen) id is the value. So all entries are "later → earlier". The chase walks `cur = rewrite_map[k]`, then while `cur` is itself a key (i.e., another duplicate), follow it. Each step strictly decreases the ValueId (since CSE always rewrites to earlier). Termination is guaranteed.
+
+**But wait** — there's a subtle issue. Consider:
+```
+block B1: %1 = iadd a, b   (key K)
+block B2: %2 = iadd a, b   (key K, same)  → rewrite %2 → %1
+```
+
+The second occurrence in B2 doesn't dedupe because each block has its own `seen` map (the inner loop is per-block). Local CSE doesn't cross blocks. Good.
+
+But within one block:
+```
+%1 = iadd a, b
+%2 = iadd a, b   → rewrite %2 → %1
+%3 = iadd a, b   → rewrite %3 → %1 (since %1 still in seen map)
+```
+
+Both %2 and %3 get mapped directly to %1. No chains. The chase-pointer logic isn't actually needed for local CSE because each rewrite is from "this id → first id in this block". **Chains only happen when** rewrites are added across multiple iterations of the outer loop in the same function — but the rewrite_map is built once per function call.
+
+Actually, looking again — the `seen` map is per-block, so for one function we build a single `rewrite_map` populated by all blocks. Within a block, we always insert `(duplicate → first)`. Across blocks, the maps don't share keys (different ValueIds). So the rewrite_map values are all "first occurrences within their respective blocks", which are not themselves keys (since they're "firsts").
+
+**Conclusion**: the chase-pointer code is doing nothing in practice — every value in rewrite_map is already the canonical target. But it's harmless. No infinite loop. **Correct, but the comment overstates its necessity.**
+
+WAIT. There's a more subtle issue. What if `substitute_in_inst` mutates the operands of an instruction such that NEW duplicates emerge? For example:
+```
+%1 = iadd a, b
+%2 = iadd c, d
+%3 = iadd %1, %2   (key uses %1 and %2)
+%4 = iadd %1, %2   (duplicate of %3) → rewrite %4 → %3
+```
+
+After substitution, %4 → %3 is applied. Single pass. Good. No chain.
+
+But what if there's:
+```
+%1 = iadd a, b
+%2 = iadd a, b   → %2 → %1
+%3 = isub %2, c   (key encodes [%2, c])
+%4 = isub %1, c   (key encodes [%1, c])
+```
+
+%3 and %4 have different keys — `%2 != %1`. Even though they're equivalent post-substitution, CSE won't recognize them in this pass. **Missed optimization, not wrong.** A second run of CSE (after the substitution rewrites %3 → ?) would fix it... but wait, after substitution `%3 = isub %1, c` (since %2 → %1). And %4 = isub %1, c. Now they ARE duplicates, and a SECOND CSE pass would catch it.
+
+Does the pass manager re-run CSE? Looking at pipeline.rs:
+
+=== MESSAGE BREAK ===
+
+Pass manager runs to fixpoint. Good. The CSE missed-opportunity is recovered next round.
+
+But wait — there's a real bug in CSE Min-1: **`LocalCse::run` returns `changed = true` whenever `rewrite_map` is non-empty, regardless of whether the substitution actually changed anything in the IR.** Let me re-check.
+
+```rust
+if rewrite_map.is_empty() { continue; }
+// ...
+substitute_uses_batch(func, &rewrite_map);
+changed = true;
+```
+
+If `rewrite_map` is non-empty, `changed = true`. The rewrite map only gets entries when there's an actual duplicate found, so non-empty implies real work. **OK, this is correct.**
+
+But wait — let's think about this: every entry in `rewrite_map` says "this id should be renamed". The `substitute_uses_batch` walks every operand and rewrites. If `rewrite_map` has entries, we WILL rename. So `changed = true` is correct.
+
+**However** — the duplicates themselves (the `inst.id`s that are now orphaned) are NOT removed by CSE. They're left for DCE. Same as the strength_reduce identity case. So CSE leaves orphans. The pass manager runs DCE next, which removes them. **Standard pattern.**
+
+Adversarial scenario 11: CSE substitution changes operand inputs but doesn't rebuild keys
+
+After substitute_uses_batch runs, instructions have new operands. If we ran CSE *again* on the same module, it might find more duplicates. The pass manager handles this. **Just a missed-on-single-pass optimization.**
+
+Adversarial scenario 12: CSE rewrites a use that it then "loses" — does CSE ever rewrite an Instruction's operands inside the same block where the substitution affects another duplicate's key?
+
+Suppose:
+```
+%1 = iadd a, b   (key K1)
+%2 = iadd a, b   (key K1)  → rewrite_map[%2] = %1
+%3 = isub %1, c  (key K2)
+%4 = isub %2, c  (key K3, different because uses %2)
+```
+
+After substitution: %2 → %1 in operands. But the keys we computed used the ORIGINAL operands. So %4's key was K3 (= isub %2 c). After substitution, %4 = isub %1 c, which equals %3. We missed the dedupe.
+
+This is a missed optimization, but the pass manager will catch it on the next iteration. **Not a correctness bug.**
+
+Adversarial scenario 13: CSE substitution applied to a *terminator* with mismatched arg count
+
+If a block param was removed by DCE, then the predecessor's branch arg list was truncated. Then a later CSE run rewrites operands in terminators. If a slot was deleted, the rewrite uses the new (shorter) arg vec. Fine.
+
+But here's a more subtle thing: CSE's `substitute_in_terminator` doesn't iterate the cases of a `Switch` correctly. Let me look:
+
+```rust
+fn substitute_in_terminator(term: &mut Terminator, mut r: impl FnMut(&mut ValueId)) {
+    match term {
+        Terminator::Return(None) | Terminator::Unreachable => {}
+        Terminator::Return(Some(v)) => r(v),
+        Terminator::Branch(_, args) => for a in args { r(a); },
+        Terminator::CondBranch { cond, true_args, false_args, .. } => {
+            r(cond);
+            for a in true_args { r(a); }
+            for a in false_args { r(a); }
+        }
+        Terminator::Switch { selector, .. } => r(selector),
+    }
+}
+```
+
+Switch only rewrites `selector`. The `cases` are `(i64, BlockId)` (no ValueIds in cases). And Switch targets can't have block params (per verifier). So no args. **Correct.**
+
+Adversarial scenario 14: CSE substitute_in_inst — does it handle all instruction kinds?
+
+Let me cross-reference with util.rs for_each_operand_mut. Both handle the same set:
+- Const* / Undef / Alloca: no operands
+- IAdd-IMod, INeg
+- FAdd-FPow, FNeg/FAbs/FSqrt
+- ICmp/FCmp
+- And/Or/Not
+- Select(c, t, f)
+- BitAnd-AShr, BitNot/CLZ/CTZ/PopCount
+- Conversions (IntToFloat etc.)
+- Load, Store, GEP
+- Call, RuntimeCall
+- ExtractField, InsertField
+
+These match. Good.
+
+**But wait** — there's a discrepancy. cse.rs's `substitute_in_inst` matches `InstKind::Alloca(..)` and skips it. But Alloca has an `IrType` payload, not a ValueId — so no operand. Correct.
+
+What about `Undef(IrType)` and `ConstString(Vec<u8>)`? Same — no operand. Correct.
+
+Adversarial scenario 15: Min-4 — CSE Key for ConstFloat
+
+```rust
+InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i64),
+```
+
+`v.to_bits() as i64` — `to_bits()` returns u64, casted to i64. This is bit-pattern preserving (Rust as cast). Good. NaN bit patterns are preserved differently.
+
+**However**: NaN comparisons. Two NaNs with the same bit pattern have the same key but different float semantics (`NaN != NaN`). For CSE, this is fine — we only deduplicate things that produce the same result, and computing the same NaN twice is the same. **Correct.**
+
+But here's an edge case: `+0.0` and `-0.0` are different bit patterns. They compare equal (`+0.0 == -0.0`) but have different bit patterns. CSE keys them differently → won't deduplicate. **Conservative but correct.**
+
+Adversarial scenario 16: Min-4 — CSE Key for ConstInt
+
+```rust
+InstKind::ConstInt(v, _) => mk(1, vec![], *v),
+```
+
+The `ty` field on `Key` disambiguates widths. So `ConstInt(255, I8)` and `ConstInt(255, I32)` have different keys due to `ty`. ✓
+
+But what about **two stored values that represent the same logical value at different widths**? E.g., `ConstInt(255, I8)` (which represents -1) and `ConstInt(-1, I8)`. Both have `ty = Int(I8)`, tag = 1, operands empty, but different aux (`255` vs `-1`). They generate different keys, so they don't dedupe. **Missed optimization.** 
+
+The fix would be to normalize via `norm()` before keying. But this is a performance issue, not correctness. Worth flagging.
+
+Actually wait — does the IR ever store unnormalized values? Looking at where ConstInt is created:
+- `const_fold` always emits `norm()`'d values now (after the fixes). 
+- `lower.rs` may emit raw values from user code (e.g., literal `255` for an `i8` declared variable becomes `ConstInt(255, I8)`).
+
+So yes, unnormalized constants exist in the IR. CSE will fail to dedupe them. **Min issue.**
+
+Adversarial scenario 17: M-D — what about ICmp where one operand isn't ConstInt?
+
+The fix only applies when both are constants. Mixed const/non-const cases aren't folded. Correct.
+
+Now let me verify one more thing — the M-D fix. Looking at the audit test:
+
+```rust
+let a = push(&mut f, InstKind::ConstInt(255, IntWidth::I32), IrType::Int(IntWidth::I32));
+let b = push(&mut f, InstKind::ConstInt(255, IntWidth::I8),  IrType::Int(IntWidth::I8));
+let eq = push(&mut f, InstKind::ICmp(CmpOp::Eq, a, b), IrType::Bool);
+```
+
+But this **violates type consistency**! The verifier's `check_type_consistency` only checks `is_int()` for both operands of ICmp... wait, ICmp isn't in the `check_type_consistency` arms. Let me check:
+
+Looking at verify.rs `check_type_consistency`:
+- IAdd/ISub/IMul/IDiv/IMod — checks `is_int()` 
+- FAdd/FSub/FMul/FDiv/FPow — checks `is_float()`
+- Store/Load — checks pointer
+
+ICmp is NOT checked. So ICmp with mismatched widths passes the verifier. **The audit test exploits this.**
+
+But is the test actually exercising the bug? Let me trace:
+1. `a = ConstInt(255, I32)`, value stored as 255
+2. `b = ConstInt(255, I8)`, value stored as 255 (NOT normalized to -1)
+3. ICmp Eq a, b
+4. Old code: `(av, w) = (255, I32), bv = 255, av_sext = sext(255, 32) = 255, bv_sext = sext(255, 32) = 255` → equal
+5. New code: `(av, aw) = (255, I32), (bv, bw) = (255, I8), av_sext = 255, bv_sext = sext(255, 8) = -1` → not equal → false
+
+The test asserts `ConstBool(false)`. The new code passes. The OLD code (using `w` for both) would have produced `ConstBool(true)`, failing the test.
+
+**Test correctly exercises the M-D bug fix.** ✓
+
+But wait — is the test setup VALID? The verifier runs after the test... actually, the test doesn't run verify_module. Let me check if the fold itself is okay even with mismatched widths in the input...
+
+Yes, the fold doesn't care about types beyond what's in the operand widths. Test passes. ✓
+
+Now: **the test asserts the FIX behavior. Did it fail BEFORE the fix?** The audit description says "Before the fix: both sign-extended at i32 → 255 == 255 → true." Yes, it would have failed before. ✓
+
+Adversarial scenario 18: Med-3 PopCount/CLZ/CTZ width
+
+```rust
+InstKind::PopCount(a) => {
+    if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
+        let val = mask(av, src_w.bits()) as u64;
+        return Some(InstKind::ConstInt(norm(val.count_ones() as i64, *out_w), *out_w));
+    }
+    None
+}
+```
+
+The `src_w` is the source operand's width (used to compute the popcount result). The `out_w` is the destination. The function counts bits in the source's value (mask to source width). The output is normalized to dest width. **Correct.**
+
+But: what if `src_w` differs from `out_w` (say src is I64 and dest is I32)? Counting bits in I64 max gives 64. norm(64, I32) = 64 (fits). Good — popcount of I64 max in an I32 result is 64. **Correct.**
+
+Now CountLeadingZeros has a subtle edge case:
+```rust
+let lz = if val == 0 {
+    bits as i64
+} else {
+    (val.leading_zeros() as i64) - (64 - bits as i64)
+};
+```
+
+`val.leading_zeros()` is the leading zeros of `val` as a u64. We subtract `(64 - bits)` to get the "logical" leading zeros at the source width. E.g., for I32 max value 0x80000000, val = 0x80000000 (lo 32 bits), `leading_zeros() = 32`, `lz = 32 - (64-32) = 0`. Correct (the high bit is set).
+
+For I8 with value 0x01, val = 1 (after mask), `leading_zeros() = 63`, `lz = 63 - (64 - 8) = 63 - 56 = 7`. Correct.
+
+For I8 with stored value -1 (i64), mask = 0xff, val = 255, `leading_zeros() = 56`, `lz = 56 - 56 = 0`. Correct.
+
+**Looks correct.** What about norm at output width? `norm(8, I64) = 8`. Fine.
+
+Adversarial scenario 19: M-1 IntToFloat through f32 — round-tie
+
+```rust
+let v = match fw {
+    FloatWidth::F32 => signed as f32 as f64,
+    FloatWidth::F64 => signed as f64,
+};
+```
+
+`signed as f32` is `i64 as f32`. Rust's `as` cast: round-to-nearest, ties to even. Then `as f64` is exact. So this approximates "i64 → f32 directly".
+
+**However**, this can differ from a direct `i64 → f32` cast in pathological round-tie cases. The audit comment notes "differs from a hypothetical direct i64 → f32 by at most one ULP near round-tie boundaries". 
+
+Wait — actually, Rust DOES do `as f32` directly from i64 with proper rounding. Let me verify: in Rust, `let x: i64 = ...; let y = x as f32;` is documented as round-to-nearest. So `signed as f32 as f64` is exactly `(i64 → f32 → f64)`, where the first conversion does the rounding. Identical to "i64 → f32" then promote.
+
+Is this the same as what AArch64 SCVTF would produce for an f32 destination? AArch64 SCVTF (with f32 dest) does round-to-nearest-ties-to-even by default. Rust's `as f32` also does round-to-nearest-ties-to-even (for valid finite cases). **Match.** ✓
+
+Adversarial scenario 20: M-1 — for `i64::MAX as f32`
+
+`i64::MAX = 9223372036854775807`. As f32, this rounds to `9223372036854775808.0` (which equals 2^63). As f64, exact value is `9223372036854775808.0` (since 2^63 is exactly representable in f64). So `i64::MAX as f32 as f64 = 9.223372036854776e18` (the f32-rounded value, then promoted).
+
+vs. `i64::MAX as f64 = 9.223372036854776e18` (also f64-rounded). Are these equal? Probably yes by coincidence (since 2^63 is representable in both). 
+
+But for `i64::MAX - 1 = 9223372036854775806`:
+- As f32: rounds to 9223372036854775808 (2^63)
+- As f64: rounds to 9223372036854775808 (2^63 — f64 mantissa is 53 bits, 2^63 - 2 doesn't fit exactly)
+
+Both round to the same. OK. The double-rounding hazard is real but vanishingly small in practice. **Acceptable.**
+
+Adversarial scenario 21: Cargo clippy warnings on the new code
+
+=== MESSAGE BREAK ===
+
+Pre-existing clippy errors unrelated to the optimizer fixes. Not in the audit's scope. Now let me try running the integration tests.
+
+=== MESSAGE BREAK ===
+
+A failure in select_type.f90 at -O2. Let me check this — could it be a regression from the fixes?
+
+=== MESSAGE BREAK ===
+
+I'm not allowed to invoke arbitrary programs. Let me check if this test was failing BEFORE the optimizer fixes, so I can determine whether it's a regression.
+
+=== MESSAGE BREAK ===
+
+The branch is `optimizer`, not `intrinsics`! And there are no source code changes to stash that affect the opt fixes — they're already committed. Let me see if the failing test was failing before any of the audit fixes by checking the commit just before the M-1 fix.
+
+=== MESSAGE BREAK ===
+
+I can't run programs or modify the git tree. Let me search for evidence: was select_type.f90 known to be failing before? Let me check the noted_issues file and any recent test output.
+
+=== MESSAGE BREAK ===
+
+select_type is marked FIXED. So it should pass at all opt levels normally. Let me see if this is a regression introduced by the optimizer fixes by examining the IR more carefully — but I can't run programs. Let me check whether the test was failing recently before the audit fixes.
+
+=== MESSAGE BREAK ===
+
+The failure could be from any optimizer pass landing — including pre-fix passes (that introduced bugs that were then fixed). I cannot run binaries, so I cannot determine whether this is a regression introduced by the fixes vs. a pre-existing issue from when the optimizer was added.
+
+Let me instead trace what could go wrong in select_type.f90 specifically — derived types with vtables, type tags, and Switch terminators. The Switch case is very interesting given Med-5's exception that "Switch targets cannot have block params per the verifier":
+
+=== MESSAGE BREAK ===
+
+OK, so SELECT CASE in Fortran lowers to chained if-else. SELECT TYPE probably does similar. Switch terminator isn't used by this lowering. Let me check if Switch is used anywhere actively.
+
+=== MESSAGE BREAK ===
+
+No lower.rs / no Fortran-frontend uses Switch. So the Switch case in Med-5 is purely defensive — currently unreachable.
+
+Let me look at SELECT TYPE lowering specifically:
+
+=== MESSAGE BREAK ===
+
+Interesting — SELECT TYPE creates many basic blocks via cond_branch. The optimizer would fold the constant tag comparisons. After fold, many blocks become dead.
+
+For the example `select_type.f90`:
+- Selector is `c` which is statically `circle`. Type tag is, say, 2.
+- TYPE IS (circle): tag_val (const 2) == guard_tag (const 2) → true → compile-time constant
+- TYPE IS (shape): tag_val (const 2) == guard_tag (const 1) → false
+- CLASS IS (shape): handled at compile time, `is_match = true` since circle extends shape
+
+So const_fold turns the icmp into ConstBool, then const_prop folds the cond_branch. Many blocks become unreachable. Then DCE prunes them.
+
+**Crucial point**: SELECT TYPE creates blocks like `bb_match`, `bb_next`. After cond_branch is folded, the dead arm's block becomes unreachable. const_prop's `prune_unreachable` removes them. DCE also has `prune_unreachable`. Either should handle it.
+
+But wait — is there a use of a block in a path that becomes orphaned when the branch is folded? Let me think...
+
+`if matches: branch bb_match else branch bb_next` — after folding `matches = true`, becomes `branch bb_match`. bb_next is unreachable. Pruned.
+
+But the assignment to `bb_current = b.current_block()` after `b.set_block(bb_next)` (line 1871) — that's frontend lowering, not IR-level. Unrelated.
+
+Hmm. Let me actually look for a reasonable hypothesis. Could it be that my Med-5 fix removes a block parameter that the second SELECT TYPE relies on? Let me think about whether SELECT TYPE introduces any block params... looking at the code, no — all branches use empty `vec![]` for args. No block params. So Med-5's removal can't break SELECT TYPE.
+
+What about M-7 (LICM self-loops)? SELECT TYPE creates linear chains, no loops. LICM does nothing.
+
+Med-6 (LICM trap-prone)? No loops in this test.
+
+C-A (strength_reduce)? Probably triggers somewhere — IMul by 1 if there's any size calculation. Should be safe.
+
+C-C (Select width)? No Select intermediates from SELECT TYPE lowering. Probably no issue.
+
+M-1 (IntToFloat → f32)? No floats meaningfully involved in SELECT TYPE control flow. Could affect the `c%radius` print but that's f32 → just printing.
+
+M-D (ICmp width)? Integer comparisons of i64 type tags — both same width. No bug triggers.
+
+Med-3 (PopCount/CLZ/CTZ)? Not used.
+
+So none of the audit fixes should affect SELECT TYPE. **Most likely the failure existed before the audit fixes too.** Let me find evidence that this is true. I'll check `audit_test` (a binary in repo root) and previous test runs.
+
+=== MESSAGE BREAK ===
+
+That commit was BEFORE the optimizer was added (b43419d landed const_fold after 5b13437). Was the test passing at the optimizer landing point?
+
+Without being able to run the binary, I cannot know definitively. Let me search for whether there's any test result snapshot.
+
+=== MESSAGE BREAK ===
+
+The test runs at -O0, -O1, -O2. The earlier test output showed only -O2 logged failures, with `select_type.f90` failing at -O2 but presumably passing at -O0/-O1. Let me re-run to confirm.
+
+=== MESSAGE BREAK ===
+
+Interesting! When running ALL three tests (parallel), they ALL pass. The earlier failure was when running sequentially with `--test-threads=1`. That's likely the parallel-flake mentioned in the prompt — the `select_type` test is intermittent due to a race in the test harness (binaries from different opt levels using the same stem).
+
+Wait, the binary path includes `opt_flag.trim_start_matches('-')` so they shouldn't collide. Let me look again carefully... the flake mentioned in the prompt was specifically *parallel* — but here the failure happened with `--test-threads=1` (sequential). Let me re-run sequentially.
+
+=== MESSAGE BREAK ===
+
+Now it passes sequentially. So the earlier failure was a one-off — possibly intermittent state on the filesystem. The select_type.f90 -O2 failure was a flake. **Not a regression.**
+
+Now let me look at some potential issues I haven't fully explored. Let me look at what `cse.rs::substitute_in_inst` and `substitute_in_terminator` do with the `mut r:` parameter — I want to verify whether the closure-by-value-into-loop pattern actually works.
+
+=== MESSAGE BREAK ===
+
+OK, this compiles. The closure `r` captures `rewrites: &HashMap<ValueId, ValueId>` by reference. That's `Copy` (immutable references are `Copy`), so the closure itself is `Copy`. Passing `r` by value into multiple calls works because `r` is `Copy`.
+
+But the function signature is `mut r: impl FnMut(&mut ValueId)`. The `mut` is needed because the FnMut trait requires mutable access to `self`. **Compiles fine.** No issue.
+
+Now let me look at one more subtle thing — the `FnMut` change. Was it changed from `Fn + Copy` to `FnMut`? Let me check.
+
+=== MESSAGE BREAK ===
+
+OK so it's `FnMut` (not `Fn`). And the closure passed is itself `Copy` (due to `&HashMap` capture), so it can be passed by value to multiple invocations within the loop. **Works.** But this would BREAK if the closure captured a `&mut HashMap` or owned anything non-Copy. **Maintainability footgun**, but currently fine.
+
+Now, let me look at one more thing — I want to investigate what happens when DCE removes block params if a *header* of a loop has a dead block param.
+
+Consider a tight loop where the loop header has a parameter `i` (the induction variable) but the loop body never reads `i` (only reads it via the back-edge as `next`). Wait — `i` is referenced in the latch's branch arg (`Branch(header, vec![next])`), but THAT references `next`, not `i`. The header's `i` is the param. Where is `i` actually used? In `i2 = iadd i, k` and `done = icmp ge i, lim`. So `i` IS used within the header's instructions.
+
+What if it WASN'T used? Then `i` would be dead, removed by remove_dead_block_params, and the predecessor's branch arg slot would be dropped. But the predecessor is *another header iteration* (the latch's `Branch(header, vec![next])`). So `next` would be dropped from the latch's branch. Then `next` becomes dead in the latch, also removed.
+
+But wait — this is a degenerate loop where iteration count is fixed. Cool. Let me make sure DCE correctly handles this.
+
+The cycle: header(i: i32) → latch(i_in: i32) → header(next). If we remove i from header's params, we drop `next` from latch's branch arg list. Now latch has `Branch(header, vec![])`. The constant `next = iadd i_in, one` becomes dead in latch (no consumer). DCE removes it. `i_in` becomes dead in latch's params (only used by `next`). Removing it drops the corresponding arg from header → latch's CondBranch. **Cascading.**
+
+The outer DCE loop handles this. **Correct.**
+
+But wait — can this cause issues with `func.blocks.iter_mut().find(|b| b.id == target_block)`? The find_first inside `remove_dead_block_params` mutates by id; there are no concurrent borrows. **Safe.**
+
+Now let me check the `remove_dead_block_params` more carefully. It collects `by_block` first (immutable iter), then iterates the by_block map to mutate. Inside that loop, it iterates `func.blocks.iter_mut()` to find each `target_block` AND iterates `func.blocks.iter_mut()` AGAIN to update predecessors. This means for each (target, idx) pair, we walk all blocks twice. For N blocks with K params total, this is O(N²·K). Inefficient, but correct.
+
+But here's a real concern: **when we remove block param `idx` from `target_block` and rewrite predecessors' arg lists, we update ALL terminators that branch to `target_block`. But we don't track which we've updated.** Suppose two different idxs in `target_block` are removed. We process them in descending order, so first idx=2 is removed, all preds drop arg[2]. Then idx=1 is removed, all preds drop arg[1]. After both: preds have only arg[0]. Each pred had 3 args originally; now has 1. **Correct.**
+
+But what if a predecessor branches to `target_block` AND to another block that also has params being removed? The two iterations don't interfere because each looks up only the target it cares about. **Correct.**
+
+OK, more concerns. Let me check another: dead block param removal AFTER LICM hoists into preheader. LICM hoists invariant insts to the preheader. Their results may reference the original location's block params (via `inst_uses`). After hoisting, the references are still valid (since the preheader still has the same block params).
+
+But what if a hoisted instruction references a header block param? That's loop-defined, so it would NOT be hoisted (loop_defs check). Good.
+
+What if DCE then removes the header block param? It can't, because the hoisted instruction in the preheader (if it referenced the header param) would be loop-invariant, but it can't reference the header param... contradiction. So this can't happen.
+
+But — a more subtle issue: **after LICM hoists, the hoisted insts still live in the preheader, BEFORE the branch into the header.** Their result IDs are still in `live` set (presumably referenced somewhere downstream). **Good.**
+
+Now let me look at one more issue: **the order of DCE and LICM in the pipeline**.
+
+Pipeline at O2:
+```
+ConstFold
+StrengthReduce
+LocalCse
+Licm
+ConstProp
+Dce
+```
+
+LICM runs BEFORE DCE. So if LICM hoists something, DCE later might remove it as dead. That's fine — DCE removes dead anything. But what if the hoisted instruction is in the preheader's instruction list, and DCE finds nothing references it, so DCE removes it? Then LICM did wasted work. **Performance, not correctness.**
+
+Now, let me check whether DCE's outer loop calling `remove_dead_block_params` could ever remove a block param that LICM still needs to consider. At the time DCE runs, LICM has already run. If DCE removes a block param, it's because nothing references it. Subsequent LICM runs (next pass manager iteration) will recompute. **No issue.**
+
+Now let me test a real adversarial scenario for the Med-5 fix.
+
+=== MESSAGE BREAK ===
+
+Let me find missed scenarios. Let me look at one specific concern: **what if `remove_dead_block_params` removes a param but a CondBranch's true_dest and false_dest are the SAME block?**
+
+Looking at `drop_branch_arg`:
+```rust
+Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
+    if *true_dest == target && idx < true_args.len() {
+        true_args.remove(idx);
+    }
+    if *false_dest == target && idx < false_args.len() {
+        false_args.remove(idx);
+    }
+}
+```
+
+If `true_dest == false_dest == target`, BOTH arg lists get the slot dropped. **Correct.**
+
+But here's a subtle issue: a `CondBranch` to the same block from both arms means BOTH branches are equivalent. After CSE/const_prop, this might fold to a regular Branch — but until it does, dropping one arg from each is correct.
+
+Let me find another corner case: **a Branch that targets the entry block.**
+
+The code skips the entry block in `remove_dead_block_params` (`if block.id == func.entry { continue; }`), so entry params would never be removed. But what if a *Branch from another block* targets entry? The entry block has no params (verified). So no slot to drop. **Safe.**
+
+Now let me look at: **what if a block has params and is its OWN successor (self-loop)?**
+
+```
+header(p:i32):
+  ...
+  cbr cond, header(next), exit
+```
+
+Suppose `p` is dead. `remove_dead_block_params` would try to remove `p`. But the predecessor of header is header itself (the back-edge). When we call `drop_branch_arg(term, header_id, 0)` for header's terminator, the cond branch updates true_args (which has [next]). After: `true_args = []`. So header now has no params, and the cbranch has no args. **But `next` was a value defined in header's body! Removing it from the branch arg list drops a use, making `next` (and its dependencies) dead.** Cascading. The outer loop catches this. **Correct.**
+
+But wait — there's an edge case here. Let me re-read `remove_dead_block_params`:
+
+```rust
+let live = collect_live_uses(func);
+```
+
+This is collected ONCE at the start. If `p` was used by something that became dead in a previous iteration of the outer loop, then `p` is now dead. We collect `live` and find `p` is dead. We remove it. The branch arg `next` (which was using `p` indirectly via the dataflow) is dropped from the branch.
+
+But here's the question: **does `live` include `next`?** Yes — `next` was used as a branch arg. Branch args are in `terminator_uses`. So `next` is in `live`.
+
+After we remove `p`, the live set is stale (we don't recompute). The branch arg drop only operates on the slot index (not the value). After dropping, `next` is no longer referenced by the (now-truncated) branch, but the live set still has it. The outer loop runs another iteration, recomputing live (which now excludes `next` if no other uses), and removes `next`'s defining instruction.
+
+**But wait** — the outer DCE loop calls inner DCE first to clean up the pruned uses, then calls remove_dead_block_params. So the sequence is:
+
+1. inner DCE cleans up dead instructions based on current live set
+2. remove_dead_block_params drops dead block params + corresponding branch args
+3. Loop: re-run inner DCE, which now sees the new (smaller) live set
+
+If remove_dead_block_params drops a use, the next inner DCE iteration recomputes live and removes whatever became dead. **Correct.** ✓
+
+Now: **does the outer loop terminate?** Each outer iteration must either change something via inner DCE OR via `remove_dead_block_params`. If neither changes, `outer_changed` stays false, and the loop exits. If only inner DCE changes things, we re-run remove_dead_block_params which might find new dead params (because of cascading)... and so on. Bounded by total IR size. **Terminates.** ✓
+
+Let me try one more thing — check whether the closure `r` in substitute_uses_batch is actually `Copy`:
+
+=== MESSAGE BREAK ===
+
+Both util.rs and cse.rs use the same signature. Now there's actually a subtle issue: the `substitute_in_inst` and `substitute_in_terminator` functions in cse.rs are *duplicates* of the util.rs ones (`for_each_operand_mut` and `for_each_terminator_operand_mut`). Why are they duplicated?
+
+=== MESSAGE BREAK ===
+
+CSE doesn't import from util.rs and reimplements the same functions. **Code duplication footgun.** A future change to operand traversal needs to be replicated in three places: util.rs, cse.rs, and dce.rs (which has its own duplicates too, see lines 76-150 of dce.rs).
+
+This is a maintainability issue. If anyone adds a new InstKind variant with operand slots, they need to update all three. If they miss one, that pass silently fails to substitute / collect uses. **MAJOR maintainability issue, not a current correctness issue.**
+
+Let me confirm dce.rs has the duplicates:
+
+=== MESSAGE BREAK ===
+
+Confirmed: dce.rs duplicates `inst_uses`, `terminator_uses`, `terminator_targets` (and `prune_unreachable`). cse.rs duplicates `substitute_in_inst`, `substitute_in_terminator`. const_prop.rs duplicates `terminator_targets` and `prune_unreachable`. Verify.rs has its own duplicates too. **Five places to update on a new InstKind variant.**
+
+Now let me look at one final thing. I want to see if `for_each_operand_mut` in util.rs is even used anywhere now. If `substitute_uses` (in util.rs) is the only consumer, and CSE has its own copy, then util's version is dead code OR strength_reduce uses it.
+
+=== MESSAGE BREAK ===
+
+strength_reduce uses `util::substitute_uses` (the old per-rewrite version). For each Identity rewrite, it makes a full function walk. Since strength_reduce can have many Identity rewrites in a function, this is O(N · size). The audit Min-1 fixed this for CSE but **NOT for strength_reduce**. **Performance issue: strength_reduce still does N walks for N Identity rewrites.**
+
+This was already noted in the audit comments but wasn't addressed. Worth flagging.
+
+Now let me verify the M-1 fix one more time by double-checking via actually computing the value.
+
+`16777217_i32 as f32 as f64`:
+- 16777217 = 2^24 + 1
+- f32 mantissa is 24 bits, so 2^24 + 1 cannot be represented exactly
+- Round to nearest: 2^24 (16777216) or 2^24 + 2 (16777218)? Banker's rounding (ties to even): 2^24 (which is even, has trailing 0)
+- So `16777217 as f32 = 16777216.0` ✓
+- `16777216.0 as f64 = 16777216.0` ✓
+
+Test asserts `v == 16_777_216.0`. Correct.
+
+Now let me look at one more subtle thing — `fold_float_un` (used for FAbs, FSqrt, FNeg):
+
+```rust
+fn fold_float_un<F>(a: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
+where F: FnOnce(f64) -> f64
+{
+    if let Some(Const::Float(av, _)) = a {
+        if let IrType::Float(w) = ty {
+            let r = op(av);
+            let r = match w { FloatWidth::F32 => r as f32 as f64, FloatWidth::F64 => r };
+            return Some(InstKind::ConstFloat(r, *w));
+        }
+    }
+    None
+}
+```
+
+Wait — this uses `av` directly without rounding through f32 first. For FAbs and FNeg, this doesn't matter (they're exact at any precision). For FSqrt, the round-twice-result is fine. **OK.**
+
+But there's a more subtle issue: **the SOURCE width is ignored.** If `av` is stored as an f64 but came from an f32 conversion, it should already be f32-rounded (per M-1 fix). So `av` is correctly precise. Good.
+
+But: **what if `av` is a literal f64 like `1.5_8` and we apply FNeg with destination f32?** Then `r = -1.5`, `r as f32 as f64 = -1.5` (1.5 is exact in f32). Correct.
+
+What if `av = 1.0/3.0` (0.333...) at f64, FNeg → -0.333..., then round to f32: f32 representation. Correct, but **is that correct WRT the source operand's width?**
+
+Hmm. If `inst.ty = F32` but `av` is from a `Const::Float(0.333..., F64)`, that's a verifier violation (FNeg with source f64 producing dest f32). Operand types must match. So this can't happen with valid IR. **Safe.**
+
+But what about: `Const::Float(0.333..., F32)` where the IR is well-formed (source f32, dest f32). The stored f64 value is *already* the f32-rounded value (per M-1 fix and fold_float_bin). Or is it?
+
+Hmm — wait. **Are f32 ConstFloat values always stored as f32-rounded f64?** Let me check. The lower.rs builder:
+
+=== MESSAGE BREAK ===
+
+`const_f32(value: f32)` does `value as f64`, which is exact (f32 → f64 is exact). So stored as f32-precise f64. ✓ And `const_float(value: f64, width: F32)` stores `value` as-is, which might NOT be f32-precise if the caller passes a f64 value.
+
+Where is `const_float` called with `width: F32` and a non-f32-rounded f64?
+
+=== MESSAGE BREAK ===
+
+All callers go through `const_f32(value: f32)` which converts via `as f64` (exact). So all f32 ConstFloats are stored as the f32-precise f64 value. **Verified safe.** ✓
+
+Now let me check one more potential bug. Looking at the audit's M-1 fix for the scenario:
+
+```rust
+let v = match fw {
+    FloatWidth::F32 => signed as f32 as f64,
+    FloatWidth::F64 => signed as f64,
+};
+```
+
+What if `signed = i64::MIN` (−9223372036854775808)?
+- `i64::MIN as f32 as f64` — let me think:
+- `i64::MIN as f32` — Rust uses round-to-nearest. `i64::MIN = -2^63`. As f32: -2^63 is exactly representable (−9.223372e18, mantissa 0).
+- `as f64`: exact promotion. Result: -9.223372036854776e18.
+- Match what AArch64 SCVTF would produce? Yes — −2^63 in f32 form. ✓
+
+What about `i64::MAX = 2^63 - 1`?
+- As f32: rounds to 2^63 (next representable f32). Stored as 9.223372e18 in f32.
+- As f64: 9.223372036854776e18 (the f32 value, exactly representable in f64).
+- vs `i64::MAX as f64`: also rounds to 2^63 (since f64 mantissa is 53 bits, can't represent 2^63 - 1).
+- Both are 2^63. **Equal.** ✓
+
+OK, M-1 fix looks robust.
+
+Now one more thing I noticed: in the `FloatToInt` fold (line 330-351), the comment in the fix says "consult operand width and round before the cast/check". But the current code does NOT do that:
+
+```rust
+InstKind::FloatToInt(a, w) => {
+    if let Some(Const::Float(av, _)) = get(a) {
+        if av.is_nan() || av.is_infinite() { return None; }
+        // Fortran INT() truncates toward zero. Match.
+        let truncd = av.trunc();
+        ...
+    }
+}
+```
+
+The audit M-F fix said "auto-fixed by M-1". Let me verify: if `av` came from `IntToFloat(int, F32)` and was correctly rounded, then `av` already represents the f32-rounded value (as an f64). So `truncd = av.trunc()` operates on an already-rounded value. Correct.
+
+But what if `av` came from a manual `ConstFloat(0.5_8, F32)`? The IR stores `0.5` (exact). Then `truncd = 0` (correct for f32 too). **Fine.**
+
+What if `av` was a partial f64 stored as F32 by mistake (verifier wouldn't catch since it doesn't enforce width)? E.g., `Const::Float(0.1, F32)` — the stored value `0.1` is f64-precise, but the IR claims F32. The fold ignores the width and treats it as f64. **Mismatch.**
+
+But this shouldn't happen with valid IR. **Defense in depth could be added, but not a current bug.**
+
+One more concern — the FloatToInt fold doesn't read the width tag of `Const::Float` at all. It just uses `av`. The audit M-F said to "consult operand width and round before the cast/check". The current code doesn't. **The audit's M-F fix isn't actually present in code — it relies on M-1 to keep f32 values pre-rounded.**
+
+Is the test `audit_const_fold_floattoint_from_f32_after_m1_fix` actually testing this? Yes — it goes through `IntToFloat(16777217, F32) → FloatToInt(_, I32)` and expects `16777216`. The chain works because:
+1. M-1 fix rounds 16777217 → 16777216.0 in the IntToFloat fold.
+2. FloatToInt sees `Const::Float(16777216.0, F32)`, truncates to 16777216, fits in i32. ✓
+
+**M-F is correctly handled by relying on M-1's invariant. Verified by test.** ✓
+
+Let me check the FCmp fold similarly:
+```rust
+InstKind::FCmp(op, a, b) => {
+    if let (Some(Const::Float(av, _)), Some(Const::Float(bv, _))) = (get(a), get(b)) {
+```
+
+Same — ignores widths. Relies on M-1 ensuring f32 values are pre-rounded. **OK if M-1 is always applied first.** If a future bug puts an unrounded f64 into a F32 ConstFloat, FCmp would diverge. **Latent.**
+
+Now let me check one more thing — is there a way the verifier could actually catch C-C width drift?
+
+Looking at `check_type_consistency`:
+- IAdd-IMod, FAdd-FPow check `is_int()` / `is_float()` only
+- Store/Load check `is_ptr()`
+
+ICmp, FCmp, Select, conversions, shifts, bit ops — none are checked. **The verifier is severely under-strict for type widths.** This is the broader issue: many fold-time bugs are dormant because the verifier can't catch them.
+
+OK, I think I have enough findings. Let me also check the `licm_invariant.f90` test file to see if LICM is exercised at all by current programs:
+
+=== MESSAGE BREAK ===
+
+OK that's a simple LICM test. Now I have enough material to write a thorough audit report.
+
+Let me check one more concrete thing — the audit test for the `audit_pipeline_o2_e2e_loop_through_passmanager` test claims it verifies an end-to-end loop. Does it test that the `i_param` (which is in `false_args: vec![i2]`) — wait, that passes `i2`, not `i_param`. So `i2 = iadd i_param, k`. Let me trace what the test exercises:
+
+Looking at the test setup:
+- entry: br header(init=0)
+- header(i_param: i32): k=5, i2=iadd(i_param, k), lim=10, done=icmp ge i_param, lim, cbr done, exit, latch(i2)
+- latch(i_in: i32): one=1, next=iadd(i_in, one), br header(next)
+- exit: ret
+
+After O2:
+- LICM hoists k=5 and lim=10 (loop-invariant) to entry
+- header now has: i2=iadd(i_param, k), done=icmp ge(i_param, lim), cbr done, exit, latch(i2)
+- DCE: i_param is live (used by i2 and done). i_in is live (used by next). Nothing dead.
+
+verify_module returns clean. Test passes.
+
+Actually wait — could there be an issue with i_param vs i_in semantic? The loop has `header → cbr → latch → br → header(next)`. The latch passes `next` to header. Header receives it as `i_param`. The loop iterates: i_param starts at 0, becomes 1, becomes 2, ... up to lim=10. When `i_param >= 10`, branch to exit.
+
+But wait — what does the test verify? It just verifies the IR is well-formed, not the semantics.
+
+Now I'm going to look for ONE more potential issue. The DCE block-param fix doesn't update `func.params` (function parameters), only block params. Could a function param be dead and DCE try to remove it? Looking at code:
+
+```rust
+for block in func.blocks.iter() {
+    if block.id == func.entry { continue; }
+    for (idx, p) in block.params.iter().enumerate() {
+```
+
+`block.params`, not `func.params`. Function params are NOT touched. **Correct** — DCE shouldn't change function signatures.
+
+But here's a question: are function params in the `live` set? Looking at `collect_live_uses`:
+```rust
+fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
+    let mut live = HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            for v in inst_uses(&inst.kind) {
+                live.insert(v);
+            }
+        }
+        ...
+    }
+    live
+}
+```
+
+This only collects `uses`, not `defs`. So `live` is the set of values consumed somewhere. Function params, if not consumed, won't be in `live`. But function params are never in `block.params` (they're in `func.params`). So `remove_dead_block_params` won't touch them. ✓
+
+One more concern: **what if a function param has the same `ValueId` as some block param?** Then both share the slot in `live`. The function param being live doesn't make the block param live. But block params are checked by their own ID, not by name. **No collision because IDs are unique** (verifier checks for duplicates).
+
+OK, I'm confident in my findings. Let me finalize the audit report.
+
+Let me also look at one more thing — the strength_reduce identity rewrite leaves the orphan. The DCE then removes it. But what does the orphan look like?
+
+After strength_reduce on `mul1 = imul(x, one)`:
+- substitute_uses replaces `mul1` with `x` everywhere
+- The original `mul1 = imul(x, one)` is left unchanged
+
+Then DCE runs:
+- collects live uses
+- mul1's id is not used anywhere (since substitute_uses rewrote all uses)
+- mul1 is pure (IMul not in side_effects)
+- mul1 removed ✓
+
+But its operands `x` and `one` were in `live` *because of mul1*. After mul1 is removed, are `x` and `one` still live? `x` is the original constant 7 (or wherever it came from); it might be used by other things. `one` is the constant 1; it was only used by mul1.
+
+The inner DCE loop runs:
+- iter 1: mul1 found dead, removed. `x` and `one` were in live (because of mul1). `live` is stale now.
+- iter 2: recompute live. `one` is not in live anymore (mul1 gone). `one` removed.
+- iter 3: recompute live. nothing else changed. exit.
+
+**Cascading works correctly.** ✓
+
+Let me also write up the issue with strength_reduce in the multi-Identity-rewrite case. The audit says strength_reduce uses `util::substitute_uses` (which is O(N)) per Identity rewrite. With M Identity rewrites, that's O(M·N). For a function with many constant-folded `*1` or `+0`, this is quadratic. CSE was fixed; strength_reduce was not. **Performance issue.**
+
+Now, one final concern. Let me verify the M-7 fix correctly handles the case when the loop has BOTH a self-loop on header AND a separate latch that isn't header.
+
+Looking at code:
+```rust
+let mut stack: Vec<BlockId> = latches.iter()
+    .filter(|&&l| l != header)
+    .copied()
+    .collect();
+while let Some(b) = stack.pop() {
+    if let Some(plist) = preds.get(&b) {
+        for &p in plist {
+            if p == header { continue; }
+            if body.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+}
+```
+
+Suppose `latches = [header, B]` (two back-edges). After filter, `stack = [B]`. BFS from B:
+- preds(B) — say [header, X]. We skip header (the `if p == header` guard). For X, body.insert(X) → push X.
+- Pop X. preds(X) — say [Y]. Insert Y, push.
+- And so on.
+
+The body now includes header (initial), B (initial), X, Y, ...
+
+But what if B itself has the header as a predecessor? That's `header → B`. The `if p == header { continue; }` guard skips it. Good — we don't walk past the header (loop entry).
+
+What if X has the header as a predecessor (header dominates X)? Then `if p == header { continue; }` skips it. But X is still in body. Good — X is correctly identified as loop body.
+
+What if X is NOT in the loop (i.e., it's outside, but it's a predecessor of B somehow)? That would mean B has an edge from outside the loop, which means B isn't reachable purely via the loop. But then B isn't actually a latch (back-edge), it's something else. Wait — the back-edge is `B → header`. B's preds (of B itself) can include things from outside the loop. Following them via BFS would erroneously include them in the body.
+
+Hmm, this is the classic loop-body-walk concern. The standard algorithm walks `preds(latch)` UNTIL hitting `header`, going only through nodes that are dominated by `header` (i.e., are part of the loop). But this code doesn't check dominance — it walks ALL preds except header.
+
+Let me trace a counterexample:
+```
+entry → A → B → header → exit
+              ↓     ↓
+             header X (back to header)
+                  ↓
+              B (back to B?)
+```
+
+Hmm, this is hard to construct. Let me think of a simpler one:
+
+```
+entry → header
+header → B → header (back-edge)
+B has another pred Q from outside (dominance violation, should not happen)
+```
+
+In SSA, Q must be dominated by header for the edge to be inside the loop. If Q is *not* dominated by header (i.e., Q is reachable from entry without going through header), then Q is outside the loop and shouldn't be in the body. But the BFS walks `preds(B)` which includes Q. The check `if p == header { continue; }` lets Q through. So Q is added to body. **Bug?**
+
+Wait — the actual issue is whether dominance is checked. The check `if p == header` only stops at the header, not at dominance boundaries. If a non-header pred is reachable from the entry without going through header, the BFS could "escape" the loop body.
+
+Is this a real concern? Let's see. The standard natural loop body computation is:
+- Start from latch L (where back-edge L → H exists, H dominates L).
+- Walk back through preds, adding nodes to the body, but stop at H.
+
+The invariant is: any block reachable from L going backward through preds without crossing H is dominated by H (and thus part of the loop). This is **only true if the CFG is reducible** (no irreducible loops).
+
+In Fortran-frontend output, loops are always reducible (DO loops, WHILE loops, etc.). No GOTO into a loop body. So this is probably safe in practice. But for an arbitrary IR, the algorithm could escape.
+
+**More importantly**, this isn't a regression — it was always like this. The M-7 fix only addressed self-loops, not the general dominance-checking issue. **Pre-existing bug, not introduced.**
+
+But here's the M-7-specific concern: **what if there are multiple back-edges and ONE of them is `header → header` (self-loop)?**
+
+Example:
+```
+header → header (self-loop, latch=header)
+header → exit
+header → B → header (regular latch)
+```
+
+Wait, header → header AND header → B AND header → exit? That's three successors from header. Header's terminator can only have one terminator. Let's say it's a Switch with 3 cases: case 0 → header, case 1 → B, case 2 → exit.
+
+Then `latches = [header, B]` (two back-edges into header). The fix filters out `header`, leaving `stack = [B]`. BFS from B → preds(B) = [header]. Skip. Body = {header, B}. **Correct.**
+
+OK, the M-7 fix handles this case. ✓
+
+But here's an even subtler case: **what if there's a self-loop AND another loop sharing the same header?**
+
+This would be two distinct natural loops with the same header. The current code groups by header, so they'd be merged into one NaturalLoop. The body computation walks ALL latches (after filtering out header itself). This might compute a body too small or too large. **Pre-existing issue, not introduced by the fix.**
+
+OK enough. Let me write the final report.
+
+One more thing — let me search for direct uses of substitute_uses_batch or similar that could iterate the closure multiple times:
+
+=== MESSAGE BREAK ===
+
+OK only used in CSE.
+
+Now I'll finalize my findings and produce the report.
+
+# Brutal re-audit findings — optimizer pipeline (pass 2)
+
+## Verification of pass-1 fixes
+
+| Finding | Status | Notes |
+|---|---|---|
+| **M-1** IntToFloat→f32 round | ✅ correctly fixed | `signed as f32 as f64` in `const_fold.rs:322-325`. Tests `audit_const_fold_int_to_f32_must_round` and `audit_int_to_f32_then_fsub_wrong_answer_today` both exercise the bug correctly. |
+| **C-A** strength_reduce Identity continue | ✅ correctly fixed | The Identity arm now just calls `substitute_uses` and lets DCE clean the orphan. `changed = true` runs unconditionally. Verified by `audit_strength_reduce_identity_reports_changed` and `audit_interaction_strength_reduce_orphans_get_dced`. |
+| **C-C** Select width mismatch | ⚠ partially fixed | Type-category mismatches now bail. **However**, width drift WITHIN the int category is still wrong: `(IrType::Int(I64), Const::Int(255, I8))` produces `ConstInt(255, I64)` instead of `ConstInt(-1, I64)`. The `norm()` call uses `inst.ty`'s width but treats the chosen branch's stored value as if it were already at that width. See NEW-MAJOR-1 below. Verifier doesn't catch Select operand-type mismatches, so this is latent. |
+| **M-7** LICM self-loop body | ✅ correctly fixed | `find_natural_loops` filters `header == latch` from BFS seed in `util.rs:294-297`. Mixed self-loop + distinct-latch case works. Test `audit_licm_dormant_with_alloca_load` covers it (single back-edge from header to itself plus an exit edge). |
+| **M-B / M-C** Shl/LShr/AShr out-of-range | ✅ correctly fixed | All three arms now `return None` when `bv < 0 || bv >= bits`. Tests `audit_const_fold_shl_at_width_bails`, `audit_const_fold_shl_negative_count_bails`, `audit_const_fold_lshr_negative_count_bails` all exercise the bug. |
+| **M-D** ICmp width-from-a only | ✅ correctly fixed | Each operand sign-extended at its OWN width. Test `audit_const_fold_icmp_uses_each_operand_width` correctly distinguishes the buggy and fixed behavior (would have returned `true` before, now `false`). |
+| **M-E** FCmp f32 precision | ✅ correctly fixed (transitively via M-1) | Test `audit_const_fold_fcmp_f32_after_m1_fix` confirms. |
+| **M-F** FloatToInt with f32 source | ✅ correctly fixed (transitively via M-1) | Test `audit_const_fold_floattoint_from_f32_after_m1_fix` confirms. |
+| **Med-3** PopCount/CLZ/CTZ output width | ✅ correctly fixed | All three use `inst.ty` for output width and re-norm. |
+| **Med-6** LICM trap-prone hoisting | ⚠ partially fixed | Excludes `IDiv/IMod/FDiv/FSqrt/FPow`. **Misses**: `Call`/`RuntimeCall` are excluded (good), but trap potential of `INeg(i64::MIN)` is OK because AArch64 NEG doesn't trap. **However**, see NEW-MEDIUM-3 — `Load` is excluded for alias reasons but may also trap (segfault on null pointer); `GetElementPtr` is NOT excluded and may construct a wild pointer that *the codegen* will later turn into a load... but GEP itself is just arithmetic and doesn't trap, so this is OK. The fix is correct but incomplete in spirit (missing `IntToFloat` of out-of-range values doesn't trap on AArch64 — no concern). |
+| **Med-5 / C-1** DCE dead block params | ✅ correctly fixed | Tests `audit_dce_removes_dead_block_param`, `audit_dce_keeps_live_block_param`, `audit_dce_removes_one_of_two_block_params_keeps_correct_arg` all cover this. Outer fixpoint terminates because each iteration strictly removes work from the IR. |
+| **Min-1** CSE substitute_uses perf | ⚠ partially fixed | CSE now uses `substitute_uses_batch`. **However**, `strength_reduce` still uses the per-rewrite `util::substitute_uses` for every Identity rewrite — same O(N·size) hazard, just in a different pass. See NEW-MINOR-1. |
+| **Min-2** LICM stale comment | ✅ correctly fixed | Comment removed and replaced with explicit "built once" annotation. |
+| **Min-4** CSE Key aux encoding | ✅ correctly fixed | `ConstInt` aux is the literal value; `ConstFloat` is `to_bits() as i64`. **However**, see NEW-MINOR-2 — two `ConstInt`s representing the same logical value but stored unnormalized (e.g., `(255, I8)` and `(-1, I8)`) get different keys and won't dedupe. |
+| **Min-6** fast_math/inlining/vectorize predicates | ✅ correctly fixed (doc-only) | No behavioral change. |
+
+## NEW critical bugs (introduced by fixes)
+
+None identified. The fixes did not introduce any silently-wrong-result regressions on the paths I exercised.
+
+## NEW major bugs
+
+### NEW-MAJOR-1 — C-C fix is incomplete: Int width drift inside Select still mis-folds
+
+**File:** `src/opt/const_fold.rs:389-408`
+
+The Select fold now bails when type categories disagree, but it fails to handle width drift WITHIN the integer category:
+
+```rust
+(IrType::Int(w), Const::Int(v, _)) => {
+    Some(InstKind::ConstInt(norm(v, *w), *w))
+}
+```
+
+The `_` discards the chosen branch's stored width. If the chosen branch is `Const::Int(255, I8)` (which represents −1 at i8 precision) and `inst.ty` is `Int(I64)`, the result is `norm(255, I64) = 255`, but the correct value is `−1`. The fix should sign-extend at the **source** width first, then renormalize at the destination width:
+
+```rust
+let sext_at_src = sext(v, src_w.bits());
+Some(InstKind::ConstInt(norm(sext_at_src, *w), *w))
+```
+
+This is currently dormant because:
+1. `Builder::select` requires both arms to have the same type.
+2. The verifier doesn't enforce Select operand-type consistency, but no current pass introduces width drift.
+
+**However**: the audit's stated rationale for C-C was "after IntExtend / FloatTrunc / similar fold chains the chosen operand can carry a narrower width than the Select declares". The chosen operand's stored width is currently captured in the `_` discard. **The fix names the destination width but ignores the source width — half a fix.**
+
+### NEW-MAJOR-2 — Verifier under-strict for Select / FCmp / ICmp / shifts / conversions
+
+**File:** `src/ir/verify.rs:428-486`
+
+`check_type_consistency` only validates IAdd/ISub/IMul/IDiv/IMod (`is_int()`) and FAdd/FSub/FMul/FDiv/FPow (`is_float()`) and Load/Store (`is_ptr()`). The following are NOT checked at all:
+
+- **ICmp / FCmp**: operands may have different widths within the same category.
+- **Select**: cond, true_val, false_val types are not validated against each other or against `inst.ty`.
+- **Shl / LShr / AShr**: count may be a different width than the value.
+- **Conversions** (IntExtend, IntTrunc, FloatExtend, FloatTrunc): operand and dest widths are not validated.
+- **And/Or/Not**: are these supposed to require Bool operands? Builder enforces it but verifier doesn't.
+
+This isn't a regression introduced by the fixes, but it's the **root cause** of why so many "latent" bugs in const_fold can sneak past tests. The audit team's rationale for fixes M-D, C-C, Med-3 was "verifier doesn't catch the mismatch". That's still true. **Tightening the verifier is the only way to make these fixes provably watertight.**
+
+## NEW medium issues
+
+### NEW-MEDIUM-1 — Operand-walking code is duplicated across **five** files
+
+`inst_uses` / `terminator_uses` / `terminator_targets` / `for_each_operand_mut` / equivalents are reimplemented in:
+
+- `src/opt/util.rs` (the canonical location)
+- `src/opt/dce.rs` (lines 76-150 — private duplicates)
+- `src/opt/cse.rs` (lines 159-220 — private duplicates `substitute_in_inst` / `substitute_in_terminator`)
+- `src/opt/const_prop.rs` (`terminator_targets` private duplicate, lines 121-132)
+- `src/ir/verify.rs` (lines 294-370 — private duplicates `inst_uses`, `terminator_uses`, `terminator_targets`)
+
+If anyone adds a new `InstKind` variant with operand slots, they need to update **all five places**. Missing one means that pass silently fails to enumerate uses — DCE might keep dead code, CSE might fail to substitute, the verifier might miss undefined-value errors. **This is the single biggest maintainability footgun in the optimizer.**
+
+The audit Min-5 noted that `prune_unreachable` was already deduplicated between `const_prop` and `dce` (now imported from `util`). The same treatment is overdue for the operand walkers.
+
+### NEW-MEDIUM-2 — DCE outer fixpoint is O(N²) on by_block extraction
+
+**File:** `src/opt/dce.rs:248-265`
+
+`remove_dead_block_params` builds `by_block` and then for each `(target_block, idxs)` pair it iterates `func.blocks.iter_mut()` *twice* per index — once to find the target and once to walk all predecessors. For N blocks with K dead params total, this is O(N · K · 2). The outer DCE loop wraps this in a fixpoint. Worst case O(N² · K). For tiny IR this is invisible; once mem2reg lands and many block params become dead simultaneously, this could become noticeable.
+
+Not a correctness issue. Worth restructuring to a single block-id index map plus a pre-built predecessor map.
+
+### NEW-MEDIUM-3 — `is_hoist_candidate` excludes Load conservatively but Load can also trap
+
+**File:** `src/opt/licm.rs:61-78`
+
+Load is excluded from hoisting "to avoid alias issues". That's correct. But Load can also trap on a null/wild pointer; if we later add memory-aliasing analysis and start hoisting safe Loads, we need to be careful that the hoisted location is provably non-null. The current exclusion is correct **for now** because of alias concerns, but the trap-safety reasoning is implicit. Worth documenting.
+
+Same concern: `GetElementPtr` is **not** excluded — it's pure pointer arithmetic and won't trap on its own. But hoisting GEP from inside a guard means the resulting pointer (which may be wild if the guard was protecting against an out-of-bounds index) is computed unconditionally. The Load consuming it is still inside the loop, so the actual fault is delayed. **Subtle but currently OK.**
+
+### NEW-MEDIUM-4 — strength_reduce still O(N²) on Identity rewrites
+
+**File:** `src/opt/strength_reduce.rs:324`
+
+The Min-1 fix batched CSE's substitution but **left strength_reduce calling `util::substitute_uses` once per Identity rewrite**. Each call walks the entire function. For a function with M Identity rewrites (e.g., many `*1`, `+0` after const-folding) and N total operands, this is O(M·N). Same hazard, different pass.
+
+The fix would mirror CSE: collect all `(old → new)` rewrites, build a `HashMap`, then apply via a single batched walk.
+
+## NEW minor issues
+
+### NEW-MINOR-1 — CSE chase-pointer code is unnecessary
+
+**File:** `src/opt/cse.rs:251-262`
+
+The chase loop is dead-code-equivalent: local CSE only inserts `(later_id → earlier_id_in_same_block)` entries, and the first-occurrence ids are never themselves keys (they were inserted into `seen`, not `rewrite_map`). Therefore `rewrite_map[k]` is *always* a canonical target on the first lookup. The chase loop runs but never advances `cur` beyond `rewrite_map[k]`.
+
+Not wrong — just dead. The comment claims "CSE never produces cycles — every duplicate is rewritten to an earlier definition in dominance order". The cycles wouldn't happen anyway because they'd require a key to also be a value, which local CSE never produces.
+
+**This isn't a bug**, but the code suggests the author didn't fully understand local CSE's structure. Worth deleting the chase loop and replacing with a comment explaining why.
+
+### NEW-MINOR-2 — CSE Key for ConstInt doesn't normalize stored value
+
+**File:** `src/opt/cse.rs:74`
+
+```rust
+InstKind::ConstInt(v, _) => mk(1, vec![], *v),
+```
+
+Two `ConstInt`s for the same logical value but different stored representations get different keys. Example: `ConstInt(255, I8)` (stored as 255 by raw lower) and `ConstInt(-1, I8)` (stored as -1) both represent −1 at i8 precision but have different aux. CSE won't dedupe them.
+
+The audit Min-4 simplified the aux encoding but didn't normalize. The fix is `norm(*v, w)` (where `w` comes from `inst.ty`, since the i8 width determines the canonical form).
+
+**Missed optimization, not a correctness bug.** Worth fixing once code-size benchmarks expose it.
+
+### NEW-MINOR-3 — `substitute_uses_batch` closure is fragile
+
+**File:** `src/opt/cse.rs:274-288`
+
+```rust
+let r = |v: &mut ValueId| { ... };
+for block in ... {
+    for inst in ... {
+        substitute_in_inst(&mut inst.kind, r);
+    }
+    if let Some(term) = ... {
+        substitute_in_terminator(term, r);
+    }
+}
+```
+
+This compiles because `r` captures `&HashMap<ValueId, ValueId>` by immutable reference, which is `Copy`, so the closure itself is `Copy` and can be passed by value into multiple calls. **If anyone changes the closure to capture mutable state**, the loop fails to compile with a "use of moved value" error. The signature `mut r: impl FnMut(&mut ValueId)` strongly suggests the author intended FnMut semantics (with rebinding/state) — but this code accidentally relies on the closure being effectively `Fn + Copy`.
+
+The cleaner pattern is `r: impl Fn(&mut ValueId)` (use `Fn` instead of `FnMut`) **or** call via `&mut r` so each call borrows the closure.
+
+### NEW-MINOR-4 — `audit_const_fold_select_uses_declared_type` is a happy-path test
+
+**File:** `src/opt/audit_tests.rs:701-728`
+
+The test asserts that `Select(true, ConstInt(1, I32), ConstInt(99, I32)) : I32` folds to `ConstInt(1, I32)`. **Both branches have the same width as the Select.** This means it would have passed BEFORE the C-C fix as well, because the bug only manifests when widths differ.
+
+The audit test acknowledges this in its comment: "The bug pattern (chosen branch with mismatched width) is hard to construct without violating verifier invariants". **It's a useless guard against the original C-C bug.** The test confirms the fix doesn't break the happy path, but it doesn't prove the fix actually handles the targeted case.
+
+To exercise the bug correctly, the test would need to construct a Select where the chosen branch has a different stored width than the Select's declared type — which requires bypassing the builder. (See NEW-MAJOR-1 which describes the still-incomplete handling.)
+
+## Things pass 1 missed
+
+### MISSED-1 — Operand-walker code duplication (NEW-MEDIUM-1)
+
+The first audit's Min-5 noted `prune_unreachable` was duplicated and got fixed. It missed that `inst_uses`, `terminator_uses`, `terminator_targets`, `for_each_operand_mut`, and `for_each_terminator_operand_mut` are duplicated across **four passes plus the verifier**. Adding a new `InstKind` variant requires updating five files in lockstep.
+
+### MISSED-2 — Verifier under-strictness (NEW-MAJOR-2)
+
+The first audit identified specific cases where the verifier doesn't catch type mismatches (M-D, C-C). It didn't note that the verifier is broadly under-strict for most non-Add/Sub/Mul/Div/Load/Store instructions. Tightening the verifier would automatically expose any future bugs in this family.
+
+### MISSED-3 — strength_reduce still O(N²) on Identity rewrites (NEW-MEDIUM-4)
+
+The first audit's Min-1 only addressed CSE. Strength reduce has the same hazard.
+
+### MISSED-4 — `find_natural_loops` doesn't check dominance during BFS
+
+**File:** `src/opt/util.rs:298-307`
+
+The body BFS walks `preds(b)` and skips only if `p == header`. It does NOT check whether `p` is dominated by `header`. For irreducible CFGs (or after a future pass introduces them), this BFS could escape the loop body and add unrelated blocks. Fortran lowering produces only reducible CFGs, so this is currently safe — but it's a latent bug that the audit missed, and it would surface the moment GOTO lowering or aggressive CFG transformations land.
+
+The fix is to call `compute_dominators` (already imported via `util::compute_dominators`) and gate `body.insert(p)` on `doms[p].contains(&header)`.
+
+### MISSED-5 — Const::Int unnormalized values (NEW-MINOR-2)
+
+The first audit's Min-4 noted the Key encoding redundancy but didn't notice that local CSE keys un-normalized constants and so misses obvious duplicates.
+
+### MISSED-6 — Switch terminator unused, defensive code untested
+
+`Terminator::Switch` is referenced by every operand walker, the verifier, and `drop_branch_arg`'s "switch targets cannot have block params" branch — but no Fortran lowering currently emits a Switch (verified via `grep`). All the Switch handling is dead code. If/when Switch starts being emitted, **none of the optimizer paths have ever been tested with it**. The first audit missed this.
+
+## Test coverage gaps
+
+### COVERAGE-1 — `audit_const_fold_select_uses_declared_type` is a happy-path test
+
+Already discussed in NEW-MINOR-4. The test would have passed before the C-C fix.
+
+### COVERAGE-2 — `audit_licm_does_not_hoist_idiv` builds a self-loop, not a normal loop
+
+**File:** `src/opt/audit_tests.rs:626-694`
+
+The test wires the loop as `header → header (true) / exit (false)`. There's no separate latch; header is its own latch. This *also* exercises the M-7 self-loop fix, which is good — but it means the test relies on M-7 and Med-6 *together*. If M-7 regressed, this test would fail with a "no preheader found" message instead of the intended "IDiv was hoisted" failure. The two failures are distinguishable but conflated.
+
+A clearer test would build a normal `entry → header → latch → header` loop with the `IDiv` in the body.
+
+### COVERAGE-3 — No test for `audit_pipeline_o2_e2e_loop_through_passmanager` semantic correctness
+
+**File:** `src/opt/audit_tests.rs:367-454`
+
+The test only verifies `verify_module` returns clean. It doesn't check that the optimized loop computes the same value as the original (which requires running it, which the test doesn't do). If LICM hoists something it shouldn't or CSE substitutes wrong, the verifier would still pass — but the runtime answer would be wrong.
+
+The closest e2e check is `licm_invariant.f90` which runs through the full `run_programs.rs` harness. That covers one shape. There's no audit_test that pins LICM correctness via IR-level inspection of "k = const 5 ended up in the entry block AND the iadd in the header references it correctly".
+
+### COVERAGE-4 — No test for the M-7 fix in the multi-back-edge case
+
+The M-7 fix handles the case where `latches` contains the header AND another block. The test `audit_licm_dormant_with_alloca_load` only has a single self-back-edge from header to header. There's no test where `latches = [header, B]` with a separate non-self latch.
+
+### COVERAGE-5 — No test exercises C-C width drift
+
+NEW-MAJOR-1 describes the case the C-C fix doesn't handle. There's no test that constructs a Select with different stored widths in the chosen branch. Such a test would require manually constructing the IR with `ConstInt(255, I8)` and a `Select : I64` — which today requires bypassing the verifier-strict builder. **That very difficulty is why the bug is latent — and why the audit team should test it explicitly.**
+
+### COVERAGE-6 — `audit_dce_removes_one_of_two_block_params_keeps_correct_arg` is correct but only covers one shape
+
+It covers two params with one dead. It doesn't cover:
+- All params dead (the block becomes argless).
+- Params that depend transitively on each other through the predecessor.
+- A target block that's also a predecessor of itself (self-loop with dead params).
+
+## Summary
+
+The fixes are **mostly correct**. The big-ticket Critical and Major findings (M-1, C-A, M-7, M-B/C, M-D, M-E, M-F, Med-3, Med-5/C-1) all genuinely address the original bugs and have tests that would catch a regression.
+
+**Two noteworthy gaps remain in the fix set itself:**
+
+1. **C-C is half-fixed.** The type-category bail is correct, but width drift inside the int category is still mishandled. Construction of an IR triggering this requires bypassing the builder, so it's latent — but the audit team's stated rationale for needing the fix at all was "after fold chains the chosen operand can carry a narrower width than the Select declares". That exact case isn't actually fixed.
+
+2. **Min-1 was applied to CSE only.** strength_reduce still has the same `O(M·N)` per-Identity-rewrite cost.
+
+**The most consequential thing the first audit missed:**
+
+- **Operand-walker code duplication across five files.** Every pass that needs to enumerate operands carries its own match. Adding a new `InstKind` variant requires updating five places, and missing one will silently break that pass. This isn't a bug today, but it's a **time bomb** for any future IR change.
+
+- **Verifier under-strict
+
+=== MESSAGE BREAK ===
+
+Only called once per function in CSE. Good. Now let me write the report.
+
+# Brutal re-audit findings — optimizer pipeline (pass 2)
+
+## Verification of pass-1 fixes
+
+| Finding | Status | Notes |
+|---|---|---|
+| **M-1** IntToFloat → f32 round | correctly fixed | Uses `signed as f32 as f64` for F32 dest. Confirmed against round-tie cases. Audit test `audit_const_fold_int_to_f32_must_round` exercises the bug. |
+| **C-A** strength_reduce Identity continue | correctly fixed | Removed placeholder machinery entirely. `changed = true` runs unconditionally. Orphan IMul left alone, DCE removes it (verified by `audit_interaction_strength_reduce_orphans_get_dced`). |
+| **C-C** Select width mismatch | partially fixed | Type-category mismatch is bailed. **Width drift WITHIN Int category is NOT fully handled** — see NEW CRITICAL B-1 below. |
+| **M-7** LICM self-loop body | correctly fixed | The filter `latches != header` handles the basic case. Verified self-loop + other-latch case works. |
+| **M-B** Shl out-of-range | correctly fixed | Returns None for `bv < 0 || bv >= bits`. Test `audit_const_fold_shl_at_width_bails` confirms. |
+| **M-C** Shl/LShr/AShr negative count | correctly fixed | Same bail. Tests cover Shl and LShr; AShr negative-count test is missing — see Test Coverage Gaps. |
+| **M-D** ICmp width-from-a | correctly fixed | Reads `(av, aw)` and `(bv, bw)` separately. Audit test `audit_const_fold_icmp_uses_each_operand_width` actually exercises the bug (would have failed BEFORE the fix). |
+| **M-E** FCmp f32 precision | correctly fixed (relies on M-1) | FCmp itself still ignores operand widths. Relies on M-1's invariant that f32 ConstFloat is f32-rounded. **Latent if invariant breaks** — see NEW MEDIUM B-3. |
+| **M-F** FloatToInt f32 source | correctly fixed (relies on M-1) | Same as M-E — fold ignores width tag, depends on invariant. Verified by `audit_const_fold_floattoint_from_f32_after_m1_fix`. |
+| **Med-3** PopCount/CLZ/CTZ width | correctly fixed | Uses `inst.ty` for output width with `norm()`. CLZ formula `(val.leading_zeros() as i64) - (64 - bits as i64)` verified for I8/I32 boundaries. |
+| **Med-6** LICM trap-prone | correctly fixed | Excludes IDiv/IMod/FDiv/FSqrt/FPow. INeg is not excluded (correctly — wrapping_neg never traps on AArch64). Test `audit_licm_does_not_hoist_idiv` confirms. |
+| **Med-5 / C-1** DCE dead block params | correctly fixed | Outer fixpoint, predecessor branch arg dropping. Three audit tests cover the cases. Cascading verified. |
+| **Min-1** CSE substitute_uses perf | correctly fixed for CSE only | **strength_reduce STILL calls `util::substitute_uses` per Identity rewrite** — same O(N·M) performance issue. Min-1 only fixed CSE. |
+| **Min-2** LICM stale comment | correctly fixed | Comment is now accurate. |
+| **Min-4** CSE Key aux | correctly fixed | Simplified. The `ty` field disambiguates widths. |
+| **Min-6** Doc comments on predicates | correctly fixed | No behavioral change. |
+
+## NEW critical bugs (introduced by fixes)
+
+None of the fixes introduce a wrong-result-today miscompile. The fix machinery is sound; the gaps below are *latent* (require future passes or unusual IR shapes to trigger).
+
+## NEW major bugs
+
+### B-1 — C-C fix is incomplete: width drift within `IrType::Int(_)` is silently misnormed
+
+**File:** `src/opt/const_fold.rs:389-408`
+
+```rust
+return match (ty, *k) {
+    (IrType::Int(w), Const::Int(v, _)) => {
+        Some(InstKind::ConstInt(norm(v, *w), *w))
+    }
+```
+
+The fix correctly bails on type-category mismatch (Int vs Float vs Bool). But within the Int category, it discards the chosen branch's source width (`_`) and re-norms `v` at the destination width. **`v` is a raw stored value that may not be sign-extended at its source width.**
+
+Adversarial case: `inst.ty = IrType::Int(I64)` and `chosen` is `Const::Int(255, I8)`. The "true" value of the i8 constant is `-1` (sign-extended from 0xFF). The current code computes `norm(255, I64) = 255`, producing `ConstInt(255, I64)` instead of `ConstInt(-1, I64)`.
+
+Required fix: sign-extend at source width first, then norm at dest width:
+```rust
+(IrType::Int(w), Const::Int(v, src_w)) => {
+    let signed = sext(v, src_w.bits());
+    Some(InstKind::ConstInt(norm(signed, *w), *w))
+}
+```
+
+The `Float` arms have the same issue but are saved by the f32-rounding pattern which applies regardless of source width.
+
+**Triggerability today**: low, because `builder.rs::select` derives `inst.ty` from `value_type(true_val)`, which prevents width drift at construction time. But the verifier never enforces it for Select, so any future pass that introduces a width-drifted Select would silently miscompile through this fold.
+
+### B-2 — `strength_reduce` still pays O(M·N) for M Identity rewrites
+
+**File:** `src/opt/strength_reduce.rs:324`
+
+```rust
+substitute_uses(func, old_id, pass_through);
+```
+
+The Min-1 fix replaced CSE's per-rewrite walks with a batched substitution. **The same problem still exists in strength_reduce**: every Identity rewrite does a full function walk via `util::substitute_uses`. A function with M `*1`/`+0` simplifications takes O(M · function_size).
+
+This is the *same finding as Min-1*, just for a different pass. Min-1's fix is incomplete.
+
+## NEW medium issues
+
+### B-3 — `FCmp` and `FloatToInt` folds still ignore the source operand width tag
+
+**File:** `src/opt/const_fold.rs:173-186, 330-351`
+
+These folds rely entirely on the M-1 invariant (any `Const::Float(_, F32)` value is already rounded to f32 precision). The folds do not verify or re-establish this invariant. If a future bug, hand-written test, or new pass produces an unrounded f64 value tagged as F32, FCmp and FloatToInt will silently diverge from runtime.
+
+The M-E and M-F audit tests pass *because* M-1 is correct. Defense-in-depth would be cheap: round through f32 in both folds when the source operand carries `F32`. The agent's pass-1 finding actually called for this; the team chose to rely on the invariant instead.
+
+### B-4 — `find_natural_loops` body computation can escape the loop in irreducible CFGs
+
+**File:** `src/opt/util.rs:298-307` (pre-existing, but exposed by the M-7 fix's framing)
+
+The BFS walks `preds(latch)` and stops only at `header`. It does **not** check that walked nodes are dominated by `header`. For any CFG with an "outside" predecessor of a body block (i.e., an irreducible loop or a goto-into-loop pattern), the BFS escapes the loop and adds non-loop blocks to `body`. LICM would then refuse to hoist (because `loop_defs` is too large) — a missed optimization, not a wrong-result.
+
+In Fortran-frontend output today, this can't be triggered because the lowerer only emits reducible loops. Worth noting for future GOTO/error-recovery handling. Not introduced by the M-7 fix; M-7 just touched the same code.
+
+### B-5 — DCE block-param removal is O(N²·K) per outer iteration
+
+**File:** `src/opt/dce.rs:248-265`
+
+```rust
+for (target_block, mut idxs) in by_block {
+    idxs.sort_by(|a, b| b.cmp(a));
+    for idx in idxs {
+        if let Some(blk) = func.blocks.iter_mut().find(|b| b.id == target_block) { ... }
+        for src in func.blocks.iter_mut() {
+            if let Some(term) = &mut src.terminator {
+                drop_branch_arg(term, target_block, idx);
+            }
+        }
+    }
+}
+```
+
+For each `(target, idx)` pair, the code walks all blocks twice via linear `find`. With N blocks and K total dead params, this is O(N²·K) per outer iteration. The outer loop can fire multiple times. For large functions with many dead block params (which becomes likely once mem2reg lands), this will dominate compile time.
+
+Performance issue, not correctness. Fix: build a `BlockId → index` map once.
+
+### B-6 — Operand-walking code is duplicated five ways
+
+**File:** `src/opt/util.rs:13-58`, `src/opt/dce.rs:76-150`, `src/opt/cse.rs:159-220`, `src/opt/const_prop.rs:121-132`, `src/ir/verify.rs:294-370`
+
+`inst_uses`, `terminator_uses`, `terminator_targets`, and `prune_unreachable` are duplicated across five files. Adding a new `InstKind` variant (likely soon — atomics, intrinsics, vector ops) requires updating all five. Missing one would silently break that pass.
+
+Pre-existing maintenance footgun, but the team's "fix" added a sixth duplicate (`substitute_in_inst`/`substitute_in_terminator` in cse.rs) instead of consolidating. Worth a one-shot refactor pass.
+
+## NEW minor issues
+
+### B-7 — CSE chase-pointer logic is dead code in practice
+
+**File:** `src/opt/cse.rs:255-262`
+
+```rust
+let keys: Vec<ValueId> = rewrite_map.keys().copied().collect();
+for k in keys {
+    let mut cur = rewrite_map[&k];
+    while let Some(&next) = rewrite_map.get(&cur) {
+        cur = next;
+    }
+    rewrite_map.insert(k, cur);
+}
+```
+
+In local CSE, every `rewrite_map` entry is `(duplicate_id → first_occurrence_id)` where `first_occurrence_id` is, by construction, never itself a key (it's the *first* occurrence in its block). So the chase-pointer loop never iterates more than zero steps. The code is correct and harmless but its comment ("CSE never produces cycles") implies the chase is necessary, when it's actually dead.
+
+Termination is guaranteed even if entries did chain — strict ValueId decrease.
+
+### B-8 — CSE Key for ConstInt does not normalize value at width
+
+**File:** `src/opt/cse.rs:74`
+
+```rust
+InstKind::ConstInt(v, _) => mk(1, vec![], *v),
+```
+
+Two equivalent constants stored at different bit-patterns at the same width fail to dedupe. Example: `ConstInt(255, I8)` and `ConstInt(-1, I8)` are semantically the same value (sign bit set in i8) but key differently. Lower.rs may emit either form depending on the source literal.
+
+Missed-optimization, not correctness. Fix: key on `norm(v, w)` for ConstInt.
+
+### B-9 — `substitute_uses_batch` closure contract is fragile
+
+**File:** `src/opt/cse.rs:274-288`
+
+```rust
+fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
+    let r = |v: &mut ValueId| { ... };
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            substitute_in_inst(&mut inst.kind, r);
+        }
+        ...
+    }
+}
+```
+
+`r` is passed by value into multiple `substitute_in_inst` calls inside a loop. This works **only because** `r` happens to be `Copy` (it captures `&HashMap`, which is `Copy`). If a maintainer ever changes the capture (e.g., to track stats with `RefCell` or to mutate a counter), the closure stops being `Copy` and the loop fails to compile — but only because of the existing borrow checker, not the contract documentation. The signature `mut r: impl FnMut(&mut ValueId)` does not communicate the implicit `Copy` requirement.
+
+A more honest signature would be `r: &mut impl FnMut(&mut ValueId)`. Same for `substitute_in_inst` and `substitute_in_terminator`.
+
+### B-10 — `drop_branch_arg` silently no-ops on out-of-range index
+
+**File:** `src/opt/dce.rs:273-290`
+
+```rust
+Terminator::Branch(d, args) if *d == target => {
+    if idx < args.len() { args.remove(idx); }
+}
+```
+
+The defensive `idx < args.len()` is good belt-and-suspenders, but a silent no-op would hide a real bug — a mismatch between the target's params and the predecessor's args is *itself* an IR validity violation (the branch arg list should always match the target's param count). If this branch ever fires, we should at least debug-assert.
+
+Recommendation: `debug_assert!(idx < args.len(), "branch arg list out of sync with target params")`.
+
+## Things pass 1 missed
+
+### M-1 — `find_natural_loops` doesn't check dominance during body BFS
+
+(Same as B-4 above; promoted because pass 1 didn't catch it.) The natural-loop body computation in `util.rs::find_natural_loops` walks `preds(latch)` and stops only at `header`, not at dominance boundaries. In any irreducible CFG, the BFS escapes. Pass 1 only flagged the self-loop case (M-7) and the team fixed it; the broader dominance issue remains.
+
+### M-2 — Strength reduce per-Identity walks (B-2 above)
+
+Same severity as Min-1 but in a different file. Pass 1 found Min-1 in CSE and missed that strength_reduce has the identical pattern.
+
+### M-3 — Operand-walk code duplication (B-6 above)
+
+Pass 1 noted Min-5 (`prune_unreachable` duplicated) but missed that the broader operand-traversal machinery is duplicated five ways.
+
+### M-4 — `ConstInt(255, I8)` vs `ConstInt(-1, I8)` CSE collision (B-8 above)
+
+Pass 1 audited Key aux encoding (Min-4) and looked at width disambiguation, but missed value-form normalization.
+
+### M-5 — `INeg` is hoisted by LICM but `INeg(i64::MIN)` overflows
+
+`INeg(i64::MIN).wrapping_neg() = i64::MIN` — semantically identical to AArch64 NEG, no trap. LICM is correct to allow hoisting. **Not a bug**, but worth a comment in `is_hoist_candidate` so a future maintainer doesn't try to "fix" it.
+
+### M-6 — `Switch` blocks are exempted by Med-5 cleanup but never enforced inside DCE
+
+`drop_branch_arg`'s comment says "Switch targets cannot have block params per the verifier; nothing to update." This is correct *if* the IR was verified before DCE. The pass manager does verify after every pass, but DCE is the first pass to *create* a Switch arm with potentially-stale block-param state if a future pass introduces Switches. Today no front-end emits Switch, so this is dormant. Worth a `debug_assert` inside `drop_branch_arg`'s `_ =>` arm.
+
+## Test coverage gaps
+
+- **M-C AShr negative count**: tests cover Shl and LShr, but the AShr arm is not exercised by any audit test. If a future refactor accidentally re-introduces the bug only in AShr, no test fails.
+
+- **C-C width-drift within Int category** (B-1): no audit test constructs a Select where the chosen branch and `inst.ty` have different IntWidths. The `audit_const_fold_select_uses_declared_type` test only uses same-width operands and does not exercise the bug it claims to. **It would pass even before the fix** because the chosen branch's width happens to match `inst.ty`. This test does not actually pin down C-C — it just verifies the happy path.
+
+- **M-7 self-loop with second latch**: the audit test `audit_licm_dormant_with_alloca_load` uses a self-loop `header → header` only. There is no test where a loop has BOTH a self-loop on header AND a separate distinct latch. The fix probably handles it (per my trace), but it's not pinned by a test.
+
+- **Med-5 cascading removal across multiple iterations**: `audit_dce_removes_one_of_two_block_params_keeps_correct_arg` exercises ONE outer-loop pass. There's no test where removing block param `p1` exposes block param `p2` as dead, requiring multiple outer iterations.
+
+- **Med-5 self-loop block param**: no test for a header block whose own back-edge passes a value that's "dead" within the body (consumed only by the back-edge itself, no other use). Could have non-obvious DCE behavior.
+
+- **C-A reports `changed = true` when no Identity rewrites fire but other rewrites do**: the test `audit_strength_reduce_identity_reports_changed` only verifies the identity-only path. The test doesn't verify the bug C-A described — that the *return value* of `StrengthReduce::run` was wrong when an Identity rewrite was the *only* rewrite of a non-int-non-bool type. After the fix, the placeholder branch is gone, so the test essentially can't reproduce the original bug shape. The new test passes both before and after the fix on this specific input. **This audit test does not pin down C-A's bug; it pins down a behavior that was already correct in most cases.** The actual C-A fix's protection is structural (removing the dead code path), not testable on the input as written.
+
+- **B-1 (C-C width drift Int→Int)**: not exercised by any test. Construct `Select(cond, ConstInt(255, I8), ConstInt(255, I8)): IrType::Int(I64)` and assert the folded result is `ConstInt(-1, I64)`, not `ConstInt(255, I64)`.
+
+- **CSE chase-pointer cycle / chain test**: B-7 notes the chase is dead code in practice. No test verifies what happens if a chain ever does form (it can't with current CSE, but a defensive test would catch a future bug).
+
+## Summary
+
+Most pass-1 fixes are correct. The team's work is largely sound. Key issues to address:
+
+1. **B-1 (Major)**: C-C fix is incomplete for width drift within Int. Add source-width sign-extension before re-normalizing. Add a real adversarial test.
+2. **B-2 (Major)**: `strength_reduce` still has the O(M·N) Identity-walk problem. Apply the same batched-substitution treatment as CSE.
+3. **B-3 (Medium)**: Defense-in-depth — round f32 in FCmp/FloatToInt rather than relying on M-1's invariant.
+4. **B-5 (Medium)**: DCE block-param removal is O(N²·K). Build a `BlockId → idx` map.
+5. **B-6 (Medium)**: Five-way duplication of operand walking. One-shot refactor.
+6. **Test coverage**: the C-A and C-C audit tests don't actually exercise the bugs they claim to. Add real adversarial tests for both.
+
+No NEW critical-severity bugs were introduced by the fixes. The verifier remains under-strict (no width checks for ICmp/Select/conversions), so several latent bugs depend on the convention that lowering keeps operand widths consistent — fragile but not broken today.
+
+Build status: clean. Unit + audit tests: 78 passing. Integration tests: 58/58 at -O2 (initial sequential run had a one-off `select_type.f90` flake that did not reproduce; not a regression from the audit fixes).
+
+Files of interest (absolute paths):
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/const_fold.rs` — B-1 lives at lines 389-408
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/strength_reduce.rs` — B-2 at line 324
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/dce.rs` — B-5 at lines 248-265, B-6 duplicates 76-150
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/cse.rs` — B-6 duplicates 159-220, B-7 at 255-262, B-8 at 74, B-9 at 274-288
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/util.rs` — B-4 at 298-307
+- `/Users/matthewwolffe/Documents/GithubOrgs/FortranGoingOnForty/armfortas/src/opt/audit_tests.rs` — coverage gaps in tests for M-C AShr, C-C width drift, M-7 multi-latch, Med-5 cascading

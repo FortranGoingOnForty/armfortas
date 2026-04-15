@@ -1,0 +1,1026 @@
+I'll conduct a brutal audit of the ARMFORTAS optimizer pipeline. Let me start by reading the IR infrastructure, then work through each pass file carefully.
+
+=== MESSAGE BREAK ===
+
+Now I have a comprehensive understanding. Let me examine a few more important pieces - the audit tests file and the builder for context on how block params and unused values are tracked.
+
+=== MESSAGE BREAK ===
+
+Now I have the full picture. Let me look at a few more details to make sure I understand particular subtleties, particularly how the Function's `value_type` works and examine the ICmp folding's sign extension behavior more carefully.
+
+=== MESSAGE BREAK ===
+
+Now let me verify specific suspicions I have by looking at the constant folding key for const int overflow and looking for the block_index rebuild issue in licm.rs.
+
+=== MESSAGE BREAK ===
+
+Now I have enough understanding. Let me verify one particular suspicion about the constant-folding pass: the `consts` map is built only within a function but shared across all blocks. A naive walk processes blocks in declaration order, but a value might be "constant" (in the map) from a later block when we're folding an earlier one if value_ids happen to match. Let me re-read more carefully.
+
+Looking at const_fold.rs lines 413-432: the `consts` map is built only as insts are visited. It's in block-walk order. If the blocks vec is not in RPO (topological order), a use in an earlier block of a value defined in a later block wouldn't be in the map yet. That's fine (no fold); the audit test already covers this.
+
+But there's a different concern: the map persists across blocks. If block X defines `%5 = ConstInt(7)` and later block Y uses `%5`, the map will contain `%5` when Y's instructions are being folded — but Y's use must be dominated by X. Since we assume valid input IR, this should be fine.
+
+Actually, a bigger issue — within a block walk we mutate inst.kind to ConstInt and update the map. But the map is keyed by ValueId, and the same ValueId persists. Good.
+
+Now let me look more carefully at the ICmp folding. I want to verify that the sext handles widths correctly, particularly for i64.
+
+Looking at const_fold.rs line 149-164:
+```rust
+InstKind::ICmp(op, a, b) => {
+    if let (Some(Const::Int(av, w)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
+        let av = sext(av, w.bits());
+        let bv = sext(bv, w.bits());
+```
+
+Note: only `w` from `a` is used; `b`'s width is ignored. Additionally, ICmp in Fortran would normally have same-width operands, but the verifier doesn't check that. If a==i8 and b==i32 (shouldn't happen but the IR permits it), the sext of b to i8 width would corrupt it. Not critical but worth noting.
+
+The bigger issue: ICmp with unsigned comparisons. Fortran doesn't have unsigned, but the IR has no unsigned CmpOp. This is fine, but if the front-end ever emits ICmp for pointer comparisons or bitwise compares...
+
+Let me also verify my concern about PopCount/CountLeadingZeros/CountTrailingZeros storing the result but `norm(..)` is missing.
+
+Lines 259-288: these return `InstKind::ConstInt(lz, w)` where `lz` can be up to 64. For i8, `w.bits() = 8`, but lz can be up to 8, which still fits. However `lz` is NOT normalized through `norm()`. For width i8, a max popcount of 8 fits but if anyone later sext's it... wait, CLZ up to 64 for i64 is fine, but `norm` would sext it. The stored value 64 sign-extended to i64 is 64 (not negative). So this works by happy coincidence because 0-64 all fit without sign-bit issue. Fine.
+
+Let me also check the `mask` function for when bits=64:
+
+```rust
+fn mask(v: i64, bits: u32) -> i64 {
+    if bits >= 64 { v }
+    else { v & ((1i64 << bits) - 1) }
+}
+```
+
+For bits=32, this is `v & 0x00000000FFFFFFFF`. That's correct for narrowing to 32 bits. The `(1i64 << bits) - 1` creates a 32-bit mask.
+
+But wait — for bits=63, `(1i64 << 63) - 1 = i64::MAX`, which is correct (top bit masked off). For bits=64, the code takes the early return. Good.
+
+Now the CSE key for `ConstInt`:
+```rust
+InstKind::ConstInt(v, w) => mk(1, vec![], (*v as i128 + (w.bits() as i128) * (1i128 << 70)) as i64),
+```
+
+Let's look hard at this. `1i128 << 70` is bigger than i64::MAX. Adding `(w.bits() as i128) * (1i128 << 70)` to `v` and casting back to i64 will cause wraparound. This is supposed to produce a hash-like differentiator but **it'll collide catastrophically** because i64 truncation discards the high bits. For w.bits=8, 16, 32, 64, this becomes `v + (8|16|32|64) * 2^70` truncated to i64, which is just `v` (the high multiplication truncates entirely). So the aux field is identical across different widths, which means **different-width same-value consts collide**. But the `ty` field of the Key differentiates them, so they don't collide. Still, this is a bug in intent — the aux field is meant to differentiate but doesn't.
+
+Actually wait, the key also includes `ty`. `i8` and `i32` ConstInts have different `ty` fields, so they key differently. OK so functionally this is fine, just the aux computation is nonsense.
+
+However — there's a subtler concern: **two ConstInts with the same value and type produce the same key**. That is intentional — CSE should dedupe duplicate constants. Fine.
+
+Let me look at ConstFloat keying:
+```rust
+InstKind::ConstFloat(v, w) => mk(2, vec![], (v.to_bits() as i64) ^ (w.bits() as i64)),
+```
+
+`v.to_bits()` returns u64 → cast to i64 (wraps for high bit). `^ w.bits()` (32 or 64). Two ConstFloats are equal when bits are equal and width is equal. Good — this handles NaN bit equality.
+
+But what about **NaN canonicalization**? A float-op that produces NaN (e.g., `0.0/0.0`) and a literal `f64::NAN` may have different bit patterns. They would never CSE together, which is acceptable conservative behavior.
+
+**What about +0.0 vs -0.0**? They have different bit patterns (0x00...00 vs 0x80...00). They key differently, so they don't collide. `+0.0 == -0.0` arithmetically but their bit patterns differ. Since we're CSEing definitions, this is correct — a `const +0.0` and `const -0.0` are different constants and shouldn't be merged.
+
+But what if the **operations** produce same `Key` between definitions that have differing signed zero semantics? E.g., `fadd %x, +0.0` and `fadd %x, -0.0` would have different `const` operand IDs, so they'd key differently. Good.
+
+However, **commutative fadd canonicalization is a bug**: `fadd x, y` and `fadd y, x` are NOT identical in IEEE 754 when one of x or y is NaN — actually they ARE identical because `x + NaN == NaN` regardless. What about signed zero? `(+0.0) + (-0.0) == +0.0` and `(-0.0) + (+0.0) == +0.0`. Still same. What about when both arguments are the same variable? No concern.
+
+Actually, FADD is commutative in IEEE 754 (the result is bit-identical regardless of operand order except possibly for sNaN payloads, which the standard permits implementations to mangle either way). Let me not raise a finding here unless I can construct a counterexample.
+
+**FSUB is not commutative** — and the key uses `vec![*a, *b]` without canonicalization. Good.
+
+**FMUL**: IEEE mul is commutative on finite values and non-signaling NaNs. With signaling NaNs there could be payload-order subtlety, but in practice most compilers treat fmul as commutative. OK.
+
+Now, **the real CSE problem**: what about CSE of sub-expressions where one feeds the other? Local CSE has a tight invariant: both instructions must be in the same block, same operands. But consider:
+
+```
+%1 = iadd %0, %0
+%2 = iadd %1, %1
+%3 = iadd %0, %0  ; same as %1
+```
+
+After walking: %1 stored in seen. %2 uses %1. %3 matches %1's key → rewrite %3 to %1. OK, this is fine.
+
+But what if there's been a previous rewrite? Let me think... After substituting `%3 → %1` via `substitute_uses`, operands of later instructions may have been rewritten, which could create NEW CSE opportunities. But the CSE pass walks ONCE per block looking for identical keys using the *pre-rewrite* operand IDs. After substitution, we don't re-walk. The pass manager fixpoint will re-run us.
+
+But here's the subtler issue: **we collect ALL rewrites during the walk before applying any**. This means if we see `%3 = iadd %0, %0` and the seen map already has `%2 = iadd %1, %1`, we don't try to match them because their operand IDs differ. Correct.
+
+However, consider:
+
+```
+Block1:
+%1 = iadd %0, %0
+Block2:
+%2 = iadd %1, %1  (seen map cleared at block start)
+%3 = iadd %2, %2
+```
+
+In Block2, %2 gets added to the seen map with its operands `[%1, %1]`. %3 keys as `[%2, %2]`. Distinct. No rewrite. OK.
+
+Now what about across rewrite order. Consider:
+
+```
+Block1:
+%1 = iadd %0, %0   // added to seen
+%2 = iadd %0, %0   // matches %1 → rewrite rule (2 → 1)
+%3 = iadd %2, %2   // added to seen (pre-rewrite)
+
+Block2:
+%4 = iadd %2, %2   // cleared seen, so this is new
+```
+
+At the end, we apply rewrites: `substitute_uses(%2, %1)` rewrites every `%2` to `%1` in **all blocks**. Now `%3 = iadd %1, %1` and `%4 = iadd %1, %1`. But we didn't add a rewrite for `%3 → %1` (they had different keys when walked — %3's operand was %2, not %1). So after the single pass, `%3` and `%4` both exist and are equivalent but not deduped. The fixpoint pass manager handles this.
+
+That's OK as long as **we collect rewrites carefully enough**. But there IS a bug here: within the same block, if we rewrite `%2 → %1`, then `%3 = iadd %2, %2` was added to seen BEFORE the rewrite. On the next fixpoint iteration we'll re-walk and dedupe %3 with %1's key correctly.
+
+Wait — no, there's a DEEPER issue. In a SINGLE CSE pass, we apply all rewrites at the end. If one rewrite causes another instruction's operand to change, the instruction's *canonical key* also changes. But CSE-pass rewrites were already decided BEFORE that happened. So we might MISS a redundancy. But we don't create incorrect code, we just miss optimizations. The fixpoint will fix it.
+
+OK, I think CSE is functionally sound with respect to correctness.
+
+Let me now spend real effort on LICM dominance correctness. The claim is: "all operands defined outside loop body" implies "all operands dominate the preheader". Is this true?
+
+Consider a diamond CFG:
+```
+entry
+ |
+ A
+/ \
+B  C    <- A dominates both
+\ /
+header (preheader=D)
+ |
+loop body   <- natural loop has header+body
+```
+
+Wait, header normally needs one preheader. What if the header has multiple out-of-loop preds? Then `find_preheader` returns None and LICM skips. OK.
+
+But consider:
+```
+entry
+ |
+ A (defines %x)
+ |
+header  <- preheader = A
+ |
+body
+```
+
+Here `A` dominates `header`. Instruction in body uses %x which is defined in A. A is outside loop body, so %x is not in loop_defs. LICM hoists the instruction to preheader A (after A's existing insts, before terminator). Good, A dominates body so preheader A dominates the instruction, which originally used %x (defined in A before A's branch). When we hoist `I = foo(%x)` from body into A, it's placed at the end of A's instruction list. %x is defined earlier in A. So %x still dominates I. Fine.
+
+Now consider this case — **the instruction to be hoisted uses a loop invariant value that is NOT defined in a block dominating the preheader**:
+
+```
+entry
+  |
+  A (defines %x)   B (defines %y)
+  |               |
+  D (preheader)
+  |
+header
+body uses %x  // %x is defined in A. B defines %y which is NOT used by body.
+```
+
+Wait, if preheader D has only one predecessor — what if D has *no* predecessors? Impossible, it has to come from somewhere. OK, but what if two blocks branch to D? 
+
+Actually, let's think harder. The invariant we need: "if an operand is defined outside the loop body, does that operand dominate the preheader?"
+
+**No, not necessarily.** Consider:
+
+```
+entry
+  |
+  A (cond)
+ / \
+B   C
+ \ /
+  header (has block params, for the phi-like merge from B and C)
+  |
+  body (uses %b_val defined in B)
+```
+
+Wait, if B defines %b_val and header uses %b_val directly, that's already a SSA violation — to flow %b_val through B+C merge to header, it must go via a block param. So header's param captures it. The body's use of the block-param value is loop-defined (header param), so LICM won't hoist it. Good.
+
+But what if a body block uses a value directly from B, bypassing the merge? That would already be an SSA violation (B doesn't dominate body since C is also a path to the loop). The verifier would catch that. OK so SSA gives us the property.
+
+**Concretely: any value that dominates any block inside a natural loop must dominate the loop header.** Is this true?
+
+Yes — because every path from entry to a body block passes through the header. If a value is used in body but NOT defined in body (i.e., defined outside), its def must dominate all body blocks, which means it must dominate the header too.
+
+**But here's the real question**: does the def dominate the *preheader*?
+
+Not necessarily! Consider:
+
+```
+entry → A → header
+           ↑
+         preheader = A
+
+entry → B → header
+           ↑
+         preheader = B
+```
+
+If the header has two predecessors A and B, then neither A nor B is the "unique out-of-loop predecessor". `find_preheader` would return None. OK, this is handled.
+
+But consider:
+```
+entry (defines %v via some conditional-ish way)
+  |
+A (defines %x based on %v)
+  |
+B
+  |
+header
+  |
+body uses %x
+```
+
+Here preheader = B. `%x` is defined in A, which dominates header (and body). Does A dominate B (preheader)? Yes, if A → B is the only path. Fine.
+
+But what about:
+```
+     entry
+    /    \
+   X      Y (defines %v)
+    \    /
+     Z (preheader, single pred for header from outside loop... wait, two preds)
+```
+
+Actually, if Z has two preds (X and Y), Z may still be the preheader if only Z (and not X, Y) is the sole out-of-loop pred of header. But Z is the preheader. Y defines %v, uses %v inside body. Does Y dominate Z? Only if Y is the *only* way to reach Z. If both X and Y can reach Z, then Y doesn't dominate Z. 
+
+**Key question**: if Y defines %v and body uses %v (via SSA), then Y must dominate body, hence Y must dominate the header, hence Y must dominate Z (because header has Z as its sole out-of-loop pred). 
+
+Wait — if Y dominates header, does Y dominate Z? Not necessarily! Z is a predecessor of header, so Z → header. If Y dominates header, every path from entry to header passes through Y. Every path from entry to header goes through Z first (since Z is the only pred of header from outside the loop). So every path from entry to Z also passes through Y... no wait, that's not right either. If Z has preds {X, Y}, a path entry → Y → Z → header goes through Y. A path entry → X → Z → header doesn't go through Y. So Y doesn't dominate Z, and therefore Y doesn't dominate header either. Contradiction!
+
+So: **if Y defines %v, Y dominates body, Y dominates header** → Y dominates every predecessor of header that's on a path from entry. Actually, domination is about paths from entry. Y dominates header iff every path from entry to header goes through Y. If Y doesn't dominate Z, there's a path entry → X → Z → header not going through Y, which means Y doesn't dominate header. Contradiction with "Y dominates header".
+
+OK so actually: **if Y dominates header and Z is a pred of header, then Y dominates Z OR Z == Y**.
+
+Why? Because every path from entry to Z can be extended to entry → Z → header (via the edge Z→header). If Y dominates header, every such extended path goes through Y. If Y ≠ Z and Y appears after Z on that path (not before), that's impossible since the path ends at header. So Y must appear before or at Z. Hence Y dominates Z or Y == Z.
+
+OK so the dominance property holds: if an operand is defined outside the loop body, its def block dominates the header, hence dominates the preheader (which is a predecessor of header on the dominance path).
+
+**But wait**: what about function parameters? They're defined "in the entry block" for dominance purposes. Entry dominates everything. So function params are fine to use from hoisted code.
+
+**What about block parameters of the preheader?** If the preheader has block params (e.g., values flowing from entry to preheader), those params are defined in the preheader itself. They dominate the preheader's instructions that come after them (which includes hoisted instructions appended at the end). Fine.
+
+OK LICM dominance seems correct... **as long as `find_preheader` correctly identifies THE preheader**. Let me check.
+
+```rust
+fn find_preheader(func, lp, preds) -> Option<BlockId> {
+    let header_preds = preds.get(&lp.header)?;
+    let outside: Vec<BlockId> = header_preds
+        .iter()
+        .copied()
+        .filter(|p| !lp.body.contains(p))
+        .collect();
+    if outside.len() != 1 { return None; }
+    let ph = outside[0];
+    if ph == lp.header { return None; }
+    let ph_block = func.block(ph);
+    match &ph_block.terminator {
+        Some(Terminator::Branch(dest, _)) if *dest == lp.header => Some(ph),
+        _ => None,
+    }
+}
+```
+
+The preheader must:
+1. Have exactly one out-of-loop predecessor. (✓)
+2. That predecessor must be an unconditional Branch to the header. (✓)
+
+But **missing check**: is the preheader's sole successor the header? The code checks `Branch(dest, _)` with `dest == header`. Unconditional Branch has exactly one successor, which is `dest`. So yes, its sole successor is the header. ✓
+
+**Missing check**: does the preheader **dominate the header**? In SSA IR this is typically implied when the preheader is the sole predecessor. **But what if the preheader has a path from some *other* block that doesn't go through entry via the preheader?** Actually, if the preheader is the sole out-of-loop pred, and loop back-edges come from within the loop (hence through the header), then every path from entry to header must enter via the preheader. Therefore the preheader dominates the header. ✓
+
+**ACTUAL BUG in LICM**: Now let me look at the hoist loop interaction with **nested loops**.
+
+For nested loops, `find_natural_loops` returns one NaturalLoop per back-edge (grouped by header). If loop L1 contains loop L2 (nested), then L1's body set includes L2's header and body. The order in which we iterate is `for lp in &loops { ... }`. Order depends on HashMap iteration order → **non-deterministic**.
+
+Suppose we process L2 (inner) first:
+- inner preheader found.
+- Hoist invariants from L2's body into L2's preheader. L2's preheader is some block inside L1's body (since L1 contains L2).
+- These hoisted instructions now live in an L1-body block.
+
+Then we process L1:
+- L1's loop_defs set includes all instructions in L1's body, which now **include the instructions we just hoisted into L2's preheader**.
+- L1's LICM walks L1's body looking for invariants. The previously-hoisted instructions (which live in L2's preheader, which is inside L1's body) will be reconsidered.
+- If their operands are all defined outside L1's body, they'll be hoisted from L2's preheader into L1's preheader. Good.
+
+If we process L1 first:
+- L1 hoists some stuff from L1's body (which includes L2's body) into L1's preheader.
+- If L1's hoisting removes an instruction from L2's body → when we later process L2, that instruction is gone. Fine.
+- But L1's `loop_defs = loop_defined_values(func, L1)` snapshot was taken before any hoisting. After hoisting, instructions hoisted into L1's preheader are no longer in loop_defs (because the hoisted set is removed from loop_defs).
+- When L1 finishes, we move to L2. L2 computes `loop_defs` fresh using `loop_defined_values(func, lp)` which scans the current state of func.blocks. **But the `preds` map is stale** — it was computed at the top of `licm_function` before any hoisting. Since hoisting doesn't change CFG (no block-to-block edges change), preds are still correct for the current CFG. ✓
+
+Actually wait — hoisting **does** move instructions, but not blocks, so the block→block edge map is unchanged. `preds` remains valid. ✓
+
+**Finding L-1 (MAJOR)**: The `loops` vector comes from HashMap iteration, so the order of processing loops is NON-DETERMINISTIC. For nested loops, hoisting effectiveness varies from run to run. More critically, since `loop_defs` for the outer loop is computed fresh for each outer iteration via `loop_defined_values`, it captures current state. But let me check again...
+
+Actually wait, `loop_defs` is computed once per loop, **not re-computed between loops**. The outer `for lp in &loops` loop calls `loop_defined_values(func, lp)` once per iteration of `lp`. If the inner loop has already hoisted something into an intermediate preheader, that hoisted instruction is *still* in the outer loop's body if the outer loop contains that block. Let me re-verify...
+
+Yes, `loop_defined_values` enumerates every instruction in every block where `lp.body.contains(block.id)`. If the outer loop body contains the inner loop's preheader block, then hoisted instructions (now in the inner preheader, which is still in the outer loop body) WILL be in outer `loop_defs`. Good.
+
+But... the outer loop's hoist check says: "all operands must be outside outer loop_defs". If an outer-loop-level hoist candidate's operand is the inner preheader's newly hoisted instruction, the operand will be in outer `loop_defs` (because the hoisted inst is still inside outer body). So the candidate won't be hoisted. **But this is wrong**: actually the hoisted instruction IS a valid operand — it's computed once per outer loop iteration (since it was hoisted out of the inner loop but still inside outer). The candidate using it is also invariant to the inner loop but not to the outer loop. Hmm, actually — if its operand varies each outer iteration (because the hoisted inst runs once per outer iteration), then the candidate DOES depend on outer iteration. So not hoistable. OK.
+
+But an interesting case: **what if the inner hoisted instruction itself has all operands outside the outer loop**? Then it's "doubly invariant" — it's invariant to both loops. Should be hoisted all the way out. In the first iteration of the outer loop, it's still in outer body → not hoistable. But after the inner loop finishes, we could re-run.
+
+The LICM pass has **an inner fixpoint loop** (`loop { ... if
+
+=== MESSAGE BREAK ===
+
+Now I have enough to write the audit. Let me verify a few of my concerns by running a quick test.
+
+=== MESSAGE BREAK ===
+
+Let me verify my suspicions directly in a test. I'll write a small Rust scratch test to confirm AArch64 shift behavior.
+
+=== MESSAGE BREAK ===
+
+Good — the ISHFT Select pattern always computes both the Shl and the LShr branches, meaning they **do** encounter Shl with an operand that could be large at runtime. But since the constant-fold pass sees the select only when the condition is constant, this is less of an immediate issue.
+
+Let me also look at how bitwise not / IntTrunc fold behave with regards to type consistency.
+
+=== MESSAGE BREAK ===
+
+I notice the PopCount fold type inconsistency. PopCount's result type is the same as its operand (width `w` from source). But `mk(59, vec![*a], 0)` in CSE uses `inst.ty`, which should be correct for the definition. Actually I should check what ICmp folds — is there a signed comparison with different operand widths bug?
+
+Let me re-examine the ICmp fold:
+
+Looking at lines 149-164 of const_fold.rs:
+```rust
+InstKind::ICmp(op, a, b) => {
+    if let (Some(Const::Int(av, w)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
+        let av = sext(av, w.bits());
+        let bv = sext(bv, w.bits());  // uses w from a, not b!
+```
+
+If the two operands had different widths (IR bug or caller bug), the `w` of b is ignored. But operands of ICmp are required to have the same type by verifier semantic rules. Still, it should use b's own width to sign-extend b.
+
+Now let me examine a critical thing: the `const_fold::try_fold` for `ICmp` takes the `w` from the first operand's `Const::Int(_, w)`, but since verifier requires matching types for integer ops, this is mostly OK. It's still a minor issue.
+
+Now I have enough evidence to write a thorough audit. Let me finalize the report.
+
+=== MESSAGE BREAK ===
+
+Select fold — important edge case! If `Const::Int(v, w)` is used where `w` is the source operand's width, but the Select instruction's declared result type is different (say, the operand was a sub-expression with I32 but Select's type is also I32), this is fine. But if widths differ (e.g., `w` from operand is I8 but the Select declared type is I16 via some pathological IR), we'd get a type-mismatch. Since the IR should be well-typed, this is a minor concern at best.
+
+But wait — there's a clearer issue. The Select fold uses the *source operand's* declared width from the `Const::Int` entry. Those widths came from the ConstInt defining instruction. But if someone stored a ConstInt narrower than its use type, you'd emit a ConstInt with mismatched type versus the Select's declared ty. More concerning: **the Select fold rewrites `inst.kind` but doesn't update `inst.ty`**. If the Select result type is I32 but the chosen branch happens to be a ConstInt I16, the rewritten ConstInt will have `kind = ConstInt(v, I16)` while `inst.ty = I32`. This breaks type consistency.
+
+Actually, looking more carefully: the verifier checks through `value_type` which returns `inst.ty`. So if kind stores I16 but ty is I32, the verifier won't necessarily notice because it only checks operand types, not the kind's embedded width. But downstream CSE `key_of` uses `inst.ty` for the key, while kind embeds a different width — the constants would collide improperly.
+
+Let me also think about the `Select` fold with `Bool` — the boolean select fold emits `ConstBool(b)` regardless of declared type; if Select's declared type were `Int`, this would be a type mismatch. But Select's result type is the type of t/f branches, and they should match. Still worth noting.
+
+Now let me check one very important thing: the FloatExtend/FloatTrunc fold with f64 -> f64 is a no-op but the IR says it's an extension/truncation. Actually that shouldn't be a valid IR state.
+
+Finally let me check: in const_prop, what happens when the CondBranch's cond is *not* a ConstBool but a ConstInt? The integer is not turned into a boolean match — but in ICmp fold we produce a ConstBool for it, so this is fine. What about the non-bool cond being type-mismatched — it can only be ConstBool if it was produced by a comparison/bool op.
+
+Now let me write the audit report.
+
+# Brutal audit findings — optimizer pipeline
+
+## Summary
+17 findings: 2 CRITICAL, 6 MAJOR, 6 MEDIUM, 3 MINOR (plus 1 notable surprise documented).
+
+## Critical bugs
+
+### C-A1 — `const_fold::IntExtend` drops sign when result normalization masks the high bits (`src/opt/const_fold.rs:330-336`)
+
+```rust
+InstKind::IntExtend(a, w, signed) => {
+    if let Some(Const::Int(av, src_w)) = get(a) {
+        let v = if *signed { sext(av, src_w.bits()) } else { mask(av, src_w.bits()) };
+        return Some(InstKind::ConstInt(norm(v, *w), *w));
+    }
+    None
+}
+```
+
+**Severity: CRITICAL.**
+`norm` calls `sext(mask(v, w.bits()), w.bits())`. For a signed extension from i8 to i32 of the value `-1` stored as `0xFF`:
+
+1. `sext(av=-1, 8)` returns `-1` (i.e., `0xFFFF_FFFF_FFFF_FFFF`).
+2. `norm(-1, I32)` = `sext(mask(-1, 32), 32)` = `sext(0xFFFF_FFFF, 32)` = `-1`. Fine here.
+
+But for an **unsigned** extension from i8 `0xFF` to i32:
+
+1. `mask(-1, 8)` = `0xFF` (255).
+2. `norm(255, I32)` = `sext(mask(255, 32), 32)` = `sext(255, 32)` = `255`. Correct.
+
+However, consider unsigned extension from i32 to i64 of a value like `0x8000_0000` (stored as a sign-extended i64 = `-2147483648`):
+
+1. `mask(-2147483648, 32)` = `0x8000_0000` (= 2147483648).
+2. `norm(2147483648, I64)` = `sext(mask(2147483648, 64), 64)` = `-2147483648` (because width >= 64 is a pass-through, and `2147483648 as i64` is already positive, **but** `norm` through `sext` for `bits >= 64` just returns `v` unchanged — so `v = 2147483648` stays positive). OK.
+
+Now the genuinely broken case: **unsigned IntExtend from narrower to same width** — e.g., `IntExtend(av = -1_i8, w = I8, signed = false)`:
+
+1. `mask(-1, 8)` = `255`.
+2. `norm(255, I8)` = `sext(255 & 0xFF, 8)` = `sext(255, 8)` = `-1`.
+
+The caller asked for an *unsigned* extend and got back a sign-extended value. Identity unsigned extend is rare but the bug is that `norm` unconditionally sign-extends to the IR's stored form, so a logically-unsigned value is re-signed as it exits. This means a later CSE key-hash or ICmp fold that tries to read back the value as unsigned sees the wrong bit pattern in i64 space.
+
+More concretely: if an `IntExtend(u8 → i32, signed=false)` feeds an `ICmp(Ugt, …)` (which doesn't exist yet, but it will) the result will be wrong. **Fix idea**: store the masked (unsigned) representation in the `ConstInt` when the destination is reached via an unsigned extend, or change the contract so that `norm`'s sign-extension only applies when the IR semantically treats the bits as signed.
+
+Related: `norm` is applied to *every* integer fold result, which conflates "the low-bits that matter" with "how to embed the value in i64." This works only because every downstream consumer re-extends via `sext(av, w.bits())`. Any pass that reads `ConstInt(v, I8)` and does a raw `v as u32` (e.g., `val.count_ones()` in PopCount at line 262) will see the extra bits. **That's actually OK in the current PopCount because it immediately masks** — but the invariant is fragile and undocumented.
+
+### C-A2 — `const_fold::Select` rewrites kind but not the instruction's declared type (`src/opt/const_fold.rs:344-358`)
+
+```rust
+InstKind::Select(c, t, f) => {
+    if let Some(Const::Bool(cv)) = get(c) {
+        let chosen = if cv { *t } else { *f };
+        if let Some(k) = consts.get(&chosen) {
+            return Some(match *k {
+                Const::Int(v, w) => InstKind::ConstInt(v, w),
+                Const::Float(v, w) => InstKind::ConstFloat(v, w),
+                Const::Bool(b) => InstKind::ConstBool(b),
+            });
+        }
+    }
+    None
+}
+```
+
+**Severity: CRITICAL.**
+The returned `InstKind::ConstInt(v, w)` uses the width that was stored for the *chosen operand's definition*, not the width of the Select instruction itself. The `try_fold` caller at line 428 does:
+
+```rust
+inst.kind = new_kind;
+```
+
+and never touches `inst.ty`. If the Select has result type `i32` and the chosen branch's ConstInt had width `I32`, you're fine. But because the lowerer may produce a Select whose true/false operands have an IntExtend intermediate, or because `ConstInt` embedding width may have been normalized differently, mismatched widths are possible in principle.
+
+The actionable form of the bug: after folding a Select, the invariant "`inst.kind`'s embedded width == `inst.ty`'s width" is not preserved by the fold code. Downstream CSE builds its key from `inst.ty`, but strength_reduce reads the width from `inst.kind` via `collect_int_consts` — these can diverge.
+
+**Reproducer I'd write (but haven't):**
+- Create a Select with `ty = Int(I32)`, `t = ConstInt(5, I8)`, `f = ConstInt(7, I8)`, `cond = ConstBool(true)`.
+- Run const_fold; the Select becomes `ConstInt(5, I8)` with `inst.ty` still `Int(I32)`.
+- Run strength_reduce on a downstream `IMul(this, const(-1, I32))`. `collect_int_consts` records `(5, I8)` for this value; `rewrite_for` checks `int_w = I32`, but the constant's tuple says I8. Most checks still work, but `sext(5, 32) = 5` rather than the width-aware read. Cross-width confusion, verifier silent because it only checks `is_int()`.
+
+**Fix**: in the Select fold, emit `ConstInt(v, w)` using the **destination** width extracted from `ty`, and renormalize `v` via `norm`.
+
+## Major bugs
+
+### M-A1 — `const_fold::Shl/LShr` "shift count ≥ width → 0" does not match AArch64 (`src/opt/const_fold.rs:212-242`)
+
+```rust
+InstKind::Shl(a, b) => {
+    …
+    if (0..bits).contains(&bv) { … normal case … }
+    // Shift count >= width is implementation-defined
+    // in C; AArch64 returns 0. Match that.
+    return Some(InstKind::ConstInt(0, *w));
+}
+```
+
+**Severity: MAJOR.**
+AArch64 `LSL` (encoded via UBFM) masks the shift amount to `log2(reg_width)` bits — i.e., `amt & 0x3F` for 64-bit and `amt & 0x1F` for 32-bit registers. `lsl w0, w1, w2` with `w2 = 32` produces `w0 = w1` (shift by 0 after masking), **not** zero. Likewise `lsl x0, x1, x2` with `x2 = 64` is identity.
+
+The comment's claim is factually wrong. The current fold disagrees with both AArch64 hardware and `i64::wrapping_shl` (which also masks the amount). Fortran programs that use negative shifts go through `ishft(x, shift)` lowering which builds a `Select(ishl, …) … where the Shl branch is speculatively computed for all shift amounts including large ones`, so a fold that returns 0 for counts ≥ width silently produces a value the runtime would never produce.
+
+Additionally, negative shift counts (`bv = -5`): `(0..bits).contains(&-5)` is false, so this emits `0` — also wrong (on AArch64 the low 5 or 6 bits are taken, so `-5 & 0x1F = 27`, yielding a very different result).
+
+**Fix**: when `(bv < 0) || (bv >= bits as i64)`, either (a) bail (leave the instruction alone — safest; matches SSA and defers to codegen), or (b) mask `bv` by `bits-1` before shifting to match AArch64 semantics. Option (b) is only correct if codegen consistently emits `LSL` (not a `Select` with an out-of-range comparison).
+
+The same bug affects `LShr` (line 229-242), with identical wrong return-0 branch.
+
+### M-A2 — `const_fold::AShr` out-of-range path is also wrong (`src/opt/const_fold.rs:243-258`)
+
+```rust
+InstKind::AShr(a, b) => {
+    …
+    if bv32 < bits { … normal case … }
+    // Arithmetic shift past the width: replicate sign bit.
+    let signed = sext(av, bits) >> (bits - 1);
+    return Some(InstKind::ConstInt(norm(signed, *w), *w));
+}
+```
+
+**Severity: MAJOR.**
+Same AArch64 mismatch as M-A1. `asr x0, x1, x2` with `x2 = 64` masks to `0`, i.e., identity. The fold replicates the sign bit, which is what Intel's x86 `SAR` *does* with count ≥ width (after masking), but AArch64 doesn't.
+
+Also note that `bv32 = bv as u32` silently loses the sign of negative `bv`. Negative shift counts become huge positive `u32` values and fall into the out-of-range path, emitting a sign-replicated result that the runtime would never compute. **Fix** same as M-A1: bail on out-of-range, or mask the count properly.
+
+### M-A3 — `const_fold` misses all integer intrinsics on any CSE'd-alias operand (`src/opt/const_fold.rs:411-434`)
+
+```rust
+let mut consts: HashMap<ValueId, Const> = HashMap::new();
+for block in &mut func.blocks {
+    for inst in &mut block.insts {
+        if let Some(c) = Const::from_inst(&inst.kind) {
+            consts.insert(inst.id, c);
+            continue;
+        }
+        …
+```
+
+**Severity: MAJOR.**
+The `consts` map is built up **incrementally as we walk each block, in block-vector order**. There is no guarantee that block-vector order is a topological order of the CFG. If `func.blocks` has a block whose const-int dominates a use in a block that appears earlier in the vector, constants defined in the dominator are **not** in the `consts` map when the use is visited, so folds are missed.
+
+`audit_const_fold_non_rpo_block_order` pins the weaker claim ("must not crash"), but does not pin the stronger claim ("must actually fold"). The test even has a comment: *"(We don't fail the test if the fold didn't happen — just verify the IR is still valid.)"* — so the current behavior is documented-broken but silently accepted.
+
+Impact: O2 misses const folds across blocks, meaning downstream LICM/strength_reduce/CSE pipelines see non-const operands where they should see constants. Correctness is not violated (we get O0 code where O2 was expected), but it's a major **missed-optimization** bug and it means the fixpoint isn't actually a global fixpoint within a single `ConstFold.run()` call — the pass manager saves us, but only because of its outer fixpoint loop.
+
+**Fix**: run a single pre-pass to collect every ConstInt/ConstFloat/ConstBool from the entire function before the transform walk; then the transform walk can fold anywhere. This is what `const_prop::collect_consts` already does correctly.
+
+### M-A4 — `const_fold::IntToFloat` uses `as f64` cast which produces wrong results for i64 > 2^53 (`src/opt/const_fold.rs:291-297`)
+
+```rust
+InstKind::IntToFloat(a, fw) => {
+    if let Some(Const::Int(av, w)) = get(a) {
+        let signed = sext(av, w.bits());
+        return Some(InstKind::ConstFloat(signed as f64, *fw));
+    }
+    None
+}
+```
+
+**Severity: MAJOR.**
+For the i64 value `9_007_199_254_740_993` (= 2^53 + 1), `as f64` rounds to 9007199254740992.0 in Rust (round-to-nearest-even), which happens to match the AArch64 `SCVTF` instruction with default rounding. OK so far.
+
+But for an **f32** destination (`fw = F32`), the current fold performs a single-step `i64 → f64` conversion and stores that f64 as the ConstFloat, tagged F32. This is the same bug already flagged as M-1 but also affects i64 sources: **the fold stores a precise-to-f64 value where the hardware would round through f32**. Any downstream FCmp/FloatToInt/FAdd fold with an f32 destination will use the precise value instead of the rounded one, producing results the runtime would not.
+
+Additionally, for i64 source → f32 destination, the current code performs `i64 as f64` and stores; but codegen must emit `SCVTF s0, x0` which goes **straight to f32** without an f64 intermediate. The rounding is different: `i64 → f64 → f32` is a double-rounding that can differ from `i64 → f32` direct rounding by 1 ULP for values near rounding-tie boundaries. Even with my "fix M-1 through f32" suggestion the caller still has to be aware.
+
+**Fix**: for F32 destinations, compute `signed as f32 as f64` (best approximation to direct conversion); for F64 destinations, compute `signed as f64`. The two-step f64→f32 rounding is a known double-rounding issue; it's close enough for test values but IEEE nerds will notice.
+
+### M-A5 — `const_fold::FloatToInt` uses `as i64` for out-of-range values (`src/opt/const_fold.rs:298-319`)
+
+```rust
+InstKind::FloatToInt(a, w) => {
+    if let Some(Const::Float(av, _)) = get(a) {
+        if av.is_nan() || av.is_infinite() { return None; }
+        let truncd = av.trunc();
+        let lo = match w { IntWidth::I8 => i8::MIN as f64, … };
+        let hi = match w { IntWidth::I8 => i8::MAX as f64, … };
+        if truncd < lo || truncd > hi { return None; }
+        return Some(InstKind::ConstInt(norm(truncd as i64, *w), *w));
+    }
+    None
+}
+```
+
+**Severity: MAJOR.**
+Two subtle issues:
+
+1. `i64::MAX as f64` is `9223372036854775808.0` (= 2^63), which is one past `i64::MAX`. So the check `truncd > hi` lets through exactly `2^63`, and then `truncd as i64` saturates to `i64::MAX` in Rust — NOT wrap. Meanwhile AArch64's `FCVTZS` with an input of exactly `2^63` **saturates** to `i64::MAX` (= `0x7FFF_FFFF_FFFF_FFFF`) as well in current specs. OK, Rust and AArch64 happen to agree here, but the comment/implementation does not reflect intent.
+
+2. `i32::MAX as f64` is exactly `2147483647.0` (exact). Good. But `truncd > hi` is *strict*, so `truncd = 2147483647.0` is accepted. Then `truncd as i64 = 2147483647`. OK.
+
+3. **The real bug**: for `truncd = -9223372036854775808.0` (= i64::MIN exactly), `i64::MIN as f64 = -9223372036854775808.0`. Check: `truncd < lo` is `-9223372036854775808.0 < -9223372036854775808.0` = false; `truncd > hi` false. So it passes the range check. Then `truncd as i64` — Rust's float-to-int saturation says this is exactly `i64::MIN`. OK. But subtle issues lurk near edge values.
+
+4. More important: **Fortran's `INT()` truncates toward zero**, which `av.trunc()` matches. BUT the comment says "Fortran INT() truncates toward zero. Match." — actually Fortran `INT(x)` is integer part (truncation toward zero), which is correct. But `NINT(x)` rounds to nearest, and `FLOOR(x)` rounds toward negative infinity. Your IR has only `FloatToInt` and the lowering needs to express `NINT`/`FLOOR` as separate IR sequences, not as a single `FloatToInt`. If any of those lowerings call `FloatToInt` with a pre-rounded `av`, you're fine; if any lowering expects `FloatToInt` to produce `round-to-nearest`, you get silent corruption.
+
+**Recommendation**: grep `FloatToInt` callers in `lower.rs` — if `NINT` or `FLOOR` ever lowers to a plain `FloatToInt` without an explicit rounding pre-step, this fold will silently produce wrong values.
+
+### M-A6 — `cse::key_of` ConstInt/ConstFloat key collisions (`src/opt/cse.rs:67-69`)
+
+```rust
+InstKind::ConstInt(v, w)   => mk(1, vec![], (*v as i128 + (w.bits() as i128) * (1i128 << 70)) as i64),
+InstKind::ConstFloat(v, w) => mk(2, vec![], (v.to_bits() as i64) ^ (w.bits() as i64)),
+InstKind::ConstBool(b)     => mk(3, vec![], if *b { 1 } else { 0 }),
+```
+
+**Severity: MAJOR.**
+
+**ConstInt key**: `(v as i128 + (w.bits() as i128) * (1i128 << 70)) as i64`. For width 64, `64 * 2^70 = 2^76`, which when cast `as i64` truncates to 0. For width 32, `32 * 2^70 = 2^75`, also truncates to 0. For width 16, same. For width 8, same. The `w.bits() * 2^70` component is **completely discarded** by the `as i64` cast — so two `ConstInt(5, I8)` and `ConstInt(5, I64)` collide on key `5, 5`.
+
+Two ConstInts with identical value but different widths collide to the same CSE key, despite being different SSA values with different types. BUT — and this is why the bug doesn't immediately explode — the `ty` field in `Key` includes the destination type, which *should* differ. So a collision at the aux int is harmless as long as `ty` differs.
+
+So actually the key is robust. **But**: `ConstFloat` uses `v.to_bits() as i64 ^ (w.bits() as i64)`. For `v = -0.0` and `v = +0.0`, the bits are `0x8000000000000000` vs `0x0`. XOR'd with width produces different aux values. OK. However, two **different** ConstFloats can collide: `v.to_bits() ^ 32 == v'.to_bits() ^ 64` happens iff `v.to_bits() ^ v'.to_bits() == 96`. Finding such a pair manually is hard, but it exists mathematically. Again, the `ty` field differs (F32 vs F64) so the key as a whole is still safe. **However**, if you ever have two F32 ConstFloats with `v.to_bits() ^ 32 == v'.to_bits() ^ 32` where `v != v'`, that's `v == v'` — impossible. So for same-width, safe.
+
+The real issue is aesthetic/fragile — the code *looks* like it's encoding the width into the key but the width goes into `ty` too, making the arithmetic a dead-weight. If someone later removes the `ty` field for efficiency, the keying breaks silently.
+
+**But** there's a **real** collision issue with ConstFloat: **signed zero**. `+0.0` and `-0.0` have different bit patterns, so they get different keys. Fortran `==` returns true for them. So CSE would fail to dedup a `+0.0` and a `-0.0` — that's not a correctness bug per se, it's just a missed optimization. **However**, the reverse is worse: `f64::NAN.to_bits() == f64::NAN.to_bits()` (same bit pattern), so two instances of NaN **will** be CSE'd to the same value. But IEEE NaN is not equal to itself; two `FCmp(Eq, NaN, NaN)` should both return false. This is fine: CSE replaces uses of value id, not NaN equality — so uses of FCmp still produce the correct (false) result.
+
+**The actual bug**: `FCmp(Eq, NaN, NaN)` with both NaN operands fol
+
+=== MESSAGE BREAK ===
+
+I can now see the Select fold issue: if the chosen branch has a constant whose width differs from the declared select type, the re-emitted `ConstInt(v, w)` uses the chosen const's width, not the Select's declared `ty`. This would break type consistency with downstream uses.
+
+Also, the FloatToInt check compares `truncd < lo || truncd > hi` — but `i64::MAX as f64` rounds *up* to 2^63, meaning `truncd = i64::MAX as f64` (which is 9223372036854775808.0) would NOT exceed hi (also 9223372036854775808.0), but `truncd as i64` saturates/wraps in Rust. Let me think...
+
+Actually: `i64::MAX` is `9223372036854775807`. Cast to f64 rounds up to `9223372036854775808.0` (which is `2^63`). So `hi = 2^63`. A value at exactly `2^63` passes the bound check `truncd > hi` (false), but casting `2^63_f64 as i64` in Rust gives `i64::MAX` via saturating conversion (in modern Rust). However, the "correct" value is undefined — this is past the representable range.
+
+Now I have enough content. Let me produce the audit report.
+
+# Brutal audit findings — optimizer pipeline
+
+## Summary
+17 new findings: 3 CRITICAL, 6 MAJOR, 6 MEDIUM, 2 MINOR. Plus 3 "looks wrong but actually works" notes at the end.
+
+---
+
+## Critical bugs
+
+### C-A. `strength_reduce` Identity rewrite for pointer/float/struct results silently drops the instruction
+**File**: `src/opt/strength_reduce.rs:305-317`
+```rust
+Rewrite::Identity { pass_through } => {
+    substitute_uses(func, old_id, pass_through);
+    let placeholder = match ty {
+        IrType::Int(w) => InstKind::ConstInt(0, w),
+        IrType::Bool   => InstKind::ConstBool(false),
+        _ => continue,
+    };
+    func.blocks[bi].insts[ii].kind = placeholder;
+}
+```
+**Severity**: CRITICAL.
+**Why wrong**: The `substitute_uses` on line 306 has already been called by the time the `_ => continue` branch on line 314 fires. That means for any `Identity` rewrite on a non-int, non-bool type, every use of `old_id` across the entire function has been rewritten to `pass_through`, but the defining instruction at `(bi, ii)` is **left in place unchanged**. That's fine by itself — the defining instruction is now dead code — but the `continue` also bypasses `changed = true` on line 319, so the pass reports "no change" even though it rewrote every use in the function. The pass manager won't re-run DCE; the original instruction keeps defining `old_id` but nothing reads it. Verifier passes (that's fine) but the program keeps a stale computation. More importantly: the uses have been redirected, so any **type mismatch** between `old_id` and `pass_through` becomes a permanent, silent bug. 
+
+Today `rewrite_for` only produces Identity for integer ops on integer types, so this branch is unreachable in practice — but that's luck, not design. The moment anyone adds `fmul x, 1.0` → Identity under fast-math (or `getelementptr x, 0` → identity), the `_ => continue` eats the `changed = true` and also leaves a live substitution with no restore path.
+**Repro (if Identity ever fires on a non-int/bool type)**: any float identity rewrite would hit this.
+**Fix**: either restrict `rewrite_for` to only emit Identity for int/bool (assert-enforced), or drop the placeholder machinery entirely — you can leave the original instruction alone because `substitute_uses` already rewired the uses and DCE will delete it next round. Also set `changed = true` before the `continue`.
+
+---
+
+### C-B. `licm::licm_function` keeps an out-of-date `block_index` when preheader isn't the entry
+**File**: `src/opt/licm.rs:126-197`
+**Severity**: CRITICAL (silently moves instructions into the wrong block).
+**Why wrong**: `block_index` is built **once** on lines 126-129 before any loop is processed. But inside the loop body (line 197) we do `let ph_idx = block_index[&ph_id];` and then `func.blocks[ph_idx].insts.extend(extracted);`. That's fine on its own because instruction moves don't resize `func.blocks`. But the comment on line 141 says "Per-iteration: rebuild the block index map" — it never does. That by itself is harmless today, but consider: when the pass processes a loop `L1` with preheader `PH1` and successfully hoists into it, then later processes loop `L2` whose preheader happens to **be** `L1`'s header (possible for nested loops), the `block_index` lookup is still correct because `func.blocks` hasn't been mutated structurally.
+
+The real bug is elsewhere: `find_preheader` is called **once** via `preds` that was computed on line 120 — that is, **before** any hoisting. Preheader analysis walks `ph_block.terminator` which hasn't moved, so this part is OK. But `loop_defined_values(func, lp)` is computed **per loop** (line 139) from the function's current state. If an earlier loop (sharing a body block with this one, which happens with nested loops) hoisted instructions out of a shared block, those instructions now live in a preheader that may or may not be inside the current loop's body. If the preheader for loop L1 is inside the body of an **outer** loop L2, hoisting into L1's preheader actually puts the instruction inside L2 — and L2's subsequent LICM pass will try to hoist it again using stale `loop_defs`. The `loop_defs` is built on line 139 for L2 and does **not** include the newly hoisted instruction (because that instruction was already originally in L2's body before the hoist), so the invariance check fires and the instruction gets re-hoisted into L2's preheader. Good so far — but the `block_idx` on line 159 was recorded from the **pre-hoist** layout, and `func.blocks[bi].insts.remove(ii)` on line 189 now removes the wrong instruction because the intra-block instruction count changed when L1 hoisted from L2's shared block.
+
+Concretely:
+```
+Outer loop body block B has insts: [a, b, c]
+Inner loop L1 body is just block B; hoisting moves `b` to L1's preheader (say block P).
+After that: B = [a, c], P = [..., b].
+```
+Now when processing outer loop L2, we walk B in its current form (`a, c`) and see them at indices 0 and 1. If we find `c` invariant and record `(bi=B, ii=1)`, then **inside the same inner-loop iteration** of L2 we process hoists for L2. But by that point, we're in the `for lp in &loops` outer loop — so L1 was already done, and the outer L2 iteration starts with a fresh `loop_defs`. The indices `(bi, ii)` are collected freshly per L2 iteration, so they **are** valid at the moment of collection. Wait, this path is fine.
+
+**The actual repro is subtler**: `find_preheader` uses `preds` captured on line 120, built once, **before** any hoist. If a later pass iteration (the `loop {}` on line 143) hoists instructions and somehow changes the CFG... it doesn't — instruction moves don't change successors. So `preds` is actually invariant.
+
+After re-tracing: **C-B is downgraded** to a real but narrower issue: `block_index` is built once over `func.blocks`, and if **the vector is ever reordered** by a prior loop iteration (it isn't today — we only mutate inst vectors), it would be stale. Since `func.blocks` is never structurally mutated by LICM, this is currently safe. Demoting to **MINOR**: the stale-comment-and-stale-map are a footgun for future maintainers; a future pass that swaps blocks around would silently corrupt things. See minor findings.
+
+---
+
+### C-C. `const_fold::Select` reemits the chosen branch's constant with the **source** type, not the Select's declared type
+**File**: `src/opt/const_fold.rs:344-358`
+```rust
+InstKind::Select(c, t, f) => {
+    if let Some(Const::Bool(cv)) = get(c) {
+        let chosen = if cv { *t } else { *f };
+        if let Some(k) = consts.get(&chosen) {
+            return Some(match *k {
+                Const::Int(v, w) => InstKind::ConstInt(v, w),        // w from source, not Select's ty!
+                Const::Float(v, w) => InstKind::ConstFloat(v, w),    // same
+                Const::Bool(b) => InstKind::ConstBool(b),
+            });
+        }
+    }
+    None
+}
+```
+**Severity**: CRITICAL (type-punning that verifier check_type_consistency won't catch).
+**Why wrong**: The Select's declared type is `inst.ty`, but the rewritten `InstKind::ConstInt(v, w)` uses `w` from the **chosen operand's** constant record. If `inst.ty = Int(I64)` but the chosen branch happens to be a folded `ConstInt(_, I32)` — which can happen after IntExtend/IntTrunc chains fold — the result instruction has `kind` reporting `I32` but `ty` reporting `I64`. The verifier's `check_type_consistency` doesn't inspect ConstInt kinds against the instruction's ty (it only checks operand types for arithmetic/load/store), so this sneaks through. Downstream codegen will emit a truncated immediate.
+
+This is aggravated by the fact that Select has `Select(cond, t, f)` where the verifier expects `t` and `f` to have the same type as the Select itself — but `inst_uses` doesn't assert that, and the AST→IR lowerer might introduce a select where one arm is a narrower int that gets implicitly extended at codegen.
+
+**Repro**: 
+```
+%0 = const_int 1 : i32
+%1 = int_extend %0 : i64    ; sext
+%2 = const_int 99 : i64
+%3 = const_bool true
+%4 = select %3, %1, %2 : i64
+```
+After const_fold runs, `%1` becomes `ConstInt(1, I32)` (IntExtend from i32→i64 folds, see line 330-336: `InstKind::ConstInt(norm(v, *w), *w)` with `w = I64`, so it's actually `ConstInt(1, I64)` in this specific case — good). But if the lowerer ever produced a Select with operands at the wrong width (common during partial lowering), the bug triggers.
+
+A cleaner repro the verifier won't catch:
+```
+%0 = const_float 1.5 : f64
+%1 = float_trunc %0 : f32    ; folds to ConstFloat(1.5_as_f32, F32)
+%2 = const_float 9.0 : f64   ; this IS legal as a Select operand if ty checks are relaxed
+%3 = const_bool true
+%4 = select %3, %1, %2 : f64  ; declared f64
+```
+Select folds to `ConstFloat(1.5, F32)` — but the instruction's `ty` is `Float(F64)`. Downstream FCmp on `%4` reads `Const::Float(_, F32)` and runs f32 math where f64 was meant.
+
+**Fix**: use `inst.ty` to pick the output constant width, not the chosen source's width. The reemit should cast:
+```rust
+let chosen_const = consts.get(&chosen)?;
+Some(match (inst.ty.clone(), *chosen_const) {
+    (IrType::Int(w),   Const::Int(v, _))   => InstKind::ConstInt(norm(v, w), w),
+    (IrType::Float(w), Const::Float(v, _)) => InstKind::ConstFloat(round(v, w), w),
+    (IrType::Bool,     Const::Bool(b))     => InstKind::ConstBool(b),
+    _ => return None,
+})
+```
+
+---
+
+## Major bugs
+
+### M-A. `const_fold::FloatToInt` bounds check uses `i64::MAX as f64` which rounds up to 2^63, admitting out-of-range values
+**File**: `src/opt/const_fold.rs:298-317`
+```rust
+let hi = match w {
+    ...
+    IntWidth::I64 => i64::MAX as f64,
+};
+if truncd < lo || truncd > hi { return None; }
+return Some(InstKind::ConstInt(norm(truncd as i64, *w), *w));
+```
+**Severity**: MAJOR.
+**Why wrong**: `i64::MAX = 9223372036854775807`. Cast to f64, it rounds to **9223372036854775808.0** = 2^63, because f64 has only 53 bits of mantissa. That means:
+- `truncd = 9223372036854775808.0` passes `truncd > hi` (false — they're equal).
+- `truncd as i64` in Rust uses saturating conversion on nightly/modern stable, producing `i64::MAX`. But semantically 2^63 is **one past** i64's range.
+- Similarly, values in `(i64::MAX, 2^63]` will appear to pass the range check.
+
+The fold silently produces `i64::MAX` for values outside the true i64 range — a wrong answer. At runtime, AArch64 `FCVTZS` on a value >= 2^63 saturates to `i64::MAX`. Rust's `as` saturates too. So... by coincidence this **matches hardware**. But the logic is wrong: the range check should use strict inequality on an exclusive hi, `truncd >= 2^63` should bail.
+
+More importantly, `i8::MAX = 127` casts exactly to 127.0, and `i32::MAX = 2147483647` casts exactly to 2147483647.0 — but `127.5.trunc() = 127.0` passes `truncd > hi` (false), and `127.0 as i8 = 127`. Fine. But `127.9.trunc() = 127.0`, still fine. This is only a correctness issue for i64 near the boundary.
+
+**Repro**:
+```fortran
+real(8) :: r = 9.223372036854776e18  ! rounds to 2^63 in f64
+integer(8) :: i
+i = int(r)  ! Fortran INT() toward zero
+```
+Expected per standard: undefined/implementation-defined (value out of integer range). Hardware: saturates to i64::MAX. Our const-fold: silently emits `i64::MAX`. Technically matches hardware, but the bounds check is broken and could allow other out-of-range folds once someone touches it.
+
+**Fix**: use exclusive upper bound: `truncd >= (i64::MAX as f64) + 1.0` → also 2^63, so check `truncd >= 9223372036854775808.0`. Better: test `!truncd.is_finite() || truncd < lo || truncd >= hi_plus_one` where `hi_plus_one = 2^(bits-1)` as f64. For i8/i16/i32 use `(i8::MAX as i64 + 1) as f64` etc.
+
+---
+
+### M-B. `const_fold::Shl` with shift count ≥ width emits 0, but **AArch64 SHL masks** the shift count — producing a **non-zero** result
+**File**: `src/opt/const_fold.rs:212-228`
+```rust
+if (0..bits).contains(&bv) {
+    return Some(InstKind::ConstInt(norm(av.wrapping_shl(bv as u32), *w), *w));
+}
+// Shift count >= width is implementation-defined
+// in C; AArch64 returns 0. Match that.
+return Some(InstKind::ConstInt(0, *w));
+```
+**Severity**: MAJOR.
+**Why wrong**: The comment is **incorrect**. AArch64 `LSL Xd, Xn, Xm` uses `Xm & 0x3F` (for 64-bit) or `Xm & 0x1F` (for 32-bit) as the actual shift count. A shift by exactly `bits` wraps to 0, producing `av` (identity), not 0. A shift by `bits+1` produces `av << 1`. See ARMv8 ARM, UBFM/LSLV definitions.
+
+So `shl x, 32` on an i32 produces `x`, not `0`. Our folder emits `0`. At `-O2`, the optimized constant and the runtime-computed value will disagree for any Fortran code that reaches a constant shift at or past the width. This is also aggravated by the ISHFT lowering on `src/ir/lower.rs:671`, which computes both the left and the right branch and selects. The left branch is `shl(args[0], args[1])` — if `args[1]` is a statically known negative number, const_fold will see `bv = -N` (sign-extended), `(0..bits).contains(&-N) = false`, and emit `0`. The Select then returns `0` when it should have returned the right-shifted value. And on AArch64, even the runtime would produce a different answer (it masks to low 5/6 bits of the negative number, which is nonzero).
+
+**Repro** (as IR):
+```
+%v = const_int 1 : i32
+%n = const_int 32 : i32
+%s = shl %v, %n : i32
+; ConstFold produces ConstInt(0, I32)
+; Runtime on AArch64 produces 1 (identity — mask of 32 & 31 = 0)
+```
+And with the ISHFT path — `ishft(1_i32, 33)` — the Shl branch gets evaluated as `shl 1, 33`, folder emits 0, but AArch64 emits `1 << (33 & 31) = 1 << 1 = 2`. Mismatch.
+
+Similar bugs in LShr (line 229-242, same `return 0`) and AShr — AShr does the right thing by replicating the sign bit, which **also disagrees with AArch64** (which would emit `av >> (count & 31)`).
+
+**Fix**: either bail (return None) for out-of-range counts, or mask the count to `bits-1` and re-enter the in-range path. Matching AArch64 means `bv & (bits-1)`.
+
+---
+
+### M-C. `const_fold::Shl` treats negative shift counts as "out of range" and emits 0
+**File**: `src/opt/const_fold.rs:212-228`
+**Severity**: MAJOR.
+**Why wrong**: `bv as i64` stays signed. `(0..bits).contains(&bv)` with `bv = -1` is false. Folder hits the `return Some(InstKind::ConstInt(0, *w))` branch. But `av.wrapping_shl(-1 as u32)` = `av.wrapping_shl(0xFFFFFFFF)` which Rust defines as `av.wrapping_shl(0xFFFFFFFF % 32) = av.wrapping_shl(31)`. So the runtime-semantic answer would be `av << 31`, not 0.
+
+More importantly: Fortran's ISHFT(a, -1) is a right shift by 1. The lowerer handles this by computing **both** the Shl(a, -1) and the LShr(a, 1) branches and selecting between them. When the const_fold sees Shl(a, -1) with a constant -1, it folds to 0. When the const_fold also sees the Select's condition as constant-false (because `-1 >= 0` folds to false), the Select picks the LShr branch — so the end result is correct! But the Shl(a, -1) instruction, before the Select fold removes it, has been folded to const(0), which is **dead-but-wrong**. Not immediately observable, but CSE or downstream passes could key off of it in surprising ways.
+
+**Fix**: for negative `bv`, return None (leave it alone — runtime semantics are implementation-defined).
+
+---
+
+### M-D. `const_fold::ICmp` uses the width from operand `a` only, ignoring `b`'s stored width
+**File**: `src/opt/const_fold.rs:149-164`
+```rust
+InstKind::ICmp(op, a, b) => {
+    if let (Some(Const::Int(av, w)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
+        let av = sext(av, w.bits());
+        let bv = sext(bv, w.bits());   // <-- uses w from a, not b
+```
+**Severity**: MAJOR.
+**Why wrong**: If the two operands have different `IntWidth` values in their stored constant records (which can happen transiently during folding — a chain like IntTrunc/IntExtend can leave widths out of sync with the containing compare's nominal operand widths), `bv` gets sign-extended from `a`'s width instead of its own. `bv = -1` stored with width i8 but `a`'s width is i32: `sext(-1, 32) = -1` (already sign-extended to i64). Safe here because both operands represent the same width normally. But consider `bv` that is stored as an i64 value `255` (the raw bit pattern of -1 as u8), with `b`'s constant record reporting i8 — the code uses `a`'s width (say i8) which happens to work. Now make them different: `a` is i32 holding 255, `b` is i8 holding 255. `sext(255, 32) = 255`, `sext(255, 32) = 255` (using a's width 32 for both) — `255 == 255` is true. But if `b` really is i8, `255` should be interpreted as `-1`, giving `255 != -1` → false.
+
+Today verifier enforces operand types match, so this is dormant. The bug is latent: any pass that mixes widths (e.g., a future GVN that unifies comparisons across type casts) hits this silently. Severity is **MAJOR** because it's invisible to the verifier (which only checks `is_int`, not widths on compares).
+
+**Fix**: use `bv`'s own width: `let (Some(Const::Int(av, aw)), Some(Const::Int(bv, bw))) = (get(a), get(b))` then `sext(av, aw.bits())` and `sext(bv, bw.bits())`. Even better: verify width equality and bail otherwise.
+
+---
+
+### M-E. `const_fold::FCmp` on floats doesn't match f32 precision for f32 operands
+**File**: `src/opt/const_fold.rs:165-178`
+```rust
+InstKind::FCmp(op, a, b) => {
+    if let (Some(Const::Float(av, _)), Some(Const::Float(bv, _))) = (get(a), get(b)) {
+        let r = match op {
+            CmpOp::Eq => av == bv,
+            ...
+```
+**Severity**: MAJOR (tied to the M-1 f32 rounding bug you already found).
+**Why wrong**: `av` and `bv` are stored as f64 regardless of declared width. If either was computed from f32 arithmetic but stored without being rounded through f32 (M-1), the compare sees the unrounded f64, but the runtime sees the f32-rounded value. Two values that compare equal at runtime can compare unequal here, and vice versa.
+
+Combined with M-1: `IntToFloat(16777217, f32)` folds to ConstFloat(16777217.0, F32). An `FCmp Eq` against `ConstFloat(16777216.0, F32)` (which actually was rounded to f32) would return false at const-fold, but true at runtime.
+
+**Fix**: normalize both operands through the declared f32 precision before comparing: if either operand's type is f32 (inspect `func.value_type` of the operand, or propagate the width in `Const::Float`), round both to f32 before comparing. Depends on M-1 being fixed too.
+
+---
+
+### M-F. `const_fold::FloatToInt` uses f64 `truncd` against f64 bounds even when the source was f32
+**File**: `src/opt/const_fold.rs:298-317`
+**Severity**: MAJOR.
+**Why wrong**: The source is `Const::Float(av, _)` — the stored width is ignored. For `av` stored as f64 but originating from an f32 computation that was never rounded, the bounds check and subsequent cast see a value that wouldn't exist at runtime. Example: an f32 computation produces `2147483648.0` (exactly representable in f32, it's 2^31). AArch64 `FCVTZS.i32` saturates to `i32::MAX`. Our fold:
+- `truncd = 2147483648.0`
+- `hi = i32::MAX as f64 = 2147483647.0`
+- `truncd > hi` → true → returns None (bails, good).
+
+OK that case works. But: an f32 value `2147483520.0` (next representable f32 below 2^31, fits in i32) — folder casts `2147483520.0 as i64 = 2147483520`, norms to i32, emits correctly.
+
+Now the adversarial: f32 source whose `Const::Float` stored f64 value is `2147483647.0` exactly. Since f32 can't represent 2147483647, the runtime would round it to `2147483648.0 = 2^31`, which `FCVTZS` saturates to i32::MAX = 2147483647. Our folder with the unrounded f64 value `2147483647.0` passes the bounds check (`>hi` is false), casts to i64 = 2147483647, emits `ConstInt(2147483647, I32)`. Both paths arrive at 2147483647 by different routes — by luck.
+
+The real divergence: f32 source stores value `2147483500.0` exactly but rounds to the nearest f32 = `2147483520.0`. Folder casts `2147483500 as i64 = 2147483500`. Runtime computes `int(2147483520.0) = 2147483520`. Mismatch of 20 units.
+
+This is really the same root as M-1/M-E: f32 values aren't rounded to f32 precision anywhere. The fix is to always round through f32 when the source/destination is declared f32.
+
+**Fix**: same as M-1 — consult operand type and round when width is F32.
+
+---
+
+## Medium issues
+
+### Med-1. `cse::LocalCse` `seen` map is **not cleared between basic blocks** → wait, it is. Scratch this. Actual issue: `ConstInt` CSE collision across widths
+**File**: `src/opt/cse.rs:66-69`
+```rust
+InstKind::ConstInt(v, w)   => mk(1, vec![], (*v as i128 + (w.bits() as i128) * (1i128 << 70)) as i64),
+```
+**Severity**: MEDIUM.
+**Why wrong**: The aux encoding `(v as i128 + w.bits() * 2^70) as i64` throws away the high bits when casting i128 → i64. Any two ConstInts with `v + bits*(2^70) ≡ v' + bits'*(2^70)  (mod 2^64)` collide. Since `bits` is 8/16/32/64, the high multiplier is `bits * 2^70`, which when cast to i64 is effectively `(bits * 2^70) mod 2^64 = 0` (because 2^70 mod 2^64 = 2^6 = 64, so bits*64 mod 2^64). So two `ConstInt(v, I8)` and `ConstInt(v, I64)` produce aux values `v + 8*64 = v + 512` vs `v + 64*64 = v + 4096`, which differ — OK. But `ConstInt(0, I8)` aux = 512, and `ConstInt(512, I8)` aux = 8*64 + 512 = 1024. Different, fine.
+
+Wait, more carefully: `(v as i128 + bits * 2^70) as i64` — the cast from i128 to i64 **wraps**. The i128 value is e.g. `0 + 8 * 2^70`. 2^70 in i128 is well-defined. Casting to i64 takes the low 64 bits: `8 * 2^70 mod 2^64 = 8 * (2^70 mod 2^64) = 8 * 2^6 = 512`. OK good.
+
+But: `ConstInt(512, I8)` aux = `512 + 8*2^70` mod 2^64 = `512 + 512 = 1024`. `ConstInt(1024, I8)` aux = `1024 + 512 = 1536`. Distinct so far.
+
+What about same value different width: `ConstInt(0, I8)` aux = 512. `ConstInt(0, I16)` aux = 16 * 2^6 = 1024. Differ, good.
+
+What about `ConstInt(512, I8)` (stored as 512, which is out of range — assuming the IR doesn't enforce narrowing, this is legal in the i64 slot) vs `ConstInt(0, I16)`: 1024 = 1024. **Collision.** Both map to the same `Key`, but the Key also has `ty: inst.ty.clone()`, which would be `Int(I8)` vs `Int(I16)` — different. **OK, the type disambiguates.**
+
+What about `ConstInt(v, I8)` where `v` is fully sign-extended to i64 (e.g., `-1 = 0xFFFFFFFFFFFFFFFF`) vs `ConstInt(0xFFFFFFFFFFFFFFFF, I8)` — same value. Aux = `-1 + 512` mod 2^64 = `-1 + 512` as i64 = `511`. Also fine.
+
+But what about `ConstInt(v, I64)` with a very large positive `v` near `i64::MAX`: aux = `i64::MAX + 64*64` mod 2^64 = `i64::MAX + 4096` mod 2^64 = `i64::MIN + 4095` (wraps into negative). Another i64 with `v' = i64::MIN + 4095 - 4096 = i64::MIN - 1 = i64::MAX` (wraps back). So `ConstInt(i64::MAX - 4096, I64)` has aux `= (i64::MAX - 4096) + 4096 = i64::MAX`. And `ConstInt(i64::MAX, I64)` has aux `= i64::MAX + 4096` → wraps to `i64::MIN + 4095`. These two are distinct. OK.
+
+Actually the encoding is **hazardous but empirically collision-resistant** for plausible values. It's ugly, though — if someone adds a new IntWidth (e.g., I128) and the exponent shift changes, collisions will become possible. And the explicit `ty` field in `Key` (line 59) **does** catch width mismatches at the top level. Good defense.
+
+**Real M-D**: the `ty` field works but means the aux bits are effectively redundant. You can simplify to `mk(1, vec![], *v)` — the width comes from `ty`. Downgrading to MINOR.
+
+### Med-1 (corrected). `cse::LocalCse` ConstFloat key uses bitcast xor with bit-width, causing `0.0` vs `-0.0` to key-collide inconsistently
+**File**: `src/opt/cse.rs:68`
+```rust
+InstKind::ConstFloat(v, w) => mk(2, vec![], (v.to_bits() as i64) ^ (w.bits() as i64)),
+```
+**Severity**: MEDIUM.
+**Why wrong**: 
+1. `0.0.to_bits() = 0`, `(-0.0).to_bits() = 0x8000000000000000`. XOR'd with width bits (32 or 64), these give distinct keys, so `0.0` and `-0.0` **don't** collide in CSE — good, because `0.0 == -0.0` is true under IEEE `FCmp Eq` but the bit patterns differ (which matters if the value is later used in a `Store` or a sign-bit-sensitive op like `FAbs`/`FNeg`/`Div`).
+2. NaN: every NaN bit pattern (`0x7FF8000000000001`, `0x7FF8000000000002`, ...) gets a different key. Good, because NaN != NaN under IEEE comparisons anyway.
+3. **Actual bug**: the `ty` field in `Key` is `Float(F32)` or `Float(F64)`, which is already captured in `ty`. But the aux value re-mixes `w.bits()` into the bit pattern. For an f64 with `v.to_bits() = 0x20` (some small positive), XOR with 64 = 0x60. For an f32 with `v.to_bits() = 0x60` (encoded as f64 bits via `*v`), XOR with 32 = 0x40. Different. But there's no systematic collision. OK.
+
+Actually the real issue: `ConstFloat(v, w)` stores `v: f64`. The same stored f64 can come from an f32 const (via cast) or an f64 const. Two `ConstFloat(1.5, F32)` and `ConstFloat(1.5, F64)` have the same `v.to_bits()` only if 1.5 is bit-identical in f64 representation — which it is (1.5 is exactly representable). Their keys differ via `w.bits() xor`: 0x3FF8000000000000 ^ 32 vs 0x3FF8000000000000 ^ 64 = `...020` vs `...040`. Distinct. **But** they also have distinct `ty`, so even identical aux would be disambiguated. OK.
+
+Downgrading again to **MINOR**: the encoding is safe but convoluted and the aux is mostly redundant with `ty`. No active correctness issue.
+
+### Med-2. `const_fold::IDiv`/`IMod` underflow check uses `i64::MIN/-1` instead of width-specific min/-1
+**File**: `src/opt/const_fold.rs:108-128`
+```rust
+// i64::MIN / -1 also overflows; bail to keep behavior identical.
+if av == i64::MIN && bv == -1 { return None; }
+```
+**Severity**: MEDIUM.
+**Why wrong**: The IR stores i8/i16/i32 constants sign-extended to i64, so an `i32::MIN = -2147483648` value comes through as `av = -2147483648` (NOT i64::MIN). The check `av == i64::MIN` only fires for true 64-bit operations. So `IDiv(i32::MIN_i32, -1) : i32` **passes the check**, computes `(-2147483648 / -1) = 2147483648` (valid as i64), then `norm(2147483648, I32) = sext(mask(2147483648, 32), 32) = sext(0, 32) = 0`. That's wrong — AArch64 SDIV of `w(-2147483648) / w(-1)` produces **undefined** behavior (AArch64 actually returns 0x80000000 = -2147483648, i.e., saturating), NOT 0.
+
+Similarly `i8::MIN / -1`: `av = -128`, `-128 / -1 = 128` as i64, `norm(128, I8) = sext(mask(128, 8), 8) = sext(0, 8) = 0`. Wrong again — hardware produces -128.
+
+**Repro** (the audit_tests.rs `audit_const_fold_idiv_i8_min_neg_one` test exists and says "Either -128 or IDiv — anything else is divergence." Currently the folder produces... let me trace: `IDiv(-128, -1) : i8`. Check `av == i64::MIN (no)`. Divides: `-128 / -1 = 128`. `norm(128, I8)`: `mask(128, 8) = 128 & 0xFF = 128`, `sext(128, 8) = shift by 56, then >> 56 signed = -128`. Oh wait, `128 << 56 = 0x8000000000000000`, shifted right arithmetic by 56 gives `0xFFFFFFFFFFFFFF80 = -128`. So the result is `-128`, matching AArch64. The test passes today.
+
+Re-checking i32: `(-2147483648_i64) / (-1_i64) = 2147483648_i64` (fits in i64). `norm(2147483648, I32)`: `mask(2147483648, 32) = 2147483648 & 0xFFFFFFFF = 0 `. `sext(0, 32) = 0`. But `-2147483648 as i32` divided by `-1 as i32` on hardware: SDIV of two's-complement `0x80000000 / 0xFFFFFFFF` — the result is `0x80000000` = `i32::MIN`, not 0.
+
+Wait: `2147483648 & 0xFFFFFFFF`. `2147483648 = 0x80000000`, the low 32 bits of which are `0x80000000`. So `mask(2147483648, 32) = 0x80000000 = 2147483648_u64`, interpreted as i64 that's still 2147483648. Then `sext(2147483648, 32)`: `shift = 32`, `(2147483648 << 32) >> 32`. `2147483648 << 32 = 0x8000000000000000 = i64::MIN`. `i64::MIN >> 32` (arithmetic) = `-2147483648`. So the final value is **-2147483648**.
+
+OK: my arithmetic was wrong. The norm does produce -2147483648 for i32. Let me re-verify i8 too: `(-128_i64) / (-1_i64) = 128_i64`. `mask(128, 8) = 128 & 0xFF = 128`. `sext(128, 8)`: `(128 << 56) >> 56` = `0x8000000000000000 >> 56` arithmetic = `0xFFFFFFFFFFFFFF80 = -128`. OK. 
+
+So the i64::MIN check is **narrow but correct** — narrow widths wrap through the norm function correctly. The guard only exists for true i64 overflow, which is the one case Rust panics on. **Demoting this to "surprises"** — it looks wrong but works. See Surprises section.
+
+### Med-3. `const_fold::PopCount`/`CountLeadingZeros`/`CountTrailingZeros` never consults `inst.ty` — the result width comes from the source operand's width
+**File**: `src/opt/const_fold.rs:259-288`
+```rust
+InstKind::PopCount(a) => {
+    if let Some(Const::Int(av, w)) = get(a) {
+        let val = mask(av, w.bits()) as u64;
+        return Some(InstKind::ConstInt(val.count_ones() as i64, w));  // w from source
+    }
+    None
+}
+```
+**Severity**: MEDIUM.
+**Why wrong**: The result type of `PopCount(x)` is declared by `inst.ty`, which Fortran semantics say is always the same width as `x`. Today they match because the lowerer respects that. But if `inst.ty != ty_of(x)` for any reason (a bug earlier in the pipeline, or a future sprint that narrows the return type of popcount to i32 always, matching C intrinsics), the fold produces a constant with the wrong width. The verifier's `check_type_consistency` doesn't catch this (it doesn't check counts' width matches inst.ty).
+
+**Fix**: use `inst.ty` as the output width, with a type extraction helper.
+
+### Med-4. `const_fold::IntToFloat` line 291-297 doesn't round through `fw` (same family as M-1 already found)
+**File**: `src/opt/const_fold.rs:291-297`
+**Severity**: MEDIUM (your M-1 finding covered this).
+**Note**: marking for completeness that this plus the FloatExtend/FloatTrunc path on line 320-329 plus `fold_float_bin/un` rounding in 364-392 is consistent — so **only line 294 is missing the rounding**. `FloatExtend/Trunc` line 323 does `av as f32 as f64` correctly. `fold_float_bin/un` also round on f32. So IntToFloat is the outlier.
+
+### Med-5. `dce::Dce` doesn't rewrite branch arguments when blocks become unreachable; dead block parameters live forever
+**File**: `src/opt/dce.rs:180-201`
+**Severity**: MEDIUM (this is your C-1 finding from audit_tests.rs).
+**Why wrong**: `dce_function` only considers instructions as liveness candidates. Block parameters are never removed even when unused. Worse: when a block's only predecessor is pruned (or rewritten to target elsewhere), the remaining predecessor may still pass block-arguments whose values aren't used — those args are themselves live (because they're referenced in a Branch/CondBranch), so DCE keeps their defining instructions alive. A chain of dead-but-referenced block args can keep an entire computation alive.
+
+**Documented in `audit_tests.rs::audit_dce_does_not_remove_dead_block_param`** — so you've noted this. Listing it here so it's in the report proper.
+
+### Med-6. `licm::is_hoist_candidate` hoists `Select` instructions — but a Select's condition is a loop-invariant **guard** that may prevent a poison/trap in one arm
+**File**: `src/opt/licm.rs:54-65`
+**Severity**: MEDIUM.
+**Why wrong**: `Select` is currently on the hoistable list (not in the exclusion list). A Select whose condition is invariant and whose arms are invariant is safe to hoist — the classic `cond ? x : y` where all three are loop-constant. But consider:
+```
+; inside loop, after bounds check against i
+%bad = idiv %a, %b_maybe_zero  ; loop-invariant values
+%good = const 0
+%cond = icmp ne %b_maybe_zero, 0
+%r = select %cond, %bad, %good  ; selects 0 when div-by-zero
+```
+The `select` itself is pure and all operands are loop-invariant. LICM would hoist `%bad` (the div) out of the loop too, because div is... wait, Div isn't currently in the hoist exclusion list either. **That's the real bug**: IDiv and IMod are candidates for LICM, and hoisting them out of a guarding conditional turns guaranteed-no-op cases into trap/UB cases.
+
+**Repro**:
+```fortran
+do i = 1, 10
+  if (b /= 0) then
+    c = a / b
+    call use(c)
+  end if
+end do
+```
+If `a`, `b`, `c` live in allocas, loads block everything and LICM does nothing. But if the lowerer ever registerizes these, the invariant `a/b` gets hoisted out of the `if`, causing SIGFPE when `b == 0`. Fortran's semantics say `a/b` only executes when the guard is true. LICM would break that.
+
+**Fix**: exclude trap-prone pure operations (`IDiv`, `IMod`, `FDiv`, `FSqrt`, `FPow`) from `is_hoist_candidate`, or require a proof that the operand that could trap is non-trapping. LLVM has the concept of "safe to speculate" for exactly this reason.
+
+---
+
+## Minor / code-smell
+
+### Min-1. `cse::LocalCse` reapplies `substitute_uses` in a loop, each call walks the whole function
+**File**: `src/opt/cse.rs:257-260`
+**Severity**: MINOR (perf, not correctness — already flagged in-code).
+
+### Min-2. `licm::block_index` is built once but comment says "rebuild per iteration"; never rebuilt
+**File**: `src/opt/licm.rs:126-129, 141`
+**Severity**: MINOR. Not a current bug because `func.blocks` is never structurally mutated by LICM, but the stale comment is a landmine.
+
+### Min-3. `const_fold::Shl` sign-extends shift count for range check but then casts `bv as u32` — a previously sign-extended negative sneaks into the cast
+**File**: `src/opt/const_fold.rs:212-228`
+**Severity**: MINOR (see M-C above).
+
+### Min-4. `cse::Key` ConstFloat aux xor is redundant with the `ty` field
+**File**: `src/opt/cse.rs:68` — see Med-1 analysis.
+
+---
+
+## Surprises (things that LOOK wrong but actually work)
+
+### S-1. `const_fold::IDiv/IMod` `i64::MIN / -1` check appears not to cover narrow widths, but `norm()` correctly wraps
+The guard at line 112 (`if av == i64::MIN && bv == -1 { return None; }`) only protects against Rust panicking on true 64-bit overflow. For narrower widths, the Rust `/` operation succeeds (e.g., `-128_i64 / -1_i64 = 128_i64`, no panic), then `norm()` truncates and re-sign-extends to yield the correct `-128` two's-complement wraparound. I worked through i8 and i32 cases and both match AArch64 SDIV semantics. **Not a bug.**
+
+### S-2. `const_fold::try_fold` walks function linearly without respecting RPO
+A single const_fold pass visits blocks in `func.blocks.iter()` order. For non-RPO layouts, an instruction in block `B[k]` might reference a constant defined in `B[k+1]` (if `B[k+1]` dominates `B[k]` but appears later in the vector). In that case, the first pass would miss the fold. **But** the pass manager runs to fixpoint, so a second pass picks it up. Audit test `audit_const_fold_non_rpo_block_order` covers this. **Not a bug.**
+
+### S-3. `licm::find_natural_loops` produces one `NaturalLoop` per header, merging multiple back-edges naturally
+The `by_header` grouping on line 274 collapses all back-edges into the same header into one `NaturalLoop` with multiple latches. The body union is computed via the shared header (line 283-298), which is correct for reducible loops. **Not a bug**, though it couples loosely with the self-loop bug you already found (M-7) — the latch==header edge still produces a 1-element latches vector, the body-computation walk starts from the latch (which is the header), adds header to body already, then immediately stops because `p == header` (continue). Self-loops with no other back path produce body={header}, then `find_preheader` sees all header predecessors as out-of-loop... which is exactly the M-7 bug you documented. So S-3 is correct for multi-latch loops; the self-loop degenerate case is M-7.
+
+---
+
+## New adversarial test suggestions (haven't written these — describing for you to verify)
+
+1. **C-C reproducer**: Select whose chosen arm is a ConstFloat with width F32 but whose declared type is F64. After const-fold, check that the rewritten ConstFloat has width F64.
+
+2. **M-A reproducer**: FloatToInt from f64 near 2^63 boundary. Specifically, fold `FloatToInt(2^63_as_f64, I64)` — should return None (or a sentinel) since 2^63 is out of range.
+
+3. **M-B reproducer**: `shl 1_i32, 32_i32` — assert fold produces `1` (matching AArch64 identity wrap) or bails to leave the Shl in place, but **not** `ConstInt(0, I32)`.
+
+4. **M-C reproducer**: `shl 1_i32, (-1)_i32` — same expectation: either produce the masked-count result or bail.
+
+5. **Med-6 reproducer**: build a synthetic loop with a guarded `idiv x, y` where y is loop-invariant. Run LICM. Assert the idiv is **not** hoisted out of the guarding block.
+
+6. **IR shape for C-B / Min-2**: nested loops where an inner loop's preheader is inside an outer loop's body. Build the IR manually, run LICM, and check that all hoisted instructions land in valid dominating positions.
+
+---
+
+## Recommendations by severity
+
+**Ship-blockers before any -O2 code hits fortsh**:
+- **C-A** strength_reduce Identity silent continue (ticking time bomb)
+- **C-C** Select constant width mismatch (type-punning verifier can't catch)
+- **M-B/M-C** Shl out-of-range counts (wrong answer on Fortran ISHFT)
+- **Med-6** LICM hoisting trap-prone ops (introduces crashes in code that was correct)
+
+**Next priority**:
+- **M-A** FloatToInt i64 range edge
+- **M-D** ICmp width from `a` only
+- **M-E/M-F** f32 precision in compares and casts (ties to your M-1)
+
+**Eventually**:
+- **Med-3** PopCount/CTZ/CLZ result width
+- **Med-5** DCE doesn't clean up dead block parameters
+- Minors are code smell, not correctness.
+
+---
+
+Happy to write any of the adversarial tests if you want; per your instructions I've stopped at reporting. The hardest-hitting ones in terms of "will this actually miscompile fortsh today" are **Med-6** (LICM + trap) and **M-B** (Shl out-of-range), since `fortsh` uses ISHFT and bit manipulation heavily in its readline/tokenizer modules, and once the lowerer registerizes values (no more load-blocks-everything dormancy) LICM will start firing on arithmetic.
