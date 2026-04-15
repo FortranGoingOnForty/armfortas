@@ -5939,6 +5939,40 @@ fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool
 }
 
 
+/// Look up the derived-type NAME a callee's result variable carries, if
+/// any.  Used by `Expr::ComponentAccess` when the base is a function
+/// call returning a derived type — the call evaluates to a pointer to
+/// a result struct, and we need the type name to resolve the
+/// subsequent `%field` through the layout registry.  Returns None for
+/// intrinsic returns, unresolved callees, or subroutines.
+fn callee_return_derived_type_name(
+    st: &SymbolTable,
+    callee_name: &str,
+) -> Option<String> {
+    use crate::sema::symtab::{ScopeKind, TypeInfo};
+    let key = callee_name.to_lowercase();
+    if let Some(TypeInfo::Derived(name)) = st
+        .scopes
+        .iter()
+        .find_map(|scope| scope.symbols.get(&key))
+        .and_then(|sym| sym.type_info.as_ref())
+    {
+        return Some(name.clone());
+    }
+    let callee_scope = st.scopes.iter().find(|scope| {
+        matches!(&scope.kind, ScopeKind::Function(name) if name.to_lowercase() == key)
+    })?;
+    for sym in callee_scope.symbols.values() {
+        if callee_scope.arg_order.iter().any(|arg| arg == &sym.name.to_lowercase()) {
+            continue;
+        }
+        if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
     use crate::sema::symtab::ScopeKind;
 
@@ -12811,7 +12845,33 @@ fn lower_expr_full(
 
         Expr::ComponentAccess { base, component } => {
             if let Some(tl) = type_layouts {
-                if let Some((base_addr, type_name)) = resolve_component_base(b, locals, base, tl) {
+                // Common case: base is a Name or chained ComponentAccess.
+                let resolved = resolve_component_base(b, locals, base, tl);
+                // Inline case: base is a call that returns a derived type,
+                // e.g. `add_t(a, b)%x`.  resolve_component_base doesn't
+                // know how to lower a FunctionCall, so handle it here.
+                // The call itself evaluates to a ptr<i8> pointing at the
+                // result struct, so we can reuse it as the component
+                // base address — but we still need the callee's return
+                // type name to look up the layout.
+                let resolved = resolved.or_else(|| {
+                    if let Expr::FunctionCall { callee, .. } = &base.node {
+                        if let Expr::Name { name } = &callee.node {
+                            if let Some(ret_type_name) =
+                                callee_return_derived_type_name(st, name)
+                            {
+                                let base_ptr = lower_expr_full(
+                                    b, locals, base, st, type_layouts,
+                                    internal_funcs, contained_host_refs,
+                                    descriptor_params,
+                                );
+                                return Some((base_ptr, ret_type_name));
+                            }
+                        }
+                    }
+                    None
+                });
+                if let Some((base_addr, type_name)) = resolved {
                     if let Some(layout) = tl.get(&type_name) {
                         if let Some(field) = layout.field(component) {
                             let offset = b.const_i64(field.offset as i64);
