@@ -91,7 +91,7 @@ Deferred items categorized during Sprint 21.5 cleanup. Items marked **[FIXED]** 
 
 ## IR — Basic Construction (Sprint 15)
 
-- **(D)** No I128 for integer(16). Exotic.
+- **[FIXED]** ~~No I128 for integer(16). Exotic.~~ Stack-passed args, formatted/internal READ, and the previously-blocked `Load(ptr<i128>)` path are now lit up. Two specific blockers were: the i128_backend_o0_supported gate rejected `Load` whose result type was `Ptr(Int(I128))` even though the loaded value is a normal 64-bit pointer, and the `collect_host_references` walker omitted a contained function's `result(r)` clause name, so `result` variables that happened to share a host name leaked into the closure-passing arg list and double-purposed as a phantom sret buffer. Both fixed; all 47 i128 integration tests now run unignored.
 - **(D)** `value_type()` is O(n) linear scan. Performance only.
 
 ## IR — Parameter Constants

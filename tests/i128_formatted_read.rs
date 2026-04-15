@@ -372,7 +372,6 @@ fn integer16_formatted_read_sections_object_snapshot_is_deterministic_at_o2() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn integer16_formatted_read_alloc_section_uses_descriptor_bounds_and_wide_reader() {
     let source = fixture("integer16_format_read_alloc_section.f90");
 
@@ -399,7 +398,6 @@ fn integer16_formatted_read_alloc_section_uses_descriptor_bounds_and_wide_reader
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn integer16_formatted_read_alloc_section_object_snapshot_is_deterministic_at_o2() {
     let source = fixture("integer16_format_read_alloc_section.f90");
     let first = capture_text(
@@ -423,7 +421,6 @@ fn integer16_formatted_read_alloc_section_object_snapshot_is_deterministic_at_o2
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn integer16_formatted_read_alloc_reverse_section_uses_wide_reader() {
     let source = fixture("integer16_format_read_alloc_reverse_section.f90");
 
@@ -449,7 +446,6 @@ fn integer16_formatted_read_alloc_reverse_section_uses_wide_reader() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn integer16_formatted_read_alloc_reverse_section_runs_across_all_opt_levels() {
     for level in [
         OptLevel::O1,
@@ -476,7 +472,6 @@ fn integer16_formatted_read_alloc_reverse_section_runs_across_all_opt_levels() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn integer16_formatted_read_alloc_reverse_section_object_snapshot_is_deterministic_at_o2() {
     let source = fixture("integer16_format_read_alloc_reverse_section.f90");
     let first = capture_text(

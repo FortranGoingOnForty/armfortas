@@ -631,6 +631,12 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::ConstInt(_, IntWidth::I128) => true,
         InstKind::Undef(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        // Loading a *pointer* whose pointee happens to be i128 is just
+        // an 8-byte vreg load — the wide-slot machinery isn't involved.
+        // type_contains_i128 walks through Ptr<>, so without this arm
+        // the catch-all would falsely reject `load ptr<i128>` when
+        // dereferencing an sret-style hidden result-buffer pointer.
+        InstKind::Load(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::ICmp(..) if uses_i128 => true,

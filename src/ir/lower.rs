@@ -987,22 +987,37 @@ fn collect_host_references(
         }
     }
     // Collect names declared locally in the subprogram.
-    let (sub_decls, sub_body, sub_args): (
+    // Also seed with the function name and any RESULT(r) clause name —
+    // those are implicit local names that don't appear in the
+    // declaration list but must shadow same-named host variables when
+    // deciding which references close over the host scope.
+    let (sub_decls, sub_body, sub_args, sub_implicit_names): (
         &[crate::ast::decl::SpannedDecl],
         &[crate::ast::stmt::SpannedStmt],
         Vec<String>,
+        Vec<String>,
     ) = match sub {
-        ProgramUnit::Subroutine { decls, body, args, .. }
-        | ProgramUnit::Function { decls, body, args, .. } => {
+        ProgramUnit::Subroutine { decls, body, args, name, .. } => {
             let arg_names: Vec<String> = args.iter().filter_map(|a| {
                 if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
             }).collect();
-            (decls, body, arg_names)
+            (decls, body, arg_names, vec![name.to_lowercase()])
+        }
+        ProgramUnit::Function { decls, body, args, name, result, .. } => {
+            let arg_names: Vec<String> = args.iter().filter_map(|a| {
+                if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
+            }).collect();
+            let mut implicits = vec![name.to_lowercase()];
+            if let Some(r) = result {
+                implicits.push(r.to_lowercase());
+            }
+            (decls, body, arg_names, implicits)
         }
         _ => return,
     };
     let mut sub_locals = std::collections::HashSet::new();
     for n in sub_args { sub_locals.insert(n); }
+    for n in sub_implicit_names { sub_locals.insert(n); }
     for d in sub_decls {
         if let Decl::TypeDecl { entities, .. } = &d.node {
             for e in entities {

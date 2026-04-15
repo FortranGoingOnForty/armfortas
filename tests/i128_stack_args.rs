@@ -20,7 +20,6 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
     let asm = capture_text(
         CaptureRequest {
@@ -54,7 +53,6 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn internal_i128_stack_call_runs_at_o0() {
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_internal_stack_call.f90"),
@@ -77,7 +75,6 @@ fn internal_i128_stack_call_runs_at_o0() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn internal_i128_stack_call_runs_through_optimized_levels() {
     for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
         let result = capture_from_path(&CaptureRequest {
@@ -103,7 +100,6 @@ fn internal_i128_stack_call_runs_through_optimized_levels() {
 }
 
 #[test]
-#[ignore = "i128 backend codegen deferred — task #475"]
 fn internal_i128_stack_call_object_snapshot_is_deterministic_at_o0() {
     let source = fixture("integer16_internal_stack_call.f90");
     let first = capture_text(
