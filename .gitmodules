@@ -5,3 +5,6 @@
 	path = bencch
 	url = https://github.com/tenseleyFlow/bencch.git
 	branch = trunk
+[submodule "afs-ld"]
+	path = afs-ld
+	url = git@github.com:FortranGoingOnForty/afs-ld.git
