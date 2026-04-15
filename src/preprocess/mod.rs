@@ -1084,8 +1084,11 @@ fn has_trailing_continuation(line: &str) -> bool {
     find_code_trailing_ampersand(line).is_some()
 }
 
-/// Find the position of a trailing `&` that's in the code portion of a line.
-/// Returns None if there's no continuation, or if the `&` is inside a string or comment.
+/// Find the position of a trailing `&` continuation marker on this line.
+/// Recognises both code continuations (`&` outside strings) and the string
+/// continuation case where the `&` sits inside an unterminated literal —
+/// `'hello &\n      &world'` is one logical literal and the line still
+/// needs to be joined to the next.  Returns None if no `&` qualifies.
 fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut in_string: Option<u8> = None;
@@ -1095,7 +1098,9 @@ fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
     while i < bytes.len() {
         let ch = bytes[i];
 
-        // Track string state.
+        // Track string state.  Inside a string, `&` followed only by
+        // whitespace until end-of-line is also a continuation, and `!`
+        // is a literal character (not the start of a comment).
         if let Some(quote) = in_string {
             if ch == quote {
                 if i + 1 < bytes.len() && bytes[i + 1] == quote {
@@ -1103,6 +1108,14 @@ fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
                     continue;
                 }
                 in_string = None;
+                last_amp = None; // any `&` we saw was inside the now-closed string
+                i += 1;
+                continue;
+            }
+            if ch == b'&' {
+                last_amp = Some(i);
+            } else if !ch.is_ascii_whitespace() {
+                last_amp = None;
             }
             i += 1;
             continue;
