@@ -82,7 +82,16 @@ pub enum Stmt {
     ForallStmt { specs: Vec<ForallSpec>, mask: Option<SpannedExpr>, stmt: Box<SpannedStmt> },
 
     // ---- BLOCK / ASSOCIATE ----
-    Block { name: Option<String>, decls: Vec<super::decl::SpannedDecl>, body: Vec<SpannedStmt> },
+    Block {
+        name: Option<String>,
+        /// IMPLICIT statements declared inside the BLOCK.  F2018 §11.1.4
+        /// gives a BLOCK its own implicit-type rule environment that does
+        /// not leak out and is independent of the enclosing scope's
+        /// IMPLICIT NONE state.
+        implicit: Vec<super::decl::SpannedDecl>,
+        decls: Vec<super::decl::SpannedDecl>,
+        body: Vec<SpannedStmt>,
+    },
     Associate { name: Option<String>, assocs: Vec<(String, SpannedExpr)>, body: Vec<SpannedStmt> },
 
     // ---- Branch/transfer ----

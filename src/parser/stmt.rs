@@ -590,11 +590,11 @@ impl<'a> Parser<'a> {
         // Reuse parse_unit_body which already handles the full
         // interleaving of type-decls, PARAMETER, COMMON, DATA,
         // derived-type defs, and executable statements.
-        let (_uses, _imports, _implicit, decls, body, _ifaces) =
+        let (_uses, _imports, implicit, decls, body, _ifaces) =
             self.parse_unit_body(&["block"])?;
         self.consume_end("block")?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Stmt::Block { name: None, decls, body }, span))
+        Ok(Spanned::new(Stmt::Block { name: None, implicit, decls, body }, span))
     }
 
     fn parse_associate(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {

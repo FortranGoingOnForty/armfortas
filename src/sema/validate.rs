@@ -981,8 +981,17 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     }
 
     let mut undeclared = Vec::new();
+    let outer_implicit_letters: std::collections::HashSet<char> =
+        std::collections::HashSet::new();
     for stmt in stmts {
-        walk_stmt_for_undeclared(ctx.st, ctx.scope_id, stmt, &declared, &mut undeclared);
+        walk_stmt_for_undeclared(
+            ctx.st,
+            ctx.scope_id,
+            stmt,
+            &declared,
+            &outer_implicit_letters,
+            &mut undeclared,
+        );
     }
 
     // Deduplicate by name (only report each undeclared name once).
@@ -1002,13 +1011,14 @@ fn walk_stmt_for_undeclared(
     scope_id: ScopeId,
     stmt: &SpannedStmt,
     declared: &std::collections::HashSet<String>,
+    implicit_letters: &std::collections::HashSet<char>,
     undeclared: &mut Vec<(String, Span)>,
 ) {
     macro_rules! chk {
-        ($e:expr) => { check_expr_names(st, scope_id, $e, declared, undeclared) };
+        ($e:expr) => { check_expr_names(st, scope_id, $e, declared, implicit_letters, undeclared) };
     }
     macro_rules! recurse {
-        ($s:expr) => { walk_stmt_for_undeclared(st, scope_id, $s, declared, undeclared) };
+        ($s:expr) => { walk_stmt_for_undeclared(st, scope_id, $s, declared, implicit_letters, undeclared) };
     }
     match &stmt.node {
         Stmt::Assignment { target, value } => {
@@ -1046,9 +1056,12 @@ fn walk_stmt_for_undeclared(
         Stmt::DoConcurrent { body, .. } => {
             for s in body { recurse!(s); }
         }
-        Stmt::Block { decls, body, .. } => {
-            // BLOCK introduces a new scope with its own declarations.
-            // Collect them and pass an augmented declared set.
+        Stmt::Block { implicit, decls, body, .. } => {
+            // F2018 §11.1.4: a BLOCK construct establishes its own
+            // scope with an independent implicit-typing environment.
+            // Layer the block's declared names AND any IMPLICIT
+            // statements over the inherited rules; the local set
+            // does not leak back out.
             let mut block_declared = declared.clone();
             for d in decls {
                 if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
@@ -1057,8 +1070,54 @@ fn walk_stmt_for_undeclared(
                     }
                 }
             }
+            let mut block_implicit = implicit_letters.clone();
+            let mut block_implicit_none = false;
+            for d in implicit {
+                match &d.node {
+                    crate::ast::decl::Decl::ImplicitNone { .. } => {
+                        block_implicit_none = true;
+                    }
+                    crate::ast::decl::Decl::ImplicitStmt { specs } => {
+                        for spec in specs {
+                            for &(start, end) in &spec.ranges {
+                                for letter_byte in start as u8..=end as u8 {
+                                    let letter = (letter_byte as char).to_ascii_lowercase();
+                                    block_implicit.insert(letter);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // An IMPLICIT NONE inside the block clears the inherited
+            // letter set rather than augmenting it.  Subsequent
+            // IMPLICIT statements in the same block (rare but legal)
+            // re-establish a covering range from scratch.
+            if block_implicit_none {
+                block_implicit.clear();
+                for d in implicit {
+                    if let crate::ast::decl::Decl::ImplicitStmt { specs } = &d.node {
+                        for spec in specs {
+                            for &(start, end) in &spec.ranges {
+                                for letter_byte in start as u8..=end as u8 {
+                                    let letter = (letter_byte as char).to_ascii_lowercase();
+                                    block_implicit.insert(letter);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             for s in body {
-                walk_stmt_for_undeclared(st, scope_id, s, &block_declared, undeclared);
+                walk_stmt_for_undeclared(
+                    st,
+                    scope_id,
+                    s,
+                    &block_declared,
+                    &block_implicit,
+                    undeclared,
+                );
             }
         }
         Stmt::SelectCase { selector, cases, .. } => {
@@ -1093,6 +1152,7 @@ fn check_expr_names(
     scope_id: ScopeId,
     expr: &crate::ast::expr::SpannedExpr,
     declared: &std::collections::HashSet<String>,
+    implicit_letters: &std::collections::HashSet<char>,
     undeclared: &mut Vec<(String, Span)>,
 ) {
     match &expr.node {
@@ -1103,14 +1163,23 @@ fn check_expr_names(
             if declared.contains(&key) { return; }
             if st.lookup_in(scope_id, &key).is_some() { return; }
             if is_intrinsic_name(&key) { return; }
+            // F2018 §11.1.4: a BLOCK-scoped IMPLICIT statement gives
+            // names whose first letter is in the covered range an
+            // implicit type, even if the enclosing scope is
+            // IMPLICIT NONE.
+            if let Some(first) = key.chars().next() {
+                if implicit_letters.contains(&first.to_ascii_lowercase()) {
+                    return;
+                }
+            }
             undeclared.push((name.clone(), expr.span));
         }
         Expr::BinaryOp { left, right, .. } => {
-            check_expr_names(st, scope_id, left, declared, undeclared);
-            check_expr_names(st, scope_id, right, declared, undeclared);
+            check_expr_names(st, scope_id, left, declared, implicit_letters, undeclared);
+            check_expr_names(st, scope_id, right, declared, implicit_letters, undeclared);
         }
         Expr::UnaryOp { operand, .. } => {
-            check_expr_names(st, scope_id, operand, declared, undeclared);
+            check_expr_names(st, scope_id, operand, declared, implicit_letters, undeclared);
         }
         Expr::FunctionCall { callee, args } => {
             // Under IMPLICIT NONE the callee name must resolve to a
@@ -1121,18 +1190,18 @@ fn check_expr_names(
             // reuse it so `foo(3)` with no declaration of `foo` is
             // rejected at compile time instead of falling through to
             // a link error.
-            check_expr_names(st, scope_id, callee, declared, undeclared);
+            check_expr_names(st, scope_id, callee, declared, implicit_letters, undeclared);
             for arg in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    check_expr_names(st, scope_id, e, declared, undeclared);
+                    check_expr_names(st, scope_id, e, declared, implicit_letters, undeclared);
                 }
             }
         }
         Expr::ComponentAccess { base, .. } => {
-            check_expr_names(st, scope_id, base, declared, undeclared);
+            check_expr_names(st, scope_id, base, declared, implicit_letters, undeclared);
         }
         Expr::ParenExpr { inner } => {
-            check_expr_names(st, scope_id, inner, declared, undeclared);
+            check_expr_names(st, scope_id, inner, declared, implicit_letters, undeclared);
         }
         _ => {}
     }

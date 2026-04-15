@@ -5577,6 +5577,80 @@ fn arg_derived_type_name(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]
     None
 }
 
+/// Walk a statement and gather every Name reference appearing in
+/// expression position.  Used by the Stmt::Block lowering to discover
+/// implicitly-typed locals introduced by a block-scope IMPLICIT
+/// statement so they can be allocated alongside the explicit decls.
+fn collect_referenced_names(stmt: &SpannedStmt, out: &mut Vec<String>) {
+    fn walk_expr(expr: &crate::ast::expr::SpannedExpr, out: &mut Vec<String>) {
+        use crate::ast::expr::Expr;
+        match &expr.node {
+            Expr::Name { name } => out.push(name.clone()),
+            Expr::BinaryOp { left, right, .. } => { walk_expr(left, out); walk_expr(right, out); }
+            Expr::UnaryOp { operand, .. } => walk_expr(operand, out),
+            Expr::ParenExpr { inner } => walk_expr(inner, out),
+            Expr::ComponentAccess { base, .. } => walk_expr(base, out),
+            Expr::FunctionCall { callee, args } => {
+                walk_expr(callee, out);
+                for a in args {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        walk_expr(e, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    macro_rules! walk { ($e:expr) => { walk_expr($e, out) }; }
+    macro_rules! recurse { ($s:expr) => { collect_referenced_names($s, out) }; }
+    match &stmt.node {
+        Stmt::Assignment { target, value } => { walk!(target); walk!(value); }
+        Stmt::PointerAssignment { target, value, .. } => { walk!(target); walk!(value); }
+        Stmt::Print { items, .. } => { for i in items { walk!(i); } }
+        Stmt::Write { items, controls, .. } => {
+            for i in items { walk!(i); }
+            for c in controls { walk!(&c.value); }
+        }
+        Stmt::Read { items, controls, .. } => {
+            for i in items { walk!(i); }
+            for c in controls { walk!(&c.value); }
+        }
+        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+            walk!(condition);
+            for s in then_body { recurse!(s); }
+            for (cond, body) in else_ifs { walk!(cond); for s in body { recurse!(s); } }
+            if let Some(body) = else_body { for s in body { recurse!(s); } }
+        }
+        Stmt::IfStmt { condition, action } => { walk!(condition); recurse!(action); }
+        Stmt::DoLoop { body, var, start, end, step, .. } => {
+            if let Some(v) = var { out.push(v.clone()); }
+            if let Some(s) = start { walk!(s); }
+            if let Some(s) = end { walk!(s); }
+            if let Some(s) = step { walk!(s); }
+            for s in body { recurse!(s); }
+        }
+        Stmt::DoWhile { body, condition, .. } => {
+            walk!(condition);
+            for s in body { recurse!(s); }
+        }
+        Stmt::DoConcurrent { body, .. } => { for s in body { recurse!(s); } }
+        Stmt::Block { body, .. } => { for s in body { recurse!(s); } }
+        Stmt::SelectCase { selector, cases, .. } => {
+            walk!(selector);
+            for c in cases { for s in &c.body { recurse!(s); } }
+        }
+        Stmt::Call { args, .. } => {
+            for a in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    walk!(e);
+                }
+            }
+        }
+        Stmt::Labeled { stmt: inner, .. } => recurse!(inner),
+        _ => {}
+    }
+}
+
 /// Extract the derived-type name from a function `return_type`
 /// declaration. Returns `Some("vec")` for `type(vec) function f()` and
 /// `None` for intrinsic-typed returns. Used by the Function lowering
@@ -7272,11 +7346,63 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Block { decls, body, .. } => {
+        Stmt::Block { implicit, decls, body, .. } => {
             // F2008 BLOCK: declarations are scoped to the body.
             // Save any locals that the BLOCK's decls shadow, run
-            // the body, then restore the originals.
-            let block_keys: Vec<String> = decls.iter().flat_map(|d| {
+            // the body, then restore the originals.  F2018 §11.1.4
+            // also gives the BLOCK its own implicit-typing
+            // environment: an `implicit integer (i-n)` here introduces
+            // `n` as an integer local even when the enclosing scope
+            // is IMPLICIT NONE.  Synthesise TypeDecl entries for any
+            // name the body references that isn't in ctx.locals and
+            // whose first letter falls in a block-local implicit
+            // range, then run alloc_decls / init_decls over the
+            // combined list.
+            let mut effective_decls: Vec<crate::ast::decl::SpannedDecl> = decls.clone();
+            let mut implicit_map: std::collections::HashMap<char, crate::ast::decl::TypeSpec> =
+                std::collections::HashMap::new();
+            for d in implicit {
+                if let crate::ast::decl::Decl::ImplicitStmt { specs } = &d.node {
+                    for spec in specs {
+                        for &(start, end) in &spec.ranges {
+                            for letter_byte in start as u8..=end as u8 {
+                                let letter = (letter_byte as char).to_ascii_lowercase();
+                                implicit_map.insert(letter, spec.type_spec.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if !implicit_map.is_empty() {
+                let mut already_decl: std::collections::HashSet<String> = decls.iter().flat_map(|d| {
+                    if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
+                        entities.iter().map(|e| e.name.to_lowercase()).collect::<Vec<_>>()
+                    } else { vec![] }
+                }).collect();
+                let mut referenced: Vec<String> = Vec::new();
+                for s in body { collect_referenced_names(s, &mut referenced); }
+                for name in referenced {
+                    let key = name.to_lowercase();
+                    if already_decl.contains(&key) { continue; }
+                    if ctx.locals.contains_key(&key) { continue; }
+                    let Some(first) = key.chars().next() else { continue; };
+                    let Some(type_spec) = implicit_map.get(&first.to_ascii_lowercase()) else { continue; };
+                    already_decl.insert(key.clone());
+                    let synth = crate::ast::decl::Decl::TypeDecl {
+                        type_spec: type_spec.clone(),
+                        attrs: Vec::new(),
+                        entities: vec![crate::ast::decl::EntityDecl {
+                            name: name.clone(),
+                            array_spec: None,
+                            char_len: None,
+                            init: None,
+                            ptr_init: None,
+                        }],
+                    };
+                    effective_decls.push(crate::ast::Spanned { node: synth, span: stmt.span });
+                }
+            }
+            let block_keys: Vec<String> = effective_decls.iter().flat_map(|d| {
                 if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
                     entities.iter().map(|e| e.name.to_lowercase()).collect::<Vec<_>>()
                 } else { vec![] }
@@ -7284,11 +7410,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             let saved: Vec<(String, Option<LocalInfo>)> = block_keys.iter()
                 .map(|k| (k.clone(), ctx.locals.get(k).cloned()))
                 .collect();
-            if !decls.is_empty() {
+            if !effective_decls.is_empty() {
                 // Remove shadowed keys so alloc_decls creates fresh allocas.
                 for k in &block_keys { ctx.locals.remove(k); }
-                alloc_decls(b, &mut ctx.locals, decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), "", ctx.st);
-                init_decls(b, &ctx.locals, decls, ctx.st);
+                alloc_decls(b, &mut ctx.locals, &effective_decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), "", ctx.st);
+                init_decls(b, &ctx.locals, &effective_decls, ctx.st);
             }
             lower_stmts(b, ctx, body);
             // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
