@@ -87,6 +87,7 @@ impl<'a> Parser<'a> {
                     Err(self.error("expected 'stop' after 'error'".into()))
                 }
             }
+            "entry" => Err(self.error("ENTRY statements are recognized but not yet implemented".into())),
             "return" => {
                 self.advance();
                 self.parse_return(start)
@@ -161,6 +162,7 @@ impl<'a> Parser<'a> {
                 let span = span_from_to(start, self.prev_span());
                 Ok(Spanned::new(Stmt::Continue { label: None }, span))
             }
+            "sync" => Err(self.error("coarray SYNC statements are recognized but not yet implemented".into())),
             _ => self.parse_assignment_or_call(start),
         }
     }
@@ -2283,5 +2285,23 @@ end if
     fn print_label_format() {
         let s = parse_one("print 100, x\n");
         assert!(matches!(s.node, Stmt::Print { .. }));
+    }
+
+    #[test]
+    fn entry_stmt_reports_not_implemented() {
+        let tokens = Lexer::tokenize("entry g(y)\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let err = parser.parse_stmt().expect_err("ENTRY should not parse yet");
+        assert!(err.msg.contains("ENTRY statements are recognized but not yet implemented"));
+    }
+
+    #[test]
+    fn sync_stmt_reports_not_implemented() {
+        let tokens = Lexer::tokenize("sync all\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let err = parser.parse_stmt().expect_err("SYNC should not parse yet");
+        assert!(err
+            .msg
+            .contains("coarray SYNC statements are recognized but not yet implemented"));
     }
 }

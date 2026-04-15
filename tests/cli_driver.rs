@@ -1646,3 +1646,72 @@ fn missing_input_file_reports_io_error() {
         result.status
     );
 }
+
+#[test]
+fn entry_statement_reports_not_implemented() {
+    let src = write_program(
+        "subroutine f(x)\n  integer :: x\n  entry g(y)\nend subroutine\n",
+        "f90",
+    );
+    let out = unique_path("entry_stmt", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(!result.status.success(), "ENTRY should not compile yet");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("ENTRY statements are recognized but not yet implemented"),
+        "expected explicit ENTRY diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn coarray_declaration_reports_not_implemented() {
+    let src = write_program("program p\n  integer :: x[*]\nend program\n", "f90");
+    let out = unique_path("coarray_decl", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "coarray declarations should fail honestly"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("coarray declarations are recognized but not yet implemented"),
+        "expected explicit coarray declaration diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn coarray_sync_reports_not_implemented() {
+    let src = write_program("program p\n  sync all\nend program\n", "f90");
+    let out = unique_path("coarray_sync", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "coarray SYNC should fail honestly"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("coarray SYNC statements are recognized but not yet implemented"),
+        "expected explicit coarray SYNC diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}

@@ -11,8 +11,7 @@ that fortsh work can begin in earnest. The current codebase is not there yet.
 The main blockers are:
 
 1. Pedantic / deprecated warning groups are still placeholders.
-2. Several legacy and robustness promises from sprint 31.x remain open.
-3. The fortsh smoke test is informative, but it is not yet a readiness gate.
+2. The fortsh smoke test is informative, but it is not yet a readiness gate.
 
 I validated these findings against the sprint docs, `.docs/noted_issues.md`,
 the current tests, and direct compiler runs.
@@ -76,6 +75,7 @@ Current reality:
   instead of producing a clear unsupported-feature diagnostic.
 - Impact: sprint 31.5 is not fully closed, and some F77 / F2008 edges remain
   below the claimed bar.
+- Status: resolved locally on 2026-04-15.
 
 ### 5. P2: fortsh smoke test is not yet a readiness gate
 
@@ -89,5 +89,5 @@ Current reality:
 1. [x] Fix fixed-form token boundaries and add real `.f` coverage.
 2. [x] Expand `--std=` enforcement and make the default standard explicit.
 3. [ ] Replace pedantic placeholders with real diagnostics or clear rejections.
-4. [ ] Close the remaining legacy / robustness gaps (`ENTRY`, coarray stubs).
+4. [x] Close the remaining legacy / robustness gaps (`ENTRY`, coarray stubs).
 5. [ ] Raise the fortsh smoke-test floor and use it to drive sprint 33 fixes.

@@ -399,6 +399,12 @@ impl<'a> Parser<'a> {
             None
         };
 
+        if self.peek() == &TokenKind::LBracket {
+            return Err(
+                self.error("coarray declarations are recognized but not yet implemented".into()),
+            );
+        }
+
         // Optional character length: character :: name*20
         let char_len = if self.eat(&TokenKind::Star) {
             Some(self.parse_len_spec()?)
@@ -1137,7 +1143,25 @@ mod tests {
             assert_eq!(entities[0].array_spec.as_ref().unwrap().len(), 1);
             assert!(entities[1].array_spec.is_some());
             assert_eq!(entities[1].array_spec.as_ref().unwrap().len(), 2);
-        } else { panic!("not TypeDecl"); }
+        } else {
+            panic!("not TypeDecl");
+        }
+    }
+
+    #[test]
+    fn coarray_entity_decl_reports_not_implemented() {
+        let tokens = Lexer::tokenize("integer :: x[*]\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let type_spec = parser
+            .try_parse_type_spec()
+            .expect("expected type specifier")
+            .unwrap();
+        let err = parser
+            .parse_type_decl(type_spec)
+            .expect_err("coarray declaration should not parse yet");
+        assert!(err
+            .msg
+            .contains("coarray declarations are recognized but not yet implemented"));
     }
 
     #[test]
