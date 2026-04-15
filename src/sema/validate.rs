@@ -7,7 +7,7 @@
 use crate::ast::unit::*;
 use crate::ast::stmt::*;
 use crate::ast::expr::Expr;
-use crate::ast::decl::{Decl, Attribute, TypeAttr};
+use crate::ast::decl::{Decl, Attribute, TypeAttr, TypeSpec};
 use crate::lexer::Span;
 use super::symtab::*;
 
@@ -215,7 +215,29 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     }
 
     match &unit.node {
-        ProgramUnit::Program { decls, body, contains, .. } => {
+        ProgramUnit::Program {
+            uses,
+            implicit,
+            decls,
+            body,
+            contains,
+            ..
+        } => {
+            for use_stmt in uses {
+                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
+            }
+            for implicit_stmt in implicit {
+                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
+                    ctx.require_std(
+                        implicit_stmt.span,
+                        FortranStandard::F90,
+                        "IMPLICIT NONE",
+                    );
+                }
+            }
+            if !contains.is_empty() {
+                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+            }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
@@ -224,13 +246,39 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 validate_unit(ctx, sub);
             }
         }
-        ProgramUnit::Module { decls, contains, .. } => {
+        ProgramUnit::Module {
+            uses,
+            implicit,
+            decls, contains, ..
+        } => {
+            ctx.require_std(unit.span, FortranStandard::F90, "MODULE");
+            for use_stmt in uses {
+                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
+            }
+            for implicit_stmt in implicit {
+                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
+                    ctx.require_std(
+                        implicit_stmt.span,
+                        FortranStandard::F90,
+                        "IMPLICIT NONE",
+                    );
+                }
+            }
             validate_decls(ctx, decls);
             for sub in contains {
                 validate_unit(ctx, sub);
             }
         }
-        ProgramUnit::Subroutine { prefix, decls, body, contains, args, .. } => {
+        ProgramUnit::Subroutine {
+            prefix,
+            uses,
+            implicit,
+            decls,
+            body,
+            contains,
+            args,
+            ..
+        } => {
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
@@ -243,6 +291,35 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 validate_elemental_args(ctx, args, decls, unit.span);
             }
 
+            for p in prefix {
+                match p {
+                    Prefix::Pure | Prefix::Elemental => {
+                        ctx.require_std(unit.span, FortranStandard::F95, "PURE/ELEMENTAL");
+                    }
+                    Prefix::Impure => {
+                        ctx.require_std(unit.span, FortranStandard::F2008, "IMPURE");
+                    }
+                    Prefix::Recursive => {
+                        ctx.require_std(unit.span, FortranStandard::F90, "RECURSIVE");
+                    }
+                    _ => {}
+                }
+            }
+            for use_stmt in uses {
+                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
+            }
+            for implicit_stmt in implicit {
+                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
+                    ctx.require_std(
+                        implicit_stmt.span,
+                        FortranStandard::F90,
+                        "IMPLICIT NONE",
+                    );
+                }
+            }
+            if !contains.is_empty() {
+                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+            }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
@@ -253,7 +330,16 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
-        ProgramUnit::Function { prefix, decls, body, contains, args, .. } => {
+        ProgramUnit::Function {
+            prefix,
+            uses,
+            implicit,
+            decls,
+            body,
+            contains,
+            args,
+            ..
+        } => {
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
@@ -266,6 +352,35 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 validate_elemental_args(ctx, args, decls, unit.span);
             }
 
+            for p in prefix {
+                match p {
+                    Prefix::Pure | Prefix::Elemental => {
+                        ctx.require_std(unit.span, FortranStandard::F95, "PURE/ELEMENTAL");
+                    }
+                    Prefix::Impure => {
+                        ctx.require_std(unit.span, FortranStandard::F2008, "IMPURE");
+                    }
+                    Prefix::Recursive => {
+                        ctx.require_std(unit.span, FortranStandard::F90, "RECURSIVE");
+                    }
+                    _ => {}
+                }
+            }
+            for use_stmt in uses {
+                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
+            }
+            for implicit_stmt in implicit {
+                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
+                    ctx.require_std(
+                        implicit_stmt.span,
+                        FortranStandard::F90,
+                        "IMPLICIT NONE",
+                    );
+                }
+            }
+            if !contains.is_empty() {
+                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+            }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
@@ -276,7 +391,14 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
-        ProgramUnit::Submodule { decls, contains, .. } => {
+        ProgramUnit::Submodule {
+            uses,
+            decls, contains, ..
+        } => {
+            ctx.require_std(unit.span, FortranStandard::F2008, "SUBMODULE");
+            for use_stmt in uses {
+                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
+            }
             validate_decls(ctx, decls);
             for sub in contains {
                 validate_unit(ctx, sub);
@@ -285,7 +407,12 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         ProgramUnit::BlockData { decls, .. } => {
             validate_decls(ctx, decls);
         }
-        ProgramUnit::InterfaceBlock { name, is_abstract, bodies } => {
+        ProgramUnit::InterfaceBlock {
+            name,
+            is_abstract,
+            bodies,
+        } => {
+            ctx.require_std(unit.span, FortranStandard::F90, "INTERFACE block");
             // Validate defined operator interfaces.
             if let Some(ref iface_name) = name {
                 if is_operator_interface(iface_name) {
@@ -294,10 +421,14 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             // Abstract interfaces cannot have MODULE PROCEDURE.
             if *is_abstract {
+                ctx.require_std(unit.span, FortranStandard::F2003, "ABSTRACT interface");
                 for body in bodies {
                     if let InterfaceBody::ModuleProcedure(names) = body {
                         if !names.is_empty() {
-                            ctx.error(unit.span, "abstract interface cannot contain MODULE PROCEDURE statements");
+                            ctx.error(
+                                unit.span,
+                                "abstract interface cannot contain MODULE PROCEDURE statements",
+                            );
                         }
                     }
                 }
@@ -317,31 +448,74 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 
 fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
     for decl in decls {
-        if let Decl::TypeDecl { attrs, entities, type_spec, .. } = &decl.node {
+        if let Decl::TypeDecl {
+            attrs,
+            entities,
+            type_spec,
+            ..
+        } = &decl.node
+        {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let is_scalar_decl = entities.iter().all(|entity| entity.array_spec.is_none());
 
             // Deferred-length character must be allocatable or pointer.
             if let crate::ast::decl::TypeSpec::Character(Some(sel)) = type_spec {
                 if let Some(crate::ast::decl::LenSpec::Colon) = &sel.len {
+                    ctx.require_std(
+                        decl.span,
+                        FortranStandard::F2003,
+                        "deferred-length character",
+                    );
                     if !has_alloc && !has_pointer {
                         ctx.error(decl.span, "deferred-length character (len=:) requires allocatable or pointer attribute");
                     }
                 }
             }
 
+            match type_spec {
+                TypeSpec::Class(_) => {
+                    ctx.require_std(decl.span, FortranStandard::F2003, "CLASS declaration");
+                }
+                TypeSpec::ClassStar | TypeSpec::TypeStar => {
+                    ctx.require_std(
+                        decl.span,
+                        FortranStandard::F2018,
+                        "CLASS(*)/TYPE(*) declaration",
+                    );
+                }
+                _ => {}
+            }
+
+            if has_alloc && is_scalar_decl {
+                ctx.require_std(
+                    decl.span,
+                    FortranStandard::F2003,
+                    "allocatable scalar variables",
+                );
+            }
+
             // Allocatable + pointer is forbidden.
             if has_alloc && has_pointer {
-                ctx.error(decl.span, "a variable cannot be both allocatable and pointer");
+                ctx.error(
+                    decl.span,
+                    "a variable cannot be both allocatable and pointer",
+                );
             }
 
             // Parameter with allocatable/pointer is forbidden.
             let has_param = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
             if has_param && has_alloc {
-                ctx.error(decl.span, "a named constant (parameter) cannot be allocatable");
+                ctx.error(
+                    decl.span,
+                    "a named constant (parameter) cannot be allocatable",
+                );
             }
             if has_param && has_pointer {
-                ctx.error(decl.span, "a named constant (parameter) cannot be a pointer");
+                ctx.error(
+                    decl.span,
+                    "a named constant (parameter) cannot be a pointer",
+                );
             }
 
             // Pure/elemental: SAVE is forbidden.
@@ -355,9 +529,38 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             let _ = entities; // entities checked individually if needed
         }
 
+        if matches!(decl.node, Decl::ImplicitNone { .. }) {
+            ctx.require_std(decl.span, FortranStandard::F90, "IMPLICIT NONE");
+        }
+
+        if matches!(decl.node, Decl::UseStmt { .. }) {
+            ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
+        }
+
         // Derived type definition validation.
-        if let Decl::DerivedTypeDef { name, attrs: type_attrs, type_bound_procs, components, .. } = &decl.node {
-            validate_derived_type(ctx, name, type_attrs, type_bound_procs, components, decl.span);
+        if let Decl::DerivedTypeDef {
+            name,
+            attrs: type_attrs,
+            type_bound_procs,
+            components,
+            ..
+        } = &decl.node
+        {
+            ctx.require_std(decl.span, FortranStandard::F90, "derived types");
+            if type_attrs
+                .iter()
+                .any(|attr| matches!(attr, TypeAttr::Abstract))
+            {
+                ctx.require_std(decl.span, FortranStandard::F2003, "ABSTRACT type");
+            }
+            validate_derived_type(
+                ctx,
+                name,
+                type_attrs,
+                type_bound_procs,
+                components,
+                decl.span,
+            );
         }
     }
 }
@@ -384,7 +587,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- Allocate / Deallocate ----
-        Stmt::Allocate { items, .. } => {
+        Stmt::Allocate { items, opts } => {
+            if opts.iter().any(|opt| {
+                opt.keyword
+                    .as_deref()
+                    .is_some_and(|kw| kw.eq_ignore_ascii_case("source"))
+            }) {
+                ctx.require_std(stmt.span, FortranStandard::F2003, "ALLOCATE with SOURCE=");
+            }
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
             }
@@ -462,15 +672,23 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 validate_stmts(ctx, &case.body);
             }
         }
-        Stmt::WhereConstruct { body, elsewhere, .. } => {
+        Stmt::WhereConstruct {
+            body, elsewhere, ..
+        } => {
             validate_stmts(ctx, body);
             for (_, ebody) in elsewhere {
                 validate_stmts(ctx, ebody);
             }
         }
         Stmt::WhereStmt { stmt: inner, .. } => validate_stmt(ctx, inner),
-        Stmt::ForallConstruct { body, .. } => validate_stmts(ctx, body),
-        Stmt::ForallStmt { stmt: inner, .. } => validate_stmt(ctx, inner),
+        Stmt::ForallConstruct { body, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F95, "FORALL construct");
+            validate_stmts(ctx, body);
+        }
+        Stmt::ForallStmt { stmt: inner, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F95, "FORALL statement");
+            validate_stmt(ctx, inner);
+        }
         Stmt::Block { body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
             validate_stmts(ctx, body);
@@ -482,6 +700,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 
         // Call in pure: callee must be pure (we check if it's known impure).
         Stmt::Call { callee, args, .. } => {
+            if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("move_alloc") {
+                    ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
+                }
+            }
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
             }
@@ -1989,20 +2212,171 @@ program test
     x = 1
   end block
 end program
-");
+",
+        );
         assert!(!errs.iter().any(|e| e.contains("requires")));
+    }
+
+    #[test]
+    fn impure_requires_f2008() {
+        let errs = errors_with_std(
+            "\
+impure subroutine s()
+end subroutine
+",
+            FortranStandard::F95,
+        );
+        assert!(errs.iter().any(|e| e.contains("IMPURE") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn submodule_requires_f2008() {
+        use crate::lexer::{Position, Span};
+
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let unit = crate::ast::Spanned::new(
+            ProgramUnit::Submodule {
+                parent: "parent_mod".into(),
+                ancestor: None,
+                name: "child_mod".into(),
+                uses: vec![],
+                decls: vec![],
+                contains: vec![],
+            },
+            span,
+        );
+        let diags = validate_file_with_std(&[unit], &SymbolTable::new(), Some(FortranStandard::F95));
+        let errs: Vec<_> = diags
+            .into_iter()
+            .filter(|d| d.kind == DiagKind::Error)
+            .map(|d| d.msg)
+            .collect();
+        assert!(errs.iter().any(|e| e.contains("SUBMODULE") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn abstract_type_requires_f2003() {
+        let errs = errors_with_std(
+            "\
+module m
+  type, abstract :: shape
+  end type shape
+end module
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("ABSTRACT type") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn class_star_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+subroutine s(x)
+  class(*) :: x
+end subroutine
+",
+            FortranStandard::F2008,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("CLASS(*)/TYPE(*) declaration") && e.contains("F2018")));
+    }
+
+    #[test]
+    fn type_star_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+subroutine s(x)
+  type(*) :: x
+end subroutine
+",
+            FortranStandard::F2008,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("CLASS(*)/TYPE(*) declaration") && e.contains("F2018")));
+    }
+
+    #[test]
+    fn deferred_length_character_requires_f2003() {
+        let errs = errors_with_std(
+            "\
+program p
+  character(len=:), allocatable :: s
+end program
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("deferred-length character") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn allocatable_scalar_requires_f2003() {
+        let errs = errors_with_std(
+            "\
+program p
+  integer, allocatable :: x
+end program
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("allocatable scalar variables") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn allocate_source_requires_f2003() {
+        let errs = errors_with_std(
+            "\
+program p
+  integer, allocatable :: x
+  integer :: y
+  allocate(x, source=y)
+end program
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("ALLOCATE with SOURCE=") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn move_alloc_requires_f2003() {
+        let errs = errors_with_std(
+            "\
+program p
+  integer, allocatable :: x, y
+  call move_alloc(x, y)
+end program
+",
+            FortranStandard::F95,
+        );
+        assert!(errs.iter().any(|e| e.contains("MOVE_ALLOC") && e.contains("F2003")));
     }
 
     // ---- Elemental ----
 
     #[test]
     fn elemental_io_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 elemental subroutine foo(x)
   real, intent(in) :: x
   print *, x
 end subroutine
-");
+",
+        );
         // Elemental implies pure, so I/O is forbidden.
         assert!(errs.iter().any(|e| e.contains("I/O") && e.contains("pure")));
     }

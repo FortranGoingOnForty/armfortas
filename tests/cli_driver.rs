@@ -439,6 +439,127 @@ fn std_space_form_is_accepted() {
 }
 
 #[test]
+fn std_f77_rejects_free_form_source() {
+    let src = write_program("program p\n  print *, 1\nend program\n", "f90");
+    let out = unique_path("std_f77_free", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f77",
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "--std=f77 should reject free-form source"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--std=f77 requires fixed-form source"),
+        "expected fixed-form requirement: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn std_f95_rejects_impure_prefix() {
+    let src = write_program("impure subroutine s()\nend subroutine\n", "f90");
+    let out = unique_path("std_impure", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f95",
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "--std=f95 should reject IMPURE"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("IMPURE") && stderr.contains("F2008"),
+        "expected IMPURE / F2008 error: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn std_f95_rejects_abstract_type() {
+    let src = write_program(
+        "module m\n  type, abstract :: t\n  end type t\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("std_abstract", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f95",
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "--std=f95 should reject ABSTRACT type"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("ABSTRACT type") && stderr.contains("F2003"),
+        "expected ABSTRACT type / F2003 error: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn std_f77_rejects_module_in_fixed_form() {
+    let src = write_program(
+        "      module m\n      implicit none\n      end module m\n",
+        "f",
+    );
+    let out = unique_path("std_f77_module", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f77",
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "--std=f77 should reject MODULE"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("MODULE") && stderr.contains("F90"),
+        "expected MODULE / F90 error: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn help_and_version_use_last_flag_wins_precedence() {
     let help_then_version = Command::new(compiler("armfortas"))
         .args(["--help", "--version"])

@@ -10,11 +10,9 @@ Sprint 33 assumes "all prior sprints (the compiler is feature-complete)" and
 that fortsh work can begin in earnest. The current codebase is not there yet.
 The main blockers are:
 
-1. Fixed-form is not actually end-to-end working.
-2. `--std=` enforcement is much narrower than sprint 31 / 31.1 claim.
-3. Pedantic / deprecated warning groups are still placeholders.
-4. Several legacy and robustness promises from sprint 31.x remain open.
-5. The fortsh smoke test is informative, but it is not yet a readiness gate.
+1. Pedantic / deprecated warning groups are still placeholders.
+2. Several legacy and robustness promises from sprint 31.x remain open.
+3. The fortsh smoke test is informative, but it is not yet a readiness gate.
 
 I validated these findings against the sprint docs, `.docs/noted_issues.md`,
 the current tests, and direct compiler runs.
@@ -52,6 +50,7 @@ Current reality:
 - Impact: sprint 31's fixed-form pipeline claim does not currently hold.
 - Test gap: the main `run_programs` harness only discovers `.f90`, so `.f`
   regressions are invisible to the core runner.
+- Status: resolved locally on 2026-04-15.
 
 ### 2. P1: `--std=` gating is far narrower than claimed
 
@@ -60,6 +59,7 @@ Current reality:
   currently gated, and only when `--std` is explicitly set.
 - Impact: sprint 31.1's standards matrix is not enforced, and the documented
   default of F2018 is not active.
+- Status: resolved locally on 2026-04-15.
 
 ### 3. P2: Pedantic / deprecated warnings are still placeholders
 
@@ -86,8 +86,8 @@ Current reality:
 
 ## Closeout Order
 
-1. Fix fixed-form token boundaries and add real `.f` coverage.
-2. Expand `--std=` enforcement and make the default standard explicit.
-3. Replace pedantic placeholders with real diagnostics or clear rejections.
-4. Close the remaining legacy / robustness gaps (`ENTRY`, coarray stubs).
-5. Raise the fortsh smoke-test floor and use it to drive sprint 33 fixes.
+1. [x] Fix fixed-form token boundaries and add real `.f` coverage.
+2. [x] Expand `--std=` enforcement and make the default standard explicit.
+3. [ ] Replace pedantic placeholders with real diagnostics or clear rejections.
+4. [ ] Close the remaining legacy / robustness gaps (`ENTRY`, coarray stubs).
+5. [ ] Raise the fortsh smoke-test floor and use it to drive sprint 33 fixes.

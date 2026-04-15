@@ -169,7 +169,7 @@ impl Default for Options {
             emit_ast: false,
             emit_tokens: false,
             preprocess_only: false,
-            std: None,
+            std: Some(crate::sema::validate::FortranStandard::F2018),
             source_form_override: None,
             default_integer_8: false,
             default_real_8: false,
@@ -625,6 +625,14 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         Some(SourceFormOverride::Fixed) => SourceForm::FixedForm,
         None => detect_source_form(&opts.input.to_string_lossy()),
     };
+    if opts.std == Some(crate::sema::validate::FortranStandard::F77)
+        && matches!(source_form, SourceForm::FreeForm)
+    {
+        return Err(format!(
+            "{}: --std=f77 requires fixed-form source (.f/.for or -ffixed-form)",
+            opts.input.display()
+        ));
+    }
     if opts.verbose {
         let form = match source_form {
             SourceForm::FreeForm => "free-form",
@@ -1371,6 +1379,14 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
+
+    #[test]
+    fn default_standard_is_f2018() {
+        assert_eq!(
+            Options::default().std,
+            Some(crate::sema::validate::FortranStandard::F2018)
+        );
     }
 
     fn i128_fixture() -> PathBuf {
