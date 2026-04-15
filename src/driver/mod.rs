@@ -8,16 +8,7 @@ pub mod dep_scan;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-/// Per-process counter so two driver invocations from the same PID
-/// (parallel tests in one cargo-test binary) don't fight over the
-/// same /tmp/armfortas_<pid>.s / .o paths.  Without this, a second
-/// thread's `as` invocation can be reading the .s file the first
-/// thread's link is still consuming, producing intermittent garbage
-/// in the linked binary and breaking determinism tests.
-static DRIVER_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::codegen::mir::MachineFunction;
@@ -408,13 +399,45 @@ _main:
     }
 
     // 10. Assemble (using system assembler for now).
-    let pid = std::process::id();
-    let inv = DRIVER_INVOCATION.fetch_add(1, Ordering::Relaxed);
-    let asm_path = std::env::temp_dir().join(format!("armfortas_{}_{}.s", pid, inv));
+    //
+    // The temp .s / .o paths must satisfy two competing needs:
+    //   (1) `ld` embeds the .o path in the linked binary's symbol
+    //       table (the OSO debug stab), so two back-to-back compiles
+    //       of the same source to the same output path must use the
+    //       same .o name — otherwise the embedded string varies and
+    //       reproducible-build tests fail.  PID is unsafe here
+    //       because each compile_binary call spawns a fresh
+    //       subprocess with a different PID.
+    //   (2) Two parallel compiles of two DIFFERENT sources with the
+    //       same basename (e.g. both writing `mod.o` to different
+    //       unique-dir test outputs) must NOT race on the same temp
+    //       file.  Output stem alone is therefore not enough.
+    // The cheap fix that satisfies both: derive a stable hash of the
+    // full output path with FNV-1a and use it in the temp basename.
+    // Same output path → same hash → same .o (deterministic across
+    // subprocesses).  Different output paths → different hashes → no
+    // collision.  std::collections::hash_map::DefaultHasher uses a
+    // per-process random seed and would defeat (1).
+    let out_path = opts.output_path();
+    let stem = out_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "afs".to_string());
+    let token = {
+        let bytes = out_path.as_os_str().as_encoded_bytes();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    };
+    let asm_path = std::env::temp_dir().join(format!("armfortas_{}_{:016x}.s", stem, token));
     let obj_path = if opts.emit_obj {
-        opts.output_path()
+        out_path.clone()
     } else {
-        std::env::temp_dir().join(format!("armfortas_{}_{}.o", pid, inv))
+        std::env::temp_dir().join(format!("armfortas_{}_{:016x}.o", stem, token))
     };
 
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
