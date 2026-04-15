@@ -267,6 +267,43 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
 }
 
+fn fmt_u64_imm(reg: &str, value: u64) -> String {
+    let mut parts = Vec::new();
+    for shift in [0u32, 16, 32, 48] {
+        let chunk = ((value >> shift) & 0xFFFF) as u16;
+        if chunk == 0 && !parts.is_empty() {
+            continue;
+        }
+        if parts.is_empty() {
+            parts.push(format!("movz {}, #{}", reg, chunk));
+        } else {
+            parts.push(format!("movk {}, #{}, lsl #{}", reg, chunk, shift));
+        }
+    }
+    if parts.is_empty() {
+        format!("movz {}, #0", reg)
+    } else {
+        parts.join("\n    ")
+    }
+}
+
+fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> String {
+    if offset == 0 {
+        return format!("mov {}, {}", dest, base);
+    }
+
+    if (0..=4095).contains(&offset) {
+        return format!("add {}, {}, #{}", dest, base, offset);
+    }
+    if (-4095..=-1).contains(&offset) {
+        return format!("sub {}, {}, #{}", dest, base, -offset);
+    }
+
+    let imm = fmt_u64_imm(scratch, offset.unsigned_abs());
+    let op = if offset.is_negative() { "sub" } else { "add" };
+    format!("{}\n    {} {}, {}, {}", imm, op, dest, base, scratch)
+}
+
 /// Emit a single machine instruction as assembly text.
 fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
     match inst.opcode {
@@ -467,8 +504,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 format!("{} {}, [{}, #{}]", mnemonic, dest, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then load.
-                format!("mov x8, #{}\n    add x8, {}, x8\n    {} {}, [x8]",
-                    offset_val, base, mnemonic, dest)
+                format!(
+                    "{}\n    {} {}, [x8]",
+                    fmt_addr_with_offset("x8", &base, offset_val, "x16"),
+                    mnemonic,
+                    dest
+                )
             }
         }
         ArmOpcode::StrImm | ArmOpcode::StrFpImm
@@ -489,8 +530,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 format!("{} {}, [{}, #{}]", mnemonic, src, base, offset_val)
             } else {
                 // Large offset: compute address in x8, then store.
-                format!("mov x8, #{}\n    add x8, {}, x8\n    {} {}, [x8]",
-                    offset_val, base, mnemonic, src)
+                format!(
+                    "{}\n    {} {}, [x8]",
+                    fmt_addr_with_offset("x8", &base, offset_val, "x16"),
+                    mnemonic,
+                    src
+                )
             }
         }
 
@@ -555,8 +600,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-512..=504).contains(&off) {
                 format!("stp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
-                format!("str {}, [{}, #{}]\n    str {}, [{}, #{}]",
-                    r1, base, off, r2, base, off + 8)
+                format!(
+                    "{}\n    str {}, [x9]\n    str {}, [x9, #8]",
+                    fmt_addr_with_offset("x9", &base, off, "x16"),
+                    r1,
+                    r2
+                )
             }
         }
         ArmOpcode::LdpOffset => {
@@ -573,8 +622,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-512..=504).contains(&off) {
                 format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
-                format!("ldr {}, [{}, #{}]\n    ldr {}, [{}, #{}]",
-                    r1, base, off, r2, base, off + 8)
+                format!(
+                    "{}\n    ldr {}, [x9]\n    ldr {}, [x9, #8]",
+                    fmt_addr_with_offset("x9", &base, off, "x16"),
+                    r1,
+                    r2
+                )
             }
         }
 
@@ -840,5 +893,53 @@ mod tests {
         };
 
         assert_eq!(emit_inst(&inst, &mf), "mov w21, w20");
+    }
+
+    #[test]
+    fn emit_large_negative_pair_offsets_use_scratch_addressing() {
+        let mf = MachineFunction::new("test".into());
+        let stp = MachineInst {
+            opcode: ArmOpcode::StpOffset,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-544),
+            ],
+            def: None,
+        };
+        let ldp = MachineInst {
+            opcode: ArmOpcode::LdpOffset,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(2)),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-544),
+            ],
+            def: None,
+        };
+
+        let stp_asm = emit_inst(&stp, &mf);
+        let ldp_asm = emit_inst(&ldp, &mf);
+        assert!(
+            stp_asm.contains("sub x9, x29, #544"),
+            "large negative stp offset should synthesize address: {}",
+            stp_asm
+        );
+        assert!(
+            ldp_asm.contains("sub x9, x29, #544"),
+            "large negative ldp offset should synthesize address: {}",
+            ldp_asm
+        );
+        assert!(
+            !stp_asm.contains("[x29, #-544]"),
+            "stp should not emit out-of-range raw offset: {}",
+            stp_asm
+        );
+        assert!(
+            !ldp_asm.contains("[x29, #-544]"),
+            "ldp should not emit out-of-range raw offset: {}",
+            ldp_asm
+        );
     }
 }

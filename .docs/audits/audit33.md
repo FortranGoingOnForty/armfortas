@@ -7,10 +7,8 @@ Compiler build used: `target/debug/armfortas`
 ## Executive Summary
 
 Sprint 33 assumes "all prior sprints (the compiler is feature-complete)" and
-that fortsh work can begin in earnest. The current codebase is not there yet.
-The main blockers are:
-
-1. The fortsh smoke test is informative, but it is not yet a readiness gate.
+that fortsh work can begin in earnest. The local closeout work for this audit
+resolved the blockers below.
 
 I validated these findings against the sprint docs, `.docs/noted_issues.md`,
 the current tests, and direct compiler runs.
@@ -34,9 +32,10 @@ Current reality:
 - `ENTRY` is still unimplemented.
 - Coarray syntax still fails in parsing instead of reaching a clear
   "not implemented" diagnostic.
-- `cargo test --test fortsh_module_graph -- --nocapture` currently reports
-  `14/55` fortsh files compiling, but the test still passes because it only
-  asserts `compiled >= 1`.
+- `cargo test --test fortsh_module_graph -- --nocapture` now gates on a real
+  compiled floor (`14/55`), uses the freshly built debug compiler in test
+  runs, and fails on hard compiler failures (ICEs / assembler crashes) instead
+  of treating fortsh as informational-only.
 
 ## Findings
 
@@ -83,6 +82,9 @@ Current reality:
 - Symptom: the test passes with only one successfully compiled fortsh file.
 - Impact: sprint 33 readiness is overstated if this test is treated as a pass
   signal. The current score is informational, not gating.
+- Status: resolved locally on 2026-04-15. The gate now records a `14/55`
+  compiled floor and rejects hard compiler failures while leaving honest
+  unsupported-feature diagnostics visible in the scorecard.
 
 ## Closeout Order
 
@@ -90,4 +92,4 @@ Current reality:
 2. [x] Expand `--std=` enforcement and make the default standard explicit.
 3. [x] Replace pedantic placeholders with real diagnostics or clear rejections.
 4. [x] Close the remaining legacy / robustness gaps (`ENTRY`, coarray stubs).
-5. [ ] Raise the fortsh smoke-test floor and use it to drive sprint 33 fixes.
+5. [x] Raise the fortsh smoke-test floor and use it to drive sprint 33 fixes.

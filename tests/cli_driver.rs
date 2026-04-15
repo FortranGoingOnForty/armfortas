@@ -1778,3 +1778,57 @@ fn coarray_sync_reports_not_implemented() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn procedure_pointer_decl_reports_not_implemented() {
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    logical function pred(x)\n      character(len=*), intent(in) :: x\n    end function pred\n  end interface\n  procedure(pred), pointer :: p => null()\nend module\n",
+        "f90",
+    );
+    let out = unique_path("procedure_ptr_decl", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "procedure pointers should fail honestly"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("procedure pointer declarations are recognized but not yet implemented"),
+        "expected explicit procedure-pointer diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_char_pointer_component_reports_not_implemented() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_ref\n    character(:), pointer :: data => null()\n  end type string_ref\nend module\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_pointer_component", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "deferred char pointer components should fail honestly"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "derived-type deferred-length character pointer components are recognized but not yet implemented"
+        ),
+        "expected explicit deferred-character component diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}

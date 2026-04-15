@@ -218,6 +218,41 @@ fn warn_legacy_feature(ctx: &mut Ctx<'_>, span: Span, feature: &str) {
     }
 }
 
+fn decl_attrs_contain(attrs: &[Attribute], needle: Attribute) -> bool {
+    attrs.iter().any(|attr| *attr == needle)
+}
+
+fn is_deferred_char_pointer_component(
+    type_spec: &TypeSpec,
+    attrs: &[Attribute],
+) -> bool {
+    decl_attrs_contain(attrs, Attribute::Pointer)
+        && matches!(
+            type_spec,
+            TypeSpec::Character(Some(sel))
+                if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+        )
+}
+
+fn validate_unsupported_component_forms(
+    ctx: &mut Ctx<'_>,
+    components: &[crate::ast::decl::SpannedDecl],
+) {
+    for component in components {
+        if let Decl::TypeDecl {
+            type_spec, attrs, ..
+        } = &component.node
+        {
+            if is_deferred_char_pointer_component(type_spec, attrs) {
+                ctx.error(
+                    component.span,
+                    "derived-type deferred-length character pointer components are recognized but not yet implemented",
+                );
+            }
+        }
+    }
+}
+
 /// Find the scope ID for a program unit, preferring children of `parent_scope`.
 /// This resolves ambiguity when multiple scopes share a name (e.g., a module
 /// subroutine and a CONTAINS subroutine with the same name).
@@ -599,6 +634,13 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 );
             }
 
+            if decl_attrs_contain(attrs, Attribute::External) && has_pointer {
+                ctx.error(
+                    decl.span,
+                    "procedure pointer declarations are recognized but not yet implemented",
+                );
+            }
+
             // Pure/elemental: SAVE is forbidden.
             if ctx.in_pure {
                 let has_save = attrs.iter().any(|a| matches!(a, Attribute::Save));
@@ -642,6 +684,7 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             {
                 ctx.require_std(decl.span, FortranStandard::F2003, "ABSTRACT type");
             }
+            validate_unsupported_component_forms(ctx, components);
             validate_derived_type(
                 ctx,
                 name,

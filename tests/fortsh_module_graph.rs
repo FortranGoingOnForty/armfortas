@@ -17,10 +17,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const FORTSH_COMPILED_FLOOR: usize = 14;
+
 fn find_compiler() -> PathBuf {
-    for c in &["target/release/armfortas", "target/debug/armfortas"] {
+    for c in &["target/debug/armfortas", "target/release/armfortas"] {
         let p = PathBuf::from(c);
-        if p.exists() { return fs::canonicalize(&p).unwrap(); }
+        if p.exists() {
+            return fs::canonicalize(&p).unwrap();
+        }
     }
     panic!("armfortas binary not found");
 }
@@ -47,12 +51,18 @@ fn scan_file(path: &Path) -> (Vec<String>, Vec<String>) {
 
     for line in content.lines() {
         let trimmed = line.trim().to_lowercase();
-        if trimmed.starts_with('!') || trimmed.is_empty() { continue; }
+        if trimmed.starts_with('!') || trimmed.is_empty() {
+            continue;
+        }
 
         if trimmed.starts_with("module ") {
             let rest = trimmed[7..].trim();
-            if rest.starts_with("procedure") || rest.starts_with("function")
-                || rest.starts_with("subroutine") { continue; }
+            if rest.starts_with("procedure")
+                || rest.starts_with("function")
+                || rest.starts_with("subroutine")
+            {
+                continue;
+            }
             if let Some(name) = rest.split_whitespace().next() {
                 let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
                 if !clean.is_empty() {
@@ -71,7 +81,10 @@ fn scan_file(path: &Path) -> (Vec<String>, Vec<String>) {
             } else {
                 trimmed[4..].trim()
             };
-            if let Some(name) = rest.split(|c: char| c == ',' || c == ':' || c.is_whitespace()).next() {
+            if let Some(name) = rest
+                .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
+                .next()
+            {
                 let clean = name.trim();
                 if !clean.is_empty() && clean != "only" {
                     uses.push(clean.to_string());
@@ -85,6 +98,13 @@ fn scan_file(path: &Path) -> (Vec<String>, Vec<String>) {
     uses.sort();
     uses.dedup();
     (defines, uses)
+}
+
+fn is_hard_failure(stderr: &str) -> bool {
+    stderr.contains("INTERNAL COMPILER ERROR")
+        || stderr.contains("internal error:")
+        || stderr.contains("assembler failed:")
+        || stderr.contains("coerce_to_type:")
 }
 
 #[test]
@@ -114,10 +134,15 @@ fn fortsh_module_graph_resolves() {
     sources.sort();
 
     eprintln!("Found {} fortsh source files", sources.len());
-    assert!(sources.len() >= 50, "expected ~55 fortsh files, found {}", sources.len());
+    assert!(
+        sources.len() >= 50,
+        "expected ~55 fortsh files, found {}",
+        sources.len()
+    );
 
     // Scan each for module/use.
-    let mut module_to_file: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut module_to_file: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut file_info: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
 
     for (i, src) in sources.iter().enumerate() {
@@ -135,11 +160,18 @@ fn fortsh_module_graph_resolves() {
     let mut in_degree = vec![0usize; n];
     let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
 
-    let intrinsic = ["iso_c_binding", "iso_fortran_env", "ieee_arithmetic",
-                     "ieee_exceptions", "ieee_features"];
+    let intrinsic = [
+        "iso_c_binding",
+        "iso_fortran_env",
+        "ieee_arithmetic",
+        "ieee_exceptions",
+        "ieee_features",
+    ];
     for (i, (_path, _defs, uses)) in file_info.iter().enumerate() {
         for used in uses {
-            if intrinsic.contains(&used.as_str()) { continue; }
+            if intrinsic.contains(&used.as_str()) {
+                continue;
+            }
             if let Some(&j) = module_to_file.get(used.as_str()) {
                 if i != j {
                     dependents[j].push(i);
@@ -170,7 +202,8 @@ fn fortsh_module_graph_resolves() {
     }
 
     assert_eq!(
-        order.len(), n,
+        order.len(),
+        n,
         "circular dependency in fortsh module graph — {} files unresolved",
         n - order.len()
     );
@@ -183,6 +216,7 @@ fn fortsh_module_graph_resolves() {
 
     let mut compiled = 0;
     let mut failed = Vec::new();
+    let mut hard_failures = Vec::new();
 
     for &idx in &order {
         let src = &file_info[idx].0;
@@ -191,8 +225,11 @@ fn fortsh_module_graph_resolves() {
 
         let result = Command::new(&compiler)
             .args([
-                src.to_str().unwrap(), "-c", "-O0",
-                "-o", obj.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-c",
+                "-O0",
+                "-o",
+                obj.to_str().unwrap(),
                 &format!("-I{}", build_dir.display()),
             ])
             .output()
@@ -202,7 +239,15 @@ fn fortsh_module_graph_resolves() {
             compiled += 1;
         } else {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            failed.push(format!("{}: {}", stem, stderr.lines().next().unwrap_or("unknown error")));
+            let summary = format!(
+                "{}: {}",
+                stem,
+                stderr.lines().next().unwrap_or("unknown error")
+            );
+            if is_hard_failure(&stderr) {
+                hard_failures.push(summary.clone());
+            }
+            failed.push(summary);
         }
     }
 
@@ -210,7 +255,9 @@ fn fortsh_module_graph_resolves() {
 
     eprintln!(
         "fortsh module graph: {}/{} compiled, {} failed",
-        compiled, n, failed.len()
+        compiled,
+        n,
+        failed.len()
     );
 
     if !failed.is_empty() {
@@ -220,22 +267,26 @@ fn fortsh_module_graph_resolves() {
         }
     }
 
-    // We don't require 100% — fortsh uses many features we haven't implemented
-    // yet. This test exists to track progress: as we add features, the compile
-    // count should increase. A regression (fewer files compiling than the
-    // recorded floor) is a failure.
-    //
-    // Current floor: the dep graph resolves and at least some files compile
-    // without crashing or hanging. The exact count will rise over time.
+    if !hard_failures.is_empty() {
+        panic!(
+            "fortsh compile should not ICE or assembler-crash; hard failures: {}",
+            hard_failures.join(" | ")
+        );
+    }
+
     assert!(
-        compiled >= 1,
-        "zero files compiled out of {} — module graph or compiler fundamentally broken",
+        compiled >= FORTSH_COMPILED_FLOOR,
+        "fortsh compiled {}/{} which regressed below the floor of {}",
+        compiled,
         n,
+        FORTSH_COMPILED_FLOOR
     );
 
     // Report counts for human tracking.
     eprintln!(
         "\nfortsh scorecard: {}/{} compiled ({:.0}%)",
-        compiled, n, compiled as f64 / n as f64 * 100.0,
+        compiled,
+        n,
+        compiled as f64 / n as f64 * 100.0,
     );
 }
