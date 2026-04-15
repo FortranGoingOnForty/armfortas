@@ -8,7 +8,16 @@ pub mod dep_scan;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+/// Per-process counter so two driver invocations from the same PID
+/// (parallel tests in one cargo-test binary) don't fight over the
+/// same /tmp/armfortas_<pid>.s / .o paths.  Without this, a second
+/// thread's `as` invocation can be reading the .s file the first
+/// thread's link is still consuming, producing intermittent garbage
+/// in the linked binary and breaking determinism tests.
+static DRIVER_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::codegen::mir::MachineFunction;
@@ -400,11 +409,12 @@ _main:
 
     // 10. Assemble (using system assembler for now).
     let pid = std::process::id();
-    let asm_path = std::env::temp_dir().join(format!("armfortas_{}.s", pid));
+    let inv = DRIVER_INVOCATION.fetch_add(1, Ordering::Relaxed);
+    let asm_path = std::env::temp_dir().join(format!("armfortas_{}_{}.s", pid, inv));
     let obj_path = if opts.emit_obj {
         opts.output_path()
     } else {
-        std::env::temp_dir().join(format!("armfortas_{}.o", pid))
+        std::env::temp_dir().join(format!("armfortas_{}_{}.o", pid, inv))
     };
 
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
