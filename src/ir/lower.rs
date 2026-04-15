@@ -2098,7 +2098,7 @@ fn lower_unit(
                         inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
                     });
                     // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
-                } else if let Some(dt_name) = derived_type_name_for_return(return_type) {
+                } else if let Some(dt_name) = derived_type_name_for_result_var(return_type, &result_name, decls) {
                     // Derived-type FUNCTION result: allocate a struct-shaped
                     // buffer ([i8 x layout.size]) and register the result
                     // variable with `derived_type = Some(name)` so component
@@ -2106,7 +2106,10 @@ fn lower_unit(
                     // Without this, the generic `b.alloca(ir_ret_ty)` path
                     // allocates a `ptr<ptr<i8>>` slot, ComponentAccess can't
                     // resolve the type name, and every assignment to the
-                    // result variable is silently dropped.
+                    // result variable is silently dropped. derived_type_name_
+                    // for_result_var accepts both header-level (`type(t)
+                    // function f`) and body-level (`function f result(r);
+                    // type(t) :: r`) declarations.
                     let layout = type_layouts.get(&dt_name);
                     let size = layout.map(|l| l.size as u64).unwrap_or(8);
                     let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), size);
@@ -2127,7 +2130,7 @@ fn lower_unit(
                     ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 } else {
                     let result_addr = b.alloca(ir_ret_ty.clone());
-                    ctx.insert_scalar(result_name, result_addr, ir_ret_ty.clone());
+                    ctx.insert_scalar(result_name.clone(), result_addr, ir_ret_ty.clone());
                     ctx.result_addr = Some(result_addr);
                     ctx.result_type = Some(ir_ret_ty.clone());
                 }
@@ -2157,7 +2160,7 @@ fn lower_unit(
                     insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, skip);
                     if is_alloc_return {
                         b.ret(None);
-                    } else if derived_type_name_for_return(return_type).is_some() {
+                    } else if derived_type_name_for_result_var(return_type, &result_name, decls).is_some() {
                         // Derived-type result: return the buffer
                         // address as a Ptr(i8) (the declared return
                         // type). A zero-offset GEP through `i8`
@@ -5535,6 +5538,41 @@ fn derived_type_name_for_return(return_type: &Option<TypeSpec>) -> Option<String
     }
 }
 
+/// Same as `derived_type_name_for_return` but also looks at the
+/// body's declaration of the result variable. A function written as
+/// `function add_t(a, b) result(r); type(t) :: r` has no return type
+/// on the header — the info lives in `decls` keyed by `result_name`
+/// (or the function name if `result(...)` wasn't specified). Without
+/// this second lookup the Function lowering arm treats the return
+/// type as an intrinsic pointer, allocates an 8-byte ptr slot for
+/// `r`, and silently drops every component-assignment in the body.
+fn derived_type_name_for_result_var(
+    return_type: &Option<TypeSpec>,
+    result_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> Option<String> {
+    if let Some(n) = derived_type_name_for_return(return_type) {
+        return Some(n);
+    }
+    let key = result_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl { type_spec, entities, .. } = &decl.node {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    if let TypeSpec::Type(name) = type_spec {
+                        let lower = name.to_lowercase();
+                        if lower == "c_ptr" || lower == "c_funptr" {
+                            return None;
+                        }
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Does the named variable in `decls` carry the ALLOCATABLE attribute
 /// (either on the type-decl attrs or the entity)? Used by host-association
 /// closure-passing to decide whether the hidden pointer param should
@@ -5769,6 +5807,7 @@ fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool
     }).collect();
     Some(mask)
 }
+
 
 fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
     use crate::sema::symtab::ScopeKind;
@@ -11975,7 +12014,7 @@ fn lower_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, None, None, None)
+    lower_expr_full(b, locals, expr, st, None, None, None, None)
 }
 
 fn lower_expr_ctx(
@@ -11983,7 +12022,7 @@ fn lower_expr_ctx(
     ctx: &LowerCtx,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> ValueId {
-    lower_expr_full(b, &ctx.locals, expr, ctx.st, None, Some(ctx.internal_funcs), Some(ctx.contained_host_refs))
+    lower_expr_full(b, &ctx.locals, expr, ctx.st, None, Some(ctx.internal_funcs), Some(ctx.contained_host_refs), Some(ctx.descriptor_params))
 }
 
 fn lower_expr_tl(
@@ -11993,7 +12032,7 @@ fn lower_expr_tl(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> ValueId {
-    lower_expr_full(b, locals, expr, st, Some(tl), None, None)
+    lower_expr_full(b, locals, expr, st, Some(tl), None, None, None)
 }
 
 fn lower_expr_ctx_tl(
@@ -12009,6 +12048,7 @@ fn lower_expr_ctx_tl(
         Some(ctx.type_layouts),
         Some(ctx.internal_funcs),
         Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
     )
 }
 
@@ -12020,6 +12060,7 @@ fn lower_expr_full(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     internal_funcs: Option<&HashMap<String, u32>>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> ValueId {
     match &expr.node {
         Expr::IntegerLiteral { text, kind, .. } => {
@@ -12149,8 +12190,8 @@ fn lower_expr_full(
         }
 
         Expr::BinaryOp { op, left, right } => {
-            let mut lhs = lower_expr_full(b, locals, left, st, type_layouts, internal_funcs, contained_host_refs);
-            let mut rhs = lower_expr_full(b, locals, right, st, type_layouts, internal_funcs, contained_host_refs);
+            let mut lhs = lower_expr_full(b, locals, left, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
+            let mut rhs = lower_expr_full(b, locals, right, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
             let lty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
             let rty = b.func().value_type(rhs).unwrap_or(IrType::Int(IntWidth::I32));
 
@@ -12311,7 +12352,7 @@ fn lower_expr_full(
         }
 
         Expr::UnaryOp { op, operand } => {
-            let val = lower_expr_full(b, locals, operand, st, type_layouts, internal_funcs, contained_host_refs);
+            let val = lower_expr_full(b, locals, operand, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
             match (op, &ty) {
                 (UnaryOp::Minus, IrType::Int(_)) => b.ineg(val),
@@ -12322,7 +12363,7 @@ fn lower_expr_full(
             }
         }
 
-        Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs, contained_host_refs),
+        Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params),
 
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
@@ -12371,7 +12412,7 @@ fn lower_expr_full(
                         for (i, arg) in args.iter().enumerate() {
                             if i < layout.fields.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                    let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs);
+                                    let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
                                     let coerced = coerce_to_type(
                                         b,
                                         val,
@@ -12437,7 +12478,7 @@ fn lower_expr_full(
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs") && args.len() == 1 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
-                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs);
+                            let val = lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
                             let ty = b.func().value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
                             if is_complex_ty(&ty) {
                                 let fw = complex_float_width(&ty);
@@ -12467,7 +12508,7 @@ fn lower_expr_full(
                 let intrinsic_arg_vals: Vec<ValueId> = args.iter().map(|a| {
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
-                            lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs)
+                            lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params)
                         }
                         _ => b.const_i32(0),
                     }
@@ -12480,13 +12521,32 @@ fn lower_expr_full(
                 // Check if the callee has VALUE args (BIND(C) interface).
                 let callee_value_args = callee_value_arg_mask(st, &key);
 
-                // Pass args: by value for VALUE, by reference otherwise.
+                // Check which params use the descriptor ABI
+                // (assumed-shape / deferred / assumed-size arrays).
+                // The Stmt::Call path consults ctx.descriptor_params
+                // directly; here we reach into it through the
+                // descriptor_params plumbed as an optional arg so
+                // the function-call path doesn't need full ctx.
+                // Without this, a function with `integer :: xs(:)`
+                // would receive a raw element pointer and size(xs)
+                // would read garbage (audit31 Finding 6).
+                let callee_descriptor_args = descriptor_params
+                    .and_then(|m| m.get(&key).cloned());
+
+                // Pass args: by value for VALUE, descriptor for
+                // assumed-shape, by reference otherwise.
                 let mut ref_arg_vals: Vec<ValueId> = args.iter().enumerate().map(|(i, a)| {
                     let is_value = callee_value_args.as_ref().map(|mask| i < mask.len() && mask[i]).unwrap_or(false);
+                    let wants_descriptor = callee_descriptor_args
+                        .as_ref()
+                        .map(|mask| i < mask.len() && mask[i])
+                        .unwrap_or(false);
                     match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
                             if is_value {
-                                lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs)
+                                lower_expr_full(b, locals, e, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params)
+                            } else if wants_descriptor {
+                                lower_arg_descriptor(b, locals, e, st)
                             } else {
                                 lower_arg_by_ref(b, locals, e, st)
                             }
@@ -12638,8 +12698,8 @@ fn lower_expr_full(
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);
             let buf = b.alloca(arr_ty);
 
-            let real_raw = lower_expr_full(b, locals, real, st, type_layouts, internal_funcs, contained_host_refs);
-            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts, internal_funcs, contained_host_refs);
+            let real_raw = lower_expr_full(b, locals, real, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
+            let imag_raw = lower_expr_full(b, locals, imag, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params);
             let real_val = coerce_to_type(b, real_raw, &elem_ty);
             let imag_val = coerce_to_type(b, imag_raw, &elem_ty);
 

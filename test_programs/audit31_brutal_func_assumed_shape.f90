@@ -1,9 +1,11 @@
-! XFAIL: assumed-shape array in FUNCTION returns size()=0 — Task #487
+! audit31 Finding 6: a FUNCTION taking `xs(:)` received a raw
+! element pointer instead of a descriptor because lower_expr_full
+! didn't consult the descriptor_params mask (only the Stmt::Call
+! path did). size(xs) then read zeros out of the raw pointer.
+! Thread descriptor_params as an optional arg through
+! lower_expr_full and emit lower_arg_descriptor for any callee
+! param flagged as descriptor-backed. Task #487.
 ! CHECK: 6
-! audit31: FUNCTION with assumed-shape array arg: size() returns 0
-! Expected: 6
-! Actual:   0
-! Subroutine with same signature works correctly.
 program audit31_func_assumed
   implicit none
   integer :: data(6), i
