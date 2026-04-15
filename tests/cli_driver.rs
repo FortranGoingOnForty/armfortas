@@ -336,6 +336,160 @@ fn time_report_prints_phase_table() {
 }
 
 #[test]
+fn diagnostic_renders_source_line_and_caret() {
+    let src = write_program(
+        "program p\n  error stop 'oops'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("diag", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f95",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // Header line uses the gfortran/clang gutter format.
+    assert!(stderr.contains(":2:3: error:"), "missing standard error header: {}", stderr);
+    // Source line is shown with a numbered gutter (`    2 |`).
+    assert!(stderr.contains("|   error stop"), "missing source-line snippet: {}", stderr);
+    // Caret underline lives on a `      |` line.
+    assert!(stderr.contains("      |"), "missing caret gutter: {}", stderr);
+    assert!(stderr.contains("^"), "missing caret marker: {}", stderr);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn no_color_env_suppresses_ansi_escapes() {
+    let src = write_program(
+        "program p\n  error stop 'x'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nocolor", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f95",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .output()
+        .expect("spawn failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!stderr.contains('\x1b'), "NO_COLOR must suppress ANSI escapes: {:?}", stderr);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn clicolor_force_enables_ansi_even_off_a_tty() {
+    let src = write_program(
+        "program p\n  error stop 'x'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("forcecolor", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--std=f95",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("CLICOLOR_FORCE", "1")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("spawn failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains('\x1b'), "CLICOLOR_FORCE must produce ANSI escapes: {:?}", stderr);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fimplicit_none_rejects_implicitly_typed_use() {
+    let src = write_program(
+        "program p\n  i = 5\n  print *, i\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fimplicit", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fimplicit-none",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(!result.status.success(), "-fimplicit-none should reject undeclared 'i'");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("'i'") && stderr.contains("IMPLICIT NONE is active"),
+        "expected implicit-none diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fdefault_integer_8_changes_default_kind() {
+    let src = write_program(
+        "program p\n  integer :: x\n  print *, kind(x)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defint", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fdefault-integer-8",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(result.status.success(), "-fdefault-integer-8 compile failed: {}",
+        String::from_utf8_lossy(&result.stderr));
+    let run = Command::new(&out).output().expect("run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.trim().ends_with('8'), "expected kind 8: {:?}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fdefault_real_8_changes_default_kind() {
+    let src = write_program(
+        "program p\n  real :: y\n  print *, kind(y)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defreal", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fdefault-real-8",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(result.status.success());
+    let run = Command::new(&out).output().expect("run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.trim().ends_with('8'), "expected kind 8: {:?}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn missing_input_file_reports_io_error() {
     let result = Command::new(compiler("armfortas"))
         .args(["/nonexistent/path/source.f90"])

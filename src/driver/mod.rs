@@ -3,7 +3,9 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
+pub mod defaults;
 pub mod dep_scan;
+pub mod diag;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -597,6 +599,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!("{}", version_string());
     }
 
+    // Reset / install the default-kind globals so subsequent passes
+    // see this run's -fdefault-{integer,real}-8 settings cleanly,
+    // even when multiple compile() calls share a process (cargo test).
+    defaults::reset();
+    if opts.default_integer_8 {
+        defaults::set_default_int_kind(8);
+    }
+    if opts.default_real_8 {
+        defaults::set_default_real_kind(8);
+    }
+
     // 1. Read source.
     if opts.verbose {
         eprintln!(" reading: {}", opts.input.display());
@@ -709,7 +722,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             e.msg
         )
     })?;
-    let st = resolve_result.st;
+    let mut st = resolve_result.st;
+    if opts.force_implicit_none {
+        st.force_implicit_none_all_units();
+    }
     let type_layouts = resolve_result.type_layouts;
 
     // Build external globals from .amod-loaded modules.
@@ -719,31 +735,27 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     let diags = validate::validate_file_with_layouts(&units, &st, opts.std, &type_layouts);
+    let file_str = opts.input.display().to_string();
     let mut had_error = false;
     for d in &diags {
+        let level = match d.kind {
+            validate::DiagKind::Error => diag::Level::Error,
+            validate::DiagKind::Warning => diag::Level::Warning,
+        };
+        // span_len is best-effort: end.col >= start.col on the same
+        // line gives a nice underline, otherwise default to 1.
+        let span_len = if d.span.end.line == d.span.start.line
+            && d.span.end.col > d.span.start.col
+        {
+            (d.span.end.col - d.span.start.col) as usize
+        } else {
+            1
+        };
+        diag::render(&file_str, &source, d.span, level, &d.msg, span_len);
         match d.kind {
-            validate::DiagKind::Error => {
-                eprintln!(
-                    "{}:{}:{}: error: {}",
-                    opts.input.display(),
-                    d.span.start.line,
-                    d.span.start.col,
-                    d.msg
-                );
-                had_error = true;
-            }
-            validate::DiagKind::Warning => {
-                eprintln!(
-                    "{}:{}:{}: warning: {}",
-                    opts.input.display(),
-                    d.span.start.line,
-                    d.span.start.col,
-                    d.msg
-                );
-                if opts.warn_as_error {
-                    had_error = true;
-                }
-            }
+            validate::DiagKind::Error => had_error = true,
+            validate::DiagKind::Warning if opts.warn_as_error => had_error = true,
+            _ => {}
         }
     }
     if had_error {
