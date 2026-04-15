@@ -126,14 +126,15 @@ pub struct Options {
     pub warn_deprecated: bool,
     pub warn_as_error: bool,
     pub disabled_warnings: Vec<String>,
+    pub cli_warnings: Vec<String>,
 
     // ---- Debug / introspection ----
-    pub debug_info: bool,                         // -g (accepted; DWARF deferred)
-    pub verbose: bool,                            // -v
-    pub time_report: bool,                        // --time-report
-    pub diagnostics_format: DiagnosticsFormat,    // --diagnostics-format=
-    pub check_bounds: bool,                       // -fcheck=bounds
-    pub check_all: bool,                          // -fcheck=all
+    pub debug_info: bool,                      // -g (accepted; DWARF deferred)
+    pub verbose: bool,                         // -v
+    pub time_report: bool,                     // --time-report
+    pub diagnostics_format: DiagnosticsFormat, // --diagnostics-format=
+    pub check_bounds: bool,                    // -fcheck=bounds
+    pub check_all: bool,                       // -fcheck=all
 
     // ---- Search paths / linking ----
     /// Directories to search for `.amod` module files (`-I <dir>`).
@@ -184,6 +185,7 @@ impl Default for Options {
             warn_deprecated: false,
             warn_as_error: false,
             disabled_warnings: Vec::new(),
+            cli_warnings: Vec::new(),
             debug_info: false,
             verbose: false,
             time_report: false,
@@ -244,6 +246,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     let mut opts = Options::default();
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut info_action: Option<InfoAction> = None;
+    let mut unknown_warning_flags = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -367,10 +370,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.disabled_warnings.push(arg[5..].to_string());
             }
             arg if arg.starts_with("-W") => {
-                // Unknown -Wfoo: accept silently rather than fail
-                // (gfortran has hundreds of these and projects pass
-                // them blindly). Record so it's queryable later.
-                opts.disabled_warnings.push(arg.to_string());
+                unknown_warning_flags.push(arg.to_string());
             }
 
             // ---- Debug / introspection ----
@@ -401,6 +401,12 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
         return Ok(ParsedCli::Info(action));
     }
 
+    if opts.shared && opts.static_link {
+        return Err("-shared and -static are mutually exclusive".into());
+    }
+
+    collect_cli_warnings(&mut opts, &unknown_warning_flags);
+
     if inputs.is_empty() {
         return Err("no input file".into());
     }
@@ -413,18 +419,188 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
 /// each whitespace-separated token as an additional argument.
 fn expand_response_files(args: &[String]) -> Result<Vec<String>, String> {
     let mut expanded: Vec<String> = Vec::with_capacity(args.len());
+    let mut stack = Vec::new();
     for arg in args {
-        if let Some(path) = arg.strip_prefix('@') {
-            let body = fs::read_to_string(path)
-                .map_err(|e| format!("cannot read response file '{}': {}", path, e))?;
-            for tok in body.split_whitespace() {
-                expanded.push(tok.to_string());
-            }
-        } else {
-            expanded.push(arg.clone());
-        }
+        expand_response_arg(arg, None, 0, &mut stack, &mut expanded)?;
     }
     Ok(expanded)
+}
+
+fn expand_response_arg(
+    arg: &str,
+    base_dir: Option<&Path>,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+    expanded: &mut Vec<String>,
+) -> Result<(), String> {
+    const RESPONSE_FILE_DEPTH_LIMIT: usize = 8;
+
+    if let Some(literal) = arg.strip_prefix("@@") {
+        expanded.push(format!("@{}", literal));
+        return Ok(());
+    }
+
+    let Some(path) = arg.strip_prefix('@') else {
+        expanded.push(arg.to_string());
+        return Ok(());
+    };
+
+    if depth >= RESPONSE_FILE_DEPTH_LIMIT {
+        return Err(format!(
+            "response file nesting exceeds limit of {}",
+            RESPONSE_FILE_DEPTH_LIMIT
+        ));
+    }
+
+    let resolved = resolve_response_file_path(path, base_dir);
+    let display = resolved.display().to_string();
+    let canonical = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    if stack.contains(&canonical) {
+        return Err(format!("circular response file '{}'", display));
+    }
+
+    let body = fs::read_to_string(&resolved)
+        .map_err(|e| format!("cannot read response file '{}': {}", display, e))?;
+    let tokens = parse_response_file_tokens(&body)
+        .map_err(|e| format!("cannot parse response file '{}': {}", display, e))?;
+    let next_base = resolved.parent().map(Path::to_path_buf);
+
+    stack.push(canonical);
+    for token in tokens {
+        expand_response_arg(&token, next_base.as_deref(), depth + 1, stack, expanded)?;
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn resolve_response_file_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(candidate)
+    } else {
+        candidate
+    }
+}
+
+fn parse_response_file_tokens(body: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(delim) => match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                c if c == delim => quote = None,
+                _ => current.push(ch),
+            },
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if let Some(delim) = quote {
+        return Err(format!("unterminated {} quote", delim));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn short_option_value<'a>(arg: &'a str, flag: &str, what: &str) -> Result<&'a str, String> {
+    let tail = &arg[flag.len()..];
+    let value = tail.strip_prefix('=').unwrap_or(tail);
+    if value.is_empty() {
+        Err(format!("{} requires {}", flag, what))
+    } else {
+        Ok(value)
+    }
+}
+
+fn set_output_path(opts: &mut Options, value: &str) -> Result<(), String> {
+    if opts.output.is_some() {
+        return Err("duplicate -o: output path already specified".into());
+    }
+    if value.is_empty() {
+        return Err("-o requires an argument".into());
+    }
+    opts.output = Some(PathBuf::from(value));
+    Ok(())
+}
+
+fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
+    if opts.check_all {
+        opts.cli_warnings.push(
+            "-fcheck=all is accepted, but only array bounds checks exist today and those are already always enabled".into(),
+        );
+    } else if opts.check_bounds {
+        opts.cli_warnings.push(
+            "-fcheck=bounds currently has no effect because array bounds checks are already always enabled".into(),
+        );
+    }
+
+    if opts.max_stack_var_size.is_some() {
+        opts.cli_warnings
+            .push("-fmax-stack-var-size is recognized but not yet implemented".into());
+    }
+    if opts.recursive_default {
+        opts.cli_warnings
+            .push("-frecursive is recognized but not yet implemented".into());
+    }
+    if opts.backslash_escapes {
+        opts.cli_warnings.push(
+            "-fbackslash is recognized but string escape processing is not yet implemented".into(),
+        );
+    }
+
+    if opts.warn_all {
+        opts.cli_warnings
+            .push("-Wall is recognized but warning-group emission is not yet implemented".into());
+    }
+    if opts.warn_extra {
+        opts.cli_warnings
+            .push("-Wextra is recognized but warning-group emission is not yet implemented".into());
+    }
+
+    if opts.debug_info {
+        opts.cli_warnings
+            .push("-g is accepted, but debug info emission is not yet implemented".into());
+    }
+
+    let suppress_unknown_warning_option = opts
+        .disabled_warnings
+        .iter()
+        .any(|name| name == "unknown-warning-option");
+    if !suppress_unknown_warning_option {
+        for flag in unknown_warning_flags {
+            opts.cli_warnings
+                .push(format!("unrecognized warning option '{}'", flag));
+        }
+    }
 }
 
 /// Help text printed by `--help`.
@@ -489,15 +665,36 @@ INFORMATION:
   --version, -V               Print version
   --help, -h                  Print help
   -dumpversion                Print version number only
+                              If multiple info flags are given, the last one wins
 
 OTHER:
   @<file>                     Read additional arguments from <file> (one per token)
+  @@<arg>                     Pass a literal argument beginning with @
 ";
+
+pub fn program_name() -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|arg| {
+            Path::new(&arg)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .or_else(|| {
+            std::env::current_exe().ok().and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "armfortas".into())
+}
 
 /// Version string emitted by `--version`.
 pub fn version_string() -> String {
     format!(
-        "armfortas {} (aarch64-apple-darwin)",
+        "{} {} (aarch64-apple-darwin)",
+        program_name(),
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -742,7 +939,14 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_globals.extend(crate::sema::amod::extract_module_globals(ext_mod));
     }
 
-    let diags = validate::validate_file_with_layouts(&units, &st, opts.std, &type_layouts);
+    let diags = validate::validate_file_with_layouts_and_warning_groups(
+        &units,
+        &st,
+        opts.std,
+        &type_layouts,
+        opts.warn_pedantic,
+        opts.warn_deprecated,
+    );
     let file_str = opts.input.display().to_string();
     let mut had_error = false;
     for d in &diags {

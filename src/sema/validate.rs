@@ -83,10 +83,17 @@ struct Ctx<'a> {
     /// sensitive targets on a component access (`obj%field`), where
     /// the base variable's attributes aren't the right thing to check.
     type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
+    warn_pedantic: bool,
+    warn_deprecated: bool,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(st: &'a SymbolTable, std: Option<FortranStandard>) -> Self {
+    fn new(
+        st: &'a SymbolTable,
+        std: Option<FortranStandard>,
+        warn_pedantic: bool,
+        warn_deprecated: bool,
+    ) -> Self {
         Self {
             st,
             diags: Vec::new(),
@@ -97,6 +104,8 @@ impl<'a> Ctx<'a> {
             labels_defined: Vec::new(),
             labels_referenced: Vec::new(),
             type_layouts: None,
+            warn_pedantic,
+            warn_deprecated,
         }
     }
 
@@ -104,8 +113,10 @@ impl<'a> Ctx<'a> {
         st: &'a SymbolTable,
         std: Option<FortranStandard>,
         type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+        warn_pedantic: bool,
+        warn_deprecated: bool,
     ) -> Self {
-        let mut ctx = Self::new(st, std);
+        let mut ctx = Self::new(st, std, warn_pedantic, warn_deprecated);
         ctx.type_layouts = Some(type_layouts);
         ctx
     }
@@ -144,7 +155,17 @@ pub fn validate_file_with_std(
     st: &SymbolTable,
     std: Option<FortranStandard>,
 ) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new(st, std);
+    validate_file_with_warning_groups(units, st, std, false, false)
+}
+
+pub fn validate_file_with_warning_groups(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+    warn_pedantic: bool,
+    warn_deprecated: bool,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new(st, std, warn_pedantic, warn_deprecated);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -160,52 +181,111 @@ pub fn validate_file_with_layouts(
     std: Option<FortranStandard>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new_with_layouts(st, std, type_layouts);
+    validate_file_with_layouts_and_warning_groups(
+        units,
+        st,
+        std,
+        type_layouts,
+        false,
+        false,
+    )
+}
+
+pub fn validate_file_with_layouts_and_warning_groups(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    warn_pedantic: bool,
+    warn_deprecated: bool,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new_with_layouts(
+        st,
+        std,
+        type_layouts,
+        warn_pedantic,
+        warn_deprecated,
+    );
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
     ctx.diags
 }
 
+fn warn_legacy_feature(ctx: &mut Ctx<'_>, span: Span, feature: &str) {
+    if ctx.warn_pedantic || ctx.warn_deprecated {
+        ctx.warning(span, format!("{} is an obsolescent feature", feature));
+    }
+}
+
 /// Find the scope ID for a program unit, preferring children of `parent_scope`.
 /// This resolves ambiguity when multiple scopes share a name (e.g., a module
 /// subroutine and a CONTAINS subroutine with the same name).
-fn find_scope_for_unit(st: &SymbolTable, unit: &ProgramUnit, parent_scope: ScopeId) -> Option<ScopeId> {
+fn find_scope_for_unit(
+    st: &SymbolTable,
+    unit: &ProgramUnit,
+    parent_scope: ScopeId,
+) -> Option<ScopeId> {
     #[allow(clippy::type_complexity)]
     let (kind_matcher, _name): (Box<dyn Fn(&ScopeKind) -> bool>, Option<String>) = match unit {
         ProgramUnit::Program { name, .. } => {
             let target = name.clone().unwrap_or_else(|| "<main>".into());
-            (Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)), None)
+            (
+                Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)),
+                None,
+            )
         }
         ProgramUnit::Module { name, .. } => {
             let n = name.clone();
-            (Box::new(move |k| matches!(k, ScopeKind::Module(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
+            (
+                Box::new(
+                    move |k| matches!(k, ScopeKind::Module(ref m) if m.eq_ignore_ascii_case(&n)),
+                ),
+                Some(name.clone()),
+            )
         }
         ProgramUnit::Subroutine { name, .. } => {
             let n = name.clone();
-            (Box::new(move |k| matches!(k, ScopeKind::Subroutine(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
+            (
+                Box::new(
+                    move |k| matches!(k, ScopeKind::Subroutine(ref m) if m.eq_ignore_ascii_case(&n)),
+                ),
+                Some(name.clone()),
+            )
         }
         ProgramUnit::Function { name, .. } => {
             let n = name.clone();
-            (Box::new(move |k| matches!(k, ScopeKind::Function(ref m) if m.eq_ignore_ascii_case(&n))), Some(name.clone()))
+            (
+                Box::new(
+                    move |k| matches!(k, ScopeKind::Function(ref m) if m.eq_ignore_ascii_case(&n)),
+                ),
+                Some(name.clone()),
+            )
         }
         ProgramUnit::BlockData { name, .. } => {
             let target = name.clone().unwrap_or_else(|| "<block_data>".into());
-            (Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)), None)
+            (
+                Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)),
+                None,
+            )
         }
         _ => return None,
     };
 
     // Prefer a child of the current parent scope.
-    let child = st.scopes.iter().find(|s| {
-        s.parent == Some(parent_scope) && kind_matcher(&s.kind)
-    });
+    let child = st
+        .scopes
+        .iter()
+        .find(|s| s.parent == Some(parent_scope) && kind_matcher(&s.kind));
     if let Some(s) = child {
         return Some(s.id);
     }
 
     // Fall back to any matching scope.
-    st.scopes.iter().find(|s| kind_matcher(&s.kind)).map(|s| s.id)
+    st.scopes
+        .iter()
+        .find(|s| kind_matcher(&s.kind))
+        .map(|s| s.id)
 }
 
 fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
@@ -405,6 +485,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
         }
         ProgramUnit::BlockData { decls, .. } => {
+            warn_legacy_feature(ctx, unit.span, "BLOCK DATA");
             validate_decls(ctx, decls);
         }
         ProgramUnit::InterfaceBlock {
@@ -537,6 +618,14 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
         }
 
+        if matches!(decl.node, Decl::CommonBlock { .. }) {
+            warn_legacy_feature(ctx, decl.span, "COMMON block");
+        }
+
+        if matches!(decl.node, Decl::EquivalenceStmt { .. }) {
+            warn_legacy_feature(ctx, decl.span, "EQUIVALENCE");
+        }
+
         // Derived type definition validation.
         if let Decl::DerivedTypeDef {
             name,
@@ -633,11 +722,13 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.labels_referenced.push((*label, stmt.span));
         }
         Stmt::ComputedGoto { labels, .. } => {
+            warn_legacy_feature(ctx, stmt.span, "computed GOTO");
             for label in labels {
                 ctx.labels_referenced.push((*label, stmt.span));
             }
         }
         Stmt::ArithmeticIf { neg, zero, pos, .. } => {
+            warn_legacy_feature(ctx, stmt.span, "arithmetic IF");
             ctx.labels_referenced.push((*neg, stmt.span));
             ctx.labels_referenced.push((*zero, stmt.span));
             ctx.labels_referenced.push((*pos, stmt.span));
@@ -1946,10 +2037,14 @@ end program
     #[test]
     fn goto_undefined_label_detected() {
         // Test the label validation infrastructure directly.
-        use crate::lexer::{Span, Position};
+        use crate::lexer::{Position, Span};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st, None);
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        let mut ctx = Ctx::new(&st, None, false, false);
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         // Reference label 999 but don't define it.
         ctx.labels_referenced.push((999, span));
@@ -1959,10 +2054,14 @@ end program
 
     #[test]
     fn goto_defined_label_no_error() {
-        use crate::lexer::{Span, Position};
+        use crate::lexer::{Position, Span};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st, None);
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        let mut ctx = Ctx::new(&st, None, false, false);
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         ctx.labels_defined.push(10);
         ctx.labels_referenced.push((10, span));

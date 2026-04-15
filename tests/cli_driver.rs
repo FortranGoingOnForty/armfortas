@@ -706,8 +706,6 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
         "-fbackslash is recognized but string escape processing is not yet implemented",
         "-Wall is recognized but warning-group emission is not yet implemented",
         "-Wextra is recognized but warning-group emission is not yet implemented",
-        "-Wpedantic is recognized but warning-group emission is not yet implemented",
-        "-Wdeprecated is recognized but warning-group emission is not yet implemented",
     ] {
         assert!(
             stderr.contains(needle),
@@ -716,6 +714,16 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
             stderr
         );
     }
+    assert!(
+        !stderr.contains("-Wpedantic is recognized but warning-group emission is not yet implemented"),
+        "pedantic should now be a real semantic warning group: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("-Wdeprecated is recognized but warning-group emission is not yet implemented"),
+        "deprecated should now be a real semantic warning group: {}",
+        stderr
+    );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
 }
@@ -798,6 +806,61 @@ fn unknown_warning_flag_emits_warning() {
     assert!(
         stderr.contains("unrecognized warning option '-Weverything'"),
         "expected unknown-warning diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn wpedantic_warns_on_arithmetic_if() {
+    let src = write_program(
+        "program p\n  integer :: i\n  i = 0\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
+        "f90",
+    );
+    let out = unique_path("wpedantic", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-Wpedantic",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(result.status.success(), "pedantic compile failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("warning: arithmetic IF is an obsolescent feature"),
+        "expected arithmetic IF warning: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn wdeprecated_warns_on_common_block() {
+    let src = write_program("program p\n  integer :: x\n  common /blk/ x\nend program\n", "f90");
+    let out = unique_path("wdeprecated", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-Wdeprecated",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(result.status.success(), "deprecated compile failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("warning: COMMON block is an obsolescent feature"),
+        "expected COMMON warning: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);

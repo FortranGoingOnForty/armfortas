@@ -35,18 +35,24 @@ pub fn cli_entry() -> ! {
     const EXIT_LINK: i32 = 2;
     const EXIT_IO: i32 = 3;
     const EXIT_ICE: i32 = 4;
+    let program_name = driver::program_name();
 
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("{}", driver::HELP_TEXT);
-        process::exit(EXIT_COMPILE);
+        print!("{}", driver::HELP_TEXT);
+        process::exit(0);
     }
 
     let parsed = match driver::parse_cli(&args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("armfortas: {}", e);
-            process::exit(EXIT_COMPILE);
+            if e == "no input file" {
+                eprintln!("{}: {}", program_name, e);
+                print!("{}", driver::HELP_TEXT);
+                process::exit(0);
+            }
+            eprintln!("{}: {}", program_name, e);
+            process::exit(classify_compile_error(&e, EXIT_COMPILE, EXIT_LINK, EXIT_IO));
         }
     };
 
@@ -64,6 +70,9 @@ pub fn cli_entry() -> ! {
             process::exit(0);
         }
         driver::ParsedCli::Compile(opts) => {
+            if emit_cli_warnings(&program_name, &opts) {
+                process::exit(EXIT_COMPILE);
+            }
             // Capture the input path before opts is moved into the
             // compile thunk so we can include it in any ICE report.
             let input_for_ice = opts.input.display().to_string();
@@ -78,7 +87,7 @@ pub fn cli_entry() -> ! {
             match result {
                 Ok(Ok(())) => process::exit(0),
                 Ok(Err(e)) => {
-                    eprintln!("armfortas: {}", e);
+                    eprintln!("{}: {}", program_name, e);
                     process::exit(classify_compile_error(&e, EXIT_COMPILE, EXIT_LINK, EXIT_IO));
                 }
                 Err(_panic) => {
@@ -88,6 +97,22 @@ pub fn cli_entry() -> ! {
             }
         }
     }
+}
+
+fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
+    if opts.cli_warnings.is_empty() {
+        return false;
+    }
+
+    let label = if opts.warn_as_error {
+        "error"
+    } else {
+        "warning"
+    };
+    for warning in &opts.cli_warnings {
+        eprintln!("{}: {}: {}", program_name, label, warning);
+    }
+    opts.warn_as_error
 }
 
 /// Map a compile error message to the appropriate exit code.  Today
