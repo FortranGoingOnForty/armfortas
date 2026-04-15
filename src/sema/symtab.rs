@@ -233,6 +233,27 @@ impl SymbolTable {
         }
     }
 
+    /// Force IMPLICIT NONE on every program-unit-level scope in the
+    /// table (Program, Module, Submodule, Subroutine, Function,
+    /// BlockData).  Used by the driver's `-fimplicit-none` flag,
+    /// which mirrors the gfortran option of the same name and tells
+    /// validate.rs to flag every undeclared name even in scopes that
+    /// don't have an explicit `implicit none` statement.
+    pub fn force_implicit_none_all_units(&mut self) {
+        for scope in &mut self.scopes {
+            if matches!(
+                scope.kind,
+                ScopeKind::Program(_)
+                    | ScopeKind::Module(_)
+                    | ScopeKind::Submodule(_)
+                    | ScopeKind::Subroutine(_)
+                    | ScopeKind::Function(_)
+            ) {
+                scope.implicit_rules.none_type = true;
+            }
+        }
+    }
+
     /// Set an implicit typing rule for the current scope.
     pub fn set_implicit_rule(&mut self, start: char, end: char, itype: ImplicitType) {
         let scope = &mut self.scopes[self.current];

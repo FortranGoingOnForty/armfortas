@@ -6455,8 +6455,16 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
 
 fn lower_type_spec_st(ts: &TypeSpec, st: Option<&SymbolTable>) -> IrType {
     match ts {
-        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind_with_st(sel, 4, st)),
-        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind_with_st(sel, 4, st)),
+        TypeSpec::Integer(sel) => IrType::int_from_kind(extract_kind_with_st(
+            sel,
+            crate::driver::defaults::default_int_kind(),
+            st,
+        )),
+        TypeSpec::Real(sel) => IrType::float_from_kind(extract_kind_with_st(
+            sel,
+            crate::driver::defaults::default_real_kind(),
+            st,
+        )),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
         TypeSpec::Complex(sel) => {
             let fw = match extract_kind_with_st(sel, 4, st) {

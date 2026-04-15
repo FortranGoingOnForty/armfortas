@@ -16,5 +16,13 @@ path = "src/lib.rs"
 name = "armfortas"
 path = "src/main.rs"
 
+# `afs` is the short alias.  src/bin/afs.rs is a one-line wrapper
+# that calls into armfortas::cli_entry() so cargo doesn't warn about
+# two bin targets sharing one source path.  Sprint 35's `make
+# install` may collapse this back to a symlink to save disk.
+[[bin]]
+name = "afs"
+path = "src/bin/afs.rs"
+
 [dependencies]
 afs-as = { path = "afs-as" }

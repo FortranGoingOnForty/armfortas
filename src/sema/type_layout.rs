@@ -91,11 +91,18 @@ impl TypeLayoutRegistry {
 pub fn size_of_type(ti: &TypeInfo) -> (usize, usize) {
     match ti {
         TypeInfo::Integer { kind } => {
-            let k = kind.unwrap_or(4) as usize;
+            // No explicit kind selector → honour the driver's
+            // -fdefault-integer-8 (sprint 32 #504).  Standard
+            // processor default is 4.
+            let k = kind
+                .map(|k| k as usize)
+                .unwrap_or_else(|| crate::driver::defaults::default_int_kind() as usize);
             (k, k)
         }
         TypeInfo::Real { kind } => {
-            let k = kind.unwrap_or(4) as usize;
+            let k = kind
+                .map(|k| k as usize)
+                .unwrap_or_else(|| crate::driver::defaults::default_real_kind() as usize);
             (k, k)
         }
         TypeInfo::DoublePrecision => (8, 8),

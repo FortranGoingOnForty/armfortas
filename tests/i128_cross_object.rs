@@ -32,13 +32,9 @@ fn compile_fortran_object(source: &Path, output: &Path, opt_level: OptLevel) {
     let opts = Options {
         input: source.to_path_buf(),
         output: Some(output.to_path_buf()),
-        emit_asm: false,
         emit_obj: true,
-        emit_ir: false,
-        preprocess_only: false,
         opt_level,
-        extra_inputs: vec![],
-        module_search_paths: vec![],
+        ..Options::default()
     };
     compile(&opts).unwrap_or_else(|e| {
         panic!(
