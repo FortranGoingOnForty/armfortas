@@ -13,6 +13,13 @@ pub struct FieldLayout {
     pub offset: usize,
     pub size: usize,
     pub type_info: TypeInfo,
+    /// F2018 §7.5.4.5 / §7.5.4.6 attributes on the component, carried
+    /// per-field because validation of `obj%comp` as an ALLOCATE
+    /// target or pointer-assignment LHS/RHS needs the leaf
+    /// component's attributes, not the base variable's.
+    pub allocatable: bool,
+    pub pointer: bool,
+    pub target: bool,
 }
 
 /// A type-bound procedure mapping.
@@ -180,6 +187,7 @@ pub fn compute_layout(
         if let crate::ast::decl::Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let is_allocatable = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
             let is_pointer = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Pointer));
+            let is_target = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Target));
 
             let ti = type_spec_to_type_info(type_spec);
             let (elem_size, elem_align) = if is_allocatable || is_pointer {
@@ -203,6 +211,9 @@ pub fn compute_layout(
                     offset,
                     size: elem_size,
                     type_info: ti.clone(),
+                    allocatable: is_allocatable,
+                    pointer: is_pointer,
+                    target: is_target,
                 });
                 offset += elem_size;
             }
@@ -261,8 +272,8 @@ mod tests {
             size: 8,
             align: 4,
             fields: vec![
-                FieldLayout { name: "x".into(), offset: 0, size: 4, type_info: TypeInfo::Real { kind: Some(4) } },
-                FieldLayout { name: "y".into(), offset: 4, size: 4, type_info: TypeInfo::Real { kind: Some(4) } },
+                FieldLayout { name: "x".into(), offset: 0, size: 4, type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "y".into(), offset: 4, size: 4, type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
             ],
             bound_procs: vec![],
             final_procs: vec![],
@@ -287,9 +298,9 @@ mod tests {
             size: 24,
             align: 8,
             fields: vec![
-                FieldLayout { name: "a".into(), offset: 0, size: 1, type_info: TypeInfo::Integer { kind: Some(1) } },
-                FieldLayout { name: "b".into(), offset: 8, size: 8, type_info: TypeInfo::Real { kind: Some(8) } },
-                FieldLayout { name: "c".into(), offset: 16, size: 4, type_info: TypeInfo::Integer { kind: Some(4) } },
+                FieldLayout { name: "a".into(), offset: 0, size: 1, type_info: TypeInfo::Integer { kind: Some(1) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "b".into(), offset: 8, size: 8, type_info: TypeInfo::Real { kind: Some(8) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "c".into(), offset: 16, size: 4, type_info: TypeInfo::Integer { kind: Some(4) }, allocatable: false, pointer: false, target: false },
             ],
             bound_procs: vec![],
             final_procs: vec![],

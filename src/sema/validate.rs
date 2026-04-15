@@ -79,6 +79,10 @@ struct Ctx<'a> {
     labels_defined: Vec<u64>,
     /// Labels referenced (GOTO targets) in the current scope.
     labels_referenced: Vec<(u64, Span)>,
+    /// Derived-type layouts — consulted when validating attribute-
+    /// sensitive targets on a component access (`obj%field`), where
+    /// the base variable's attributes aren't the right thing to check.
+    type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
 }
 
 impl<'a> Ctx<'a> {
@@ -92,7 +96,18 @@ impl<'a> Ctx<'a> {
             std,
             labels_defined: Vec::new(),
             labels_referenced: Vec::new(),
+            type_layouts: None,
         }
+    }
+
+    fn new_with_layouts(
+        st: &'a SymbolTable,
+        std: Option<FortranStandard>,
+        type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    ) -> Self {
+        let mut ctx = Self::new(st, std);
+        ctx.type_layouts = Some(type_layouts);
+        ctx
     }
 
     /// Emit an error if a feature requires a newer standard than selected.
@@ -130,6 +145,22 @@ pub fn validate_file_with_std(
     std: Option<FortranStandard>,
 ) -> Vec<Diagnostic> {
     let mut ctx = Ctx::new(st, std);
+    for unit in units {
+        validate_unit(&mut ctx, unit);
+    }
+    ctx.diags
+}
+
+/// Validate with access to derived-type layouts, enabling per-field
+/// attribute checks on ALLOCATE / pointer-assignment targets that
+/// select a component (`obj%comp`).
+pub fn validate_file_with_layouts(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new_with_layouts(st, std, type_layouts);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -506,24 +537,46 @@ fn validate_pointer_assignment(
     value: &crate::ast::expr::SpannedExpr,
     span: Span,
 ) {
-    // Component-access target (`p%ptr_field => x`): the attribute
-    // lives on the final component, which the sema registry doesn't
-    // expose per-field. Skip the base-name check rather than issue
-    // a wrong-entity diagnostic (previous code reported the base as
-    // the target even when the real target was a pointer component).
-    if !expr_selects_component(target) {
-        if let Some(name) = extract_base_name(target) {
-            let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
-            if !is_pointer {
-                ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
+    // Component-access target (`p%ptr_field => x`): check the leaf
+    // component's attributes through the type-layout registry.  If
+    // layouts aren't available (older callers) or the chain can't be
+    // resolved, skip the check rather than flag the base variable.
+    if expr_selects_component(target) {
+        if let Some(leaf) = leaf_field_layout(ctx, target) {
+            if !leaf.field.pointer {
+                ctx.error(span, format!(
+                    "pointer assignment target component '{}' must have pointer attribute",
+                    leaf.field.name
+                ));
             }
+        }
+    } else if let Some(name) = extract_base_name(target) {
+        let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
+        if !is_pointer {
+            ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
         }
     }
 
     // RHS must have target attribute or be a pointer (or null()/function call).
-    // A component-access RHS (e.g. `=> p%buf`) likewise can't be
-    // attribute-checked without a per-field registry — skip.
-    if expr_selects_component(value) { return; }
+    if expr_selects_component(value) {
+        // Look up the leaf component's attributes.  F2018 §8.5.14
+        // says a subobject of a TARGET base (or an allocated
+        // ALLOCATABLE) is itself a valid target, so accept when any
+        // ancestor on the path carries one of those attributes.
+        if let Some(leaf) = leaf_field_layout(ctx, value) {
+            let ok = leaf.field.pointer
+                || leaf.field.target
+                || leaf.ancestor_is_target
+                || leaf.ancestor_is_allocatable;
+            if !ok {
+                ctx.error(span, format!(
+                    "pointer assignment source component '{}' must have target or pointer attribute",
+                    leaf.field.name
+                ));
+            }
+        }
+        return;
+    }
     if let Some(name) = extract_base_name(value) {
         // Skip if the value is a function call — could be null() or pointer-valued function.
         if matches!(value.node, Expr::FunctionCall { .. }) {
@@ -554,16 +607,22 @@ fn validate_pointer_assignment(
 /// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
 ///
 /// For a component access like `pools(i)%tokens(n)`, the target is
-/// the `tokens` field — not the `pools` base. We don't currently
-/// carry per-field attributes in the sema type registry, so checking
-/// would require more infrastructure. For now, skip the check
-/// whenever the item selects into a component; the lowering path
-/// already requires the leaf to be allocatable (it uses the
-/// descriptor ABI) and a mismatch would surface as a verifier or
-/// runtime error rather than silent miscompile. Bare-name ALLOCATE
-/// targets still get the attribute check on their symbol.
+/// the `tokens` field — not the `pools` base.  Resolve the leaf
+/// component through the type-layout registry and check its own
+/// attributes.  Bare-name targets still get the symbol attribute
+/// check.  If the chain can't be resolved (registry missing, cross-
+/// TU stale .amod, etc.) we skip rather than produce a misleading
+/// error.
 fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr, stmt_name: &str) {
     if expr_selects_component(item) {
+        if let Some(leaf) = leaf_field_layout(ctx, item) {
+            if !leaf.field.allocatable && !leaf.field.pointer {
+                ctx.error(item.span, format!(
+                    "only allocatable or pointer components can appear in {}, but '{}' is neither",
+                    stmt_name.to_uppercase(), leaf.field.name
+                ));
+            }
+        }
         return;
     }
     let base_name = extract_base_name(item);
@@ -582,16 +641,93 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
 
 /// Does this expression select into a derived-type component
 /// anywhere in its path? e.g. `pools(i)%tokens(n)` → true,
-/// `pools(i)` → false, `pools` → false. Used by the
-/// ALLOCATE / pointer-assignment validators to bail out of the
-/// bare-name attribute check when the real target lives on a
-/// component that the registry doesn't expose attributes for.
+/// `pools(i)` → false, `pools` → false.
 fn expr_selects_component(expr: &crate::ast::expr::SpannedExpr) -> bool {
     match &expr.node {
         Expr::ComponentAccess { .. } => true,
         Expr::FunctionCall { callee, .. } => expr_selects_component(callee),
         _ => false,
     }
+}
+
+/// Resolved metadata for the leaf of a component access.
+struct LeafComponent<'a> {
+    field: &'a crate::sema::type_layout::FieldLayout,
+    /// Any ancestor on the path (including the base variable or any
+    /// intermediate component) has the TARGET attribute.  F2018
+    /// §8.5.14: a subobject of a TARGET is itself a valid target.
+    ancestor_is_target: bool,
+    /// Any ancestor is ALLOCATABLE — per §8.5.14, an allocated
+    /// subobject of an allocatable is also a valid target.
+    ancestor_is_allocatable: bool,
+}
+
+/// Walk an expression down to its leaf component access and return
+/// that component's FieldLayout (with attribute metadata).  Returns
+/// `None` if the expression has no component access, or if the
+/// chain's derived-type path can't be resolved through the symbol
+/// table + layout registry (for example, a field whose type is a
+/// derived type that wasn't in the registry — uncommon but possible
+/// when a cross-TU .amod is stale).
+fn leaf_field_layout<'a>(
+    ctx: &'a Ctx,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<LeafComponent<'a>> {
+    let layouts = ctx.type_layouts?;
+    // Collect the component chain from outermost to innermost.
+    let mut chain: Vec<&str> = Vec::new();
+    let mut cur = expr;
+    let base_name = loop {
+        match &cur.node {
+            Expr::ComponentAccess { base, component } => {
+                chain.push(component.as_str());
+                cur = base;
+            }
+            Expr::FunctionCall { callee, .. } => {
+                cur = callee;
+            }
+            Expr::Name { name } => break name.as_str(),
+            _ => return None,
+        }
+    };
+    chain.reverse();
+    if chain.is_empty() { return None; }
+    // Resolve the base variable's derived type via the symbol table.
+    let sym = ctx.lookup(base_name)?;
+    let base_type = match sym.type_info.as_ref()? {
+        crate::sema::symtab::TypeInfo::Derived(name) => name.clone(),
+        _ => return None,
+    };
+    // Seed ancestor flags from the base variable's own attributes.
+    let mut ancestor_is_target = sym.attrs.target;
+    let mut ancestor_is_allocatable = sym.attrs.allocatable;
+    let mut current_type = base_type;
+    let mut leaf: Option<&crate::sema::type_layout::FieldLayout> = None;
+    for (i, comp) in chain.iter().enumerate() {
+        let layout = layouts.get(&current_type)?;
+        let field = layout.field(comp)?;
+        // On non-terminal components, accumulate TARGET / ALLOCATABLE
+        // so the leaf check can honour inherited target-ness.
+        let is_terminal = i + 1 == chain.len();
+        if !is_terminal {
+            if field.target { ancestor_is_target = true; }
+            if field.allocatable { ancestor_is_allocatable = true; }
+        }
+        leaf = Some(field);
+        match &field.type_info {
+            crate::sema::symtab::TypeInfo::Derived(name) => {
+                current_type = name.clone();
+            }
+            _ => {
+                // Scalar / intrinsic-typed leaf — no further resolution.
+            }
+        }
+    }
+    leaf.map(|field| LeafComponent {
+        field,
+        ancestor_is_target,
+        ancestor_is_allocatable,
+    })
 }
 
 /// Check if a call in a pure procedure is to a known impure procedure.

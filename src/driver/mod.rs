@@ -249,7 +249,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_globals.extend(crate::sema::amod::extract_module_globals(ext_mod));
     }
 
-    let diags = validate::validate_file(&units, &st);
+    let diags = validate::validate_file_with_layouts(&units, &st, None, &type_layouts);
     for d in &diags {
         if d.kind == validate::DiagKind::Error {
             return Err(format!(

@@ -342,7 +342,15 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         }
         for field in &layout.fields {
             let ft = type_info_to_string(Some(&field.type_info));
-            writeln!(out, "  @field {} : {} @offset {} @size {}", field.name, ft, field.offset, field.size).unwrap();
+            let mut attrs = String::new();
+            if field.allocatable { attrs.push_str(" @allocatable"); }
+            if field.pointer { attrs.push_str(" @pointer"); }
+            if field.target { attrs.push_str(" @target"); }
+            writeln!(
+                out,
+                "  @field {} : {} @offset {} @size {}{}",
+                field.name, ft, field.offset, field.size, attrs
+            ).unwrap();
         }
         for bp in &layout.bound_procs {
             if bp.method_name == bp.target_name {
@@ -785,20 +793,32 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         } else if let Some(rest) = trimmed.strip_prefix("@extends ") {
             parent = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@field ") {
-            // @field name : type @offset N @size M
+            // @field name : type @offset N @size M [@allocatable] [@pointer] [@target]
             if let Some((name_type, offset_part)) = rest.split_once(" @offset ") {
                 let (fname, ftype_str) = name_type.split_once(" : ").unwrap_or((name_type, "unknown"));
-                let (offset_str, size_part) = if let Some(idx) = offset_part.find(" @size ") {
-                    (&offset_part[..idx], &offset_part[idx + 7..])
-                } else {
-                    (offset_part, "0")
+                // Split off the size and any trailing attribute flags.
+                let (offset_str, after_offset) = match offset_part.find(" @size ") {
+                    Some(idx) => (&offset_part[..idx], &offset_part[idx + 7..]),
+                    None => (offset_part, "0"),
                 };
+                let mut size_str = after_offset;
+                let mut flag_tail: &str = "";
+                if let Some(idx) = after_offset.find(" @") {
+                    size_str = &after_offset[..idx];
+                    flag_tail = &after_offset[idx..];
+                }
+                let allocatable = flag_tail.contains("@allocatable");
+                let pointer = flag_tail.contains("@pointer");
+                let target = flag_tail.contains("@target");
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
                     offset: offset_str.trim().parse().unwrap_or(0),
-                    size: size_part.trim().parse().unwrap_or(0),
+                    size: size_str.trim().parse().unwrap_or(0),
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
+                    allocatable,
+                    pointer,
+                    target,
                 });
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
