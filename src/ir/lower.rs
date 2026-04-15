@@ -229,10 +229,19 @@ pub fn lower_file(
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
 
-    // Pass 1: collect module-level variables.
+    // Pass 1: collect module-level variables.  Submodule decls are
+    // installed under their parent module's name so the submodule's
+    // contained procedures can resolve them through the same global
+    // lookup the parent uses.
     for unit in units {
-        if let ProgramUnit::Module { name, decls, .. } = &unit.node {
-            collect_module_globals(&mut module, &mut globals, name, decls, st);
+        match &unit.node {
+            ProgramUnit::Module { name, decls, .. } => {
+                collect_module_globals(&mut module, &mut globals, name, decls, st);
+            }
+            ProgramUnit::Submodule { parent, decls, .. } => {
+                collect_module_globals(&mut module, &mut globals, parent, decls, st);
+            }
+            _ => {}
         }
     }
 
@@ -385,10 +394,12 @@ fn walk_contained_host_refs_inner<'a>(
         ProgramUnit::Program { decls, contains, .. } => (decls, contains),
         ProgramUnit::Subroutine { decls, contains, .. } => (decls, contains),
         ProgramUnit::Function { decls, contains, .. } => (decls, contains),
-        ProgramUnit::Module { contains, .. } => {
-            // Module procedures access module globals directly (not via
-            // host association closures). Recurse into each so any
-            // nested contains still gets analyzed against its own host.
+        ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
+            // Module / submodule procedures access module globals
+            // directly (not via host association closures). Recurse
+            // into each so any nested contains still gets analyzed
+            // against its own host.
             for sub in contains {
                 walk_contained_host_refs_inner(&sub.node, ancestor_decls, out);
             }
@@ -484,7 +495,8 @@ fn collect_internal_func_names(
                 collect_internal_func_names(&sub.node, out, next_idx);
             }
         }
-        ProgramUnit::Module { contains, .. } => {
+        ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
                 collect_internal_func_names(&sub.node, out, next_idx);
             }
@@ -532,7 +544,8 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
         }
         ProgramUnit::Program { contains, .. }
         | ProgramUnit::Subroutine { contains, .. }
-        | ProgramUnit::Module { contains, .. } => {
+        | ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
                 collect_alloc_return_funcs(&sub.node, out);
             }
@@ -587,7 +600,9 @@ fn collect_char_len_star_params(unit: &ProgramUnit, out: &mut HashMap<String, Ve
             record(name, args, decls, out);
             for sub in contains { collect_char_len_star_params(&sub.node, out); }
         }
-        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains { collect_char_len_star_params(&sub.node, out); }
         }
         _ => {}
@@ -625,7 +640,9 @@ fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<boo
             record(name, args, decls, out);
             for sub in contains { collect_optional_params(&sub.node, out); }
         }
-        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains { collect_optional_params(&sub.node, out); }
         }
         _ => {}
@@ -695,7 +712,9 @@ fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<b
             record(name, args, decls, out);
             for sub in contains { collect_descriptor_params(&sub.node, out); }
         }
-        ProgramUnit::Program { contains, .. } | ProgramUnit::Module { contains, .. } => {
+        ProgramUnit::Program { contains, .. }
+        | ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains { collect_descriptor_params(&sub.node, out); }
         }
         _ => {}
@@ -718,7 +737,8 @@ fn collect_elemental_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
         }
         ProgramUnit::Program { contains, .. }
         | ProgramUnit::Subroutine { contains, .. }
-        | ProgramUnit::Module { contains, .. } => {
+        | ProgramUnit::Module { contains, .. }
+        | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
                 collect_elemental_funcs(&sub.node, out);
             }
@@ -2235,6 +2255,42 @@ fn lower_unit(
                     &visible_param_consts,
                     &no_host_decls,
                     module_name,
+                    alloc_return_funcs,
+                    optional_params,
+                    descriptor_params,
+                    internal_funcs,
+                    elemental_funcs,
+                    char_len_star_params,
+                    contained_host_refs,
+                    false,
+                );
+            }
+        }
+        ProgramUnit::Submodule { parent, decls, uses, contains, .. } => {
+            // F2018 §11.2.3: a submodule provides implementations for the
+            // separate-module procedures declared in its parent module's
+            // interface block.  The parent module already installed its
+            // globals in pass 1; the submodule's own decls (if any) act
+            // like additional private module-scope state.  We treat the
+            // submodule's CONTAINS subprograms exactly like the parent
+            // module's contains — emit them as top-level functions whose
+            // host scope is the parent module — so the linker sees the
+            // implementations the program later calls into.
+            let visible_param_consts = collect_decl_param_consts_with_host(decls, host_param_consts);
+            let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
+                host_uses.iter().chain(uses.iter()).cloned().collect();
+            let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
+            for sub in contains {
+                lower_unit(
+                    module,
+                    sub,
+                    st,
+                    globals,
+                    type_layouts,
+                    &combined_uses,
+                    &visible_param_consts,
+                    &no_host_decls,
+                    Some(parent.as_str()),
                     alloc_return_funcs,
                     optional_params,
                     descriptor_params,
