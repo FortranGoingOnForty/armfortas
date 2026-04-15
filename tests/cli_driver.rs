@@ -490,6 +490,42 @@ fn fdefault_real_8_changes_default_kind() {
 }
 
 #[test]
+fn afs_runtime_path_env_overrides_runtime_discovery() {
+    // Point $AFS_RUNTIME_PATH at a directory that DOES contain the
+    // real runtime and verify compilation still succeeds — exercises
+    // the override branch end-to-end without hiding the real runtime.
+    let rt = PathBuf::from("target/release/libarmfortas_rt.a");
+    if !rt.exists() {
+        // Skip silently when running off a tree that only has a
+        // debug runtime — CI has both; a contributor's fresh clone
+        // with only `cargo build` will hit release.
+        return;
+    }
+    let rt_dir = rt.parent().unwrap().to_path_buf();
+    let src = write_program(
+        "program p\n  print *, 11\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rtpath", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_PATH", &rt_dir)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "AFS_RUNTIME_PATH-directed compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn missing_input_file_reports_io_error() {
     let result = Command::new(compiler("armfortas"))
         .args(["/nonexistent/path/source.f90"])

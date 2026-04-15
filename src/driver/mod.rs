@@ -1218,6 +1218,22 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
 
 /// Find libarmfortas_rt.a in common locations.
 fn find_runtime_lib() -> Result<String, String> {
+    // 1. $AFS_RUNTIME_PATH — the explicit override.  Accepts either
+    //    a directory containing libarmfortas_rt.a or the archive
+    //    path directly.
+    if let Ok(env_path) = std::env::var("AFS_RUNTIME_PATH") {
+        let p = PathBuf::from(&env_path);
+        if p.is_dir() {
+            let candidate = p.join("libarmfortas_rt.a");
+            if candidate.exists() {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+        } else if p.exists() {
+            return Ok(env_path);
+        }
+    }
+
+    // 2. Cargo workspace — when running out of the build tree.
     if let Some(workspace_root) = find_workspace_root() {
         maybe_refresh_runtime_lib(&workspace_root)?;
         for candidate in [
@@ -1230,16 +1246,42 @@ fn find_runtime_lib() -> Result<String, String> {
         }
     }
 
-    // Fall back to a runtime shipped next to the compiler binary.
+    // 3. Sibling of the compiler binary:
+    //      <bindir>/libarmfortas_rt.a
+    //      <bindir>/../lib/libarmfortas_rt.a      (classic FHS)
+    //      <bindir>/../lib/armfortas/libarmfortas_rt.a
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(Path::new("."));
-        let candidate = dir.join("libarmfortas_rt.a");
-        if candidate.exists() {
-            return Ok(candidate.to_str().unwrap().to_string());
+        let candidates = [
+            dir.join("libarmfortas_rt.a"),
+            dir.join("../lib/libarmfortas_rt.a"),
+            dir.join("../lib/armfortas/libarmfortas_rt.a"),
+        ];
+        for candidate in &candidates {
+            if candidate.exists() {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
         }
     }
 
-    Err("cannot find libarmfortas_rt.a — build with 'cargo build -p armfortas-rt'".into())
+    // 4. Standard install locations.
+    for fixed in &[
+        "/usr/local/lib/libarmfortas_rt.a",
+        "/usr/local/lib/armfortas/libarmfortas_rt.a",
+        "/opt/homebrew/lib/libarmfortas_rt.a",
+    ] {
+        if Path::new(fixed).exists() {
+            return Ok((*fixed).to_string());
+        }
+    }
+
+    Err(
+        "cannot find libarmfortas_rt.a. Searched: \
+         $AFS_RUNTIME_PATH, cargo workspace, next to the compiler \
+         binary, and /usr/local/lib. Build with \
+         'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
+            .into(),
+    )
 }
 
 fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
