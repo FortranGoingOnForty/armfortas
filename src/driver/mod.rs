@@ -272,7 +272,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 set_output_path(&mut opts, value)?;
             }
             arg if arg.starts_with("-o") => {
-                set_output_path(&mut opts, short_option_value(&arg, "-o", "an argument")?)?;
+                set_output_path(&mut opts, short_option_value(arg, "-o", "an argument")?)?;
             }
 
             // ---- Mode ----
@@ -308,7 +308,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             arg if arg.starts_with("-I") => opts
                 .module_search_paths
-                .push(PathBuf::from(short_option_value(&arg, "-I", "a directory")?)),
+                .push(PathBuf::from(short_option_value(arg, "-I", "a directory")?)),
 
             "-J" => {
                 i += 1;
@@ -317,7 +317,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             arg if arg.starts_with("-J") => {
                 opts.module_output_dir = Some(PathBuf::from(short_option_value(
-                    &arg,
+                    arg,
                     "-J",
                     "a directory",
                 )?));
@@ -331,7 +331,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             arg if arg.starts_with("-L") => {
                 opts.library_search_paths
-                    .push(PathBuf::from(short_option_value(&arg, "-L", "a directory")?))
+                    .push(PathBuf::from(short_option_value(arg, "-L", "a directory")?))
             }
 
             "-l" => {
@@ -340,7 +340,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     .push(args.get(i).ok_or("-l requires a library name")?.clone());
             }
             arg if arg.starts_with("-l") => opts.link_libs.push(
-                short_option_value(&arg, "-l", "a library name")?.to_string(),
+                short_option_value(arg, "-l", "a library name")?.to_string(),
             ),
 
             "-rpath" | "--rpath" => {
