@@ -10793,6 +10793,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
                             let elem_size_bytes: i64 = match &info.ty {
                                 IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+                                IrType::Int(IntWidth::I128) => 16,
                                 IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                                 IrType::Bool => 4,
                                 _ => 8,
