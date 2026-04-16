@@ -1171,6 +1171,71 @@ fn dash_i_equals_form_finds_modules() {
 }
 
 #[test]
+fn public_derived_type_in_private_module_is_emitted_and_importable() {
+    let dir = unique_dir("public_type_mod");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  private\n  public :: make_t\n  type, public :: result_t\n    integer :: source = 0\n    integer :: length = 0\n  end type\ncontains\n  function make_t() result(res)\n    type(result_t) :: res\n    res%source = 1\n    res%length = 2\n  end function\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use m, only: make_t, result_t\n  implicit none\n  type(result_t) :: x\n  x = make_t()\n  if (x%source /= 1) error stop 1\n  if (x%length /= 2) error stop 2\nend program\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = dir.join("m.amod");
+    let amod_text = std::fs::read_to_string(&amod).expect("module .amod should exist");
+    assert!(
+        amod_text.contains("@type result_t"),
+        "public derived type should be exported to .amod: {}",
+        amod_text
+    );
+    assert!(
+        amod_text.contains("@field source") && amod_text.contains("@field length"),
+        "derived type layout should be exported to .amod: {}",
+        amod_text
+    );
+
+    let user_obj = dir.join("user.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "consumer compile should import the public derived type layout: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn shared_compile_emits_amod_and_links_cleanly() {
     let dir = unique_dir("shared_mod");
     let lib_src = write_program_in(

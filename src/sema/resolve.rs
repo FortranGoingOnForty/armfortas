@@ -725,12 +725,23 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     }
                 }
             }
-            Decl::DerivedTypeDef { name, .. } => {
+            Decl::DerivedTypeDef { name, attrs, .. } => {
+                let mut sym_attrs = SymbolAttrs {
+                    access: st.default_access(st.current_scope()),
+                    ..SymbolAttrs::default()
+                };
+                for attr in attrs {
+                    match attr {
+                        decl::TypeAttr::Public => sym_attrs.access = Access::Public,
+                        decl::TypeAttr::Private => sym_attrs.access = Access::Private,
+                        _ => {}
+                    }
+                }
                 st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::DerivedType,
                     type_info: None,
-                    attrs: SymbolAttrs::default(),
+                    attrs: sym_attrs,
                     defined_at: decl.span,
                     scope: st.current_scope(),
                     arg_names: vec![],
