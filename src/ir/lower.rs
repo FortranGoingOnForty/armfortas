@@ -8278,21 +8278,26 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
     if let (Some(var_name), Some(start_expr), Some(end_expr)) = (var, start, end) {
         // Counted DO loop.
         let key = var_name.to_lowercase();
+        let var_ty = ctx.locals.get(&key).map(|info| info.ty.clone()).unwrap_or(IrType::Int(IntWidth::I32));
         let var_addr = ctx.locals.get(&key).map(|info| info.addr).unwrap_or_else(|| {
-            let addr = b.alloca(IrType::Int(IntWidth::I32));
-            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: IrType::Int(IntWidth::I32), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
+            let addr = b.alloca(var_ty.clone());
+            ctx.locals.insert(key.clone(), LocalInfo { addr, ty: var_ty.clone(), dims: vec![], allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
             addr
         });
 
         // Initialize loop variable.
-        let init_val = lower_expr_ctx(b, ctx, start_expr);
+        let init_raw = lower_expr_ctx(b, ctx, start_expr);
+        let init_val = coerce_to_type(b, init_raw, &var_ty);
         b.store(init_val, var_addr);
 
-        let end_val = lower_expr_ctx(b, ctx, end_expr);
+        let end_raw = lower_expr_ctx(b, ctx, end_expr);
+        let end_val = coerce_to_type(b, end_raw, &var_ty);
         let step_val = if let Some(step_expr) = step {
-            lower_expr_ctx(b, ctx, step_expr)
+            let step_raw = lower_expr_ctx(b, ctx, step_expr);
+            coerce_to_type(b, step_raw, &var_ty)
         } else {
-            b.const_i32(1)
+            let one = b.const_i32(1);
+            coerce_to_type(b, one, &var_ty)
         };
 
         let bb_check = b.create_block(check_name);
@@ -8314,7 +8319,8 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
             b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
         } else {
             // Runtime step: check sign and use appropriate comparison.
-            let zero = b.const_i32(0);
+            let zero_const = b.const_i32(0);
+            let zero = coerce_to_type(b, zero_const, &var_ty);
             let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
             let bb_neg_check = b.create_block(neg_check_name);
             let bb_pos_check = b.create_block(pos_check_name);

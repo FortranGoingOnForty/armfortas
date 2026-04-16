@@ -250,6 +250,28 @@ fn max_intrinsic_coerces_mixed_width_integer_args() {
 }
 
 #[test]
+fn counted_do_coerces_mixed_width_bounds() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=5) :: s\n  integer :: i, total\n  s = 'abc  '\n  total = 0\n  do i = len_trim(s), 1, -1\n    total = total + i\n  end do\n  print *, total\nend program\n",
+        "f90",
+    );
+    let out = unique_path("do_mixed_width", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed-width DO compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "mixed-width DO compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(out.exists(), "mixed-width DO should produce an object file");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_o_equals_form_sets_output_path() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("oeq", "o");
