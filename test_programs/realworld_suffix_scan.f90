@@ -2,7 +2,7 @@
 ! Conservatively written because the typed constructor spelling
 ! `[character(len=20) :: ...]` is still a separate parser-gap note.
 ! CHECK: 3 2 2 322
-! IR_CHECK: call @classify_sources(
+! IR_CHECK: call @afs_modproc_suffix_scan_mod_classify_sources(
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run
