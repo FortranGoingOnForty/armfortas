@@ -31,12 +31,31 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
-fn call_arg_counts_for(func_section: &str, callee_marker: &str) -> Vec<usize> {
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn call_arg_counts_for(func_section: &str, callee_name: &str) -> Vec<usize> {
     func_section
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            let call = line.find(&format!("call {}", callee_marker))?;
+            let call = line.find(&format!("call @{}", callee_name))?;
             let inside = line[call..].split_once('(')?.1.split_once(')')?.0.trim();
             Some(if inside.is_empty() {
                 0
@@ -84,23 +103,32 @@ fn o2_propagates_trivial_return_and_deletes_helper() {
         Stage::Obj,
     );
 
-    let raw_main = function_section(&raw_ir, "__prog_ipo_return_prop");
-    let _raw_helper = function_section(&raw_ir, "passthrough");
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained helper:\n{}",
+        raw_ir
+    );
+    let raw_main = raw_sections[0];
+    let raw_helper = raw_sections[1];
+    let raw_helper_name = function_name(raw_helper);
 
     assert_eq!(
-        call_arg_counts_for(raw_main, "@passthrough"),
+        call_arg_counts_for(raw_main, raw_helper_name),
         vec![1, 1],
         "raw caller should still materialize helper calls:\n{}",
         raw_main
     );
     assert!(
-        !opt_ir.contains("func @passthrough"),
+        !opt_ir.contains(&format!("func @{}", raw_helper_name)),
         "optimized IR should remove the trivial helper entirely:\n{}",
         opt_ir
     );
     let opt_main = function_section(&opt_ir, "__prog_ipo_return_prop");
     assert!(
-        !opt_main.contains("call @func_") && !opt_main.contains("call @passthrough"),
+        !opt_main.contains("call @func_")
+            && !opt_main.contains(&format!("call @{}", raw_helper_name)),
         "optimized caller should no longer call the passthrough helper:\n{}",
         opt_main
     );

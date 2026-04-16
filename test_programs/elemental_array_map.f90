@@ -3,7 +3,7 @@
 ! CHECK: 21
 ! CHECK: 24
 ! IR_CHECK: doconc_check_
-! IR_CHECK: call @shift_scale(
+! IR_CHECK: call @afs_internal___prog_elemental_array_map_1(
 program elemental_array_map
   implicit none
   integer :: a(4), b(4), i

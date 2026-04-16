@@ -1,6 +1,6 @@
 ! Repeated PURE recursive calls should be reused at O2+ in the caller.
-! IR_CHECK: call @heavy_fact(
-! IR_CHECK: call @heavy_fact(
+! IR_CHECK: call @afs_internal___prog_pure_recursive_reuse_1(
+! IR_CHECK: call @afs_internal___prog_pure_recursive_reuse_1(
 ! CHECK: 1440
 program pure_recursive_reuse
   implicit none
