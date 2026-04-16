@@ -36,11 +36,16 @@ impl std::error::Error for ParseError {}
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    expr_depth: usize,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            expr_depth: 0,
+        }
     }
 
     /// Peek at the current token kind without consuming.
