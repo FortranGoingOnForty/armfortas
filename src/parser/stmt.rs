@@ -64,7 +64,13 @@ impl<'a> Parser<'a> {
             "select" => self.parse_select(start),
             "where" => self.parse_where_construct(start),
             "forall" => self.parse_forall_construct(start),
-            "block" => self.parse_block_construct(start),
+            "block" => {
+                if self.at_stmt_end_after(1) {
+                    self.parse_block_construct(start)
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
+            }
             "associate" => self.parse_associate(start),
             "exit" => {
                 self.advance();
@@ -2308,6 +2314,12 @@ end if
     #[test]
     fn entry_name_can_still_start_assignment() {
         let s = parse_one("entry(i:i) = c_entry(i)\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
+    }
+
+    #[test]
+    fn block_name_can_still_start_component_assignment() {
+        let s = parse_one("block%for_count = count\n");
         assert!(matches!(s.node, Stmt::Assignment { .. }));
     }
 
