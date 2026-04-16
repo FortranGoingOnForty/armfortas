@@ -3173,6 +3173,35 @@ fn parameter_integer_literal_overflow_is_diagnosed() {
 }
 
 #[test]
+fn symbolic_integer_kind_suffix_uses_imported_width() {
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_long\n  integer(c_long), parameter :: x = 9223372036854775807_c_long\n  if (x /= 9223372036854775807_c_long) error stop 1\n  print *, x\nend program\n",
+        "f90",
+    );
+    let out = unique_path("symbolic_int_kind_ok", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "symbolic integer kind suffix should honor imported width: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "symbolic integer kind program should run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn integer_division_by_zero_is_diagnosed() {
     let src = write_program(
         "program p\n  integer, parameter :: x = 1 / 0\n  print *, x\nend program\n",

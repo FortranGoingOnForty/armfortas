@@ -239,10 +239,21 @@ fn default_int_kind(kind: Option<u8>) -> u8 {
     kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
 }
 
-fn parse_int_literal_kind(kind: &Option<String>) -> u8 {
-    kind.as_ref()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or_else(crate::driver::defaults::default_int_kind)
+fn parse_int_literal_kind(ctx: &Ctx<'_>, kind: &Option<String>) -> u8 {
+    if let Some(kind_name) = kind {
+        if let Ok(n) = kind_name.parse::<u8>() {
+            return n;
+        }
+        if let Some(sym) = ctx
+            .lookup(kind_name)
+            .or_else(|| ctx.st.find_symbol_any_scope(&kind_name.to_lowercase()))
+        {
+            if let Some(value) = sym.const_value.and_then(|v| u8::try_from(v).ok()) {
+                return value;
+            }
+        }
+    }
+    crate::driver::defaults::default_int_kind()
 }
 
 fn int_kind_bounds(kind: u8) -> Option<(i128, i128)> {
@@ -288,7 +299,7 @@ fn eval_const_int_expr_checked(
                 span: expr.span,
                 msg: "compile-time integer overflow",
             })?;
-            checked_int_value(value, parse_int_literal_kind(kind), expr.span).map(Some)
+            checked_int_value(value, parse_int_literal_kind(ctx, kind), expr.span).map(Some)
         }
         Expr::Name { name } => {
             let Some(sym) = ctx.lookup(name) else {
