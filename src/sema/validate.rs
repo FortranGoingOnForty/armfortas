@@ -813,11 +813,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.require_std(stmt.span, FortranStandard::F95, "FORALL statement");
             validate_stmt(ctx, inner);
         }
-        Stmt::Block { uses, implicit, decls, body, .. } => {
+        Stmt::Block { uses, ifaces, implicit, decls, body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
             validate_decls(ctx, uses);
             validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
+            for iface in ifaces {
+                validate_unit(ctx, iface);
+            }
             validate_stmts(ctx, body);
         }
         Stmt::Associate { assocs, body, .. } => {
@@ -1434,22 +1437,7 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
 
     // Collect declared names in this scope (from declarations).
     let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for decl in decls {
-        match &decl.node {
-            Decl::TypeDecl { entities, .. } => {
-                for e in entities {
-                    declared.insert(e.name.to_lowercase());
-                }
-            }
-            // COMMON block variables are also declared.
-            Decl::CommonBlock { vars, .. } => {
-                for v in vars {
-                    declared.insert(v.to_lowercase());
-                }
-            }
-            _ => {}
-        }
-    }
+    extend_declared_names_from_decls(&mut declared, decls);
     // Also scan for INTERFACE blocks — function/subroutine names
     // declared in interfaces are valid in the current scope.
     // The interface bodies are stored as program units in the
@@ -1491,6 +1479,57 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
             ctx.error(*span, format!(
                 "variable '{}' used but not declared (IMPLICIT NONE is active)", name
             ));
+        }
+    }
+}
+
+fn extend_declared_names_from_decls(
+    declared: &mut std::collections::HashSet<String>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for e in entities {
+                    declared.insert(e.name.to_lowercase());
+                }
+            }
+            // COMMON block variables are also declared.
+            Decl::CommonBlock { vars, .. } => {
+                for v in vars {
+                    declared.insert(v.to_lowercase());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extend_declared_names_from_ifaces(
+    declared: &mut std::collections::HashSet<String>,
+    ifaces: &[crate::ast::unit::SpannedUnit],
+) {
+    use crate::ast::unit::{InterfaceBody, ProgramUnit};
+
+    for iface in ifaces {
+        let ProgramUnit::InterfaceBlock { bodies, .. } = &iface.node else {
+            continue;
+        };
+        for body in bodies {
+            match body {
+                InterfaceBody::Subprogram(sub) => match &sub.node {
+                    ProgramUnit::Function { name, .. }
+                    | ProgramUnit::Subroutine { name, .. } => {
+                        declared.insert(name.to_lowercase());
+                    }
+                    _ => {}
+                },
+                InterfaceBody::ModuleProcedure(names) => {
+                    for name in names {
+                        declared.insert(name.to_lowercase());
+                    }
+                }
+            }
         }
     }
 }
@@ -1566,7 +1605,7 @@ fn walk_stmt_for_undeclared(
         Stmt::DoConcurrent { body, .. } => {
             for s in body { recurse!(s); }
         }
-        Stmt::Block { uses, implicit, decls, body, .. } => {
+        Stmt::Block { uses, ifaces, implicit, decls, body, .. } => {
             // F2018 §11.1.4: a BLOCK construct establishes its own
             // scope with an independent implicit-typing environment.
             // Layer the block's declared names AND any IMPLICIT
@@ -1574,13 +1613,8 @@ fn walk_stmt_for_undeclared(
             // does not leak back out.
             let mut block_declared = declared.clone();
             block_declared.extend(block_use_imported_names(st, uses));
-            for d in decls {
-                if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
-                    for e in entities {
-                        block_declared.insert(e.name.to_lowercase());
-                    }
-                }
-            }
+            extend_declared_names_from_decls(&mut block_declared, decls);
+            extend_declared_names_from_ifaces(&mut block_declared, ifaces);
             let mut block_implicit = implicit_letters.clone();
             let mut block_implicit_none = false;
             for d in implicit {

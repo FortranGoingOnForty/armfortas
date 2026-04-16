@@ -77,7 +77,7 @@ pub fn write_amod(
 
     // ---- Variables ----
     let vars: Vec<_> = syms.iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::Variable) && !sym.attrs.parameter)
+        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::Variable | SymbolKind::ProcedurePointer) && !sym.attrs.parameter)
         .collect();
     for (name, sym) in &vars {
         emit_variable(&mut out, &mod_key, name, sym, globals);
@@ -135,13 +135,22 @@ fn emit_variable(
     sym: &Symbol,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
 ) {
-    let type_str = type_info_to_string(sym.type_info.as_ref());
+    let type_str = if matches!(sym.kind, SymbolKind::ProcedurePointer) {
+        sym.attrs
+            .procedure_iface
+            .as_ref()
+            .map(|iface| format!("type({})", iface))
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        type_info_to_string(sym.type_info.as_ref())
+    };
     write!(out, "@var {} : {}", name, type_str).unwrap();
 
     let mut attrs = Vec::new();
     if sym.attrs.allocatable { attrs.push("allocatable"); }
     if sym.attrs.save { attrs.push("save"); }
     if sym.attrs.pointer { attrs.push("pointer"); }
+    if matches!(sym.kind, SymbolKind::ProcedurePointer) { attrs.push("procptr"); }
     if sym.attrs.target { attrs.push("target"); }
     if !attrs.is_empty() {
         write!(out, ", {}", attrs.join(", ")).unwrap();
@@ -476,6 +485,7 @@ pub struct AmodVar {
     pub allocatable: bool,
     pub save: bool,
     pub pointer: bool,
+    pub proc_pointer: bool,
     pub target: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
@@ -638,6 +648,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let allocatable = attr_str.contains("allocatable");
     let save = attr_str.contains("save");
     let pointer = attr_str.contains("pointer");
+    let proc_pointer = attr_str.contains("procptr");
     let target = attr_str.contains("target");
 
     let mut ir_symbol = None;
@@ -679,6 +690,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         allocatable,
         save,
         pointer,
+        proc_pointer,
         target,
         ir_symbol,
         deferred_char,
@@ -905,7 +917,13 @@ pub fn extract_module_globals(
     for var in &iface.variables {
         if var.is_parameter { continue; } // PARAMETERs are inlined, no global
         if let Some(ref ir_sym) = var.ir_symbol {
-            let ir_ty = type_info_to_ir_type(var.type_info.as_ref());
+            let ir_ty = if var.proc_pointer {
+                crate::ir::types::IrType::Ptr(Box::new(
+                    crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8),
+                ))
+            } else {
+                type_info_to_ir_type(var.type_info.as_ref())
+            };
             out.insert(
                 (mod_key.clone(), var.name.to_lowercase()),
                 crate::ir::lower::ModuleGlobalInfo {
@@ -913,6 +931,7 @@ pub fn extract_module_globals(
                     ty: ir_ty,
                     dims: var.dims.clone(),
                     allocatable: var.allocatable,
+                    is_pointer: var.pointer,
                     deferred_char: var.deferred_char,
                     char_kind: match var.type_info.as_ref() {
                         Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => {
@@ -1026,6 +1045,7 @@ mod tests {
         assert_eq!(iface.variables.len(), 2); // call_count + gravity
         assert!(iface.variables.iter().any(|v| v.name == "call_count" && v.ir_symbol.as_deref() == Some("afs_mod_physics_call_count")));
         assert!(iface.variables.iter().any(|v| v.name == "gravity" && v.is_parameter));
+        assert!(iface.variables.iter().all(|v| !v.proc_pointer));
         assert_eq!(iface.procedures.len(), 2);
         let ke = iface.procedures.iter().find(|p| p.name == "kinetic_energy").unwrap();
         assert!(ke.pure);
@@ -1042,5 +1062,47 @@ mod tests {
         assert_eq!(pt.fields.len(), 3);
         assert_eq!(pt.bound_procs.len(), 1);
         assert_eq!(pt.bound_procs[0].method_name, "kinetic_energy");
+    }
+
+    #[test]
+    fn proc_pointer_var_round_trips_with_global_storage() {
+        let amod_text = r#"#!amod 2
+# module: control_flow
+# source: control_flow.f90
+# checksum: sha256:def456
+
+@subroutine evaluate_condition_interface
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg n : integer, intent(inout)
+    @abi pass=x0 width=8
+@end subroutine
+
+@var evaluate_condition : type(evaluate_condition_interface), pointer, procptr @ir afs_mod_control_flow_evaluate_condition
+"#;
+        let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
+        let var = iface
+            .variables
+            .iter()
+            .find(|v| v.name == "evaluate_condition")
+            .unwrap();
+        assert!(var.pointer);
+        assert!(var.proc_pointer);
+        assert!(matches!(
+            var.type_info,
+            Some(TypeInfo::Derived(ref name)) if name == "evaluate_condition_interface"
+        ));
+
+        let globals = extract_module_globals(&iface);
+        let info = globals
+            .get(&("control_flow".into(), "evaluate_condition".into()))
+            .unwrap();
+        assert!(info.is_pointer);
+        assert_eq!(info.symbol, "afs_mod_control_flow_evaluate_condition");
+        assert_eq!(
+            info.ty,
+            crate::ir::types::IrType::Ptr(Box::new(
+                crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8)
+            ))
+        );
     }
 }

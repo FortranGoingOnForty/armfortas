@@ -1223,6 +1223,27 @@ fn block_use_imports_module_values_and_procedures() {
 }
 
 #[test]
+fn block_interface_declares_callable_under_implicit_none() {
+    let src = write_program(
+        "subroutine s(acc_status)\n  use iso_c_binding, only: c_char, c_int\n  implicit none\n  integer, intent(out) :: acc_status\n  character(kind=c_char), target :: c_path(2)\n  block\n    interface\n      function cache_access(pathname, mode) bind(C, name=\"access\")\n        import :: c_char, c_int\n        character(kind=c_char), intent(in) :: pathname(*)\n        integer(c_int), value :: mode\n        integer(c_int) :: cache_access\n      end function\n    end interface\n    acc_status = cache_access(c_path, int(1, c_int))\n  end block\nend subroutine\n",
+        "f90",
+    );
+    let out = unique_path("block_interface_decl", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "BLOCK-local interface procedures should count as declared: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn public_derived_type_in_private_module_is_emitted_and_importable() {
     let dir = unique_dir("public_type_mod");
     let mod_src = write_program_in(
@@ -2033,6 +2054,63 @@ fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn procedure_pointer_module_export_survives_amod_import() {
+    let dir = unique_dir("procptr_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "control_flow.f90",
+        "module control_flow\n  implicit none\n  abstract interface\n    subroutine evaluate_condition_interface(n)\n      integer, intent(inout) :: n\n    end subroutine\n  end interface\n  procedure(evaluate_condition_interface), pointer, public :: evaluate_condition => null()\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "executor.f90",
+        "module executor\n  implicit none\ncontains\n  subroutine init_control_flow_callbacks()\n    use control_flow\n    evaluate_condition => evaluate_condition_impl\n  end subroutine\n\n  subroutine evaluate_condition_impl(n)\n    integer, intent(inout) :: n\n    n = n + 1\n  end subroutine\nend module\n",
+    );
+
+    let mod_obj = dir.join("control_flow.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "procedure-pointer module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("executor.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "imported module procedure pointers should survive .amod export/import: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

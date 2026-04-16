@@ -841,13 +841,14 @@ impl<'a> Parser<'a> {
                         // Reuse parse_unit_body which already handles the full
                         // interleaving of type-decls, PARAMETER, COMMON, DATA,
                         // derived-type defs, and executable statements.
-        let (uses, _imports, implicit, decls, body, _ifaces) = self.parse_unit_body(&["block"])?;
+        let (uses, _imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["block"])?;
         self.consume_end("block")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
             Stmt::Block {
                 name: None,
                 uses,
+                ifaces,
                 implicit,
                 decls,
                 body,

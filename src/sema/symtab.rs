@@ -429,6 +429,9 @@ pub struct SymbolAttrs {
     pub access: Access,
     pub allocatable: bool,
     pub pointer: bool,
+    /// For `procedure(iface), pointer :: p`, preserve the declared
+    /// interface name so `.amod` can round-trip the symbol truthfully.
+    pub procedure_iface: Option<String>,
     pub target: bool,
     pub optional: bool,
     pub save: bool,
@@ -449,6 +452,7 @@ impl Default for SymbolAttrs {
             access: Access::Default,
             allocatable: false,
             pointer: false,
+            procedure_iface: None,
             target: false,
             optional: false,
             save: false,

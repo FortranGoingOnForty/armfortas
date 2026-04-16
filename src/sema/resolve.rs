@@ -443,8 +443,11 @@ fn preload_stmt_uses(
             | Stmt::Labeled { stmt: inner, .. } => {
                 preload_stmt_uses(st, std::slice::from_ref(inner.as_ref()), module_search_paths, type_layouts);
             }
-            Stmt::Block { uses, body, .. } => {
+            Stmt::Block { uses, ifaces, body, .. } => {
                 ensure_uses_loaded(st, uses, module_search_paths, type_layouts);
+                for iface in ifaces {
+                    let _ = resolve_unit(st, iface, module_search_paths, type_layouts);
+                }
                 preload_stmt_uses(st, body, module_search_paths, type_layouts);
             }
             Stmt::SelectCase { cases, .. } => {
@@ -532,7 +535,13 @@ fn load_external_module(
 
     // Populate variables and parameters.
     for var in &iface.variables {
-        let kind = if var.is_parameter { SymbolKind::Parameter } else { SymbolKind::Variable };
+        let kind = if var.is_parameter {
+            SymbolKind::Parameter
+        } else if var.proc_pointer {
+            SymbolKind::ProcedurePointer
+        } else {
+            SymbolKind::Variable
+        };
         let attrs = SymbolAttrs {
             access: Access::Public,
             allocatable: var.allocatable,
@@ -540,6 +549,15 @@ fn load_external_module(
             pointer: var.pointer,
             target: var.target,
             parameter: var.is_parameter,
+            external: var.proc_pointer,
+            procedure_iface: if var.proc_pointer {
+                match &var.type_info {
+                    Some(TypeInfo::Derived(name)) => Some(name.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            },
             ..Default::default()
         };
         let _ = st.define(Symbol {
@@ -613,6 +631,7 @@ fn load_external_module(
         }
         st.pop_scope();
     }
+    backfill_procedure_pointer_interfaces(st, scope_id);
 
     // Register type layouts.
     for layout in &iface.types {
@@ -755,7 +774,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
             }
             Decl::TypeDecl { type_spec, attrs, entities } => {
                 let mut type_info = type_spec_to_info(type_spec, st);
-                let sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));
+                let mut sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));
                 let mut kind = if sym_attrs.parameter {
                     SymbolKind::Parameter
                 } else {
@@ -766,6 +785,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 if sym_attrs.pointer && sym_attrs.external {
                     kind = SymbolKind::ProcedurePointer;
                     if let TypeSpec::Type(iface_name) = type_spec {
+                        sym_attrs.procedure_iface = Some(iface_name.clone());
                         if let Some(iface_sym) =
                             st.find_symbol_any_scope(&iface_name.to_lowercase())
                         {

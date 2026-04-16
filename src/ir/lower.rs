@@ -955,6 +955,7 @@ pub struct ModuleGlobalInfo {
     pub ty: IrType,
     pub dims: Vec<(i64, i64)>,
     pub allocatable: bool,
+    pub is_pointer: bool,
     pub deferred_char: bool,
     pub(crate) char_kind: CharKind,
     /// External modules (from .amod files) — skip emitting Global
@@ -1359,6 +1360,7 @@ fn collect_module_globals(
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+            let is_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
             let global_char_kind = match type_spec {
                 TypeSpec::Character(Some(sel)) => match &sel.len {
                     Some(crate::ast::decl::LenSpec::Expr(e)) => match &e.node {
@@ -1403,6 +1405,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims: vec![],
                             allocatable: true,
+                            is_pointer,
                             deferred_char: false,
                             char_kind: global_char_kind.clone(),
                             external: false,
@@ -1430,6 +1433,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims: vec![],
                             allocatable: false,
+                            is_pointer,
                             deferred_char: true,
                             char_kind: CharKind::Deferred,
                             external: false,
@@ -1495,6 +1499,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims,
                             allocatable: false,
+                            is_pointer,
                             deferred_char: false,
                             char_kind: global_char_kind.clone(),
                             external: false,
@@ -1516,6 +1521,7 @@ fn collect_module_globals(
                             ty: ir_ty.clone(),
                             dims: vec![],
                             allocatable: false,
+                            is_pointer,
                             deferred_char: false,
                             char_kind: global_char_kind.clone(),
                             external: false,
@@ -3050,7 +3056,7 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: info.char_kind.clone(), derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
+        char_kind: info.char_kind.clone(), derived_type: None, inline_const: None, is_pointer: info.is_pointer, runtime_dim_upper: vec![],
     });
 }
 
