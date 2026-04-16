@@ -4362,15 +4362,29 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "max" | "max0" | "amax1" | "dmax1" => {
             if args.len() >= 2 {
-                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let mut ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                if ty.is_float() {
+                    if args.iter().any(|arg| matches!(b.func().value_type(*arg), Some(IrType::Float(FloatWidth::F64)))) {
+                        ty = IrType::Float(FloatWidth::F64);
+                    }
+                } else if ty.is_int() {
+                    let width = args.iter()
+                        .filter_map(|arg| b.func().value_type(*arg).and_then(|ty| ty.int_width()))
+                        .max_by_key(|width| width.bits())
+                        .unwrap_or(IntWidth::I32);
+                    ty = IrType::Int(width);
+                }
+                let coerced: Vec<ValueId> = args.iter()
+                    .map(|arg| coerce_to_type(b, *arg, &ty))
+                    .collect();
                 let cmp = if ty.is_float() {
-                    b.fcmp(CmpOp::Ge, args[0], args[1])
+                    b.fcmp(CmpOp::Ge, coerced[0], coerced[1])
                 } else {
-                    b.icmp(CmpOp::Ge, args[0], args[1])
+                    b.icmp(CmpOp::Ge, coerced[0], coerced[1])
                 };
-                let mut result = b.select(cmp, args[0], args[1]);
+                let mut result = b.select(cmp, coerced[0], coerced[1]);
                 // Variadic: max(a, b, c, ...) chains.
-                for arg in &args[2..] {
+                for arg in &coerced[2..] {
                     let cmp = if ty.is_float() {
                         b.fcmp(CmpOp::Ge, result, *arg)
                     } else {
@@ -4383,14 +4397,28 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "min" | "min0" | "amin1" | "dmin1" => {
             if args.len() >= 2 {
-                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let mut ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                if ty.is_float() {
+                    if args.iter().any(|arg| matches!(b.func().value_type(*arg), Some(IrType::Float(FloatWidth::F64)))) {
+                        ty = IrType::Float(FloatWidth::F64);
+                    }
+                } else if ty.is_int() {
+                    let width = args.iter()
+                        .filter_map(|arg| b.func().value_type(*arg).and_then(|ty| ty.int_width()))
+                        .max_by_key(|width| width.bits())
+                        .unwrap_or(IntWidth::I32);
+                    ty = IrType::Int(width);
+                }
+                let coerced: Vec<ValueId> = args.iter()
+                    .map(|arg| coerce_to_type(b, *arg, &ty))
+                    .collect();
                 let cmp = if ty.is_float() {
-                    b.fcmp(CmpOp::Le, args[0], args[1])
+                    b.fcmp(CmpOp::Le, coerced[0], coerced[1])
                 } else {
-                    b.icmp(CmpOp::Le, args[0], args[1])
+                    b.icmp(CmpOp::Le, coerced[0], coerced[1])
                 };
-                let mut result = b.select(cmp, args[0], args[1]);
-                for arg in &args[2..] {
+                let mut result = b.select(cmp, coerced[0], coerced[1]);
+                for arg in &coerced[2..] {
                     let cmp = if ty.is_float() {
                         b.fcmp(CmpOp::Le, result, *arg)
                     } else {
@@ -8063,6 +8091,8 @@ fn try_lower_select(
     let cond = lower_expr_ctx(b, ctx, condition);
     let tv = lower_expr_ctx(b, ctx, then_val_expr);
     let fv = lower_expr_ctx(b, ctx, else_val_expr);
+    let tv = coerce_to_type(b, tv, &info.ty);
+    let fv = coerce_to_type(b, fv, &info.ty);
     let selected = b.select(cond, tv, fv);
     b.store(selected, info.addr);
     true

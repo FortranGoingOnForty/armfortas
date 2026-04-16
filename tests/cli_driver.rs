@@ -206,6 +206,50 @@ fn fixed_form_program_compiles_and_runs() {
 }
 
 #[test]
+fn select_lowering_coerces_mixed_width_branch_values() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  integer(8) :: y\n  y = 7_8\n  if (y > 0_8) then\n    x = 1\n  else\n    x = y\n  end if\n  print *, x\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_mixed_width", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed-width select compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "mixed-width select compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(out.exists(), "mixed-width select should produce an object file");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn max_intrinsic_coerces_mixed_width_integer_args() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  integer(8) :: y\n  y = 7_8\n  x = max(1, y)\n  print *, x\nend program\n",
+        "f90",
+    );
+    let out = unique_path("max_mixed_width", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed-width max compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "mixed-width max compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(out.exists(), "mixed-width max should produce an object file");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_o_equals_form_sets_output_path() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("oeq", "o");
