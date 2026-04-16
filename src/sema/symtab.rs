@@ -134,65 +134,80 @@ impl SymbolTable {
 
     /// Look up a name starting from a specific scope.
     pub fn lookup_in(&self, scope_id: ScopeId, name: &str) -> Option<&Symbol> {
-        let mut visited: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
-        self.lookup_in_guarded(scope_id, name, &mut visited)
+        let key = name.to_ascii_lowercase();
+        let mut visited = Vec::new();
+        self.lookup_in_guarded(scope_id, &key, &mut visited)
     }
 
     fn lookup_in_guarded(
         &self,
         scope_id: ScopeId,
-        name: &str,
-        visited: &mut std::collections::HashSet<ScopeId>,
+        key: &str,
+        visited: &mut Vec<ScopeId>,
     ) -> Option<&Symbol> {
-        if !visited.insert(scope_id) { return None; }
-        let key = name.to_lowercase();
+        if visited.contains(&scope_id) {
+            return None;
+        }
+        visited.push(scope_id);
+
         let scope = &self.scopes[scope_id];
 
-        // 1. Local declaration.
-        if let Some(sym) = scope.symbols.get(&key) {
-            return Some(sym);
-        }
+        let result = (|| {
+            // 1. Local declaration.
+            if let Some(sym) = scope.symbols.get(key) {
+                return Some(sym);
+            }
 
-        // 2. Direct USE association.
-        for assoc in &scope.use_associations {
-            if assoc.local_name.to_lowercase() == key {
-                if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name.to_lowercase()) {
-                    if sym.attrs.access != Access::Private || assoc.is_submodule_access {
+            // 2. Direct USE association.
+            for assoc in &scope.use_associations {
+                if assoc.local_name == key {
+                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name) {
+                        if sym.attrs.access != Access::Private || assoc.is_submodule_access {
+                            return Some(sym);
+                        }
+                    }
+                }
+            }
+
+            // 2b. Transitive USE: look through each USE'd module's own
+            // public symbols and its transitive USE chain. Only applies
+            // to bare `USE M` (local_name == original_name); renamed
+            // USE associations are intentional restrictions.
+            let mut seen_use_scopes = Vec::new();
+            for assoc in &scope.use_associations {
+                if assoc.local_name != assoc.original_name {
+                    continue;
+                }
+                if seen_use_scopes.contains(&assoc.source_scope) {
+                    continue;
+                }
+                seen_use_scopes.push(assoc.source_scope);
+                if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, key, visited) {
+                    if sym.attrs.access != Access::Private {
                         return Some(sym);
                     }
                 }
             }
-        }
-        // 2b. Transitive USE: look through each USE'd module's own
-        // public symbols and its transitive USE chain. Only applies
-        // to bare `USE M` (local_name == original_name); renamed
-        // USE associations are intentional restrictions.
-        for assoc in &scope.use_associations {
-            if assoc.local_name != assoc.original_name { continue; }
-            let mut branch_visited = visited.clone();
-            if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, name, &mut branch_visited) {
-                if sym.attrs.access != Access::Private {
-                    return Some(sym);
+
+            // 3. Host association — look in parent scope.
+            if let Some(parent) = scope.parent {
+                if self.scopes[parent].kind != ScopeKind::Global {
+                    return self.lookup_in_guarded(parent, key, visited);
                 }
             }
-        }
 
-        // 3. Host association — look in parent scope.
-        if let Some(parent) = scope.parent {
-            if self.scopes[parent].kind != ScopeKind::Global {
-                let mut branch_visited = visited.clone();
-                return self.lookup_in_guarded(parent, name, &mut branch_visited);
-            }
-        }
+            None
+        })();
 
-        None
+        visited.pop();
+        result
     }
 
     /// Search ALL scopes for a symbol by name.
     /// Used during lowering when the current scope may not be set correctly.
     /// Prefers parameter symbols (for kind resolution) but returns any match.
     pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
-        let key = name.to_lowercase();
+        let key = name.to_ascii_lowercase();
         let mut fallback: Option<&Symbol> = None;
         for scope in &self.scopes {
             if let Some(sym) = scope.symbols.get(&key) {
@@ -216,9 +231,8 @@ impl SymbolTable {
         // dispatch, Function for ordinary calls, etc.).
         for scope in &self.scopes {
             for assoc in &scope.use_associations {
-                if assoc.local_name.to_lowercase() == key {
-                    let orig_key = assoc.original_name.to_lowercase();
-                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&orig_key) {
+                if assoc.local_name == key {
+                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name) {
                         return Some(sym);
                     }
                 }
@@ -276,6 +290,12 @@ impl SymbolTable {
 
     /// Add a USE association to the current scope.
     pub fn add_use_association(&mut self, assoc: UseAssociation) {
+        let assoc = UseAssociation {
+            local_name: assoc.local_name.to_ascii_lowercase(),
+            original_name: assoc.original_name.to_ascii_lowercase(),
+            source_scope: assoc.source_scope,
+            is_submodule_access: assoc.is_submodule_access,
+        };
         self.scopes[self.current].use_associations.push(assoc);
     }
 

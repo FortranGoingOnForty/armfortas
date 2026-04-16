@@ -10,6 +10,7 @@ use crate::ast::expr::Expr;
 use crate::ast::decl::{Decl, Attribute, TypeAttr, TypeSpec};
 use crate::lexer::Span;
 use super::symtab::*;
+use std::cell::RefCell;
 
 /// Fortran standard level for --std= conformance checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,6 +84,7 @@ struct Ctx<'a> {
     /// sensitive targets on a component access (`obj%field`), where
     /// the base variable's attributes aren't the right thing to check.
     type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
+    lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
     warn_pedantic: bool,
     warn_deprecated: bool,
 }
@@ -104,6 +106,7 @@ impl<'a> Ctx<'a> {
             labels_defined: Vec::new(),
             labels_referenced: Vec::new(),
             type_layouts: None,
+            lookup_cache: RefCell::new(std::collections::HashMap::new()),
             warn_pedantic,
             warn_deprecated,
         }
@@ -131,8 +134,14 @@ impl<'a> Ctx<'a> {
     }
 
     /// Look up a symbol in the current validation scope.
-    fn lookup(&self, name: &str) -> Option<&Symbol> {
-        self.st.lookup_in(self.scope_id, name)
+    fn lookup(&self, name: &str) -> Option<&'a Symbol> {
+        let key = (self.scope_id, name.to_lowercase());
+        if let Some(cached) = self.lookup_cache.borrow().get(&key).copied() {
+            return cached;
+        }
+        let resolved = self.st.lookup_in(self.scope_id, name);
+        self.lookup_cache.borrow_mut().insert(key, resolved);
+        resolved
     }
 
     fn error(&mut self, span: Span, msg: impl Into<String>) {
@@ -1455,6 +1464,8 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     }
 
     let mut undeclared = Vec::new();
+    let mut resolution_cache: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     let outer_implicit_letters: std::collections::HashSet<char> =
         std::collections::HashSet::new();
     for stmt in stmts {
@@ -1464,6 +1475,7 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
             stmt,
             &declared,
             &outer_implicit_letters,
+            &mut resolution_cache,
             &mut undeclared,
         );
     }
@@ -1486,13 +1498,34 @@ fn walk_stmt_for_undeclared(
     stmt: &SpannedStmt,
     declared: &std::collections::HashSet<String>,
     implicit_letters: &std::collections::HashSet<char>,
+    resolution_cache: &mut std::collections::HashMap<String, bool>,
     undeclared: &mut Vec<(String, Span)>,
 ) {
     macro_rules! chk {
-        ($e:expr) => { check_expr_names(st, scope_id, $e, declared, implicit_letters, undeclared) };
+        ($e:expr) => {
+            check_expr_names(
+                st,
+                scope_id,
+                $e,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            )
+        };
     }
     macro_rules! recurse {
-        ($s:expr) => { walk_stmt_for_undeclared(st, scope_id, $s, declared, implicit_letters, undeclared) };
+        ($s:expr) => {
+            walk_stmt_for_undeclared(
+                st,
+                scope_id,
+                $s,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            )
+        };
     }
     match &stmt.node {
         Stmt::Assignment { target, value } => {
@@ -1590,6 +1623,7 @@ fn walk_stmt_for_undeclared(
                     s,
                     &block_declared,
                     &block_implicit,
+                    resolution_cache,
                     undeclared,
                 );
             }
@@ -1627,6 +1661,7 @@ fn check_expr_names(
     expr: &crate::ast::expr::SpannedExpr,
     declared: &std::collections::HashSet<String>,
     implicit_letters: &std::collections::HashSet<char>,
+    resolution_cache: &mut std::collections::HashMap<String, bool>,
     undeclared: &mut Vec<(String, Span)>,
 ) {
     match &expr.node {
@@ -1635,7 +1670,6 @@ fn check_expr_names(
             // Skip format specifier * (appears in WRITE(*, *) / READ(*, *)).
             if key == "*" { return; }
             if declared.contains(&key) { return; }
-            if st.lookup_in(scope_id, &key).is_some() { return; }
             if is_intrinsic_name(&key) { return; }
             // F2018 §11.1.4: a BLOCK-scoped IMPLICIT statement gives
             // names whose first letter is in the covered range an
@@ -1646,14 +1680,44 @@ fn check_expr_names(
                     return;
                 }
             }
+            if *resolution_cache
+                .entry(key.clone())
+                .or_insert_with(|| st.lookup_in(scope_id, &key).is_some())
+            {
+                return;
+            }
             undeclared.push((name.clone(), expr.span));
         }
         Expr::BinaryOp { left, right, .. } => {
-            check_expr_names(st, scope_id, left, declared, implicit_letters, undeclared);
-            check_expr_names(st, scope_id, right, declared, implicit_letters, undeclared);
+            check_expr_names(
+                st,
+                scope_id,
+                left,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
+            check_expr_names(
+                st,
+                scope_id,
+                right,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
         }
         Expr::UnaryOp { operand, .. } => {
-            check_expr_names(st, scope_id, operand, declared, implicit_letters, undeclared);
+            check_expr_names(
+                st,
+                scope_id,
+                operand,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
         }
         Expr::FunctionCall { callee, args } => {
             // Under IMPLICIT NONE the callee name must resolve to a
@@ -1664,18 +1728,50 @@ fn check_expr_names(
             // reuse it so `foo(3)` with no declaration of `foo` is
             // rejected at compile time instead of falling through to
             // a link error.
-            check_expr_names(st, scope_id, callee, declared, implicit_letters, undeclared);
+            check_expr_names(
+                st,
+                scope_id,
+                callee,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
             for arg in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    check_expr_names(st, scope_id, e, declared, implicit_letters, undeclared);
+                    check_expr_names(
+                        st,
+                        scope_id,
+                        e,
+                        declared,
+                        implicit_letters,
+                        resolution_cache,
+                        undeclared,
+                    );
                 }
             }
         }
         Expr::ComponentAccess { base, .. } => {
-            check_expr_names(st, scope_id, base, declared, implicit_letters, undeclared);
+            check_expr_names(
+                st,
+                scope_id,
+                base,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
         }
         Expr::ParenExpr { inner } => {
-            check_expr_names(st, scope_id, inner, declared, implicit_letters, undeclared);
+            check_expr_names(
+                st,
+                scope_id,
+                inner,
+                declared,
+                implicit_letters,
+                resolution_cache,
+                undeclared,
+            );
         }
         _ => {}
     }
