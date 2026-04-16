@@ -1384,9 +1384,9 @@ _main:
                         .to_path_buf()
                 });
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
-                if let Err(e) = fs::write(&amod_path, &amod_text) {
-                    eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
-                } else if opts.verbose {
+                fs::write(&amod_path, &amod_text)
+                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
             }
