@@ -28,7 +28,9 @@ pub extern "C" fn afs_assign_char_fixed(
     src: *const u8,
     src_len: i64,
 ) {
-    if dest.is_null() || dest_len <= 0 { return; }
+    if dest.is_null() || dest_len <= 0 {
+        return;
+    }
     let copy_len = src_len.min(dest_len) as usize;
     unsafe {
         if !src.is_null() && copy_len > 0 {
@@ -56,13 +58,17 @@ pub extern "C" fn afs_assign_char_deferred(
     src: *const u8,
     src_len: i64,
 ) {
-    if desc.is_null() { return; }
+    if desc.is_null() {
+        return;
+    }
     let desc = unsafe { &mut *desc };
 
     if src_len <= 0 {
         // Empty string assignment.
         if desc.is_allocated() && !desc.data.is_null() {
-            unsafe { free(desc.data); }
+            unsafe {
+                free(desc.data);
+            }
         }
         desc.data = ptr::null_mut();
         desc.len = 0;
@@ -84,12 +90,16 @@ pub extern "C" fn afs_assign_char_deferred(
 
         // Copy source to new buffer (safe even if src points into old buffer).
         if !src.is_null() {
-            unsafe { ptr::copy_nonoverlapping(src, new_data, src_len as usize); }
+            unsafe {
+                ptr::copy_nonoverlapping(src, new_data, src_len as usize);
+            }
         }
 
         // NOW free old buffer (after copy is complete).
         if desc.is_allocated() && !desc.data.is_null() {
-            unsafe { free(desc.data); }
+            unsafe {
+                free(desc.data);
+            }
         }
 
         desc.data = new_data;
@@ -98,7 +108,9 @@ pub extern "C" fn afs_assign_char_deferred(
         // Fits in existing buffer. Use ptr::copy (not copy_nonoverlapping)
         // in case src overlaps with dest (e.g., s = s(2:)).
         if !src.is_null() {
-            unsafe { ptr::copy(src, desc.data, src_len as usize); }
+            unsafe {
+                ptr::copy(src, desc.data, src_len as usize);
+            }
         }
     }
 
@@ -109,10 +121,14 @@ pub extern "C" fn afs_assign_char_deferred(
 /// Deallocate a deferred-length string descriptor.
 #[no_mangle]
 pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
-    if desc.is_null() { return; }
+    if desc.is_null() {
+        return;
+    }
     let desc = unsafe { &mut *desc };
     if desc.is_allocated() && !desc.data.is_null() {
-        unsafe { free(desc.data); }
+        unsafe {
+            free(desc.data);
+        }
     }
     desc.data = ptr::null_mut();
     desc.len = 0;
@@ -122,17 +138,42 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     desc.flags &= STR_DEFERRED; // keep deferred, clear everything else
 }
 
+/// Transfer allocation from `from` to `to` (F2003 MOVE_ALLOC).
+///
+/// `to` is deallocated if allocated, then receives `from`'s descriptor.
+/// `from` is cleared back to an unallocated deferred-length descriptor.
+#[no_mangle]
+pub extern "C" fn afs_move_alloc_string(from: *mut StringDescriptor, to: *mut StringDescriptor) {
+    if from.is_null() || to.is_null() {
+        return;
+    }
+
+    let from_desc = unsafe { &mut *from };
+    let to_desc = unsafe { &mut *to };
+
+    if to_desc.is_allocated() && !to_desc.data.is_null() {
+        unsafe {
+            free(to_desc.data);
+        }
+    }
+
+    *to_desc = from_desc.clone();
+
+    from_desc.data = ptr::null_mut();
+    from_desc.len = 0;
+    from_desc.capacity = 0;
+    from_desc.flags &= STR_DEFERRED;
+}
+
 // ---- Concatenation ----
 
 /// Concatenate two strings into a pre-allocated result buffer.
 /// The caller must ensure result has at least a_len + b_len bytes.
 #[no_mangle]
-pub extern "C" fn afs_concat(
-    result: *mut u8,
-    a: *const u8, a_len: i64,
-    b: *const u8, b_len: i64,
-) {
-    if result.is_null() { return; }
+pub extern "C" fn afs_concat(result: *mut u8, a: *const u8, a_len: i64, b: *const u8, b_len: i64) {
+    if result.is_null() {
+        return;
+    }
     unsafe {
         if !a.is_null() && a_len > 0 {
             ptr::copy_nonoverlapping(a, result, a_len as usize);
@@ -149,16 +190,25 @@ pub extern "C" fn afs_concat(
 /// Shorter string is padded with spaces for comparison (Fortran standard).
 /// Returns: -1 if a < b, 0 if a == b, 1 if a > b.
 #[no_mangle]
-pub extern "C" fn afs_compare_char(
-    a: *const u8, a_len: i64,
-    b: *const u8, b_len: i64,
-) -> i32 {
+pub extern "C" fn afs_compare_char(a: *const u8, a_len: i64, b: *const u8, b_len: i64) -> i32 {
     let max_len = a_len.max(b_len) as usize;
     for i in 0..max_len {
-        let ac = if i < a_len as usize && !a.is_null() { unsafe { *a.add(i) } } else { b' ' };
-        let bc = if i < b_len as usize && !b.is_null() { unsafe { *b.add(i) } } else { b' ' };
-        if ac < bc { return -1; }
-        if ac > bc { return 1; }
+        let ac = if i < a_len as usize && !a.is_null() {
+            unsafe { *a.add(i) }
+        } else {
+            b' '
+        };
+        let bc = if i < b_len as usize && !b.is_null() {
+            unsafe { *b.add(i) }
+        } else {
+            b' '
+        };
+        if ac < bc {
+            return -1;
+        }
+        if ac > bc {
+            return 1;
+        }
     }
     0
 }
@@ -169,9 +219,13 @@ pub extern "C" fn afs_compare_char(
 /// The data pointer is unchanged (TRIM returns a view, not a copy).
 #[no_mangle]
 pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
-    if src.is_null() || src_len <= 0 { return 0; }
+    if src.is_null() || src_len <= 0 {
+        return 0;
+    }
     let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
-    let trimmed = slice.iter().rposition(|&b| b != b' ')
+    let trimmed = slice
+        .iter()
+        .rposition(|&b| b != b' ')
         .map(|pos| pos + 1)
         .unwrap_or(0);
     trimmed as i64
@@ -180,9 +234,14 @@ pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
 /// ADJUSTL: left-justify by removing leading spaces, padding trailing.
 #[no_mangle]
 pub extern "C" fn afs_adjustl(dest: *mut u8, src: *const u8, len: i64) {
-    if dest.is_null() || src.is_null() || len <= 0 { return; }
+    if dest.is_null() || src.is_null() || len <= 0 {
+        return;
+    }
     let slice = unsafe { std::slice::from_raw_parts(src, len as usize) };
-    let leading = slice.iter().position(|&b| b != b' ').unwrap_or(len as usize);
+    let leading = slice
+        .iter()
+        .position(|&b| b != b' ')
+        .unwrap_or(len as usize);
     let content_len = (len as usize) - leading;
     unsafe {
         if content_len > 0 {
@@ -197,9 +256,13 @@ pub extern "C" fn afs_adjustl(dest: *mut u8, src: *const u8, len: i64) {
 /// ADJUSTR: right-justify by removing trailing spaces, padding leading.
 #[no_mangle]
 pub extern "C" fn afs_adjustr(dest: *mut u8, src: *const u8, len: i64) {
-    if dest.is_null() || src.is_null() || len <= 0 { return; }
+    if dest.is_null() || src.is_null() || len <= 0 {
+        return;
+    }
     let slice = unsafe { std::slice::from_raw_parts(src, len as usize) };
-    let trailing = slice.iter().rposition(|&b| b != b' ')
+    let trailing = slice
+        .iter()
+        .rposition(|&b| b != b' ')
         .map(|pos| (len as usize) - pos - 1)
         .unwrap_or(len as usize);
     let content_len = (len as usize) - trailing;
@@ -233,13 +296,21 @@ pub extern "C" fn afs_c_strlen(src: *const u8) -> i64 {
 /// Returns 1-based position, or 0 if not found.
 #[no_mangle]
 pub extern "C" fn afs_index(
-    str_ptr: *const u8, str_len: i64,
-    sub_ptr: *const u8, sub_len: i64,
+    str_ptr: *const u8,
+    str_len: i64,
+    sub_ptr: *const u8,
+    sub_len: i64,
     back: i32,
 ) -> i64 {
-    if str_ptr.is_null() || sub_ptr.is_null() || str_len <= 0 { return 0; }
-    if sub_len <= 0 { return if back != 0 { str_len + 1 } else { 1 }; }
-    if sub_len > str_len { return 0; }
+    if str_ptr.is_null() || sub_ptr.is_null() || str_len <= 0 {
+        return 0;
+    }
+    if sub_len <= 0 {
+        return if back != 0 { str_len + 1 } else { 1 };
+    }
+    if sub_len > str_len {
+        return 0;
+    }
 
     let haystack = unsafe { std::slice::from_raw_parts(str_ptr, str_len as usize) };
     let needle = unsafe { std::slice::from_raw_parts(sub_ptr, sub_len as usize) };
@@ -265,21 +336,29 @@ pub extern "C" fn afs_index(
 /// Returns 1-based position, or 0 if not found.
 #[no_mangle]
 pub extern "C" fn afs_scan(
-    str_ptr: *const u8, str_len: i64,
-    set_ptr: *const u8, set_len: i64,
+    str_ptr: *const u8,
+    str_len: i64,
+    set_ptr: *const u8,
+    set_len: i64,
     back: i32,
 ) -> i64 {
-    if str_ptr.is_null() || set_ptr.is_null() || str_len <= 0 || set_len <= 0 { return 0; }
+    if str_ptr.is_null() || set_ptr.is_null() || str_len <= 0 || set_len <= 0 {
+        return 0;
+    }
     let s = unsafe { std::slice::from_raw_parts(str_ptr, str_len as usize) };
     let set = unsafe { std::slice::from_raw_parts(set_ptr, set_len as usize) };
 
     if back != 0 {
         for (i, &c) in s.iter().enumerate().rev() {
-            if set.contains(&c) { return (i + 1) as i64; }
+            if set.contains(&c) {
+                return (i + 1) as i64;
+            }
         }
     } else {
         for (i, &c) in s.iter().enumerate() {
-            if set.contains(&c) { return (i + 1) as i64; }
+            if set.contains(&c) {
+                return (i + 1) as i64;
+            }
         }
     }
     0
@@ -289,23 +368,33 @@ pub extern "C" fn afs_scan(
 /// Returns 1-based position, or 0 if all characters are in set.
 #[no_mangle]
 pub extern "C" fn afs_verify(
-    str_ptr: *const u8, str_len: i64,
-    set_ptr: *const u8, set_len: i64,
+    str_ptr: *const u8,
+    str_len: i64,
+    set_ptr: *const u8,
+    set_len: i64,
     back: i32,
 ) -> i64 {
-    if str_ptr.is_null() || str_len <= 0 { return 0; }
+    if str_ptr.is_null() || str_len <= 0 {
+        return 0;
+    }
     let s = unsafe { std::slice::from_raw_parts(str_ptr, str_len as usize) };
     let set = if !set_ptr.is_null() && set_len > 0 {
         unsafe { std::slice::from_raw_parts(set_ptr, set_len as usize) }
-    } else { &[] };
+    } else {
+        &[]
+    };
 
     if back != 0 {
         for (i, &c) in s.iter().enumerate().rev() {
-            if !set.contains(&c) { return (i + 1) as i64; }
+            if !set.contains(&c) {
+                return (i + 1) as i64;
+            }
         }
     } else {
         for (i, &c) in s.iter().enumerate() {
-            if !set.contains(&c) { return (i + 1) as i64; }
+            if !set.contains(&c) {
+                return (i + 1) as i64;
+            }
         }
     }
     0
@@ -314,12 +403,10 @@ pub extern "C" fn afs_verify(
 /// REPEAT: repeat string ncopies times into dest.
 /// Dest must have at least src_len * ncopies bytes.
 #[no_mangle]
-pub extern "C" fn afs_repeat(
-    src: *const u8, src_len: i64,
-    ncopies: i64,
-    dest: *mut u8,
-) {
-    if dest.is_null() || src.is_null() || src_len <= 0 || ncopies <= 0 { return; }
+pub extern "C" fn afs_repeat(src: *const u8, src_len: i64, ncopies: i64, dest: *mut u8) {
+    if dest.is_null() || src.is_null() || src_len <= 0 || ncopies <= 0 {
+        return;
+    }
     unsafe {
         for i in 0..ncopies as usize {
             ptr::copy_nonoverlapping(src, dest.add(i * src_len as usize), src_len as usize);
@@ -461,12 +548,40 @@ mod tests {
         afs_dealloc_string(&mut desc);
     }
 
+    #[test]
+    fn move_alloc_transfers_deferred_string_storage() {
+        let mut from = StringDescriptor::zeroed();
+        let mut to = StringDescriptor::zeroed();
+
+        afs_assign_char_deferred(&mut from, b"hello".as_ptr(), 5);
+        afs_assign_char_deferred(&mut to, b"bye".as_ptr(), 3);
+
+        afs_move_alloc_string(&mut from, &mut to);
+
+        assert!(!from.is_allocated());
+        assert!(from.data.is_null());
+        assert_eq!(from.len, 0);
+        assert_eq!(from.capacity, 0);
+
+        assert!(to.is_allocated());
+        let data = unsafe { std::slice::from_raw_parts(to.data, 5) };
+        assert_eq!(data, b"hello");
+
+        afs_dealloc_string(&mut to);
+    }
+
     // ---- Concatenation ----
 
     #[test]
     fn concat_basic() {
         let mut result = [0u8; 11];
-        afs_concat(result.as_mut_ptr(), b"hello".as_ptr(), 5, b" world".as_ptr(), 6);
+        afs_concat(
+            result.as_mut_ptr(),
+            b"hello".as_ptr(),
+            5,
+            b" world".as_ptr(),
+            6,
+        );
         assert_eq!(&result, b"hello world");
     }
 
@@ -474,7 +589,10 @@ mod tests {
 
     #[test]
     fn compare_equal() {
-        assert_eq!(afs_compare_char(b"hello".as_ptr(), 5, b"hello".as_ptr(), 5), 0);
+        assert_eq!(
+            afs_compare_char(b"hello".as_ptr(), 5, b"hello".as_ptr(), 5),
+            0
+        );
     }
 
     #[test]
@@ -490,7 +608,10 @@ mod tests {
     #[test]
     fn compare_with_padding() {
         // "abc" vs "abc   " — should be equal (space padding).
-        assert_eq!(afs_compare_char(b"abc".as_ptr(), 3, b"abc   ".as_ptr(), 6), 0);
+        assert_eq!(
+            afs_compare_char(b"abc".as_ptr(), 3, b"abc   ".as_ptr(), 6),
+            0
+        );
     }
 
     // ---- Intrinsics ----
@@ -524,8 +645,14 @@ mod tests {
 
     #[test]
     fn index_basic() {
-        assert_eq!(afs_index(b"hello world".as_ptr(), 11, b"world".as_ptr(), 5, 0), 7);
-        assert_eq!(afs_index(b"hello world".as_ptr(), 11, b"xyz".as_ptr(), 3, 0), 0);
+        assert_eq!(
+            afs_index(b"hello world".as_ptr(), 11, b"world".as_ptr(), 5, 0),
+            7
+        );
+        assert_eq!(
+            afs_index(b"hello world".as_ptr(), 11, b"xyz".as_ptr(), 3, 0),
+            0
+        );
     }
 
     #[test]

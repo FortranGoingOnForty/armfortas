@@ -212,7 +212,11 @@ fn fixed_form_program_compiles_and_runs() {
     );
 
     let run = Command::new(&out).output().expect("fixed-form run failed");
-    assert!(run.status.success(), "fixed-form run failed: {:?}", run.status);
+    assert!(
+        run.status.success(),
+        "fixed-form run failed: {:?}",
+        run.status
+    );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         stdout.trim().ends_with('6'),
@@ -240,7 +244,10 @@ fn select_lowering_coerces_mixed_width_branch_values() {
         "mixed-width select compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    assert!(out.exists(), "mixed-width select should produce an object file");
+    assert!(
+        out.exists(),
+        "mixed-width select should produce an object file"
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -262,7 +269,10 @@ fn max_intrinsic_coerces_mixed_width_integer_args() {
         "mixed-width max compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    assert!(out.exists(), "mixed-width max should produce an object file");
+    assert!(
+        out.exists(),
+        "mixed-width max should produce an object file"
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -456,7 +466,9 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_allocated" || sym == "_size"),
+        !undefined
+            .iter()
+            .any(|sym| sym == "_allocated" || sym == "_size"),
         "component array condition should not call raw allocated/size symbols: {:?}",
         undefined
     );
@@ -611,7 +623,10 @@ fn named_len_char_component_substring_and_trim_compile() {
         "named-len char component compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    assert!(out.exists(), "named-len char component should produce an object file");
+    assert!(
+        out.exists(),
+        "named-len char component should produce an object file"
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -910,7 +925,10 @@ fn prebuilt_archive_input_links_after_objects() {
         "prebuilt archive link failed: {}",
         String::from_utf8_lossy(&link.stderr)
     );
-    assert!(exe.exists(), "prebuilt archive link should write the binary");
+    assert!(
+        exe.exists(),
+        "prebuilt archive link should write the binary"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1142,10 +1160,7 @@ fn std_f95_rejects_impure_prefix() {
         .env("NO_COLOR", "1")
         .output()
         .expect("spawn failed");
-    assert!(
-        !result.status.success(),
-        "--std=f95 should reject IMPURE"
-    );
+    assert!(!result.status.success(), "--std=f95 should reject IMPURE");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("IMPURE") && stderr.contains("F2008"),
@@ -1206,10 +1221,7 @@ fn std_f77_rejects_module_in_fixed_form() {
         .env("NO_COLOR", "1")
         .output()
         .expect("spawn failed");
-    assert!(
-        !result.status.success(),
-        "--std=f77 should reject MODULE"
-    );
+    assert!(!result.status.success(), "--std=f77 should reject MODULE");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("MODULE") && stderr.contains("F90"),
@@ -1376,12 +1388,15 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
         );
     }
     assert!(
-        !stderr.contains("-Wpedantic is recognized but warning-group emission is not yet implemented"),
+        !stderr
+            .contains("-Wpedantic is recognized but warning-group emission is not yet implemented"),
         "pedantic should now be a real semantic warning group: {}",
         stderr
     );
     assert!(
-        !stderr.contains("-Wdeprecated is recognized but warning-group emission is not yet implemented"),
+        !stderr.contains(
+            "-Wdeprecated is recognized but warning-group emission is not yet implemented"
+        ),
         "deprecated should now be a real semantic warning group: {}",
         stderr
     );
@@ -1504,7 +1519,10 @@ fn wpedantic_warns_on_arithmetic_if() {
 
 #[test]
 fn wdeprecated_warns_on_common_block() {
-    let src = write_program("program p\n  integer :: x\n  common /blk/ x\nend program\n", "f90");
+    let src = write_program(
+        "program p\n  integer :: x\n  common /blk/ x\nend program\n",
+        "f90",
+    );
     let out = unique_path("wdeprecated", "o");
     let result = Command::new(compiler("armfortas"))
         .args([
@@ -2692,6 +2710,44 @@ fn procedure_pointer_module_export_survives_amod_import() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_char_allocatable_dummy_uses_descriptor_abi() {
+    let src = write_program(
+        "module m\ncontains\n  subroutine grow(buf, cap, content_len)\n    character(len=:), allocatable, intent(inout) :: buf\n    integer, intent(inout) :: cap\n    integer, intent(in) :: content_len\n    character(len=:), allocatable :: tmp\n    integer :: new_cap\n    new_cap = cap * 2\n    allocate(character(len=new_cap) :: tmp)\n    if (content_len > 0) tmp(1:content_len) = buf(1:content_len)\n    call move_alloc(tmp, buf)\n    cap = new_cap\n  end subroutine\nend module\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_dummy", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred-length allocatable character dummy should lower cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm = std::fs::read_to_string(&out).expect("cannot read deferred-char dummy assembly");
+    assert!(
+        asm.contains("bl _afs_move_alloc_string"),
+        "MOVE_ALLOC on deferred-length character dummies should call the string runtime: {}",
+        asm
+    );
+    assert!(
+        !asm.contains("bl _move_alloc"),
+        "deferred-length character MOVE_ALLOC should not escape as a raw external call: {}",
+        asm
+    );
+    assert!(
+        !asm.contains("bl _buf"),
+        "substringing a deferred-length dummy should not lower as a fake function call: {}",
+        asm
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
