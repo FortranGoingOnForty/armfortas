@@ -63,6 +63,38 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn normalize_lc_uuid(mut bytes: Vec<u8>) -> Vec<u8> {
+    const MH_MAGIC_64: u32 = 0xfeedfacf;
+    const LC_UUID: u32 = 0x1b;
+    const MACH_HEADER_64_SIZE: usize = 32;
+
+    if bytes.len() < MACH_HEADER_64_SIZE {
+        return bytes;
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if magic != MH_MAGIC_64 {
+        return bytes;
+    }
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut offset = MACH_HEADER_64_SIZE;
+    for _ in 0..ncmds {
+        if offset + 8 > bytes.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let cmdsize = cmdsize as usize;
+        if cmdsize < 8 || offset + cmdsize > bytes.len() {
+            break;
+        }
+        if cmd == LC_UUID && cmdsize >= 24 {
+            bytes[offset + 8..offset + 24].fill(0);
+        }
+        offset += cmdsize;
+    }
+    bytes
+}
+
 #[test]
 fn realworld_object_snapshots_stay_deterministic_at_o2() {
     for name in [
@@ -154,7 +186,7 @@ fn realworld_opt_ir_differs_from_raw_ir_at_o2() {
 }
 
 #[test]
-fn linked_realworld_binaries_are_deterministic_and_uuid_free() {
+fn linked_realworld_binaries_are_deterministic_modulo_uuid() {
     let compiler = find_compiler();
 
     for name in [
@@ -188,20 +220,22 @@ fn linked_realworld_binaries_are_deterministic_and_uuid_free() {
             compile_binary(&compiler, &source, opt, &bin_path);
             let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
             assert!(
-                !load_commands.contains("LC_UUID"),
-                "linked binary at {} should omit LC_UUID for {}:\n{}",
+                load_commands.contains("LC_UUID"),
+                "linked binary at {} should carry LC_UUID for {}:\n{}",
                 opt,
                 name,
                 load_commands
             );
-            let first = fs::read(&bin_path).expect("cannot read first binary image");
+            let first =
+                normalize_lc_uuid(fs::read(&bin_path).expect("cannot read first binary image"));
 
             compile_binary(&compiler, &source, opt, &bin_path);
-            let second = fs::read(&bin_path).expect("cannot read second binary image");
+            let second =
+                normalize_lc_uuid(fs::read(&bin_path).expect("cannot read second binary image"));
 
             assert_eq!(
                 first, second,
-                "real-world linked binary should be byte-identical when rebuilt at the same output path ({} {})",
+                "real-world linked binary should stay deterministic modulo LC_UUID when rebuilt at the same output path ({} {})",
                 name,
                 opt
             );

@@ -63,6 +63,38 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn normalize_lc_uuid(mut bytes: Vec<u8>) -> Vec<u8> {
+    const MH_MAGIC_64: u32 = 0xfeedfacf;
+    const LC_UUID: u32 = 0x1b;
+    const MACH_HEADER_64_SIZE: usize = 32;
+
+    if bytes.len() < MACH_HEADER_64_SIZE {
+        return bytes;
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if magic != MH_MAGIC_64 {
+        return bytes;
+    }
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut offset = MACH_HEADER_64_SIZE;
+    for _ in 0..ncmds {
+        if offset + 8 > bytes.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let cmdsize = cmdsize as usize;
+        if cmdsize < 8 || offset + cmdsize > bytes.len() {
+            break;
+        }
+        if cmd == LC_UUID && cmdsize >= 24 {
+            bytes[offset + 8..offset + 24].fill(0);
+        }
+        offset += cmdsize;
+    }
+    bytes
+}
+
 fn opt_name(opt: OptLevel) -> &'static str {
     match opt {
         OptLevel::O0 => "-O0",
@@ -149,7 +181,7 @@ fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
 }
 
 #[test]
-fn linked_binary_is_deterministic_for_same_output_path_and_has_no_uuid() {
+fn linked_binary_is_deterministic_for_same_output_path_and_has_uuid() {
     let compiler = find_compiler();
     let source = fixture("module_init.f90");
     let stem = source.file_stem().unwrap().to_str().unwrap();
@@ -165,19 +197,20 @@ fn linked_binary_is_deterministic_for_same_output_path_and_has_no_uuid() {
         compile_binary(&compiler, &source, opt, &bin_path);
         let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
         assert!(
-            !load_commands.contains("LC_UUID"),
-            "linked binary at {} should omit LC_UUID for reproducible builds:\n{}",
+            load_commands.contains("LC_UUID"),
+            "linked binary at {} should carry LC_UUID so dyld accepts it:\n{}",
             opt,
             load_commands
         );
-        let first = fs::read(&bin_path).expect("cannot read first binary image");
+        let first = normalize_lc_uuid(fs::read(&bin_path).expect("cannot read first binary image"));
 
         compile_binary(&compiler, &source, opt, &bin_path);
-        let second = fs::read(&bin_path).expect("cannot read second binary image");
+        let second =
+            normalize_lc_uuid(fs::read(&bin_path).expect("cannot read second binary image"));
 
         assert_eq!(
             first, second,
-            "linked binary should be byte-identical when rebuilt at the same output path ({})",
+            "linked binary should stay deterministic modulo LC_UUID when rebuilt at the same output path ({})",
             opt
         );
 
@@ -202,19 +235,20 @@ fn linked_runtime_heavy_binary_is_deterministic_for_section_reads() {
         compile_binary(&compiler, &source, opt, &bin_path);
         let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
         assert!(
-            !load_commands.contains("LC_UUID"),
-            "runtime-heavy linked binary at {} should omit LC_UUID:\n{}",
+            load_commands.contains("LC_UUID"),
+            "runtime-heavy linked binary at {} should carry LC_UUID:\n{}",
             opt,
             load_commands
         );
-        let first = fs::read(&bin_path).expect("cannot read first binary image");
+        let first = normalize_lc_uuid(fs::read(&bin_path).expect("cannot read first binary image"));
 
         compile_binary(&compiler, &source, opt, &bin_path);
-        let second = fs::read(&bin_path).expect("cannot read second binary image");
+        let second =
+            normalize_lc_uuid(fs::read(&bin_path).expect("cannot read second binary image"));
 
         assert_eq!(
             first, second,
-            "runtime-heavy linked binary should be byte-identical when rebuilt at the same output path ({})",
+            "runtime-heavy linked binary should stay deterministic modulo LC_UUID when rebuilt at the same output path ({})",
             opt
         );
 

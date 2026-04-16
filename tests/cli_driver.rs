@@ -3111,6 +3111,57 @@ fn use_renamed_procedure_call_uses_remote_symbol() {
 }
 
 #[test]
+fn linked_binary_carries_uuid_and_launches() {
+    let dir = unique_dir("linked_binary_uuid");
+    let src = write_program_in(
+        &dir,
+        "hello.f90",
+        "program hello\n  print *, 42\nend program hello\n",
+    );
+
+    let exe = dir.join("hello.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("hello compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "linked hello should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let otool = Command::new("otool")
+        .args(["-l", exe.to_str().unwrap()])
+        .output()
+        .expect("otool spawn failed");
+    assert!(
+        otool.status.success(),
+        "otool should inspect linked hello: {}",
+        String::from_utf8_lossy(&otool.stderr)
+    );
+    let load_commands = String::from_utf8_lossy(&otool.stdout);
+    assert!(
+        load_commands.contains("LC_UUID"),
+        "linked hello should carry LC_UUID so dyld accepts it:\n{}",
+        load_commands
+    );
+
+    let run = Command::new(&exe)
+        .current_dir(&dir)
+        .output()
+        .expect("hello run spawn failed");
+    assert!(
+        run.status.success(),
+        "linked hello should launch successfully:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn same_named_module_helpers_link_without_colliding() {
     let dir = unique_dir("module_helper_link_names");
     let mod_a = write_program_in(
@@ -3205,6 +3256,107 @@ fn same_named_module_helpers_link_without_colliding() {
     assert!(
         link.status.success(),
         "same-named module helpers should link cleanly: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contained_helpers_link_without_cross_object_internal_symbol_collisions() {
+    let dir = unique_dir("contained_helper_link_names");
+    let mod_a = write_program_in(
+        &dir,
+        "mod_a.f90",
+        "module mod_a\ncontains\n  subroutine run_a()\n    implicit none\n    call helper()\n  contains\n    subroutine helper()\n      print *, 11\n    end subroutine helper\n  end subroutine run_a\nend module mod_a\n",
+    );
+    let mod_b = write_program_in(
+        &dir,
+        "mod_b.f90",
+        "module mod_b\ncontains\n  subroutine run_b()\n    implicit none\n    call helper()\n  contains\n    subroutine helper()\n      print *, 22\n    end subroutine helper\n  end subroutine run_b\nend module mod_b\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use mod_a, only: run_a\n  use mod_b, only: run_b\n  call run_a()\n  call run_b()\nend program p\n",
+    );
+
+    let mod_a_obj = dir.join("mod_a.o");
+    let compile_a = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_a.to_str().unwrap(),
+            "-o",
+            mod_a_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mod_a compile spawn failed");
+    assert!(
+        compile_a.status.success(),
+        "mod_a should compile: {}",
+        String::from_utf8_lossy(&compile_a.stderr)
+    );
+
+    let mod_b_obj = dir.join("mod_b.o");
+    let compile_b = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            mod_b.to_str().unwrap(),
+            "-o",
+            mod_b_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mod_b compile spawn failed");
+    assert!(
+        compile_b.status.success(),
+        "mod_b should compile: {}",
+        String::from_utf8_lossy(&compile_b.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("contained_helpers.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_a_obj.to_str().unwrap(),
+            mod_b_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("contained helper link spawn failed");
+    assert!(
+        link.status.success(),
+        "contained helpers in different objects should link cleanly: {}",
         String::from_utf8_lossy(&link.stderr)
     );
 

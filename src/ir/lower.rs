@@ -402,6 +402,7 @@ pub fn lower_file(
             &no_host_param_consts,
             &no_host,
             None,
+            None,
             &alloc_return_funcs,
             &optional_params,
             &descriptor_params,
@@ -2201,6 +2202,7 @@ fn lower_unit(
     // and character-kind for each host-associated variable the
     // closure-passing ABI threads in as a hidden pointer param.
     host_decls: &[crate::ast::decl::SpannedDecl],
+    host_link_name: Option<&str>,
     host_module: Option<&str>,
     alloc_return_funcs: &HashSet<String>,
     optional_params: &HashMap<String, Vec<bool>>,
@@ -2302,6 +2304,7 @@ fn lower_unit(
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
+                    Some(body_fname.as_str()),
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -2328,6 +2331,7 @@ fn lower_unit(
             let func_name = lowered_procedure_symbol_name(
                 name,
                 bind.as_ref(),
+                host_link_name,
                 host_module,
                 internal_only,
                 internal_funcs,
@@ -2604,6 +2608,7 @@ fn lower_unit(
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
+                    Some(func_name.as_str()),
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -2632,6 +2637,7 @@ fn lower_unit(
             let func_name = lowered_procedure_symbol_name(
                 name,
                 bind.as_ref(),
+                host_link_name,
                 host_module,
                 internal_only,
                 internal_funcs,
@@ -3095,6 +3101,7 @@ fn lower_unit(
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
+                    Some(func_name.as_str()),
                     host_module,
                     alloc_return_funcs,
                     optional_params,
@@ -3139,6 +3146,7 @@ fn lower_unit(
                     &combined_uses,
                     &visible_param_consts,
                     &no_host_decls,
+                    None,
                     module_name,
                     alloc_return_funcs,
                     optional_params,
@@ -3182,6 +3190,7 @@ fn lower_unit(
                     &combined_uses,
                     &visible_param_consts,
                     &no_host_decls,
+                    None,
                     Some(parent.as_str()),
                     alloc_return_funcs,
                     optional_params,
@@ -7129,9 +7138,23 @@ fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
     format!("afs_modproc_{}_{}", module_name.to_lowercase(), proc_name)
 }
 
+fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
+    host_link_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn lowered_procedure_symbol_name(
     name: &str,
     bind: Option<&crate::ast::unit::BindInfo>,
+    host_link_name: Option<&str>,
     host_module: Option<&str>,
     internal_only: bool,
     internal_funcs: &HashMap<String, u32>,
@@ -7147,7 +7170,11 @@ fn lowered_procedure_symbol_name(
     }
     if internal_only {
         if let Some(idx) = internal_funcs.get(&name.to_lowercase()) {
-            return format!("afs_internal_{}", idx);
+            let host_prefix = host_link_name
+                .map(sanitize_internal_host_symbol)
+                .filter(|prefix| !prefix.is_empty())
+                .unwrap_or_else(|| "local".into());
+            return format!("afs_internal_{}_{}", host_prefix, idx);
         }
     }
     if let Some(module_name) = host_module {

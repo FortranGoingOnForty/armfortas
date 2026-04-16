@@ -1413,7 +1413,6 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
     args.extend([
         rt_path,
         "-lSystem".into(),
-        "-no_uuid".into(),
         "-syslibroot".into(),
         sysroot,
         "-e".into(),

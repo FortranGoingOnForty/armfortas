@@ -159,7 +159,6 @@ fn link_objects(objects: &[&Path], output: &Path) {
     args.push(rt_path.to_string_lossy().into_owned());
     args.extend([
         "-lSystem".into(),
-        "-no_uuid".into(),
         "-syslibroot".into(),
         sysroot,
         "-e".into(),
@@ -202,6 +201,38 @@ fn tool_output(tool: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn normalize_lc_uuid(mut bytes: Vec<u8>) -> Vec<u8> {
+    const MH_MAGIC_64: u32 = 0xfeedfacf;
+    const LC_UUID: u32 = 0x1b;
+    const MACH_HEADER_64_SIZE: usize = 32;
+
+    if bytes.len() < MACH_HEADER_64_SIZE {
+        return bytes;
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if magic != MH_MAGIC_64 {
+        return bytes;
+    }
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut offset = MACH_HEADER_64_SIZE;
+    for _ in 0..ncmds {
+        if offset + 8 > bytes.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let cmdsize = cmdsize as usize;
+        if cmdsize < 8 || offset + cmdsize > bytes.len() {
+            break;
+        }
+        if cmd == LC_UUID && cmdsize >= 24 {
+            bytes[offset + 8..offset + 24].fill(0);
+        }
+        offset += cmdsize;
+    }
+    bytes
 }
 
 fn run_cross_object_case_named(
@@ -290,18 +321,18 @@ fn deterministic_cross_object_case_named(
     link_objects(&[&fortran_obj, &helper_obj], &binary);
     let load_commands = tool_output("otool", &["-l", binary.to_str().unwrap()]);
     assert!(
-        !load_commands.contains("LC_UUID"),
-        "linked cross-object integer(16) binary should omit LC_UUID:\n{}",
+        load_commands.contains("LC_UUID"),
+        "linked cross-object integer(16) binary should carry LC_UUID:\n{}",
         load_commands
     );
-    let first = fs::read(&binary).expect("cannot read first linked binary");
+    let first = normalize_lc_uuid(fs::read(&binary).expect("cannot read first linked binary"));
 
     link_objects(&[&fortran_obj, &helper_obj], &binary);
-    let second = fs::read(&binary).expect("cannot read second linked binary");
+    let second = normalize_lc_uuid(fs::read(&binary).expect("cannot read second linked binary"));
 
     assert_eq!(
         first, second,
-        "linked cross-object integer(16) binary should be byte-identical across rebuilds"
+        "linked cross-object integer(16) binary should stay deterministic modulo LC_UUID"
     );
 
     let _ = fs::remove_file(&fortran_obj);
