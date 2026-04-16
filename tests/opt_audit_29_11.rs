@@ -29,6 +29,23 @@ fn function_slice<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest.find("\n  func @").unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn three_point_apply_scalarizes_coeffs_and_removes_safe_stencil_checks_at_o2() {
     let source = fixture("realworld_three_point_apply.f90");
@@ -50,8 +67,16 @@ fn three_point_apply_scalarizes_coeffs_and_removes_safe_stencil_checks_at_o2() {
         Stage::OptIr,
     );
 
-    let raw_apply = function_slice(&raw_ir, "apply");
-    let opt_apply = function_slice(&opt_ir, "apply");
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained apply helper:\n{}",
+        raw_ir
+    );
+    let helper_name = function_name(raw_sections[1]);
+    let raw_apply = function_slice(&raw_ir, helper_name);
+    let opt_apply = function_slice(&opt_ir, helper_name);
 
     assert!(
         raw_apply.contains("alloca [i32 x 3]"),
