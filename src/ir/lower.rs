@@ -6780,6 +6780,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     if let Expr::Name { name } = &callee.node {
                         let akey = name.to_lowercase();
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
+                            if lower_1d_section_assign(b, ctx, &info, args, value) {
+                                return;
+                            }
                             // Substring LHS: s(lo:hi) = rhs where s is a
                             // scalar character.  Compute the target substring
                             // pointer+length, get the RHS as (ptr, len), and
@@ -11368,6 +11371,140 @@ fn emit_bulk_array_plan(
     }
 }
 
+fn lower_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> Option<(ValueId, IrType)> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => lower_array_expr_descriptor(b, locals, inner, st),
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                let desc = if local_uses_array_descriptor(info) {
+                    array_descriptor_addr(b, info)
+                } else {
+                    materialize_array_descriptor_for_info(b, info)
+                };
+                Some((desc, info.ty.clone()))
+            } else {
+                None
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let info = locals.get(&name.to_lowercase())?;
+            if (!info.dims.is_empty() || local_uses_array_descriptor(info))
+                && args.iter().any(|arg| {
+                    matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+                })
+            {
+                Some((lower_array_section(b, locals, info, args, st), info.ty.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn lower_1d_section_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    dest_args: &[crate::ast::expr::Argument],
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_args.len() != 1
+        || !matches!(
+            dest_args[0].value,
+            crate::ast::expr::SectionSubscript::Range { .. }
+        )
+        || !matches!(dest_info.char_kind, CharKind::None)
+    {
+        return false;
+    }
+
+    let dest_desc = lower_array_section(b, &ctx.locals, dest_info, dest_args, ctx.st);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(dest_info.ty.clone())));
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+
+    let src_desc = lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st);
+    let scalar = src_desc.is_none().then(|| {
+        let raw = lower_expr_ctx_tl(b, ctx, value);
+        coerce_to_type(b, raw, &dest_info.ty)
+    });
+
+    let (src_base, src_stride, src_n, src_ty) = if let Some((desc, ty)) = src_desc {
+        (
+            Some(b.load_typed(desc, IrType::Ptr(Box::new(ty.clone())))),
+            Some(load_array_desc_i64_field(b, desc, 24 + 16)),
+            Some(b.call(
+                FuncRef::External("afs_array_size".into()),
+                vec![desc],
+                IrType::Int(IntWidth::I64),
+            )),
+            Some(ty),
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("section_assign_check");
+    let bb_body = b.create_block("section_assign_body");
+    let bb_exit = b.create_block("section_assign_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let mut done = b.icmp(CmpOp::Ge, i, dest_n);
+    if let Some(src_len) = src_n {
+        let src_done = b.icmp(CmpOp::Ge, i, src_len);
+        done = b.or(done, src_done);
+    }
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, elem_bytes);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+
+    let stored = if let (Some(src_base), Some(src_stride), Some(src_ty)) =
+        (src_base, src_stride, src_ty.clone())
+    {
+        let src_index = b.imul(i_val, src_stride);
+        let src_off = b.imul(src_index, elem_bytes);
+        let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+        let raw = b.load_typed(src_ptr, src_ty);
+        coerce_to_type(b, raw, &dest_info.ty)
+    } else {
+        scalar.expect("scalar slice assignment should have scalar RHS")
+    };
+    b.store(stored, dest_ptr);
+
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
 fn loop_indexed_array_ref(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -12120,8 +12257,13 @@ fn lower_array_intrinsic(
             } else { None }
         }
         "allocated" => {
-            Some(b.call(FuncRef::External("afs_array_allocated".into()),
-                vec![desc], IrType::Int(IntWidth::I32)))
+            let raw = b.call(
+                FuncRef::External("afs_array_allocated".into()),
+                vec![desc],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero = b.const_i32(0);
+            Some(b.icmp(CmpOp::Ne, raw, zero))
         }
         "sum" => {
             let is_real = first_arg_is_real(args, locals);
@@ -12265,6 +12407,12 @@ fn is_type_or_extends(actual_type: &str, target_type: &str, tl: &crate::sema::ty
 /// Convert TypeInfo to IR type for field loads.
 fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     use crate::sema::symtab::TypeInfo;
+    if let TypeInfo::Derived(name) = ti {
+        let lower = name.to_lowercase();
+        if lower == "c_ptr" || lower == "c_funptr" {
+            return IrType::Int(IntWidth::I64);
+        }
+    }
     // Derived types lower to a byte pointer — the compiler treats
     // values of derived types as addresses into struct-shaped
     // buffers. Without this case, size_of_type for a small derived
@@ -12877,16 +13025,20 @@ fn lower_expr_full(
                 }
                 (BinaryOp::Eqv, _) => {
                     // a .eqv. b = .not. (a .xor. b)
-                    let both = b.and(lhs, rhs);
-                    let either = b.or(lhs, rhs);
+                    let lbool = coerce_to_type(b, lhs, &IrType::Bool);
+                    let rbool = coerce_to_type(b, rhs, &IrType::Bool);
+                    let both = b.and(lbool, rbool);
+                    let either = b.or(lbool, rbool);
                     let not_both = b.not(both);
                     let xor = b.and(either, not_both);
                     b.not(xor)
                 }
                 (BinaryOp::Neqv, _) => {
                     // a .neqv. b = a .xor. b
-                    let both = b.and(lhs, rhs);
-                    let either = b.or(lhs, rhs);
+                    let lbool = coerce_to_type(b, lhs, &IrType::Bool);
+                    let rbool = coerce_to_type(b, rhs, &IrType::Bool);
+                    let both = b.and(lbool, rbool);
+                    let either = b.or(lbool, rbool);
                     let not_both = b.not(both);
                     b.and(either, not_both)
                 }

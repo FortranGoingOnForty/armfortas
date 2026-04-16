@@ -1938,3 +1938,66 @@ fn deferred_char_pointer_component_compiles_string_pool_style_ops() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn logical_allocatable_slice_assignment_compiles() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  integer :: n\n  n = 4\n  allocate(a(n), b(n))\n  a = .false.\n  b = .true.\n  a(1:n) = b(1:n)\n  b(2:n-1) = .false.\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_slice_assign", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "logical allocatable slice assignment should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_interop_opaque_pointer_values_compile() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  type(c_ptr) :: pbuf\n  type(c_funptr) :: fptr\n  pbuf = c_null_ptr\n  fptr = c_null_funptr\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_interop_opaque_values", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "C interop opaque pointer values should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_eqv_on_allocatables_compiles() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  logical :: same\n  allocate(a(1), b(1))\n  same = allocated(a) .eqv. allocated(b)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocated_eqv", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "allocated() logical combinations should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
