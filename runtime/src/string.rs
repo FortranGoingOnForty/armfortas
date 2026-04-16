@@ -138,6 +138,15 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     desc.flags &= STR_DEFERRED; // keep deferred, clear everything else
 }
 
+/// ALLOCATED(s) for deferred-length character descriptors.
+#[no_mangle]
+pub extern "C" fn afs_string_allocated(desc: *const StringDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    unsafe { (*desc).is_allocated() as i32 }
+}
+
 /// Transfer allocation from `from` to `to` (F2003 MOVE_ALLOC).
 ///
 /// `to` is deallocated if allocated, then receives `from`'s descriptor.
@@ -568,6 +577,16 @@ mod tests {
         assert_eq!(data, b"hello");
 
         afs_dealloc_string(&mut to);
+    }
+
+    #[test]
+    fn string_allocated_reflects_descriptor_state() {
+        let mut desc = StringDescriptor::zeroed();
+        assert_eq!(afs_string_allocated(&desc), 0);
+        afs_assign_char_deferred(&mut desc, b"abc".as_ptr(), 3);
+        assert_eq!(afs_string_allocated(&desc), 1);
+        afs_dealloc_string(&mut desc);
+        assert_eq!(afs_string_allocated(&desc), 0);
     }
 
     // ---- Concatenation ----

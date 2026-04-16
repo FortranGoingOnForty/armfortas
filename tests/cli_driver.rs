@@ -400,6 +400,87 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 }
 
 #[test]
+fn module_procedure_case_and_bind_label_survive_amod_import() {
+    let dir = unique_dir("amod_case_bind");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function C_CLOSE(fd) bind(c, name='close') result(ret)\n      import :: c_int\n      integer(c_int), value :: fd\n      integer(c_int) :: ret\n    end function C_CLOSE\n  end interface\ncontains\n  function WEXITSTATUS(status) result(exit_status)\n    integer(c_int), intent(in) :: status\n    integer :: exit_status\n    exit_status = status + 1\n  end function WEXITSTATUS\nend module\n",
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_m.f90",
+        "program p\n  use iso_c_binding, only: c_int\n  use m\n  implicit none\n  integer(c_int) :: status, closed\n  status = WEXITSTATUS(1_c_int)\n  closed = C_CLOSE(0_c_int)\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let use_obj = dir.join("use_m.o");
+    let compile_use = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            use_src.to_str().unwrap(),
+            "-o",
+            use_obj.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("consumer compile failed to spawn");
+    assert!(
+        compile_use.status.success(),
+        "consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_use.stderr)
+    );
+
+    let undefined = undefined_symbols(&use_obj);
+    assert!(
+        undefined.iter().any(|sym| sym == "_WEXITSTATUS"),
+        "mixed-case module procedures should retain case across .amod import: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_wexitstatus"),
+        "imported mixed-case module procedures should not be downcased: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_close"),
+        "bind(c, name=...) procedures should keep binding labels across .amod import: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_c_close"),
+        "bind(c, name=...) procedures should not fall back to Fortran aliases: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn repeat_intrinsic_lowers_to_runtime_symbol() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = repeat('ab', 3)\n  print *, len_trim(s)\nend program\n",
@@ -425,6 +506,35 @@ fn repeat_intrinsic_lowers_to_runtime_symbol() {
     assert!(
         !undefined.iter().any(|sym| sym == "_repeat"),
         "repeat intrinsic should not lower to a raw repeat symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_dummy_associated_lowers_without_raw_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  logical function present(node) result(ok)\n    type(node_t), pointer, intent(in) :: node\n    ok = associated(node)\n  end function present\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("associated_pointer_dummy", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("pointer associated compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer associated compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_associated"),
+        "pointer dummy associated() should not escape as a raw symbol: {:?}",
         undefined
     );
 
@@ -470,6 +580,35 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
             .iter()
             .any(|sym| sym == "_allocated" || sym == "_size"),
         "component array condition should not call raw allocated/size symbols: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_component_array_size_lowers_without_raw_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: shell_t\n    integer :: vars(4)\n  end type shell_t\ncontains\n  integer function f(shell) result(n)\n    type(shell_t), intent(in) :: shell\n    n = size(shell%vars)\n  end function f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("fixed_component_size", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("fixed component size compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed component size compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_size"),
+        "fixed-size component array SIZE() should not escape as a raw symbol: {:?}",
         undefined
     );
 
@@ -2710,6 +2849,50 @@ fn procedure_pointer_module_export_survives_amod_import() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
+    let src = write_program(
+        "module m\n  use iso_c_binding, only: c_funptr, c_intptr_t\ncontains\n  subroutine s(buf, mask, ok)\n    character(len=:), allocatable, intent(inout) :: buf\n    logical, intent(in) :: mask\n    logical, intent(out) :: ok\n    type(c_funptr) :: sig_ign\n    if (allocated(buf)) then\n      ok = lgt(trim(buf), 'a')\n    else\n      ok = .false.\n    end if\n    ok = ok .or. any(buf(1:1) == ['!', '?'])\n    buf = merge(buf // new_line('a'), '?', mask)\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine s\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("char_intrinsics_link", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("char intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "char intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_string_allocated"),
+        "deferred-char ALLOCATED() should lower to the string runtime: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_lgt"),
+        "LGT should lower to the string runtime: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| {
+            matches!(
+                sym.as_str(),
+                "_allocated" | "_any" | "_merge" | "_new_line" | "_transfer" | "_lgt"
+            )
+        }),
+        "char/link intrinsics should not escape as raw symbols: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

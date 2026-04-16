@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 
+use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
 use crate::ir::lower::ModuleGlobalInfo;
-use crate::ir::inst::{Function, InstKind, FuncRef, Module as IrModule};
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
@@ -54,12 +54,16 @@ pub fn write_amod(
     writeln!(out).unwrap();
 
     // ---- Dependencies ----
-    let mut deps: Vec<String> = scope.use_associations.iter()
+    let mut deps: Vec<String> = scope
+        .use_associations
+        .iter()
         .filter_map(|ua| {
             let src_scope = st.scope(ua.source_scope);
             if let ScopeKind::Module(ref n) = src_scope.kind {
                 Some(n.to_lowercase())
-            } else { None }
+            } else {
+                None
+            }
         })
         .collect();
     deps.sort();
@@ -67,42 +71,67 @@ pub fn write_amod(
     for dep in &deps {
         writeln!(out, "@uses {}", dep).unwrap();
     }
-    if !deps.is_empty() { writeln!(out).unwrap(); }
+    if !deps.is_empty() {
+        writeln!(out).unwrap();
+    }
 
     // Collect and sort public symbols.
-    let mut syms: Vec<(&String, &Symbol)> = scope.symbols.iter()
+    let mut syms: Vec<(&String, &Symbol)> = scope
+        .symbols
+        .iter()
         .filter(|(_, sym)| is_public(sym, scope))
         .collect();
     syms.sort_by_key(|(k, _)| k.to_lowercase());
 
     // ---- Variables ----
-    let vars: Vec<_> = syms.iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::Variable | SymbolKind::ProcedurePointer) && !sym.attrs.parameter)
+    let vars: Vec<_> = syms
+        .iter()
+        .filter(|(_, sym)| {
+            matches!(
+                sym.kind,
+                SymbolKind::Variable | SymbolKind::ProcedurePointer
+            ) && !sym.attrs.parameter
+        })
         .collect();
     for (name, sym) in &vars {
         emit_variable(&mut out, &mod_key, name, sym, globals);
     }
-    if !vars.is_empty() { writeln!(out).unwrap(); }
+    if !vars.is_empty() {
+        writeln!(out).unwrap();
+    }
 
     // ---- Parameters ----
-    let params: Vec<_> = syms.iter()
+    let params: Vec<_> = syms
+        .iter()
         .filter(|(_, sym)| sym.attrs.parameter || matches!(sym.kind, SymbolKind::Parameter))
         .collect();
     for (name, sym) in &params {
         emit_parameter(&mut out, &mod_key, name, sym, globals);
     }
-    if !params.is_empty() { writeln!(out).unwrap(); }
+    if !params.is_empty() {
+        writeln!(out).unwrap();
+    }
 
     // ---- Procedures ----
-    let procs: Vec<_> = syms.iter()
+    let procs: Vec<_> = syms
+        .iter()
         .filter(|(_, sym)| matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine))
         .collect();
     for (name, sym) in &procs {
-        emit_procedure(&mut out, name, sym, st, mod_scope_id, ir_module, char_len_star_params);
+        emit_procedure(
+            &mut out,
+            name,
+            sym,
+            st,
+            mod_scope_id,
+            ir_module,
+            char_len_star_params,
+        );
     }
 
     // ---- Types ----
-    let types: Vec<_> = syms.iter()
+    let types: Vec<_> = syms
+        .iter()
         .filter(|(_, sym)| matches!(sym.kind, SymbolKind::DerivedType))
         .collect();
     for (name, _sym) in &types {
@@ -110,7 +139,8 @@ pub fn write_amod(
     }
 
     // ---- Interfaces ----
-    let ifaces: Vec<_> = syms.iter()
+    let ifaces: Vec<_> = syms
+        .iter()
         .filter(|(_, sym)| matches!(sym.kind, SymbolKind::NamedInterface))
         .collect();
     for (name, sym) in &ifaces {
@@ -147,11 +177,21 @@ fn emit_variable(
     write!(out, "@var {} : {}", name, type_str).unwrap();
 
     let mut attrs = Vec::new();
-    if sym.attrs.allocatable { attrs.push("allocatable"); }
-    if sym.attrs.save { attrs.push("save"); }
-    if sym.attrs.pointer { attrs.push("pointer"); }
-    if matches!(sym.kind, SymbolKind::ProcedurePointer) { attrs.push("procptr"); }
-    if sym.attrs.target { attrs.push("target"); }
+    if sym.attrs.allocatable {
+        attrs.push("allocatable");
+    }
+    if sym.attrs.save {
+        attrs.push("save");
+    }
+    if sym.attrs.pointer {
+        attrs.push("pointer");
+    }
+    if matches!(sym.kind, SymbolKind::ProcedurePointer) {
+        attrs.push("procptr");
+    }
+    if sym.attrs.target {
+        attrs.push("target");
+    }
     if !attrs.is_empty() {
         write!(out, ", {}", attrs.join(", ")).unwrap();
     }
@@ -159,7 +199,9 @@ fn emit_variable(
     let global_key = (mod_key.to_string(), name.to_lowercase());
     if let Some(info) = globals.get(&global_key) {
         write!(out, " @ir {}", info.symbol).unwrap();
-        if info.deferred_char { write!(out, " @deferred_char").unwrap(); }
+        if info.deferred_char {
+            write!(out, " @deferred_char").unwrap();
+        }
         if !info.dims.is_empty() {
             write!(out, " @dims").unwrap();
             for (lo, ext) in &info.dims {
@@ -206,22 +248,30 @@ fn emit_procedure(
 
     if is_func {
         let ret_str = type_info_to_string(sym.type_info.as_ref());
-        write!(out, "@function {} -> {}", name, ret_str).unwrap();
+        write!(out, "@function {} -> {}", sym.name, ret_str).unwrap();
     } else {
-        write!(out, "@subroutine {}", name).unwrap();
+        write!(out, "@subroutine {}", sym.name).unwrap();
     }
-    if sym.attrs.pure { write!(out, ", pure").unwrap(); }
-    if sym.attrs.elemental { write!(out, ", elemental").unwrap(); }
+    if sym.attrs.pure {
+        write!(out, ", pure").unwrap();
+    }
+    if sym.attrs.elemental {
+        write!(out, ", elemental").unwrap();
+    }
+    if let Some(binding_label) = &sym.attrs.binding_label {
+        write!(out, ", bind={}", binding_label).unwrap();
+    }
     writeln!(out).unwrap();
 
     let name_lc = name.to_lowercase();
 
     // Walk into the procedure's child scope for full arg info.
     let proc_scope = st.scopes.iter().find(|s| {
-        s.parent == Some(mod_scope_id) && match &s.kind {
-            ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(name),
-            _ => false,
-        }
+        s.parent == Some(mod_scope_id)
+            && match &s.kind {
+                ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(name),
+                _ => false,
+            }
     });
 
     // Compute hidden char-length count from the scope's arg types.
@@ -229,8 +279,10 @@ fn emit_procedure(
     if let Some(pscope) = proc_scope {
         for arg_name in &pscope.arg_order {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                if matches!(arg_sym.type_info, Some(TypeInfo::Character { len: None, .. }))
-                    && !arg_sym.attrs.allocatable
+                if matches!(
+                    arg_sym.type_info,
+                    Some(TypeInfo::Character { len: None, .. })
+                ) && !arg_sym.attrs.allocatable
                 {
                     hidden_count += 1;
                 }
@@ -255,16 +307,28 @@ fn emit_procedure(
                         Intent::InOut => "intent(inout)",
                     });
                 }
-                if arg_sym.attrs.optional { arg_attrs.push("optional"); }
-                if arg_sym.attrs.value { arg_attrs.push("value"); }
-                if arg_sym.attrs.allocatable { arg_attrs.push("allocatable"); }
-                if arg_sym.attrs.pointer { arg_attrs.push("pointer"); }
+                if arg_sym.attrs.optional {
+                    arg_attrs.push("optional");
+                }
+                if arg_sym.attrs.value {
+                    arg_attrs.push("value");
+                }
+                if arg_sym.attrs.allocatable {
+                    arg_attrs.push("allocatable");
+                }
+                if arg_sym.attrs.pointer {
+                    arg_attrs.push("pointer");
+                }
                 if !arg_attrs.is_empty() {
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
                 }
                 writeln!(out).unwrap();
                 // @abi per arg — ARM64 AAPCS64: first 8 int/ptr args in x0-x7.
-                let reg = if reg_idx < 8 { format!("x{}", reg_idx) } else { format!("stack+{}", (reg_idx - 8) * 8) };
+                let reg = if reg_idx < 8 {
+                    format!("x{}", reg_idx)
+                } else {
+                    format!("stack+{}", (reg_idx - 8) * 8)
+                };
                 writeln!(out, "    @abi pass={} width=8", reg).unwrap();
                 reg_idx += 1;
             } else {
@@ -292,7 +356,11 @@ fn emit_procedure(
                     Some(TypeInfo::Character { len: None, .. })
                 ) && !arg_sym.attrs.allocatable;
                 if is_assumed_len {
-                    let reg = if reg_idx < 8 { format!("x{}", reg_idx) } else { format!("stack+{}", (reg_idx - 8) * 8) };
+                    let reg = if reg_idx < 8 {
+                        format!("x{}", reg_idx)
+                    } else {
+                        format!("stack+{}", (reg_idx - 8) * 8)
+                    };
                     writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
                     writeln!(out, "    @abi pass={} width=8 hidden", reg).unwrap();
                     reg_idx += 1;
@@ -302,12 +370,18 @@ fn emit_procedure(
     }
 
     // @hint line.
-    let ir_func = ir_module.functions.iter()
+    let ir_func = ir_module
+        .functions
+        .iter()
         .find(|f| f.name.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(&name_lc));
     if let Some(func) = ir_func {
         let mut hints = Vec::new();
-        if is_leaf(func) { hints.push("leaf".to_string()); }
-        if !touches_globals(func) { hints.push("no_globals".to_string()); }
+        if is_leaf(func) {
+            hints.push("leaf".to_string());
+        }
+        if !touches_globals(func) {
+            hints.push("no_globals".to_string());
+        }
         let cost: usize = func.blocks.iter().map(|b| b.insts.len()).sum();
         hints.push(format!("cost={}", cost));
         writeln!(out, "  @hint {}", hints.join(" ")).unwrap();
@@ -366,14 +440,21 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                 format!(" @dims {}", rendered)
             };
             let mut attrs = String::new();
-            if field.allocatable { attrs.push_str(" @allocatable"); }
-            if field.pointer { attrs.push_str(" @pointer"); }
-            if field.target { attrs.push_str(" @target"); }
+            if field.allocatable {
+                attrs.push_str(" @allocatable");
+            }
+            if field.pointer {
+                attrs.push_str(" @pointer");
+            }
+            if field.target {
+                attrs.push_str(" @target");
+            }
             writeln!(
                 out,
                 "  @field {} : {} @offset {} @size {}{}{}",
                 field.name, ft, field.offset, field.size, dims, attrs
-            ).unwrap();
+            )
+            .unwrap();
         }
         for bp in &layout.bound_procs {
             if bp.method_name == bp.target_name {
@@ -384,7 +465,12 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                 }
             } else {
                 if bp.nopass {
-                    writeln!(out, "  @binds {} => {}, nopass", bp.method_name, bp.target_name).unwrap();
+                    writeln!(
+                        out,
+                        "  @binds {} => {}, nopass",
+                        bp.method_name, bp.target_name
+                    )
+                    .unwrap();
                 } else {
                     writeln!(out, "  @binds {} => {}", bp.method_name, bp.target_name).unwrap();
                 }
@@ -487,6 +573,7 @@ pub struct AmodProc {
     pub return_type: Option<TypeInfo>,
     pub pure: bool,
     pub elemental: bool,
+    pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
 }
 
@@ -543,9 +630,14 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     // Header: #!amod N
     let magic = lines.next().ok_or("empty .amod file")?;
     if !magic.starts_with("#!amod ") {
-        return Err(format!("{}: not an .amod file (missing #!amod magic)", path.display()));
+        return Err(format!(
+            "{}: not an .amod file (missing #!amod magic)",
+            path.display()
+        ));
     }
-    let version: u32 = magic[7..].trim().parse()
+    let version: u32 = magic[7..]
+        .trim()
+        .parse()
         .map_err(|_| format!("{}: invalid .amod version", path.display()))?;
     if version > 2 {
         eprintln!("warning: {}: .amod version {} is newer than this compiler supports; some information may be ignored", path.display(), version);
@@ -584,7 +676,9 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(dep.trim().to_string());
@@ -605,12 +699,17 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             let mut specifics = Vec::new();
             for iline in lines.by_ref() {
                 let t = iline.trim();
-                if t.starts_with("@end interface") { break; }
+                if t.starts_with("@end interface") {
+                    break;
+                }
                 if let Some(spec) = t.strip_prefix("@specific ") {
                     specifics.push(spec.trim().to_string());
                 }
             }
-            interfaces.push(AmodInterface { name: iface_name, specifics });
+            interfaces.push(AmodInterface {
+                name: iface_name,
+                specifics,
+            });
         }
         // Skip unrecognized directives (forward compatibility).
     }
@@ -635,7 +734,9 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (rest, None)
     };
 
-    let (name, type_and_attrs) = name_type.split_once(" : ").unwrap_or((name_type, "unknown"));
+    let (name, type_and_attrs) = name_type
+        .split_once(" : ")
+        .unwrap_or((name_type, "unknown"));
     let name = name.trim().to_string();
 
     // Split type from attrs on comma.
@@ -655,8 +756,12 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 const_value = Some(v);
             }
             &type_str[..eq_idx]
-        } else { type_str }
-    } else { type_str };
+        } else {
+            type_str
+        }
+    } else {
+        type_str
+    };
 
     let type_info = parse_type_info(clean_type_str.trim());
     let allocatable = attr_str.contains("allocatable");
@@ -737,15 +842,24 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     let pure = attrs_str.contains("pure");
     let elemental = attrs_str.contains("elemental");
+    let binding_label = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
 
-    let kind = if is_func { SymbolKind::Function } else { SymbolKind::Subroutine };
+    let kind = if is_func {
+        SymbolKind::Function
+    } else {
+        SymbolKind::Subroutine
+    };
 
     let mut args = Vec::new();
 
     // Parse body lines until @end.
     for line in lines.by_ref() {
         let trimmed = line.trim();
-        if trimmed.starts_with("@end ") { break; }
+        if trimmed.starts_with("@end ") {
+            break;
+        }
         if trimmed.starts_with("@arg ") {
             args.push(parse_arg(trimmed));
         }
@@ -753,7 +867,15 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         // them for optimization but not for correctness).
     }
 
-    AmodProc { name, kind, return_type, pure, elemental, args }
+    AmodProc {
+        name,
+        kind,
+        return_type,
+        pure,
+        elemental,
+        binding_label,
+        args,
+    }
 }
 
 fn parse_arg(line: &str) -> AmodArg {
@@ -782,20 +904,38 @@ fn parse_arg(line: &str) -> AmodArg {
         Some(Intent::Out)
     } else if attr_str.contains("intent(inout)") {
         Some(Intent::InOut)
-    } else { None };
+    } else {
+        None
+    };
 
     let optional = attr_str.contains("optional");
     let value = attr_str.contains("value");
     let allocatable = attr_str.contains("allocatable");
     let pointer = attr_str.contains("pointer");
 
-    AmodArg { name, type_info, intent, optional, value, allocatable, pointer, hidden }
+    AmodArg {
+        name,
+        type_info,
+        intent,
+        optional,
+        value,
+        allocatable,
+        pointer,
+        hidden,
+    }
 }
 
-fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> crate::sema::type_layout::TypeLayout {
+fn parse_type(
+    header: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines>,
+) -> crate::sema::type_layout::TypeLayout {
     use crate::sema::type_layout::*;
 
-    let name = header.strip_prefix("@type ").unwrap_or("unknown").trim().to_string();
+    let name = header
+        .strip_prefix("@type ")
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
     let mut size = 0;
     let mut align = 1;
     let mut parent = None;
@@ -806,7 +946,9 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     for line in lines.by_ref() {
         let trimmed = line.trim();
-        if trimmed.starts_with("@end type") { break; }
+        if trimmed.starts_with("@end type") {
+            break;
+        }
 
         if let Some(rest) = trimmed.strip_prefix("@layout ") {
             for part in rest.split_whitespace() {
@@ -821,7 +963,9 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         } else if let Some(rest) = trimmed.strip_prefix("@field ") {
             // @field name : type @offset N @size M [@allocatable] [@pointer] [@target]
             if let Some((name_type, offset_part)) = rest.split_once(" @offset ") {
-                let (fname, ftype_str) = name_type.split_once(" : ").unwrap_or((name_type, "unknown"));
+                let (fname, ftype_str) = name_type
+                    .split_once(" : ")
+                    .unwrap_or((name_type, "unknown"));
                 // Split off the size and any trailing attribute flags.
                 let (offset_str, after_offset) = match offset_part.find(" @size ") {
                     Some(idx) => (&offset_part[..idx], &offset_part[idx + 7..]),
@@ -838,7 +982,11 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
                     } else {
                         (dims_part, "")
                     };
-                    for dim in dims_str.split(',').map(str::trim).filter(|dim| !dim.is_empty()) {
+                    for dim in dims_str
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|dim| !dim.is_empty())
+                    {
                         if let Some((lower_str, upper_str)) = dim.split_once(':') {
                             let lower = lower_str.trim().parse().unwrap_or(1);
                             let upper = upper_str.trim().parse().unwrap_or(lower - 1);
@@ -874,7 +1022,11 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
                 let m = clean.trim().to_string();
                 (m.clone(), m)
             };
-            bound_procs.push(BoundProc { method_name: method, target_name: target, nopass });
+            bound_procs.push(BoundProc {
+                method_name: method,
+                target_name: target,
+                nopass,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             final_procs.push(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
@@ -882,15 +1034,32 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         }
     }
 
-    TypeLayout { name, size, align, fields, bound_procs, final_procs, type_tag, parent }
+    TypeLayout {
+        name,
+        size,
+        align,
+        fields,
+        bound_procs,
+        final_procs,
+        type_tag,
+        parent,
+    }
 }
 
 fn parse_type_info(s: &str) -> Option<TypeInfo> {
     let s = s.trim();
-    if s == "unknown" || s.is_empty() { return None; }
-    if s == "double precision" { return Some(TypeInfo::DoublePrecision); }
-    if s == "class(*)" { return Some(TypeInfo::ClassStar); }
-    if s == "type(*)" { return Some(TypeInfo::TypeStar); }
+    if s == "unknown" || s.is_empty() {
+        return None;
+    }
+    if s == "double precision" {
+        return Some(TypeInfo::DoublePrecision);
+    }
+    if s == "class(*)" {
+        return Some(TypeInfo::ClassStar);
+    }
+    if s == "type(*)" {
+        return Some(TypeInfo::TypeStar);
+    }
 
     // integer[(K)]
     if s.starts_with("integer") {
@@ -911,14 +1080,26 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
     }
     if s.starts_with("character") {
         // character(len=N) or character(len=:)
-        if let Some(inner) = s.strip_prefix("character(len=").and_then(|r| r.strip_suffix(')')) {
+        if let Some(inner) = s
+            .strip_prefix("character(len=")
+            .and_then(|r| r.strip_suffix(')'))
+        {
             if inner == ":" {
-                return Some(TypeInfo::Character { len: None, kind: None });
+                return Some(TypeInfo::Character {
+                    len: None,
+                    kind: None,
+                });
             } else if let Ok(n) = inner.parse::<i64>() {
-                return Some(TypeInfo::Character { len: Some(n), kind: None });
+                return Some(TypeInfo::Character {
+                    len: Some(n),
+                    kind: None,
+                });
             }
         }
-        return Some(TypeInfo::Character { len: None, kind: None });
+        return Some(TypeInfo::Character {
+            len: None,
+            kind: None,
+        });
     }
     if let Some(inner) = s.strip_prefix("type(").and_then(|r| r.strip_suffix(')')) {
         return Some(TypeInfo::Derived(inner.to_string()));
@@ -947,16 +1128,18 @@ pub fn extract_module_globals(
     let mod_key = iface.module_name.to_lowercase();
     let mut out = HashMap::new();
     for var in &iface.variables {
-        if var.is_parameter { continue; } // PARAMETERs are inlined, no global
+        if var.is_parameter {
+            continue;
+        } // PARAMETERs are inlined, no global
         if let Some(ref ir_sym) = var.ir_symbol {
             let derived_type = match var.type_info.as_ref() {
                 Some(TypeInfo::Derived(name)) => Some(name.clone()),
                 _ => None,
             };
             let ir_ty = if var.proc_pointer {
-                crate::ir::types::IrType::Ptr(Box::new(
-                    crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8),
-                ))
+                crate::ir::types::IrType::Ptr(Box::new(crate::ir::types::IrType::Int(
+                    crate::ir::types::IntWidth::I8,
+                )))
             } else if var.pointer {
                 match derived_type.as_deref() {
                     Some("c_ptr") | Some("c_funptr") => {
@@ -1013,18 +1196,16 @@ pub fn extract_module_globals(
 /// Extract char_len_star_params from a loaded ModuleInterface.
 /// For each procedure with character(len=*) args, produces a
 /// Vec<bool> (per-position, true = assumed-length character).
-pub fn extract_char_len_star_params(
-    iface: &ModuleInterface,
-) -> HashMap<String, Vec<bool>> {
+pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
-        let visible_args: Vec<&AmodArg> = proc.args.iter()
-            .filter(|a| !a.hidden)
+        let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
+        let flags: Vec<bool> = visible_args
+            .iter()
+            .map(|a| {
+                matches!(a.type_info, Some(TypeInfo::Character { len: None, .. })) && !a.allocatable
+            })
             .collect();
-        let flags: Vec<bool> = visible_args.iter().map(|a| {
-            matches!(a.type_info, Some(TypeInfo::Character { len: None, .. }))
-                && !a.allocatable
-        }).collect();
         if flags.iter().any(|f| *f) {
             out.insert(proc.name.to_lowercase(), flags);
         }
@@ -1033,7 +1214,7 @@ pub fn extract_char_len_star_params(
 }
 
 fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
-    use crate::ir::types::{IrType, IntWidth, FloatWidth};
+    use crate::ir::types::{FloatWidth, IntWidth, IrType};
     match info {
         Some(TypeInfo::Derived(name)) => {
             let lower = name.to_lowercase();
@@ -1056,7 +1237,10 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
         }),
         Some(TypeInfo::DoublePrecision) => IrType::Float(FloatWidth::F64),
         Some(TypeInfo::Complex { kind }) => {
-            let fw = match kind { Some(8) => FloatWidth::F64, _ => FloatWidth::F32 };
+            let fw = match kind {
+                Some(8) => FloatWidth::F64,
+                _ => FloatWidth::F32,
+            };
             IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
         Some(TypeInfo::Logical { .. }) => IrType::Bool,
@@ -1113,16 +1297,28 @@ mod tests {
         assert_eq!(iface.module_name, "physics");
         assert_eq!(iface.dependencies, vec!["iso_c_binding"]);
         assert_eq!(iface.variables.len(), 2); // call_count + gravity
-        assert!(iface.variables.iter().any(|v| v.name == "call_count" && v.ir_symbol.as_deref() == Some("afs_mod_physics_call_count")));
-        assert!(iface.variables.iter().any(|v| v.name == "gravity" && v.is_parameter));
+        assert!(iface.variables.iter().any(|v| v.name == "call_count"
+            && v.ir_symbol.as_deref() == Some("afs_mod_physics_call_count")));
+        assert!(iface
+            .variables
+            .iter()
+            .any(|v| v.name == "gravity" && v.is_parameter));
         assert!(iface.variables.iter().all(|v| !v.proc_pointer));
         assert_eq!(iface.procedures.len(), 2);
-        let ke = iface.procedures.iter().find(|p| p.name == "kinetic_energy").unwrap();
+        let ke = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "kinetic_energy")
+            .unwrap();
         assert!(ke.pure);
         assert_eq!(ke.args.len(), 2);
         assert_eq!(ke.args[0].name, "self");
         assert!(matches!(ke.args[0].intent, Some(Intent::In)));
-        let af = iface.procedures.iter().find(|p| p.name == "apply_force").unwrap();
+        let af = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "apply_force")
+            .unwrap();
         assert_eq!(af.args.len(), 2);
         assert!(af.args[1].optional);
         assert_eq!(iface.types.len(), 1);
@@ -1170,9 +1366,9 @@ mod tests {
         assert_eq!(info.symbol, "afs_mod_control_flow_evaluate_condition");
         assert_eq!(
             info.ty,
-            crate::ir::types::IrType::Ptr(Box::new(
-                crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8)
-            ))
+            crate::ir::types::IrType::Ptr(Box::new(crate::ir::types::IrType::Int(
+                crate::ir::types::IntWidth::I8
+            )))
         );
     }
 }
