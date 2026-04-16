@@ -8,10 +8,7 @@
 //!
 //! Produces the same Token types as the free-form lexer.
 
-use super::{
-    is_keyword, is_known_dot_op, unexpected_char_message, LexError, Position, Span, Token,
-    TokenKind,
-};
+use super::{is_keyword, is_known_dot_op, LexError, Position, Span, Token, TokenKind};
 
 /// Tokenize fixed-form Fortran source.
 pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
@@ -107,6 +104,11 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
     });
 
     Ok(tokens)
+}
+
+fn unexpected_char_message(text: &str, pos: usize, context: &str) -> String {
+    let ch = text.as_bytes().get(pos).copied().unwrap_or(b'?') as char;
+    format!("{context}: '{ch}'")
 }
 
 // ---- Whitespace-insensitive body tokenizer ----

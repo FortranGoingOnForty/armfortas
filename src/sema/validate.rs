@@ -2116,7 +2116,7 @@ end program
     fn duplicate_label_detected() {
         use crate::lexer::{Span, Position};
         let st = SymbolTable::new();
-        let mut ctx = Ctx::new(&st, None);
+        let mut ctx = Ctx::new(&st, None, false, false);
         let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
 
         register_label(&mut ctx, 10, span);
@@ -2152,6 +2152,25 @@ contains
   subroutine update(val)
     integer, intent(in) :: val
     shared = val
+  end subroutine
+end module
+");
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    #[test]
+    fn module_parameter_visible_in_contained_subroutine() {
+        let errs = errors_from("\
+module m
+  use iso_c_binding, only: c_int
+  implicit none
+  private
+  public :: s
+  integer, parameter :: color_red = 31
+contains
+  subroutine s()
+    use iso_c_binding, only: c_int
+    print *, color_red
   end subroutine
 end module
 ");
