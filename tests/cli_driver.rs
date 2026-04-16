@@ -4167,6 +4167,89 @@ fn program_internal_char_helper_assignment_uses_internal_symbol() {
 }
 
 #[test]
+fn runtime_sized_character_function_result_compiles_and_runs() {
+    let dir = unique_dir("runtime_char_function_result");
+    let module_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  function normalize(input) result(output)\n    character(len=*), intent(in) :: input\n    character(len=len(input)) :: output\n    integer :: i, j\n    output = ''\n    i = 1\n    j = 1\n    do while (i <= len_trim(input))\n      if (input(i:i) == char(10)) then\n        i = i + 1\n        cycle\n      end if\n      output(j:j) = input(i:i)\n      i = i + 1\n      j = j + 1\n    end do\n  end function normalize\nend module m\n",
+    );
+    let program_src = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only: normalize\n  implicit none\n  character(len=3) :: input, output\n  input = 'a' // char(10) // 'b'\n  output = normalize(input)\n  if (output /= 'ab ') error stop 1\n  print *, trim(output)\nend program p\n",
+    );
+    let out = dir.join("p.out");
+
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            module_src.to_str().unwrap(),
+            program_src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("runtime-sized char function compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "runtime-sized char function result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "runtime-sized char function result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ab"),
+        "unexpected runtime-sized char function output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_character_pointer_function_result_compiles_and_runs() {
+    let src = write_program(
+        "module m\ncontains\n  function maybe_ptr(flag) result(ptr)\n    logical, intent(in) :: flag\n    character(:), pointer :: ptr\n    character(len=4), target, save :: pool = 'okay'\n    if (flag) then\n      ptr => pool(1:4)\n    else\n      ptr => null()\n    end if\n  end function maybe_ptr\nend module m\n\nprogram p\n  use m, only: maybe_ptr\n  implicit none\n  character(len=:), allocatable :: s\n  s = maybe_ptr(.true.)\n  if (s /= 'okay') error stop 1\n  print *, trim(s)\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_pointer_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char pointer result compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred char pointer function result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred char pointer function result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("okay"),
+        "unexpected deferred char pointer result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_result_helper_assignment_uses_resolved_symbol() {
     let dir = unique_dir("alloc_result_helper_symbol");
     let src = write_program_in(

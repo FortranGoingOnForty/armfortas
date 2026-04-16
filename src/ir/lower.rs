@@ -123,10 +123,10 @@ struct LowerCtx<'a> {
     result_addr: Option<ValueId>,
     /// For functions: the return type.
     result_type: Option<IrType>,
-    /// True when this function uses the sret (hidden-output-param) convention
-    /// because it returns an allocatable array. Stmt::Return emits `ret void`
-    /// instead of loading result_addr. Audit6 BLOCKING-1.
-    is_alloc_return: bool,
+    /// For functions: lowercase result variable name when one exists.
+    result_name: Option<String>,
+    /// Hidden result ABI for this function, if any.
+    hidden_result_abi: HiddenResultAbi,
     /// Names of functions in the compilation unit that return allocatable
     /// arrays (sret convention). Used at call sites to detect when to
     /// pass a temp descriptor as the hidden first arg. Audit6 BLOCKING-1.
@@ -182,7 +182,8 @@ impl<'a> LowerCtx<'a> {
             filtered_names: HashSet::new(),
             result_addr: None,
             result_type: None,
-            is_alloc_return: false,
+            result_name: None,
+            hidden_result_abi: HiddenResultAbi::None,
             alloc_return_funcs,
             optional_params,
             descriptor_params,
@@ -593,6 +594,7 @@ fn collect_internal_func_names(
 fn function_hidden_result_abi(
     function_name: &str,
     result: &Option<String>,
+    return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
@@ -622,15 +624,7 @@ fn function_hidden_result_abi(
                 continue;
             }
             let has_dims = entity.array_spec.as_ref().or(attr_dims).is_some();
-            let is_hidden_string = matches!(
-                type_spec,
-                TypeSpec::Character(Some(sel))
-                    if matches!(sel.len, Some(crate::ast::decl::LenSpec::Colon))
-            ) && !has_dims
-                && attrs
-                    .iter()
-                    .any(|a| matches!(a, Attribute::Allocatable | Attribute::Pointer));
-            if is_hidden_string {
+            if matches!(type_spec, TypeSpec::Character(_)) && !has_dims {
                 return HiddenResultAbi::StringDescriptor;
             }
             if attrs.iter().any(|a| matches!(a, Attribute::Allocatable)) {
@@ -639,14 +633,17 @@ fn function_hidden_result_abi(
             return HiddenResultAbi::None;
         }
     }
+    if matches!(return_type, Some(TypeSpec::Character(_))) {
+        return HiddenResultAbi::StringDescriptor;
+    }
     HiddenResultAbi::None
 }
 
 /// Walk a program unit and any nested `contains` to collect the
 /// names of functions whose result variable is lowered through the
-/// 384-byte array descriptor hidden-result ABI. Deferred-length
-/// scalar character results use the 32-byte string descriptor ABI
-/// and are intentionally excluded here.
+/// 384-byte array descriptor hidden-result ABI. Scalar character
+/// results use the 32-byte string descriptor ABI and are
+/// intentionally excluded here.
 ///
 /// Audit6 BLOCKING-1: a function `function f() result(r); integer,
 /// allocatable :: r(:)` cannot be returned by value through the
@@ -662,9 +659,12 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
             decls,
             contains,
             result,
+            return_type,
             ..
         } => {
-            if function_hidden_result_abi(name, result, decls) == HiddenResultAbi::ArrayDescriptor {
+            if function_hidden_result_abi(name, result, return_type.as_ref(), decls)
+                == HiddenResultAbi::ArrayDescriptor
+            {
                 out.insert(name.to_lowercase());
             }
             for sub in contains {
@@ -2722,10 +2722,11 @@ fn lower_unit(
                 collect_decl_param_consts_with_host(decls, host_param_consts);
 
             // Hidden-result ABI: allocatable arrays use a 384-byte array
-            // descriptor, while deferred-length scalar character results use
-            // a 32-byte string descriptor. In both cases the caller provides
-            // the descriptor storage as param 0 and the callee returns void.
-            let hidden_result_abi = function_hidden_result_abi(name, result, decls);
+            // descriptor, while scalar character results use a 32-byte
+            // string descriptor. In both cases the caller provides the
+            // descriptor storage as param 0 and the callee returns void.
+            let hidden_result_abi =
+                function_hidden_result_abi(name, result, return_type.as_ref(), decls);
             let uses_hidden_result = hidden_result_abi != HiddenResultAbi::None;
 
             let (func_params, ir_ret_ty) = if uses_hidden_result {
@@ -2882,7 +2883,6 @@ fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
             );
-            ctx.is_alloc_return = uses_hidden_result;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -2982,6 +2982,8 @@ fn lower_unit(
                 );
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
+                ctx.result_name = Some(result_name.clone());
+                ctx.hidden_result_abi = hidden_result_abi;
 
                 let result_is_pointer = decl_is_pointer(&result_name, decls);
 
@@ -3005,24 +3007,11 @@ fn lower_unit(
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::StringDescriptor {
-                    // Deferred-length scalar character result: the hidden first
-                    // param is a caller-provided StringDescriptor.
-                    ctx.locals.insert(
-                        result_name.clone(),
-                        LocalInfo {
-                            addr: ValueId(0),
-                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            dims: vec![],
-                            allocatable: true,
-                            descriptor_arg: false,
-                            by_ref: false,
-                            char_kind: CharKind::Deferred,
-                            derived_type: None,
-                            inline_const: None,
-                            is_pointer: result_is_pointer,
-                            runtime_dim_upper: vec![],
-                        },
-                    );
+                    // Scalar character results use the hidden StringDescriptor
+                    // ABI, but the body still writes to a normal local result
+                    // variable. We materialize that local through alloc_decls
+                    // / ensure_hidden_string_result_local below and copy it
+                    // into the hidden descriptor right before return.
                 } else if result_is_pointer {
                     let result_addr = b.alloca(ir_ret_ty.clone());
                     let zero_byte = b.const_i32(0);
@@ -3113,6 +3102,16 @@ fn lower_unit(
                     &func_name,
                     st,
                 );
+                if hidden_result_abi == HiddenResultAbi::StringDescriptor {
+                    ensure_hidden_string_result_local(
+                        &mut b,
+                        &mut ctx.locals,
+                        &result_name,
+                        return_type.as_ref(),
+                        &visible_param_consts,
+                        st,
+                    );
+                }
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
                 install_globals_as_locals(
                     &mut b,
@@ -3130,7 +3129,10 @@ fn lower_unit(
                 lower_stmts(&mut b, &mut ctx, body);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    let skip = if uses_hidden_result {
+                    if hidden_result_abi == HiddenResultAbi::StringDescriptor {
+                        lower_hidden_string_result_copy(&mut b, &ctx);
+                    }
+                    let skip = if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                         Some(ValueId(0))
                     } else {
                         None
@@ -4555,11 +4557,10 @@ fn alloc_decls(
                         continue;
                     }
                 }
-                if is_deferred_char && is_allocatable && array_spec.is_none() {
-                    // Deferred-length allocatable scalar character:
-                    // 32-byte StringDescriptor. Deferred-length
-                    // allocatable arrays fall through to the general
-                    // array-descriptor path below.
+                if is_deferred_char && (is_allocatable || is_pointer_attr) && array_spec.is_none() {
+                    // Deferred-length allocatable/pointer scalar character:
+                    // 32-byte StringDescriptor. Deferred-length arrays fall
+                    // through to the general descriptor path below.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
                     let addr = b.alloca(desc_ty);
                     let zero = b.const_i32(0);
@@ -4581,7 +4582,7 @@ fn alloc_decls(
                             char_kind: CharKind::Deferred,
                             derived_type: None,
                             inline_const: None,
-                            is_pointer: false,
+                            is_pointer: is_pointer_attr,
                             runtime_dim_upper: vec![],
                         },
                     );
@@ -5780,6 +5781,62 @@ fn char_addr_and_len(
     }
 }
 
+fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(ValueId, ValueId)> {
+    match &info.char_kind {
+        CharKind::Fixed(n) => {
+            if !info.dims.is_empty() {
+                return None;
+            }
+            let ptr = if info.by_ref {
+                let outer = b.load(info.addr);
+                b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else {
+                let zero = b.const_i64(0);
+                b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8))
+            };
+            Some((ptr, b.const_i64(*n)))
+        }
+        CharKind::FixedRuntime { len_addr } => {
+            Some(fixed_runtime_char_ptr_and_len(b, info, *len_addr))
+        }
+        CharKind::Deferred => {
+            let desc = string_descriptor_addr(b, info);
+            Some(load_string_descriptor_view(b, desc))
+        }
+        CharKind::AssumedLen { len_addr } => {
+            let outer = b.load(info.addr);
+            let ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let len = b.load(*len_addr);
+            Some((ptr, len))
+        }
+        CharKind::None => {
+            if let Some(len) = local_fixed_char_allocatable_scalar_len(info) {
+                let desc = array_descriptor_addr(b, info);
+                let base = b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())));
+                let zero = b.const_i64(0);
+                let ptr = b.gep(base, vec![zero], IrType::Int(IntWidth::I8));
+                Some((ptr, b.const_i64(len)))
+            } else if info.by_ref
+                && matches!(
+                    info.ty,
+                    IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+                )
+            {
+                let outer = b.load(info.addr);
+                let ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let len = b.call(
+                    FuncRef::External("afs_c_strlen".into()),
+                    vec![ptr],
+                    IrType::Int(IntWidth::I64),
+                );
+                Some((ptr, len))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn char_addr_and_runtime_len(
     b: &mut FuncBuilder,
     arg_spanned: &crate::ast::expr::SpannedExpr,
@@ -5789,67 +5846,7 @@ fn char_addr_and_runtime_len(
     match &arg_spanned.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
-            match &info.char_kind {
-                CharKind::Fixed(n) => {
-                    if !info.dims.is_empty() {
-                        return None;
-                    }
-                    let ptr = if info.by_ref {
-                        let outer = b.load(info.addr);
-                        b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                    } else {
-                        let zero = b.const_i64(0);
-                        b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8))
-                    };
-                    let len = b.const_i64(*n);
-                    Some((ptr, len))
-                }
-                CharKind::FixedRuntime { len_addr } => {
-                    Some(fixed_runtime_char_ptr_and_len(b, info, *len_addr))
-                }
-                CharKind::Deferred => {
-                    let desc = string_descriptor_addr(b, info);
-                    let ptr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    let eight = b.const_i64(8);
-                    let len_ptr = b.gep(desc, vec![eight], IrType::Int(IntWidth::I8));
-                    let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
-                    Some((ptr, len))
-                }
-                CharKind::AssumedLen { len_addr } => {
-                    // by_ref assumed-length dummy: double-deref for
-                    // the data pointer, load the hidden-length param.
-                    let outer = b.load(info.addr);
-                    let ptr = b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    let len = b.load(*len_addr);
-                    Some((ptr, len))
-                }
-                CharKind::None => {
-                    if let Some(len) = local_fixed_char_allocatable_scalar_len(info) {
-                        let desc = array_descriptor_addr(b, info);
-                        let base = b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())));
-                        let zero = b.const_i64(0);
-                        let ptr = b.gep(base, vec![zero], IrType::Int(IntWidth::I8));
-                        Some((ptr, b.const_i64(len)))
-                    } else if info.by_ref
-                        && matches!(
-                            info.ty,
-                            IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
-                        )
-                    {
-                        let outer = b.load(info.addr);
-                        let ptr =
-                            b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        let len = b.call(
-                            FuncRef::External("afs_c_strlen".into()),
-                            vec![ptr],
-                            IrType::Int(IntWidth::I64),
-                        );
-                        Some((ptr, len))
-                    } else {
-                        None
-                    }
-                }
-            }
+            local_char_ptr_and_len(b, info)
         }
         Expr::StringLiteral { value, .. } => {
             let ptr = b.const_string(value.as_bytes());
@@ -9306,7 +9303,6 @@ fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> 
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharacterReturnAbi {
-    Direct(Option<i64>),
     HiddenDescriptor,
 }
 
@@ -9322,14 +9318,10 @@ fn callee_character_return_abi(st: &SymbolTable, callee_name: &str) -> Option<Ch
         | SymbolKind::ProcedurePointer => {}
         _ => return None,
     }
-    let TypeInfo::Character { len, .. } = sym.type_info.as_ref()? else {
+    let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
-    if sym.attrs.allocatable || sym.attrs.pointer {
-        Some(CharacterReturnAbi::HiddenDescriptor)
-    } else {
-        Some(CharacterReturnAbi::Direct(*len))
-    }
+    Some(CharacterReturnAbi::HiddenDescriptor)
 }
 
 fn local_fixed_char_allocatable_scalar_len(info: &LocalInfo) -> Option<i64> {
@@ -9881,22 +9873,6 @@ fn lower_string_expr_full(
                                 IrType::Void,
                             );
                             return load_string_descriptor_view(b, desc);
-                        }
-                        CharacterReturnAbi::Direct(len) => {
-                            let ptr = emit_named_function_call(
-                                b,
-                                locals,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                                name,
-                                args,
-                                None,
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
-                            return (ptr, b.const_i64(len.unwrap_or(0)));
                         }
                     }
                 }
@@ -11526,7 +11502,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Return { .. } => {
-            let skip = if ctx.is_alloc_return {
+            if ctx.hidden_result_abi == HiddenResultAbi::StringDescriptor {
+                lower_hidden_string_result_copy(b, ctx);
+            }
+            let skip = if ctx.hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                 Some(ValueId(0))
             } else {
                 None
@@ -11541,7 +11520,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 Some(ctx.contained_host_refs),
                 skip,
             );
-            if ctx.is_alloc_return {
+            if ctx.hidden_result_abi != HiddenResultAbi::None {
                 // sret convention: result was written into the hidden first param.
                 b.ret(None);
             } else if let Some(addr) = ctx.result_addr {
@@ -11553,7 +11532,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Stop { .. } => {
-            let skip = if ctx.is_alloc_return {
+            let skip = if ctx.hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                 Some(ValueId(0))
             } else {
                 None
@@ -11572,7 +11551,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             b.unreachable();
         }
         Stmt::ErrorStop { .. } => {
-            let skip = if ctx.is_alloc_return {
+            let skip = if ctx.hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                 Some(ValueId(0))
             } else {
                 None
@@ -18543,6 +18522,167 @@ fn init_allocated_string_descriptor(b: &mut FuncBuilder, desc: ValueId, len: Val
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I64), len);
     let flags = b.const_i32(3);
     store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I32), flags);
+}
+
+fn ensure_hidden_string_result_local(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    result_name: &str,
+    return_type: Option<&TypeSpec>,
+    visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) {
+    if locals.contains_key(result_name) {
+        return;
+    }
+    let Some(TypeSpec::Character(sel)) = return_type else {
+        return;
+    };
+    let const_len = match sel.as_ref().and_then(|sel| sel.len.as_ref()) {
+        Some(crate::ast::decl::LenSpec::Expr(expr)) => {
+            eval_const_int_in_scope_or_any_scope(expr, visible_param_consts, st)
+        }
+        Some(crate::ast::decl::LenSpec::Star) | Some(crate::ast::decl::LenSpec::Colon) => None,
+        None => Some(1),
+    };
+    if matches!(
+        sel.as_ref().and_then(|sel| sel.len.as_ref()),
+        Some(crate::ast::decl::LenSpec::Colon)
+    ) {
+        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
+        let addr = b.alloca(desc_ty);
+        let zero = b.const_i32(0);
+        let size32 = b.const_i64(32);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![addr, zero, size32],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        locals.insert(
+            result_name.to_string(),
+            LocalInfo {
+                addr,
+                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                dims: vec![],
+                allocatable: true,
+                descriptor_arg: false,
+                by_ref: false,
+                char_kind: CharKind::Deferred,
+                derived_type: None,
+                inline_const: None,
+                is_pointer: false,
+                runtime_dim_upper: vec![],
+            },
+        );
+        return;
+    }
+    if let Some(len) = const_len {
+        let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
+        let addr = b.alloca(buf_ty);
+        let zero = b.const_i32(0);
+        let total = b.const_i64(len + 1);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![addr, zero, total],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let space = b.const_i32(b' ' as i32);
+        let len_val = b.const_i64(len);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![addr, space, len_val],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        locals.insert(
+            result_name.to_string(),
+            LocalInfo {
+                addr,
+                ty: IrType::Int(IntWidth::I8),
+                dims: vec![],
+                allocatable: false,
+                descriptor_arg: false,
+                by_ref: false,
+                char_kind: CharKind::Fixed(len),
+                derived_type: None,
+                inline_const: None,
+                is_pointer: false,
+                runtime_dim_upper: vec![],
+            },
+        );
+        return;
+    }
+    if let Some(len_expr) = sel.as_ref().and_then(|sel| match sel.len.as_ref() {
+        Some(crate::ast::decl::LenSpec::Expr(expr)) => Some(expr),
+        _ => None,
+    }) {
+        let raw_len = lower_expr(b, locals, len_expr, st);
+        let len_val = clamp_nonnegative_i64(b, raw_len);
+        let len_addr = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(len_val, len_addr);
+
+        let one = b.const_i64(1);
+        let total = b.iadd(len_val, one);
+        let ptr = b.runtime_call(
+            RuntimeFunc::Allocate,
+            vec![total],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        b.store(ptr, ptr_slot);
+
+        let zero = b.const_i32(0);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![ptr, zero, total],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let space = b.const_i32(b' ' as i32);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![ptr, space, len_val],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        locals.insert(
+            result_name.to_string(),
+            LocalInfo {
+                addr: ptr_slot,
+                ty: IrType::Int(IntWidth::I8),
+                dims: vec![],
+                allocatable: false,
+                descriptor_arg: false,
+                by_ref: false,
+                char_kind: CharKind::FixedRuntime { len_addr },
+                derived_type: None,
+                inline_const: None,
+                is_pointer: false,
+                runtime_dim_upper: vec![],
+            },
+        );
+    }
+}
+
+fn lower_hidden_string_result_copy(b: &mut FuncBuilder, ctx: &LowerCtx) {
+    let result_name = ctx
+        .result_name
+        .as_ref()
+        .expect("hidden string result must have a result variable name");
+    let info = ctx
+        .locals
+        .get(result_name)
+        .unwrap_or_else(|| panic!("missing hidden string result local '{}'", result_name));
+    let (src_ptr, src_len) = local_char_ptr_and_len(b, info).unwrap_or_else(|| {
+        panic!(
+            "hidden string result '{}' is not lowered as a string local",
+            result_name
+        )
+    });
+    init_allocated_string_descriptor(b, ValueId(0), src_len);
+    let (dest_ptr, _dest_len) = load_string_descriptor_view(b, ValueId(0));
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest_ptr, src_ptr, src_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
 }
 
 fn typed_allocate_char_len(
