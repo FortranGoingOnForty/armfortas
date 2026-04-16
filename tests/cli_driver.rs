@@ -1531,6 +1531,43 @@ fn fixed_c_char_array_null_scan_compiles_and_runs() {
 }
 
 #[test]
+fn imported_param_c_char_array_scan_in_char_result_function_runs() {
+    let src = write_program(
+        "module constants\n  implicit none\n  integer, parameter :: path_cap = 8\nend module constants\n\nmodule m\n  use iso_c_binding\n  use constants, only: path_cap\ncontains\n  function get_path() result(path)\n    character(len=:), allocatable :: path\n    character(kind=c_char), target :: c_path(path_cap)\n    integer :: i\n    c_path = c_null_char\n    c_path(1) = achar(97, kind=c_char)\n    c_path(2) = c_null_char\n    do i = 1, path_cap\n      if (c_path(i) == c_null_char) exit\n    end do\n    allocate(character(len=i-1) :: path)\n    do i = 1, len(path)\n      path(i:i) = c_path(i)\n    end do\n  end function\nend module m\n\nprogram p\n  use m, only: get_path\n  implicit none\n  if (get_path() /= 'a') error stop 1\n  print *, trim(get_path())\nend program\n",
+        "f90",
+    );
+    let out = unique_path("imported_param_c_char_scan", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("imported-param c_char scan compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "imported-param c_char scan should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported-param c_char scan run failed");
+    assert!(
+        run.status.success(),
+        "imported-param c_char scan should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("a"),
+        "unexpected imported-param c_char scan output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), allocatable, target :: c_tokens(:,:)\n  type(c_ptr) :: raw\n  integer :: i\n  allocate(c_tokens(4, 1))\n  do i = 1, 3\n    c_tokens(i, 1) = achar(96 + i, kind=c_char)\n  end do\n  c_tokens(4, 1) = c_null_char\n  raw = c_loc(c_tokens(1, 1))\n  if (.not. c_associated(raw)) stop 1\n  print *, 'ok'\nend program\n",

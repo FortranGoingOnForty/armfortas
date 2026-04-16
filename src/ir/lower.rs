@@ -1928,7 +1928,7 @@ fn collect_module_globals(
                     // IntArray/FloatArray initializer when the
                     // entity.init is an array constructor of
                     // literal values.
-                    let dims = extract_array_dims(specs, &param_consts);
+                    let dims = extract_array_dims(specs, &param_consts, Some(st));
                     let total: i64 = dims.iter().map(|(_, e)| *e).product();
                     if total <= 0 {
                         continue; // assumed/deferred shape — skip
@@ -2564,7 +2564,7 @@ fn lower_unit(
                         let info = LocalInfo {
                             addr: slot,
                             ty: elem_ty.clone(),
-                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts),
+                            dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
                             allocatable: false,
                             descriptor_arg: uses_descriptor,
                             by_ref: true,
@@ -2943,7 +2943,7 @@ fn lower_unit(
                             LocalInfo {
                                 addr: slot,
                                 ty: elem_ty.clone(),
-                                dims: arg_dims_from_decls(pname, decls, &visible_param_consts),
+                                dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
                                 allocatable: false,
                                 descriptor_arg: uses_descriptor,
                                 by_ref: true,
@@ -4589,7 +4589,7 @@ fn alloc_decls(
                     continue;
                 } else if let Some(len) = char_len {
                     if let Some(specs) = array_spec.filter(|_| !is_allocatable) {
-                        let dims = extract_array_dims(specs, &param_consts);
+                        let dims = extract_array_dims(specs, &param_consts, Some(st));
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                         if len == 1 {
                             // `character(len=1)` arrays are byte arrays, not
@@ -4869,7 +4869,7 @@ fn alloc_decls(
                     );
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
-                    let dims = extract_array_dims(specs, &param_consts);
+                    let dims = extract_array_dims(specs, &param_consts, Some(st));
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let (array_elem_ty, array_derived_type) =
                         if let TypeSpec::Type(ref type_name) = type_spec {
@@ -5460,6 +5460,7 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
 fn extract_array_dims(
     specs: &[ArraySpec],
     param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
 ) -> Vec<(i64, i64)> {
     specs
         .iter()
@@ -5468,9 +5469,19 @@ fn extract_array_dims(
                 ArraySpec::Explicit { lower, upper } => {
                     let lo = lower
                         .as_ref()
-                        .and_then(|e| eval_const_int_in_scope(e, param_consts))
+                        .and_then(|e| {
+                            st.and_then(|st| {
+                                eval_const_int_in_scope_or_any_scope(e, param_consts, st)
+                            })
+                            .or_else(|| eval_const_int_in_scope(e, param_consts))
+                        })
                         .unwrap_or(1);
-                    let hi = eval_const_int_in_scope(upper, param_consts).unwrap_or(1);
+                    let hi = st
+                        .and_then(|st| {
+                            eval_const_int_in_scope_or_any_scope(upper, param_consts, st)
+                        })
+                        .or_else(|| eval_const_int_in_scope(upper, param_consts))
+                        .unwrap_or(1);
                     (lo, hi - lo + 1)
                 }
                 ArraySpec::AssumedShape { .. } => (1, 0), // size unknown at compile time
@@ -8544,6 +8555,7 @@ fn arg_dims_from_decls(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
     visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
 ) -> Vec<(i64, i64)> {
     let key = arg_name.to_lowercase();
     let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
@@ -8563,7 +8575,7 @@ fn arg_dims_from_decls(
                 if entity.name.to_lowercase() == key {
                     let array_spec = entity.array_spec.as_ref().or(attr_dims);
                     return array_spec
-                        .map(|specs| extract_array_dims(specs, &param_consts))
+                        .map(|specs| extract_array_dims(specs, &param_consts, Some(st)))
                         .unwrap_or_default();
                 }
             }
@@ -9036,7 +9048,7 @@ fn build_host_ref_params(
             name: hname.clone(),
             id: pid,
             elem_ty,
-            dims: arg_dims_from_decls(hname, host_decls, &host_visible),
+            dims: arg_dims_from_decls(hname, host_decls, &host_visible, st),
             char_kind: arg_char_kind_from_decls(hname, host_decls, st),
             derived_type,
             descriptor_arg,
