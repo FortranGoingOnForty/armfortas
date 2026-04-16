@@ -230,7 +230,7 @@ fn warn_legacy_feature(ctx: &mut Ctx<'_>, span: Span, feature: &str) {
 }
 
 fn decl_attrs_contain(attrs: &[Attribute], needle: Attribute) -> bool {
-    attrs.iter().any(|attr| *attr == needle)
+    attrs.contains(&needle)
 }
 
 fn is_deferred_char_pointer_component(type_spec: &TypeSpec, attrs: &[Attribute]) -> bool {

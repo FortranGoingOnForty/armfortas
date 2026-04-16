@@ -101,6 +101,14 @@ fn normalized_bind_name(bind: Option<&crate::ast::unit::BindInfo>) -> Option<Str
         .map(|name| name.trim_matches('\'').trim_matches('"').to_string())
 }
 
+type InterfaceOuterRef = (
+    String,
+    SymbolKind,
+    Option<TypeInfo>,
+    Vec<String>,
+    Option<String>,
+);
+
 fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
@@ -309,13 +317,7 @@ fn resolve_unit(
             // the *declared* callable back into the enclosing scope
             // (otherwise IMPLICIT NONE rejects the call at the use
             // site, and generic dispatch can't see the body types).
-            let mut outer_refs: Vec<(
-                String,
-                SymbolKind,
-                Option<crate::sema::symtab::TypeInfo>,
-                Vec<String>,
-                Option<String>,
-            )> = Vec::new();
+            let mut outer_refs: Vec<InterfaceOuterRef> = Vec::new();
             for body in bodies {
                 if let InterfaceBody::Subprogram(sub) = body {
                     match &sub.node {
@@ -992,9 +994,7 @@ fn eval_const_int_expr_with_params(
                     })
                 }
                 "kind" => {
-                    let Some(arg) = args.first() else {
-                        return None;
-                    };
+                    let arg = args.first()?;
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                         return None;
                     };

@@ -199,9 +199,7 @@ fn eval_const_int_expr(
                     })
                 }
                 "kind" => {
-                    let Some(arg) = args.first() else {
-                        return None;
-                    };
+                    let arg = args.first()?;
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                         return None;
                     };

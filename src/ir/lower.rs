@@ -5637,7 +5637,7 @@ fn lower_char_intrinsic(
             let (rhs_ptr, rhs_len) =
                 lower_string_expr_with_layouts(b, locals, arg_spanned(1)?, st, type_layouts);
             let raw = b.call(
-                FuncRef::External(format!("afs_{}", name).into()),
+                FuncRef::External(format!("afs_{}", name)),
                 vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
                 IrType::Int(IntWidth::I32),
             );
