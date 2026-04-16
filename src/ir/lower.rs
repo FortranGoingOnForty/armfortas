@@ -2325,18 +2325,13 @@ fn lower_unit(
             prefix,
             ..
         } => {
-            // BIND(C): use specified C name, otherwise use Fortran name.
-            let func_name = bind
-                .as_ref()
-                .map(|b| {
-                    b.name
-                        .as_deref()
-                        .unwrap_or(name)
-                        .trim_matches('\'')
-                        .trim_matches('"')
-                        .to_string()
-                })
-                .unwrap_or_else(|| name.clone());
+            let func_name = lowered_procedure_symbol_name(
+                name,
+                bind.as_ref(),
+                host_module,
+                internal_only,
+                internal_funcs,
+            );
             let visible_param_consts =
                 collect_decl_param_consts_with_host(decls, host_param_consts);
             let mut params: Vec<Param> = args
@@ -2634,17 +2629,13 @@ fn lower_unit(
             prefix,
             ..
         } => {
-            let func_name = bind
-                .as_ref()
-                .map(|b| {
-                    b.name
-                        .as_deref()
-                        .unwrap_or(name)
-                        .trim_matches('\'')
-                        .trim_matches('"')
-                        .to_string()
-                })
-                .unwrap_or_else(|| name.clone());
+            let func_name = lowered_procedure_symbol_name(
+                name,
+                bind.as_ref(),
+                host_module,
+                internal_only,
+                internal_funcs,
+            );
             let visible_param_consts =
                 collect_decl_param_consts_with_host(decls, host_param_consts);
 
@@ -2653,7 +2644,7 @@ fn lower_unit(
             // 384-byte descriptor and passes its address as param 0; the
             // function writes its result into that descriptor and returns
             // void. This avoids trying to return 384 bytes "by value".
-            let is_alloc_return = alloc_return_funcs.contains(&func_name.to_lowercase());
+            let is_alloc_return = alloc_return_funcs.contains(&name.to_lowercase());
 
             let (func_params, ir_ret_ty) = if is_alloc_return {
                 // Hidden first param: ptr to caller-provided 384-byte descriptor.
@@ -6942,12 +6933,13 @@ fn try_defined_assignment(
         None => return false,
     };
     let rk = resolved.to_lowercase();
+    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
     let func_ref = ctx
         .internal_funcs
         .get(&rk)
         .copied()
         .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(resolved));
+        .unwrap_or_else(|| FuncRef::External(call_name));
     // RHS for ASSIGNMENT(=) is passed by reference to match
     // intent(in) dummy semantics — build a temp slot for scalar
     // values (the common case for user assignment from integer etc).
@@ -7112,7 +7104,8 @@ fn resolve_subroutine_call_name(
             match resolve_generic_call(st, b, key, arg_vals) {
                 Some(resolved) => {
                     let rk = resolved.to_lowercase();
-                    return (resolved, rk);
+                    let (call_name, _) = resolved_symbol_call_target(st, &rk, &resolved);
+                    return (call_name, rk);
                 }
                 None => {
                     let specifics = sym.arg_names.join(", ");
@@ -7132,20 +7125,172 @@ fn resolve_subroutine_call_name(
     resolved_symbol_call_target(st, key, orig_name)
 }
 
+fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
+    format!("afs_modproc_{}_{}", module_name.to_lowercase(), proc_name)
+}
+
+fn lowered_procedure_symbol_name(
+    name: &str,
+    bind: Option<&crate::ast::unit::BindInfo>,
+    host_module: Option<&str>,
+    internal_only: bool,
+    internal_funcs: &HashMap<String, u32>,
+) -> String {
+    if let Some(bind) = bind {
+        return bind
+            .name
+            .as_deref()
+            .unwrap_or(name)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+    }
+    if internal_only {
+        if let Some(idx) = internal_funcs.get(&name.to_lowercase()) {
+            return format!("afs_internal_{}", idx);
+        }
+    }
+    if let Some(module_name) = host_module {
+        return module_procedure_symbol_name(module_name, name);
+    }
+    name.to_string()
+}
+
+fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> String {
+    if let Some(binding_label) = &sym.attrs.binding_label {
+        return binding_label.clone();
+    }
+    if matches!(
+        sym.kind,
+        crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine
+    ) {
+        match &st.scope(sym.scope).kind {
+            crate::sema::symtab::ScopeKind::Module(module_name)
+            | crate::sema::symtab::ScopeKind::Submodule(module_name) => {
+                return module_procedure_symbol_name(module_name, &sym.name);
+            }
+            _ => {}
+        }
+    }
+    sym.name.clone()
+}
+
 fn resolved_symbol_call_target(
     st: &SymbolTable,
     key: &str,
     fallback_name: &str,
 ) -> (String, String) {
     if let Some(sym) = st.find_symbol_any_scope(key) {
-        let call_name = sym
-            .attrs
-            .binding_label
-            .clone()
-            .unwrap_or_else(|| sym.name.clone());
+        let call_name = symbol_link_name(st, sym);
         return (call_name, sym.name.to_lowercase());
     }
     (fallback_name.to_string(), key.to_string())
+}
+
+fn lower_alloc_return_call_into_desc(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    desc_addr: ValueId,
+    callee_name: &str,
+    args: &[crate::ast::expr::Argument],
+) {
+    let key = callee_name.to_lowercase();
+    let reordered = reorder_args_by_keyword(args, &key, ctx.st);
+    let args: &[crate::ast::expr::Argument] = &reordered;
+
+    let intrinsic_arg_vals: Vec<ValueId> = args
+        .iter()
+        .map(|a| match &a.value {
+            crate::ast::expr::SectionSubscript::Element(e) => lower_expr_ctx(b, ctx, e),
+            _ => b.const_i32(0),
+        })
+        .collect();
+
+    let resolved_name = match resolve_generic_call(ctx.st, b, &key, &intrinsic_arg_vals) {
+        Some(name) => name,
+        None => callee_name.to_string(),
+    };
+    let resolved_key = resolved_name.to_lowercase();
+    let (call_name, callee_key) =
+        resolved_symbol_call_target(ctx.st, &resolved_key, &resolved_name);
+
+    let callee_value_args =
+        callee_value_arg_mask(ctx.st, &callee_key).or_else(|| callee_value_arg_mask(ctx.st, &key));
+    let callee_descriptor_args = ctx
+        .descriptor_params
+        .get(&callee_key)
+        .cloned()
+        .or_else(|| ctx.descriptor_params.get(&key).cloned());
+    let callee_string_descriptor_args = callee_string_descriptor_arg_mask(ctx.st, &callee_key)
+        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key));
+
+    let mut call_args = vec![desc_addr];
+    call_args.extend(args.iter().enumerate().map(|(i, a)| {
+        let is_value = callee_value_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        let wants_descriptor = callee_descriptor_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        let wants_string_descriptor = callee_string_descriptor_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        match &a.value {
+            crate::ast::expr::SectionSubscript::Element(e) => {
+                if is_value {
+                    lower_expr_ctx(b, ctx, e)
+                } else if wants_string_descriptor {
+                    lower_arg_string_descriptor(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
+                } else if wants_descriptor {
+                    lower_arg_descriptor(b, &ctx.locals, e, ctx.st)
+                } else {
+                    lower_arg_by_ref(b, &ctx.locals, e, ctx.st)
+                }
+            }
+            _ => b.const_i32(0),
+        }
+    }));
+
+    if let Some(cls_flags) = ctx
+        .char_len_star_params
+        .get(&callee_key)
+        .or_else(|| ctx.char_len_star_params.get(&key))
+    {
+        for (i, flag) in cls_flags.iter().enumerate() {
+            if !*flag || i >= args.len() {
+                continue;
+            }
+            if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
+                if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, &ctx.locals) {
+                    call_args.push(len);
+                } else if let Expr::StringLiteral { value, .. } = &e.node {
+                    call_args.push(b.const_i64(value.len() as i64));
+                } else if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
+                {
+                    let (_ptr, len) = lower_string_expr_ctx(b, ctx, e);
+                    call_args.push(len);
+                } else {
+                    call_args.push(b.const_i64(0));
+                }
+            } else {
+                call_args.push(b.const_i64(0));
+            }
+        }
+    }
+
+    append_host_closure_args(b, ctx, &callee_key, &mut call_args);
+
+    let func_ref = ctx
+        .internal_funcs
+        .get(&callee_key)
+        .or_else(|| ctx.internal_funcs.get(&key))
+        .copied()
+        .map(FuncRef::Internal)
+        .unwrap_or_else(|| FuncRef::External(call_name));
+    b.call(func_ref, call_args, IrType::Void);
 }
 
 fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
@@ -8483,7 +8628,7 @@ fn lower_string_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> (ValueId, ValueId) {
-    lower_string_expr_with_layouts(b, locals, expr, st, None)
+    lower_string_expr_full(b, locals, expr, st, None, None, None, None)
 }
 
 fn lower_string_expr_with_layouts(
@@ -8492,6 +8637,36 @@ fn lower_string_expr_with_layouts(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> (ValueId, ValueId) {
+    lower_string_expr_full(b, locals, expr, st, type_layouts, None, None, None)
+}
+
+fn lower_string_expr_ctx(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> (ValueId, ValueId) {
+    lower_string_expr_full(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )
+}
+
+fn lower_string_expr_full(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> (ValueId, ValueId) {
     match &expr.node {
         Expr::StringLiteral { value, .. } => {
@@ -8515,7 +8690,16 @@ fn lower_string_expr_with_layouts(
                     }
                 }
             }
-            let val = lower_expr(b, locals, expr, st);
+            let val = lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let zero = b.const_i64(0);
             (val, zero)
         }
@@ -8533,20 +8717,47 @@ fn lower_string_expr_with_layouts(
                         if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
                             (ptr, len)
                         } else {
-                            let val = lower_expr(b, locals, expr, st);
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let zero = b.const_i64(0);
                             (val, zero)
                         }
                     }
                     CharKind::None => {
                         // Not a character variable — shouldn't happen but fall back.
-                        let val = lower_expr(b, locals, expr, st);
+                        let val = lower_expr_full(
+                            b,
+                            locals,
+                            expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
                         let zero = b.const_i64(0);
                         (val, zero)
                     }
                 }
             } else {
-                let val = lower_expr(b, locals, expr, st);
+                let val = lower_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 let zero = b.const_i64(0);
                 (val, zero)
             }
@@ -8558,8 +8769,16 @@ fn lower_string_expr_with_layouts(
             {
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
-                        let (base_ptr, base_len) =
-                            lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
+                        let (base_ptr, base_len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            callee,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
                         return lower_substring(
                             b,
                             locals,
@@ -8571,8 +8790,16 @@ fn lower_string_expr_with_layouts(
                         );
                     }
                     crate::ast::expr::SectionSubscript::Element(idx_expr) => {
-                        let (base_ptr, base_len) =
-                            lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
+                        let (base_ptr, base_len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            callee,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
                         return lower_substring(
                             b,
                             locals,
@@ -8597,8 +8824,16 @@ fn lower_string_expr_with_layouts(
                 match key.as_str() {
                     "trim" => {
                         if let Some(arg) = first_char_arg {
-                            let (src_ptr, len_val) =
-                                lower_string_expr_with_layouts(b, locals, arg, st, type_layouts);
+                            let (src_ptr, len_val) = lower_string_expr_full(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let buf = b.runtime_call(
                                 RuntimeFunc::Allocate,
                                 vec![len_val],
@@ -8619,8 +8854,16 @@ fn lower_string_expr_with_layouts(
                     }
                     "adjustl" => {
                         if let Some(arg) = first_char_arg {
-                            let (src_ptr, len_val) =
-                                lower_string_expr_with_layouts(b, locals, arg, st, type_layouts);
+                            let (src_ptr, len_val) = lower_string_expr_full(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let buf = b.runtime_call(
                                 RuntimeFunc::Allocate,
                                 vec![len_val],
@@ -8636,8 +8879,16 @@ fn lower_string_expr_with_layouts(
                     }
                     "adjustr" => {
                         if let Some(arg) = first_char_arg {
-                            let (src_ptr, len_val) =
-                                lower_string_expr_with_layouts(b, locals, arg, st, type_layouts);
+                            let (src_ptr, len_val) = lower_string_expr_full(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let buf = b.runtime_call(
                                 RuntimeFunc::Allocate,
                                 vec![len_val],
@@ -8698,10 +8949,26 @@ fn lower_string_expr_with_layouts(
                         if let (Some(tsrc), Some(fsrc), Some(mask_expr)) =
                             (first_char_arg, second_char_arg, mask_arg)
                         {
-                            let (t_ptr, t_len) =
-                                lower_string_expr_with_layouts(b, locals, tsrc, st, type_layouts);
-                            let (f_ptr, f_len) =
-                                lower_string_expr_with_layouts(b, locals, fsrc, st, type_layouts);
+                            let (t_ptr, t_len) = lower_string_expr_full(
+                                b,
+                                locals,
+                                tsrc,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let (f_ptr, f_len) = lower_string_expr_full(
+                                b,
+                                locals,
+                                fsrc,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let mask_raw = lower_expr(b, locals, mask_expr, st);
                             let mask = coerce_to_type(b, mask_raw, &IrType::Bool);
                             let ptr = b.select(mask, t_ptr, f_ptr);
@@ -8831,7 +9098,16 @@ fn lower_string_expr_with_layouts(
                     }
                 }
             }
-            let val = lower_expr(b, locals, expr, st);
+            let val = lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let len = b.const_i64(string_literal_len(expr));
             (val, len)
         }
@@ -8841,8 +9117,26 @@ fn lower_string_expr_with_layouts(
             right,
         } => {
             // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
-            let (a_ptr, a_len) = lower_string_expr_with_layouts(b, locals, left, st, type_layouts);
-            let (b_ptr, b_len) = lower_string_expr_with_layouts(b, locals, right, st, type_layouts);
+            let (a_ptr, a_len) = lower_string_expr_full(
+                b,
+                locals,
+                left,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let (b_ptr, b_len) = lower_string_expr_full(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let total_len = b.iadd(a_len, b_len);
             // Allocate temp buffer for the result.
             let result_buf = b.runtime_call(
@@ -8860,7 +9154,16 @@ fn lower_string_expr_with_layouts(
         }
         _ => {
             // For other expressions, evaluate as value and use literal length if available.
-            let val = lower_expr(b, locals, expr, st);
+            let val = lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let len = b.const_i64(string_literal_len(expr));
             (val, len)
         }
@@ -9201,13 +9504,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             CharKind::Fixed(len) => {
                                 // Fixed-length character assignment: copy with space padding.
                                 // Get source pointer and length from the expression.
-                                let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                    b,
-                                    &ctx.locals,
-                                    value,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                );
+                                let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                 let dest_len = b.const_i64(*len);
                                 b.call(
                                     FuncRef::External("afs_assign_char_fixed".into()),
@@ -9216,13 +9513,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::FixedRuntime { len_addr } => {
-                                let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                    b,
-                                    &ctx.locals,
-                                    value,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                );
+                                let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                 let (dest_ptr, dest_len) =
                                     fixed_runtime_char_ptr_and_len(b, &info, *len_addr);
                                 b.call(
@@ -9233,13 +9524,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                             CharKind::Deferred => {
                                 // Deferred-length: call afs_assign_char_deferred.
-                                let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                    b,
-                                    &ctx.locals,
-                                    value,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                );
+                                let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                 let desc = string_descriptor_addr(b, &info);
                                 b.call(
                                     FuncRef::External("afs_assign_char_deferred".into()),
@@ -9251,13 +9536,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 // Assumed-length dummy assignment: use
                                 // the hidden-length param as the
                                 // destination length.
-                                let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                    b,
-                                    &ctx.locals,
-                                    value,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                );
+                                let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                 let outer = b.load(info.addr);
                                 let dest_ptr = b.load_typed(
                                     outer,
@@ -9288,19 +9567,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 // the hidden first arg so the function writes its
                                                 // result directly into the destination descriptor.
                                                 // No temp descriptor or afs_assign_allocatable needed.
-                                                let ref_args: Vec<ValueId> = call_args.iter().map(|a| {
-                                                    match &a.value {
-                                                        crate::ast::expr::SectionSubscript::Element(e) =>
-                                                            lower_arg_by_ref(b, &ctx.locals, e, ctx.st),
-                                                        _ => b.const_i32(0),
-                                                    }
-                                                }).collect();
-                                                let mut all_args = vec![info.addr];
-                                                all_args.extend(ref_args);
-                                                b.call(
-                                                    FuncRef::External(callee_name.clone()),
-                                                    all_args,
-                                                    IrType::Void,
+                                                lower_alloc_return_call_into_desc(
+                                                    b,
+                                                    ctx,
+                                                    info.addr,
+                                                    callee_name,
+                                                    call_args,
                                                 );
                                             } else {
                                                 // Non-sret: function returns a temp descriptor.
@@ -9435,13 +9707,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             start.as_ref(),
                                             end.as_ref(),
                                         );
-                                        let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                        );
+                                        let (src_ptr, src_len) =
+                                            lower_string_expr_ctx(b, ctx, value);
                                         b.call(
                                             FuncRef::External("afs_assign_char_fixed".into()),
                                             vec![dest_ptr, dest_len, src_ptr, src_len],
@@ -9525,13 +9792,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             start.as_ref(),
                                             end.as_ref(),
                                         );
-                                        let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                        );
+                                        let (src_ptr, src_len) =
+                                            lower_string_expr_ctx(b, ctx, value);
                                         b.call(
                                             FuncRef::External("afs_assign_char_fixed".into()),
                                             vec![dest_ptr, dest_len, src_ptr, src_len],
@@ -9560,13 +9822,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     ..
                                 } = &field.type_info
                                 {
-                                    let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                        b,
-                                        &ctx.locals,
-                                        value,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    );
+                                    let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                     let dest_len = b.const_i64(*flen);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
@@ -9576,13 +9832,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } else if is_deferred_char_component_field(field) {
                                     let (dest_ptr, dest_len) =
                                         load_string_descriptor_view(b, field_ptr);
-                                    let (src_ptr, src_len) = lower_string_expr_with_layouts(
-                                        b,
-                                        &ctx.locals,
-                                        value,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    );
+                                    let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
                                         vec![dest_ptr, dest_len, src_ptr, src_len],
@@ -17429,10 +17679,12 @@ fn lower_expr_full(
                 let (specific, arg_vals) = resolved;
                 let ret_ty =
                     callee_return_ir_type(st, &specific).unwrap_or(IrType::Int(IntWidth::I32));
+                let specific_key = specific.to_lowercase();
+                let (call_name, _) = resolved_symbol_call_target(st, &specific_key, &specific);
                 let func_ref = internal_funcs
-                    .and_then(|m| m.get(&specific).copied())
+                    .and_then(|m| m.get(&specific_key).copied())
                     .map(FuncRef::Internal)
-                    .unwrap_or_else(|| FuncRef::External(specific));
+                    .unwrap_or_else(|| FuncRef::External(call_name));
                 return b.call(func_ref, arg_vals, ret_ty);
             }
 

@@ -457,12 +457,16 @@ fn module_procedure_case_and_bind_label_survive_amod_import() {
 
     let undefined = undefined_symbols(&use_obj);
     assert!(
-        undefined.iter().any(|sym| sym == "_WEXITSTATUS"),
+        undefined
+            .iter()
+            .any(|sym| sym == "_afs_modproc_m_WEXITSTATUS"),
         "mixed-case module procedures should retain case across .amod import: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_wexitstatus"),
+        !undefined
+            .iter()
+            .any(|sym| sym == "_afs_modproc_m_wexitstatus"),
         "imported mixed-case module procedures should not be downcased: {:?}",
         undefined
     );
@@ -3091,13 +3095,178 @@ fn use_renamed_procedure_call_uses_remote_symbol() {
 
     let undefined = undefined_symbols(&user_obj);
     assert!(
-        undefined.iter().any(|sym| sym == "_set_shell_variable"),
+        undefined
+            .iter()
+            .any(|sym| sym == "_afs_modproc_m_set_shell_variable"),
         "USE rename should call the imported procedure symbol: {:?}",
         undefined
     );
     assert!(
         !undefined.iter().any(|sym| sym == "_var_set_shell_variable"),
         "USE rename should not lower to the local alias as a link symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_named_module_helpers_link_without_colliding() {
+    let dir = unique_dir("module_helper_link_names");
+    let mod_a = write_program_in(
+        &dir,
+        "mod_a.f90",
+        "module mod_a\ncontains\n  subroutine helper()\n    print *, 11\n  end subroutine helper\n\n  subroutine run_a()\n    call helper()\n  end subroutine run_a\nend module mod_a\n",
+    );
+    let mod_b = write_program_in(
+        &dir,
+        "mod_b.f90",
+        "module mod_b\ncontains\n  subroutine helper()\n    print *, 22\n  end subroutine helper\n\n  subroutine run_b()\n    call helper()\n  end subroutine run_b\nend module mod_b\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use mod_a, only: run_a\n  use mod_b, only: run_b\n  call run_a()\n  call run_b()\nend program p\n",
+    );
+
+    let mod_a_obj = dir.join("mod_a.o");
+    let compile_a = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_a.to_str().unwrap(),
+            "-o",
+            mod_a_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mod_a compile spawn failed");
+    assert!(
+        compile_a.status.success(),
+        "mod_a should compile: {}",
+        String::from_utf8_lossy(&compile_a.stderr)
+    );
+
+    let mod_b_obj = dir.join("mod_b.o");
+    let compile_b = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            mod_b.to_str().unwrap(),
+            "-o",
+            mod_b_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mod_b compile spawn failed");
+    assert!(
+        compile_b.status.success(),
+        "mod_b should compile: {}",
+        String::from_utf8_lossy(&compile_b.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("helpers.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_a_obj.to_str().unwrap(),
+            mod_b_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("helper link spawn failed");
+    assert!(
+        link.status.success(),
+        "same-named module helpers should link cleanly: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn program_internal_char_helper_assignment_uses_internal_symbol() {
+    let dir = unique_dir("program_internal_char_helper");
+    let src = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  implicit none\n  character(len=16) :: x\n  x = helper('a')\ncontains\n  function helper(v) result(out)\n    character(len=*), intent(in) :: v\n    character(len=16) :: out\n    out = v\n  end function helper\nend program p\n",
+    );
+
+    let obj = dir.join("p.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("program compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "program-contained character helper should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&obj);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_helper"),
+        "program-contained character helper should not escape as a raw external symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocatable_result_helper_assignment_uses_resolved_symbol() {
+    let dir = unique_dir("alloc_result_helper_symbol");
+    let src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  function helper(x) result(y)\n    character(len=*), intent(in) :: x\n    character(len=:), allocatable :: y\n    y = trim(x)\n  end function helper\n\n  function run(x) result(y)\n    character(len=*), intent(in) :: x\n    character(len=:), allocatable :: y\n    y = helper(x)\n  end function run\nend module m\n",
+    );
+
+    let obj = dir.join("m.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable-result helper source should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&obj);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_helper"),
+        "same-file allocatable-result helper should not lower to a raw external symbol: {:?}",
         undefined
     );
 
