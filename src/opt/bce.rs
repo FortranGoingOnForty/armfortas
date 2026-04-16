@@ -62,7 +62,7 @@ fn bce_function(func: &mut Function) -> bool {
     }
 
     // Remove in reverse order to preserve indices.
-    to_remove.sort_by(|a, b| b.1.cmp(&a.1));
+    to_remove.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (block_id, inst_idx) in to_remove {
         func.block_mut(block_id).insts.remove(inst_idx);
     }

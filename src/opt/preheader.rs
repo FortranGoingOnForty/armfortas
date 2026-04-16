@@ -108,10 +108,8 @@ fn redirect_terminator(func: &mut Function, block: BlockId, old_dest: BlockId, n
         None => return,
     };
     match term {
-        Terminator::Branch(dest, _) => {
-            if *dest == old_dest {
-                *dest = new_dest;
-            }
+        Terminator::Branch(dest, _) if *dest == old_dest => {
+            *dest = new_dest;
         }
         Terminator::CondBranch {
             true_dest,

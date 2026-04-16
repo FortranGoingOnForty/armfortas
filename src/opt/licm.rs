@@ -91,10 +91,10 @@ fn load_is_loop_invariant(
                 continue;
             }
             match &inst.kind {
-                InstKind::Store(_, ptr) => {
-                    if !matches!(alias::query(func, *ptr, load_ptr), AliasResult::NoAlias) {
-                        return false;
-                    }
+                InstKind::Store(_, ptr)
+                    if !matches!(alias::query(func, *ptr, load_ptr), AliasResult::NoAlias) =>
+                {
+                    return false;
                 }
                 InstKind::Call(..) | InstKind::RuntimeCall(..) => return false,
                 _ => {}

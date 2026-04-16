@@ -139,10 +139,8 @@ fn simplify_function(func: &mut Function) -> bool {
 /// Redirect all edges targeting `old` to `new` in a terminator.
 fn redirect_terminator(term: &mut Terminator, old: BlockId, new: BlockId) {
     match term {
-        Terminator::Branch(dest, _) => {
-            if *dest == old {
-                *dest = new;
-            }
+        Terminator::Branch(dest, _) if *dest == old => {
+            *dest = new;
         }
         Terminator::CondBranch {
             true_dest,

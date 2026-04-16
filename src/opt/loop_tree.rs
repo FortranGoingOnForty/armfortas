@@ -122,7 +122,7 @@ pub fn build_loop_tree(func: &Function) -> LoopTree {
     // Create nodes sorted by body size descending (largest = outermost first).
     let mut indexed: Vec<(usize, &crate::ir::walk::NaturalLoop)> =
         natural.iter().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.body.len().cmp(&a.1.body.len()));
+    indexed.sort_by_key(|entry| std::cmp::Reverse(entry.1.body.len()));
 
     // Build nodes with stable IDs (original discovery order).
     let mut nodes: Vec<LoopTreeNode> = natural
