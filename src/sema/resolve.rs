@@ -95,13 +95,14 @@ fn resolve_unit(
     layouts: &mut super::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     match &unit.node {
-        ProgramUnit::Program { name, uses, imports: _, implicit, decls, body: _, contains } => {
+        ProgramUnit::Program { name, uses, imports: _, implicit, decls, body, contains } => {
             let scope_name = name.clone().unwrap_or_else(|| "<main>".into());
             st.push_scope(ScopeKind::Program(scope_name));
             let scope_id = st.current_scope();
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
@@ -120,7 +121,7 @@ fn resolve_unit(
                 st.enter_scope(saved);
             }
         }
-        ProgramUnit::Subroutine { name, args, prefix: _, bind: _, uses, imports: _, implicit, decls, body: _, contains } => {
+        ProgramUnit::Subroutine { name, args, prefix: _, bind: _, uses, imports: _, implicit, decls, body, contains } => {
             let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
             // Store ordered arg names for VALUE lookup by callers.
             st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
@@ -144,11 +145,12 @@ fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
-        ProgramUnit::Function { name, args, result, return_type, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
+        ProgramUnit::Function { name, args, result, return_type, bind: _, prefix: _, uses, imports: _, implicit, decls, body, contains } => {
             let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
             st.scope_mut(scope_id).arg_order = args.iter().filter_map(|a| {
                 if let DummyArg::Name(n) = a { Some(n.to_lowercase()) } else { None }
@@ -182,6 +184,7 @@ fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
@@ -384,6 +387,85 @@ fn process_uses(
         }
     }
     Ok(())
+}
+
+/// BLOCK constructs can carry their own USE statements inside a statement body.
+/// We do not model block-local use associations in the symbol table yet, but we
+/// still need the referenced modules loaded so later validation and lowering can
+/// resolve imported procedures, derived types, and module globals.
+fn ensure_uses_loaded(
+    st: &mut SymbolTable,
+    uses: &[SpannedDecl],
+    module_search_paths: &[std::path::PathBuf],
+    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+) {
+    for use_decl in uses {
+        if let Decl::UseStmt { module, .. } = &use_decl.node {
+            if st.find_module_scope(module).is_none() {
+                let _ = load_external_module(st, module, module_search_paths, type_layouts);
+            }
+        }
+    }
+}
+
+fn preload_stmt_uses(
+    st: &mut SymbolTable,
+    stmts: &[crate::ast::stmt::SpannedStmt],
+    module_search_paths: &[std::path::PathBuf],
+    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+) {
+    use crate::ast::stmt::Stmt;
+
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::IfConstruct { then_body, else_ifs, else_body, .. } => {
+                preload_stmt_uses(st, then_body, module_search_paths, type_layouts);
+                for (_, body) in else_ifs {
+                    preload_stmt_uses(st, body, module_search_paths, type_layouts);
+                }
+                if let Some(body) = else_body {
+                    preload_stmt_uses(st, body, module_search_paths, type_layouts);
+                }
+            }
+            Stmt::IfStmt { action, .. } => {
+                preload_stmt_uses(st, std::slice::from_ref(action.as_ref()), module_search_paths, type_layouts);
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::ForallConstruct { body, .. }
+            | Stmt::WhereConstruct { body, .. } => {
+                preload_stmt_uses(st, body, module_search_paths, type_layouts);
+            }
+            Stmt::ForallStmt { stmt: inner, .. }
+            | Stmt::WhereStmt { stmt: inner, .. }
+            | Stmt::Labeled { stmt: inner, .. } => {
+                preload_stmt_uses(st, std::slice::from_ref(inner.as_ref()), module_search_paths, type_layouts);
+            }
+            Stmt::Block { uses, body, .. } => {
+                ensure_uses_loaded(st, uses, module_search_paths, type_layouts);
+                preload_stmt_uses(st, body, module_search_paths, type_layouts);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    preload_stmt_uses(st, &case.body, module_search_paths, type_layouts);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            preload_stmt_uses(st, body, module_search_paths, type_layouts);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Try to load a module interface from an .amod file on the search path.

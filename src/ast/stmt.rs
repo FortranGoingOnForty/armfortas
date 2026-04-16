@@ -84,6 +84,10 @@ pub enum Stmt {
     // ---- BLOCK / ASSOCIATE ----
     Block {
         name: Option<String>,
+        /// USE statements declared inside the BLOCK specification part.
+        /// These imports are scoped to the block body and do not leak
+        /// into the enclosing procedure.
+        uses: Vec<super::decl::SpannedDecl>,
         /// IMPLICIT statements declared inside the BLOCK.  F2018 §11.1.4
         /// gives a BLOCK its own implicit-type rule environment that does
         /// not leak out and is independent of the enclosing scope's

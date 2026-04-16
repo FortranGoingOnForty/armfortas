@@ -1171,6 +1171,58 @@ fn dash_i_equals_form_finds_modules() {
 }
 
 #[test]
+fn block_use_imports_module_values_and_procedures() {
+    let dir = unique_dir("block_use_mod");
+    let mod_src = write_program_in(
+        &dir,
+        "expansion.f90",
+        "module expansion\n  implicit none\n  integer, save :: base_value = 7\ncontains\n  function arithmetic_expansion_shell(expr, shell) result(r)\n    character(len=*), intent(in) :: expr\n    integer, intent(inout) :: shell\n    character(len=:), allocatable :: r\n    r = trim(expr)\n    shell = shell + 1\n  end function\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  implicit none\n  integer :: shell, total\n  character(len=32) :: var_value\n  integer :: actual_value_len\n  shell = 0\n  total = 0\n  var_value = '123'\n  actual_value_len = 3\n  block\n    use expansion, only: arithmetic_expansion_shell, base_value\n    character(len=:), allocatable :: arith_expr, arith_result\n    arith_expr = '$((' // var_value(:actual_value_len) // '))'\n    arith_result = arithmetic_expansion_shell(trim(arith_expr), shell)\n    total = base_value + len_trim(arith_result)\n  end block\n  if (shell /= 1) error stop 1\n  if (total /= 14) error stop 2\nend program\n",
+    );
+    let mod_obj = dir.join("expansion.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("user.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "BLOCK-local USE imports should compile: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn public_derived_type_in_private_module_is_emitted_and_importable() {
     let dir = unique_dir("public_type_mod");
     let mod_src = write_program_in(

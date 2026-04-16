@@ -813,8 +813,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.require_std(stmt.span, FortranStandard::F95, "FORALL statement");
             validate_stmt(ctx, inner);
         }
-        Stmt::Block { body, .. } => {
+        Stmt::Block { uses, implicit, decls, body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
+            validate_decls(ctx, uses);
+            validate_decls(ctx, implicit);
+            validate_decls(ctx, decls);
             validate_stmts(ctx, body);
         }
         Stmt::Associate { assocs, body, .. } => {
@@ -1563,13 +1566,14 @@ fn walk_stmt_for_undeclared(
         Stmt::DoConcurrent { body, .. } => {
             for s in body { recurse!(s); }
         }
-        Stmt::Block { implicit, decls, body, .. } => {
+        Stmt::Block { uses, implicit, decls, body, .. } => {
             // F2018 §11.1.4: a BLOCK construct establishes its own
             // scope with an independent implicit-typing environment.
             // Layer the block's declared names AND any IMPLICIT
             // statements over the inherited rules; the local set
             // does not leak back out.
             let mut block_declared = declared.clone();
+            block_declared.extend(block_use_imported_names(st, uses));
             for d in decls {
                 if let crate::ast::decl::Decl::TypeDecl { entities, .. } = &d.node {
                     for e in entities {
@@ -1652,6 +1656,46 @@ fn walk_stmt_for_undeclared(
         }
         _ => {}
     }
+}
+
+fn block_use_imported_names(
+    st: &SymbolTable,
+    uses: &[crate::ast::decl::SpannedDecl],
+) -> std::collections::HashSet<String> {
+    use crate::ast::decl::OnlyItem;
+    use crate::sema::symtab::Access;
+
+    let mut imported = std::collections::HashSet::new();
+    for use_decl in uses {
+        let crate::ast::decl::Decl::UseStmt { module, renames, only, .. } = &use_decl.node else {
+            continue;
+        };
+        if let Some(only_items) = only {
+            for item in only_items {
+                match item {
+                    OnlyItem::Name(name) => {
+                        imported.insert(name.to_lowercase());
+                    }
+                    OnlyItem::Rename(rename) => {
+                        imported.insert(rename.local.to_lowercase());
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(scope_id) = st.find_module_scope(module) {
+            for sym in st.scope(scope_id).symbols.values() {
+                if sym.attrs.access != Access::Private {
+                    imported.insert(sym.name.to_lowercase());
+                }
+            }
+        }
+        for rename in renames {
+            imported.insert(rename.local.to_lowercase());
+        }
+    }
+    imported
 }
 
 /// Walk an expression and collect undeclared Name references.

@@ -7536,7 +7536,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Block { implicit, decls, body, .. } => {
+        Stmt::Block { uses, implicit, decls, body, .. } => {
             // F2008 BLOCK: declarations are scoped to the body.
             // Save any locals that the BLOCK's decls shadow, run
             // the body, then restore the originals.  F2018 §11.1.4
@@ -7548,6 +7548,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             // whose first letter falls in a block-local implicit
             // range, then run alloc_decls / init_decls over the
             // combined list.
+            let pre_block_keys: HashSet<String> = ctx.locals.keys().cloned().collect();
             let mut effective_decls: Vec<crate::ast::decl::SpannedDecl> = decls.clone();
             let mut implicit_map: std::collections::HashMap<char, crate::ast::decl::TypeSpec> =
                 std::collections::HashMap::new();
@@ -7606,6 +7607,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 alloc_decls(b, &mut ctx.locals, &effective_decls, &HashMap::new(), ctx.type_layouts, &mut Vec::new(), "", ctx.st);
                 init_decls(b, &ctx.locals, &effective_decls, ctx.st);
             }
+            if !uses.is_empty() {
+                install_globals_as_locals(
+                    b,
+                    &mut ctx.locals,
+                    ctx.globals,
+                    uses,
+                    None,
+                    ctx.st,
+                );
+            }
             lower_stmts(b, ctx, body);
             // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
             // locals that have FINAL subroutines and deallocate
@@ -7629,6 +7640,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     ctx.locals.remove(&k);
                 }
             }
+            ctx.locals.retain(|k, _| pre_block_keys.contains(k));
         }
 
         Stmt::Associate { assocs, body, .. } => {
