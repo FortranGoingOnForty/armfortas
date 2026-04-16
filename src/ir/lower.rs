@@ -2277,7 +2277,16 @@ fn lower_unit(
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
+                    insert_implicit_dealloc(
+                        &mut b,
+                        &ctx.locals,
+                        &ctx.locals,
+                        type_layouts,
+                        ctx.st,
+                        ctx.internal_funcs,
+                        Some(ctx.contained_host_refs),
+                        None,
+                    );
                 }
                 ensure_termination(&mut b, None);
             }
@@ -2579,7 +2588,16 @@ fn lower_unit(
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, None);
+                    insert_implicit_dealloc(
+                        &mut b,
+                        &ctx.locals,
+                        &ctx.locals,
+                        type_layouts,
+                        ctx.st,
+                        ctx.internal_funcs,
+                        Some(ctx.contained_host_refs),
+                        None,
+                    );
                 }
                 ensure_termination(&mut b, None);
             }
@@ -3057,7 +3075,16 @@ fn lower_unit(
                     } else {
                         None
                     };
-                    insert_implicit_dealloc(&mut b, &ctx.locals, type_layouts, skip);
+                    insert_implicit_dealloc(
+                        &mut b,
+                        &ctx.locals,
+                        &ctx.locals,
+                        type_layouts,
+                        ctx.st,
+                        ctx.internal_funcs,
+                        Some(ctx.contained_host_refs),
+                        skip,
+                    );
                     if is_alloc_return {
                         b.ret(None);
                     } else if derived_type_name_for_result_var(return_type, &result_name, decls)
@@ -9255,10 +9282,42 @@ fn complex_byte_size(ty: &IrType) -> i64 {
 /// variable of an allocatable-returning function is allocated inside the
 /// callee but ownership is transferred to the caller — the callee must
 /// NOT free it. Audit6 BLOCKING-1.
+fn emit_final_proc_call(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    final_proc: &str,
+    finalized_addr: ValueId,
+) {
+    let key = final_proc.to_lowercase();
+    let (call_name, resolved_key) = resolved_symbol_call_target(st, &key, final_proc);
+    let mut call_args = vec![finalized_addr];
+    append_host_closure_args_raw(
+        b,
+        closure_locals,
+        contained_host_refs,
+        &resolved_key,
+        &mut call_args,
+    );
+    let func_ref = internal_funcs
+        .get(&resolved_key)
+        .or_else(|| internal_funcs.get(&key))
+        .copied()
+        .map(FuncRef::Internal)
+        .unwrap_or_else(|| FuncRef::External(call_name));
+    b.call(func_ref, call_args, IrType::Void);
+}
+
 fn insert_implicit_dealloc(
     b: &mut FuncBuilder,
-    locals: &HashMap<String, LocalInfo>,
+    owned_locals: &HashMap<String, LocalInfo>,
+    closure_locals: &HashMap<String, LocalInfo>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     skip_addr: Option<ValueId>,
 ) {
     // Audit Med-2: only allocate the stat_addr scratch slot if we
@@ -9267,16 +9326,16 @@ fn insert_implicit_dealloc(
     // got a zombie i32 alloca right before its ret, bloating the
     // frame and the IR — and DCE couldn't drop it because allocas
     // are classified as side-effecting.
-    let needs_dealloc = locals.values().any(|info| {
+    let needs_dealloc = owned_locals.values().any(|info| {
         info.allocatable
             || matches!(
                 info.char_kind,
                 CharKind::Deferred | CharKind::FixedRuntime { .. }
             )
     });
-    let needs_stat = locals.values().any(|info| info.allocatable);
+    let needs_stat = owned_locals.values().any(|info| info.allocatable);
     if !needs_dealloc
-        && !locals.values().any(|info| {
+        && !owned_locals.values().any(|info| {
             !info.by_ref
                 && info
                     .derived_type
@@ -9300,7 +9359,7 @@ fn insert_implicit_dealloc(
     // whether info.addr was produced by a GlobalAddr instruction.
     let global_addrs = collect_global_addr_values(b);
 
-    let mut sorted: Vec<(&String, &LocalInfo)> = locals.iter().collect();
+    let mut sorted: Vec<(&String, &LocalInfo)> = owned_locals.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (_name, info) in sorted {
         // Skip caller-owned allocatables (sret result variables).
@@ -9342,10 +9401,14 @@ fn insert_implicit_dealloc(
             if let Some(ref type_name) = info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
                     for final_proc in &layout.final_procs {
-                        b.call(
-                            FuncRef::External(final_proc.clone()),
-                            vec![info.addr],
-                            IrType::Void,
+                        emit_final_proc_call(
+                            b,
+                            st,
+                            internal_funcs,
+                            contained_host_refs,
+                            closure_locals,
+                            final_proc,
+                            info.addr,
                         );
                     }
                 }
@@ -10592,7 +10655,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             } else {
                 None
             };
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
+            insert_implicit_dealloc(
+                b,
+                &ctx.locals,
+                &ctx.locals,
+                ctx.type_layouts,
+                ctx.st,
+                ctx.internal_funcs,
+                Some(ctx.contained_host_refs),
+                skip,
+            );
             if ctx.is_alloc_return {
                 // sret convention: result was written into the hidden first param.
                 b.ret(None);
@@ -10610,7 +10682,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             } else {
                 None
             };
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
+            insert_implicit_dealloc(
+                b,
+                &ctx.locals,
+                &ctx.locals,
+                ctx.type_layouts,
+                ctx.st,
+                ctx.internal_funcs,
+                Some(ctx.contained_host_refs),
+                skip,
+            );
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
@@ -10620,7 +10701,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             } else {
                 None
             };
-            insert_implicit_dealloc(b, &ctx.locals, ctx.type_layouts, skip);
+            insert_implicit_dealloc(
+                b,
+                &ctx.locals,
+                &ctx.locals,
+                ctx.type_layouts,
+                ctx.st,
+                ctx.internal_funcs,
+                Some(ctx.contained_host_refs),
+                skip,
+            );
             b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
             b.unreachable();
         }
@@ -10873,7 +10963,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     .filter_map(|k| ctx.locals.get(k).map(|v| (k.clone(), v.clone())))
                     .collect();
                 if !block_only.is_empty() {
-                    insert_implicit_dealloc(b, &block_only, ctx.type_layouts, None);
+                    insert_implicit_dealloc(
+                        b,
+                        &block_only,
+                        &ctx.locals,
+                        ctx.type_layouts,
+                        ctx.st,
+                        ctx.internal_funcs,
+                        Some(ctx.contained_host_refs),
+                        None,
+                    );
                 }
             }
             // Restore the outer scope's locals.
