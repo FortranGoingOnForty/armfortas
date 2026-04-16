@@ -1515,18 +1515,28 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     let order = dep_scan::resolve_compilation_order(&file_deps)?;
 
     // Compile each file in order.
-    let tmp_dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
+    let tmp_dir = if opts.emit_obj {
+        None
+    } else {
+        let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
+        Some(dir)
+    };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for &idx in &order {
         let src = &file_deps[idx].path;
-        let stem = src
-            .file_stem()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("out");
-        let obj_path = tmp_dir.join(format!("{}.o", stem));
+        let obj_path = if opts.emit_obj {
+            src.with_extension("o")
+        } else {
+            let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
+            let stem = src
+                .file_stem()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("out");
+            tmp_dir.join(format!("{}.o", stem))
+        };
 
         // Build a single-file Options for this source by inheriting
         // the user-facing flags and overriding only the per-file bits.
@@ -1561,11 +1571,19 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         sub_opts.module_output_dir = opts.module_output_dir.clone();
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
-            paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+            if let Some(tmp_dir) = tmp_dir.as_ref() {
+                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+            }
             paths
         };
         compile(&sub_opts)?;
-        object_files.push(obj_path);
+        if !opts.emit_obj {
+            object_files.push(obj_path);
+        }
+    }
+
+    if opts.emit_obj {
+        return Ok(());
     }
 
     // Link all object files.
@@ -1576,7 +1594,9 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     link_multi(&object_files, &output, opts)?;
 
     // Cleanup.
-    let _ = fs::remove_dir_all(&tmp_dir);
+    if let Some(tmp_dir) = tmp_dir {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 
     Ok(())
 }
