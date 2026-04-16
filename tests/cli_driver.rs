@@ -357,6 +357,39 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 }
 
 #[test]
+fn bind_c_name_call_uses_declared_c_symbol() {
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function getpid_c() bind(c, name='getpid') result(pid)\n      import :: c_int\n      integer(c_int) :: pid\n    end function getpid_c\n  end interface\n  integer(c_int) :: pid\n  pid = getpid_c()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("bind_c_name_call", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("bind(c) name compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "bind(c) name compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_getpid"),
+        "bind(c, name=...) should call the declared C symbol: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_getpid_c"),
+        "bind(c, name=...) should not call the local Fortran alias: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeat_intrinsic_lowers_to_runtime_symbol() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = repeat('ab', 3)\n  print *, len_trim(s)\nend program\n",
@@ -2618,6 +2651,75 @@ fn procedure_pointer_module_export_survives_amod_import() {
         compile_user.status.success(),
         "imported module procedure pointers should survive .amod export/import: {}",
         String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn use_renamed_procedure_call_uses_remote_symbol() {
+    let dir = unique_dir("use_rename_proc");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  subroutine set_shell_variable()\n  end subroutine set_shell_variable\nend module m\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "module user\ncontains\n  subroutine run()\n    use m, only: var_set_shell_variable => set_shell_variable\n    call var_set_shell_variable()\n  end subroutine run\nend module user\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rename module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "rename source module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("user.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rename user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "USE-renamed procedure call should compile: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let undefined = undefined_symbols(&user_obj);
+    assert!(
+        undefined.iter().any(|sym| sym == "_set_shell_variable"),
+        "USE rename should call the imported procedure symbol: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_var_set_shell_variable"),
+        "USE rename should not lower to the local alias as a link symbol: {:?}",
+        undefined
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -89,6 +89,11 @@ fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId
     }
 }
 
+fn normalized_bind_name(bind: Option<&crate::ast::unit::BindInfo>) -> Option<String> {
+    bind.and_then(|info| info.name.as_ref())
+        .map(|name| name.trim_matches('\'').trim_matches('"').to_string())
+}
+
 fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
@@ -230,22 +235,40 @@ fn resolve_unit(
             // the *declared* callable back into the enclosing scope
             // (otherwise IMPLICIT NONE rejects the call at the use
             // site, and generic dispatch can't see the body types).
-            let mut outer_refs: Vec<(String, SymbolKind, Option<crate::sema::symtab::TypeInfo>, Vec<String>)> = Vec::new();
+            let mut outer_refs: Vec<(
+                String,
+                SymbolKind,
+                Option<crate::sema::symtab::TypeInfo>,
+                Vec<String>,
+                Option<String>,
+            )> = Vec::new();
             for body in bodies {
                 if let InterfaceBody::Subprogram(sub) = body {
                     match &sub.node {
-                        ProgramUnit::Function { name: fn_name, return_type, args, .. } => {
+                        ProgramUnit::Function { name: fn_name, return_type, args, bind, .. } => {
                             let arg_names = args.iter().filter_map(|a| {
                                 if let DummyArg::Name(n) = a { Some(n.clone()) } else { None }
                             }).collect();
                             let ti = return_type.as_ref().map(|ts| type_spec_to_info(ts, st));
-                            outer_refs.push((fn_name.clone(), SymbolKind::Function, ti, arg_names));
+                            outer_refs.push((
+                                fn_name.clone(),
+                                SymbolKind::Function,
+                                ti,
+                                arg_names,
+                                normalized_bind_name(bind.as_ref()),
+                            ));
                         }
-                        ProgramUnit::Subroutine { name: fn_name, args, .. } => {
+                        ProgramUnit::Subroutine { name: fn_name, args, bind, .. } => {
                             let arg_names = args.iter().filter_map(|a| {
                                 if let DummyArg::Name(n) = a { Some(n.clone()) } else { None }
                             }).collect();
-                            outer_refs.push((fn_name.clone(), SymbolKind::Subroutine, None, arg_names));
+                            outer_refs.push((
+                                fn_name.clone(),
+                                SymbolKind::Subroutine,
+                                None,
+                                arg_names,
+                                normalized_bind_name(bind.as_ref()),
+                            ));
                         }
                         _ => {}
                     }
@@ -278,13 +301,17 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names) in outer_refs {
+            for (fn_name, kind, ti, arg_names, binding_label) in outer_refs {
                 let span = unit.span;
                 let _ = st.define(Symbol {
                     name: fn_name,
                     kind,
                     type_info: ti,
-                    attrs: SymbolAttrs { external: true, ..Default::default() },
+                    attrs: SymbolAttrs {
+                        external: true,
+                        binding_label,
+                        ..Default::default()
+                    },
                     defined_at: span,
                     scope: st.current_scope(),
                     arg_names,
@@ -1020,12 +1047,13 @@ fn process_contains(
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
         match &unit.node {
-            ProgramUnit::Subroutine { name, prefix, .. } => {
+            ProgramUnit::Subroutine { name, prefix, bind, .. } => {
                 let elemental = prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
                 let pure = elemental || prefix.iter().any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
+                    binding_label: normalized_bind_name(bind.as_ref()),
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -1039,7 +1067,7 @@ fn process_contains(
                     const_value: None,
                 });
             }
-            ProgramUnit::Function { name, return_type, result, decls, prefix, .. } => {
+            ProgramUnit::Function { name, return_type, result, decls, prefix, bind, .. } => {
                 let ret_type_info = return_type.as_ref().map(|ts| type_spec_to_info(ts, st))
                     .or_else(|| {
                         // Infer return type from result variable's declaration.
@@ -1061,6 +1089,7 @@ fn process_contains(
                 let fn_attrs = SymbolAttrs {
                     pure: fn_pure,
                     elemental: fn_elemental,
+                    binding_label: normalized_bind_name(bind.as_ref()),
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {

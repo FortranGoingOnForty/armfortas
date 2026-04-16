@@ -429,6 +429,10 @@ pub struct SymbolAttrs {
     pub access: Access,
     pub allocatable: bool,
     pub pointer: bool,
+    /// For BIND(C, NAME="...") procedures, preserve the actual link
+    /// symbol so lowering can call the declared external name rather
+    /// than the local Fortran alias.
+    pub binding_label: Option<String>,
     /// For `procedure(iface), pointer :: p`, preserve the declared
     /// interface name so `.amod` can round-trip the symbol truthfully.
     pub procedure_iface: Option<String>,
@@ -452,6 +456,7 @@ impl Default for SymbolAttrs {
             access: Access::Default,
             allocatable: false,
             pointer: false,
+            binding_label: None,
             procedure_iface: None,
             target: false,
             optional: false,

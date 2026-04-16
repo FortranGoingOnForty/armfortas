@@ -5602,7 +5602,23 @@ fn resolve_subroutine_call_name(
             }
         }
     }
-    (orig_name.to_string(), key.to_string())
+    resolved_symbol_call_target(st, key, orig_name)
+}
+
+fn resolved_symbol_call_target(
+    st: &SymbolTable,
+    key: &str,
+    fallback_name: &str,
+) -> (String, String) {
+    if let Some(sym) = st.find_symbol_any_scope(key) {
+        let call_name = sym
+            .attrs
+            .binding_label
+            .clone()
+            .unwrap_or_else(|| sym.name.clone());
+        return (call_name, sym.name.to_lowercase());
+    }
+    (fallback_name.to_string(), key.to_string())
 }
 
 /// Does the actual IR value at `arg_val` satisfy the declared
@@ -14387,7 +14403,9 @@ fn lower_expr_full(
                     }
                 };
                 let resolved_key = resolved_name.to_lowercase();
-                let callee_char_len_star_args = callee_char_len_star_mask(st, &resolved_key)
+                let (call_name, callee_key) =
+                    resolved_symbol_call_target(st, &resolved_key, &resolved_name);
+                let callee_char_len_star_args = callee_char_len_star_mask(st, &callee_key)
                     .or_else(|| callee_char_len_star_mask(st, &key));
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
@@ -14419,23 +14437,23 @@ fn lower_expr_full(
                 // to the unresolved key so calls that don't go through
                 // generic dispatch still thread host vars.
                 let closure_key = if contained_host_refs
-                    .map(|m| m.contains_key(&resolved_key))
+                    .map(|m| m.contains_key(&callee_key))
                     .unwrap_or(false)
                 {
-                    &resolved_key
+                    &callee_key
                 } else {
                     &key
                 };
                 append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut ref_arg_vals);
 
                 // Look up callee return type from symbol table.
-                let ret_ty = callee_return_ir_type(st, &resolved_key)
+                let ret_ty = callee_return_ir_type(st, &callee_key)
                     .or_else(|| callee_return_ir_type(st, &key))
                     .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = internal_funcs
-                    .and_then(|map| map.get(&resolved_key).or_else(|| map.get(&key)).copied())
+                    .and_then(|map| map.get(&callee_key).or_else(|| map.get(&key)).copied())
                     .map(FuncRef::Internal)
-                    .unwrap_or_else(|| FuncRef::External(resolved_name));
+                    .unwrap_or_else(|| FuncRef::External(call_name));
                 b.call(func_ref, ref_arg_vals, ret_ty)
             } else if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
