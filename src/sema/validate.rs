@@ -453,7 +453,9 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
 
 fn validate_const_int_subscript(ctx: &mut Ctx<'_>, value: &crate::ast::expr::SectionSubscript) {
     match value {
-        crate::ast::expr::SectionSubscript::Element(expr) => validate_const_int_expr_tree(ctx, expr),
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            validate_const_int_expr_tree(ctx, expr)
+        }
         crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
             if let Some(expr) = start {
                 validate_const_int_expr_tree(ctx, expr);
@@ -610,13 +612,16 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         Stmt::IfStmt { condition, .. }
         | Stmt::DoWhile { condition, .. }
         | Stmt::SelectCase {
-            selector: condition, ..
+            selector: condition,
+            ..
         }
         | Stmt::SelectType {
-            selector: condition, ..
+            selector: condition,
+            ..
         }
         | Stmt::ComputedGoto {
-            selector: condition, ..
+            selector: condition,
+            ..
         }
         | Stmt::ArithmeticIf {
             expr: condition, ..
@@ -1260,17 +1265,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         | Stmt::Backspace { .. }
         | Stmt::Endfile { .. }
         | Stmt::Flush { .. }
-        | Stmt::Wait { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
-            }
+        | Stmt::Wait { .. }
+            if ctx.in_pure =>
+        {
+            ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
         }
 
         // ---- STOP in pure ----
-        Stmt::Stop { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "STOP not allowed in pure procedure");
-            }
+        Stmt::Stop { .. } if ctx.in_pure => {
+            ctx.error(stmt.span, "STOP not allowed in pure procedure");
         }
         Stmt::ErrorStop { .. } => {
             if ctx.in_pure {
@@ -1709,16 +1712,16 @@ fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, spa
         return;
     };
     match sym.kind {
-        SymbolKind::Function | SymbolKind::Subroutine => {
-            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic {
-                ctx.error(
-                    span,
-                    format!(
-                        "call to '{}' inside a pure procedure: callee is not pure, elemental, or intrinsic (F2018 15.7)",
-                        sym.name
-                    ),
-                );
-            }
+        SymbolKind::Function | SymbolKind::Subroutine
+            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic =>
+        {
+            ctx.error(
+                span,
+                format!(
+                    "call to '{}' inside a pure procedure: callee is not pure, elemental, or intrinsic (F2018 15.7)",
+                    sym.name
+                ),
+            );
         }
         SymbolKind::IntrinsicProc => {} // always OK
         _ => {}                         // external / unknown — can't check
