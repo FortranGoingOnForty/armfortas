@@ -1359,41 +1359,41 @@ _main:
         eprintln!(" assembled: {}", obj_path.display());
     }
 
-    if opts.emit_obj {
-        // Emit .amod files for each MODULE in the compilation unit.
-        // -J <dir> overrides where they go; default is the parent of
-        // the output .o.
-        for unit in &units {
-            if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
-                let mod_key = name.to_lowercase();
-                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                    let amod_text = crate::sema::amod::write_amod(
-                        name,
-                        opts.input.to_str().unwrap_or(""),
-                        &source,
-                        &st,
-                        mod_scope_id,
-                        &module_globals,
-                        &type_layouts,
-                        &ir_module,
-                        &std::collections::HashMap::new(), // char_len_star computed by writer from scope
-                    );
-                    let amod_dir: std::path::PathBuf =
-                        opts.module_output_dir.clone().unwrap_or_else(|| {
-                            opts.output_path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("."))
-                                .to_path_buf()
-                        });
-                    let amod_path = amod_dir.join(format!("{}.amod", mod_key));
-                    if let Err(e) = fs::write(&amod_path, &amod_text) {
-                        eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
-                    } else if opts.verbose {
-                        eprintln!(" amod: {}", amod_path.display());
-                    }
+    // Emit .amod files for each MODULE in the compilation unit.
+    // -J <dir> overrides where they go; otherwise they follow the
+    // primary output path, even for shared-library builds.
+    for unit in &units {
+        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                let amod_text = crate::sema::amod::write_amod(
+                    name,
+                    opts.input.to_str().unwrap_or(""),
+                    &source,
+                    &st,
+                    mod_scope_id,
+                    &module_globals,
+                    &type_layouts,
+                    &ir_module,
+                    &std::collections::HashMap::new(), // char_len_star computed by writer from scope
+                );
+                let amod_dir: std::path::PathBuf = opts.module_output_dir.clone().unwrap_or_else(|| {
+                    opts.output_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                });
+                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
+                if let Err(e) = fs::write(&amod_path, &amod_text) {
+                    eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
+                } else if opts.verbose {
+                    eprintln!(" amod: {}", amod_path.display());
                 }
             }
         }
+    }
+
+    if opts.emit_obj {
         phases.report();
         return Ok(());
     }
