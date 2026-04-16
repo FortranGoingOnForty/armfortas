@@ -4254,32 +4254,34 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             // MOD(a, p) = a - INT(a/p) * p  (sign of dividend)
             // C-style remainder matches this.
             if args.len() >= 2 {
-                Some(b.imod(args[0], args[1]))
+                let (lhs, rhs) = unify_int_widths(b, args[0], args[1]);
+                Some(b.imod(lhs, rhs))
             } else { None }
         }
         "modulo" => {
             // MODULO(a, p) = a - FLOOR(a/p) * p  (sign of divisor, result in [0, |p|))
             // For integers: if result has opposite sign to p, add p.
             if args.len() >= 2 {
-                let ty = b.func().value_type(args[0]).unwrap_or(IrType::Int(IntWidth::I32));
+                let (lhs, rhs) = unify_int_widths(b, args[0], args[1]);
+                let ty = b.func().value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
                 if ty.is_float() {
                     // Float modulo: use fmod then adjust.
-                    let rem = b.call(FuncRef::External("fmod".into()), vec![args[0], args[1]], ty.clone());
-                    let sum = b.fadd(rem, args[1]);
-                    let rem2 = b.call(FuncRef::External("fmod".into()), vec![sum, args[1]], ty);
+                    let rem = b.call(FuncRef::External("fmod".into()), vec![lhs, rhs], ty.clone());
+                    let sum = b.fadd(rem, rhs);
+                    let rem2 = b.call(FuncRef::External("fmod".into()), vec![sum, rhs], ty);
                     Some(rem2)
                 } else {
                     // Integer modulo: rem = a % p; if (rem != 0 && (rem ^ p) < 0) rem += p
-                    let rem = b.imod(args[0], args[1]);
+                    let rem = b.imod(lhs, rhs);
                     let zero = match &ty {
                         IrType::Int(IntWidth::I64) => b.const_i64(0),
                         _ => b.const_i32(0),
                     };
                     let rem_ne_zero = b.icmp(CmpOp::Ne, rem, zero);
-                    let rem_xor_p = b.bit_xor(rem, args[1]);
+                    let rem_xor_p = b.bit_xor(rem, rhs);
                     let sign_differs = b.icmp(CmpOp::Lt, rem_xor_p, zero);
                     let needs_adjust = b.and(rem_ne_zero, sign_differs);
-                    let adjusted = b.iadd(rem, args[1]);
+                    let adjusted = b.iadd(rem, rhs);
                     Some(b.select(needs_adjust, adjusted, rem))
                 }
             } else { None }
@@ -13694,6 +13696,22 @@ end program
         assert!(ir.contains("doconc_check"));
         assert!(ir.contains("if_then"));
         assert!(ir.contains("if_end"));
+    }
+
+    #[test]
+    fn mod_intrinsic_coerces_mixed_width_integer_args() {
+        let (_, ir) = lower_and_verify("\
+program test
+  use iso_fortran_env, only: int64
+  implicit none
+  integer(int64) :: total_commands
+  logical :: should_report
+  total_commands = 51_int64
+  should_report = mod(total_commands, 50_int64) == 0_int64
+end program
+");
+        assert!(ir.contains("imod"));
+        assert!(!ir.contains("operand width mismatch"));
     }
 
     #[test]
