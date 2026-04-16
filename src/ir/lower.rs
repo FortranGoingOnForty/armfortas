@@ -5715,6 +5715,15 @@ fn char_array_element_ptr_and_len(
         CharKind::None => return None,
     };
     if !local_uses_array_descriptor(info) && !info.by_ref {
+        if matches!(info.ty, IrType::Int(IntWidth::I8)) {
+            // `character(len=1)` / `character(kind=c_char)` locals use
+            // contiguous byte storage, not the pointer-table layout used by
+            // fixed-length character(N>1) arrays.
+            let base = array_data_ptr_for_call(b, info);
+            let byte_offset = b.imul(idx64, elem_len);
+            let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+            return Some((elem_ptr, elem_len));
+        }
         let slot_ptr = b.gep(
             info.addr,
             vec![idx64],

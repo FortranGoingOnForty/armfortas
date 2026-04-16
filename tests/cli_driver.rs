@@ -1501,6 +1501,36 @@ fn fixed_c_char_array_element_assignment_compiles_and_runs() {
 }
 
 #[test]
+fn fixed_c_char_array_null_scan_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(256)\n  integer :: i\n  buf = c_null_char\n  buf(1) = achar(97, kind=c_char)\n  do i = 1, 256\n    if (buf(i) == c_null_char) exit\n  end do\n  if (i /= 2) stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_c_char_array_null_scan", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed c_char null scan compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed c_char null scan compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed c_char null scan run failed");
+    assert!(
+        run.status.success(),
+        "fixed c_char null scan run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), allocatable, target :: c_tokens(:,:)\n  type(c_ptr) :: raw\n  integer :: i\n  allocate(c_tokens(4, 1))\n  do i = 1, 3\n    c_tokens(i, 1) = achar(96 + i, kind=c_char)\n  end do\n  c_tokens(4, 1) = c_null_char\n  raw = c_loc(c_tokens(1, 1))\n  if (.not. c_associated(raw)) stop 1\n  print *, 'ok'\nend program\n",
