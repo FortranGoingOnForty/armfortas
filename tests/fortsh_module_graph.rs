@@ -228,6 +228,7 @@ fn fortsh_module_graph_resolves() {
                 src.to_str().unwrap(),
                 "-c",
                 "-O0",
+                "-DUSE_C_STRINGS",
                 "-o",
                 obj.to_str().unwrap(),
                 &format!("-I{}", build_dir.display()),

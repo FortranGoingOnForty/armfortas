@@ -105,6 +105,7 @@ pub struct Options {
     pub emit_ast: bool,        // --emit-ast
     pub emit_tokens: bool,     // --emit-tokens
     pub preprocess_only: bool, // -E
+    pub preprocessor_defines: Vec<(String, String)>,
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
@@ -170,6 +171,7 @@ impl Default for Options {
             emit_ast: false,
             emit_tokens: false,
             preprocess_only: false,
+            preprocessor_defines: Vec::new(),
             std: Some(crate::sema::validate::FortranStandard::F2018),
             source_form_override: None,
             default_integer_8: false,
@@ -267,6 +269,15 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-S" => opts.emit_asm = true,
             "-c" => opts.emit_obj = true,
             "-E" => opts.preprocess_only = true,
+            "-D" => {
+                i += 1;
+                let spec = args.get(i).ok_or("-D requires a macro name")?;
+                opts.preprocessor_defines.push(parse_preprocessor_define(spec)?);
+            }
+            arg if arg.starts_with("-D") => {
+                opts.preprocessor_defines
+                    .push(parse_preprocessor_define(&arg[2..])?);
+            }
             "--emit-ir" => opts.emit_ir = true,
             "--emit-ast" => opts.emit_ast = true,
             "--emit-tokens" => opts.emit_tokens = true,
@@ -413,6 +424,36 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     opts.input = inputs.remove(0);
     opts.extra_inputs = inputs;
     Ok(ParsedCli::Compile(Box::new(opts)))
+}
+
+fn parse_preprocessor_define(spec: &str) -> Result<(String, String), String> {
+    if spec.is_empty() {
+        return Err("-D requires a macro name".into());
+    }
+    let (name, value) = match spec.split_once('=') {
+        Some((name, value)) => (name, value),
+        None => (spec, "1"),
+    };
+    if name.is_empty() {
+        return Err(format!("invalid macro definition '{}': missing macro name", spec));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("invalid macro definition '{}': missing macro name", spec));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(format!(
+            "invalid macro definition '{}': macro name must start with a letter or underscore",
+            spec
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "invalid macro definition '{}': macro name must be alphanumeric or underscore",
+            spec
+        ));
+    }
+    Ok((name.to_string(), value.to_string()))
 }
 
 /// Expand any `@file` argument into the lines of `file`, treating
@@ -612,6 +653,7 @@ COMPILATION:
   -c                          Compile to object file only (no linking)
   -S                          Emit assembly text
   -E                          Preprocess only
+  -D<name>[=<value>]          Define a preprocessor macro
   -o <file>                   Output file name
 
 LANGUAGE:
@@ -838,11 +880,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" preprocessing: {} ({})", opts.input.display(), form);
     }
     let phase = phases.start("preprocess");
-    let pp_config = crate::preprocess::PreprocConfig {
+    let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
         ..crate::preprocess::PreprocConfig::default()
     };
+    for (name, value) in &opts.preprocessor_defines {
+        pp_config
+            .defines
+            .insert(name.clone(), crate::preprocess::MacroDef::object(value));
+    }
     let pp_result =
         crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);

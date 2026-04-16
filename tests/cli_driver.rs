@@ -452,6 +452,58 @@ fn dash_capital_e_without_o_writes_to_stdout() {
 }
 
 #[test]
+fn dash_capital_d_defines_preprocessor_macro() {
+    let src = write_program(
+        "#ifdef USE_C_STRINGS\n#define X 1\n#else\n#define X 0\n#endif\nprogram p\n  print *, X\nend program\n",
+        "F90",
+    );
+    let out = unique_path("pp_define", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-DUSE_C_STRINGS",
+            "-E",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-D preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pp = std::fs::read_to_string(&out).expect("missing preprocessed output");
+    assert!(
+        pp.contains(", 1"),
+        "preprocessed text should take the defined branch: {}",
+        pp
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn dash_capital_d_rejects_invalid_macro_name() {
+    let src = write_program("program p\n  print *, 1\nend program\n", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-D1BAD", src.to_str().unwrap(), "-c"])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "-D with an invalid macro name should fail"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("invalid macro definition"),
+        "expected invalid macro diagnostic, got: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn std_f95_rejects_f2008_error_stop() {
     let src = write_program("program p\n  error stop 'oops'\nend program\n", "f90");
     let out = unique_path("f95", "bin");
