@@ -1106,11 +1106,10 @@ impl<'a> Lexer<'a> {
             b'%' => (TokenKind::Percent, "%"),
             b'&' => (TokenKind::Ampersand, "&"),
             _ => {
-                let unexpected = self.char_at(self.pos.saturating_sub(1)).unwrap_or(ch as char);
-                return Err(self.err(
-                    start,
-                    format!("unexpected character: '{}'", unexpected),
-                ));
+                let unexpected = self
+                    .char_at(self.pos.saturating_sub(1))
+                    .unwrap_or(ch as char);
+                return Err(self.err(start, format!("unexpected character: '{}'", unexpected)));
             }
         };
 

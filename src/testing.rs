@@ -347,6 +347,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         &type_layouts,
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
     );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {

@@ -196,6 +196,7 @@ pub enum Stmt {
 
     // ---- Memory ----
     Allocate {
+        type_spec: Option<super::decl::TypeSpec>,
         items: Vec<SpannedExpr>,
         opts: Vec<IoControl>,
     },

@@ -1236,7 +1236,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- Allocate / Deallocate ----
-        Stmt::Allocate { items, opts } => {
+        Stmt::Allocate { items, opts, .. } => {
             if opts.iter().any(|opt| {
                 opt.keyword
                     .as_deref()

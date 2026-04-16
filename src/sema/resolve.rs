@@ -745,6 +745,8 @@ fn load_external_module(
     for proc in &iface.procedures {
         let attrs = SymbolAttrs {
             access: Access::Public,
+            allocatable: proc.result_allocatable,
+            pointer: proc.result_pointer,
             pure: proc.pure,
             elemental: proc.elemental,
             binding_label: proc.binding_label.clone(),
@@ -1295,7 +1297,10 @@ fn process_contains(
                     || prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                let result_attrs = function_result_attrs(name, result, decls);
                 let fn_attrs = SymbolAttrs {
+                    allocatable: result_attrs.allocatable,
+                    pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
                     binding_label: normalized_bind_name(bind.as_ref()),
@@ -1518,6 +1523,32 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
         }
     }
     sa
+}
+
+fn function_result_attrs(
+    function_name: &str,
+    result: &Option<String>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> SymbolAttrs {
+    let result_key = result
+        .as_deref()
+        .unwrap_or(function_name)
+        .to_ascii_lowercase();
+    for decl in decls {
+        let crate::ast::decl::Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        if entities
+            .iter()
+            .any(|entity| entity.name.eq_ignore_ascii_case(&result_key))
+        {
+            return attrs_to_symbol_attrs(attrs, Access::Default);
+        }
+    }
+    SymbolAttrs::default()
 }
 
 #[cfg(test)]

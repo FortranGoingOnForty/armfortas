@@ -316,11 +316,8 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     Some(PathBuf::from(args.get(i).ok_or("-J requires a directory")?));
             }
             arg if arg.starts_with("-J") => {
-                opts.module_output_dir = Some(PathBuf::from(short_option_value(
-                    arg,
-                    "-J",
-                    "a directory",
-                )?));
+                opts.module_output_dir =
+                    Some(PathBuf::from(short_option_value(arg, "-J", "a directory")?));
             }
 
             // ---- Linker search / libs / rpath ----
@@ -329,19 +326,18 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.library_search_paths
                     .push(PathBuf::from(args.get(i).ok_or("-L requires a directory")?));
             }
-            arg if arg.starts_with("-L") => {
-                opts.library_search_paths
-                    .push(PathBuf::from(short_option_value(arg, "-L", "a directory")?))
-            }
+            arg if arg.starts_with("-L") => opts
+                .library_search_paths
+                .push(PathBuf::from(short_option_value(arg, "-L", "a directory")?)),
 
             "-l" => {
                 i += 1;
                 opts.link_libs
                     .push(args.get(i).ok_or("-l requires a library name")?.clone());
             }
-            arg if arg.starts_with("-l") => opts.link_libs.push(
-                short_option_value(arg, "-l", "a library name")?.to_string(),
-            ),
+            arg if arg.starts_with("-l") => opts
+                .link_libs
+                .push(short_option_value(arg, "-l", "a library name")?.to_string()),
 
             "-rpath" | "--rpath" => {
                 i += 1;
@@ -1043,7 +1039,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 1,
             );
             phases.report();
-            return Err(format!("aborting due to errors in {}", opts.input.display()));
+            return Err(format!(
+                "aborting due to errors in {}",
+                opts.input.display()
+            ));
         }
     };
     phase.end(&mut phases);
@@ -1067,12 +1066,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         Ok(units) => units,
         Err(e) => {
             phase.end(&mut phases);
-            let span_len = if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col
-            {
-                (e.span.end.col - e.span.start.col) as usize
-            } else {
-                1
-            };
+            let span_len =
+                if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col {
+                    (e.span.end.col - e.span.start.col) as usize
+                } else {
+                    1
+                };
             diag::render(
                 &file_str,
                 &source,
@@ -1082,7 +1081,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 span_len,
             );
             phases.report();
-            return Err(format!("aborting due to errors in {}", opts.input.display()));
+            return Err(format!(
+                "aborting due to errors in {}",
+                opts.input.display()
+            ));
         }
     };
     phase.end(&mut phases);
@@ -1164,6 +1166,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
+    let mut external_descriptor_params = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_descriptor_params.extend(crate::sema::amod::extract_descriptor_params(ext_mod));
+    }
+
     // Build external char_len_star_params from .amod-loaded modules.
     let mut external_char_len_star = std::collections::HashMap::new();
     for ext_mod in &resolve_result.external_modules {
@@ -1175,6 +1182,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         &st,
         &type_layouts,
         external_globals,
+        external_descriptor_params,
         external_char_len_star,
     );
     let ir_errors = verify::verify_module(&ir_module);
@@ -1398,12 +1406,13 @@ _main:
                     &ir_module,
                     &std::collections::HashMap::new(), // char_len_star computed by writer from scope
                 );
-                let amod_dir: std::path::PathBuf = opts.module_output_dir.clone().unwrap_or_else(|| {
-                    opts.output_path()
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .to_path_buf()
-                });
+                let amod_dir: std::path::PathBuf =
+                    opts.module_output_dir.clone().unwrap_or_else(|| {
+                        opts.output_path()
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf()
+                    });
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
                 fs::write(&amod_path, &amod_text)
                     .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;

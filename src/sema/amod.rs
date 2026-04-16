@@ -249,6 +249,12 @@ fn emit_procedure(
     if is_func {
         let ret_str = type_info_to_string(sym.type_info.as_ref());
         write!(out, "@function {} -> {}", sym.name, ret_str).unwrap();
+        if sym.attrs.allocatable {
+            write!(out, ", result_allocatable").unwrap();
+        }
+        if sym.attrs.pointer {
+            write!(out, ", result_pointer").unwrap();
+        }
     } else {
         write!(out, "@subroutine {}", sym.name).unwrap();
     }
@@ -264,15 +270,45 @@ fn emit_procedure(
     writeln!(out).unwrap();
 
     let name_lc = name.to_lowercase();
-
-    // Walk into the procedure's child scope for full arg info.
-    let proc_scope = st.scopes.iter().find(|s| {
-        s.parent == Some(mod_scope_id)
-            && match &s.kind {
-                ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(name),
-                _ => false,
-            }
+    let ir_func = ir_module.functions.iter().find(|f| {
+        f.name.eq_ignore_ascii_case(name)
+            || f.name.eq_ignore_ascii_case(&name_lc)
+            || f.name.to_lowercase().ends_with(&format!("_{}", name_lc))
     });
+
+    // Walk into the procedure's scope for full arg info. Interface-declared
+    // procedures sit under an intermediate Interface scope rather than
+    // directly under the module, so check both shapes.
+    let proc_scope = st
+        .scopes
+        .iter()
+        .find(|s| {
+            s.parent == Some(mod_scope_id)
+                && match &s.kind {
+                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                        n.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                }
+        })
+        .or_else(|| {
+            st.scopes.iter().find(|s| {
+                let matches_name = match &s.kind {
+                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                        n.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                };
+                if !matches_name {
+                    return false;
+                }
+                let Some(parent_id) = s.parent else {
+                    return false;
+                };
+                let parent = st.scope(parent_id);
+                matches!(parent.kind, ScopeKind::Interface) && parent.parent == Some(mod_scope_id)
+            })
+        });
 
     // Compute hidden char-length count from the scope's arg types.
     let mut hidden_count = 0usize;
@@ -295,7 +331,14 @@ fn emit_procedure(
 
     let mut reg_idx = 0usize;
     if let Some(pscope) = proc_scope {
-        for arg_name in &pscope.arg_order {
+        let ir_arg_base = ir_func
+            .map(|func| {
+                func.params
+                    .len()
+                    .saturating_sub(pscope.arg_order.len() + hidden_count)
+            })
+            .unwrap_or(0);
+        for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
                 let type_str = type_info_to_string(arg_sym.type_info.as_ref());
                 write!(out, "  @arg {} : {}", arg_name, type_str).unwrap();
@@ -312,6 +355,28 @@ fn emit_procedure(
                 }
                 if arg_sym.attrs.value {
                     arg_attrs.push("value");
+                }
+                let is_descriptor_arg = ir_func
+                    .and_then(|func| func.params.get(ir_arg_base + arg_idx))
+                    .map(|param| {
+                        matches!(
+                            &param.ty,
+                            crate::ir::types::IrType::Ptr(inner)
+                                if matches!(
+                                    inner.as_ref(),
+                                    crate::ir::types::IrType::Array(elem, 384)
+                                        if matches!(
+                                            elem.as_ref(),
+                                            crate::ir::types::IrType::Int(
+                                                crate::ir::types::IntWidth::I8
+                                            )
+                                        )
+                                )
+                        )
+                    })
+                    .unwrap_or(false);
+                if is_descriptor_arg {
+                    arg_attrs.push("descriptor");
                 }
                 if arg_sym.attrs.allocatable {
                     arg_attrs.push("allocatable");
@@ -370,10 +435,6 @@ fn emit_procedure(
     }
 
     // @hint line.
-    let ir_func = ir_module
-        .functions
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(&name_lc));
     if let Some(func) = ir_func {
         let mut hints = Vec::new();
         if is_leaf(func) {
@@ -560,6 +621,7 @@ pub struct AmodArg {
     pub intent: Option<Intent>,
     pub optional: bool,
     pub value: bool,
+    pub descriptor: bool,
     pub allocatable: bool,
     pub pointer: bool,
     pub hidden: bool,
@@ -571,6 +633,8 @@ pub struct AmodProc {
     pub name: String,
     pub kind: SymbolKind,
     pub return_type: Option<TypeInfo>,
+    pub result_allocatable: bool,
+    pub result_pointer: bool,
     pub pure: bool,
     pub elemental: bool,
     pub binding_label: Option<String>,
@@ -842,6 +906,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     let pure = attrs_str.contains("pure");
     let elemental = attrs_str.contains("elemental");
+    let result_allocatable = attrs_str.contains("result_allocatable");
+    let result_pointer = attrs_str.contains("result_pointer");
     let binding_label = attrs_str
         .split(", ")
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
@@ -871,6 +937,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         name,
         kind,
         return_type,
+        result_allocatable,
+        result_pointer,
         pure,
         elemental,
         binding_label,
@@ -910,6 +978,7 @@ fn parse_arg(line: &str) -> AmodArg {
 
     let optional = attr_str.contains("optional");
     let value = attr_str.contains("value");
+    let descriptor = attr_str.contains("descriptor");
     let allocatable = attr_str.contains("allocatable");
     let pointer = attr_str.contains("pointer");
 
@@ -919,6 +988,7 @@ fn parse_arg(line: &str) -> AmodArg {
         intent,
         optional,
         value,
+        descriptor,
         allocatable,
         pointer,
         hidden,
@@ -1206,6 +1276,21 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
                 matches!(a.type_info, Some(TypeInfo::Character { len: None, .. })) && !a.allocatable
             })
             .collect();
+        if flags.iter().any(|f| *f) {
+            out.insert(proc.name.to_lowercase(), flags);
+        }
+    }
+    out
+}
+
+/// Extract descriptor_params from a loaded ModuleInterface.
+/// For each procedure with descriptor-backed dummies, produces a
+/// Vec<bool> (per-position, true = pass the 384-byte descriptor).
+pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for proc in &iface.procedures {
+        let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
+        let flags: Vec<bool> = visible_args.iter().map(|a| a.descriptor).collect();
         if flags.iter().any(|f| *f) {
             out.insert(proc.name.to_lowercase(), flags);
         }

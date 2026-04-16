@@ -1424,6 +1424,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen)?;
         let mut items = Vec::new();
         let mut opts = Vec::new();
+        let mut type_spec = None;
 
         // Check for typed allocation: allocate(type-spec :: items)
         // E.g., allocate(integer :: x), allocate(base_type :: poly_var)
@@ -1431,6 +1432,7 @@ impl<'a> Parser<'a> {
             let save = self.pos;
             if let Some(ts_result) = self.try_parse_type_spec() {
                 if ts_result.is_ok() && self.peek() == &TokenKind::ColonColon {
+                    type_spec = ts_result.ok();
                     self.advance(); // consume ::
                                     // Continue to parse items normally below.
                 } else {
@@ -1474,7 +1476,14 @@ impl<'a> Parser<'a> {
         if is_dealloc {
             Ok(Spanned::new(Stmt::Deallocate { items, opts }, span))
         } else {
-            Ok(Spanned::new(Stmt::Allocate { items, opts }, span))
+            Ok(Spanned::new(
+                Stmt::Allocate {
+                    type_spec,
+                    items,
+                    opts,
+                },
+                span,
+            ))
         }
     }
 
@@ -2178,7 +2187,13 @@ end if
     #[test]
     fn allocate_simple() {
         let s = parse_one("allocate(a(n), b(m,k))\n");
-        if let Stmt::Allocate { items, opts } = &s.node {
+        if let Stmt::Allocate {
+            type_spec,
+            items,
+            opts,
+        } = &s.node
+        {
+            assert!(type_spec.is_none());
             assert_eq!(items.len(), 2);
             assert!(opts.is_empty());
         } else {
@@ -2189,7 +2204,7 @@ end if
     #[test]
     fn allocate_with_stat() {
         let s = parse_one("allocate(x(100), stat=ios, errmsg=msg)\n");
-        if let Stmt::Allocate { items, opts } = &s.node {
+        if let Stmt::Allocate { items, opts, .. } = &s.node {
             assert_eq!(items.len(), 1);
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("stat")));
             assert!(opts.iter().any(|o| o.keyword.as_deref() == Some("errmsg")));
@@ -2285,7 +2300,14 @@ end if
     fn allocate_typed() {
         // allocate(integer :: x) — typed allocation.
         let s = parse_one("allocate(integer :: x(100))\n");
-        assert!(matches!(s.node, Stmt::Allocate { .. }));
+        if let Stmt::Allocate {
+            type_spec: Some(crate::ast::decl::TypeSpec::Integer(_)),
+            ..
+        } = s.node
+        {
+        } else {
+            panic!("typed allocation should preserve the type-spec");
+        }
     }
 
     #[test]

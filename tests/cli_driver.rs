@@ -74,6 +74,26 @@ fn undefined_symbols(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+fn compile_c_object(source: &std::path::Path, output: &std::path::Path) {
+    let result = Command::new("clang")
+        .args([
+            "-arch",
+            "arm64",
+            "-c",
+            source.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn clang");
+    assert!(
+        result.status.success(),
+        "clang failed for {}: {}",
+        source.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[test]
 fn version_flag_prints_version_string_to_stdout() {
     let out = Command::new(compiler("armfortas"))
@@ -226,6 +246,327 @@ fn fixed_form_program_compiles_and_runs() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
+    let dir = unique_dir("imported_param_char_len");
+    let mod_src = write_program_in(
+        &dir,
+        "cfg.f90",
+        "module cfg\n  implicit none\n  integer, parameter :: max_path_len = 32\nend module cfg\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use cfg, only: max_path_len\n  implicit none\n  character(len=max_path_len) :: arg1\n  call get_command_argument(1, arg1)\n  if (trim(arg1) /= '--version') error stop 1\n  print *, trim(arg1)\nend program\n",
+    );
+
+    let mod_obj = dir.join("cfg.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cfg module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "cfg module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile with imported fixed char len: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_param_char_len.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported-param char-len objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .arg("--version")
+        .output()
+        .expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "imported-param char-len binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("--version"),
+        "imported fixed char len should preserve command argument text: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_param_char_dummy_element_assignment_runs() {
+    let dir = unique_dir("imported_param_char_dummy");
+    let cfg_src = write_program_in(
+        &dir,
+        "cfg.f90",
+        "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 32\nend module cfg\n",
+    );
+    let ops_src = write_program_in(
+        &dir,
+        "ops.f90",
+        "module ops\n  use cfg, only: max_token_len\n  implicit none\ncontains\n  subroutine set_first(words)\n    character(len=max_token_len), intent(inout) :: words(:)\n    character(len=max_token_len) :: tmp\n    tmp = 'hello'\n    words(1) = tmp\n  end subroutine set_first\nend module ops\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use cfg, only: max_token_len\n  use ops, only: set_first\n  implicit none\n  character(len=max_token_len), allocatable :: words(:)\n  allocate(words(2))\n  words = ''\n  call set_first(words)\n  print *, trim(words(1))\nend program p\n",
+    );
+
+    let cfg_obj = dir.join("cfg.o");
+    let compile_cfg = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            cfg_src.to_str().unwrap(),
+            "-o",
+            cfg_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cfg compile failed to spawn");
+    assert!(
+        compile_cfg.status.success(),
+        "cfg module should compile: {}",
+        String::from_utf8_lossy(&compile_cfg.stderr)
+    );
+
+    let ops_obj = dir.join("ops.o");
+    let compile_ops = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            ops_src.to_str().unwrap(),
+            "-o",
+            ops_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ops compile failed to spawn");
+    assert!(
+        compile_ops.status.success(),
+        "imported-param char dummy assignment should compile: {}",
+        String::from_utf8_lossy(&compile_ops.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_param_char_dummy.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            cfg_obj.to_str().unwrap(),
+            ops_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported-param char dummy objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "imported-param char dummy binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("hello"),
+        "dummy char assignment should preserve fixed imported length: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_param_char_section_assignment_preserves_elements() {
+    let dir = unique_dir("imported_param_char_section");
+    let cfg_src = write_program_in(
+        &dir,
+        "cfg.f90",
+        "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 32\nend module cfg\n",
+    );
+    let ops_src = write_program_in(
+        &dir,
+        "ops.f90",
+        "module ops\n  use cfg, only: max_token_len\n  implicit none\ncontains\n  subroutine grow(words, current_size)\n    character(len=max_token_len), allocatable, intent(inout) :: words(:)\n    integer, intent(inout) :: current_size\n    character(len=max_token_len), allocatable :: new_words(:)\n    integer :: new_size\n    new_size = current_size * 2\n    allocate(new_words(new_size))\n    new_words(1:current_size) = words(1:current_size)\n    call move_alloc(new_words, words)\n    current_size = new_size\n  end subroutine grow\nend module ops\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use cfg, only: max_token_len\n  use ops, only: grow\n  implicit none\n  character(len=max_token_len), allocatable :: words(:)\n  integer :: n\n  n = 2\n  allocate(words(n))\n  words = ''\n  words(1) = 'one'\n  words(2) = 'two'\n  call grow(words, n)\n  print *, trim(words(1)), trim(words(2)), n\nend program p\n",
+    );
+
+    let cfg_obj = dir.join("cfg.o");
+    let compile_cfg = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            cfg_src.to_str().unwrap(),
+            "-o",
+            cfg_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cfg compile failed to spawn");
+    assert!(
+        compile_cfg.status.success(),
+        "cfg module should compile: {}",
+        String::from_utf8_lossy(&compile_cfg.stderr)
+    );
+
+    let ops_obj = dir.join("ops.o");
+    let compile_ops = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            ops_src.to_str().unwrap(),
+            "-o",
+            ops_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ops compile failed to spawn");
+    assert!(
+        compile_ops.status.success(),
+        "imported-param char section assignment should compile: {}",
+        String::from_utf8_lossy(&compile_ops.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_param_char_section.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            cfg_obj.to_str().unwrap(),
+            ops_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported-param char section objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "imported-param char section binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("one") && stdout.contains("two") && stdout.contains('4'),
+        "char section assignment should preserve copied elements: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -397,6 +738,181 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn bind_c_subroutine_value_arg_is_passed_by_value() {
+    let dir = unique_dir("bind_c_subroutine_value");
+    let c_src = write_program_in(
+        &dir,
+        "store_incremented.c",
+        "#include <stdint.h>\n\nvoid store_incremented(int32_t value, int32_t *out) {\n    *out = value + 1;\n}\n",
+    );
+    let c_obj = dir.join("store_incremented.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine store_incremented(value, out) bind(C, name='store_incremented')\n      import :: c_int\n      integer(c_int), value :: value\n      integer(c_int), intent(out) :: out\n    end subroutine store_incremented\n  end interface\n  integer(c_int) :: out\n  call store_incremented(41_c_int, out)\n  if (out /= 42_c_int) error stop 1\n  print *, out\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value subroutine object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) value subroutine should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_subroutine_value.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value subroutine link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) value subroutine objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) value run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) value subroutine should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("42"),
+        "bind(c) value subroutine should observe the by-value integer argument: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
+    let dir = unique_dir("bind_c_interface_value_amod");
+    let c_src = write_program_in(
+        &dir,
+        "store_incremented.c",
+        "#include <stdint.h>\n\nvoid store_incremented(int32_t value, int32_t *out) {\n    *out = value + 1;\n}\n",
+    );
+    let c_obj = dir.join("store_incremented.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let mod_src = write_program_in(
+        &dir,
+        "c_math.f90",
+        "module c_math\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine store_incremented(value, out) bind(C, name='store_incremented')\n      import :: c_int\n      integer(c_int), value :: value\n      integer(c_int), intent(out) :: out\n    end subroutine store_incremented\n  end interface\nend module c_math\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int\n  use c_math, only: store_incremented\n  implicit none\n  integer(c_int) :: out\n  call store_incremented(41_c_int, out)\n  if (out /= 42_c_int) error stop 1\n  print *, out\nend program\n",
+    );
+
+    let mod_obj = dir.join("c_math.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) interface module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "bind(c) interface module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("c_math.amod")).expect("missing c_math.amod");
+    assert!(
+        amod.contains("@arg value") && amod.contains("value"),
+        "interface-declared VALUE arg should survive into .amod: {}",
+        amod
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) interface user compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "bind(c) interface user should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("bind_c_interface_value.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) interface user link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) interface user objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) interface user run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) interface user binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("42"),
+        "unexpected bind(c) interface user output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -846,6 +1362,132 @@ fn allocated_on_derived_array_element_component_uses_descriptor_runtime() {
         !undefined.iter().any(|sym| sym == "_allocated" || sym == "_size"),
         "derived array element component intrinsics should not call raw allocated/size symbols: {:?}",
         undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_derived_shell_initialization_runs_through_components() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    type(string_t), allocatable :: positional_params(:)\n    integer, allocatable :: counts(:)\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  call initialize_shell(shell)\n  if (.not. allocated(shell%positional_params)) stop 10\n  if (.not. allocated(shell%counts)) stop 11\n  if (shell%counts(1) /= 7) stop 12\n  print *, trim(shell%positional_params(1)%str)\ncontains\n  subroutine initialize_shell(shell)\n    type(shell_t), intent(out) :: shell\n    if (allocated(shell%positional_params)) stop 1\n    if (allocated(shell%counts)) stop 2\n    allocate(shell%positional_params(2))\n    allocate(shell%counts(2))\n    shell%positional_params(1)%str = 'ok'\n    shell%counts = [7, 9]\n  end subroutine initialize_shell\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocatable_derived_shell", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable derived shell compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable derived shell compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable derived shell run failed");
+    assert!(
+        run.status.success(),
+        "allocatable derived shell run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "allocatable derived shell should initialize nested components: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_f_pointer_array_target_builds_descriptor_backing() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  type(c_ptr) :: raw\n  character(kind=c_char), pointer :: view(:)\n  buf = [achar(111, kind=c_char), achar(107, kind=c_char), c_null_char, achar(120, kind=c_char)]\n  raw = c_loc(buf)\n  call c_f_pointer(raw, view, [4])\n  if (.not. associated(view)) stop 1\n  if (view(1) /= buf(1)) stop 2\n  if (view(2) /= buf(2)) stop 3\n  if (view(3) /= c_null_char) stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_f_pointer_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_f_pointer array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_f_pointer array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_f_pointer array run failed");
+    assert!(
+        run.status.success(),
+        "c_f_pointer array run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_c_char_array_element_assignment_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  integer :: i\n  do i = 1, 3\n    buf(i) = achar(96 + i, kind=c_char)\n  end do\n  buf(4) = c_null_char\n  if (buf(1) /= achar(97, kind=c_char)) stop 1\n  if (buf(2) /= achar(98, kind=c_char)) stop 2\n  if (buf(3) /= achar(99, kind=c_char)) stop 3\n  if (buf(4) /= c_null_char) stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_c_char_array_store", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed c_char array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed c_char array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed c_char array run failed");
+    assert!(
+        run.status.success(),
+        "fixed c_char array run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), allocatable, target :: c_tokens(:,:)\n  type(c_ptr) :: raw\n  integer :: i\n  allocate(c_tokens(4, 1))\n  do i = 1, 3\n    c_tokens(i, 1) = achar(96 + i, kind=c_char)\n  end do\n  c_tokens(4, 1) = c_null_char\n  raw = c_loc(c_tokens(1, 1))\n  if (.not. c_associated(raw)) stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cloc_alloc_c_char_element", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_loc allocatable c_char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_loc allocatable c_char compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_loc allocatable c_char run failed");
+    assert!(
+        run.status.success(),
+        "c_loc allocatable c_char run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -3040,6 +3682,41 @@ fn deferred_char_allocatable_dummy_uses_descriptor_abi() {
 }
 
 #[test]
+fn deferred_char_allocatable_array_dummy_whole_and_element_assignment_runs() {
+    let src = write_program(
+        "module m\ncontains\n  subroutine fill(tokens)\n    character(len=:), allocatable, intent(out) :: tokens(:)\n    allocate(character(len=32) :: tokens(2))\n    tokens = ''\n    tokens(1) = 'hello'\n    tokens(2) = 'world'\n  end subroutine\nend module\nprogram p\n  use m, only: fill\n  implicit none\n  character(len=:), allocatable :: tokens(:)\n  call fill(tokens)\n  print *, trim(tokens(1)), trim(tokens(2))\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_array_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred-length allocatable character array dummy should compile and link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred-length allocatable character array dummy binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("hello") && stdout.contains("world"),
+        "deferred char array dummy assignments should preserve element text: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_renamed_procedure_call_uses_remote_symbol() {
     let dir = unique_dir("use_rename_proc");
     let mod_src = write_program_in(
@@ -3423,6 +4100,164 @@ fn allocatable_result_helper_assignment_uses_resolved_symbol() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_char_function_result_round_trips_across_amod_and_runs() {
+    let dir = unique_dir("deferred_char_result_runtime");
+    let mod_src = write_program_in(
+        &dir,
+        "builder.f90",
+        "module builder\ncontains\n  function make_text(n) result(text)\n    integer, intent(in) :: n\n    integer :: i\n    character(len=:), allocatable :: text\n    allocate(character(len=n) :: text)\n    do i = 1, n\n      text(i:i) = 'x'\n    end do\n  end function make_text\nend module builder\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use builder\n  implicit none\n  character(len=:), allocatable :: s\n  s = make_text(3)\n  if (len(s) /= 3) error stop 1\n  if (s /= 'xxx') error stop 2\n  print *, trim(s)\nend program\n",
+    );
+
+    let mod_obj = dir.join("builder.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("builder module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "deferred-char builder module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported deferred-char result caller should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("deferred_char_result.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "deferred-char result objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "deferred-char result binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("xxx"),
+        "unexpected deferred-char result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fixed_allocatable_character_substring_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16), allocatable :: buffer\n  allocate(buffer)\n  buffer = ''\n  buffer(1:1) = 'A'\n  if (buffer(1:1) /= 'A') error stop 1\n  print *, trim(buffer)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_char_substring", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable-char substring compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "fixed allocatable character substring should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "fixed allocatable character substring should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('A'),
+        "unexpected allocatable-char substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn local_array_element_does_not_fall_back_to_unrelated_char_symbol() {
+    let src = write_program(
+        "module helper_mod\ncontains\n  function values(i) result(out)\n    integer, intent(in) :: i\n    character(len=1) :: out\n    if (i > 0) then\n      out = 'x'\n    else\n      out = 'y'\n    end if\n  end function values\nend module helper_mod\n\nprogram p\n  implicit none\n  integer :: values(8)\n  values = 0\n  values(2) = 5\n  if (values(2) >= 1 .and. values(2) <= 12) print *, values(2)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("local_array_element_scope", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("local-array-element compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "local array element should not lower as an unrelated character call: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "local array element binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('5'),
+        "unexpected local-array-element output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

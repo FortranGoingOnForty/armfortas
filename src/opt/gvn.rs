@@ -629,6 +629,7 @@ mod tests {
             &type_layouts,
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         )
         .0
     }
