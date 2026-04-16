@@ -68,6 +68,7 @@ fn optir_respects_requested_optimization_level() {
 #[test]
 fn backend_capture_stages_use_optimized_ir() {
     let source = fixture("inline_pure.f90");
+    let outlined_helper = "_afs_internal___prog_inline_pure_1";
 
     let asm_o0 = capture_text(
         CaptureRequest {
@@ -87,19 +88,19 @@ fn backend_capture_stages_use_optimized_ir() {
     );
 
     assert!(
-        asm_o0.contains("bl _double_it"),
+        asm_o0.contains(&format!("bl {}", outlined_helper)),
         "O0 assembly should still contain the out-of-line helper call"
     );
     assert!(
-        asm_o0.contains("_double_it:"),
+        asm_o0.contains(&format!("{}:", outlined_helper)),
         "O0 assembly should still emit the contained helper function"
     );
     assert!(
-        !asm_o2.contains("bl _double_it"),
+        !asm_o2.contains(&format!("bl {}", outlined_helper)),
         "O2 assembly capture should reflect inlining and remove helper calls"
     );
     assert!(
-        !asm_o2.contains("_double_it:"),
+        !asm_o2.contains(&format!("{}:", outlined_helper)),
         "O2 assembly capture should not emit a now-dead outlined helper"
     );
 }

@@ -109,6 +109,7 @@ fn opt_name(opt: OptLevel) -> &'static str {
 #[test]
 fn optimized_object_snapshot_removes_inlined_helper_symbol() {
     let source = fixture("inline_pure.f90");
+    let outlined_helper = "private external _afs_internal___prog_inline_pure_1";
 
     let obj_o0 = capture_text(
         CaptureRequest {
@@ -128,12 +129,12 @@ fn optimized_object_snapshot_removes_inlined_helper_symbol() {
     );
 
     assert!(
-        obj_o0.contains("external _double_it"),
+        obj_o0.contains(outlined_helper),
         "O0 object snapshot should still export the outlined helper:\n{}",
         obj_o0
     );
     assert!(
-        !obj_o2.contains("external _double_it"),
+        !obj_o2.contains(outlined_helper),
         "O2 object snapshot should reflect inlining + dead function elimination:\n{}",
         obj_o2
     );
