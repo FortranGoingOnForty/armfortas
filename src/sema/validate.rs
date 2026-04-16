@@ -223,6 +223,528 @@ pub fn validate_file_with_layouts_and_warning_groups(
     ctx.diags
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConstIntValue {
+    value: i128,
+    kind: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConstIntError {
+    span: Span,
+    msg: &'static str,
+}
+
+fn default_int_kind(kind: Option<u8>) -> u8 {
+    kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
+}
+
+fn parse_int_literal_kind(kind: &Option<String>) -> u8 {
+    kind.as_ref()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or_else(crate::driver::defaults::default_int_kind)
+}
+
+fn int_kind_bounds(kind: u8) -> Option<(i128, i128)> {
+    let bits = u32::from(kind).checked_mul(8)?;
+    if bits == 0 {
+        return None;
+    }
+    if bits >= 128 {
+        return Some((i128::MIN, i128::MAX));
+    }
+    let shift = bits - 1;
+    Some((-(1i128 << shift), (1i128 << shift) - 1))
+}
+
+fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
+    let Some((min, max)) = int_kind_bounds(kind) else {
+        return Ok(ConstIntValue { value, kind });
+    };
+    if value < min || value > max {
+        return Err(ConstIntError {
+            span,
+            msg: "compile-time integer overflow",
+        });
+    }
+    Ok(ConstIntValue { value, kind })
+}
+
+fn const_int_kind_of_symbol(sym: &Symbol) -> Option<u8> {
+    match &sym.type_info {
+        Some(TypeInfo::Integer { kind }) => Some(default_int_kind(*kind)),
+        _ => None,
+    }
+}
+
+fn eval_const_int_expr_checked(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Result<Option<ConstIntValue>, ConstIntError> {
+    match &expr.node {
+        Expr::IntegerLiteral { text, kind } => {
+            let clean = text.split('_').next().unwrap_or(text);
+            let value = clean.parse::<i128>().map_err(|_| ConstIntError {
+                span: expr.span,
+                msg: "compile-time integer overflow",
+            })?;
+            checked_int_value(value, parse_int_literal_kind(kind), expr.span).map(Some)
+        }
+        Expr::Name { name } => {
+            let Some(sym) = ctx.lookup(name) else {
+                return Ok(None);
+            };
+            let Some(kind) = const_int_kind_of_symbol(sym) else {
+                return Ok(None);
+            };
+            let Some(value) = sym.const_value.map(i128::from) else {
+                return Ok(None);
+            };
+            checked_int_value(value, kind, expr.span).map(Some)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let Some(value) = eval_const_int_expr_checked(ctx, operand)? else {
+                return Ok(None);
+            };
+            match op {
+                crate::ast::expr::UnaryOp::Plus => {
+                    checked_int_value(value.value, value.kind, expr.span).map(Some)
+                }
+                crate::ast::expr::UnaryOp::Minus => {
+                    let negated = value.value.checked_neg().ok_or(ConstIntError {
+                        span: expr.span,
+                        msg: "compile-time integer overflow",
+                    })?;
+                    checked_int_value(negated, value.kind, expr.span).map(Some)
+                }
+                _ => Ok(None),
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let Some(left_value) = eval_const_int_expr_checked(ctx, left)? else {
+                return Ok(None);
+            };
+            let Some(right_value) = eval_const_int_expr_checked(ctx, right)? else {
+                return Ok(None);
+            };
+            let kind = left_value.kind.max(right_value.kind);
+            let value = match op {
+                crate::ast::expr::BinaryOp::Add => left_value
+                    .value
+                    .checked_add(right_value.value)
+                    .ok_or(ConstIntError {
+                        span: expr.span,
+                        msg: "compile-time integer overflow",
+                    })?,
+                crate::ast::expr::BinaryOp::Sub => left_value
+                    .value
+                    .checked_sub(right_value.value)
+                    .ok_or(ConstIntError {
+                        span: expr.span,
+                        msg: "compile-time integer overflow",
+                    })?,
+                crate::ast::expr::BinaryOp::Mul => left_value
+                    .value
+                    .checked_mul(right_value.value)
+                    .ok_or(ConstIntError {
+                        span: expr.span,
+                        msg: "compile-time integer overflow",
+                    })?,
+                crate::ast::expr::BinaryOp::Div => {
+                    if right_value.value == 0 {
+                        return Err(ConstIntError {
+                            span: right.span,
+                            msg: "compile-time integer division by zero",
+                        });
+                    }
+                    left_value
+                        .value
+                        .checked_div(right_value.value)
+                        .ok_or(ConstIntError {
+                            span: expr.span,
+                            msg: "compile-time integer overflow",
+                        })?
+                }
+                crate::ast::expr::BinaryOp::Pow => {
+                    let Ok(exp) = u32::try_from(right_value.value) else {
+                        return Ok(None);
+                    };
+                    left_value.value.checked_pow(exp).ok_or(ConstIntError {
+                        span: expr.span,
+                        msg: "compile-time integer overflow",
+                    })?
+                }
+                _ => return Ok(None),
+            };
+            checked_int_value(value, kind, expr.span).map(Some)
+        }
+        Expr::ParenExpr { inner } => eval_const_int_expr_checked(ctx, inner),
+        _ => Ok(None),
+    }
+}
+
+fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    match &expr.node {
+        Expr::IntegerLiteral { .. } => {
+            if let Err(diag) = eval_const_int_expr_checked(ctx, expr) {
+                ctx.error(diag.span, diag.msg);
+            }
+        }
+        Expr::UnaryOp { op, operand } => {
+            if matches!(
+                op,
+                crate::ast::expr::UnaryOp::Plus | crate::ast::expr::UnaryOp::Minus
+            ) {
+                match eval_const_int_expr_checked(ctx, expr) {
+                    Ok(Some(_)) => {}
+                    Err(diag) => ctx.error(diag.span, diag.msg),
+                    Ok(None) => validate_const_int_expr_tree(ctx, operand),
+                }
+            } else {
+                validate_const_int_expr_tree(ctx, operand);
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            if matches!(
+                op,
+                crate::ast::expr::BinaryOp::Add
+                    | crate::ast::expr::BinaryOp::Sub
+                    | crate::ast::expr::BinaryOp::Mul
+                    | crate::ast::expr::BinaryOp::Div
+                    | crate::ast::expr::BinaryOp::Pow
+            ) {
+                match eval_const_int_expr_checked(ctx, expr) {
+                    Ok(Some(_)) => {}
+                    Err(diag) => ctx.error(diag.span, diag.msg),
+                    Ok(None) => {
+                        validate_const_int_expr_tree(ctx, left);
+                        validate_const_int_expr_tree(ctx, right);
+                    }
+                }
+            } else {
+                validate_const_int_expr_tree(ctx, left);
+                validate_const_int_expr_tree(ctx, right);
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            validate_const_int_expr_tree(ctx, callee);
+            for arg in args {
+                validate_const_int_subscript(ctx, &arg.value);
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                validate_const_int_ac_value(ctx, value);
+            }
+        }
+        Expr::ComponentAccess { base, .. } => validate_const_int_expr_tree(ctx, base),
+        Expr::ComplexLiteral { real, imag } => {
+            validate_const_int_expr_tree(ctx, real);
+            validate_const_int_expr_tree(ctx, imag);
+        }
+        Expr::ParenExpr { inner } => validate_const_int_expr_tree(ctx, inner),
+        Expr::Name { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. } => {}
+    }
+}
+
+fn validate_const_int_subscript(ctx: &mut Ctx<'_>, value: &crate::ast::expr::SectionSubscript) {
+    match value {
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            validate_const_int_expr_tree(ctx, expr)
+        }
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            if let Some(expr) = start {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+            if let Some(expr) = end {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+            if let Some(expr) = stride {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+        }
+    }
+}
+
+fn validate_const_int_ac_value(ctx: &mut Ctx<'_>, value: &crate::ast::expr::AcValue) {
+    match value {
+        crate::ast::expr::AcValue::Expr(expr) => validate_const_int_expr_tree(ctx, expr),
+        crate::ast::expr::AcValue::ImpliedDo(loop_) => {
+            for nested in &loop_.values {
+                validate_const_int_ac_value(ctx, nested);
+            }
+            validate_const_int_expr_tree(ctx, &loop_.start);
+            validate_const_int_expr_tree(ctx, &loop_.end);
+            if let Some(step) = &loop_.step {
+                validate_const_int_expr_tree(ctx, step);
+            }
+        }
+    }
+}
+
+fn validate_const_int_array_spec(ctx: &mut Ctx<'_>, spec: &crate::ast::decl::ArraySpec) {
+    match spec {
+        crate::ast::decl::ArraySpec::Explicit { lower, upper } => {
+            if let Some(lower) = lower {
+                validate_const_int_expr_tree(ctx, lower);
+            }
+            validate_const_int_expr_tree(ctx, upper);
+        }
+        crate::ast::decl::ArraySpec::AssumedShape { lower }
+        | crate::ast::decl::ArraySpec::AssumedSize { lower } => {
+            if let Some(lower) = lower {
+                validate_const_int_expr_tree(ctx, lower);
+            }
+        }
+        crate::ast::decl::ArraySpec::Deferred | crate::ast::decl::ArraySpec::AssumedRank => {}
+    }
+}
+
+fn validate_const_int_type_spec(ctx: &mut Ctx<'_>, type_spec: &TypeSpec) {
+    match type_spec {
+        TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Star(expr))) => {
+            validate_const_int_expr_tree(ctx, expr);
+        }
+        TypeSpec::Character(Some(sel)) => {
+            if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &sel.len {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+            if let Some(kind) = &sel.kind {
+                validate_const_int_expr_tree(ctx, kind);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::SpannedDecl) {
+    match &decl.node {
+        Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } => {
+            validate_const_int_type_spec(ctx, type_spec);
+            for attr in attrs {
+                if let Attribute::Dimension(specs) = attr {
+                    for spec in specs {
+                        validate_const_int_array_spec(ctx, spec);
+                    }
+                }
+            }
+            for entity in entities {
+                if let Some(specs) = &entity.array_spec {
+                    for spec in specs {
+                        validate_const_int_array_spec(ctx, spec);
+                    }
+                }
+                if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &entity.char_len {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+                if let Some(init) = &entity.init {
+                    validate_const_int_expr_tree(ctx, init);
+                }
+                if let Some(init) = &entity.ptr_init {
+                    validate_const_int_expr_tree(ctx, init);
+                }
+            }
+        }
+        Decl::ParameterStmt { pairs } => {
+            for (_, expr) in pairs {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+        }
+        Decl::EquivalenceStmt { groups } => {
+            for group in groups {
+                for expr in group {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+            }
+        }
+        Decl::DataStmt { sets } => {
+            for set in sets {
+                for expr in &set.objects {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+                for expr in &set.values {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+            }
+        }
+        Decl::EnumDef { enumerators } => {
+            for (_, expr) in enumerators {
+                if let Some(expr) = expr {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
+    match &stmt.node {
+        Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
+            validate_const_int_expr_tree(ctx, target);
+            validate_const_int_expr_tree(ctx, value);
+        }
+        Stmt::IfConstruct {
+            condition,
+            else_ifs,
+            ..
+        } => {
+            validate_const_int_expr_tree(ctx, condition);
+            for (expr, _) in else_ifs {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+        }
+        Stmt::IfStmt { condition, .. }
+        | Stmt::DoWhile { condition, .. }
+        | Stmt::SelectCase {
+            selector: condition,
+            ..
+        }
+        | Stmt::SelectType {
+            selector: condition,
+            ..
+        }
+        | Stmt::ComputedGoto {
+            selector: condition,
+            ..
+        }
+        | Stmt::ArithmeticIf {
+            expr: condition, ..
+        }
+        | Stmt::WhereStmt {
+            mask: condition, ..
+        } => validate_const_int_expr_tree(ctx, condition),
+        Stmt::DoLoop {
+            start, end, step, ..
+        } => {
+            if let Some(start) = start {
+                validate_const_int_expr_tree(ctx, start);
+            }
+            if let Some(end) = end {
+                validate_const_int_expr_tree(ctx, end);
+            }
+            if let Some(step) = step {
+                validate_const_int_expr_tree(ctx, step);
+            }
+        }
+        Stmt::DoConcurrent { controls, mask, .. } => {
+            for control in controls {
+                validate_const_int_expr_tree(ctx, &control.start);
+                validate_const_int_expr_tree(ctx, &control.end);
+                if let Some(step) = &control.step {
+                    validate_const_int_expr_tree(ctx, step);
+                }
+            }
+            if let Some(mask) = mask {
+                validate_const_int_expr_tree(ctx, mask);
+            }
+        }
+        Stmt::WhereConstruct {
+            mask, elsewhere, ..
+        } => {
+            validate_const_int_expr_tree(ctx, mask);
+            for (maybe_mask, _) in elsewhere {
+                if let Some(mask) = maybe_mask {
+                    validate_const_int_expr_tree(ctx, mask);
+                }
+            }
+        }
+        Stmt::ForallConstruct { specs, mask, .. } | Stmt::ForallStmt { specs, mask, .. } => {
+            for spec in specs {
+                validate_const_int_expr_tree(ctx, &spec.start);
+                validate_const_int_expr_tree(ctx, &spec.end);
+                if let Some(step) = &spec.step {
+                    validate_const_int_expr_tree(ctx, step);
+                }
+            }
+            if let Some(mask) = mask {
+                validate_const_int_expr_tree(ctx, mask);
+            }
+        }
+        Stmt::Associate { assocs, .. } => {
+            for (_, expr) in assocs {
+                validate_const_int_expr_tree(ctx, expr);
+            }
+        }
+        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+            if let Some(code) = code {
+                validate_const_int_expr_tree(ctx, code);
+            }
+        }
+        Stmt::Write { controls, items }
+        | Stmt::Read { controls, items }
+        | Stmt::Inquire {
+            specs: controls,
+            items,
+        } => {
+            for control in controls {
+                validate_const_int_expr_tree(ctx, &control.value);
+            }
+            for item in items {
+                validate_const_int_expr_tree(ctx, item);
+            }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for spec in specs {
+                validate_const_int_expr_tree(ctx, &spec.value);
+            }
+        }
+        Stmt::Allocate { items, opts } | Stmt::Deallocate { items, opts } => {
+            for item in items {
+                validate_const_int_expr_tree(ctx, item);
+            }
+            for opt in opts {
+                validate_const_int_expr_tree(ctx, &opt.value);
+            }
+        }
+        Stmt::Nullify { items } => {
+            for item in items {
+                validate_const_int_expr_tree(ctx, item);
+            }
+        }
+        Stmt::Call { callee, args } => {
+            validate_const_int_expr_tree(ctx, callee);
+            for arg in args {
+                validate_const_int_subscript(ctx, &arg.value);
+            }
+        }
+        Stmt::Print { items, .. } => {
+            for item in items {
+                validate_const_int_expr_tree(ctx, item);
+            }
+        }
+        Stmt::Block { .. }
+        | Stmt::Declaration(_)
+        | Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Labeled { .. }
+        | Stmt::Namelist { .. } => {}
+    }
+}
+
 fn warn_legacy_feature(ctx: &mut Ctx<'_>, span: Span, feature: &str) {
     if ctx.warn_pedantic || ctx.warn_deprecated {
         ctx.warning(span, format!("{} is an obsolescent feature", feature));
@@ -560,6 +1082,8 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 
 fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
     for decl in decls {
+        validate_decl_const_int_exprs(ctx, decl);
+
         if let Decl::TypeDecl {
             attrs,
             entities,
@@ -695,6 +1219,8 @@ fn validate_stmts(ctx: &mut Ctx, stmts: &[SpannedStmt]) {
 }
 
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
+    validate_stmt_const_int_exprs(ctx, stmt);
+
     match &stmt.node {
         // ---- Assignment ----
         Stmt::Assignment { target, value } => {
@@ -739,17 +1265,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         | Stmt::Backspace { .. }
         | Stmt::Endfile { .. }
         | Stmt::Flush { .. }
-        | Stmt::Wait { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
-            }
+        | Stmt::Wait { .. }
+            if ctx.in_pure =>
+        {
+            ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
         }
 
         // ---- STOP in pure ----
-        Stmt::Stop { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "STOP not allowed in pure procedure");
-            }
+        Stmt::Stop { .. } if ctx.in_pure => {
+            ctx.error(stmt.span, "STOP not allowed in pure procedure");
         }
         Stmt::ErrorStop { .. } => {
             if ctx.in_pure {
@@ -1188,16 +1712,16 @@ fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, spa
         return;
     };
     match sym.kind {
-        SymbolKind::Function | SymbolKind::Subroutine => {
-            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic {
-                ctx.error(
-                    span,
-                    format!(
-                        "call to '{}' inside a pure procedure: callee is not pure, elemental, or intrinsic (F2018 15.7)",
-                        sym.name
-                    ),
-                );
-            }
+        SymbolKind::Function | SymbolKind::Subroutine
+            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic =>
+        {
+            ctx.error(
+                span,
+                format!(
+                    "call to '{}' inside a pure procedure: callee is not pure, elemental, or intrinsic (F2018 15.7)",
+                    sym.name
+                ),
+            );
         }
         SymbolKind::IntrinsicProc => {} // always OK
         _ => {}                         // external / unknown — can't check

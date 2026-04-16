@@ -409,10 +409,8 @@ fn get_branch_arg_to(func: &Function, from: BlockId, to: BlockId, idx: usize) ->
 fn set_branch_arg_to(func: &mut Function, from: BlockId, to: BlockId, idx: usize, val: ValueId) {
     let block = func.block_mut(from);
     match &mut block.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == to => {
-            if idx < args.len() {
-                args[idx] = val;
-            }
+        Some(Terminator::Branch(dest, args)) if *dest == to && idx < args.len() => {
+            args[idx] = val;
         }
         Some(Terminator::CondBranch {
             true_dest,

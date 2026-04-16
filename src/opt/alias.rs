@@ -81,23 +81,18 @@ pub fn query(func: &Function, a: ValueId, b: ValueId) -> AliasResult {
 
     // Different base pointers → no alias (Fortran guarantee).
     match (&base_a, &base_b) {
-        (PtrBase::Alloca(id_a), PtrBase::Alloca(id_b)) => {
-            if id_a != id_b {
-                return AliasResult::NoAlias;
-            }
+        (PtrBase::Alloca(id_a), PtrBase::Alloca(id_b)) if id_a != id_b => {
+            return AliasResult::NoAlias;
         }
-        (PtrBase::Global(name_a), PtrBase::Global(name_b)) => {
-            if name_a != name_b {
-                return AliasResult::NoAlias;
-            }
+        (PtrBase::Global(name_a), PtrBase::Global(name_b)) if name_a != name_b => {
+            return AliasResult::NoAlias;
         }
-        (PtrBase::Param(id_a), PtrBase::Param(id_b)) => {
+        (PtrBase::Param(id_a), PtrBase::Param(id_b))
             if id_a != id_b
                 && param_is_fortran_noalias(func, *id_a)
-                && param_is_fortran_noalias(func, *id_b)
-            {
-                return AliasResult::NoAlias;
-            }
+                && param_is_fortran_noalias(func, *id_b) =>
+        {
+            return AliasResult::NoAlias;
         }
         (PtrBase::Alloca(_), PtrBase::Global(_))
         | (PtrBase::Global(_), PtrBase::Alloca(_))

@@ -31,6 +31,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn o1_eliminates_unused_pure_recursive_call_from_program_entry() {
     let source = fixture("pure_dead_call.f90");
@@ -51,17 +70,25 @@ fn o1_eliminates_unused_pure_recursive_call_from_program_entry() {
         },
         Stage::OptIr,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained pure helper:\n{}",
+        raw_ir
+    );
+    let helper_name = function_name(raw_sections[1]);
 
     let raw_main = function_section(&raw_ir, "__prog_pure_dead_call");
     let opt_main = function_section(&opt_ir, "__prog_pure_dead_call");
 
     assert!(
-        raw_main.contains("call @heavy_fact(") || raw_main.contains("call @func_"),
+        raw_main.contains(&format!("call @{}(", helper_name)),
         "lowered caller should still contain the unused PURE call before optimization:\n{}",
         raw_main
     );
     assert!(
-        !opt_main.contains("call @heavy_fact(") && !opt_main.contains("call @func_"),
+        !opt_main.contains(&format!("call @{}(", helper_name)),
         "O1 optimized caller should delete the dead PURE call:\n{}",
         opt_main
     );

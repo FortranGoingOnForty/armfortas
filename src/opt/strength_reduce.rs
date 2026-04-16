@@ -314,7 +314,7 @@ impl Pass for StrengthReduce {
             // block-then-instruction order so that inserting a new
             // const instruction at index `ii` doesn't shift the
             // indices of any earlier rewrite still pending.
-            rewrites.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+            rewrites.sort_by_key(|entry| std::cmp::Reverse((entry.0, entry.1)));
 
             // Audit B-2: collect all Identity rewrites into a single
             // rename map and apply them in one function walk at the

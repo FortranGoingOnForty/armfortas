@@ -268,7 +268,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             // ---- Output path ----
             "-o" => {
                 i += 1;
-                opts.output = Some(PathBuf::from(args.get(i).ok_or("-o requires an argument")?));
+                let value = args.get(i).ok_or("-o requires an argument")?;
+                set_output_path(&mut opts, value)?;
+            }
+            arg if arg.starts_with("-o") => {
+                set_output_path(&mut opts, short_option_value(arg, "-o", "an argument")?)?;
             }
 
             // ---- Mode ----
@@ -302,7 +306,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.module_search_paths
                     .push(PathBuf::from(args.get(i).ok_or("-I requires a directory")?));
             }
-            arg if arg.starts_with("-I") => opts.module_search_paths.push(PathBuf::from(&arg[2..])),
+            arg if arg.starts_with("-I") => opts
+                .module_search_paths
+                .push(PathBuf::from(short_option_value(arg, "-I", "a directory")?)),
 
             "-J" => {
                 i += 1;
@@ -310,7 +316,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     Some(PathBuf::from(args.get(i).ok_or("-J requires a directory")?));
             }
             arg if arg.starts_with("-J") => {
-                opts.module_output_dir = Some(PathBuf::from(&arg[2..]));
+                opts.module_output_dir = Some(PathBuf::from(short_option_value(
+                    arg,
+                    "-J",
+                    "a directory",
+                )?));
             }
 
             // ---- Linker search / libs / rpath ----
@@ -320,7 +330,8 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     .push(PathBuf::from(args.get(i).ok_or("-L requires a directory")?));
             }
             arg if arg.starts_with("-L") => {
-                opts.library_search_paths.push(PathBuf::from(&arg[2..]))
+                opts.library_search_paths
+                    .push(PathBuf::from(short_option_value(arg, "-L", "a directory")?))
             }
 
             "-l" => {
@@ -328,7 +339,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.link_libs
                     .push(args.get(i).ok_or("-l requires a library name")?.clone());
             }
-            arg if arg.starts_with("-l") => opts.link_libs.push(arg[2..].to_string()),
+            arg if arg.starts_with("-l") => opts.link_libs.push(
+                short_option_value(arg, "-l", "a library name")?.to_string(),
+            ),
 
             "-rpath" | "--rpath" => {
                 i += 1;
@@ -422,6 +435,10 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     }
 
     collect_cli_warnings(&mut opts, &unknown_warning_flags);
+
+    if matches!(opts.diagnostics_format, DiagnosticsFormat::Json) {
+        return Err("JSON diagnostics are not yet implemented".into());
+    }
 
     if inputs.is_empty() {
         return Err("no input file".into());
@@ -948,6 +965,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let source = fs::read_to_string(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
     phase.end(&mut phases);
+    let file_str = opts.input.display().to_string();
 
     // 2. Preprocess.
     let source_form = match opts.source_form_override {
@@ -987,15 +1005,24 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
-        let out = opts.output_path();
-        if out.as_os_str() == "-" {
+        if opts.output.is_none() {
             print!("{}", preprocessed);
         } else {
-            fs::write(&out, &preprocessed)
-                .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+            let out = opts.output_path();
+            if out.as_os_str() == "-" {
+                print!("{}", preprocessed);
+            } else {
+                fs::write(&out, &preprocessed)
+                    .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+            }
+            if opts.verbose {
+                eprintln!(" preprocess-only: wrote {}", out.display());
+            }
+            phases.report();
+            return Ok(());
         }
         if opts.verbose {
-            eprintln!(" preprocess-only: wrote {}", out.display());
+            eprintln!(" preprocess-only: wrote stdout");
         }
         phases.report();
         return Ok(());
@@ -1003,15 +1030,22 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| {
-        format!(
-            "{}:{}:{}: lexer error: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let tokens = match tokenize(&preprocessed, 0, source_form) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            phase.end(&mut phases);
+            diag::render(
+                &file_str,
+                &source,
+                e.span,
+                diag::Level::Error,
+                &format!("lexer error: {}", e.msg),
+                1,
+            );
+            phases.report();
+            return Err(format!("aborting due to errors in {}", opts.input.display()));
+        }
+    };
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" lexed: {} tokens", tokens.len());
@@ -1029,15 +1063,28 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 4. Parse.
     let phase = phases.start("parse");
     let mut parser = Parser::new(&tokens);
-    let units = parser.parse_file().map_err(|e| {
-        format!(
-            "{}:{}:{}: parse error: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let units = match parser.parse_file() {
+        Ok(units) => units,
+        Err(e) => {
+            phase.end(&mut phases);
+            let span_len = if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col
+            {
+                (e.span.end.col - e.span.start.col) as usize
+            } else {
+                1
+            };
+            diag::render(
+                &file_str,
+                &source,
+                e.span,
+                diag::Level::Error,
+                &format!("parse error: {}", e.msg),
+                span_len,
+            );
+            phases.report();
+            return Err(format!("aborting due to errors in {}", opts.input.display()));
+        }
+    };
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" parsed: {} top-level units", units.len());
@@ -1083,7 +1130,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         opts.warn_pedantic,
         opts.warn_deprecated,
     );
-    let file_str = opts.input.display().to_string();
+    phase.end(&mut phases);
     let mut had_error = false;
     for d in &diags {
         let level = match d.kind {
@@ -1106,12 +1153,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
     if had_error {
+        phases.report();
         return Err(format!(
             "aborting due to errors in {}",
             opts.input.display()
         ));
     }
-    phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" sema: {} diagnostics", diags.len());
     }
@@ -1333,41 +1380,41 @@ _main:
         eprintln!(" assembled: {}", obj_path.display());
     }
 
-    if opts.emit_obj {
-        // Emit .amod files for each MODULE in the compilation unit.
-        // -J <dir> overrides where they go; default is the parent of
-        // the output .o.
-        for unit in &units {
-            if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
-                let mod_key = name.to_lowercase();
-                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                    let amod_text = crate::sema::amod::write_amod(
-                        name,
-                        opts.input.to_str().unwrap_or(""),
-                        &source,
-                        &st,
-                        mod_scope_id,
-                        &module_globals,
-                        &type_layouts,
-                        &ir_module,
-                        &std::collections::HashMap::new(), // char_len_star computed by writer from scope
-                    );
-                    let amod_dir: std::path::PathBuf =
-                        opts.module_output_dir.clone().unwrap_or_else(|| {
-                            opts.output_path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("."))
-                                .to_path_buf()
-                        });
-                    let amod_path = amod_dir.join(format!("{}.amod", mod_key));
-                    if let Err(e) = fs::write(&amod_path, &amod_text) {
-                        eprintln!("warning: cannot write {}: {}", amod_path.display(), e);
-                    } else if opts.verbose {
-                        eprintln!(" amod: {}", amod_path.display());
-                    }
+    // Emit .amod files for each MODULE in the compilation unit.
+    // -J <dir> overrides where they go; otherwise they follow the
+    // primary output path, even for shared-library builds.
+    for unit in &units {
+        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                let amod_text = crate::sema::amod::write_amod(
+                    name,
+                    opts.input.to_str().unwrap_or(""),
+                    &source,
+                    &st,
+                    mod_scope_id,
+                    &module_globals,
+                    &type_layouts,
+                    &ir_module,
+                    &std::collections::HashMap::new(), // char_len_star computed by writer from scope
+                );
+                let amod_dir: std::path::PathBuf = opts.module_output_dir.clone().unwrap_or_else(|| {
+                    opts.output_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                });
+                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
+                fs::write(&amod_path, &amod_text)
+                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                if opts.verbose {
+                    eprintln!(" amod: {}", amod_path.display());
                 }
             }
         }
+    }
+
+    if opts.emit_obj {
         phases.report();
         return Ok(());
     }
@@ -1475,6 +1522,10 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     let mut all_inputs = vec![opts.input.clone()];
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
+    if opts.emit_obj && opts.output.is_some() {
+        return Err("-o cannot be used with -c and multiple input files".into());
+    }
+
     // Scan dependencies.
     let file_deps: Vec<dep_scan::FileDeps> = all_inputs
         .iter()
@@ -1485,18 +1536,28 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     let order = dep_scan::resolve_compilation_order(&file_deps)?;
 
     // Compile each file in order.
-    let tmp_dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
+    let tmp_dir = if opts.emit_obj {
+        None
+    } else {
+        let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
+        Some(dir)
+    };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for &idx in &order {
         let src = &file_deps[idx].path;
-        let stem = src
-            .file_stem()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("out");
-        let obj_path = tmp_dir.join(format!("{}.o", stem));
+        let obj_path = if opts.emit_obj {
+            src.with_extension("o")
+        } else {
+            let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
+            let stem = src
+                .file_stem()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("out");
+            tmp_dir.join(format!("{}.o", stem))
+        };
 
         // Build a single-file Options for this source by inheriting
         // the user-facing flags and overriding only the per-file bits.
@@ -1531,11 +1592,19 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         sub_opts.module_output_dir = opts.module_output_dir.clone();
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
-            paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+            if let Some(tmp_dir) = tmp_dir.as_ref() {
+                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+            }
             paths
         };
         compile(&sub_opts)?;
-        object_files.push(obj_path);
+        if !opts.emit_obj {
+            object_files.push(obj_path);
+        }
+    }
+
+    if opts.emit_obj {
+        return Ok(());
     }
 
     // Link all object files.
@@ -1546,7 +1615,9 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     link_multi(&object_files, &output, opts)?;
 
     // Cleanup.
-    let _ = fs::remove_dir_all(&tmp_dir);
+    if let Some(tmp_dir) = tmp_dir {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 
     Ok(())
 }
@@ -1883,7 +1954,7 @@ mod tests {
         compile(&opts).expect("internal integer(16) call should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
         assert!(
-            asm.contains("bl _add_one"),
+            asm.contains("bl _afs_internal___prog_integer16_internal_call_1"),
             "expected internal helper call in asm:\n{}",
             asm
         );

@@ -707,8 +707,7 @@ impl Preprocessor {
                             break;
                         }
                     } else {
-                        result.push(bytes[i] as char);
-                        i += 1;
+                        push_utf8_char(&mut result, bytes, &mut i);
                     }
                 }
                 if i < bytes.len() {
@@ -778,8 +777,7 @@ impl Preprocessor {
                 continue;
             }
 
-            result.push(bytes[i] as char);
-            i += 1;
+            push_utf8_char(&mut result, bytes, &mut i);
         }
 
         result
@@ -1269,6 +1267,23 @@ fn split_first_word(s: &str) -> (&str, &str) {
     } else {
         (s, "")
     }
+}
+
+fn push_utf8_char(result: &mut String, bytes: &[u8], i: &mut usize) {
+    if bytes[*i].is_ascii() {
+        result.push(bytes[*i] as char);
+        *i += 1;
+        return;
+    }
+    if let Ok(rest) = std::str::from_utf8(&bytes[*i..]) {
+        if let Some(ch) = rest.chars().next() {
+            result.push(ch);
+            *i += ch.len_utf8();
+            return;
+        }
+    }
+    result.push(bytes[*i] as char);
+    *i += 1;
 }
 
 /// Get current date and time strings for __DATE__ and __TIME__.

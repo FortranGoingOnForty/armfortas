@@ -8,6 +8,9 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn compiler(name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{}", name)) {
@@ -30,11 +33,8 @@ fn compiler(name: &str) -> PathBuf {
 
 fn unique_path(stem: &str, ext: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("afs_cli_{}_{}_{}.{}", stem, pid, nanos, ext))
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("afs_cli_{}_{}_{}.{}", stem, pid, id, ext))
 }
 
 fn unique_dir(stem: &str) -> PathBuf {

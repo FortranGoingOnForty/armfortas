@@ -31,6 +31,33 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn non_program_function_names(ir: &str) -> Vec<&str> {
+    function_sections(ir)
+        .into_iter()
+        .map(function_name)
+        .filter(|name| !name.starts_with("__prog_"))
+        .collect()
+}
+
 fn block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     let mut start = None;
     let mut end = None;
@@ -92,9 +119,16 @@ fn o2_hoists_affine_dummy_loads_out_of_loop() {
         },
         Stage::OptIr,
     );
+    let helper_names = non_program_function_names(&raw_ir);
+    assert_eq!(
+        helper_names.len(),
+        1,
+        "raw IR should include exactly one contained affine helper:\n{}",
+        raw_ir
+    );
 
-    let raw_apply = function_section(&raw_ir, "apply");
-    let opt_apply = function_section(&opt_ir, "apply");
+    let raw_apply = function_section(&raw_ir, helper_names[0]);
+    let opt_apply = function_section(&opt_ir, helper_names[0]);
     let raw_body = block_section(raw_apply, "do_body_");
     let opt_preheader = block_section(opt_apply, "if_end_");
     let opt_body = block_section(opt_apply, "do_body_");
@@ -136,14 +170,22 @@ fn o2_forwards_local_store_reuse_across_noalias_call() {
         },
         Stage::OptIr,
     );
+    let helper_names = non_program_function_names(&raw_ir);
+    assert_eq!(
+        helper_names.len(),
+        3,
+        "raw IR should include a side-effect helper plus two contained noalias workers:\n{}",
+        raw_ir
+    );
 
-    let raw_local = function_section(&raw_ir, "classify_local");
-    let opt_local = function_section(&opt_ir, "classify_local");
+    let raw_local = function_section(&raw_ir, helper_names[1]);
+    let opt_local = function_section(&opt_ir, helper_names[1]);
     let raw_body = block_section(raw_local, "do_body_");
     let opt_body = block_section(opt_local, "do_body_");
 
-    let raw_after_call = tail_after(raw_body, "call @touch");
-    let opt_after_call = tail_after(opt_body, "call @touch");
+    let side_effect_call = format!("call @{}", helper_names[0]);
+    let raw_after_call = tail_after(raw_body, &side_effect_call);
+    let opt_after_call = tail_after(opt_body, &side_effect_call);
 
     assert!(
         raw_after_call.contains("gep") && raw_after_call.contains("load"),
@@ -177,9 +219,16 @@ fn o2_forwards_branch_join_reuse_across_noalias_side_call() {
         },
         Stage::OptIr,
     );
+    let helper_names = non_program_function_names(&raw_ir);
+    assert_eq!(
+        helper_names.len(),
+        3,
+        "raw IR should include a side-effect helper plus two contained noalias workers:\n{}",
+        raw_ir
+    );
 
-    let raw_branchy = function_section(&raw_ir, "classify_branchy");
-    let opt_branchy = function_section(&opt_ir, "classify_branchy");
+    let raw_branchy = function_section(&raw_ir, helper_names[2]);
+    let opt_branchy = function_section(&opt_ir, helper_names[2]);
     let raw_join = block_section(raw_branchy, "if_end_9");
     let opt_join = block_section(opt_branchy, "if_end_9");
 

@@ -31,6 +31,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn param_count(func_section: &str) -> usize {
     let header = func_section.lines().next().expect("function header");
     let inside = header
@@ -45,12 +64,12 @@ fn param_count(func_section: &str) -> usize {
     }
 }
 
-fn call_arg_counts_for(func_section: &str, callee_marker: &str) -> Vec<usize> {
+fn call_arg_counts_for(func_section: &str, callee_name: &str) -> Vec<usize> {
     func_section
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            let call = line.find(&format!("call {}", callee_marker))?;
+            let call = line.find(&format!("call @{}", callee_name))?;
             let inside = line[call..].split_once('(')?.1.split_once(')')?.0.trim();
             Some(if inside.is_empty() {
                 0
@@ -82,10 +101,18 @@ fn o2_elides_dead_dummy_arg_from_recursive_internal_helper() {
         Stage::OptIr,
     );
 
-    let raw_main = function_section(&raw_ir, "__prog_ipo_dead_arg");
-    let raw_helper = function_section(&raw_ir, "helper");
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained helper:\n{}",
+        raw_ir
+    );
+    let raw_main = raw_sections[0];
+    let raw_helper = raw_sections[1];
+    let raw_helper_name = function_name(raw_helper);
     let opt_main = function_section(&opt_ir, "__prog_ipo_dead_arg");
-    let opt_helper = function_section(&opt_ir, "helper");
+    let opt_helper = function_section(&opt_ir, raw_helper_name);
 
     assert_eq!(
         param_count(raw_helper),
@@ -101,16 +128,16 @@ fn o2_elides_dead_dummy_arg_from_recursive_internal_helper() {
     );
 
     let raw_call_counts = [
-        call_arg_counts_for(raw_main, "@helper"),
-        call_arg_counts_for(raw_helper, "@helper"),
+        call_arg_counts_for(raw_main, raw_helper_name),
+        call_arg_counts_for(raw_helper, raw_helper_name),
     ]
     .concat();
     // dead-arg-elim rewrites @helper in-place (no clone, no rename)
     // so the optimized IR still calls @helper — with one fewer
     // argument per site.
     let opt_call_counts = [
-        call_arg_counts_for(opt_main, "@helper"),
-        call_arg_counts_for(opt_helper, "@helper"),
+        call_arg_counts_for(opt_main, raw_helper_name),
+        call_arg_counts_for(opt_helper, raw_helper_name),
     ]
     .concat();
 

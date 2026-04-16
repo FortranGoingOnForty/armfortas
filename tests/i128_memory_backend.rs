@@ -311,8 +311,8 @@ fn simple_internal_i128_call_uses_pair_arg_and_return_regs_at_o0() {
     );
 
     assert!(
-        asm.contains("bl _add_one"),
-        "internal integer(16) call should branch to the contained helper:\n{}",
+        asm.contains("bl _afs_internal_"),
+        "internal integer(16) call should branch to the internalized contained helper:\n{}",
         asm
     );
     assert!(

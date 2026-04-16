@@ -31,6 +31,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn count(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
@@ -55,12 +74,20 @@ fn o2_reuses_pure_recursive_call_in_program_caller() {
         },
         Stage::OptIr,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained pure helper:\n{}",
+        raw_ir
+    );
+    let helper_name = function_name(raw_sections[1]);
 
     let raw_main = function_section(&raw_ir, "__prog_pure_recursive_reuse");
     let opt_main = function_section(&opt_ir, "__prog_pure_recursive_reuse");
 
-    let raw_pure_calls = count(raw_main, "call @heavy_fact(") + count(raw_main, "call @func_");
-    let opt_pure_calls = count(opt_main, "call @heavy_fact(") + count(opt_main, "call @func_");
+    let raw_pure_calls = count(raw_main, &format!("call @{}(", helper_name));
+    let opt_pure_calls = count(opt_main, &format!("call @{}(", helper_name));
 
     assert_eq!(
         raw_pure_calls, 2,

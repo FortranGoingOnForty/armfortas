@@ -21,9 +21,31 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
     }
 }
 
+fn candidate_target_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if matches!(name, "debug" | "release") {
+                dirs.push(ancestor.to_path_buf());
+                break;
+            }
+        }
+    }
+    for dir in ["target/release", "target/debug"] {
+        let candidate = PathBuf::from(dir);
+        if !dirs.iter().any(|existing| existing == &candidate) {
+            dirs.push(candidate);
+        }
+    }
+    dirs
+}
+
 fn find_compiler() -> PathBuf {
-    for candidate in ["target/debug/armfortas", "target/release/armfortas"] {
-        let path = PathBuf::from(candidate);
+    for dir in candidate_target_dirs() {
+        let path = dir.join("armfortas");
         if path.exists() {
             return path;
         }

@@ -456,6 +456,7 @@ pub fn detect_source_form(filename: &str) -> SourceForm {
 
 /// Tokenize Fortran source, automatically selecting the appropriate lexer.
 pub fn tokenize(src: &str, file_id: u32, form: SourceForm) -> Result<Vec<Token>, LexError> {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     match form {
         SourceForm::FreeForm => Lexer::tokenize(src, file_id),
         SourceForm::FixedForm => fixed::tokenize_fixed(src, file_id),
@@ -535,6 +536,12 @@ impl<'a> Lexer<'a> {
         } else {
             0
         }
+    }
+
+    fn char_at(&self, pos: usize) -> Option<char> {
+        std::str::from_utf8(&self.src[pos..])
+            .ok()
+            .and_then(|rest| rest.chars().next())
     }
 
     fn advance(&mut self) -> u8 {
@@ -1098,7 +1105,13 @@ impl<'a> Lexer<'a> {
             b';' => (TokenKind::Semicolon, ";"),
             b'%' => (TokenKind::Percent, "%"),
             b'&' => (TokenKind::Ampersand, "&"),
-            _ => return Err(self.err(start, format!("unexpected character: '{}'", ch as char))),
+            _ => {
+                let unexpected = self.char_at(self.pos.saturating_sub(1)).unwrap_or(ch as char);
+                return Err(self.err(
+                    start,
+                    format!("unexpected character: '{}'", unexpected),
+                ));
+            }
         };
 
         Ok(Token {

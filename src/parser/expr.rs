@@ -60,50 +60,61 @@ impl<'a> Parser<'a> {
 
     /// Parse an expression with at least `min_bp` binding power (Pratt core).
     pub fn parse_expr_bp(&mut self, min_bp: u8) -> Result<SpannedExpr, ParseError> {
-        // Parse prefix (atom or unary operator).
-        let mut left = self.parse_prefix()?;
+        const EXPR_NESTING_LIMIT: usize = 1024;
 
-        // Loop: consume infix operators with sufficient binding power.
-        loop {
-            // Check for postfix operations: function call, component access.
-            left = self.parse_postfix(left)?;
-
-            // Check for infix operator.
-            let Some(bp) = self.infix_bp() else { break };
-            if bp.left < min_bp {
-                break;
-            }
-
-            // Non-associative operators: if left_bp == right_bp and we're at the
-            // same precedence level, reject chaining (e.g., a < b < c is illegal).
-            if bp.left == bp.right && bp.left == min_bp {
-                return Err(self.error(
-                    "chained comparison operators are not allowed in Fortran (non-associative)"
-                        .into(),
-                ));
-            }
-
-            let op_token = self.advance().clone();
-            let op = token_to_binary_op(&op_token)?;
-            let right = self.parse_expr_bp(bp.right)?;
-
-            let span = Span {
-                file_id: left.span.file_id,
-                start: left.span.start,
-                end: right.span.end,
-            };
-
-            left = Spanned::new(
-                Expr::BinaryOp {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                span,
-            );
+        if self.expr_depth >= EXPR_NESTING_LIMIT {
+            return Err(self.error("expression nesting exceeds parser limit".into()));
         }
 
-        Ok(left)
+        self.expr_depth += 1;
+        let result = (|| {
+            // Parse prefix (atom or unary operator).
+            let mut left = self.parse_prefix()?;
+
+            // Loop: consume infix operators with sufficient binding power.
+            loop {
+                // Check for postfix operations: function call, component access.
+                left = self.parse_postfix(left)?;
+
+                // Check for infix operator.
+                let Some(bp) = self.infix_bp() else { break };
+                if bp.left < min_bp {
+                    break;
+                }
+
+                // Non-associative operators: if left_bp == right_bp and we're at the
+                // same precedence level, reject chaining (e.g., a < b < c is illegal).
+                if bp.left == bp.right && bp.left == min_bp {
+                    return Err(self.error(
+                        "chained comparison operators are not allowed in Fortran (non-associative)"
+                            .into(),
+                    ));
+                }
+
+                let op_token = self.advance().clone();
+                let op = token_to_binary_op(&op_token)?;
+                let right = self.parse_expr_bp(bp.right)?;
+
+                let span = Span {
+                    file_id: left.span.file_id,
+                    start: left.span.start,
+                    end: right.span.end,
+                };
+
+                left = Spanned::new(
+                    Expr::BinaryOp {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    span,
+                );
+            }
+
+            Ok(left)
+        })();
+        self.expr_depth -= 1;
+        result
     }
 
     /// Parse a prefix expression (atom, unary operator, parenthesized expr).

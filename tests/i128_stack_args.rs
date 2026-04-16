@@ -31,8 +31,8 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
     );
 
     assert!(
-        asm.contains("bl _add5"),
-        "internal integer(16) stack-call should branch to the contained helper:\n{}",
+        asm.contains("bl _afs_internal_"),
+        "internal integer(16) stack-call should branch to the internalized contained helper:\n{}",
         asm
     );
     assert!(

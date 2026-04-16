@@ -31,6 +31,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn param_count(func_section: &str) -> usize {
     let header = func_section.lines().next().expect("function header");
     let inside = header
@@ -57,6 +76,14 @@ fn o0_realworld_elemental_stage_proves_elemental_and_concurrent_lowering() {
         },
         Stage::Ir,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one scalar ELEMENTAL helper:\n{}",
+        raw_ir
+    );
+    let scalar_body_name = function_name(raw_sections[1]);
 
     assert!(
         raw_ir.contains("doconc_check_"),
@@ -64,7 +91,7 @@ fn o0_realworld_elemental_stage_proves_elemental_and_concurrent_lowering() {
         raw_ir
     );
     assert!(
-        raw_ir.contains("call @mix(") || raw_ir.contains("call @func_"),
+        raw_ir.contains(&format!("call @{}(", scalar_body_name)),
         "raw IR should still call the scalar ELEMENTAL body per element:\n{}",
         raw_ir
     );
@@ -112,7 +139,17 @@ fn o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper() {
         Stage::Obj,
     );
 
-    let raw_mix = function_section(&raw_ir, "mix_step");
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        5,
+        "raw IR should still include accumulate, emit_value, passthrough, and mix_step helpers:\n{}",
+        raw_ir
+    );
+    let raw_wrapper = raw_sections[3];
+    let raw_wrapper_name = function_name(raw_wrapper);
+    let raw_mix = raw_sections[4];
+    let raw_mix_name = function_name(raw_mix);
     assert_eq!(
         param_count(raw_mix),
         3,
@@ -120,13 +157,13 @@ fn o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper() {
         raw_mix
     );
     assert!(
-        raw_ir.contains("func @passthrough"),
+        param_count(raw_wrapper) == 1,
         "raw IR should still materialize the trivial wrapper helper:\n{}",
         raw_ir
     );
 
-    if opt_ir.contains("func @mix_step") {
-        let opt_mix = function_section(&opt_ir, "mix_step");
+    if opt_ir.contains(&format!("func @{}", raw_mix_name)) {
+        let opt_mix = function_section(&opt_ir, raw_mix_name);
         assert_eq!(
             param_count(opt_mix),
             2,
@@ -135,7 +172,7 @@ fn o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper() {
         );
     }
     assert!(
-        !opt_ir.contains("func @passthrough"),
+        !opt_ir.contains(&format!("func @{}", raw_wrapper_name)),
         "optimized IR should remove the trivial wrapper helper:\n{}",
         opt_ir
     );

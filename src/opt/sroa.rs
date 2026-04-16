@@ -165,18 +165,14 @@ fn gep_result_escapes(func: &Function, gep_id: ValueId) -> bool {
                     true_args,
                     false_args,
                     ..
-                } => {
-                    if *cond == gep_id
-                        || true_args.contains(&gep_id)
-                        || false_args.contains(&gep_id)
-                    {
-                        return true;
-                    }
+                } if *cond == gep_id
+                    || true_args.contains(&gep_id)
+                    || false_args.contains(&gep_id) =>
+                {
+                    return true;
                 }
-                Terminator::Switch { selector, .. } => {
-                    if *selector == gep_id {
-                        return true;
-                    }
+                Terminator::Switch { selector, .. } if *selector == gep_id => {
+                    return true;
                 }
                 _ => {}
             }

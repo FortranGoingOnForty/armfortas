@@ -25,6 +25,7 @@ impl SymbolTable {
             kind: ScopeKind::Global,
             symbols: HashMap::new(),
             implicit_rules: ImplicitRules::default_fortran(),
+            has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
             default_access: Access::Public,
             pending_access: HashMap::new(),
@@ -54,6 +55,7 @@ impl SymbolTable {
             kind,
             symbols: HashMap::new(),
             implicit_rules: parent_implicit, // inherit from parent, may be overridden
+            has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
             default_access: Access::Public,
             pending_access: HashMap::new(),
@@ -261,6 +263,7 @@ impl SymbolTable {
     /// Set implicit none for the current scope.
     pub fn set_implicit_none(&mut self, type_: bool, external: bool) {
         let scope = &mut self.scopes[self.current];
+        scope.has_explicit_implicit_stmt = true;
         if type_ {
             scope.implicit_rules.none_type = true;
         }
@@ -284,7 +287,8 @@ impl SymbolTable {
                     | ScopeKind::Submodule(_)
                     | ScopeKind::Subroutine(_)
                     | ScopeKind::Function(_)
-            ) {
+            ) && !scope.has_explicit_implicit_stmt
+            {
                 scope.implicit_rules.none_type = true;
             }
         }
@@ -293,6 +297,8 @@ impl SymbolTable {
     /// Set an implicit typing rule for the current scope.
     pub fn set_implicit_rule(&mut self, start: char, end: char, itype: ImplicitType) {
         let scope = &mut self.scopes[self.current];
+        scope.has_explicit_implicit_stmt = true;
+        scope.implicit_rules.none_type = false;
         for c in start..=end {
             scope
                 .implicit_rules
@@ -369,6 +375,7 @@ pub struct Scope {
     pub kind: ScopeKind,
     pub symbols: HashMap<String, Symbol>,
     pub implicit_rules: ImplicitRules,
+    pub has_explicit_implicit_stmt: bool,
     pub use_associations: Vec<UseAssociation>,
     pub default_access: Access,
     pub pending_access: HashMap<String, Access>,
