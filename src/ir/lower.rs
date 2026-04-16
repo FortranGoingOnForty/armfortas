@@ -928,6 +928,30 @@ fn arg_uses_string_descriptor_from_decls(
     false
 }
 
+fn descriptor_ptr_ir_type(size: u64) -> IrType {
+    IrType::Ptr(Box::new(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        size,
+    )))
+}
+
+fn by_ref_storage_ir_type(
+    elem_ty: &IrType,
+    uses_descriptor: bool,
+    uses_string_descriptor: bool,
+    is_derived: bool,
+) -> IrType {
+    if uses_descriptor {
+        descriptor_ptr_ir_type(384)
+    } else if uses_string_descriptor {
+        descriptor_ptr_ir_type(32)
+    } else if is_derived {
+        elem_ty.clone()
+    } else {
+        IrType::Ptr(Box::new(elem_ty.clone()))
+    }
+}
+
 /// Record which positional dummy arguments are lowered through an
 /// ArrayDescriptor rather than a raw element pointer.
 fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
@@ -2403,6 +2427,7 @@ fn lower_unit(
                         let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(n, decls);
+                        let is_derived = arg_derived_type_name(n, decls).is_some();
                         if arg_has_value_attr(n, decls) {
                             // VALUE: pass by value (raw type, not pointer).
                             Some(Param {
@@ -2414,19 +2439,12 @@ fn lower_unit(
                         } else {
                             Some(Param {
                                 name: n.clone(),
-                                ty: if uses_descriptor {
-                                    IrType::Ptr(Box::new(IrType::Array(
-                                        Box::new(IrType::Int(IntWidth::I8)),
-                                        384,
-                                    )))
-                                } else if uses_string_descriptor {
-                                    IrType::Ptr(Box::new(IrType::Array(
-                                        Box::new(IrType::Int(IntWidth::I8)),
-                                        32,
-                                    )))
-                                } else {
-                                    IrType::Ptr(Box::new(elem_ty))
-                                },
+                                ty: by_ref_storage_ir_type(
+                                    &elem_ty,
+                                    uses_descriptor,
+                                    uses_string_descriptor,
+                                    is_derived,
+                                ),
                                 id: ValueId(i as u32),
                                 fortran_noalias,
                             })
@@ -2529,22 +2547,15 @@ fn lower_unit(
                         let uses_descriptor = arg_uses_descriptor_from_decls(pname, decls);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
-                        let slot = if uses_descriptor {
-                            b.alloca(IrType::Ptr(Box::new(IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                384,
-                            ))))
-                        } else if uses_string_descriptor {
-                            b.alloca(IrType::Ptr(Box::new(IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                32,
-                            ))))
-                        } else {
-                            b.alloca(IrType::Ptr(Box::new(elem_ty.clone())))
-                        };
+                        let dt_name = arg_derived_type_name(pname, decls);
+                        let slot = b.alloca(by_ref_storage_ir_type(
+                            elem_ty,
+                            uses_descriptor,
+                            uses_string_descriptor,
+                            dt_name.is_some(),
+                        ));
                         b.store(*pid, slot);
                         // Check if this is a derived type parameter.
-                        let dt_name = arg_derived_type_name(pname, decls);
                         let ck = if let Some(&len_slot) = hidden_len_addrs.get(pname) {
                             CharKind::AssumedLen { len_addr: len_slot }
                         } else {
@@ -2744,6 +2755,7 @@ fn lower_unit(
                             let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                             let uses_string_descriptor =
                                 arg_uses_string_descriptor_from_decls(n, decls);
+                            let is_derived = arg_derived_type_name(n, decls).is_some();
                             if arg_has_value_attr(n, decls) {
                                 Some(Param {
                                     name: n.clone(),
@@ -2754,19 +2766,12 @@ fn lower_unit(
                             } else {
                                 Some(Param {
                                     name: n.clone(),
-                                    ty: if uses_descriptor {
-                                        IrType::Ptr(Box::new(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            384,
-                                        )))
-                                    } else if uses_string_descriptor {
-                                        IrType::Ptr(Box::new(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            32,
-                                        )))
-                                    } else {
-                                        IrType::Ptr(Box::new(elem_ty))
-                                    },
+                                    ty: by_ref_storage_ir_type(
+                                        &elem_ty,
+                                        uses_descriptor,
+                                        uses_string_descriptor,
+                                        is_derived,
+                                    ),
                                     id: ValueId(i as u32 + 1),
                                     fortran_noalias,
                                 })
@@ -2797,6 +2802,7 @@ fn lower_unit(
                             let uses_descriptor = arg_uses_descriptor_from_decls(n, decls);
                             let uses_string_descriptor =
                                 arg_uses_string_descriptor_from_decls(n, decls);
+                            let is_derived = arg_derived_type_name(n, decls).is_some();
                             if arg_has_value_attr(n, decls) {
                                 Some(Param {
                                     name: n.clone(),
@@ -2807,19 +2813,12 @@ fn lower_unit(
                             } else {
                                 Some(Param {
                                     name: n.clone(),
-                                    ty: if uses_descriptor {
-                                        IrType::Ptr(Box::new(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            384,
-                                        )))
-                                    } else if uses_string_descriptor {
-                                        IrType::Ptr(Box::new(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            32,
-                                        )))
-                                    } else {
-                                        IrType::Ptr(Box::new(elem_ty))
-                                    },
+                                    ty: by_ref_storage_ir_type(
+                                        &elem_ty,
+                                        uses_descriptor,
+                                        uses_string_descriptor,
+                                        is_derived,
+                                    ),
                                     id: ValueId(i as u32),
                                     fortran_noalias,
                                 })
@@ -2926,21 +2925,14 @@ fn lower_unit(
                         let uses_descriptor = arg_uses_descriptor_from_decls(pname, decls);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
-                        let slot = if uses_descriptor {
-                            b.alloca(IrType::Ptr(Box::new(IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                384,
-                            ))))
-                        } else if uses_string_descriptor {
-                            b.alloca(IrType::Ptr(Box::new(IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                32,
-                            ))))
-                        } else {
-                            b.alloca(IrType::Ptr(Box::new(elem_ty.clone())))
-                        };
-                        b.store(*pid, slot);
                         let dt_name = arg_derived_type_name(pname, decls);
+                        let slot = b.alloca(by_ref_storage_ir_type(
+                            elem_ty,
+                            uses_descriptor,
+                            uses_string_descriptor,
+                            dt_name.is_some(),
+                        ));
+                        b.store(*pid, slot);
                         let ck = if let Some(&len_slot) = hidden_len_addrs.get(pname) {
                             CharKind::AssumedLen { len_addr: len_slot }
                         } else {
@@ -8981,6 +8973,9 @@ struct HostRefParamInfo {
     /// True when the host var is represented by a 384-byte
     /// ArrayDescriptor (assumed-shape, deferred, allocatable array).
     descriptor_arg: bool,
+    /// True when the host var is a deferred-length scalar character
+    /// carried via a 32-byte string descriptor.
+    string_descriptor_arg: bool,
     allocatable: bool,
     is_pointer: bool,
 }
@@ -9013,17 +9008,17 @@ fn build_host_ref_params(
     for (idx, hname) in refs.iter().enumerate() {
         let elem_ty = arg_type_from_decls(hname, host_decls, Some(st));
         let uses_desc = arg_uses_descriptor_from_decls(hname, host_decls);
+        let uses_string_descriptor = arg_uses_string_descriptor_from_decls(hname, host_decls);
         let alloc = decl_is_allocatable(hname, host_decls);
         let ptr_is_pointer = decl_is_pointer(hname, host_decls);
-        let descriptor_arg = uses_desc || alloc;
-        let ptr_ty = if descriptor_arg {
-            IrType::Ptr(Box::new(IrType::Array(
-                Box::new(IrType::Int(IntWidth::I8)),
-                384,
-            )))
-        } else {
-            IrType::Ptr(Box::new(elem_ty.clone()))
-        };
+        let descriptor_arg = (uses_desc || alloc) && !uses_string_descriptor;
+        let derived_type = arg_derived_type_name(hname, host_decls);
+        let ptr_ty = by_ref_storage_ir_type(
+            &elem_ty,
+            descriptor_arg,
+            uses_string_descriptor,
+            derived_type.is_some(),
+        );
         let pid = ValueId(starting_id + idx as u32);
         out_params.push(Param {
             name: format!("__host_{}", hname),
@@ -9037,8 +9032,9 @@ fn build_host_ref_params(
             elem_ty,
             dims: arg_dims_from_decls(hname, host_decls, &host_visible),
             char_kind: arg_char_kind_from_decls(hname, host_decls, st),
-            derived_type: arg_derived_type_name(hname, host_decls),
+            derived_type,
             descriptor_arg,
+            string_descriptor_arg: uses_string_descriptor,
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
         });
@@ -9115,14 +9111,12 @@ fn install_host_ref_locals(
     infos: &[HostRefParamInfo],
 ) {
     for info in infos {
-        let slot_ty = if info.descriptor_arg {
-            IrType::Ptr(Box::new(IrType::Array(
-                Box::new(IrType::Int(IntWidth::I8)),
-                384,
-            )))
-        } else {
-            IrType::Ptr(Box::new(info.elem_ty.clone()))
-        };
+        let slot_ty = by_ref_storage_ir_type(
+            &info.elem_ty,
+            info.descriptor_arg,
+            info.string_descriptor_arg,
+            info.derived_type.is_some(),
+        );
         let slot = b.alloca(slot_ty);
         b.store(info.id, slot);
         locals.insert(
@@ -9330,7 +9324,11 @@ fn callee_character_return_abi(st: &SymbolTable, callee_name: &str) -> Option<Ch
 }
 
 fn local_fixed_char_allocatable_scalar_len(info: &LocalInfo) -> Option<i64> {
-    if !info.allocatable || !info.dims.is_empty() || info.char_kind != CharKind::None {
+    if !info.allocatable
+        || !info.dims.is_empty()
+        || info.char_kind != CharKind::None
+        || info.derived_type.is_some()
+    {
         return None;
     }
     match &info.ty {
@@ -10746,6 +10744,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
                 Expr::ComponentAccess { base, component } => {
                     // x%field = val (supports chained: x%a%b = val).
+                    if let Some(info) =
+                        component_array_local_info(b, &ctx.locals, target, ctx.st, ctx.type_layouts)
+                    {
+                        if local_is_array_like(&info) {
+                            lower_array_assign(b, ctx, "", &info, value);
+                            return;
+                        }
+                    }
                     if let Some((base_addr, type_name)) =
                         resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
                     {
@@ -16099,6 +16105,22 @@ fn array_data_ptr_for_call(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     }
 }
 
+fn derived_scalar_storage_addr_for_call(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    debug_assert!(info.derived_type.is_some());
+    debug_assert!(info.dims.is_empty());
+    debug_assert!(!info.is_pointer);
+    if info.by_ref {
+        b.load(info.addr)
+    } else if local_uses_array_descriptor(info) {
+        let base = array_data_ptr_for_call(b, info);
+        let zero = b.const_i64(0);
+        b.gep(base, vec![zero], IrType::Int(IntWidth::I8))
+    } else {
+        let zero = b.const_i64(0);
+        b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8))
+    }
+}
+
 fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
@@ -18772,6 +18794,9 @@ fn lower_arg_by_ref_full(
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
+            if info.derived_type.is_some() && info.dims.is_empty() && !info.is_pointer {
+                return derived_scalar_storage_addr_for_call(b, info);
+            }
             if info.by_ref {
                 if info.descriptor_arg {
                     return array_data_ptr_for_call(b, info);
@@ -18808,7 +18833,12 @@ fn lower_arg_by_ref_full(
                             };
                             let one = b.const_i64(1);
                             let idx0 = b.isub(idx64, one); // Fortran 1-indexed → 0-indexed
-                            return b.gep(base, vec![idx0], info.ty.clone());
+                            let elem = b.gep(base, vec![idx0], info.ty.clone());
+                            if info.derived_type.is_some() {
+                                let zero = b.const_i64(0);
+                                return b.gep(elem, vec![zero], IrType::Int(IntWidth::I8));
+                            }
+                            return elem;
                         }
                     }
                 }
