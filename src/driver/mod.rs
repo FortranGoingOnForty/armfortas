@@ -965,6 +965,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let source = fs::read_to_string(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
     phase.end(&mut phases);
+    let file_str = opts.input.display().to_string();
 
     // 2. Preprocess.
     let source_form = match opts.source_form_override {
@@ -1029,15 +1030,22 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| {
-        format!(
-            "{}:{}:{}: lexer error: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let tokens = match tokenize(&preprocessed, 0, source_form) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            phase.end(&mut phases);
+            diag::render(
+                &file_str,
+                &source,
+                e.span,
+                diag::Level::Error,
+                &format!("lexer error: {}", e.msg),
+                1,
+            );
+            phases.report();
+            return Err(format!("aborting due to errors in {}", opts.input.display()));
+        }
+    };
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" lexed: {} tokens", tokens.len());
@@ -1055,15 +1063,28 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 4. Parse.
     let phase = phases.start("parse");
     let mut parser = Parser::new(&tokens);
-    let units = parser.parse_file().map_err(|e| {
-        format!(
-            "{}:{}:{}: parse error: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let units = match parser.parse_file() {
+        Ok(units) => units,
+        Err(e) => {
+            phase.end(&mut phases);
+            let span_len = if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col
+            {
+                (e.span.end.col - e.span.start.col) as usize
+            } else {
+                1
+            };
+            diag::render(
+                &file_str,
+                &source,
+                e.span,
+                diag::Level::Error,
+                &format!("parse error: {}", e.msg),
+                span_len,
+            );
+            phases.report();
+            return Err(format!("aborting due to errors in {}", opts.input.display()));
+        }
+    };
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" parsed: {} top-level units", units.len());
@@ -1109,7 +1130,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         opts.warn_pedantic,
         opts.warn_deprecated,
     );
-    let file_str = opts.input.display().to_string();
+    phase.end(&mut phases);
     let mut had_error = false;
     for d in &diags {
         let level = match d.kind {
@@ -1132,12 +1153,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
     if had_error {
+        phases.report();
         return Err(format!(
             "aborting due to errors in {}",
             opts.input.display()
         ));
     }
-    phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" sema: {} diagnostics", diags.len());
     }
