@@ -55,6 +55,25 @@ fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+fn undefined_symbols(path: &std::path::Path) -> Vec<String> {
+    let out = Command::new("nm")
+        .args(["-u", "-j", path.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn nm");
+    assert!(
+        out.status.success(),
+        "nm failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[test]
 fn version_flag_prints_version_string_to_stdout() {
     let out = Command::new(compiler("armfortas"))
@@ -266,6 +285,208 @@ fn counted_do_coerces_mixed_width_bounds() {
         String::from_utf8_lossy(&compile.stderr)
     );
     assert!(out.exists(), "mixed-width DO should produce an object file");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn runtime_sized_local_character_uses_runtime_string_support() {
+    let src = write_program(
+        "subroutine f(input, trimmed)\n  implicit none\n  character(len=*), intent(in) :: input\n  integer, intent(out) :: trimmed\n  character(len=len(input)) :: working_input\n  working_input = input\n  trimmed = len_trim(working_input)\nend subroutine\n",
+        "f90",
+    );
+    let out = unique_path("runtime_char_local", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime-sized local character compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime-sized local character compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        "runtime-sized local character should call afs_len_trim, undefineds were: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_working_input"),
+        "runtime-sized local character should not lower to an external working_input call: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_len_trim"),
+        "runtime-sized local character should not lower to a raw len_trim symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn assumed_length_character_dummy_keeps_hidden_length_abi() {
+    let src = write_program(
+        "subroutine f(prompt_str, first)\n  implicit none\n  character(len=*), intent(in) :: prompt_str\n  character(len=1), intent(out) :: first\n  first = prompt_str(1:1)\nend subroutine\n",
+        "f90",
+    );
+    let out = unique_path("assumed_len_dummy", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("assumed-length dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "assumed-length dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_prompt_str"),
+        "assumed-length dummy should not become an external prompt_str call: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn repeat_intrinsic_lowers_to_runtime_symbol() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = repeat('ab', 3)\n  print *, len_trim(s)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("repeat_runtime", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("repeat intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "repeat intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_repeat"),
+        "repeat intrinsic should lower to afs_repeat, undefineds were: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_repeat"),
+        "repeat intrinsic should not lower to a raw repeat symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn component_array_intrinsics_survive_logical_condition_lowering() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: cmd_t\n    character(:), allocatable :: tokens(:)\n    integer, allocatable :: token_lengths(:)\n  end type cmd_t\ncontains\n  integer function f(cmd, i) result(strip_len)\n    type(cmd_t), intent(in) :: cmd\n    integer, intent(in) :: i\n    if (allocated(cmd%token_lengths) .and. i <= size(cmd%token_lengths) .and. cmd%token_lengths(i) > 0) then\n      strip_len = cmd%token_lengths(i)\n    else\n      strip_len = len_trim(cmd%tokens(i))\n    end if\n  end function f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("component_array_condition", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component array condition compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component array condition compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        "component array condition should lower allocated() to afs_array_allocated: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        "component array condition should lower size() to afs_array_size: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        "component array condition should lower len_trim() to afs_len_trim: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_allocated" || sym == "_size"),
+        "component array condition should not call raw allocated/size symbols: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_char_component_ops_and_achar_compile() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: shell_t\n    character(len=8) :: ifs = ''\n  end type shell_t\ncontains\n  subroutine f(shell, sep)\n    type(shell_t), intent(in) :: shell\n    character(len=1), intent(out) :: sep\n    if (len_trim(shell%ifs) > 0) then\n      sep = shell%ifs(1:1)\n    else\n      sep = achar(0)\n    end if\n  end subroutine f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("scalar_char_component", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        "scalar char component should lower len_trim() to afs_len_trim: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_char"),
+        "ACHAR should lower to afs_char: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_achar" || sym == "_ifs"),
+        "scalar char component lowering should not introduce raw achar/ifs symbols: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn named_len_char_component_substring_and_trim_compile() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: max_token_len = 8\n  type :: token_t\n    character(len=max_token_len) :: value\n  end type token_t\ncontains\n  subroutine f(tok, i, is_bang, trimmed)\n    type(token_t), intent(in) :: tok\n    integer, intent(in) :: i\n    logical, intent(out) :: is_bang\n    character(len=max_token_len), intent(out) :: trimmed\n    is_bang = (tok%value(i:i) == '!')\n    trimmed = trim(tok%value)\n  end subroutine f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("named_len_char_component", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("named-len char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "named-len char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(out.exists(), "named-len char component should produce an object file");
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);

@@ -123,41 +123,153 @@ pub fn size_of_type(ti: &TypeInfo) -> (usize, usize) {
     }
 }
 
-/// Convert a TypeSpec AST node to TypeInfo for layout computation.
-fn type_spec_to_type_info(ts: &crate::ast::decl::TypeSpec) -> TypeInfo {
-    use crate::ast::decl::{TypeSpec, KindSelector, LenSpec};
-
-    fn kind_to_u8(ks: &Option<KindSelector>) -> Option<u8> {
-        ks.as_ref().and_then(|k| match k {
-            KindSelector::Expr(e) | KindSelector::Star(e) => {
-                if let crate::ast::expr::Expr::IntegerLiteral { text, .. } = &e.node {
-                    text.parse::<u8>().ok()
-                } else { None }
+fn eval_const_int_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
+) -> Option<i64> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => {
+            let clean = text.split('_').next().unwrap_or(text);
+            clean.parse::<i64>().ok()
+        }
+        Expr::Name { name } => const_params.get(&name.to_lowercase()).copied(),
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_const_int_expr(operand, const_params)?;
+            match op {
+                crate::ast::expr::UnaryOp::Minus => Some(-v),
+                crate::ast::expr::UnaryOp::Plus => Some(v),
+                _ => None,
             }
-        })
-    }
-
-    match ts {
-        TypeSpec::Integer(kind) => TypeInfo::Integer { kind: kind_to_u8(kind) },
-        TypeSpec::Real(kind) => TypeInfo::Real { kind: kind_to_u8(kind) },
-        TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
-        TypeSpec::Complex(kind) => TypeInfo::Complex { kind: kind_to_u8(kind) },
-        TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
-        TypeSpec::Logical(kind) => TypeInfo::Logical { kind: kind_to_u8(kind) },
-        TypeSpec::Character(sel) => {
-            let len = sel.as_ref().and_then(|s| s.len.as_ref()).and_then(|l| match l {
-                LenSpec::Expr(e) => {
-                    if let crate::ast::expr::Expr::IntegerLiteral { text, .. } = &e.node {
-                        text.parse::<i64>().ok()
-                    } else { None }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_const_int_expr(left, const_params)?;
+            let r = eval_const_int_expr(right, const_params)?;
+            match op {
+                crate::ast::expr::BinaryOp::Add => Some(l + r),
+                crate::ast::expr::BinaryOp::Sub => Some(l - r),
+                crate::ast::expr::BinaryOp::Mul => Some(l * r),
+                crate::ast::expr::BinaryOp::Div if r != 0 => Some(l / r),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_int_expr(inner, const_params),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let first_arg_val = args.first().and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    eval_const_int_expr(e, const_params)
+                } else {
+                    None
+                }
+            });
+            match name.to_lowercase().as_str() {
+                "selected_int_kind" => {
+                    let r = first_arg_val?;
+                    Some(if r <= 2 {
+                        1
+                    } else if r <= 4 {
+                        2
+                    } else if r <= 9 {
+                        4
+                    } else if r <= 18 {
+                        8
+                    } else if r <= 38 {
+                        16
+                    } else {
+                        -1
+                    })
+                }
+                "selected_real_kind" => {
+                    let p = first_arg_val?;
+                    Some(if p <= 6 {
+                        4
+                    } else if p <= 15 {
+                        8
+                    } else {
+                        -1
+                    })
+                }
+                "kind" => {
+                    let Some(arg) = args.first() else {
+                        return None;
+                    };
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    match &e.node {
+                        Expr::RealLiteral { text, .. } => {
+                            Some(if text.contains('d') || text.contains('D') { 8 } else { 4 })
+                        }
+                        Expr::IntegerLiteral { .. } => Some(4),
+                        _ => None,
+                    }
                 }
                 _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a TypeSpec AST node to TypeInfo for layout computation.
+fn type_spec_to_type_info(
+    ts: &crate::ast::decl::TypeSpec,
+    const_params: &HashMap<String, i64>,
+) -> TypeInfo {
+    use crate::ast::decl::{TypeSpec, KindSelector, LenSpec};
+
+    match ts {
+        TypeSpec::Integer(kind) => TypeInfo::Integer {
+            kind: kind
+                .as_ref()
+                .and_then(|k| match k {
+                    KindSelector::Expr(e) | KindSelector::Star(e) => {
+                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                    }
+                }),
+        },
+        TypeSpec::Real(kind) => TypeInfo::Real {
+            kind: kind
+                .as_ref()
+                .and_then(|k| match k {
+                    KindSelector::Expr(e) | KindSelector::Star(e) => {
+                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                    }
+                }),
+        },
+        TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
+        TypeSpec::Complex(kind) => TypeInfo::Complex {
+            kind: kind
+                .as_ref()
+                .and_then(|k| match k {
+                    KindSelector::Expr(e) | KindSelector::Star(e) => {
+                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                    }
+                }),
+        },
+        TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
+        TypeSpec::Logical(kind) => TypeInfo::Logical {
+            kind: kind
+                .as_ref()
+                .and_then(|k| match k {
+                    KindSelector::Expr(e) | KindSelector::Star(e) => {
+                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                    }
+                }),
+        },
+        TypeSpec::Character(sel) => {
+            let len = sel.as_ref().and_then(|s| s.len.as_ref()).and_then(|l| match l {
+                LenSpec::Expr(e) => eval_const_int_expr(e, const_params),
+                _ => None,
             });
-            let kind = sel.as_ref().and_then(|s| s.kind.as_ref()).and_then(|e| {
-                if let crate::ast::expr::Expr::IntegerLiteral { text, .. } = &e.node {
-                    text.parse::<u8>().ok()
-                } else { None }
-            });
+            let kind = sel
+                .as_ref()
+                .and_then(|s| s.kind.as_ref())
+                .and_then(|e| eval_const_int_expr(e, const_params))
+                .and_then(|v| u8::try_from(v).ok());
             TypeInfo::Character { len, kind }
         }
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
@@ -175,6 +287,7 @@ pub fn compute_layout(
     components: &[crate::ast::decl::SpannedDecl],
     parent_layout: Option<&TypeLayout>,
     registry: &TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
 ) -> TypeLayout {
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
@@ -196,23 +309,22 @@ pub fn compute_layout(
             let is_pointer = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Pointer));
             let is_target = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Target));
 
-            let ti = type_spec_to_type_info(type_spec);
-            let (elem_size, elem_align) = if matches!(
-                &ti,
-                TypeInfo::Character { len: None, .. }
-            ) && (is_allocatable || is_pointer) {
-                (32, 8) // StringDescriptor for deferred-length char allocatable/pointer components
-            } else if is_allocatable || is_pointer {
-                (384, 8) // ArrayDescriptor size for allocatable/pointer components
-            } else if let TypeInfo::Derived(ref dname) = ti {
-                registry.get(dname)
-                    .map(|l| (l.size, l.align))
-                    .unwrap_or((8, 8))
-            } else {
-                size_of_type(&ti)
-            };
-
+            let ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
+                let (elem_size, elem_align) = if matches!(
+                    &ti,
+                    TypeInfo::Character { len: None, .. }
+                ) && (is_allocatable || is_pointer) && entity.array_spec.is_none() {
+                    (32, 8) // StringDescriptor for deferred-length scalar char components
+                } else if is_allocatable || is_pointer {
+                    (384, 8) // ArrayDescriptor size for allocatable/pointer components
+                } else if let TypeInfo::Derived(ref dname) = ti {
+                    registry.get(dname)
+                        .map(|l| (l.size, l.align))
+                        .unwrap_or((8, 8))
+                } else {
+                    size_of_type(&ti)
+                };
                 // Pad to alignment.
                 let padding = (elem_align - (offset % elem_align)) % elem_align;
                 offset += padding;
@@ -364,6 +476,10 @@ mod tests {
         }, span)
     }
 
+    fn empty_params() -> std::collections::HashMap<String, i64> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn compute_layout_simple_struct() {
         // type :: pair; integer :: x; real :: y; end type
@@ -372,7 +488,7 @@ mod tests {
             make_component("x", crate::ast::decl::TypeSpec::Integer(None)),
             make_component("y", crate::ast::decl::TypeSpec::Real(None)),
         ];
-        let layout = compute_layout("pair", &[], &[], &components, None, &reg);
+        let layout = compute_layout("pair", &[], &[], &components, None, &reg, &empty_params());
         assert_eq!(layout.name, "pair");
         assert_eq!(layout.size, 8); // 4 + 4, no padding needed
         assert_eq!(layout.align, 4);
@@ -397,7 +513,7 @@ mod tests {
             )),
             make_component("b", crate::ast::decl::TypeSpec::DoublePrecision),
         ];
-        let layout = compute_layout("padded", &[], &[], &components, None, &reg);
+        let layout = compute_layout("padded", &[], &[], &components, None, &reg, &empty_params());
         assert_eq!(layout.field("a").unwrap().offset, 0);
         assert_eq!(layout.field("a").unwrap().size, 1);
         assert_eq!(layout.field("b").unwrap().offset, 8); // padded to 8-byte alignment
@@ -412,14 +528,56 @@ mod tests {
         // type, extends(base) :: child; real :: y; end type
         let reg = TypeLayoutRegistry::new();
         let base_comps = vec![make_component("x", crate::ast::decl::TypeSpec::Integer(None))];
-        let base_layout = compute_layout("base", &[], &[], &base_comps, None, &reg);
+        let base_layout = compute_layout("base", &[], &[], &base_comps, None, &reg, &empty_params());
         assert_eq!(base_layout.size, 4);
 
         let child_comps = vec![make_component("y", crate::ast::decl::TypeSpec::Real(None))];
-        let child_layout = compute_layout("child", &[], &[], &child_comps, Some(&base_layout), &reg);
+        let child_layout =
+            compute_layout("child", &[], &[], &child_comps, Some(&base_layout), &reg, &empty_params());
         assert_eq!(child_layout.fields.len(), 2); // x + y
         assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
         assert_eq!(child_layout.field("y").unwrap().offset, 4); // appended
         assert_eq!(child_layout.size, 8);
+    }
+
+    #[test]
+    fn compute_layout_resolves_named_character_length_params() {
+        use crate::ast::decl::{CharSelector, LenSpec, TypeSpec};
+        use crate::ast::expr::Expr;
+        use crate::ast::Spanned;
+
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+        let components = vec![make_component(
+            "value",
+            TypeSpec::Character(Some(CharSelector {
+                len: Some(LenSpec::Expr(Spanned::new(
+                    Expr::Name {
+                        name: "MAX_TOKEN_LEN".into(),
+                    },
+                    span,
+                ))),
+                kind: None,
+            })),
+        )];
+        let reg = TypeLayoutRegistry::new();
+        let mut params = std::collections::HashMap::new();
+        params.insert("max_token_len".into(), 8);
+
+        let layout = compute_layout("token_t", &[], &[], &components, None, &reg, &params);
+        let field = layout.field("value").expect("missing value field");
+
+        assert_eq!(field.size, 8);
+        assert!(matches!(
+            field.type_info,
+            TypeInfo::Character {
+                len: Some(8),
+                kind: None
+            }
+        ));
     }
 }

@@ -4,6 +4,7 @@
 //! This establishes the symbol table that type checking (Sprint 13) will use.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use crate::ast::unit::*;
 use crate::ast::decl;
 use crate::ast::decl::{SpannedDecl, Decl, TypeSpec, Attribute, OnlyItem};
@@ -684,29 +685,37 @@ fn load_external_module(
 
 /// Walk all program units and compute layouts for derived types.
 fn compute_all_layouts(units: &[SpannedUnit], layouts: &mut super::type_layout::TypeLayoutRegistry) {
+    let inherited_params = HashMap::new();
     for unit in units {
-        collect_derived_type_layouts(&unit.node, layouts);
+        collect_derived_type_layouts(&unit.node, layouts, &inherited_params);
     }
 }
 
-fn collect_derived_type_layouts(unit: &ProgramUnit, layouts: &mut super::type_layout::TypeLayoutRegistry) {
-    let decls = match unit {
-        ProgramUnit::Program { decls, contains, .. } |
-        ProgramUnit::Module { decls, contains, .. } => {
-            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
-            decls
-        }
-        ProgramUnit::Subroutine { decls, contains, .. } |
-        ProgramUnit::Function { decls, contains, .. } => {
-            for sub in contains { collect_derived_type_layouts(&sub.node, layouts); }
-            decls
-        }
+fn collect_derived_type_layouts(
+    unit: &ProgramUnit,
+    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    inherited_params: &HashMap<String, i64>,
+) {
+    let (decls, contains) = match unit {
+        ProgramUnit::Program { decls, contains, .. }
+        | ProgramUnit::Module { decls, contains, .. }
+        | ProgramUnit::Subroutine { decls, contains, .. }
+        | ProgramUnit::Function { decls, contains, .. } => (decls, contains),
         _ => return,
     };
+    let const_params = collect_const_int_params(decls, inherited_params);
     for decl in decls {
         if let Decl::DerivedTypeDef { name, extends, components, type_bound_procs, final_procs, .. } = &decl.node {
             let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
-            let layout = super::type_layout::compute_layout(name, type_bound_procs, final_procs, components, parent.as_ref(), layouts);
+            let layout = super::type_layout::compute_layout(
+                name,
+                type_bound_procs,
+                final_procs,
+                components,
+                parent.as_ref(),
+                layouts,
+                &const_params,
+            );
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts.get(&name.to_lowercase())
@@ -721,6 +730,146 @@ fn collect_derived_type_layouts(unit: &ProgramUnit, layouts: &mut super::type_la
             }
         }
     }
+    for sub in contains {
+        collect_derived_type_layouts(&sub.node, layouts, &const_params);
+    }
+}
+
+fn eval_const_int_expr_with_params(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
+) -> Option<i64> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => {
+            let clean = text.split('_').next().unwrap_or(text);
+            clean.parse::<i64>().ok()
+        }
+        Expr::Name { name } => const_params.get(&name.to_lowercase()).copied(),
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_const_int_expr_with_params(operand, const_params)?;
+            match op {
+                crate::ast::expr::UnaryOp::Minus => Some(-v),
+                crate::ast::expr::UnaryOp::Plus => Some(v),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_const_int_expr_with_params(left, const_params)?;
+            let r = eval_const_int_expr_with_params(right, const_params)?;
+            match op {
+                crate::ast::expr::BinaryOp::Add => Some(l + r),
+                crate::ast::expr::BinaryOp::Sub => Some(l - r),
+                crate::ast::expr::BinaryOp::Mul => Some(l * r),
+                crate::ast::expr::BinaryOp::Div if r != 0 => Some(l / r),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_int_expr_with_params(inner, const_params),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let first_arg_val = args.first().and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    eval_const_int_expr_with_params(e, const_params)
+                } else {
+                    None
+                }
+            });
+            match name.to_lowercase().as_str() {
+                "selected_int_kind" => {
+                    let r = first_arg_val?;
+                    Some(if r <= 2 {
+                        1
+                    } else if r <= 4 {
+                        2
+                    } else if r <= 9 {
+                        4
+                    } else if r <= 18 {
+                        8
+                    } else if r <= 38 {
+                        16
+                    } else {
+                        -1
+                    })
+                }
+                "selected_real_kind" => {
+                    let p = first_arg_val?;
+                    Some(if p <= 6 {
+                        4
+                    } else if p <= 15 {
+                        8
+                    } else {
+                        -1
+                    })
+                }
+                "kind" => {
+                    let Some(arg) = args.first() else {
+                        return None;
+                    };
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    match &e.node {
+                        Expr::RealLiteral { text, .. } => {
+                            Some(if text.contains('d') || text.contains('D') { 8 } else { 4 })
+                        }
+                        Expr::IntegerLiteral { .. } => Some(4),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn collect_const_int_params(
+    decls: &[SpannedDecl],
+    inherited_params: &HashMap<String, i64>,
+) -> HashMap<String, i64> {
+    let mut params = inherited_params.clone();
+    for decl in decls {
+        let Decl::TypeDecl { attrs, entities, .. } = &decl.node else {
+            continue;
+        };
+        if !attrs.iter().any(|a| matches!(a, Attribute::Parameter)) {
+            continue;
+        }
+        for entity in entities {
+            params.remove(&entity.name.to_lowercase());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for decl in decls {
+            let Decl::TypeDecl { attrs, entities, .. } = &decl.node else {
+                continue;
+            };
+            if !attrs.iter().any(|a| matches!(a, Attribute::Parameter)) {
+                continue;
+            }
+            for entity in entities {
+                let key = entity.name.to_lowercase();
+                if params.contains_key(&key) {
+                    continue;
+                }
+                let Some(init) = entity.init.as_ref() else {
+                    continue;
+                };
+                if let Some(value) = eval_const_int_expr_with_params(init, &params) {
+                    params.insert(key, value);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    params
 }
 
 fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Result<(), SemaError> {
@@ -1034,21 +1183,14 @@ fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8
 }
 
 /// Extract character length from a CharSelector.
-fn extract_char_len(sel: &Option<decl::CharSelector>) -> Option<i64> {
-    use crate::ast::expr::Expr;
+fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
     match sel {
-        Some(cs) => {
-            match &cs.len {
-                Some(decl::LenSpec::Expr(e)) => {
-                    if let Expr::IntegerLiteral { text, .. } = &e.node {
-                        text.parse().ok()
-                    } else { None }
-                }
-                Some(decl::LenSpec::Star) => None, // assumed length
-                Some(decl::LenSpec::Colon) => None, // deferred length
-                None => None,
-            }
-        }
+        Some(cs) => match &cs.len {
+            Some(decl::LenSpec::Expr(e)) => eval_const_int_expr(e, st),
+            Some(decl::LenSpec::Star) => None, // assumed length
+            Some(decl::LenSpec::Colon) => None, // deferred length
+            None => None,
+        },
         None => None,
     }
 }
@@ -1061,7 +1203,10 @@ fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
         TypeSpec::Complex(sel) => TypeInfo::Complex { kind: extract_kind(sel, st) },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
         TypeSpec::Logical(sel) => TypeInfo::Logical { kind: extract_kind(sel, st) },
-        TypeSpec::Character(sel) => TypeInfo::Character { len: extract_char_len(sel), kind: None },
+        TypeSpec::Character(sel) => TypeInfo::Character {
+            len: extract_char_len(sel, st),
+            kind: None,
+        },
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
         TypeSpec::ClassStar => TypeInfo::ClassStar,
