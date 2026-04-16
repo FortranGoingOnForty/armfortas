@@ -31,6 +31,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     let mut start = None;
     let mut end = None;
@@ -125,17 +144,27 @@ fn o2_reuses_branch_join_affine_expression() {
         },
         Stage::OptIr,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        3,
+        "raw IR should include the program body plus a pure helper and a tally worker:\n{}",
+        raw_ir
+    );
+    let helper_name = function_name(raw_sections[1]);
+    let worker_name = function_name(raw_sections[2]);
 
-    let raw_tally = function_section(&raw_ir, "tally");
+    let raw_tally = function_section(&raw_ir, worker_name);
     let raw_join = last_block_section(raw_tally, "if_end_");
 
     assert!(
-        raw_join.matches("call @offset_value").count() >= 2,
+        raw_join.matches(&format!("call @{}", helper_name)).count() >= 2,
         "raw join block should still recompute the repeated branch-join PURE helper call:\n{}",
         raw_join
     );
     assert!(
-        opt_ir.matches("call @offset_value").count() < raw_ir.matches("call @offset_value").count(),
+        opt_ir.matches(&format!("call @{}", helper_name)).count()
+            < raw_ir.matches(&format!("call @{}", helper_name)).count(),
         "O2 should reduce duplicated branch-join PURE helper calls:\n{}",
         opt_ir
     );
@@ -161,9 +190,17 @@ fn o2_removes_dead_seed_store_across_noalias_call() {
         },
         Stage::OptIr,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        3,
+        "raw IR should include the program body plus a helper and a fill worker:\n{}",
+        raw_ir
+    );
+    let worker_name = function_name(raw_sections[2]);
 
-    let raw_fill = function_section(&raw_ir, "seed_and_fill");
-    let opt_fill = function_section(&opt_ir, "seed_and_fill");
+    let raw_fill = function_section(&raw_ir, worker_name);
+    let opt_fill = function_section(&opt_ir, worker_name);
     let raw_body = block_section(raw_fill, "do_body_");
     let opt_body = block_section(opt_fill, "do_body_");
 

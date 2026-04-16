@@ -31,6 +31,33 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn non_program_function_names(ir: &str) -> Vec<&str> {
+    function_sections(ir)
+        .into_iter()
+        .map(function_name)
+        .filter(|name| !name.starts_with("__prog_"))
+        .collect()
+}
+
 fn block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     let mut start = None;
     let mut end = None;
@@ -78,7 +105,14 @@ fn o2_hoists_noalias_dummy_load_into_loop_preheader() {
         Stage::OptIr,
     );
 
-    let kernel = function_section(&opt_ir, "kernel");
+    let helper_names = non_program_function_names(&opt_ir);
+    assert_eq!(
+        helper_names.len(),
+        1,
+        "optimized IR should include exactly one contained kernel helper:\n{}",
+        opt_ir
+    );
+    let kernel = function_section(&opt_ir, helper_names[0]);
     let preheader = block_section(kernel, "if_end_");
     let loop_body = block_section(kernel, "do_body_");
 

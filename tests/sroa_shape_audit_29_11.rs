@@ -40,6 +40,25 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn o2_binomial_blend_scalarizes_taps_and_removes_safe_stencil_checks() {
     let source = fixture("realworld_binomial_blend.f90");
@@ -60,9 +79,17 @@ fn o2_binomial_blend_scalarizes_taps_and_removes_safe_stencil_checks() {
         },
         Stage::OptIr,
     );
+    let raw_sections = function_sections(&raw_ir);
+    assert_eq!(
+        raw_sections.len(),
+        2,
+        "raw IR should include the program body plus one contained blend helper:\n{}",
+        raw_ir
+    );
+    let helper_name = function_name(raw_sections[1]);
 
-    let raw_blend = function_section(&raw_ir, "blend");
-    let opt_blend = function_section(&opt_ir, "blend");
+    let raw_blend = function_section(&raw_ir, helper_name);
+    let opt_blend = function_section(&opt_ir, helper_name);
 
     assert!(
         raw_blend.contains("alloca [i32 x 4]"),

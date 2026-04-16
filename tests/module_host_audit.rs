@@ -40,6 +40,33 @@ fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     &rest[..end + "\n  }".len()]
 }
 
+fn function_sections(ir: &str) -> Vec<&str> {
+    ir.match_indices("  func @")
+        .map(|(idx, _)| {
+            let rest = &ir[idx..];
+            let end = rest
+                .find("\n  }\n")
+                .unwrap_or_else(|| panic!("unterminated function section in:\n{}", rest));
+            &rest[..end + "\n  }".len()]
+        })
+        .collect()
+}
+
+fn function_name<'a>(func_section: &'a str) -> &'a str {
+    let header = func_section.lines().next().expect("function header").trim();
+    let rest = header.strip_prefix("func @").expect("function header prefix");
+    let end = rest.find(|ch: char| ch == ' ' || ch == '(').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn non_program_function_names(ir: &str) -> Vec<&str> {
+    function_sections(ir)
+        .into_iter()
+        .map(function_name)
+        .filter(|name| !name.starts_with("__prog_"))
+        .collect()
+}
+
 #[test]
 fn raw_ir_module_procedure_sees_shared_module_global() {
     let raw_ir = capture_text(
@@ -51,7 +78,14 @@ fn raw_ir_module_procedure_sees_shared_module_global() {
         Stage::Ir,
     );
 
-    let bump = function_section(&raw_ir, "bump");
+    let helper_names = non_program_function_names(&raw_ir);
+    assert_eq!(
+        helper_names.len(),
+        1,
+        "raw IR should include exactly one module procedure helper:\n{}",
+        raw_ir
+    );
+    let bump = function_section(&raw_ir, helper_names[0]);
 
     assert!(
         bump.contains("global_addr @afs_mod_module_global_host_assoc_mod_g"),
