@@ -10,18 +10,22 @@
 //! (runtime, external linkage) are also kept since the call might come
 //! from outside.
 
-use std::collections::HashSet;
-use crate::ir::inst::*;
 use super::pass::Pass;
+use crate::ir::inst::*;
+use std::collections::HashSet;
 
 pub struct DeadFuncElim;
 
 impl Pass for DeadFuncElim {
-    fn name(&self) -> &'static str { "dead-func-elim" }
+    fn name(&self) -> &'static str {
+        "dead-func-elim"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let n = module.functions.len();
-        if n <= 1 { return false; }
+        if n <= 1 {
+            return false;
+        }
 
         // Collect all function indices that are referenced by Internal calls.
         let mut referenced: HashSet<u32> = HashSet::new();
@@ -78,7 +82,9 @@ impl Pass for DeadFuncElim {
             .filter(|i| !referenced.contains(&(*i as u32)))
             .collect();
 
-        if dead.is_empty() { return false; }
+        if dead.is_empty() {
+            return false;
+        }
 
         // Remove in reverse order so indices stay valid.
         for &idx in dead.iter().rev() {
@@ -117,13 +123,17 @@ impl Pass for DeadFuncElim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
-    use crate::lexer::{Span, Position};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     #[test]
@@ -155,7 +165,9 @@ mod tests {
         let cid = caller.next_value_id();
         caller.register_type(cid, IrType::Void);
         caller.block_mut(caller.entry).insts.push(Inst {
-            id: cid, ty: IrType::Void, span: span(),
+            id: cid,
+            ty: IrType::Void,
+            span: span(),
             kind: InstKind::Call(FuncRef::Internal(1), vec![]),
         });
         caller.block_mut(caller.entry).terminator = Some(Terminator::Return(None));
@@ -212,7 +224,10 @@ mod tests {
 
         let pass = DeadFuncElim;
         let changed = pass.run(&mut m);
-        assert!(changed, "dead helper should be removed while keeping program body");
+        assert!(
+            changed,
+            "dead helper should be removed while keeping program body"
+        );
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].name, "__prog_entry");
     }

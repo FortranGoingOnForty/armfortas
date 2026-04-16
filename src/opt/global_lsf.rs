@@ -12,22 +12,26 @@
 //!     %r = load %ptr        → %r = %val (forwarded)
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use super::alias::{self, AliasResult};
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, predecessors, terminator_targets};
-use super::alias::{self, AliasResult};
-use super::pass::Pass;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct GlobalLsf;
 
 impl Pass for GlobalLsf {
-    fn name(&self) -> &'static str { "global-lsf" }
+    fn name(&self) -> &'static str {
+        "global-lsf"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if global_lsf_function(func) { changed = true; }
+            if global_lsf_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -51,7 +55,9 @@ fn global_lsf_function(func: &mut Function) -> bool {
         }
     }
 
-    if replacements.is_empty() { return false; }
+    if replacements.is_empty() {
+        return false;
+    }
 
     // Apply replacements.
     for block in &mut func.blocks {
@@ -59,11 +65,8 @@ fn global_lsf_function(func: &mut Function) -> bool {
             inst.kind = super::loop_utils::remap_inst_kind(&inst.kind, &replacements);
         }
         if let Some(ref mut term) = block.terminator {
-            let new_term = super::loop_utils::remap_terminator(
-                term,
-                &HashMap::new(),
-                &replacements,
-            );
+            let new_term =
+                super::loop_utils::remap_terminator(term, &HashMap::new(), &replacements);
             *term = new_term;
         }
     }
@@ -95,7 +98,9 @@ fn find_reaching_store(
 
     let mut current = load_block;
     while let Some(&idom) = idoms.get(&current) {
-        if idom == current { break; } // entry
+        if idom == current {
+            break;
+        } // entry
         current = idom;
 
         if !paths_to_load_are_clean(func, preds, current, load_block, load_ptr) {
@@ -186,9 +191,10 @@ fn update_memory_state(
                 .copied()
                 .filter(|arg| value_is_pointer(func, *arg))
                 .collect();
-            if pointer_args.iter().any(|arg| {
-                alias::may_reach_through_call_arg(func, load_ptr, *arg)
-            }) {
+            if pointer_args
+                .iter()
+                .any(|arg| alias::may_reach_through_call_arg(func, load_ptr, *arg))
+            {
                 *last_store = None;
                 *clobbered = true;
             }
@@ -201,10 +207,17 @@ fn value_is_pointer(func: &Function, value: ValueId) -> bool {
     if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
         return true;
     }
-    if func.params.iter().any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_))) {
+    if func
+        .params
+        .iter()
+        .any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_)))
+    {
         return true;
     }
-    func.blocks.iter().flat_map(|block| block.insts.iter()).find(|inst| inst.id == value)
+    func.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .find(|inst| inst.id == value)
         .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
         .unwrap_or(false)
 }
@@ -316,7 +329,7 @@ fn reverse_reachable_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 
     #[test]
@@ -379,7 +392,10 @@ mod tests {
         m.add_function(f);
 
         let pass = GlobalLsf;
-        assert!(pass.run(&mut m), "straight-line dominated load should be forwarded");
+        assert!(
+            pass.run(&mut m),
+            "straight-line dominated load should be forwarded"
+        );
         let term = m.functions[0].block(load_block).terminator.clone().unwrap();
         assert!(
             matches!(term, Terminator::Return(Some(v)) if v == value),

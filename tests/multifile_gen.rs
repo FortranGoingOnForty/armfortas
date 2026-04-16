@@ -13,9 +13,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(prefix: &str) -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "afs_gen_{}_{}_{}", prefix, std::process::id(), id
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("afs_gen_{}_{}_{}", prefix, std::process::id(), id));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -23,7 +22,9 @@ fn unique_dir(prefix: &str) -> PathBuf {
 fn find_compiler() -> PathBuf {
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
-        if p.exists() { return fs::canonicalize(&p).unwrap(); }
+        if p.exists() {
+            return fs::canonicalize(&p).unwrap();
+        }
     }
     panic!("armfortas binary not found");
 }
@@ -31,7 +32,9 @@ fn find_compiler() -> PathBuf {
 fn find_runtime() -> PathBuf {
     for dir in &["target/release", "target/debug"] {
         let p = PathBuf::from(dir).join("libarmfortas_rt.a");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     panic!("libarmfortas_rt.a not found");
 }
@@ -47,8 +50,11 @@ fn sdk_path() -> String {
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path, opt: &str) {
     let result = Command::new(compiler)
         .args([
-            source.to_str().unwrap(), "-c", opt,
-            "-o", output.to_str().unwrap(),
+            source.to_str().unwrap(),
+            "-c",
+            opt,
+            "-o",
+            output.to_str().unwrap(),
             &format!("-I{}", search_dir.display()),
         ])
         .output()
@@ -69,8 +75,17 @@ fn link_files(objects: &[PathBuf], output: &Path) {
         args.push(o.to_str().unwrap().into());
     }
     args.push(runtime.to_str().unwrap().into());
-    args.extend(["-lSystem".into(), "-syslibroot".into(), sdk, "-arch".into(), "arm64".into()]);
-    let result = Command::new("ld").args(&args).output().expect("ld launch failed");
+    args.extend([
+        "-lSystem".into(),
+        "-syslibroot".into(),
+        sdk,
+        "-arch".into(),
+        "arm64".into(),
+    ]);
+    let result = Command::new("ld")
+        .args(&args)
+        .output()
+        .expect("ld launch failed");
     assert!(
         result.status.success(),
         "link failed:\n{}",
@@ -83,7 +98,8 @@ fn run_binary(binary: &Path) -> String {
     assert!(
         result.status.success(),
         "{} exited with {:?}\nstderr: {}",
-        binary.display(), result.status.code(),
+        binary.display(),
+        result.status.code(),
         String::from_utf8_lossy(&result.stderr)
     );
     String::from_utf8_lossy(&result.stdout).into_owned()
@@ -114,16 +130,16 @@ fn gen_chain(depth: usize) -> (Vec<(String, String)>, String, &'static str) {
             format!(
                 "module mod_{i}\n  use mod_{next}\n  implicit none\n  \
                  integer, parameter :: val_{i} = val_{next} + {i}\nend module\n",
-                i = i, next = i + 1
+                i = i,
+                next = i + 1
             ),
         ));
     }
 
     // Main program uses mod_1 and prints the accumulated value.
     let expected: usize = (1..=depth).sum();
-    let main_src = format!(
-        "program p\n  use mod_1\n  implicit none\n  print *, val_1\nend program\n"
-    );
+    let main_src =
+        format!("program p\n  use mod_1\n  implicit none\n  print *, val_1\nend program\n");
 
     // Files are already in compilation order: leaf first, then towards root.
     let expected_str = Box::leak(format!("{}", expected).into_boxed_str());
@@ -211,7 +227,10 @@ fn run_generated_test(
     assert!(
         output.contains(expected),
         "{} [{}]: expected '{}' in output, got:\n{}",
-        label, opt, expected, output
+        label,
+        opt,
+        expected,
+        output
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -303,7 +322,11 @@ fn run_cross_opt_test(
     assert!(
         output.contains(expected),
         "{}: mod@{} + main@{}: expected '{}' in output, got:\n{}",
-        label, mod_opt, main_opt, expected, output
+        label,
+        mod_opt,
+        main_opt,
+        expected,
+        output
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -336,11 +359,25 @@ fn abi_matrix_diamond4_mod_o2_main_o0() {
 #[test]
 fn abi_matrix_chain5_mod_o0_main_ofast() {
     let (files, main_src, expected) = gen_chain(5);
-    run_cross_opt_test(files, main_src, expected, "-O0", "-Ofast", "abi_chain5_0_fast");
+    run_cross_opt_test(
+        files,
+        main_src,
+        expected,
+        "-O0",
+        "-Ofast",
+        "abi_chain5_0_fast",
+    );
 }
 
 #[test]
 fn abi_matrix_chain5_mod_ofast_main_o0() {
     let (files, main_src, expected) = gen_chain(5);
-    run_cross_opt_test(files, main_src, expected, "-Ofast", "-O0", "abi_chain5_fast_0");
+    run_cross_opt_test(
+        files,
+        main_src,
+        expected,
+        "-Ofast",
+        "-O0",
+        "abi_chain5_fast_0",
+    );
 }

@@ -3,8 +3,8 @@
 //! Computes field offsets, alignment, and total size for derived types
 //! using natural alignment rules (same as C struct layout on ARM64).
 
-use std::collections::HashMap;
 use super::symtab::TypeInfo;
+use std::collections::HashMap;
 
 /// Layout of a single field in a derived type.
 #[derive(Debug, Clone)]
@@ -56,7 +56,9 @@ impl TypeLayout {
     /// Look up a type-bound procedure by method name.
     pub fn bound_proc(&self, name: &str) -> Option<&BoundProc> {
         let key = name.to_lowercase();
-        self.bound_procs.iter().find(|p| p.method_name.to_lowercase() == key)
+        self.bound_procs
+            .iter()
+            .find(|p| p.method_name.to_lowercase() == key)
     }
 }
 
@@ -69,7 +71,10 @@ pub struct TypeLayoutRegistry {
 
 impl TypeLayoutRegistry {
     pub fn new() -> Self {
-        Self { layouts: HashMap::new(), next_tag: 1 }
+        Self {
+            layouts: HashMap::new(),
+            next_tag: 1,
+        }
     }
 
     pub fn alloc_tag(&mut self) -> u64 {
@@ -202,7 +207,11 @@ fn eval_const_int_expr(
                     };
                     match &e.node {
                         Expr::RealLiteral { text, .. } => {
-                            Some(if text.contains('d') || text.contains('D') { 8 } else { 4 })
+                            Some(if text.contains('d') || text.contains('D') {
+                                8
+                            } else {
+                                4
+                            })
                         }
                         Expr::IntegerLiteral { .. } => Some(4),
                         _ => None,
@@ -246,52 +255,47 @@ fn type_spec_to_type_info(
     ts: &crate::ast::decl::TypeSpec,
     const_params: &HashMap<String, i64>,
 ) -> TypeInfo {
-    use crate::ast::decl::{TypeSpec, KindSelector, LenSpec};
+    use crate::ast::decl::{KindSelector, LenSpec, TypeSpec};
 
     match ts {
         TypeSpec::Integer(kind) => TypeInfo::Integer {
-            kind: kind
-                .as_ref()
-                .and_then(|k| match k {
-                    KindSelector::Expr(e) | KindSelector::Star(e) => {
-                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
-                    }
-                }),
+            kind: kind.as_ref().and_then(|k| match k {
+                KindSelector::Expr(e) | KindSelector::Star(e) => {
+                    eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                }
+            }),
         },
         TypeSpec::Real(kind) => TypeInfo::Real {
-            kind: kind
-                .as_ref()
-                .and_then(|k| match k {
-                    KindSelector::Expr(e) | KindSelector::Star(e) => {
-                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
-                    }
-                }),
+            kind: kind.as_ref().and_then(|k| match k {
+                KindSelector::Expr(e) | KindSelector::Star(e) => {
+                    eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                }
+            }),
         },
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
         TypeSpec::Complex(kind) => TypeInfo::Complex {
-            kind: kind
-                .as_ref()
-                .and_then(|k| match k {
-                    KindSelector::Expr(e) | KindSelector::Star(e) => {
-                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
-                    }
-                }),
+            kind: kind.as_ref().and_then(|k| match k {
+                KindSelector::Expr(e) | KindSelector::Star(e) => {
+                    eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                }
+            }),
         },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
         TypeSpec::Logical(kind) => TypeInfo::Logical {
-            kind: kind
-                .as_ref()
-                .and_then(|k| match k {
-                    KindSelector::Expr(e) | KindSelector::Star(e) => {
-                        eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
-                    }
-                }),
+            kind: kind.as_ref().and_then(|k| match k {
+                KindSelector::Expr(e) | KindSelector::Star(e) => {
+                    eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
+                }
+            }),
         },
         TypeSpec::Character(sel) => {
-            let len = sel.as_ref().and_then(|s| s.len.as_ref()).and_then(|l| match l {
-                LenSpec::Expr(e) => eval_const_int_expr(e, const_params),
-                _ => None,
-            });
+            let len = sel
+                .as_ref()
+                .and_then(|s| s.len.as_ref())
+                .and_then(|l| match l {
+                    LenSpec::Expr(e) => eval_const_int_expr(e, const_params),
+                    _ => None,
+                });
             let kind = sel
                 .as_ref()
                 .and_then(|s| s.kind.as_ref())
@@ -331,10 +335,21 @@ pub fn compute_layout(
 
     // Process component declarations.
     for decl in components {
-        if let crate::ast::decl::Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
-            let is_allocatable = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
-            let is_pointer = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Pointer));
-            let is_target = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Target));
+        if let crate::ast::decl::Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } = &decl.node
+        {
+            let is_allocatable = attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
+            let is_pointer = attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Pointer));
+            let is_target = attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Target));
 
             let ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
@@ -343,20 +358,22 @@ pub fn compute_layout(
                 } else {
                     eval_explicit_array_dims(entity.array_spec.as_ref(), const_params)
                 };
-                let (elem_size, elem_align) = if matches!(
-                    &ti,
-                    TypeInfo::Character { len: None, .. }
-                ) && (is_allocatable || is_pointer) && entity.array_spec.is_none() {
-                    (32, 8) // StringDescriptor for deferred-length scalar char components
-                } else if is_allocatable || is_pointer {
-                    (384, 8) // ArrayDescriptor size for allocatable/pointer components
-                } else if let TypeInfo::Derived(ref dname) = ti {
-                    registry.get(dname)
-                        .map(|l| (l.size, l.align))
-                        .unwrap_or((8, 8))
-                } else {
-                    size_of_type(&ti)
-                };
+                let (elem_size, elem_align) =
+                    if matches!(&ti, TypeInfo::Character { len: None, .. })
+                        && (is_allocatable || is_pointer)
+                        && entity.array_spec.is_none()
+                    {
+                        (32, 8) // StringDescriptor for deferred-length scalar char components
+                    } else if is_allocatable || is_pointer {
+                        (384, 8) // ArrayDescriptor size for allocatable/pointer components
+                    } else if let TypeInfo::Derived(ref dname) = ti {
+                        registry
+                            .get(dname)
+                            .map(|l| (l.size, l.align))
+                            .unwrap_or((8, 8))
+                    } else {
+                        size_of_type(&ti)
+                    };
                 // Pad to alignment.
                 let padding = (elem_align - (offset % elem_align)) % elem_align;
                 offset += padding;
@@ -392,15 +409,18 @@ pub fn compute_layout(
     }
 
     // Collect type-bound procedure mappings.
-    let bound_procs: Vec<BoundProc> = type_bound_procs.iter().map(|tbp| {
-        let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
-        let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
-        BoundProc {
-            method_name: tbp.name.clone(),
-            target_name: target.to_string(),
-            nopass,
-        }
-    }).collect();
+    let bound_procs: Vec<BoundProc> = type_bound_procs
+        .iter()
+        .map(|tbp| {
+            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
+            let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
+            BoundProc {
+                method_name: tbp.name.clone(),
+                target_name: target.to_string(),
+                nopass,
+            }
+        })
+        .collect();
 
     TypeLayout {
         name: type_name.to_string(),
@@ -425,7 +445,13 @@ mod tests {
         assert_eq!(size_of_type(&TypeInfo::Real { kind: Some(4) }), (4, 4));
         assert_eq!(size_of_type(&TypeInfo::Real { kind: Some(8) }), (8, 8));
         assert_eq!(size_of_type(&TypeInfo::Logical { kind: Some(4) }), (4, 4));
-        assert_eq!(size_of_type(&TypeInfo::Character { len: Some(10), kind: None }), (10, 1));
+        assert_eq!(
+            size_of_type(&TypeInfo::Character {
+                len: Some(10),
+                kind: None
+            }),
+            (10, 1)
+        );
         assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(4) }), (8, 4));
         assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(8) }), (16, 8));
     }
@@ -437,8 +463,26 @@ mod tests {
             size: 8,
             align: 4,
             fields: vec![
-                FieldLayout { name: "x".into(), offset: 0, size: 4, dims: vec![], type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "y".into(), offset: 4, size: 4, dims: vec![], type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout {
+                    name: "x".into(),
+                    offset: 0,
+                    size: 4,
+                    dims: vec![],
+                    type_info: TypeInfo::Real { kind: Some(4) },
+                    allocatable: false,
+                    pointer: false,
+                    target: false,
+                },
+                FieldLayout {
+                    name: "y".into(),
+                    offset: 4,
+                    size: 4,
+                    dims: vec![],
+                    type_info: TypeInfo::Real { kind: Some(4) },
+                    allocatable: false,
+                    pointer: false,
+                    target: false,
+                },
             ],
             bound_procs: vec![],
             final_procs: vec![],
@@ -463,9 +507,36 @@ mod tests {
             size: 24,
             align: 8,
             fields: vec![
-                FieldLayout { name: "a".into(), offset: 0, size: 1, dims: vec![], type_info: TypeInfo::Integer { kind: Some(1) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "b".into(), offset: 8, size: 8, dims: vec![], type_info: TypeInfo::Real { kind: Some(8) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "c".into(), offset: 16, size: 4, dims: vec![], type_info: TypeInfo::Integer { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout {
+                    name: "a".into(),
+                    offset: 0,
+                    size: 1,
+                    dims: vec![],
+                    type_info: TypeInfo::Integer { kind: Some(1) },
+                    allocatable: false,
+                    pointer: false,
+                    target: false,
+                },
+                FieldLayout {
+                    name: "b".into(),
+                    offset: 8,
+                    size: 8,
+                    dims: vec![],
+                    type_info: TypeInfo::Real { kind: Some(8) },
+                    allocatable: false,
+                    pointer: false,
+                    target: false,
+                },
+                FieldLayout {
+                    name: "c".into(),
+                    offset: 16,
+                    size: 4,
+                    dims: vec![],
+                    type_info: TypeInfo::Integer { kind: Some(4) },
+                    allocatable: false,
+                    pointer: false,
+                    target: false,
+                },
             ],
             bound_procs: vec![],
             final_procs: vec![],
@@ -503,18 +574,25 @@ mod tests {
         use crate::ast::decl::*;
         use crate::ast::Spanned;
         let pos = crate::lexer::Position { line: 0, col: 0 };
-        let span = crate::lexer::Span { start: pos, end: pos, file_id: 0 };
-        Spanned::new(Decl::TypeDecl {
-            type_spec: ts,
-            attrs: vec![],
-            entities: vec![EntityDecl {
-                name: name.to_string(),
-                array_spec: None,
-                char_len: None,
-                init: None,
-                ptr_init: None,
-            }],
-        }, span)
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+        Spanned::new(
+            Decl::TypeDecl {
+                type_spec: ts,
+                attrs: vec![],
+                entities: vec![EntityDecl {
+                    name: name.to_string(),
+                    array_spec: None,
+                    char_len: None,
+                    init: None,
+                    ptr_init: None,
+                }],
+            },
+            span,
+        )
     }
 
     fn empty_params() -> std::collections::HashMap<String, i64> {
@@ -544,14 +622,22 @@ mod tests {
         // a(1) + 7pad + b(8) = 16
         let reg = TypeLayoutRegistry::new();
         let components = vec![
-            make_component("a", crate::ast::decl::TypeSpec::Integer(
-                Some(crate::ast::decl::KindSelector::Expr(
+            make_component(
+                "a",
+                crate::ast::decl::TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Expr(
                     crate::ast::Spanned::new(
-                        crate::ast::expr::Expr::IntegerLiteral { text: "1".into(), kind: None },
-                        crate::lexer::Span { start: crate::lexer::Position { line: 0, col: 0 }, end: crate::lexer::Position { line: 0, col: 0 }, file_id: 0 },
-                    )
-                ))
-            )),
+                        crate::ast::expr::Expr::IntegerLiteral {
+                            text: "1".into(),
+                            kind: None,
+                        },
+                        crate::lexer::Span {
+                            start: crate::lexer::Position { line: 0, col: 0 },
+                            end: crate::lexer::Position { line: 0, col: 0 },
+                            file_id: 0,
+                        },
+                    ),
+                ))),
+            ),
             make_component("b", crate::ast::decl::TypeSpec::DoublePrecision),
         ];
         let layout = compute_layout("padded", &[], &[], &components, None, &reg, &empty_params());
@@ -568,13 +654,24 @@ mod tests {
         // type :: base; integer :: x; end type
         // type, extends(base) :: child; real :: y; end type
         let reg = TypeLayoutRegistry::new();
-        let base_comps = vec![make_component("x", crate::ast::decl::TypeSpec::Integer(None))];
-        let base_layout = compute_layout("base", &[], &[], &base_comps, None, &reg, &empty_params());
+        let base_comps = vec![make_component(
+            "x",
+            crate::ast::decl::TypeSpec::Integer(None),
+        )];
+        let base_layout =
+            compute_layout("base", &[], &[], &base_comps, None, &reg, &empty_params());
         assert_eq!(base_layout.size, 4);
 
         let child_comps = vec![make_component("y", crate::ast::decl::TypeSpec::Real(None))];
-        let child_layout =
-            compute_layout("child", &[], &[], &child_comps, Some(&base_layout), &reg, &empty_params());
+        let child_layout = compute_layout(
+            "child",
+            &[],
+            &[],
+            &child_comps,
+            Some(&base_layout),
+            &reg,
+            &empty_params(),
+        );
         assert_eq!(child_layout.fields.len(), 2); // x + y
         assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
         assert_eq!(child_layout.field("y").unwrap().offset, 4); // appended

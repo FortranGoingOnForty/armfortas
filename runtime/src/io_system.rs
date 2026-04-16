@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write, BufRead, BufReader, BufWriter, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
 // ---- Global I/O state ----
@@ -45,7 +45,6 @@ fn write_i128_ptr(dst: *mut i128, value: i128) {
 enum UnitStatus {
     Open,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Access {
@@ -110,7 +109,12 @@ impl Unit {
             UnitStream::FileRaw(f) => {
                 f.write_all(data)?;
             }
-            _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for writing")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unit not open for writing",
+                ))
+            }
         }
         Ok(())
     }
@@ -143,7 +147,12 @@ impl Unit {
                     }
                 }
             }
-            _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unit not open for reading",
+                ))
+            }
         }
         Ok(line)
     }
@@ -197,44 +206,56 @@ impl IoState {
         let mut units = HashMap::new();
 
         // Preconnected units.
-        units.insert(5, Unit {
-            _number: 5,
-            stream: UnitStream::Stdin,
-            filename: "stdin".into(),
-            _status: UnitStatus::Open,
-            access: Access::Sequential,
-            form: Form::Formatted,
-            action: Action::Read,
-            recl: None,
-            read_tokens: Vec::new(),
-            formatted_read_record: None,
-        });
-        units.insert(6, Unit {
-            _number: 6,
-            stream: UnitStream::Stdout,
-            filename: "stdout".into(),
-            _status: UnitStatus::Open,
-            access: Access::Sequential,
-            form: Form::Formatted,
-            action: Action::Write,
-            recl: None,
-            read_tokens: Vec::new(),
-            formatted_read_record: None,
-        });
-        units.insert(0, Unit {
-            _number: 0,
-            stream: UnitStream::Stderr,
-            filename: "stderr".into(),
-            _status: UnitStatus::Open,
-            access: Access::Sequential,
-            form: Form::Formatted,
-            action: Action::Write,
-            recl: None,
-            read_tokens: Vec::new(),
-            formatted_read_record: None,
-        });
+        units.insert(
+            5,
+            Unit {
+                _number: 5,
+                stream: UnitStream::Stdin,
+                filename: "stdin".into(),
+                _status: UnitStatus::Open,
+                access: Access::Sequential,
+                form: Form::Formatted,
+                action: Action::Read,
+                recl: None,
+                read_tokens: Vec::new(),
+                formatted_read_record: None,
+            },
+        );
+        units.insert(
+            6,
+            Unit {
+                _number: 6,
+                stream: UnitStream::Stdout,
+                filename: "stdout".into(),
+                _status: UnitStatus::Open,
+                access: Access::Sequential,
+                form: Form::Formatted,
+                action: Action::Write,
+                recl: None,
+                read_tokens: Vec::new(),
+                formatted_read_record: None,
+            },
+        );
+        units.insert(
+            0,
+            Unit {
+                _number: 0,
+                stream: UnitStream::Stderr,
+                filename: "stderr".into(),
+                _status: UnitStatus::Open,
+                access: Access::Sequential,
+                form: Form::Formatted,
+                action: Action::Write,
+                recl: None,
+                read_tokens: Vec::new(),
+                formatted_read_record: None,
+            },
+        );
 
-        Self { units, next_newunit: -10 }
+        Self {
+            units,
+            next_newunit: -10,
+        }
     }
 
     fn get_unit(&mut self, unit_num: i32) -> Option<&mut Unit> {
@@ -277,20 +298,30 @@ pub struct OpenControlBlock {
 #[no_mangle]
 pub extern "C" fn afs_open_simple(
     unit: i32,
-    filename: *const u8, filename_len: i64,
-    status: *const u8, status_len: i64,
-    action: *const u8, action_len: i64,
+    filename: *const u8,
+    filename_len: i64,
+    status: *const u8,
+    status_len: i64,
+    action: *const u8,
+    action_len: i64,
 ) {
     let cb = OpenControlBlock {
-        unit, filename, filename_len,
-        status, status_len,
-        action, action_len,
-        access: std::ptr::null(), access_len: 0,
-        form: std::ptr::null(), form_len: 0,
+        unit,
+        filename,
+        filename_len,
+        status,
+        status_len,
+        action,
+        action_len,
+        access: std::ptr::null(),
+        access_len: 0,
+        form: std::ptr::null(),
+        form_len: 0,
         recl: 0,
         iostat: std::ptr::null_mut(),
         newunit: std::ptr::null_mut(),
-        position: std::ptr::null(), position_len: 0,
+        position: std::ptr::null(),
+        position_len: 0,
     };
     afs_open(&cb);
 }
@@ -299,7 +330,9 @@ pub extern "C" fn afs_open_simple(
 /// exceeding the 8-register ARM64 calling convention limit.
 #[no_mangle]
 pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
-    if cb.is_null() { return; }
+    if cb.is_null() {
+        return;
+    }
     let cb = unsafe { &*cb };
     let unit = cb.unit;
     let fname = unsafe_str(cb.filename, cb.filename_len);
@@ -317,7 +350,9 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     // NEWUNIT: allocate a new unit number.
     let actual_unit = if !newunit.is_null() {
         let u = state.alloc_newunit();
-        unsafe { *newunit = u; }
+        unsafe {
+            *newunit = u;
+        }
         u
     } else {
         unit
@@ -326,11 +361,21 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     // Build OpenOptions based on status/action.
     let mut opts = OpenOptions::new();
     match status_str.trim() {
-        "old" => { opts.read(true); }
-        "new" => { opts.write(true).create_new(true); }
-        "replace" => { opts.write(true).create(true).truncate(true); }
-        "scratch" | "unknown" | "" => { opts.read(true).write(true).create(true); }
-        _ => { opts.read(true).write(true).create(true); }
+        "old" => {
+            opts.read(true);
+        }
+        "new" => {
+            opts.write(true).create_new(true);
+        }
+        "replace" => {
+            opts.write(true).create(true).truncate(true);
+        }
+        "scratch" | "unknown" | "" => {
+            opts.read(true).write(true).create(true);
+        }
+        _ => {
+            opts.read(true).write(true).create(true);
+        }
     }
 
     // Determine action. Default depends on status:
@@ -348,9 +393,15 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     };
 
     match effective_action {
-        "read" => { opts.read(true); }
-        "write" => { opts.write(true).create(true); }
-        _ => { opts.read(true).write(true).create(true); }
+        "read" => {
+            opts.read(true);
+        }
+        "write" => {
+            opts.write(true).create(true);
+        }
+        _ => {
+            opts.read(true).write(true).create(true);
+        }
     }
 
     // Flush and close existing unit if re-opening.
@@ -386,18 +437,21 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     Action::ReadWrite => UnitStream::FileRaw(file),
                 },
             };
-            state.units.insert(actual_unit, Unit {
-                _number: actual_unit,
-                stream,
-                filename: fname,
-                _status: UnitStatus::Open,
-                access: file_access,
-                form: file_form,
-                action: file_action,
-                recl: if recl > 0 { Some(recl) } else { None },
-                read_tokens: Vec::new(),
-                formatted_read_record: None,
-            });
+            state.units.insert(
+                actual_unit,
+                Unit {
+                    _number: actual_unit,
+                    stream,
+                    filename: fname,
+                    _status: UnitStatus::Open,
+                    access: file_access,
+                    form: file_form,
+                    action: file_action,
+                    recl: if recl > 0 { Some(recl) } else { None },
+                    read_tokens: Vec::new(),
+                    formatted_read_record: None,
+                },
+            );
 
             // Apply POSITION specifier.
             // Default: REWIND for sequential, ASIS for direct/stream.
@@ -414,19 +468,31 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             if let Some(seek) = pos {
                 if let Some(u) = state.get_unit(actual_unit) {
                     match &mut u.stream {
-                        UnitStream::FileRaw(f) => { let _ = f.seek(seek); }
-                        UnitStream::FileRead(r) => { let _ = r.seek(seek); }
-                        UnitStream::FileWrite(w) => { let _ = w.seek(seek); }
+                        UnitStream::FileRaw(f) => {
+                            let _ = f.seek(seek);
+                        }
+                        UnitStream::FileRead(r) => {
+                            let _ = r.seek(seek);
+                        }
+                        UnitStream::FileWrite(w) => {
+                            let _ = w.seek(seek);
+                        }
                         _ => {}
                     }
                 }
             }
 
-            if !iostat.is_null() { unsafe { *iostat = 0; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
         }
         Err(e) => {
             if !iostat.is_null() {
-                unsafe { *iostat = e.raw_os_error().unwrap_or(1); }
+                unsafe {
+                    *iostat = e.raw_os_error().unwrap_or(1);
+                }
             } else {
                 eprintln!("OPEN: {}: {}", fname, e);
                 std::process::exit(1);
@@ -442,9 +508,17 @@ pub extern "C" fn afs_close(unit: i32, iostat: *mut i32) {
     if let Some(mut u) = state.units.remove(&unit) {
         let _ = u.flush();
         // File is dropped here, closing the handle.
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     } else {
-        if !iostat.is_null() { unsafe { *iostat = 0; } } // closing unopen unit is not an error
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        } // closing unopen unit is not an error
     }
 }
 
@@ -558,25 +632,49 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.next_read_token() {
-            Ok(Some(token)) => {
-                match token.parse::<i32>() {
-                    Ok(v) => {
-                        if !val.is_null() { unsafe { *val = v; } }
-                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+            Ok(Some(token)) => match token.parse::<i32>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
                     }
-                    Err(_) => {
-                        if !iostat.is_null() { unsafe { *iostat = 1; } }
-                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
                     }
                 }
-            }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    } else {
+                        eprintln!("READ: cannot parse integer from '{}'", token);
+                        std::process::exit(1);
+                    }
+                }
+            },
             Ok(None) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
-                else { eprintln!("READ: end of file"); std::process::exit(1); }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                } else {
+                    eprintln!("READ: end of file");
+                    std::process::exit(1);
+                }
             }
             Err(e) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-                else { eprintln!("READ: {}", e); std::process::exit(1); }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                } else {
+                    eprintln!("READ: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -588,23 +686,43 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.next_read_token() {
-            Ok(Some(token)) => {
-                match token.parse::<i64>() {
-                    Ok(v) => {
-                        if !val.is_null() { unsafe { *val = v; } }
-                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+            Ok(Some(token)) => match token.parse::<i64>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
                     }
-                    Err(_) => {
-                        if !iostat.is_null() { unsafe { *iostat = 1; } }
-                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    } else {
+                        eprintln!("READ: cannot parse integer from '{}'", token);
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Ok(None) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
                     }
                 }
             }
-            Ok(None) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
-            }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     }
@@ -616,23 +734,39 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.next_read_token() {
-            Ok(Some(token)) => {
-                match token.parse::<i128>() {
-                    Ok(v) => {
-                        write_i128_ptr(val, v);
-                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+            Ok(Some(token)) => match token.parse::<i128>() {
+                Ok(v) => {
+                    write_i128_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
                     }
-                    Err(_) => {
-                        if !iostat.is_null() { unsafe { *iostat = 1; } }
-                        else { eprintln!("READ: cannot parse integer from '{}'", token); std::process::exit(1); }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    } else {
+                        eprintln!("READ: cannot parse integer from '{}'", token);
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Ok(None) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
                     }
                 }
             }
-            Ok(None) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
-            }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     }
@@ -649,21 +783,45 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                 let normalized = token.replace('d', "e").replace('D', "E");
                 match normalized.parse::<f32>() {
                     Ok(v) => {
-                        if !val.is_null() { unsafe { *val = v; } }
-                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                        if !val.is_null() {
+                            unsafe {
+                                *val = v;
+                            }
+                        }
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = 0;
+                            }
+                        }
                     }
                     Err(_) => {
-                        if !iostat.is_null() { unsafe { *iostat = 1; } }
-                        else { eprintln!("READ: cannot parse real from '{}'", token); std::process::exit(1); }
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = 1;
+                            }
+                        } else {
+                            eprintln!("READ: cannot parse real from '{}'", token);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
             Ok(None) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
-                else { eprintln!("READ: end of file"); std::process::exit(1); }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                } else {
+                    eprintln!("READ: end of file");
+                    std::process::exit(1);
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     }
@@ -679,20 +837,42 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                 let normalized = token.replace('d', "e").replace('D', "E");
                 match normalized.parse::<f64>() {
                     Ok(v) => {
-                        if !val.is_null() { unsafe { *val = v; } }
-                        if !iostat.is_null() { unsafe { *iostat = 0; } }
+                        if !val.is_null() {
+                            unsafe {
+                                *val = v;
+                            }
+                        }
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = 0;
+                            }
+                        }
                     }
                     Err(_) => {
-                        if !iostat.is_null() { unsafe { *iostat = 1; } }
-                        else { eprintln!("READ: cannot parse real from '{}'", token); std::process::exit(1); }
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = 1;
+                            }
+                        } else {
+                            eprintln!("READ: cannot parse real from '{}'", token);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
             Ok(None) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     }
@@ -716,22 +896,32 @@ impl Unit {
     /// Record numbers are 1-based. Returns Ok(()) or Err on failure.
     fn seek_to_record(&mut self, rec: i64) -> io::Result<()> {
         if rec < 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "direct access record number must be >= 1"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct access record number must be >= 1",
+            ));
         }
-        let recl = self.recl.ok_or_else(||
-            io::Error::new(io::ErrorKind::InvalidInput, "direct access requires RECL"))?;
-        let offset = (rec - 1).checked_mul(recl).ok_or_else(||
-            io::Error::new(io::ErrorKind::InvalidInput, "record offset overflow"))?;
+        let recl = self.recl.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "direct access requires RECL")
+        })?;
+        let offset = (rec - 1)
+            .checked_mul(recl)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record offset overflow"))?;
         if offset < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative record offset"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "negative record offset",
+            ));
         }
         match &mut self.stream {
             UnitStream::FileRaw(f) => {
                 f.seek(SeekFrom::Start(offset as u64))?;
                 Ok(())
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unit not opened for direct access")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unit not opened for direct access",
+            )),
         }
     }
 
@@ -740,7 +930,10 @@ impl Unit {
         match &mut self.stream {
             UnitStream::FileRaw(f) => f.write_all(data),
             UnitStream::FileWrite(w) => w.write_all(data),
-            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for writing")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unit not open for writing",
+            )),
         }
     }
 
@@ -749,7 +942,10 @@ impl Unit {
         match &mut self.stream {
             UnitStream::FileRaw(f) => f.read(buf),
             UnitStream::FileRead(r) => r.read(buf),
-            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "unit not open for reading")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unit not open for reading",
+            )),
         }
     }
 }
@@ -757,44 +953,72 @@ impl Unit {
 /// Write a direct-access record (formatted string padded to recl).
 #[no_mangle]
 pub extern "C" fn afs_write_direct(
-    unit: i32, rec: i64,
-    data: *const u8, data_len: i64,
+    unit: i32,
+    rec: i64,
+    data: *const u8,
+    data_len: i64,
     iostat: *mut i32,
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if let Err(e) = u.seek_to_record(rec) {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
-            else { eprintln!("WRITE direct: {}", e); std::process::exit(1); }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            } else {
+                eprintln!("WRITE direct: {}", e);
+                std::process::exit(1);
+            }
             return;
         }
         let recl = u.recl.unwrap_or(0) as usize;
         let mut record = vec![b' '; recl]; // space-padded
         let copy_len = (data_len as usize).min(recl);
         if !data.is_null() && copy_len > 0 {
-            unsafe { std::ptr::copy_nonoverlapping(data, record.as_mut_ptr(), copy_len); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(data, record.as_mut_ptr(), copy_len);
+            }
         }
         if let Err(e) = u.write_raw(&record) {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
-            else { eprintln!("WRITE direct: {}", e); std::process::exit(1); }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            } else {
+                eprintln!("WRITE direct: {}", e);
+                std::process::exit(1);
+            }
             return;
         }
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     }
 }
 
 /// Read a direct-access record.
 #[no_mangle]
 pub extern "C" fn afs_read_direct(
-    unit: i32, rec: i64,
-    data: *mut u8, data_len: i64,
+    unit: i32,
+    rec: i64,
+    data: *mut u8,
+    data_len: i64,
     iostat: *mut i32,
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if let Err(e) = u.seek_to_record(rec) {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
-            else { eprintln!("READ direct: {}", e); std::process::exit(1); }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            } else {
+                eprintln!("READ direct: {}", e);
+                std::process::exit(1);
+            }
             return;
         }
         let recl = u.recl.unwrap_or(0) as usize;
@@ -803,17 +1027,35 @@ pub extern "C" fn afs_read_direct(
             Ok(n) => {
                 let copy_len = n.min(data_len as usize);
                 if !data.is_null() && copy_len > 0 {
-                    unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), data, copy_len); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(record.as_ptr(), data, copy_len);
+                    }
                 }
                 // Pad remainder with spaces.
                 if copy_len < data_len as usize {
-                    unsafe { std::ptr::write_bytes(data.add(copy_len), b' ', data_len as usize - copy_len); }
+                    unsafe {
+                        std::ptr::write_bytes(
+                            data.add(copy_len),
+                            b' ',
+                            data_len as usize - copy_len,
+                        );
+                    }
                 }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             Err(e) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-                else { eprintln!("READ direct: {}", e); std::process::exit(1); }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                } else {
+                    eprintln!("READ direct: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -825,14 +1067,24 @@ pub extern "C" fn afs_read_direct(
 #[no_mangle]
 pub extern "C" fn afs_write_unformatted(
     unit: i32,
-    data: *const u8, data_len: i64,
+    data: *const u8,
+    data_len: i64,
     iostat: *mut i32,
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if data_len < 0 || data_len > u32::MAX as i64 {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
-            else { eprintln!("WRITE unformatted: record length {} exceeds 4GB limit", data_len); std::process::exit(1); }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            } else {
+                eprintln!(
+                    "WRITE unformatted: record length {} exceeds 4GB limit",
+                    data_len
+                );
+                std::process::exit(1);
+            }
             return;
         }
         let len_bytes = (data_len as u32).to_ne_bytes();
@@ -841,12 +1093,22 @@ pub extern "C" fn afs_write_unformatted(
         let r2 = if !data.is_null() && data_len > 0 {
             let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
             u.write_raw(slice)
-        } else { Ok(()) };
+        } else {
+            Ok(())
+        };
         let r3 = u.write_raw(&len_bytes);
         if r1.is_err() || r2.is_err() || r3.is_err() {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         } else {
-            if !iostat.is_null() { unsafe { *iostat = 0; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
         }
     }
 }
@@ -855,7 +1117,8 @@ pub extern "C" fn afs_write_unformatted(
 #[no_mangle]
 pub extern "C" fn afs_read_unformatted(
     unit: i32,
-    data: *mut u8, max_len: i64,
+    data: *mut u8,
+    max_len: i64,
     actual_len: *mut i64,
     iostat: *mut i32,
 ) {
@@ -866,16 +1129,28 @@ pub extern "C" fn afs_read_unformatted(
         match u.read_raw(&mut len_buf) {
             Ok(4) => {}
             Ok(0) => {
-                if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                }
                 return;
             }
             _ => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
                 return;
             }
         }
         let record_len = u32::from_ne_bytes(len_buf) as usize;
-        if !actual_len.is_null() { unsafe { *actual_len = record_len as i64; } }
+        if !actual_len.is_null() {
+            unsafe {
+                *actual_len = record_len as i64;
+            }
+        }
 
         // Read record data.
         let read_len = record_len.min(max_len as usize);
@@ -892,7 +1167,11 @@ pub extern "C" fn afs_read_unformatted(
 
         // Read trailing length marker (and discard).
         let _ = u.read_raw(&mut len_buf);
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     }
 }
 
@@ -900,18 +1179,26 @@ pub extern "C" fn afs_read_unformatted(
 
 /// Write raw bytes at the current stream position.
 #[no_mangle]
-pub extern "C" fn afs_write_stream(
-    unit: i32,
-    data: *const u8, data_len: i64,
-    iostat: *mut i32,
-) {
+pub extern "C" fn afs_write_stream(unit: i32, data: *const u8, data_len: i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if !data.is_null() && data_len > 0 {
             let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
             match u.write_raw(slice) {
-                Ok(()) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
-                Err(_) => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
+                Ok(()) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -923,13 +1210,29 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match &mut u.stream {
-            UnitStream::FileRaw(f) => {
-                match f.seek(SeekFrom::Start(pos as u64)) {
-                    Ok(_) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
-                    Err(_) => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
+            UnitStream::FileRaw(f) => match f.seek(SeekFrom::Start(pos as u64)) {
+                Ok(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
+            },
+            _ => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
                 }
             }
-            _ => { if !iostat.is_null() { unsafe { *iostat = 1; } } }
         }
     }
 }
@@ -942,8 +1245,8 @@ pub struct NamelistEntry {
     pub name: *const u8,
     pub name_len: i64,
     pub data: *mut u8,
-    pub data_type: i32,  // 0=int, 1=real, 2=string, 3=logical
-    pub data_len: i64,   // string length for type 2
+    pub data_type: i32, // 0=int, 1=real, 2=string, 3=logical
+    pub data_len: i64,  // string length for type 2
 }
 
 /// Write a NAMELIST group to a unit.
@@ -951,8 +1254,10 @@ pub struct NamelistEntry {
 #[no_mangle]
 pub extern "C" fn afs_write_namelist(
     unit: i32,
-    group_name: *const u8, group_name_len: i64,
-    entries: *const NamelistEntry, n_entries: i32,
+    group_name: *const u8,
+    group_name_len: i64,
+    entries: *const NamelistEntry,
+    n_entries: i32,
 ) {
     let gname = unsafe_str(group_name, group_name_len);
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
@@ -965,19 +1270,23 @@ pub extern "C" fn afs_write_namelist(
                 let name = unsafe_str(entry.name, entry.name_len);
                 let sep = if i > 0 { "," } else { "" };
                 let val_str = match entry.data_type {
-                    0 => { // integer
+                    0 => {
+                        // integer
                         let v = unsafe { *(entry.data as *const i32) };
                         format!("{}", v)
                     }
-                    1 => { // real
+                    1 => {
+                        // real
                         let v = unsafe { *(entry.data as *const f64) };
                         format!("{}", v)
                     }
-                    2 => { // string
+                    2 => {
+                        // string
                         let s = unsafe_str(entry.data, entry.data_len);
                         format!("'{}'", s.trim_end())
                     }
-                    3 => { // logical
+                    3 => {
+                        // logical
                         let v = unsafe { *(entry.data as *const i32) };
                         (if v != 0 { ".TRUE." } else { ".FALSE." }).to_string()
                     }
@@ -996,8 +1305,10 @@ pub extern "C" fn afs_write_namelist(
 #[no_mangle]
 pub extern "C" fn afs_read_namelist(
     unit: i32,
-    group_name: *const u8, group_name_len: i64,
-    entries: *const NamelistEntry, n_entries: i32,
+    group_name: *const u8,
+    group_name_len: i64,
+    entries: *const NamelistEntry,
+    n_entries: i32,
     iostat: *mut i32,
 ) {
     let gname = unsafe_str(group_name, group_name_len).to_lowercase();
@@ -1022,7 +1333,11 @@ pub extern "C" fn afs_read_namelist(
                     }
                 }
                 Err(_) => {
-                    if !iostat.is_null() { unsafe { *iostat = IOSTAT_END; } }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = IOSTAT_END;
+                        }
+                    }
                     return;
                 }
             }
@@ -1036,8 +1351,12 @@ pub extern "C" fn afs_read_namelist(
                 let after_name = &all_lines[start + gname.len()..];
                 if let Some(end) = after_name.find('/') {
                     &after_name[..end]
-                } else { after_name }
-            } else { "" };
+                } else {
+                    after_name
+                }
+            } else {
+                ""
+            };
 
             // Parse var=val pairs. Supports:
             //   var=val            — simple scalar assignment
@@ -1047,12 +1366,12 @@ pub extern "C" fn afs_read_namelist(
                 let pair = pair.trim();
                 if let Some(eq_pos) = pair.find('=') {
                     let lhs = pair[..eq_pos].trim().to_lowercase();
-                    let val_str = pair[eq_pos+1..].trim();
+                    let val_str = pair[eq_pos + 1..].trim();
 
                     // Parse array index from "var(idx)" syntax.
                     let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
                         let name = lhs[..paren].trim();
-                        let idx_str = lhs[paren+1..].trim_end_matches(')').trim();
+                        let idx_str = lhs[paren + 1..].trim_end_matches(')').trim();
                         let idx = idx_str.parse::<usize>().unwrap_or(1);
                         (name.to_string(), Some(idx))
                     } else {
@@ -1064,7 +1383,7 @@ pub extern "C" fn afs_read_namelist(
                         // Make sure * is preceded by digits (not part of a number like 1.5E*).
                         let before = val_str[..star].trim();
                         if let Ok(n) = before.parse::<usize>() {
-                            (n, val_str[star+1..].trim())
+                            (n, val_str[star + 1..].trim())
                         } else {
                             (1, val_str)
                         }
@@ -1074,7 +1393,9 @@ pub extern "C" fn afs_read_namelist(
 
                     // Find the matching entry.
                     for entry in entries_slice {
-                        if entry.data.is_null() { continue; }
+                        if entry.data.is_null() {
+                            continue;
+                        }
                         let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
                         if ename == var_name {
                             namelist_assign_value(entry, actual_val, array_index, repeat_count);
@@ -1084,37 +1405,55 @@ pub extern "C" fn afs_read_namelist(
                 }
             }
         }
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     }
 }
 
 /// Assign a parsed NAMELIST value to an entry, handling array indexing and repeat.
-fn namelist_assign_value(entry: &NamelistEntry, val_str: &str, index: Option<usize>, repeat: usize) {
+fn namelist_assign_value(
+    entry: &NamelistEntry,
+    val_str: &str,
+    index: Option<usize>,
+    repeat: usize,
+) {
     // For array elements, compute byte offset from 1-based index.
     let elem_size = match entry.data_type {
-        0 => 4,  // integer (i32)
-        1 => 8,  // real (f64)
-        3 => 4,  // logical (i32)
-        _ => 1,  // string
+        0 => 4, // integer (i32)
+        1 => 8, // real (f64)
+        3 => 4, // logical (i32)
+        _ => 1, // string
     };
-    let base_offset = index.map(|i| (i.saturating_sub(1)) * elem_size).unwrap_or(0);
+    let base_offset = index
+        .map(|i| (i.saturating_sub(1)) * elem_size)
+        .unwrap_or(0);
 
     for r in 0..repeat {
         let offset = base_offset + r * elem_size;
         let ptr = unsafe { entry.data.add(offset) };
         match entry.data_type {
-            0 => { // integer
+            0 => {
+                // integer
                 if let Ok(v) = val_str.parse::<i32>() {
-                    unsafe { *(ptr as *mut i32) = v; }
+                    unsafe {
+                        *(ptr as *mut i32) = v;
+                    }
                 }
             }
-            1 => { // real
+            1 => {
+                // real
                 let normalized = val_str.replace('d', "e").replace('D', "E");
                 if let Ok(v) = normalized.parse::<f64>() {
-                    unsafe { *(ptr as *mut f64) = v; }
+                    unsafe {
+                        *(ptr as *mut f64) = v;
+                    }
                 }
             }
-            2 => { // string (only first element for repeat, no array stride for strings)
+            2 => {
+                // string (only first element for repeat, no array stride for strings)
                 let s = val_str.trim_matches('\'').trim_matches('"');
                 let bytes = s.as_bytes();
                 let copy_len = bytes.len().min(entry.data_len as usize);
@@ -1122,17 +1461,23 @@ fn namelist_assign_value(entry: &NamelistEntry, val_str: &str, index: Option<usi
                     unsafe {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
                         if copy_len < entry.data_len as usize {
-                            std::ptr::write_bytes(entry.data.add(copy_len), b' ',
-                                entry.data_len as usize - copy_len);
+                            std::ptr::write_bytes(
+                                entry.data.add(copy_len),
+                                b' ',
+                                entry.data_len as usize - copy_len,
+                            );
                         }
                     }
                 }
                 return; // string repeat doesn't make sense
             }
-            3 => { // logical
+            3 => {
+                // logical
                 let lower = val_str.to_lowercase();
                 let v = lower.starts_with(".t") || lower.starts_with("t");
-                unsafe { *(ptr as *mut i32) = v as i32; }
+                unsafe {
+                    *(ptr as *mut i32) = v as i32;
+                }
             }
             _ => {}
         }
@@ -1144,64 +1489,85 @@ fn namelist_assign_value(entry: &NamelistEntry, val_str: &str, index: Option<usi
 /// Write a formatted integer to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_int(
-    buf: *mut u8, buf_len: i64,
+    buf: *mut u8,
+    buf_len: i64,
     val: i32,
     pos: *mut i64, // current write position, updated after write
 ) {
-    if buf.is_null() || buf_len <= 0 { return; }
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
     let s = format!(" {}", val);
-    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
     write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted i64 to a character buffer (internal I/O).
 #[no_mangle]
-pub extern "C" fn afs_write_internal_int64(
-    buf: *mut u8, buf_len: i64,
-    val: i64,
-    pos: *mut i64,
-) {
-    if buf.is_null() || buf_len <= 0 { return; }
+pub extern "C" fn afs_write_internal_int64(buf: *mut u8, buf_len: i64, val: i64, pos: *mut i64) {
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
     let s = format!(" {}", val);
-    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
     write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted integer(16) to a character buffer (internal I/O).
 #[no_mangle]
-pub extern "C" fn afs_write_internal_int128(
-    buf: *mut u8, buf_len: i64,
-    val: i128,
-    pos: *mut i64,
-) {
-    if buf.is_null() || buf_len <= 0 { return; }
+pub extern "C" fn afs_write_internal_int128(buf: *mut u8, buf_len: i64, val: i128, pos: *mut i64) {
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
     let s = format!(" {}", val);
-    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
     write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted real to a character buffer (internal I/O).
 #[no_mangle]
-pub extern "C" fn afs_write_internal_real64(
-    buf: *mut u8, buf_len: i64,
-    val: f64,
-    pos: *mut i64,
-) {
-    if buf.is_null() || buf_len <= 0 { return; }
+pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64, pos: *mut i64) {
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
     let s = format!(" {}", val);
-    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
     write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted string to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_string(
-    buf: *mut u8, buf_len: i64,
-    src: *const u8, src_len: i64,
+    buf: *mut u8,
+    buf_len: i64,
+    src: *const u8,
+    src_len: i64,
     pos: *mut i64,
 ) {
-    if buf.is_null() || buf_len <= 0 { return; }
-    let start = if !pos.is_null() { (unsafe { *pos }) as usize } else { 0 };
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
     let mut data = vec![b' '];
     if !src.is_null() && src_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
@@ -1228,7 +1594,9 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
 
     if idx >= slice.len() {
         if !pos.is_null() {
-            unsafe { *pos = idx as i64; }
+            unsafe {
+                *pos = idx as i64;
+            }
         }
         return None;
     }
@@ -1239,7 +1607,9 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
     }
 
     if !pos.is_null() {
-        unsafe { *pos = idx as i64; }
+        unsafe {
+            *pos = idx as i64;
+        }
     }
 
     Some(String::from_utf8_lossy(&slice[start..idx]).into_owned())
@@ -1248,7 +1618,8 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
 /// Read an integer from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_int(
-    buf: *const u8, buf_len: i64,
+    buf: *const u8,
+    buf_len: i64,
     pos: *mut i64,
     val: *mut i32,
     iostat: *mut i32,
@@ -1256,22 +1627,39 @@ pub extern "C" fn afs_read_internal_int(
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i32>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !val.is_null() {
+                    unsafe {
+                        *val = v;
+                    }
+                }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     } else {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = -1;
+            }
+        }
     }
 }
 
 /// Read an i64 from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_int64(
-    buf: *const u8, buf_len: i64,
+    buf: *const u8,
+    buf_len: i64,
     pos: *mut i64,
     val: *mut i64,
     iostat: *mut i32,
@@ -1279,22 +1667,39 @@ pub extern "C" fn afs_read_internal_int64(
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i64>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !val.is_null() {
+                    unsafe {
+                        *val = v;
+                    }
+                }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     } else {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = -1;
+            }
+        }
     }
 }
 
 /// Read an integer(16) from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_int128(
-    buf: *const u8, buf_len: i64,
+    buf: *const u8,
+    buf_len: i64,
     pos: *mut i64,
     val: *mut i128,
     iostat: *mut i32,
@@ -1303,21 +1708,34 @@ pub extern "C" fn afs_read_internal_int128(
         match token.replace(',', "").parse::<i128>() {
             Ok(v) => {
                 write_i128_ptr(val, v);
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     } else {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = -1;
+            }
+        }
     }
 }
 
 /// Read a real from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_real(
-    buf: *const u8, buf_len: i64,
+    buf: *const u8,
+    buf_len: i64,
     pos: *mut i64,
     val: *mut f64,
     iostat: *mut i32,
@@ -1326,15 +1744,31 @@ pub extern "C" fn afs_read_internal_real(
         let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
         match normalized.parse::<f64>() {
             Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !val.is_null() {
+                    unsafe {
+                        *val = v;
+                    }
+                }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
             }
         }
     } else {
-        if !iostat.is_null() { unsafe { *iostat = -1; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = -1;
+            }
+        }
     }
 }
 
@@ -1349,10 +1783,14 @@ fn write_to_buffer(buf: *mut u8, buf_len: usize, start: usize, data: &[u8], pos:
     // Space-pad remaining buffer.
     let end = start + copy_len;
     if end < buf_len {
-        unsafe { std::ptr::write_bytes(buf.add(end), b' ', buf_len - end); }
+        unsafe {
+            std::ptr::write_bytes(buf.add(end), b' ', buf_len - end);
+        }
     }
     if !pos.is_null() {
-        unsafe { *pos = end as i64; }
+        unsafe {
+            *pos = end as i64;
+        }
     }
 }
 
@@ -1370,7 +1808,11 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
                 let pos = f.stream_position().unwrap_or(0);
                 if pos <= 1 {
                     let _ = f.seek(SeekFrom::Start(0));
-                    if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
                     // Clear stale read tokens.
                     u.read_tokens.clear();
                     return;
@@ -1380,7 +1822,9 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
                 loop {
                     f.seek(SeekFrom::Start(search_pos)).ok();
                     let mut byte = [0u8; 1];
-                    if f.read(&mut byte).unwrap_or(0) == 0 { break; }
+                    if f.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
                     if byte[0] == b'\n' {
                         f.seek(SeekFrom::Start(search_pos + 1)).ok();
                         break;
@@ -1393,11 +1837,19 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
                 }
                 // Clear stale read tokens after repositioning.
                 u.read_tokens.clear();
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
             _ => {
                 // Sequential buffered files: backspace is not well-supported.
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
             }
         }
     }
@@ -1413,7 +1865,11 @@ pub extern "C" fn afs_endfile(unit: i32, iostat: *mut i32) {
             let pos = f.stream_position().unwrap_or(0);
             let _ = f.set_len(pos); // truncate at current position
         }
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     }
 }
 
@@ -1429,7 +1885,9 @@ pub const IOSTAT_EOR: i32 = -2;
 /// Write a Fortran-style string result into a caller-provided buffer.
 /// Pads with spaces to buf_len (Fortran CHARACTER semantics).
 fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
-    if buf.is_null() || buf_len <= 0 { return; }
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
     let n = buf_len as usize;
     let val_bytes = value.as_bytes();
     let copy_len = val_bytes.len().min(n);
@@ -1445,15 +1903,20 @@ fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
 /// INQUIRE by file: check if a file exists, report its properties.
 #[no_mangle]
 pub extern "C" fn afs_inquire_file(
-    filename: *const u8, filename_len: i64,
+    filename: *const u8,
+    filename_len: i64,
     exist: *mut i32,
     opened: *mut i32,
     iostat: *mut i32,
     // Extended specifiers — pass null for any not needed.
-    name_buf: *mut u8, name_buf_len: i64,
-    access_buf: *mut u8, access_buf_len: i64,
-    form_buf: *mut u8, form_buf_len: i64,
-    action_buf: *mut u8, action_buf_len: i64,
+    name_buf: *mut u8,
+    name_buf_len: i64,
+    access_buf: *mut u8,
+    access_buf_len: i64,
+    form_buf: *mut u8,
+    form_buf_len: i64,
+    action_buf: *mut u8,
+    action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
 ) {
@@ -1461,7 +1924,9 @@ pub extern "C" fn afs_inquire_file(
 
     let file_exists = std::path::Path::new(&fname).exists();
     if !exist.is_null() {
-        unsafe { *exist = file_exists as i32; }
+        unsafe {
+            *exist = file_exists as i32;
+        }
     }
 
     // Find unit connected to this file (if any).
@@ -1469,14 +1934,24 @@ pub extern "C" fn afs_inquire_file(
     let connected_unit = state.units.values().find(|u| u.filename == fname);
 
     if !opened.is_null() {
-        unsafe { *opened = connected_unit.is_some() as i32; }
+        unsafe {
+            *opened = connected_unit.is_some() as i32;
+        }
     }
 
     write_inquire_string(name_buf, name_buf_len, &fname);
 
     if let Some(u) = connected_unit {
-        write_unit_properties(u, access_buf, access_buf_len, form_buf, form_buf_len,
-                              action_buf, action_buf_len, recl_out);
+        write_unit_properties(
+            u,
+            access_buf,
+            access_buf_len,
+            form_buf,
+            form_buf_len,
+            action_buf,
+            action_buf_len,
+            recl_out,
+        );
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
@@ -1485,12 +1960,18 @@ pub extern "C" fn afs_inquire_file(
 
     // File size via metadata.
     if !size_out.is_null() {
-        let sz = std::fs::metadata(&fname).map(|m| m.len() as i64).unwrap_or(-1);
-        unsafe { *size_out = sz; }
+        let sz = std::fs::metadata(&fname)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+        unsafe {
+            *size_out = sz;
+        }
     }
 
     if !iostat.is_null() {
-        unsafe { *iostat = 0; }
+        unsafe {
+            *iostat = 0;
+        }
     }
 }
 
@@ -1502,10 +1983,14 @@ pub extern "C" fn afs_inquire_unit(
     opened: *mut i32,
     iostat: *mut i32,
     // Extended specifiers.
-    name_buf: *mut u8, name_buf_len: i64,
-    access_buf: *mut u8, access_buf_len: i64,
-    form_buf: *mut u8, form_buf_len: i64,
-    action_buf: *mut u8, action_buf_len: i64,
+    name_buf: *mut u8,
+    name_buf_len: i64,
+    access_buf: *mut u8,
+    access_buf_len: i64,
+    form_buf: *mut u8,
+    form_buf_len: i64,
+    action_buf: *mut u8,
+    action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
 ) {
@@ -1513,42 +1998,69 @@ pub extern "C" fn afs_inquire_unit(
     let unit_entry = state.units.get(&unit);
 
     if !exist.is_null() {
-        unsafe { *exist = unit_entry.is_some() as i32; }
+        unsafe {
+            *exist = unit_entry.is_some() as i32;
+        }
     }
     if !opened.is_null() {
-        unsafe { *opened = unit_entry.is_some() as i32; }
+        unsafe {
+            *opened = unit_entry.is_some() as i32;
+        }
     }
 
     if let Some(u) = unit_entry {
         write_inquire_string(name_buf, name_buf_len, &u.filename);
-        write_unit_properties(u, access_buf, access_buf_len, form_buf, form_buf_len,
-                              action_buf, action_buf_len, recl_out);
+        write_unit_properties(
+            u,
+            access_buf,
+            access_buf_len,
+            form_buf,
+            form_buf_len,
+            action_buf,
+            action_buf_len,
+            recl_out,
+        );
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
-                std::fs::metadata(&u.filename).map(|m| m.len() as i64).unwrap_or(-1)
-            } else { -1 };
-            unsafe { *size_out = sz; }
+                std::fs::metadata(&u.filename)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+            unsafe {
+                *size_out = sz;
+            }
         }
     } else {
         write_inquire_string(name_buf, name_buf_len, "");
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
         write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
-        if !size_out.is_null() { unsafe { *size_out = -1; } }
+        if !size_out.is_null() {
+            unsafe {
+                *size_out = -1;
+            }
+        }
     }
 
     if !iostat.is_null() {
-        unsafe { *iostat = 0; }
+        unsafe {
+            *iostat = 0;
+        }
     }
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
 fn write_unit_properties(
     u: &Unit,
-    access_buf: *mut u8, access_buf_len: i64,
-    form_buf: *mut u8, form_buf_len: i64,
-    action_buf: *mut u8, action_buf_len: i64,
+    access_buf: *mut u8,
+    access_buf_len: i64,
+    form_buf: *mut u8,
+    form_buf_len: i64,
+    action_buf: *mut u8,
+    action_buf_len: i64,
     recl_out: *mut i64,
 ) {
     let access_str = match u.access {
@@ -1572,7 +2084,9 @@ fn write_unit_properties(
     write_inquire_string(action_buf, action_buf_len, action_str);
 
     if !recl_out.is_null() {
-        unsafe { *recl_out = u.recl.unwrap_or(-1); }
+        unsafe {
+            *recl_out = u.recl.unwrap_or(-1);
+        }
     }
 }
 
@@ -1584,10 +2098,18 @@ pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match u.flush() {
-            Ok(()) => { if !iostat.is_null() { unsafe { *iostat = 0; } } }
+            Ok(()) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
+            }
             Err(e) => {
                 if !iostat.is_null() {
-                    unsafe { *iostat = e.raw_os_error().unwrap_or(1); }
+                    unsafe {
+                        *iostat = e.raw_os_error().unwrap_or(1);
+                    }
                 }
             }
         }
@@ -1616,7 +2138,11 @@ pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
         }
         // Clear stale read tokens so subsequent reads come from file start.
         u.read_tokens.clear();
-        if !iostat.is_null() { unsafe { *iostat = 0; } }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
     }
 }
 
@@ -1649,8 +2175,8 @@ pub extern "C" fn afs_io_finalize() {
 //   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real(val) / ...
 //   afs_fmt_end()
 
-use std::cell::RefCell;
 use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue};
+use std::cell::RefCell;
 
 enum FmtSink {
     Unit(i32),
@@ -1857,7 +2383,10 @@ fn extract_nth_formatted_field(
 ) -> Option<(FormatDesc, String)> {
     for desc in descs {
         match desc {
-            FormatDesc::Group { repeat, descriptors } => {
+            FormatDesc::Group {
+                repeat,
+                descriptors,
+            } => {
                 for _ in 0..*repeat {
                     if let Some(found) = extract_nth_formatted_field(
                         descriptors,
@@ -1970,20 +2499,42 @@ pub extern "C" fn afs_fmt_read_int(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i32>() {
-            Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i32>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2000,20 +2551,42 @@ pub extern "C" fn afs_fmt_read_int64(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i64>() {
-            Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i64>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2030,20 +2603,38 @@ pub extern "C" fn afs_fmt_read_int128(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i128>() {
-            Ok(v) => {
-                write_i128_ptr(val, v);
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i128>() {
+                Ok(v) => {
+                    write_i128_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2067,22 +2658,46 @@ pub extern "C" fn afs_fmt_read_real(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = field.trim().replace('d', "e").replace('D', "E").replace(',', "");
+            let normalized = field
+                .trim()
+                .replace('d', "e")
+                .replace('D', "E")
+                .replace(',', "");
             match normalized.parse::<f64>() {
                 Ok(v) => {
-                    if !val.is_null() { unsafe { *val = v; } }
-                    if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
                 }
                 Err(_) => {
-                    if !iostat.is_null() { unsafe { *iostat = 1; } }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2098,20 +2713,42 @@ pub extern "C" fn afs_fmt_read_int_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i32>() {
-            Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i32>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2127,20 +2764,42 @@ pub extern "C" fn afs_fmt_read_int64_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i64>() {
-            Ok(v) => {
-                if !val.is_null() { unsafe { *val = v; } }
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i64>() {
+                Ok(v) => {
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2156,20 +2815,38 @@ pub extern "C" fn afs_fmt_read_int128_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => match field.trim().replace(',', "").parse::<i128>() {
-            Ok(v) => {
-                write_i128_ptr(val, v);
-                if !iostat.is_null() { unsafe { *iostat = 0; } }
+        Ok((FormatDesc::IntegerI { .. }, field)) => {
+            match field.trim().replace(',', "").parse::<i128>() {
+                Ok(v) => {
+                    write_i128_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                if !iostat.is_null() { unsafe { *iostat = 1; } }
-            }
-        },
+        }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2192,22 +2869,46 @@ pub extern "C" fn afs_fmt_read_real_internal(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = field.trim().replace('d', "e").replace('D', "E").replace(',', "");
+            let normalized = field
+                .trim()
+                .replace('d', "e")
+                .replace('D', "E")
+                .replace(',', "");
             match normalized.parse::<f64>() {
                 Ok(v) => {
-                    if !val.is_null() { unsafe { *val = v; } }
-                    if !iostat.is_null() { unsafe { *iostat = 0; } }
+                    if !val.is_null() {
+                        unsafe {
+                            *val = v;
+                        }
+                    }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
                 }
                 Err(_) => {
-                    if !iostat.is_null() { unsafe { *iostat = 1; } }
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    }
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() { unsafe { *iostat = 1; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
         }
         Err(code) => {
-            if !iostat.is_null() { unsafe { *iostat = code; } }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
         }
     }
 }
@@ -2245,9 +2946,12 @@ mod tests {
         let path = "/tmp/afs_write_i128_test.dat";
         afs_open_simple(
             97,
-            path.as_ptr(), path.len() as i64,
-            "replace".as_ptr(), 7,
-            std::ptr::null(), 0,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
         );
 
         afs_write_int128(97, 170141183460469231731687303715884105727i128);
@@ -2269,9 +2973,12 @@ mod tests {
 
         afs_open_simple(
             95,
-            path.as_ptr(), path.len() as i64,
-            "old".as_ptr(), 3,
-            "read".as_ptr(), 4,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
         );
 
         let mut value = 0i128;
@@ -2335,13 +3042,7 @@ mod tests {
         let ptr = unsafe { raw.as_mut_ptr().add(1) as *mut i128 };
         let mut iostat = -99i32;
 
-        afs_read_internal_int128(
-            buf.as_ptr(),
-            buf.len() as i64,
-            &mut pos,
-            ptr,
-            &mut iostat,
-        );
+        afs_read_internal_int128(buf.as_ptr(), buf.len() as i64, &mut pos, ptr, &mut iostat);
 
         assert_eq!(iostat, 0, "expected internal i128 read to succeed");
         let value = unsafe { std::ptr::read_unaligned(ptr) };
@@ -2353,9 +3054,12 @@ mod tests {
         let path = "/tmp/afs_fmt_test.dat";
         afs_open_simple(
             99,
-            path.as_ptr(), path.len() as i64,
-            "replace".as_ptr(), 7,
-            std::ptr::null(), 0,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
         );
 
         afs_fmt_begin(99, "(I5, F8.2)".as_ptr(), 10);
@@ -2376,9 +3080,12 @@ mod tests {
         let wide = 170141183460469231731687303715884105727i128;
         afs_open_simple(
             96,
-            path.as_ptr(), path.len() as i64,
-            "replace".as_ptr(), 7,
-            std::ptr::null(), 0,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
         );
 
         afs_fmt_begin(96, "(I40)".as_ptr(), 5);
@@ -2404,7 +3111,12 @@ mod tests {
 
         unsafe { std::ptr::write_unaligned(ptr, wide) };
 
-        afs_fmt_begin_internal(rendered.as_mut_ptr(), rendered.len() as i64, "(I40)".as_ptr(), 5);
+        afs_fmt_begin_internal(
+            rendered.as_mut_ptr(),
+            rendered.len() as i64,
+            "(I40)".as_ptr(),
+            5,
+        );
         afs_fmt_push_int128(ptr);
         afs_fmt_end(0);
 
@@ -2453,7 +3165,10 @@ mod tests {
             &mut iostat,
         );
 
-        assert_eq!(iostat, 0, "expected formatted internal i128 read to succeed");
+        assert_eq!(
+            iostat, 0,
+            "expected formatted internal i128 read to succeed"
+        );
         assert_eq!(value, 170141183460469231731687303715884105727i128);
     }
 
@@ -2474,7 +3189,10 @@ mod tests {
             &mut iostat,
         );
 
-        assert_eq!(iostat, 0, "expected formatted internal i128 read to succeed");
+        assert_eq!(
+            iostat, 0,
+            "expected formatted internal i128 read to succeed"
+        );
         let value = unsafe { std::ptr::read_unaligned(ptr) };
         assert_eq!(value, 170141183460469231731687303715884105727i128);
     }
@@ -2518,9 +3236,12 @@ mod tests {
 
         afs_open_simple(
             94,
-            path.as_ptr(), path.len() as i64,
-            "old".as_ptr(), 3,
-            "read".as_ptr(), 4,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
         );
 
         let mut value = 0i128;
@@ -2539,9 +3260,12 @@ mod tests {
 
         afs_open_simple(
             93,
-            path.as_ptr(), path.len() as i64,
-            "old".as_ptr(), 3,
-            "read".as_ptr(), 4,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
         );
 
         let mut first = 0i128;
@@ -2569,9 +3293,12 @@ mod tests {
 
         afs_open_simple(
             92,
-            path.as_ptr(), path.len() as i64,
-            "old".as_ptr(), 3,
-            "readwrite".as_ptr(), 9,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "readwrite".as_ptr(),
+            9,
         );
 
         let mut first = 0i128;
@@ -2579,12 +3306,18 @@ mod tests {
         let mut iostat = -99i32;
 
         afs_fmt_read_int128(92, "(I40)".as_ptr(), 5, 0, &mut first, &mut iostat);
-        assert_eq!(iostat, 0, "expected first formatted readwrite-unit read to succeed");
+        assert_eq!(
+            iostat, 0,
+            "expected first formatted readwrite-unit read to succeed"
+        );
 
         afs_fmt_read_int128(92, "(I40)".as_ptr(), 5, 0, &mut second, &mut iostat);
         afs_close(92, std::ptr::null_mut());
 
-        assert_eq!(iostat, 0, "expected second formatted readwrite-unit read to succeed");
+        assert_eq!(
+            iostat, 0,
+            "expected second formatted readwrite-unit read to succeed"
+        );
         assert_eq!(first, 170141183460469231731687303715884105727i128);
         assert_eq!(second, -170141183460469231731687303715884105727i128);
     }
@@ -2594,9 +3327,12 @@ mod tests {
         let path = "/tmp/afs_fmt_noadv_test.dat";
         afs_open_simple(
             98,
-            path.as_ptr(), path.len() as i64,
-            "replace".as_ptr(), 7,
-            std::ptr::null(), 0,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
         );
 
         afs_fmt_begin(98, "('hello')".as_ptr(), 9);

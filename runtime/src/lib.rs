@@ -11,12 +11,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::missing_safety_doc)]
 
-pub mod descriptor;
 pub mod array;
-pub mod string;
+pub mod descriptor;
 pub mod format;
-pub mod io_system;
-pub mod system;
 mod io;
-mod mem;
+pub mod io_system;
 mod lifecycle;
+mod mem;
+pub mod string;
+pub mod system;

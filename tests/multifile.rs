@@ -20,7 +20,9 @@ fn unique_dir() -> PathBuf {
 fn find_compiler() -> PathBuf {
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     panic!("armfortas binary not found");
 }
@@ -28,7 +30,9 @@ fn find_compiler() -> PathBuf {
 fn find_runtime() -> PathBuf {
     for dir in &["target/release", "target/debug"] {
         let p = PathBuf::from(dir).join("libarmfortas_rt.a");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     panic!("libarmfortas_rt.a not found");
 }
@@ -44,7 +48,12 @@ fn sdk_path() -> String {
 /// Compile a .f90 file with -c, producing .o and optionally .amod.
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: Option<&Path>) {
     let mut cmd = Command::new(compiler);
-    cmd.args([source.to_str().unwrap(), "-c", "-o", output.to_str().unwrap()]);
+    cmd.args([
+        source.to_str().unwrap(),
+        "-c",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
     if let Some(dir) = search_dir {
         cmd.arg(format!("-I{}", dir.display()));
     }
@@ -66,8 +75,17 @@ fn link_files(objects: &[&Path], output: &Path) {
         args.push(o.to_str().unwrap().into());
     }
     args.push(runtime.to_str().unwrap().into());
-    args.extend(["-lSystem".into(), "-syslibroot".into(), sdk, "-arch".into(), "arm64".into()]);
-    let result = Command::new("ld").args(&args).output().expect("ld launch failed");
+    args.extend([
+        "-lSystem".into(),
+        "-syslibroot".into(),
+        sdk,
+        "-arch".into(),
+        "arm64".into(),
+    ]);
+    let result = Command::new("ld")
+        .args(&args)
+        .output()
+        .expect("ld launch failed");
     assert!(
         result.status.success(),
         "link failed:\n{}",
@@ -77,9 +95,7 @@ fn link_files(objects: &[&Path], output: &Path) {
 
 /// Run a binary and return its stdout.
 fn run_binary(binary: &Path) -> String {
-    let result = Command::new(binary)
-        .output()
-        .expect("binary launch failed");
+    let result = Command::new(binary).output().expect("binary launch failed");
     assert!(
         result.status.success(),
         "{} exited with {:?}\nstderr: {}",
@@ -91,11 +107,7 @@ fn run_binary(binary: &Path) -> String {
 }
 
 /// Full multi-file test: write sources, compile, link, run, check.
-fn multifile_test(
-    mod_source: &str,
-    main_source: &str,
-    expected_substring: &str,
-) {
+fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str) {
     let compiler = find_compiler();
     let dir = unique_dir();
     let mod_f90 = dir.join("mod.f90");
@@ -209,15 +221,27 @@ fn generic_interface_transitive_use() {
 
     std::fs::write(&base_f90, "module base\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n").unwrap();
     std::fs::write(&middle_f90, "module middle\n  use base\nend module\n").unwrap();
-    std::fs::write(&main_f90, "program p\n  use middle\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n").unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use middle\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n",
+    )
+    .unwrap();
 
     compile_file(&compiler, &base_f90, &base_o, None);
     compile_file(&compiler, &middle_f90, &middle_o, Some(&dir));
     compile_file(&compiler, &main_f90, &main_o, Some(&dir));
     link_files(&[&main_o, &middle_o, &base_o], &binary);
     let output = run_binary(&binary);
-    assert!(output.contains("3"), "expected '3' in output, got:\n{}", output);
-    assert!(output.contains("4.0000000E0"), "expected real add result in output, got:\n{}", output);
+    assert!(
+        output.contains("3"),
+        "expected '3' in output, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("4.0000000E0"),
+        "expected real add result in output, got:\n{}",
+        output
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -238,7 +262,10 @@ fn module_private_default() {
     // Check .amod only has pub_val.
     let amod = std::fs::read_to_string(dir.join("priv_mod.amod")).unwrap();
     assert!(amod.contains("pub_val"), "pub_val should be in .amod");
-    assert!(!amod.contains("priv_val"), "priv_val should NOT be in .amod");
+    assert!(
+        !amod.contains("priv_val"),
+        "priv_val should NOT be in .amod"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

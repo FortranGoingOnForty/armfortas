@@ -3,50 +3,30 @@
 //! Represents all Fortran expression forms: literals, names, operators,
 //! function calls, array constructors, component access, and more.
 
-
 /// A Fortran expression.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum Expr {
     // ---- Literals ----
-
     /// Integer literal: `42`, `42_8`, `42_int64`
-    IntegerLiteral {
-        text: String,
-        kind: Option<String>,
-    },
+    IntegerLiteral { text: String, kind: Option<String> },
     /// Real literal: `3.14`, `1.0d0`, `6.022e23`, `1.0_8`, `.5`, `5.`
-    RealLiteral {
-        text: String,
-        kind: Option<String>,
-    },
+    RealLiteral { text: String, kind: Option<String> },
     /// String literal: `'hello'`, `"hello"`, `'it''s'`
-    StringLiteral {
-        value: String,
-        kind: Option<String>,
-    },
+    StringLiteral { value: String, kind: Option<String> },
     /// Logical literal: `.true.`, `.false.`, `.true._4`
-    LogicalLiteral {
-        value: bool,
-        kind: Option<String>,
-    },
+    LogicalLiteral { value: bool, kind: Option<String> },
     /// Complex literal: `(1.0, 2.0)`
     ComplexLiteral {
         real: Box<SpannedExpr>,
         imag: Box<SpannedExpr>,
     },
     /// BOZ literal: `B'1010'`, `O'777'`, `Z'FF'`
-    BozLiteral {
-        text: String,
-        base: BozBase,
-    },
+    BozLiteral { text: String, base: BozBase },
 
     // ---- Names and access ----
-
     /// Simple name (variable, function, type, etc.)
-    Name {
-        name: String,
-    },
+    Name { name: String },
     /// Component access: `x%field`, `x%inner%deep`
     ComponentAccess {
         base: Box<SpannedExpr>,
@@ -54,7 +34,6 @@ pub enum Expr {
     },
 
     // ---- Operations ----
-
     /// Unary operation: `-x`, `.not. x`, `+x`
     UnaryOp {
         op: UnaryOp,
@@ -70,7 +49,6 @@ pub enum Expr {
     // ---- Calls and subscripts ----
     // Note: A(I) is ambiguous — could be array access, function call, or substring.
     // The parser produces FunctionCall for all of them; sema disambiguates.
-
     /// Function call or array access: `sin(x)`, `a(i,j)`, `s(1:5)`
     FunctionCall {
         callee: Box<SpannedExpr>,
@@ -78,19 +56,15 @@ pub enum Expr {
     },
 
     // ---- Array constructors ----
-
     /// Array constructor: `[1, 2, 3]` or `(/ 1, 2, 3 /)`
     ArrayConstructor {
-        type_spec: Option<String>,  // [integer :: 1, 2, 3]
+        type_spec: Option<String>, // [integer :: 1, 2, 3]
         values: Vec<AcValue>,
     },
 
     // ---- Parenthesized ----
-
     /// Parenthesized expression: `(x + y)`
-    ParenExpr {
-        inner: Box<SpannedExpr>,
-    },
+    ParenExpr { inner: Box<SpannedExpr> },
 }
 
 /// An expression with source location.
@@ -104,7 +78,11 @@ impl SpannedExpr {
             Expr::RealLiteral { text, .. } => text.clone(),
             Expr::StringLiteral { value, .. } => format!("'{}'", value),
             Expr::LogicalLiteral { value, .. } => {
-                if *value { ".true.".into() } else { ".false.".into() }
+                if *value {
+                    ".true.".into()
+                } else {
+                    ".false.".into()
+                }
             }
             Expr::ComplexLiteral { real, imag } => {
                 format!("({}, {})", real.to_sexpr(), imag.to_sexpr())
@@ -121,27 +99,47 @@ impl SpannedExpr {
                 format!("({} {} {})", left.to_sexpr(), op, right.to_sexpr())
             }
             Expr::FunctionCall { callee, args } => {
-                let args_str: Vec<String> = args.iter().map(|a| {
-                    if let Some(kw) = &a.keyword {
-                        format!("{}={}", kw, a.value.to_sexpr())
-                    } else {
-                        a.value.to_sexpr()
-                    }
-                }).collect();
+                let args_str: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        if let Some(kw) = &a.keyword {
+                            format!("{}={}", kw, a.value.to_sexpr())
+                        } else {
+                            a.value.to_sexpr()
+                        }
+                    })
+                    .collect();
                 format!("{}({})", callee.to_sexpr(), args_str.join(", "))
             }
             Expr::ArrayConstructor { values, type_spec } => {
-                let vals: Vec<String> = values.iter().map(|v| match v {
-                    AcValue::Expr(e) => e.to_sexpr(),
-                    AcValue::ImpliedDo(ido) => {
-                        let vals: Vec<String> = ido.values.iter().map(|v| match v {
-                            AcValue::Expr(e) => e.to_sexpr(),
-                            AcValue::ImpliedDo(_) => "(nested-implied-do)".into(),
-                        }).collect();
-                        let step_str = ido.step.as_ref().map_or(String::new(), |s| format!(", {}", s.to_sexpr()));
-                        format!("({}, {}={}, {}{})", vals.join(", "), ido.var, ido.start.to_sexpr(), ido.end.to_sexpr(), step_str)
-                    }
-                }).collect();
+                let vals: Vec<String> = values
+                    .iter()
+                    .map(|v| match v {
+                        AcValue::Expr(e) => e.to_sexpr(),
+                        AcValue::ImpliedDo(ido) => {
+                            let vals: Vec<String> = ido
+                                .values
+                                .iter()
+                                .map(|v| match v {
+                                    AcValue::Expr(e) => e.to_sexpr(),
+                                    AcValue::ImpliedDo(_) => "(nested-implied-do)".into(),
+                                })
+                                .collect();
+                            let step_str = ido
+                                .step
+                                .as_ref()
+                                .map_or(String::new(), |s| format!(", {}", s.to_sexpr()));
+                            format!(
+                                "({}, {}={}, {}{})",
+                                vals.join(", "),
+                                ido.var,
+                                ido.start.to_sexpr(),
+                                ido.end.to_sexpr(),
+                                step_str
+                            )
+                        }
+                    })
+                    .collect();
                 if let Some(ts) = type_spec {
                     format!("[{} :: {}]", ts, vals.join(", "))
                 } else {
@@ -166,9 +164,9 @@ pub enum BozBase {
 /// Unary operators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnaryOp {
-    Plus,       // +
-    Minus,      // -
-    Not,        // .not.
+    Plus,            // +
+    Minus,           // -
+    Not,             // .not.
     Defined(String), // .myop.
 }
 
@@ -187,28 +185,28 @@ impl std::fmt::Display for UnaryOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinaryOp {
     // Arithmetic
-    Add,        // +
-    Sub,        // -
-    Mul,        // *
-    Div,        // /
-    Pow,        // **
+    Add, // +
+    Sub, // -
+    Mul, // *
+    Div, // /
+    Pow, // **
 
     // String
-    Concat,     // //
+    Concat, // //
 
     // Comparison
-    Eq,         // == or .eq.
-    Ne,         // /= or .ne.
-    Lt,         // < or .lt.
-    Le,         // <= or .le.
-    Gt,         // > or .gt.
-    Ge,         // >= or .ge.
+    Eq, // == or .eq.
+    Ne, // /= or .ne.
+    Lt, // < or .lt.
+    Le, // <= or .le.
+    Gt, // > or .gt.
+    Ge, // >= or .ge.
 
     // Logical
-    And,        // .and.
-    Or,         // .or.
-    Eqv,        // .eqv.
-    Neqv,       // .neqv.
+    And,  // .and.
+    Or,   // .or.
+    Eqv,  // .eqv.
+    Neqv, // .neqv.
 
     // User-defined
     Defined(String), // .myop.

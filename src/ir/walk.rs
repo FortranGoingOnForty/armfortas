@@ -23,19 +23,26 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// All `ValueId`s consumed as operands by an instruction.
 pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
     match kind {
-        InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
-        InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) |
-        InstKind::GlobalAddr(..) => vec![],
+        InstKind::ConstInt(..)
+        | InstKind::ConstFloat(..)
+        | InstKind::ConstBool(..)
+        | InstKind::ConstString(..)
+        | InstKind::Undef(..)
+        | InstKind::Alloca(..)
+        | InstKind::GlobalAddr(..) => vec![],
 
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
-        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
-        InstKind::IMod(a, b) => vec![*a, *b],
+        InstKind::IAdd(a, b)
+        | InstKind::ISub(a, b)
+        | InstKind::IMul(a, b)
+        | InstKind::IDiv(a, b)
+        | InstKind::IMod(a, b) => vec![*a, *b],
         InstKind::INeg(a) => vec![*a],
 
-        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
-        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
-        InstKind::FPow(a, b) => vec![*a, *b],
+        InstKind::FAdd(a, b)
+        | InstKind::FSub(a, b)
+        | InstKind::FMul(a, b)
+        | InstKind::FDiv(a, b)
+        | InstKind::FPow(a, b) => vec![*a, *b],
         InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => vec![*a],
 
         InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => vec![*a, *b],
@@ -45,16 +52,25 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
 
         InstKind::Select(c, t, f) => vec![*c, *t, *f],
 
-        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
-        InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
-        InstKind::LShr(a, b) | InstKind::AShr(a, b) => vec![*a, *b],
-        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
-        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => vec![*a],
+        InstKind::BitAnd(a, b)
+        | InstKind::BitOr(a, b)
+        | InstKind::BitXor(a, b)
+        | InstKind::Shl(a, b)
+        | InstKind::LShr(a, b)
+        | InstKind::AShr(a, b) => vec![*a, *b],
+        InstKind::BitNot(a)
+        | InstKind::CountLeadingZeros(a)
+        | InstKind::CountTrailingZeros(a)
+        | InstKind::PopCount(a) => vec![*a],
 
-        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
-        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) |
-        InstKind::PtrToInt(v) | InstKind::IntToPtr(v, _) => vec![*v],
+        InstKind::IntToFloat(v, _)
+        | InstKind::FloatToInt(v, _)
+        | InstKind::FloatExtend(v, _)
+        | InstKind::FloatTrunc(v, _)
+        | InstKind::IntExtend(v, _, _)
+        | InstKind::IntTrunc(v, _)
+        | InstKind::PtrToInt(v)
+        | InstKind::IntToPtr(v, _) => vec![*v],
 
         InstKind::Load(a) => vec![*a],
         InstKind::Store(v, a) => vec![*v, *a],
@@ -82,7 +98,12 @@ pub fn terminator_uses(term: &Terminator) -> Vec<ValueId> {
         Terminator::Return(None) | Terminator::Unreachable => vec![],
         Terminator::Return(Some(v)) => vec![*v],
         Terminator::Branch(_, args) => args.clone(),
-        Terminator::CondBranch { cond, true_args, false_args, .. } => {
+        Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
             let mut uses = vec![*cond];
             uses.extend(true_args);
             uses.extend(false_args);
@@ -97,7 +118,11 @@ pub fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
     match term {
         Terminator::Return(_) | Terminator::Unreachable => vec![],
         Terminator::Branch(d, _) => vec![*d],
-        Terminator::CondBranch { true_dest, false_dest, .. } => vec![*true_dest, *false_dest],
+        Terminator::CondBranch {
+            true_dest,
+            false_dest,
+            ..
+        } => vec![*true_dest, *false_dest],
         Terminator::Switch { cases, default, .. } => {
             let mut t: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
             t.push(*default);
@@ -113,72 +138,129 @@ pub fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
 /// Apply a closure to every operand slot of an instruction in place.
 pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)) {
     match kind {
-        InstKind::ConstInt(..) | InstKind::ConstFloat(..) |
-        InstKind::ConstBool(..) | InstKind::ConstString(..) |
-        InstKind::Undef(..) | InstKind::Alloca(..) |
-        InstKind::GlobalAddr(..) => {}
+        InstKind::ConstInt(..)
+        | InstKind::ConstFloat(..)
+        | InstKind::ConstBool(..)
+        | InstKind::ConstString(..)
+        | InstKind::Undef(..)
+        | InstKind::Alloca(..)
+        | InstKind::GlobalAddr(..) => {}
 
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
-        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
-        InstKind::IMod(a, b) => { r(a); r(b); }
+        InstKind::IAdd(a, b)
+        | InstKind::ISub(a, b)
+        | InstKind::IMul(a, b)
+        | InstKind::IDiv(a, b)
+        | InstKind::IMod(a, b) => {
+            r(a);
+            r(b);
+        }
         InstKind::INeg(a) => r(a),
 
-        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
-        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
-        InstKind::FPow(a, b) => { r(a); r(b); }
+        InstKind::FAdd(a, b)
+        | InstKind::FSub(a, b)
+        | InstKind::FMul(a, b)
+        | InstKind::FDiv(a, b)
+        | InstKind::FPow(a, b) => {
+            r(a);
+            r(b);
+        }
         InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => r(a),
 
-        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => { r(a); r(b); }
+        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => {
+            r(a);
+            r(b);
+        }
 
-        InstKind::And(a, b) | InstKind::Or(a, b) => { r(a); r(b); }
+        InstKind::And(a, b) | InstKind::Or(a, b) => {
+            r(a);
+            r(b);
+        }
         InstKind::Not(a) => r(a),
 
-        InstKind::Select(c, t, f) => { r(c); r(t); r(f); }
+        InstKind::Select(c, t, f) => {
+            r(c);
+            r(t);
+            r(f);
+        }
 
-        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) |
-        InstKind::BitXor(a, b) | InstKind::Shl(a, b) |
-        InstKind::LShr(a, b) | InstKind::AShr(a, b) => { r(a); r(b); }
-        InstKind::BitNot(a) | InstKind::CountLeadingZeros(a) |
-        InstKind::CountTrailingZeros(a) | InstKind::PopCount(a) => r(a),
+        InstKind::BitAnd(a, b)
+        | InstKind::BitOr(a, b)
+        | InstKind::BitXor(a, b)
+        | InstKind::Shl(a, b)
+        | InstKind::LShr(a, b)
+        | InstKind::AShr(a, b) => {
+            r(a);
+            r(b);
+        }
+        InstKind::BitNot(a)
+        | InstKind::CountLeadingZeros(a)
+        | InstKind::CountTrailingZeros(a)
+        | InstKind::PopCount(a) => r(a),
 
-        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) |
-        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) |
-        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) |
-        InstKind::PtrToInt(v) | InstKind::IntToPtr(v, _) => r(v),
+        InstKind::IntToFloat(v, _)
+        | InstKind::FloatToInt(v, _)
+        | InstKind::FloatExtend(v, _)
+        | InstKind::FloatTrunc(v, _)
+        | InstKind::IntExtend(v, _, _)
+        | InstKind::IntTrunc(v, _)
+        | InstKind::PtrToInt(v)
+        | InstKind::IntToPtr(v, _) => r(v),
 
         InstKind::Load(a) => r(a),
-        InstKind::Store(v, a) => { r(v); r(a); }
+        InstKind::Store(v, a) => {
+            r(v);
+            r(a);
+        }
         InstKind::GetElementPtr(base, idxs) => {
             r(base);
-            for i in idxs { r(i); }
+            for i in idxs {
+                r(i);
+            }
         }
 
         InstKind::Call(FuncRef::Indirect(target), args) => {
             r(target);
-            for a in args { r(a); }
+            for a in args {
+                r(a);
+            }
         }
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-            for a in args { r(a); }
+            for a in args {
+                r(a);
+            }
         }
 
         InstKind::ExtractField(agg, _) => r(agg),
-        InstKind::InsertField(agg, _, val) => { r(agg); r(val); }
+        InstKind::InsertField(agg, _, val) => {
+            r(agg);
+            r(val);
+        }
     }
 }
 
 /// Apply a closure to every operand slot of a terminator in place.
-pub fn for_each_terminator_operand_mut(
-    term: &mut Terminator,
-    mut r: impl FnMut(&mut ValueId),
-) {
+pub fn for_each_terminator_operand_mut(term: &mut Terminator, mut r: impl FnMut(&mut ValueId)) {
     match term {
         Terminator::Return(None) | Terminator::Unreachable => {}
         Terminator::Return(Some(v)) => r(v),
-        Terminator::Branch(_, args) => for a in args { r(a); },
-        Terminator::CondBranch { cond, true_args, false_args, .. } => {
+        Terminator::Branch(_, args) => {
+            for a in args {
+                r(a);
+            }
+        }
+        Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
             r(cond);
-            for a in true_args { r(a); }
-            for a in false_args { r(a); }
+            for a in true_args {
+                r(a);
+            }
+            for a in false_args {
+                r(a);
+            }
         }
         Terminator::Switch { selector, .. } => r(selector),
     }
@@ -188,7 +270,11 @@ pub fn for_each_terminator_operand_mut(
 /// Definitions are unaffected — only operand slots in instructions and
 /// terminators are rewritten.
 pub fn substitute_uses(func: &mut Function, old: ValueId, new: ValueId) {
-    let r = |v: &mut ValueId| if *v == old { *v = new; };
+    let r = |v: &mut ValueId| {
+        if *v == old {
+            *v = new;
+        }
+    };
     for block in &mut func.blocks {
         for inst in &mut block.insts {
             for_each_operand_mut(&mut inst.kind, r);
@@ -267,7 +353,9 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
     // update them — they participate in no meaningful dominance
     // relationship.
     for block in &func.blocks {
-        if block.id == func.entry { continue; }
+        if block.id == func.entry {
+            continue;
+        }
         if reachable.contains(&block.id) {
             doms.insert(block.id, reachable.clone());
         } else {
@@ -280,15 +368,22 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
     while changed {
         changed = false;
         for block in &func.blocks {
-            if block.id == func.entry { continue; }
-            if !reachable.contains(&block.id) { continue; }
+            if block.id == func.entry {
+                continue;
+            }
+            if !reachable.contains(&block.id) {
+                continue;
+            }
             let plist = preds.get(&block.id).cloned().unwrap_or_default();
             // Reachable-only predecessors — an edge from an
             // unreachable block doesn't contribute to dominance.
-            let reachable_preds: Vec<BlockId> = plist.into_iter()
+            let reachable_preds: Vec<BlockId> = plist
+                .into_iter()
                 .filter(|p| reachable.contains(p))
                 .collect();
-            if reachable_preds.is_empty() { continue; }
+            if reachable_preds.is_empty() {
+                continue;
+            }
             let mut new_dom = reachable.clone();
             for p in &reachable_preds {
                 if let Some(pd) = doms.get(p) {
@@ -381,21 +476,24 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
         // everything reachable from the entry, which both inflates
         // the body and makes `find_preheader` see no out-of-loop
         // predecessor for the header.
-        let mut stack: Vec<BlockId> = latches.iter()
-            .filter(|&&l| l != header)
-            .copied()
-            .collect();
+        let mut stack: Vec<BlockId> = latches.iter().filter(|&&l| l != header).copied().collect();
         while let Some(b) = stack.pop() {
             if let Some(plist) = preds.get(&b) {
                 for &p in plist {
-                    if p == header { continue; }
+                    if p == header {
+                        continue;
+                    }
                     if body.insert(p) {
                         stack.push(p);
                     }
                 }
             }
         }
-        loops.push(NaturalLoop { header, body, latches });
+        loops.push(NaturalLoop {
+            header,
+            body,
+            latches,
+        });
     }
     loops
 }
@@ -414,7 +512,9 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
     queue.push_back(func.entry);
     reachable.insert(func.entry);
     while let Some(bid) = queue.pop_front() {
-        let Some(block) = func.try_block(bid) else { continue };
+        let Some(block) = func.try_block(bid) else {
+            continue;
+        };
         if let Some(term) = &block.terminator {
             for tgt in terminator_targets(term) {
                 if reachable.insert(tgt) {
@@ -458,28 +558,31 @@ pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId
     let mut idoms: HashMap<BlockId, BlockId> = HashMap::new();
 
     for block in &func.blocks {
-        if block.id == func.entry { continue; }
-        let Some(my_doms) = doms.get(&block.id) else { continue };
-        if my_doms.is_empty() { continue; } // unreachable
+        if block.id == func.entry {
+            continue;
+        }
+        let Some(my_doms) = doms.get(&block.id) else {
+            continue;
+        };
+        if my_doms.is_empty() {
+            continue;
+        } // unreachable
 
         // The immediate dominator is the dominator (other than
         // self) that is dominated by every other dominator (other
         // than self). Equivalently: the dominator that has the
         // largest dominator set — all other dominators of `block`
         // also dominate the idom.
-        let candidates: Vec<BlockId> = my_doms.iter()
-            .copied()
-            .filter(|&d| d != block.id)
-            .collect();
+        let candidates: Vec<BlockId> = my_doms.iter().copied().filter(|&d| d != block.id).collect();
 
         let idom = candidates.iter().copied().find(|&cand| {
             // cand is idom iff no other candidate strictly
             // dominates it (only cand itself and cand's own
             // dominators do).
             let cand_doms = doms.get(&cand).cloned().unwrap_or_default();
-            candidates.iter().all(|&other| {
-                other == cand || cand_doms.contains(&other)
-            })
+            candidates
+                .iter()
+                .all(|&other| other == cand || cand_doms.contains(&other))
         });
 
         if let Some(idom) = idom {
@@ -496,9 +599,9 @@ pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId
 /// `children[B]` is the set of blocks whose immediate dominator is
 /// `B`. A dominator-tree traversal visits `B` then recurses into
 /// `children[B]` in some order.
-pub fn dominator_tree_children(idoms: &HashMap<BlockId, BlockId>)
-    -> HashMap<BlockId, Vec<BlockId>>
-{
+pub fn dominator_tree_children(
+    idoms: &HashMap<BlockId, BlockId>,
+) -> HashMap<BlockId, Vec<BlockId>> {
     let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (&child, &parent) in idoms {
         children.entry(parent).or_default().push(child);
@@ -522,9 +625,7 @@ pub fn dominator_tree_children(idoms: &HashMap<BlockId, BlockId>)
 /// for every join point `X` (block with ≥ 2 predecessors), walk
 /// each predecessor `P` upward in the dominator tree, adding `X`
 /// to `DF(runner)` until `runner == idom(X)`.
-pub fn compute_dominance_frontiers(func: &Function)
-    -> HashMap<BlockId, HashSet<BlockId>>
-{
+pub fn compute_dominance_frontiers(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
     let idoms = compute_immediate_dominators(func);
     let preds = predecessors(func);
 
@@ -536,7 +637,9 @@ pub fn compute_dominance_frontiers(func: &Function)
     // unreachable predecessors that downstream consumers (mem2reg's
     // iterated-DF closure in particular) must then defensively
     // ignore. Filtering at the source keeps the DF map clean.
-    let reachable: HashSet<BlockId> = idoms.keys().copied()
+    let reachable: HashSet<BlockId> = idoms
+        .keys()
+        .copied()
         .chain(std::iter::once(func.entry))
         .collect();
 
@@ -552,15 +655,20 @@ pub fn compute_dominance_frontiers(func: &Function)
 
     for block in &func.blocks {
         let x = block.id;
-        if !reachable.contains(&x) { continue; }
+        if !reachable.contains(&x) {
+            continue;
+        }
         let plist = preds.get(&x).cloned().unwrap_or_default();
         // Drop unreachable predecessors before counting toward
         // "join point" status. An unreachable predecessor adds no
         // runtime control flow into x.
-        let plist: Vec<BlockId> = plist.into_iter()
+        let plist: Vec<BlockId> = plist
+            .into_iter()
             .filter(|p| reachable.contains(p))
             .collect();
-        if plist.len() < 2 { continue; }
+        if plist.len() < 2 {
+            continue;
+        }
 
         // `x` is a join point. Walk each predecessor upward.
         let idom_x = idoms.get(&x).copied();
@@ -609,13 +717,17 @@ pub fn dominator_tree_preorder(func: &Function) -> Vec<BlockId> {
 
 #[cfg(test)]
 mod walk_tests {
-    use super::*;
     use super::super::types::IrType;
-    use crate::lexer::{Span, Position};
+    use super::*;
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     /// Build a diamond CFG:
@@ -760,21 +872,31 @@ mod walk_tests {
         let entry = f.entry;
         let c0 = f.next_value_id();
         f.block_mut(entry).insts.push(Inst {
-            id: c0, kind: InstKind::ConstBool(true),
-            ty: IrType::Bool, span: dummy_span(),
+            id: c0,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
         });
         f.block_mut(entry).terminator = Some(Terminator::CondBranch {
-            cond: c0, true_dest: a, true_args: vec![],
-            false_dest: b, false_args: vec![],
+            cond: c0,
+            true_dest: a,
+            true_args: vec![],
+            false_dest: b,
+            false_args: vec![],
         });
         let c1 = f.next_value_id();
         f.block_mut(b).insts.push(Inst {
-            id: c1, kind: InstKind::ConstBool(true),
-            ty: IrType::Bool, span: dummy_span(),
+            id: c1,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
         });
         f.block_mut(b).terminator = Some(Terminator::CondBranch {
-            cond: c1, true_dest: c, true_args: vec![],
-            false_dest: d, false_args: vec![],
+            cond: c1,
+            true_dest: c,
+            true_args: vec![],
+            false_dest: d,
+            false_args: vec![],
         });
         f.block_mut(c).terminator = Some(Terminator::Branch(m1, vec![]));
         f.block_mut(d).terminator = Some(Terminator::Branch(m1, vec![]));
@@ -815,7 +937,10 @@ mod walk_tests {
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
         let idoms = compute_immediate_dominators(&f);
-        assert!(idoms.is_empty(), "single-block function should have no idoms");
+        assert!(
+            idoms.is_empty(),
+            "single-block function should have no idoms"
+        );
 
         let df = compute_dominance_frontiers(&f);
         // Entry is reachable, so it has an entry in the DF map, but
@@ -847,13 +972,18 @@ mod walk_tests {
         let exit = f.create_block("exit");
         f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
             cond,
-            true_dest: f.entry, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: f.entry,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
 
         let idoms = compute_immediate_dominators(&f);
-        assert!(!idoms.contains_key(&f.entry), "entry has no idom even with a self-edge");
+        assert!(
+            !idoms.contains_key(&f.entry),
+            "entry has no idom even with a self-edge"
+        );
         assert_eq!(idoms[&exit], f.entry);
 
         let df = compute_dominance_frontiers(&f);
@@ -861,8 +991,11 @@ mod walk_tests {
         // the implicit "function entry edge" doesn't count, so entry
         // has 1 reachable pred. Not a join point — entry ∉ any DF.
         for (b, frontier) in &df {
-            assert!(!frontier.contains(&f.entry),
-                "entry should not appear in DF[{:?}]", b);
+            assert!(
+                !frontier.contains(&f.entry),
+                "entry should not appear in DF[{:?}]",
+                b
+            );
         }
     }
 
@@ -889,14 +1022,19 @@ mod walk_tests {
         });
         f.block_mut(b).terminator = Some(Terminator::CondBranch {
             cond,
-            true_dest: b, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: b,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
 
         let df = compute_dominance_frontiers(&f);
-        assert_eq!(df[&b], HashSet::from([b]),
-            "b's self-edge puts b in its own dominance frontier");
+        assert_eq!(
+            df[&b],
+            HashSet::from([b]),
+            "b's self-edge puts b in its own dominance frontier"
+        );
         let idoms = compute_immediate_dominators(&f);
         assert_eq!(idoms[&b], f.entry);
         assert_eq!(idoms[&exit], b);
@@ -921,13 +1059,17 @@ mod walk_tests {
         // entry → cond ? a : b
         let c0 = f.next_value_id();
         f.block_mut(f.entry).insts.push(Inst {
-            id: c0, kind: InstKind::ConstBool(true),
-            ty: IrType::Bool, span: dummy_span(),
+            id: c0,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
         });
         f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
             cond: c0,
-            true_dest: a, true_args: vec![],
-            false_dest: b, false_args: vec![],
+            true_dest: a,
+            true_args: vec![],
+            false_dest: b,
+            false_args: vec![],
         });
 
         // a → b
@@ -938,13 +1080,17 @@ mod walk_tests {
         //                      bypasses it).
         let c1 = f.next_value_id();
         f.block_mut(b).insts.push(Inst {
-            id: c1, kind: InstKind::ConstBool(true),
-            ty: IrType::Bool, span: dummy_span(),
+            id: c1,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
         });
         f.block_mut(b).terminator = Some(Terminator::CondBranch {
             cond: c1,
-            true_dest: a, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: a,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
 

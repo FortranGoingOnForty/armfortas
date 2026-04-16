@@ -20,7 +20,9 @@ use super::util::{find_natural_loops, inst_uses, predecessors, terminator_uses, 
 pub struct Vectorize;
 
 impl Pass for Vectorize {
-    fn name(&self) -> &'static str { "vectorize" }
+    fn name(&self) -> &'static str {
+        "vectorize"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -164,14 +166,20 @@ fn detect_counted_loop(
         }) => (*cond, *true_dest, *false_dest, true_args, false_args),
         _ => return None,
     };
-    if !true_args.is_empty() || !false_args.is_empty() || true_dest != body || lp.body.contains(&false_dest) {
+    if !true_args.is_empty()
+        || !false_args.is_empty()
+        || true_dest != body
+        || lp.body.contains(&false_dest)
+    {
         return None;
     }
 
     let cond_inst = header_block.insts.iter().find(|inst| inst.id == cond_id)?;
     let iv_bound = match cond_inst.kind {
         InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?,
-        InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?.checked_sub(1)?,
+        InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => {
+            resolve_const_int(func, rhs)?.checked_sub(1)?
+        }
         _ => return None,
     };
 
@@ -231,13 +239,10 @@ fn build_kernel_plan(
         return None;
     }
 
-    let mut stores = body
-        .insts
-        .iter()
-        .filter_map(|inst| match inst.kind {
-            InstKind::Store(value, ptr) => Some((inst.span, value, ptr)),
-            _ => None,
-        });
+    let mut stores = body.insts.iter().filter_map(|inst| match inst.kind {
+        InstKind::Store(value, ptr) => Some((inst.span, value, ptr)),
+        _ => None,
+    });
     let (span, stored_value, dest_ptr) = stores.next()?;
     if stores.next().is_some() {
         return None;
@@ -248,7 +253,9 @@ fn build_kernel_plan(
         return None;
     }
 
-    let plan = if let Some(scalar) = classify_invariant_scalar(func, loop_defs, stored_value, &dest.elem_ty) {
+    let plan = if let Some(scalar) =
+        classify_invariant_scalar(func, loop_defs, stored_value, &dest.elem_ty)
+    {
         let kernel = fill_kernel_name(&dest.elem_ty)?;
         KernelPlan::Fill {
             kernel,
@@ -382,7 +389,11 @@ fn classify_invariant_scalar(
     (func.value_type(value).as_ref() == Some(elem_ty)).then_some(value)
 }
 
-fn classify_loaded_array(func: &Function, value: ValueId, iv_param: ValueId) -> Option<ArrayAccess> {
+fn classify_loaded_array(
+    func: &Function,
+    value: ValueId,
+    iv_param: ValueId,
+) -> Option<ArrayAccess> {
     let defs = inst_map(func);
     let inst = defs.get(&value)?;
     let InstKind::Load(ptr) = inst.kind else {
@@ -442,18 +453,18 @@ fn loop_values_escape(func: &Function, lp: &NaturalLoop, loop_defs: &HashSet<Val
         if lp.body.contains(&block.id) {
             continue;
         }
-        if block
-            .insts
-            .iter()
-            .any(|inst| inst_uses(&inst.kind).into_iter().any(|value| loop_defs.contains(&value)))
-        {
+        if block.insts.iter().any(|inst| {
+            inst_uses(&inst.kind)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+        }) {
             return true;
         }
-        if block
-            .terminator
-            .as_ref()
-            .is_some_and(|term| terminator_uses(term).into_iter().any(|value| loop_defs.contains(&value)))
-        {
+        if block.terminator.as_ref().is_some_and(|term| {
+            terminator_uses(term)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+        }) {
             return true;
         }
     }
@@ -468,14 +479,33 @@ fn apply_kernel_plan(
 ) {
     let n_id = ensure_i64_const(func, shape.preheader, kernel_len(plan) as i64, span);
     let (kernel, args) = match plan {
-        KernelPlan::Fill { kernel, dest, scalar, .. } => (kernel, vec![dest, n_id, scalar]),
-        KernelPlan::ArrayBinary { kernel, dest, lhs, rhs, .. } => (kernel, vec![dest, lhs, rhs, n_id]),
-        KernelPlan::ArrayScalar { kernel, dest, src, scalar, .. } => {
-            (kernel, vec![dest, src, scalar, n_id])
-        }
-        KernelPlan::ScalarArray { kernel, dest, scalar, src, .. } => {
-            (kernel, vec![dest, scalar, src, n_id])
-        }
+        KernelPlan::Fill {
+            kernel,
+            dest,
+            scalar,
+            ..
+        } => (kernel, vec![dest, n_id, scalar]),
+        KernelPlan::ArrayBinary {
+            kernel,
+            dest,
+            lhs,
+            rhs,
+            ..
+        } => (kernel, vec![dest, lhs, rhs, n_id]),
+        KernelPlan::ArrayScalar {
+            kernel,
+            dest,
+            src,
+            scalar,
+            ..
+        } => (kernel, vec![dest, src, scalar, n_id]),
+        KernelPlan::ScalarArray {
+            kernel,
+            dest,
+            scalar,
+            src,
+            ..
+        } => (kernel, vec![dest, scalar, src, n_id]),
     };
 
     let id = func.next_value_id();
@@ -579,18 +609,27 @@ fn scalar_array_kernel_name(kind: BinaryKind, ty: &IrType) -> Option<&'static st
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
-    use crate::opt::pass::Pass;
     use crate::lexer::{Position, Span};
+    use crate::opt::pass::Pass;
 
     fn dummy_span() -> Span {
         let p = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: p, end: p }
+        Span {
+            file_id: 0,
+            start: p,
+            end: p,
+        }
     }
 
     fn push_inst(func: &mut Function, block: BlockId, kind: InstKind, ty: IrType) -> ValueId {
         let id = func.next_value_id();
         func.register_type(id, ty.clone());
-        func.block_mut(block).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        func.block_mut(block).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
@@ -608,29 +647,61 @@ mod tests {
             &mut func,
             entry,
             InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32)),
-            IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32))),
+            IrType::Ptr(Box::new(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I32)),
+                32,
+            ))),
         );
         let b = push_inst(
             &mut func,
             entry,
             InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32)),
-            IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32))),
+            IrType::Ptr(Box::new(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I32)),
+                32,
+            ))),
         );
         let c = push_inst(
             &mut func,
             entry,
             InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32)),
-            IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32))),
+            IrType::Ptr(Box::new(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I32)),
+                32,
+            ))),
         );
-        let one_i32 = push_inst(&mut func, entry, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let hi_i32 = push_inst(&mut func, entry, InstKind::ConstInt(32, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let one_i64 = push_inst(&mut func, entry, InstKind::ConstInt(1, IntWidth::I64), IrType::Int(IntWidth::I64));
+        let one_i32 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let hi_i32 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(32, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one_i64 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
         func.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![one_i32]));
 
         let iv = func.next_value_id();
         func.register_type(iv, IrType::Int(IntWidth::I32));
-        func.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
-        let cmp = push_inst(&mut func, header, InstKind::ICmp(CmpOp::Le, iv, hi_i32), IrType::Bool);
+        func.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        let cmp = push_inst(
+            &mut func,
+            header,
+            InstKind::ICmp(CmpOp::Le, iv, hi_i32),
+            IrType::Bool,
+        );
         func.block_mut(header).terminator = Some(Terminator::CondBranch {
             cond: cmp,
             true_dest: body,
@@ -639,23 +710,71 @@ mod tests {
             false_args: vec![],
         });
 
-        let idx64 = push_inst(&mut func, body, InstKind::IntExtend(iv, IntWidth::I64, true), IrType::Int(IntWidth::I64));
-        let offset = push_inst(&mut func, body, InstKind::ISub(idx64, one_i64), IrType::Int(IntWidth::I64));
-        let a_ptr = push_inst(&mut func, body, InstKind::GetElementPtr(a, vec![offset]), IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let a_val = push_inst(&mut func, body, InstKind::Load(a_ptr), IrType::Int(IntWidth::I32));
-        let b_ptr = push_inst(&mut func, body, InstKind::GetElementPtr(b, vec![offset]), IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let b_val = push_inst(&mut func, body, InstKind::Load(b_ptr), IrType::Int(IntWidth::I32));
-        let sum = push_inst(&mut func, body, InstKind::IAdd(a_val, b_val), IrType::Int(IntWidth::I32));
-        let c_ptr = push_inst(&mut func, body, InstKind::GetElementPtr(c, vec![offset]), IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let idx64 = push_inst(
+            &mut func,
+            body,
+            InstKind::IntExtend(iv, IntWidth::I64, true),
+            IrType::Int(IntWidth::I64),
+        );
+        let offset = push_inst(
+            &mut func,
+            body,
+            InstKind::ISub(idx64, one_i64),
+            IrType::Int(IntWidth::I64),
+        );
+        let a_ptr = push_inst(
+            &mut func,
+            body,
+            InstKind::GetElementPtr(a, vec![offset]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let a_val = push_inst(
+            &mut func,
+            body,
+            InstKind::Load(a_ptr),
+            IrType::Int(IntWidth::I32),
+        );
+        let b_ptr = push_inst(
+            &mut func,
+            body,
+            InstKind::GetElementPtr(b, vec![offset]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let b_val = push_inst(
+            &mut func,
+            body,
+            InstKind::Load(b_ptr),
+            IrType::Int(IntWidth::I32),
+        );
+        let sum = push_inst(
+            &mut func,
+            body,
+            InstKind::IAdd(a_val, b_val),
+            IrType::Int(IntWidth::I32),
+        );
+        let c_ptr = push_inst(
+            &mut func,
+            body,
+            InstKind::GetElementPtr(c, vec![offset]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
         push_inst(&mut func, body, InstKind::Store(sum, c_ptr), IrType::Void);
-        let next = push_inst(&mut func, body, InstKind::IAdd(iv, one_i32), IrType::Int(IntWidth::I32));
+        let next = push_inst(
+            &mut func,
+            body,
+            InstKind::IAdd(iv, one_i32),
+            IrType::Int(IntWidth::I32),
+        );
         func.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next]));
         func.block_mut(exit).terminator = Some(Terminator::Return(None));
 
         module.add_function(func);
 
         let changed = Vectorize.run(&mut module);
-        assert!(changed, "vectorize should rewrite the counted array-add loop");
+        assert!(
+            changed,
+            "vectorize should rewrite the counted array-add loop"
+        );
 
         let func = &module.functions[0];
         let entry_block = func.block(entry);

@@ -16,13 +16,20 @@ use super::util::substitute_uses;
 pub struct ConstArgSpecialize;
 
 impl Pass for ConstArgSpecialize {
-    fn name(&self) -> &'static str { "const-arg-specialize" }
+    fn name(&self) -> &'static str {
+        "const-arg-specialize"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let param_modes: Vec<Vec<Option<ParamMode>>> = module
             .functions
             .iter()
-            .map(|func| func.params.iter().map(|param| classify_param(func, param)).collect())
+            .map(|func| {
+                func.params
+                    .iter()
+                    .map(|param| classify_param(func, param))
+                    .collect()
+            })
             .collect();
 
         let plans = specialization_plans(module, &param_modes);
@@ -309,7 +316,11 @@ fn default_span(func: &Function) -> Span {
         span
     } else {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 }
 
@@ -372,18 +383,27 @@ fn apply_plan(module: &mut Module, plan: SpecializationPlan) {
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
-    use crate::opt::dead_arg::DeadArgElim;
     use crate::lexer::{Position, Span};
+    use crate::opt::dead_arg::DeadArgElim;
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty: ty.clone(), span: span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty: ty.clone(),
+            span: span(),
+        });
         f.register_type(id, ty);
         id
     }
@@ -418,21 +438,41 @@ mod tests {
         module.add_function(callee);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
-        let x1 = push(&mut caller, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let step1 = push(&mut caller, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x1 = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let step1 = push(
+            &mut caller,
+            InstKind::ConstInt(3, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let c1 = push(
             &mut caller,
             InstKind::Call(FuncRef::Internal(0), vec![x1, step1]),
             IrType::Int(IntWidth::I32),
         );
-        let x2 = push(&mut caller, InstKind::ConstInt(9, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let step2 = push(&mut caller, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x2 = push(
+            &mut caller,
+            InstKind::ConstInt(9, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let step2 = push(
+            &mut caller,
+            InstKind::ConstInt(3, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let c2 = push(
             &mut caller,
             InstKind::Call(FuncRef::Internal(0), vec![x2, step2]),
             IrType::Int(IntWidth::I32),
         );
-        let total = push(&mut caller, InstKind::IAdd(c1, c2), IrType::Int(IntWidth::I32));
+        let total = push(
+            &mut caller,
+            InstKind::IAdd(c1, c2),
+            IrType::Int(IntWidth::I32),
+        );
         let caller_entry = caller.entry;
         caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(total)));
         module.add_function(caller);
@@ -440,12 +480,20 @@ mod tests {
         assert!(ConstArgSpecialize.run(&mut module));
         assert!(DeadArgElim.run(&mut module));
 
-        assert_eq!(module.functions[0].params.len(), 1, "specialized helper should drop constant dummy");
+        assert_eq!(
+            module.functions[0].params.len(),
+            1,
+            "specialized helper should drop constant dummy"
+        );
         let call_args_1 = match &module.functions[1].blocks[0].insts[2].kind {
             InstKind::Call(FuncRef::Internal(0), args) => args,
             other => panic!("expected call, got {:?}", other),
         };
-        assert_eq!(call_args_1.len(), 1, "call site should drop specialized constant arg");
+        assert_eq!(
+            call_args_1.len(),
+            1,
+            "call site should drop specialized constant arg"
+        );
     }
 
     #[test]
@@ -478,15 +526,31 @@ mod tests {
         module.add_function(callee);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
-        let x1 = push(&mut caller, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let step1 = push(&mut caller, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x1 = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let step1 = push(
+            &mut caller,
+            InstKind::ConstInt(3, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let _ = push(
             &mut caller,
             InstKind::Call(FuncRef::Internal(0), vec![x1, step1]),
             IrType::Int(IntWidth::I32),
         );
-        let x2 = push(&mut caller, InstKind::ConstInt(9, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let step2 = push(&mut caller, InstKind::ConstInt(4, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x2 = push(
+            &mut caller,
+            InstKind::ConstInt(9, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let step2 = push(
+            &mut caller,
+            InstKind::ConstInt(4, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let call = push(
             &mut caller,
             InstKind::Call(FuncRef::Internal(0), vec![x2, step2]),

@@ -6,26 +6,26 @@
 /// A Fortran type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FortranType {
-    Integer { kind: u8 },        // kind in bytes: 1, 2, 4, 8, 16
-    Real { kind: u8 },           // 4 (single), 8 (double), 16 (quad)
-    Complex { kind: u8 },        // 4, 8, 16
-    Logical { kind: u8 },        // 1, 2, 4, 8
+    Integer { kind: u8 }, // kind in bytes: 1, 2, 4, 8, 16
+    Real { kind: u8 },    // 4 (single), 8 (double), 16 (quad)
+    Complex { kind: u8 }, // 4, 8, 16
+    Logical { kind: u8 }, // 1, 2, 4, 8
     Character { kind: u8, len: CharLen },
     Derived { name: String },
-    ClassOf { base: String },    // CLASS(t)
-    UnlimitedPoly,               // CLASS(*)
-    AssumedType,                 // TYPE(*)
-    Void,                        // subroutine (no return value)
-    Unknown,                     // not yet determined
+    ClassOf { base: String }, // CLASS(t)
+    UnlimitedPoly,            // CLASS(*)
+    AssumedType,              // TYPE(*)
+    Void,                     // subroutine (no return value)
+    Unknown,                  // not yet determined
 }
 
 /// Character length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CharLen {
     Known(i64),
-    Assumed,    // len=*
-    Deferred,   // len=:
-    Unknown,    // runtime expression
+    Assumed,  // len=*
+    Deferred, // len=:
+    Unknown,  // runtime expression
 }
 
 /// Array type information — wraps an element type with rank and shape.
@@ -62,35 +62,59 @@ pub enum Bound {
 
 impl FortranType {
     /// Default integer: integer(4).
-    pub fn default_integer() -> Self { Self::Integer { kind: 4 } }
+    pub fn default_integer() -> Self {
+        Self::Integer { kind: 4 }
+    }
     /// Default real: real(4).
-    pub fn default_real() -> Self { Self::Real { kind: 4 } }
+    pub fn default_real() -> Self {
+        Self::Real { kind: 4 }
+    }
     /// Default double precision: real(8).
-    pub fn double_precision() -> Self { Self::Real { kind: 8 } }
+    pub fn double_precision() -> Self {
+        Self::Real { kind: 8 }
+    }
     /// Default complex: complex(4).
-    pub fn default_complex() -> Self { Self::Complex { kind: 4 } }
+    pub fn default_complex() -> Self {
+        Self::Complex { kind: 4 }
+    }
     /// Default logical: logical(4).
-    pub fn default_logical() -> Self { Self::Logical { kind: 4 } }
+    pub fn default_logical() -> Self {
+        Self::Logical { kind: 4 }
+    }
     /// Default character: character(1, len=1).
-    pub fn default_character() -> Self { Self::Character { kind: 1, len: CharLen::Known(1) } }
+    pub fn default_character() -> Self {
+        Self::Character {
+            kind: 1,
+            len: CharLen::Known(1),
+        }
+    }
 
     /// Is this a numeric type (integer, real, or complex)?
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Self::Integer { .. } | Self::Real { .. } | Self::Complex { .. })
+        matches!(
+            self,
+            Self::Integer { .. } | Self::Real { .. } | Self::Complex { .. }
+        )
     }
 
     /// Is this a logical type?
-    pub fn is_logical(&self) -> bool { matches!(self, Self::Logical { .. }) }
+    pub fn is_logical(&self) -> bool {
+        matches!(self, Self::Logical { .. })
+    }
 
     /// Is this a character type?
-    pub fn is_character(&self) -> bool { matches!(self, Self::Character { .. }) }
+    pub fn is_character(&self) -> bool {
+        matches!(self, Self::Character { .. })
+    }
 
     /// Get the kind (size in bytes) for numeric/logical types.
     pub fn kind(&self) -> Option<u8> {
         match self {
-            Self::Integer { kind } | Self::Real { kind } |
-            Self::Complex { kind } | Self::Logical { kind } |
-            Self::Character { kind, .. } => Some(*kind),
+            Self::Integer { kind }
+            | Self::Real { kind }
+            | Self::Complex { kind }
+            | Self::Logical { kind }
+            | Self::Character { kind, .. } => Some(*kind),
             _ => None,
         }
     }
@@ -125,13 +149,13 @@ pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option
     //   real + complex → max(kind_a, kind_b)
     let result_rank = left_rank.max(right_rank);
     let result_kind = if left_rank == right_rank {
-        left_kind.max(right_kind)  // same type class: max kind
+        left_kind.max(right_kind) // same type class: max kind
     } else if left_rank == 1 {
-        right_kind  // integer + real/complex: use real/complex kind
+        right_kind // integer + real/complex: use real/complex kind
     } else if right_rank == 1 {
-        left_kind   // real/complex + integer: use real/complex kind
+        left_kind // real/complex + integer: use real/complex kind
     } else {
-        left_kind.max(right_kind)  // real + complex: max kind
+        left_kind.max(right_kind) // real + complex: max kind
     };
 
     Some(match result_rank {
@@ -151,7 +175,9 @@ pub fn power_result_type(base: &FortranType, exponent: &FortranType) -> Option<F
         return None;
     }
     // If both integer, result is integer with max kind.
-    if matches!(base, FortranType::Integer { .. }) && matches!(exponent, FortranType::Integer { .. }) {
+    if matches!(base, FortranType::Integer { .. })
+        && matches!(exponent, FortranType::Integer { .. })
+    {
         let kind = base.kind().unwrap_or(4).max(exponent.kind().unwrap_or(4));
         return Some(FortranType::Integer { kind });
     }
@@ -186,17 +212,23 @@ pub fn concat_result_type(left: &FortranType, right: &FortranType) -> Option<For
         (CharLen::Known(a), CharLen::Known(b)) => CharLen::Known(a + b),
         _ => CharLen::Unknown,
     };
-    Some(FortranType::Character { kind: left_kind, len: result_len })
+    Some(FortranType::Character {
+        kind: left_kind,
+        len: result_len,
+    })
 }
 
 /// Check if an implicit conversion is needed from `from` to `to`.
 /// Returns None if no conversion needed, or the target type if needed.
 /// Complex→non-complex requires explicit conversion per standard.
 pub fn needs_conversion(from: &FortranType, to: &FortranType) -> Option<FortranType> {
-    if from == to { return None; }
+    if from == to {
+        return None;
+    }
     if from.is_numeric() && to.is_numeric() {
         // Complex → non-complex requires explicit conversion (REAL(), INT()).
-        if matches!(from, FortranType::Complex { .. }) && !matches!(to, FortranType::Complex { .. }) {
+        if matches!(from, FortranType::Complex { .. }) && !matches!(to, FortranType::Complex { .. })
+        {
             return None;
         }
         return Some(to.clone());
@@ -207,7 +239,9 @@ pub fn needs_conversion(from: &FortranType, to: &FortranType) -> Option<FortranT
 /// Logical operators require logical operands and produce logical.
 pub fn logical_result_type(operand: &FortranType) -> Option<FortranType> {
     if operand.is_logical() {
-        Some(FortranType::Logical { kind: operand.kind().unwrap_or(4) })
+        Some(FortranType::Logical {
+            kind: operand.kind().unwrap_or(4),
+        })
     } else {
         None // Error: logical operator applied to non-logical type
     }
@@ -224,7 +258,11 @@ pub fn binary_logical_result_type(left: &FortranType, right: &FortranType) -> Op
 }
 
 /// Compute the result type of any binary operation.
-pub fn binary_op_result_type(op: &crate::ast::expr::BinaryOp, left: &FortranType, right: &FortranType) -> Option<FortranType> {
+pub fn binary_op_result_type(
+    op: &crate::ast::expr::BinaryOp,
+    left: &FortranType,
+    right: &FortranType,
+) -> Option<FortranType> {
     use crate::ast::expr::BinaryOp;
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
@@ -232,9 +270,10 @@ pub fn binary_op_result_type(op: &crate::ast::expr::BinaryOp, left: &FortranType
         }
         BinaryOp::Pow => power_result_type(left, right),
         BinaryOp::Concat => concat_result_type(left, right),
-        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le |
-        BinaryOp::Gt | BinaryOp::Ge => {
-            if (left.is_numeric() && right.is_numeric()) || (left.is_character() && right.is_character()) {
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            if (left.is_numeric() && right.is_numeric())
+                || (left.is_character() && right.is_character())
+            {
                 Some(comparison_result_type())
             } else {
                 None
@@ -248,11 +287,18 @@ pub fn binary_op_result_type(op: &crate::ast::expr::BinaryOp, left: &FortranType
 }
 
 /// Compute the result type of a unary operation.
-pub fn unary_op_result_type(op: &crate::ast::expr::UnaryOp, operand: &FortranType) -> Option<FortranType> {
+pub fn unary_op_result_type(
+    op: &crate::ast::expr::UnaryOp,
+    operand: &FortranType,
+) -> Option<FortranType> {
     use crate::ast::expr::UnaryOp;
     match op {
         UnaryOp::Plus | UnaryOp::Minus => {
-            if operand.is_numeric() { Some(operand.clone()) } else { None }
+            if operand.is_numeric() {
+                Some(operand.clone())
+            } else {
+                None
+            }
         }
         UnaryOp::Not => logical_result_type(operand),
         UnaryOp::Defined(_) => Some(FortranType::Unknown),
@@ -269,7 +315,10 @@ pub enum CallKind {
 }
 
 /// Disambiguate `A(I)` based on symbol table information.
-pub fn disambiguate_call(sym_kind: &super::symtab::SymbolKind, has_range_subscript: bool) -> CallKind {
+pub fn disambiguate_call(
+    sym_kind: &super::symtab::SymbolKind,
+    has_range_subscript: bool,
+) -> CallKind {
     use super::symtab::SymbolKind;
     match sym_kind {
         SymbolKind::Variable => {
@@ -279,8 +328,10 @@ pub fn disambiguate_call(sym_kind: &super::symtab::SymbolKind, has_range_subscri
                 CallKind::ArrayElement // variable with subscripts → array element
             }
         }
-        SymbolKind::Function | SymbolKind::ExternalProc |
-        SymbolKind::IntrinsicProc | SymbolKind::ProcedurePointer => CallKind::FunctionCall,
+        SymbolKind::Function
+        | SymbolKind::ExternalProc
+        | SymbolKind::IntrinsicProc
+        | SymbolKind::ProcedurePointer => CallKind::FunctionCall,
         SymbolKind::NamedInterface => CallKind::FunctionCall, // generic → function call
         _ => CallKind::Unknown,
     }
@@ -290,11 +341,19 @@ pub fn disambiguate_call(sym_kind: &super::symtab::SymbolKind, has_range_subscri
 pub fn type_info_to_fortran_type(info: &super::symtab::TypeInfo) -> FortranType {
     use super::symtab::TypeInfo;
     match info {
-        TypeInfo::Integer { kind } => FortranType::Integer { kind: kind.unwrap_or(4) },
-        TypeInfo::Real { kind } => FortranType::Real { kind: kind.unwrap_or(4) },
+        TypeInfo::Integer { kind } => FortranType::Integer {
+            kind: kind.unwrap_or(4),
+        },
+        TypeInfo::Real { kind } => FortranType::Real {
+            kind: kind.unwrap_or(4),
+        },
         TypeInfo::DoublePrecision => FortranType::Real { kind: 8 },
-        TypeInfo::Complex { kind } => FortranType::Complex { kind: kind.unwrap_or(4) },
-        TypeInfo::Logical { kind } => FortranType::Logical { kind: kind.unwrap_or(4) },
+        TypeInfo::Complex { kind } => FortranType::Complex {
+            kind: kind.unwrap_or(4),
+        },
+        TypeInfo::Logical { kind } => FortranType::Logical {
+            kind: kind.unwrap_or(4),
+        },
         TypeInfo::Character { len, kind } => FortranType::Character {
             kind: kind.unwrap_or(1),
             len: match len {
@@ -327,7 +386,10 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
     use crate::ast::expr::Expr;
     match expr {
         Expr::IntegerLiteral { kind, .. } => {
-            let k = kind.as_ref().and_then(|s| s.parse::<u8>().ok()).unwrap_or(4);
+            let k = kind
+                .as_ref()
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(4);
             FortranType::Integer { kind: k }
         }
         Expr::RealLiteral { text, kind, .. } => {
@@ -344,11 +406,20 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
             }
         }
         Expr::StringLiteral { kind, value, .. } => {
-            let k = kind.as_ref().and_then(|s| s.parse::<u8>().ok()).unwrap_or(1);
-            FortranType::Character { kind: k, len: CharLen::Known(value.len() as i64) }
+            let k = kind
+                .as_ref()
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(1);
+            FortranType::Character {
+                kind: k,
+                len: CharLen::Known(value.len() as i64),
+            }
         }
         Expr::LogicalLiteral { kind, .. } => {
-            let k = kind.as_ref().and_then(|s| s.parse::<u8>().ok()).unwrap_or(4);
+            let k = kind
+                .as_ref()
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(4);
             FortranType::Logical { kind: k }
         }
         Expr::ComplexLiteral { .. } => FortranType::default_complex(),
@@ -359,13 +430,19 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
 
 /// Compute the type of an expression given a symbol table context.
 /// Returns Unknown for expressions that can't be resolved without more context.
-pub fn expr_type(expr: &crate::ast::expr::SpannedExpr, symtab: &super::symtab::SymbolTable) -> FortranType {
+pub fn expr_type(
+    expr: &crate::ast::expr::SpannedExpr,
+    symtab: &super::symtab::SymbolTable,
+) -> FortranType {
     use crate::ast::expr::Expr;
     match &expr.node {
         // Literals
-        Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } |
-        Expr::StringLiteral { .. } | Expr::LogicalLiteral { .. } |
-        Expr::ComplexLiteral { .. } | Expr::BozLiteral { .. } => literal_type(&expr.node),
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. } => literal_type(&expr.node),
 
         // Name — look up in symbol table
         Expr::Name { name } => {
@@ -401,12 +478,13 @@ pub fn expr_type(expr: &crate::ast::expr::SpannedExpr, symtab: &super::symtab::S
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 // Check intrinsics first
-                let arg_types: Vec<FortranType> = args.iter().map(|a| {
-                    match &a.value {
+                let arg_types: Vec<FortranType> = args
+                    .iter()
+                    .map(|a| match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => expr_type(e, symtab),
                         crate::ast::expr::SectionSubscript::Range { .. } => FortranType::Unknown,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 if let Some(result) = intrinsic_result_type(name, &arg_types) {
                     return result;
@@ -432,9 +510,10 @@ pub fn expr_type(expr: &crate::ast::expr::SpannedExpr, symtab: &super::symtab::S
                                 None => FortranType::Unknown,
                             }
                         }
-                        CallKind::Substring => {
-                            FortranType::Character { kind: 1, len: CharLen::Unknown }
-                        }
+                        CallKind::Substring => FortranType::Character {
+                            kind: 1,
+                            len: CharLen::Unknown,
+                        },
                         CallKind::Unknown => FortranType::Unknown,
                     }
                 } else {
@@ -495,7 +574,10 @@ pub fn check_arguments(
         if let Some(kw) = keyword {
             seen_keyword = true;
             // Keyword argument — find matching dummy
-            if let Some(idx) = dummy_args.iter().position(|d| d.name.eq_ignore_ascii_case(kw)) {
+            if let Some(idx) = dummy_args
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(kw))
+            {
                 if matched[idx] {
                     errors.push(format!("duplicate keyword argument '{}'", kw));
                 } else {
@@ -520,7 +602,10 @@ pub fn check_arguments(
                 check_arg_type(&dummy_args[pos], actual_type, &mut errors);
                 pos += 1;
             } else {
-                errors.push(format!("too many arguments (expected at most {})", dummy_args.len()));
+                errors.push(format!(
+                    "too many arguments (expected at most {})",
+                    dummy_args.len()
+                ));
                 break;
             }
         }
@@ -624,10 +709,8 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "sign" | "mod" | "modulo" => args.first().cloned(),
 
         // Real-valued math.
-        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" |
-        "exp" | "log" | "log10" | "sqrt" | "atan2" => {
-            Some(args.first().cloned().unwrap_or(FortranType::default_real()))
-        }
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "sqrt"
+        | "atan2" => Some(args.first().cloned().unwrap_or(FortranType::default_real())),
 
         // Integer-valued.
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),
@@ -661,10 +744,14 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "any" | "all" => Some(FortranType::default_logical()),
 
         // Character-valued.
-        "trim" | "adjustl" | "adjustr" | "repeat" => {
-            Some(FortranType::Character { kind: 1, len: CharLen::Unknown })
-        }
-        "char" | "achar" => Some(FortranType::Character { kind: 1, len: CharLen::Known(1) }),
+        "trim" | "adjustl" | "adjustr" | "repeat" => Some(FortranType::Character {
+            kind: 1,
+            len: CharLen::Unknown,
+        }),
+        "char" | "achar" => Some(FortranType::Character {
+            kind: 1,
+            len: CharLen::Known(1),
+        }),
 
         // Complex-valued.
         "cmplx" => Some(FortranType::default_complex()),
@@ -683,18 +770,25 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Inquiry intrinsics.
         "huge" | "tiny" | "epsilon" => args.first().cloned(),
-        "precision" | "range" | "digits" | "radix" | "exponent" => Some(FortranType::default_integer()),
+        "precision" | "range" | "digits" | "radix" | "exponent" => {
+            Some(FortranType::default_integer())
+        }
         "storage_size" | "c_sizeof" => Some(FortranType::default_integer()),
         "iachar" | "ichar" => Some(FortranType::default_integer()),
 
         // System / misc.
         "command_argument_count" => Some(FortranType::default_integer()),
         "null" => Some(FortranType::Unknown), // null pointer — type from context
-        "new_line" => Some(FortranType::Character { kind: 1, len: CharLen::Known(1) }),
+        "new_line" => Some(FortranType::Character {
+            kind: 1,
+            len: CharLen::Known(1),
+        }),
         "logical" => Some(FortranType::default_logical()),
 
         // iso_c_binding.
-        "c_loc" | "c_funloc" => Some(FortranType::Derived { name: "c_ptr".into() }),
+        "c_loc" | "c_funloc" => Some(FortranType::Derived {
+            name: "c_ptr".into(),
+        }),
         "c_associated" => Some(FortranType::default_logical()),
 
         // Status inquiry.
@@ -715,7 +809,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Integer { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Integer { kind: 4 });
     }
 
@@ -724,7 +819,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Real { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
@@ -733,7 +829,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Real { kind: 4 },
             &FortranType::Complex { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Complex { kind: 4 });
     }
 
@@ -742,7 +839,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Real { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
     }
 
@@ -751,7 +849,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Integer { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Integer { kind: 8 });
     }
 
@@ -760,7 +859,8 @@ mod tests {
         assert!(arithmetic_result_type(
             &FortranType::default_logical(),
             &FortranType::default_integer(),
-        ).is_none());
+        )
+        .is_none());
     }
 
     // ---- Power ----
@@ -770,7 +870,8 @@ mod tests {
         let result = power_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Integer { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Integer { kind: 4 });
     }
 
@@ -779,7 +880,8 @@ mod tests {
         let result = power_result_type(
             &FortranType::Real { kind: 8 },
             &FortranType::Integer { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
     }
 
@@ -789,7 +891,8 @@ mod tests {
         let result = power_result_type(
             &FortranType::Integer { kind: 4 },
             &FortranType::Complex { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Complex { kind: 8 });
     }
 
@@ -805,18 +908,35 @@ mod tests {
     #[test]
     fn concat_known_lengths() {
         let result = concat_result_type(
-            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
-            &FortranType::Character { kind: 1, len: CharLen::Known(3) },
-        ).unwrap();
-        assert_eq!(result, FortranType::Character { kind: 1, len: CharLen::Known(8) });
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5),
+            },
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(3),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(8)
+            }
+        );
     }
 
     #[test]
     fn concat_non_character_returns_none() {
         assert!(concat_result_type(
             &FortranType::default_integer(),
-            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
-        ).is_none());
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5)
+            },
+        )
+        .is_none());
     }
 
     // ---- Conversion ----
@@ -826,7 +946,8 @@ mod tests {
         assert!(needs_conversion(
             &FortranType::Integer { kind: 4 },
             &FortranType::Integer { kind: 4 },
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
@@ -834,7 +955,8 @@ mod tests {
         let conv = needs_conversion(
             &FortranType::Integer { kind: 4 },
             &FortranType::Real { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(conv, FortranType::Real { kind: 4 });
     }
 
@@ -860,9 +982,14 @@ mod tests {
 
     #[test]
     fn len_returns_integer() {
-        let result = intrinsic_result_type("len", &[
-            FortranType::Character { kind: 1, len: CharLen::Known(10) }
-        ]).unwrap();
+        let result = intrinsic_result_type(
+            "len",
+            &[FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(10),
+            }],
+        )
+        .unwrap();
         assert_eq!(result, FortranType::default_integer());
     }
 
@@ -874,15 +1001,22 @@ mod tests {
 
     #[test]
     fn trim_returns_character() {
-        let result = intrinsic_result_type("trim", &[
-            FortranType::Character { kind: 1, len: CharLen::Known(20) }
-        ]).unwrap();
+        let result = intrinsic_result_type(
+            "trim",
+            &[FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(20),
+            }],
+        )
+        .unwrap();
         assert!(result.is_character());
     }
 
     #[test]
     fn unknown_intrinsic_returns_none() {
-        assert!(intrinsic_result_type("nonexistent_func", &[FortranType::default_integer()]).is_none());
+        assert!(
+            intrinsic_result_type("nonexistent_func", &[FortranType::default_integer()]).is_none()
+        );
     }
 
     // ---- Binary op result type ----
@@ -894,7 +1028,8 @@ mod tests {
             &BinaryOp::Add,
             &FortranType::Integer { kind: 4 },
             &FortranType::Real { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
     }
 
@@ -905,7 +1040,8 @@ mod tests {
             &BinaryOp::Pow,
             &FortranType::Real { kind: 4 },
             &FortranType::Integer { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
@@ -914,10 +1050,23 @@ mod tests {
         use crate::ast::expr::BinaryOp;
         let result = binary_op_result_type(
             &BinaryOp::Concat,
-            &FortranType::Character { kind: 1, len: CharLen::Known(3) },
-            &FortranType::Character { kind: 1, len: CharLen::Known(4) },
-        ).unwrap();
-        assert_eq!(result, FortranType::Character { kind: 1, len: CharLen::Known(7) });
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(3),
+            },
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(4),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(7)
+            }
+        );
     }
 
     #[test]
@@ -927,7 +1076,8 @@ mod tests {
             &BinaryOp::Eq,
             &FortranType::Integer { kind: 4 },
             &FortranType::Real { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::default_logical());
     }
 
@@ -936,9 +1086,16 @@ mod tests {
         use crate::ast::expr::BinaryOp;
         let result = binary_op_result_type(
             &BinaryOp::Lt,
-            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
-            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
-        ).unwrap();
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5),
+            },
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5),
+            },
+        )
+        .unwrap();
         assert_eq!(result, FortranType::default_logical());
     }
 
@@ -948,8 +1105,12 @@ mod tests {
         assert!(binary_op_result_type(
             &BinaryOp::Eq,
             &FortranType::Integer { kind: 4 },
-            &FortranType::Character { kind: 1, len: CharLen::Known(3) },
-        ).is_none());
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(3)
+            },
+        )
+        .is_none());
     }
 
     #[test]
@@ -959,7 +1120,8 @@ mod tests {
             &BinaryOp::And,
             &FortranType::Logical { kind: 4 },
             &FortranType::Logical { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Logical { kind: 4 });
     }
 
@@ -970,7 +1132,8 @@ mod tests {
             &BinaryOp::And,
             &FortranType::Integer { kind: 4 },
             &FortranType::Logical { kind: 4 },
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
@@ -980,7 +1143,8 @@ mod tests {
             &BinaryOp::Or,
             &FortranType::Logical { kind: 1 },
             &FortranType::Logical { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Logical { kind: 4 });
     }
 
@@ -991,7 +1155,8 @@ mod tests {
             &BinaryOp::Defined("cross".into()),
             &FortranType::default_real(),
             &FortranType::default_real(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Unknown);
     }
 
@@ -1000,39 +1165,28 @@ mod tests {
     #[test]
     fn unary_minus_real() {
         use crate::ast::expr::UnaryOp;
-        let result = unary_op_result_type(
-            &UnaryOp::Minus,
-            &FortranType::Real { kind: 8 },
-        ).unwrap();
+        let result = unary_op_result_type(&UnaryOp::Minus, &FortranType::Real { kind: 8 }).unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
     }
 
     #[test]
     fn unary_plus_non_numeric_returns_none() {
         use crate::ast::expr::UnaryOp;
-        assert!(unary_op_result_type(
-            &UnaryOp::Plus,
-            &FortranType::default_logical(),
-        ).is_none());
+        assert!(unary_op_result_type(&UnaryOp::Plus, &FortranType::default_logical(),).is_none());
     }
 
     #[test]
     fn unary_not_logical() {
         use crate::ast::expr::UnaryOp;
-        let result = unary_op_result_type(
-            &UnaryOp::Not,
-            &FortranType::Logical { kind: 4 },
-        ).unwrap();
+        let result =
+            unary_op_result_type(&UnaryOp::Not, &FortranType::Logical { kind: 4 }).unwrap();
         assert_eq!(result, FortranType::Logical { kind: 4 });
     }
 
     #[test]
     fn unary_not_non_logical_returns_none() {
         use crate::ast::expr::UnaryOp;
-        assert!(unary_op_result_type(
-            &UnaryOp::Not,
-            &FortranType::Integer { kind: 4 },
-        ).is_none());
+        assert!(unary_op_result_type(&UnaryOp::Not, &FortranType::Integer { kind: 4 },).is_none());
     }
 
     // ---- Disambiguation ----
@@ -1040,43 +1194,64 @@ mod tests {
     #[test]
     fn disambiguate_variable_element() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::Variable, false), CallKind::ArrayElement);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::Variable, false),
+            CallKind::ArrayElement
+        );
     }
 
     #[test]
     fn disambiguate_variable_range_is_substring() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::Variable, true), CallKind::Substring);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::Variable, true),
+            CallKind::Substring
+        );
     }
 
     #[test]
     fn disambiguate_function() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::Function, false), CallKind::FunctionCall);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::Function, false),
+            CallKind::FunctionCall
+        );
     }
 
     #[test]
     fn disambiguate_external_proc() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::ExternalProc, false), CallKind::FunctionCall);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::ExternalProc, false),
+            CallKind::FunctionCall
+        );
     }
 
     #[test]
     fn disambiguate_intrinsic_proc() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::IntrinsicProc, true), CallKind::FunctionCall);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::IntrinsicProc, true),
+            CallKind::FunctionCall
+        );
     }
 
     #[test]
     fn disambiguate_named_interface() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::NamedInterface, false), CallKind::FunctionCall);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::NamedInterface, false),
+            CallKind::FunctionCall
+        );
     }
 
     #[test]
     fn disambiguate_unknown_kind() {
         use super::super::symtab::SymbolKind;
-        assert_eq!(disambiguate_call(&SymbolKind::Module, false), CallKind::Unknown);
+        assert_eq!(
+            disambiguate_call(&SymbolKind::Module, false),
+            CallKind::Unknown
+        );
     }
 
     // ---- TypeInfo → FortranType conversion ----
@@ -1112,8 +1287,14 @@ mod tests {
     fn type_info_character_with_len() {
         use super::super::symtab::TypeInfo;
         assert_eq!(
-            type_info_to_fortran_type(&TypeInfo::Character { len: Some(10), kind: None }),
-            FortranType::Character { kind: 1, len: CharLen::Known(10) }
+            type_info_to_fortran_type(&TypeInfo::Character {
+                len: Some(10),
+                kind: None
+            }),
+            FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(10)
+            }
         );
     }
 
@@ -1122,7 +1303,9 @@ mod tests {
         use super::super::symtab::TypeInfo;
         assert_eq!(
             type_info_to_fortran_type(&TypeInfo::Derived("point".into())),
-            FortranType::Derived { name: "point".into() }
+            FortranType::Derived {
+                name: "point".into()
+            }
         );
     }
 
@@ -1141,7 +1324,10 @@ mod tests {
     fn literal_type_integer() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::IntegerLiteral { text: "42".into(), kind: None }),
+            literal_type(&Expr::IntegerLiteral {
+                text: "42".into(),
+                kind: None
+            }),
             FortranType::Integer { kind: 4 }
         );
     }
@@ -1150,7 +1336,10 @@ mod tests {
     fn literal_type_integer_kind8() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::IntegerLiteral { text: "42".into(), kind: Some("8".into()) }),
+            literal_type(&Expr::IntegerLiteral {
+                text: "42".into(),
+                kind: Some("8".into())
+            }),
             FortranType::Integer { kind: 8 }
         );
     }
@@ -1159,7 +1348,10 @@ mod tests {
     fn literal_type_real_default() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::RealLiteral { text: "3.14".into(), kind: None }),
+            literal_type(&Expr::RealLiteral {
+                text: "3.14".into(),
+                kind: None
+            }),
             FortranType::Real { kind: 4 }
         );
     }
@@ -1168,7 +1360,10 @@ mod tests {
     fn literal_type_real_d_exponent() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::RealLiteral { text: "1.0d0".into(), kind: None }),
+            literal_type(&Expr::RealLiteral {
+                text: "1.0d0".into(),
+                kind: None
+            }),
             FortranType::Real { kind: 8 }
         );
     }
@@ -1177,8 +1372,14 @@ mod tests {
     fn literal_type_string() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::StringLiteral { value: "hello".into(), kind: None }),
-            FortranType::Character { kind: 1, len: CharLen::Known(5) }
+            literal_type(&Expr::StringLiteral {
+                value: "hello".into(),
+                kind: None
+            }),
+            FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5)
+            }
         );
     }
 
@@ -1186,7 +1387,10 @@ mod tests {
     fn literal_type_logical() {
         use crate::ast::expr::Expr;
         assert_eq!(
-            literal_type(&Expr::LogicalLiteral { value: true, kind: None }),
+            literal_type(&Expr::LogicalLiteral {
+                value: true,
+                kind: None
+            }),
             FortranType::Logical { kind: 4 }
         );
     }
@@ -1197,20 +1401,34 @@ mod tests {
     fn expr_type_integer_literal() {
         use crate::ast::expr::Expr;
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
-        let expr = Spanned::new(Expr::IntegerLiteral { text: "42".into(), kind: None }, span);
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let expr = Spanned::new(
+            Expr::IntegerLiteral {
+                text: "42".into(),
+                kind: None,
+            },
+            span,
+        );
         let st = super::super::symtab::SymbolTable::new();
         assert_eq!(expr_type(&expr, &st), FortranType::Integer { kind: 4 });
     }
 
     #[test]
     fn expr_type_name_lookup() {
+        use super::super::symtab::*;
         use crate::ast::expr::Expr;
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        use super::super::symtab::*;
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Program("main".into()));
@@ -1223,7 +1441,8 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         let expr = Spanned::new(Expr::Name { name: "x".into() }, span);
         assert_eq!(expr_type(&expr, &st), FortranType::Real { kind: 8 });
@@ -1231,11 +1450,15 @@ mod tests {
 
     #[test]
     fn expr_type_name_implicit() {
+        use super::super::symtab::*;
         use crate::ast::expr::Expr;
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        use super::super::symtab::*;
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Program("main".into()));
@@ -1246,15 +1469,38 @@ mod tests {
 
     #[test]
     fn expr_type_binary_add() {
-        use crate::ast::expr::{Expr, BinaryOp};
+        use crate::ast::expr::{BinaryOp, Expr};
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
         let st = super::super::symtab::SymbolTable::new();
 
-        let left = Box::new(Spanned::new(Expr::IntegerLiteral { text: "1".into(), kind: None }, span));
-        let right = Box::new(Spanned::new(Expr::RealLiteral { text: "2.0".into(), kind: None }, span));
-        let expr = Spanned::new(Expr::BinaryOp { op: BinaryOp::Add, left, right }, span);
+        let left = Box::new(Spanned::new(
+            Expr::IntegerLiteral {
+                text: "1".into(),
+                kind: None,
+            },
+            span,
+        ));
+        let right = Box::new(Spanned::new(
+            Expr::RealLiteral {
+                text: "2.0".into(),
+                kind: None,
+            },
+            span,
+        ));
+        let expr = Spanned::new(
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                left,
+                right,
+            },
+            span,
+        );
         assert_eq!(expr_type(&expr, &st), FortranType::Real { kind: 4 });
     }
 
@@ -1262,31 +1508,61 @@ mod tests {
     fn expr_type_unary_minus() {
         use crate::ast::expr::{Expr, UnaryOp};
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
         let st = super::super::symtab::SymbolTable::new();
 
-        let operand = Box::new(Spanned::new(Expr::RealLiteral { text: "3.14".into(), kind: None }, span));
-        let expr = Spanned::new(Expr::UnaryOp { op: UnaryOp::Minus, operand }, span);
+        let operand = Box::new(Spanned::new(
+            Expr::RealLiteral {
+                text: "3.14".into(),
+                kind: None,
+            },
+            span,
+        ));
+        let expr = Spanned::new(
+            Expr::UnaryOp {
+                op: UnaryOp::Minus,
+                operand,
+            },
+            span,
+        );
         assert_eq!(expr_type(&expr, &st), FortranType::Real { kind: 4 });
     }
 
     #[test]
     fn expr_type_intrinsic_call() {
-        use crate::ast::expr::{Expr, Argument, SectionSubscript};
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
         let st = super::super::symtab::SymbolTable::new();
 
         let callee = Box::new(Spanned::new(Expr::Name { name: "abs".into() }, span));
         let arg = Argument {
             keyword: None,
             value: SectionSubscript::Element(Spanned::new(
-                Expr::IntegerLiteral { text: "-5".into(), kind: None }, span
+                Expr::IntegerLiteral {
+                    text: "-5".into(),
+                    kind: None,
+                },
+                span,
             )),
         };
-        let expr = Spanned::new(Expr::FunctionCall { callee, args: vec![arg] }, span);
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![arg],
+            },
+            span,
+        );
         assert_eq!(expr_type(&expr, &st), FortranType::Integer { kind: 4 });
     }
 
@@ -1294,22 +1570,36 @@ mod tests {
     fn expr_type_paren() {
         use crate::ast::expr::Expr;
         use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
         let st = super::super::symtab::SymbolTable::new();
 
-        let inner = Box::new(Spanned::new(Expr::RealLiteral { text: "1.0".into(), kind: None }, span));
+        let inner = Box::new(Spanned::new(
+            Expr::RealLiteral {
+                text: "1.0".into(),
+                kind: None,
+            },
+            span,
+        ));
         let expr = Spanned::new(Expr::ParenExpr { inner }, span);
         assert_eq!(expr_type(&expr, &st), FortranType::Real { kind: 4 });
     }
 
     #[test]
     fn expr_type_array_element() {
-        use crate::ast::expr::{Expr, Argument, SectionSubscript};
-        use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
         use super::super::symtab::*;
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Program("main".into()));
@@ -1322,51 +1612,88 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         let callee = Box::new(Spanned::new(Expr::Name { name: "arr".into() }, span));
         let arg = Argument {
             keyword: None,
             value: SectionSubscript::Element(Spanned::new(
-                Expr::IntegerLiteral { text: "3".into(), kind: None }, span
+                Expr::IntegerLiteral {
+                    text: "3".into(),
+                    kind: None,
+                },
+                span,
             )),
         };
-        let expr = Spanned::new(Expr::FunctionCall { callee, args: vec![arg] }, span);
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![arg],
+            },
+            span,
+        );
         // arr(3) where arr is a variable → array element → real(8)
         assert_eq!(expr_type(&expr, &st), FortranType::Real { kind: 8 });
     }
 
     #[test]
     fn expr_type_substring() {
-        use crate::ast::expr::{Expr, Argument, SectionSubscript};
-        use crate::ast::Spanned;
-        use crate::lexer::{Span, Position};
         use super::super::symtab::*;
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Program("main".into()));
         st.define(Symbol {
             name: "s".into(),
             kind: SymbolKind::Variable,
-            type_info: Some(TypeInfo::Character { len: Some(20), kind: None }),
+            type_info: Some(TypeInfo::Character {
+                len: Some(20),
+                kind: None,
+            }),
             attrs: SymbolAttrs::default(),
             defined_at: span,
             scope: 0,
             arg_names: vec![],
             const_value: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         let callee = Box::new(Spanned::new(Expr::Name { name: "s".into() }, span));
         let arg = Argument {
             keyword: None,
             value: SectionSubscript::Range {
-                start: Some(Spanned::new(Expr::IntegerLiteral { text: "1".into(), kind: None }, span)),
-                end: Some(Spanned::new(Expr::IntegerLiteral { text: "5".into(), kind: None }, span)),
+                start: Some(Spanned::new(
+                    Expr::IntegerLiteral {
+                        text: "1".into(),
+                        kind: None,
+                    },
+                    span,
+                )),
+                end: Some(Spanned::new(
+                    Expr::IntegerLiteral {
+                        text: "5".into(),
+                        kind: None,
+                    },
+                    span,
+                )),
                 stride: None,
             },
         };
-        let expr = Spanned::new(Expr::FunctionCall { callee, args: vec![arg] }, span);
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![arg],
+            },
+            span,
+        );
         // s(1:5) where s is character variable → substring
         assert!(expr_type(&expr, &st).is_character());
     }
@@ -1377,8 +1704,18 @@ mod tests {
     fn check_args_positional_ok() {
         use super::super::symtab::Intent;
         let dummies = vec![
-            DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: Some(Intent::In), optional: false },
-            DummyArgDesc { name: "n".into(), type_: FortranType::Integer { kind: 4 }, intent: Some(Intent::In), optional: false },
+            DummyArgDesc {
+                name: "a".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: Some(Intent::In),
+                optional: false,
+            },
+            DummyArgDesc {
+                name: "n".into(),
+                type_: FortranType::Integer { kind: 4 },
+                intent: Some(Intent::In),
+                optional: false,
+            },
         ];
         let actuals = vec![
             (None, FortranType::Real { kind: 4 }),
@@ -1391,8 +1728,18 @@ mod tests {
     fn check_args_keyword_ok() {
         use super::super::symtab::Intent;
         let dummies = vec![
-            DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: Some(Intent::In), optional: false },
-            DummyArgDesc { name: "n".into(), type_: FortranType::Integer { kind: 4 }, intent: Some(Intent::In), optional: false },
+            DummyArgDesc {
+                name: "a".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: Some(Intent::In),
+                optional: false,
+            },
+            DummyArgDesc {
+                name: "n".into(),
+                type_: FortranType::Integer { kind: 4 },
+                intent: Some(Intent::In),
+                optional: false,
+            },
         ];
         let actuals = vec![
             (Some("n".into()), FortranType::Integer { kind: 4 }),
@@ -1404,24 +1751,40 @@ mod tests {
     #[test]
     fn check_args_optional_omitted_ok() {
         let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-            DummyArgDesc { name: "verbose".into(), type_: FortranType::default_logical(), intent: None, optional: true },
+            DummyArgDesc {
+                name: "x".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: None,
+                optional: false,
+            },
+            DummyArgDesc {
+                name: "verbose".into(),
+                type_: FortranType::default_logical(),
+                intent: None,
+                optional: true,
+            },
         ];
-        let actuals = vec![
-            (None, FortranType::Real { kind: 4 }),
-        ];
+        let actuals = vec![(None, FortranType::Real { kind: 4 })];
         assert!(check_arguments(&dummies, &actuals).is_empty());
     }
 
     #[test]
     fn check_args_missing_required() {
         let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-            DummyArgDesc { name: "y".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+            DummyArgDesc {
+                name: "x".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: None,
+                optional: false,
+            },
+            DummyArgDesc {
+                name: "y".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: None,
+                optional: false,
+            },
         ];
-        let actuals = vec![
-            (None, FortranType::Real { kind: 4 }),
-        ];
+        let actuals = vec![(None, FortranType::Real { kind: 4 })];
         let errs = check_arguments(&dummies, &actuals);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("missing required argument 'y'"));
@@ -1429,9 +1792,12 @@ mod tests {
 
     #[test]
     fn check_args_too_many() {
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 4 },
+            intent: None,
+            optional: false,
+        }];
         let actuals = vec![
             (None, FortranType::Real { kind: 4 }),
             (None, FortranType::Real { kind: 4 }),
@@ -1443,12 +1809,13 @@ mod tests {
 
     #[test]
     fn check_args_type_mismatch() {
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::default_logical(), intent: None, optional: false },
-        ];
-        let actuals = vec![
-            (None, FortranType::Integer { kind: 4 }),
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::default_logical(),
+            intent: None,
+            optional: false,
+        }];
+        let actuals = vec![(None, FortranType::Integer { kind: 4 })];
         let errs = check_arguments(&dummies, &actuals);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("type mismatch"));
@@ -1456,21 +1823,25 @@ mod tests {
 
     #[test]
     fn check_args_numeric_conversion_allowed() {
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 8 }, intent: None, optional: false },
-        ];
-        let actuals = vec![
-            (None, FortranType::Integer { kind: 4 }),
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 8 },
+            intent: None,
+            optional: false,
+        }];
+        let actuals = vec![(None, FortranType::Integer { kind: 4 })];
         // integer → real conversion allowed
         assert!(check_arguments(&dummies, &actuals).is_empty());
     }
 
     #[test]
     fn check_args_duplicate_keyword() {
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 4 },
+            intent: None,
+            optional: false,
+        }];
         let actuals = vec![
             (Some("x".into()), FortranType::Real { kind: 4 }),
             (Some("x".into()), FortranType::Real { kind: 4 }),
@@ -1481,12 +1852,13 @@ mod tests {
 
     #[test]
     fn check_args_unknown_keyword() {
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-        ];
-        let actuals = vec![
-            (Some("bogus".into()), FortranType::Real { kind: 4 }),
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 4 },
+            intent: None,
+            optional: false,
+        }];
+        let actuals = vec![(Some("bogus".into()), FortranType::Real { kind: 4 })];
         let errs = check_arguments(&dummies, &actuals);
         assert!(errs.iter().any(|e| e.contains("unknown keyword")));
     }
@@ -1499,43 +1871,77 @@ mod tests {
             SpecificProc {
                 name: "swap_int".into(),
                 dummy_args: vec![
-                    DummyArgDesc { name: "a".into(), type_: FortranType::Integer { kind: 4 }, intent: None, optional: false },
-                    DummyArgDesc { name: "b".into(), type_: FortranType::Integer { kind: 4 }, intent: None, optional: false },
+                    DummyArgDesc {
+                        name: "a".into(),
+                        type_: FortranType::Integer { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
+                    DummyArgDesc {
+                        name: "b".into(),
+                        type_: FortranType::Integer { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
                 ],
                 result_type: FortranType::Void,
             },
             SpecificProc {
                 name: "swap_real".into(),
                 dummy_args: vec![
-                    DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-                    DummyArgDesc { name: "b".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+                    DummyArgDesc {
+                        name: "a".into(),
+                        type_: FortranType::Real { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
+                    DummyArgDesc {
+                        name: "b".into(),
+                        type_: FortranType::Real { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
                 ],
                 result_type: FortranType::Void,
             },
         ];
 
         // integer args → swap_int (index 0)
-        assert_eq!(resolve_generic(&specifics, &[
-            FortranType::Integer { kind: 4 }, FortranType::Integer { kind: 4 }
-        ]).unwrap(), 0);
+        assert_eq!(
+            resolve_generic(
+                &specifics,
+                &[
+                    FortranType::Integer { kind: 4 },
+                    FortranType::Integer { kind: 4 }
+                ]
+            )
+            .unwrap(),
+            0
+        );
 
         // real args → swap_real (index 1)
-        assert_eq!(resolve_generic(&specifics, &[
-            FortranType::Real { kind: 4 }, FortranType::Real { kind: 4 }
-        ]).unwrap(), 1);
+        assert_eq!(
+            resolve_generic(
+                &specifics,
+                &[FortranType::Real { kind: 4 }, FortranType::Real { kind: 4 }]
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn resolve_generic_no_match() {
-        let specifics = vec![
-            SpecificProc {
-                name: "foo_int".into(),
-                dummy_args: vec![
-                    DummyArgDesc { name: "x".into(), type_: FortranType::Integer { kind: 4 }, intent: None, optional: false },
-                ],
-                result_type: FortranType::Void,
-            },
-        ];
+        let specifics = vec![SpecificProc {
+            name: "foo_int".into(),
+            dummy_args: vec![DummyArgDesc {
+                name: "x".into(),
+                type_: FortranType::Integer { kind: 4 },
+                intent: None,
+                optional: false,
+            }],
+            result_type: FortranType::Void,
+        }];
         assert!(resolve_generic(&specifics, &[FortranType::Real { kind: 4 }]).is_err());
     }
 
@@ -1545,42 +1951,76 @@ mod tests {
             SpecificProc {
                 name: "swap_int".into(),
                 dummy_args: vec![
-                    DummyArgDesc { name: "a".into(), type_: FortranType::Integer { kind: 4 }, intent: None, optional: false },
-                    DummyArgDesc { name: "b".into(), type_: FortranType::Integer { kind: 4 }, intent: None, optional: false },
+                    DummyArgDesc {
+                        name: "a".into(),
+                        type_: FortranType::Integer { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
+                    DummyArgDesc {
+                        name: "b".into(),
+                        type_: FortranType::Integer { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
                 ],
                 result_type: FortranType::Void,
             },
             SpecificProc {
                 name: "swap_real".into(),
                 dummy_args: vec![
-                    DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-                    DummyArgDesc { name: "b".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+                    DummyArgDesc {
+                        name: "a".into(),
+                        type_: FortranType::Real { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
+                    DummyArgDesc {
+                        name: "b".into(),
+                        type_: FortranType::Real { kind: 4 },
+                        intent: None,
+                        optional: false,
+                    },
                 ],
                 result_type: FortranType::Void,
             },
         ];
         // mixed integer + real → no match (exact type required for disambiguation)
-        assert!(resolve_generic(&specifics, &[
-            FortranType::Integer { kind: 4 }, FortranType::Real { kind: 4 }
-        ]).is_err());
+        assert!(resolve_generic(
+            &specifics,
+            &[
+                FortranType::Integer { kind: 4 },
+                FortranType::Real { kind: 4 }
+            ]
+        )
+        .is_err());
     }
 
     #[test]
     fn resolve_generic_with_optional() {
-        let specifics = vec![
-            SpecificProc {
-                name: "process".into(),
-                dummy_args: vec![
-                    DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-                    DummyArgDesc { name: "mask".into(), type_: FortranType::default_logical(), intent: None, optional: true },
-                ],
-                result_type: FortranType::Void,
-            },
-        ];
+        let specifics = vec![SpecificProc {
+            name: "process".into(),
+            dummy_args: vec![
+                DummyArgDesc {
+                    name: "x".into(),
+                    type_: FortranType::Real { kind: 4 },
+                    intent: None,
+                    optional: false,
+                },
+                DummyArgDesc {
+                    name: "mask".into(),
+                    type_: FortranType::default_logical(),
+                    intent: None,
+                    optional: true,
+                },
+            ],
+            result_type: FortranType::Void,
+        }];
         // Only required arg supplied — should match
-        assert_eq!(resolve_generic(&specifics, &[
-            FortranType::Real { kind: 4 }
-        ]).unwrap(), 0);
+        assert_eq!(
+            resolve_generic(&specifics, &[FortranType::Real { kind: 4 }]).unwrap(),
+            0
+        );
     }
 
     // ---- Logical result type ----
@@ -1601,7 +2041,8 @@ mod tests {
         let result = binary_logical_result_type(
             &FortranType::Logical { kind: 1 },
             &FortranType::Logical { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Logical { kind: 8 });
     }
 
@@ -1613,7 +2054,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Real { kind: 8 },
             &FortranType::Complex { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Complex { kind: 8 });
     }
 
@@ -1623,7 +2065,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 8 },
             &FortranType::Real { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
@@ -1633,7 +2076,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Integer { kind: 8 },
             &FortranType::Complex { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Complex { kind: 4 });
     }
 
@@ -1643,7 +2087,8 @@ mod tests {
         let result = arithmetic_result_type(
             &FortranType::Real { kind: 4 },
             &FortranType::Integer { kind: 8 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Real { kind: 4 });
     }
 
@@ -1652,15 +2097,27 @@ mod tests {
     #[test]
     fn positional_after_keyword_rejected() {
         let dummies = vec![
-            DummyArgDesc { name: "a".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
-            DummyArgDesc { name: "b".into(), type_: FortranType::Real { kind: 4 }, intent: None, optional: false },
+            DummyArgDesc {
+                name: "a".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: None,
+                optional: false,
+            },
+            DummyArgDesc {
+                name: "b".into(),
+                type_: FortranType::Real { kind: 4 },
+                intent: None,
+                optional: false,
+            },
         ];
         let actuals = vec![
             (Some("a".into()), FortranType::Real { kind: 4 }),
             (None, FortranType::Real { kind: 4 }), // positional after keyword
         ];
         let errs = check_arguments(&dummies, &actuals);
-        assert!(errs.iter().any(|e| e.contains("positional argument after keyword")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("positional argument after keyword")));
     }
 
     // ---- Audit fix: M5 — intent(out/inout) rejects numeric conversion ----
@@ -1668,12 +2125,13 @@ mod tests {
     #[test]
     fn intent_inout_rejects_numeric_conversion() {
         use super::super::symtab::Intent;
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 8 }, intent: Some(Intent::InOut), optional: false },
-        ];
-        let actuals = vec![
-            (None, FortranType::Integer { kind: 4 }),
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 8 },
+            intent: Some(Intent::InOut),
+            optional: false,
+        }];
+        let actuals = vec![(None, FortranType::Integer { kind: 4 })];
         let errs = check_arguments(&dummies, &actuals);
         assert!(!errs.is_empty());
         assert!(errs[0].contains("intent(out/inout)"));
@@ -1682,12 +2140,13 @@ mod tests {
     #[test]
     fn intent_in_allows_numeric_conversion() {
         use super::super::symtab::Intent;
-        let dummies = vec![
-            DummyArgDesc { name: "x".into(), type_: FortranType::Real { kind: 8 }, intent: Some(Intent::In), optional: false },
-        ];
-        let actuals = vec![
-            (None, FortranType::Integer { kind: 4 }),
-        ];
+        let dummies = vec![DummyArgDesc {
+            name: "x".into(),
+            type_: FortranType::Real { kind: 8 },
+            intent: Some(Intent::In),
+            optional: false,
+        }];
+        let actuals = vec![(None, FortranType::Integer { kind: 4 })];
         assert!(check_arguments(&dummies, &actuals).is_empty());
     }
 
@@ -1728,7 +2187,8 @@ mod tests {
         assert!(needs_conversion(
             &FortranType::Complex { kind: 4 },
             &FortranType::Integer { kind: 4 },
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
@@ -1736,7 +2196,8 @@ mod tests {
         assert!(needs_conversion(
             &FortranType::Complex { kind: 4 },
             &FortranType::Real { kind: 4 },
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
@@ -1744,7 +2205,8 @@ mod tests {
         let conv = needs_conversion(
             &FortranType::Integer { kind: 4 },
             &FortranType::Complex { kind: 4 },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(conv, FortranType::Complex { kind: 4 });
     }
 
@@ -1753,9 +2215,16 @@ mod tests {
     #[test]
     fn concat_mismatched_kind_returns_none() {
         assert!(concat_result_type(
-            &FortranType::Character { kind: 1, len: CharLen::Known(5) },
-            &FortranType::Character { kind: 4, len: CharLen::Known(5) },
-        ).is_none());
+            &FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(5)
+            },
+            &FortranType::Character {
+                kind: 4,
+                len: CharLen::Known(5)
+            },
+        )
+        .is_none());
     }
 
     // ---- New intrinsics ----
@@ -1768,9 +2237,13 @@ mod tests {
 
     #[test]
     fn intrinsic_c_associated() {
-        let result = intrinsic_result_type("c_associated", &[
-            FortranType::Derived { name: "c_ptr".into() }
-        ]).unwrap();
+        let result = intrinsic_result_type(
+            "c_associated",
+            &[FortranType::Derived {
+                name: "c_ptr".into(),
+            }],
+        )
+        .unwrap();
         assert_eq!(result, FortranType::default_logical());
     }
 
@@ -1782,11 +2255,15 @@ mod tests {
 
     #[test]
     fn intrinsic_merge() {
-        let result = intrinsic_result_type("merge", &[
-            FortranType::Integer { kind: 4 },
-            FortranType::Integer { kind: 4 },
-            FortranType::default_logical(),
-        ]).unwrap();
+        let result = intrinsic_result_type(
+            "merge",
+            &[
+                FortranType::Integer { kind: 4 },
+                FortranType::Integer { kind: 4 },
+                FortranType::default_logical(),
+            ],
+        )
+        .unwrap();
         assert_eq!(result, FortranType::Integer { kind: 4 });
     }
 }

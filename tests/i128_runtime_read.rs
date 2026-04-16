@@ -74,15 +74,21 @@ fn integer16_read_runs_across_all_opt_levels() {
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful integer(16) read run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful integer(16) read run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(
-            run.stdout.contains("170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("170141183460469231731687303715884105727"),
             "wide positive integer(16) read should survive at {:?}:\n{}",
             level,
             run.stdout
         );
         assert!(
-            run.stdout.contains("-170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("-170141183460469231731687303715884105727"),
             "wide negative integer(16) read should survive at {:?}:\n{}",
             level,
             run.stdout

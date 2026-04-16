@@ -46,7 +46,7 @@
 use super::pass::Pass;
 use super::util::{for_each_operand_mut, for_each_terminator_operand_mut};
 use crate::ir::inst::*;
-use crate::ir::types::{IrType, IntWidth};
+use crate::ir::types::{IntWidth, IrType};
 use std::collections::HashMap;
 
 /// Apply `rewrites` to every operand slot in the function in a
@@ -101,8 +101,9 @@ fn collect_int_consts(func: &Function) -> HashMap<ValueId, (i64, IntWidth)> {
 /// Sign-extend a stored i64 to its declared bit width. Used so that
 /// "is this -1?" checks survive narrow types.
 fn sext(v: i64, bits: u32) -> i64 {
-    if bits >= 64 { v }
-    else {
+    if bits >= 64 {
+        v
+    } else {
         let shift = 64 - bits;
         (v << shift) >> shift
     }
@@ -112,7 +113,9 @@ fn sext(v: i64, bits: u32) -> i64 {
 /// when `v == 1 << k` and `k > 0`. (`v == 1` is handled separately as
 /// "multiply by 1 → identity".)
 fn pow2_exponent(v: i64) -> Option<u32> {
-    if v <= 0 { return None; }
+    if v <= 0 {
+        return None;
+    }
     let u = v as u64;
     if u.is_power_of_two() && u != 1 {
         Some(u.trailing_zeros())
@@ -138,11 +141,12 @@ enum Rewrite {
 
 /// Try to derive a strength-reduction rewrite for one instruction.
 /// Returns `None` if no rewrite applies.
-fn rewrite_for(
-    inst: &Inst,
-    consts: &HashMap<ValueId, (i64, IntWidth)>,
-) -> Option<Rewrite> {
-    let int_w = if let IrType::Int(w) = inst.ty { w } else { return None; };
+fn rewrite_for(inst: &Inst, consts: &HashMap<ValueId, (i64, IntWidth)>) -> Option<Rewrite> {
+    let int_w = if let IrType::Int(w) = inst.ty {
+        w
+    } else {
+        return None;
+    };
     // Audit m4-1: after the M4-4 normalization in `collect_int_consts`,
     // every `kv` returned from `const_int` is already sign-extended
     // at its source width. The earlier code re-sext'd at `int_w` (the
@@ -168,7 +172,9 @@ fn rewrite_for(
                     return Some(Rewrite::KindOnly(InstKind::ConstInt(0, int_w)));
                 }
                 if kv == 1 {
-                    return Some(Rewrite::Identity { pass_through: var_id });
+                    return Some(Rewrite::Identity {
+                        pass_through: var_id,
+                    });
                 }
                 if kv == -1 {
                     return Some(Rewrite::KindOnly(InstKind::INeg(var_id)));
@@ -278,7 +284,9 @@ fn rewrite_for(
 pub struct StrengthReduce;
 
 impl Pass for StrengthReduce {
-    fn name(&self) -> &'static str { "strength-reduce" }
+    fn name(&self) -> &'static str {
+        "strength-reduce"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -298,7 +306,9 @@ impl Pass for StrengthReduce {
                     }
                 }
             }
-            if rewrites.is_empty() { continue; }
+            if rewrites.is_empty() {
+                continue;
+            }
 
             // Second pass: apply rewrites. We process them in reverse
             // block-then-instruction order so that inserting a new
@@ -317,15 +327,22 @@ impl Pass for StrengthReduce {
             for (bi, ii, rw, old_id, ty) in rewrites {
                 match rw {
                     Rewrite::ShlByConst { var, k } => {
-                        let int_w = if let IrType::Int(w) = ty { w } else { unreachable!() };
+                        let int_w = if let IrType::Int(w) = ty {
+                            w
+                        } else {
+                            unreachable!()
+                        };
                         let kid = func.next_value_id();
                         let span = func.blocks[bi].insts[ii].span;
-                        func.blocks[bi].insts.insert(ii, Inst {
-                            id: kid,
-                            kind: InstKind::ConstInt(k as i128, int_w),
-                            ty: IrType::Int(int_w),
-                            span,
-                        });
+                        func.blocks[bi].insts.insert(
+                            ii,
+                            Inst {
+                                id: kid,
+                                kind: InstKind::ConstInt(k as i128, int_w),
+                                ty: IrType::Int(int_w),
+                                span,
+                            },
+                        );
                         // The original instruction shifted to ii+1.
                         func.blocks[bi].insts[ii + 1].kind = InstKind::Shl(var, kid);
                     }
@@ -376,7 +393,9 @@ impl Pass for StrengthReduce {
                         std::collections::HashSet::new();
                     visited.insert(k);
                     while let Some(&next) = identity_rewrites.get(&cur) {
-                        if !visited.insert(next) { break; }
+                        if !visited.insert(next) {
+                            break;
+                        }
                         cur = next;
                     }
                     identity_rewrites.insert(k, cur);
@@ -392,17 +411,26 @@ impl Pass for StrengthReduce {
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
-    use crate::lexer::{Span, Position};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
@@ -415,8 +443,16 @@ mod tests {
     #[test]
     fn imul_by_pow2_becomes_shl() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let k = push(&mut f, InstKind::ConstInt(8, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let k = push(
+            &mut f,
+            InstKind::ConstInt(8, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IMul(x, k), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -425,21 +461,37 @@ mod tests {
         assert!(StrengthReduce.run(&mut m));
         // The Shl should reference x and a freshly inserted const(3).
         let block = &m.functions[0].blocks[0];
-        let shl = block.insts.iter().find_map(|i| match &i.kind {
-            InstKind::Shl(var, kid) => Some((*var, *kid)),
-            _ => None,
-        }).expect("expected Shl");
+        let shl = block
+            .insts
+            .iter()
+            .find_map(|i| match &i.kind {
+                InstKind::Shl(var, kid) => Some((*var, *kid)),
+                _ => None,
+            })
+            .expect("expected Shl");
         assert_eq!(shl.0, x);
         // The shift count should be a const(3).
-        let kconst = block.insts.iter().find(|i| i.id == shl.1).expect("shift const");
+        let kconst = block
+            .insts
+            .iter()
+            .find(|i| i.id == shl.1)
+            .expect("shift const");
         assert!(matches!(kconst.kind, InstKind::ConstInt(3, IntWidth::I32)));
     }
 
     #[test]
     fn imul_by_zero_becomes_const_zero() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let z = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let z = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IMul(x, z), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -447,15 +499,27 @@ mod tests {
 
         assert!(StrengthReduce.run(&mut m));
         // y now defines const(0)
-        let y_inst = m.functions[0].blocks[0].insts.iter().find(|i| i.id == y).unwrap();
+        let y_inst = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.id == y)
+            .unwrap();
         assert!(matches!(y_inst.kind, InstKind::ConstInt(0, IntWidth::I32)));
     }
 
     #[test]
     fn imul_by_one_becomes_identity() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IMul(x, one), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -472,15 +536,27 @@ mod tests {
     #[test]
     fn imul_by_neg_one_becomes_neg() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let neg = push(&mut f, InstKind::ConstInt(-1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let neg = push(
+            &mut f,
+            InstKind::ConstInt(-1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IMul(x, neg), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
         m.add_function(f);
 
         assert!(StrengthReduce.run(&mut m));
-        let y_inst = m.functions[0].blocks[0].insts.iter().find(|i| i.id == y).unwrap();
+        let y_inst = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.id == y)
+            .unwrap();
         match y_inst.kind {
             InstKind::INeg(v) => assert_eq!(v, x),
             ref other => panic!("expected INeg, got {:?}", other),
@@ -490,8 +566,16 @@ mod tests {
     #[test]
     fn iadd_zero_becomes_identity() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let z = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let z = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IAdd(x, z), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -507,15 +591,27 @@ mod tests {
     #[test]
     fn isub_from_zero_becomes_neg() {
         let (mut m, mut f) = make_fn();
-        let z = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let z = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::ISub(z, x), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
         m.add_function(f);
 
         assert!(StrengthReduce.run(&mut m));
-        let y_inst = m.functions[0].blocks[0].insts.iter().find(|i| i.id == y).unwrap();
+        let y_inst = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.id == y)
+            .unwrap();
         match y_inst.kind {
             InstKind::INeg(v) => assert_eq!(v, x),
             _ => panic!(),
@@ -525,8 +621,16 @@ mod tests {
     #[test]
     fn idiv_by_one_becomes_identity() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::IDiv(x, one), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -542,9 +646,21 @@ mod tests {
     #[test]
     fn band_with_neg_one_becomes_identity() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let mask = push(&mut f, InstKind::ConstInt(-1, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let y = push(&mut f, InstKind::BitAnd(x, mask), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let mask = push(
+            &mut f,
+            InstKind::ConstInt(-1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let y = push(
+            &mut f,
+            InstKind::BitAnd(x, mask),
+            IrType::Int(IntWidth::I32),
+        );
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
         m.add_function(f);
@@ -559,23 +675,43 @@ mod tests {
     #[test]
     fn band_with_zero_becomes_const_zero() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let z = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let z = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::BitAnd(x, z), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
         m.add_function(f);
 
         assert!(StrengthReduce.run(&mut m));
-        let y_inst = m.functions[0].blocks[0].insts.iter().find(|i| i.id == y).unwrap();
+        let y_inst = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.id == y)
+            .unwrap();
         assert!(matches!(y_inst.kind, InstKind::ConstInt(0, IntWidth::I32)));
     }
 
     #[test]
     fn shift_by_zero_becomes_identity() {
         let (mut m, mut f) = make_fn();
-        let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let z = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let x = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let z = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let y = push(&mut f, InstKind::Shl(x, z), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
@@ -607,7 +743,11 @@ mod tests {
             },
         ];
         let mut f = Function::new("f".into(), params, IrType::Int(IntWidth::I32));
-        let y = push(&mut f, InstKind::IMul(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32));
+        let y = push(
+            &mut f,
+            InstKind::IMul(ValueId(0), ValueId(1)),
+            IrType::Int(IntWidth::I32),
+        );
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(y)));
         m.add_function(f);

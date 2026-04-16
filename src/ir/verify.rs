@@ -4,10 +4,10 @@
 //! Checks: SSA dominance, type consistency, block structure,
 //! terminator completeness, block param/branch arg matching.
 
-use std::collections::{HashMap, HashSet};
 use super::inst::*;
-use super::types::{IrType, IntWidth};
-use super::walk::{inst_uses, terminator_uses, terminator_targets, compute_dominators};
+use super::types::{IntWidth, IrType};
+use super::walk::{compute_dominators, inst_uses, terminator_targets, terminator_uses};
+use std::collections::{HashMap, HashSet};
 
 /// Verification error.
 #[derive(Debug, Clone)]
@@ -59,7 +59,9 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         });
     }
     for block in &func.blocks {
-        let Some(term) = &block.terminator else { continue; };
+        let Some(term) = &block.terminator else {
+            continue;
+        };
         if terminator_targets(term).contains(&func.entry) {
             errors.push(VerifyError {
                 msg: format!(
@@ -78,8 +80,10 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
             for used in inst_uses(&inst.kind) {
                 if !defined.contains(&used) {
                     errors.push(VerifyError {
-                        msg: format!("value %{} used in block '{}' but not defined",
-                            used.0, block.name),
+                        msg: format!(
+                            "value %{} used in block '{}' but not defined",
+                            used.0, block.name
+                        ),
                     });
                 }
             }
@@ -88,8 +92,10 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
             for used in terminator_uses(term) {
                 if !defined.contains(&used) {
                     errors.push(VerifyError {
-                        msg: format!("value %{} used in terminator of block '{}' but not defined",
-                            used.0, block.name),
+                        msg: format!(
+                            "value %{} used in terminator of block '{}' but not defined",
+                            used.0, block.name
+                        ),
                     });
                 }
             }
@@ -164,8 +170,10 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
             for target in terminator_targets(term) {
                 if !block_ids.contains(&target) {
                     errors.push(VerifyError {
-                        msg: format!("block '{}' branches to undefined block {}",
-                            block.name, target.0),
+                        msg: format!(
+                            "block '{}' branches to undefined block {}",
+                            block.name, target.0
+                        ),
                     });
                 }
             }
@@ -276,14 +284,22 @@ fn collect_defined_values(func: &Function) -> HashSet<ValueId> {
 }
 
 /// Check that branch arguments match block parameters in count and type.
-fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, errors: &mut Vec<VerifyError>) {
+fn check_branch_args(
+    func: &Function,
+    term: &Terminator,
+    from_block: &str,
+    errors: &mut Vec<VerifyError>,
+) {
     let mut check = |dest: BlockId, args: &[ValueId]| {
         let target = func.block(dest);
         if target.params.len() != args.len() {
             errors.push(VerifyError {
                 msg: format!(
                     "branch from '{}' to '{}': expected {} args, got {}",
-                    from_block, target.name, target.params.len(), args.len()
+                    from_block,
+                    target.name,
+                    target.params.len(),
+                    args.len()
                 ),
             });
         } else {
@@ -305,7 +321,13 @@ fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, error
 
     match term {
         Terminator::Branch(dest, args) => check(*dest, args),
-        Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
+        Terminator::CondBranch {
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+            ..
+        } => {
             check(*true_dest, true_args);
             check(*false_dest, false_args);
         }
@@ -314,7 +336,10 @@ fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, error
             let default_block = func.block(*default);
             if !default_block.params.is_empty() {
                 errors.push(VerifyError {
-                    msg: format!("switch default target '{}' has block parameters", default_block.name),
+                    msg: format!(
+                        "switch default target '{}' has block parameters",
+                        default_block.name
+                    ),
                 });
             }
             for (_, dest) in cases {
@@ -333,9 +358,11 @@ fn check_branch_args(func: &Function, term: &Terminator, from_block: &str, error
 /// Check type consistency for instructions.
 fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyError>) {
     match &inst.kind {
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) |
-        InstKind::IMul(a, b) | InstKind::IDiv(a, b) |
-        InstKind::IMod(a, b) => {
+        InstKind::IAdd(a, b)
+        | InstKind::ISub(a, b)
+        | InstKind::IMul(a, b)
+        | InstKind::IDiv(a, b)
+        | InstKind::IMod(a, b) => {
             let ta = func.value_type(*a);
             let tb = func.value_type(*b);
             // Report missing types so the upstream cache-miss (already
@@ -354,12 +381,18 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             if let (Some(ta), Some(tb)) = (&ta, &tb) {
                 if !ta.is_int() {
                     errors.push(VerifyError {
-                        msg: format!("integer op %{} has non-integer operand %{} : {}", inst.id.0, a.0, ta),
+                        msg: format!(
+                            "integer op %{} has non-integer operand %{} : {}",
+                            inst.id.0, a.0, ta
+                        ),
                     });
                 }
                 if !tb.is_int() {
                     errors.push(VerifyError {
-                        msg: format!("integer op %{} has non-integer operand %{} : {}", inst.id.0, b.0, tb),
+                        msg: format!(
+                            "integer op %{} has non-integer operand %{} : {}",
+                            inst.id.0, b.0, tb
+                        ),
                     });
                 }
                 // Audit MAJOR-4: enforce exact width agreement.
@@ -380,20 +413,28 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::FAdd(a, b) | InstKind::FSub(a, b) |
-        InstKind::FMul(a, b) | InstKind::FDiv(a, b) |
-        InstKind::FPow(a, b) => {
+        InstKind::FAdd(a, b)
+        | InstKind::FSub(a, b)
+        | InstKind::FMul(a, b)
+        | InstKind::FDiv(a, b)
+        | InstKind::FPow(a, b) => {
             let ta = func.value_type(*a);
             let tb = func.value_type(*b);
             if let (Some(ta), Some(tb)) = (&ta, &tb) {
                 if !ta.is_float() {
                     errors.push(VerifyError {
-                        msg: format!("float op %{} has non-float operand %{} : {}", inst.id.0, a.0, ta),
+                        msg: format!(
+                            "float op %{} has non-float operand %{} : {}",
+                            inst.id.0, a.0, ta
+                        ),
                     });
                 }
                 if !tb.is_float() {
                     errors.push(VerifyError {
-                        msg: format!("float op %{} has non-float operand %{} : {}", inst.id.0, b.0, tb),
+                        msg: format!(
+                            "float op %{} has non-float operand %{} : {}",
+                            inst.id.0, b.0, tb
+                        ),
                     });
                 }
                 // Same width-agreement rule for floats. Mixing
@@ -423,9 +464,7 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             // A Store(i64_val, ptr<i32>) would silently truncate
             // at codegen because isel picks the str width from
             // the value's reg class, not the pointer's pointee.
-            if let (Some(IrType::Ptr(pointee)), Some(vty)) =
-                (&addr_ty, func.value_type(*val))
-            {
+            if let (Some(IrType::Ptr(pointee)), Some(vty)) = (&addr_ty, func.value_type(*val)) {
                 let inner: &IrType = pointee.as_ref();
                 // Byte-level GEPs into derived-type layouts use
                 // `ptr<i8>` as a marker with arbitrary pointee on
@@ -457,8 +496,12 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
 
         // Bitwise binary ops: both operands must be integers of
         // the same width. Audit Med-1.
-        InstKind::BitAnd(a, b) | InstKind::BitOr(a, b) | InstKind::BitXor(a, b)
-        | InstKind::Shl(a, b) | InstKind::LShr(a, b) | InstKind::AShr(a, b) => {
+        InstKind::BitAnd(a, b)
+        | InstKind::BitOr(a, b)
+        | InstKind::BitXor(a, b)
+        | InstKind::Shl(a, b)
+        | InstKind::LShr(a, b)
+        | InstKind::AShr(a, b) => {
             let ta = func.value_type(*a);
             let tb = func.value_type(*b);
             if let (Some(ta), Some(tb)) = (&ta, &tb) {
@@ -503,9 +546,9 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::types::*;
     use super::super::builder::FuncBuilder;
+    use super::super::types::*;
+    use super::*;
 
     #[test]
     fn valid_simple_function() {
@@ -551,7 +594,8 @@ mod tests {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         // Manually add a param to the entry block.
         func.blocks[0].params.push(BlockParam {
-            id: ValueId(99), ty: IrType::Int(IntWidth::I32),
+            id: ValueId(99),
+            ty: IrType::Int(IntWidth::I32),
         });
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);
@@ -568,7 +612,8 @@ mod tests {
         let errs = verify_function(&func);
         assert!(
             errs.iter().any(|e| e.msg.contains("entry block")),
-            "expected entry-back-edge error, got: {:?}", errs,
+            "expected entry-back-edge error, got: {:?}",
+            errs,
         );
     }
 
@@ -586,7 +631,9 @@ mod tests {
             b.ret_void();
         }
         let errs = verify_function(&func);
-        assert!(errs.iter().any(|e| e.msg.contains("expected 1 args, got 0")));
+        assert!(errs
+            .iter()
+            .any(|e| e.msg.contains("expected 1 args, got 0")));
     }
 
     #[test]
@@ -619,7 +666,8 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(
-            errs.iter().any(|e| e.msg.contains("doesn't match pointee type")),
+            errs.iter()
+                .any(|e| e.msg.contains("doesn't match pointee type")),
             "expected pointee type mismatch error, got: {:?}",
             errs,
         );
@@ -734,7 +782,7 @@ mod tests {
             let mut b = FuncBuilder::new(&mut func);
             let val = b.const_i32(42);
             let not_ptr = b.const_i32(0); // not a pointer
-            // Force a store to non-pointer.
+                                          // Force a store to non-pointer.
             b.emit_bogus_store(val, not_ptr);
             b.ret_void();
         }
@@ -767,25 +815,39 @@ mod tests {
             b.ret_void();
         }
         // Manually inject the value definition in block B with the ID we referenced.
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
-        func.blocks[2].insts.insert(0, Inst {
-            id: ValueId(100),
-            kind: InstKind::ConstInt(99, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32),
-            span,
-        });
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 0, col: 0 },
+            end: Position { line: 0, col: 0 },
+        };
+        func.blocks[2].insts.insert(
+            0,
+            Inst {
+                id: ValueId(100),
+                kind: InstKind::ConstInt(99, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span,
+            },
+        );
         let errs = verify_function(&func);
-        assert!(errs.iter().any(|e| e.msg.contains("does not dominate")),
-            "expected dominance error, got: {:?}", errs);
+        assert!(
+            errs.iter().any(|e| e.msg.contains("does not dominate")),
+            "expected dominance error, got: {:?}",
+            errs
+        );
     }
 
     #[test]
     fn dominance_same_block_order_violation() {
         // Use a value before it's defined in the same block.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 0, col: 0 },
+            end: Position { line: 0, col: 0 },
+        };
 
         // Manually construct: %1 = iadd %0, %0 then %0 = const_int 42
         // (use of %0 before its definition)
@@ -803,8 +865,12 @@ mod tests {
         });
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);
-        assert!(errs.iter().any(|e| e.msg.contains("used before its definition")),
-            "expected same-block order error, got: {:?}", errs);
+        assert!(
+            errs.iter()
+                .any(|e| e.msg.contains("used before its definition")),
+            "expected same-block order error, got: {:?}",
+            errs
+        );
     }
 
     #[test]
@@ -837,13 +903,23 @@ mod tests {
     fn duplicate_value_id_errors() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         // Manually push two instructions with the same ID.
-        use crate::lexer::{Span, Position};
-        let span = Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 0, col: 0 },
+            end: Position { line: 0, col: 0 },
+        };
         func.blocks[0].insts.push(Inst {
-            id: ValueId(0), kind: InstKind::ConstInt(1, IntWidth::I32), ty: IrType::Int(IntWidth::I32), span,
+            id: ValueId(0),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span,
         });
         func.blocks[0].insts.push(Inst {
-            id: ValueId(0), kind: InstKind::ConstInt(2, IntWidth::I32), ty: IrType::Int(IntWidth::I32), span,
+            id: ValueId(0),
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span,
         });
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);

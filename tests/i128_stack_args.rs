@@ -66,7 +66,11 @@ fn internal_i128_stack_call_runs_at_o0() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful integer(16) stack-call run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful integer(16) stack-call run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('1'),
         "internal integer(16) stack-call program should print score 1:\n{}",
@@ -76,20 +80,35 @@ fn internal_i128_stack_call_runs_at_o0() {
 
 #[test]
 fn internal_i128_stack_call_runs_through_optimized_levels() {
-    for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+    for level in [
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
         let result = capture_from_path(&CaptureRequest {
             input: fixture("integer16_internal_stack_call.f90"),
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("optimized integer(16) stack-call should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "optimized integer(16) stack-call should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful integer(16) stack-call run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful integer(16) stack-call run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(
             run.stdout.contains('1'),
             "integer(16) stack-call program should print score 1 at {:?}:\n{}",

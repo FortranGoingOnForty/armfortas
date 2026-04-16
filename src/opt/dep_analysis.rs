@@ -11,8 +11,8 @@
 //! - Column-major strides are compile-time constants for fixed-shape arrays.
 //! - INTENT(IN) arguments cannot alias INTENT(OUT) arguments.
 
-use std::collections::HashSet;
 use crate::ir::inst::*;
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -23,16 +23,29 @@ use crate::ir::inst::*;
 #[derive(Debug, Clone)]
 pub struct AffineExpr {
     pub constant: i64,
-    pub terms: Vec<(i64, ValueId)>,  // (coefficient, iv)
+    pub terms: Vec<(i64, ValueId)>, // (coefficient, iv)
 }
 
 impl AffineExpr {
-    fn zero() -> Self { Self { constant: 0, terms: Vec::new() } }
+    fn zero() -> Self {
+        Self {
+            constant: 0,
+            terms: Vec::new(),
+        }
+    }
 
-    fn from_const(c: i64) -> Self { Self { constant: c, terms: Vec::new() } }
+    fn from_const(c: i64) -> Self {
+        Self {
+            constant: c,
+            terms: Vec::new(),
+        }
+    }
 
     fn from_iv(iv: ValueId) -> Self {
-        Self { constant: 0, terms: vec![(1, iv)] }
+        Self {
+            constant: 0,
+            terms: vec![(1, iv)],
+        }
     }
 
     fn add(&self, other: &Self) -> Self {
@@ -89,11 +102,7 @@ pub struct DepResult {
 /// Extract an affine expression from a GEP index by walking backwards
 /// through arithmetic instructions. `ivs` is the set of known induction
 /// variables for the enclosing loop nest.
-pub fn extract_affine(
-    func: &Function,
-    val: ValueId,
-    ivs: &HashSet<ValueId>,
-) -> Option<AffineExpr> {
+pub fn extract_affine(func: &Function, val: ValueId, ivs: &HashSet<ValueId>) -> Option<AffineExpr> {
     // Is this an IV?
     if ivs.contains(&val) {
         return Some(AffineExpr::from_iv(val));
@@ -142,13 +151,19 @@ pub fn extract_affine(
 
 fn resolve_const(func: &Function, vid: ValueId) -> Option<i64> {
     let inst = find_inst(func, vid)?;
-    if let InstKind::ConstInt(c, _) = &inst.kind { i64::try_from(*c).ok() } else { None }
+    if let InstKind::ConstInt(c, _) = &inst.kind {
+        i64::try_from(*c).ok()
+    } else {
+        None
+    }
 }
 
 fn find_inst(func: &Function, vid: ValueId) -> Option<&Inst> {
     for block in &func.blocks {
         for inst in &block.insts {
-            if inst.id == vid { return Some(inst); }
+            if inst.id == vid {
+                return Some(inst);
+            }
         }
     }
     None
@@ -203,7 +218,12 @@ fn extract_mem_ref(
     // We work with the flat offset (single index for 1D GEP).
     let idx = indices.first()?;
     let subscript = extract_affine(func, *idx, ivs)?;
-    Some(MemRef { inst_id, base, subscript, is_write })
+    Some(MemRef {
+        inst_id,
+        base,
+        subscript,
+        is_write,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -229,17 +249,23 @@ pub fn test_dependence(ref_a: &MemRef, ref_b: &MemRef) -> DepResult {
     // If the constant is 0, they access the same element (same iteration = ok
     // unless both are writes). If non-zero, they access different elements.
     if diff.terms.is_empty() {
-        return DepResult { dependent: diff.constant == 0 };
+        return DepResult {
+            dependent: diff.constant == 0,
+        };
     }
 
     // GCD of all IV coefficients in the difference.
-    let g = diff.terms.iter()
+    let g = diff
+        .terms
+        .iter()
         .map(|(c, _)| c.unsigned_abs())
         .fold(0u64, gcd);
 
     if g == 0 {
         // All coefficients are zero — same as fixed-distance case.
-        return DepResult { dependent: diff.constant == 0 };
+        return DepResult {
+            dependent: diff.constant == 0,
+        };
     }
 
     // GCD test: if gcd does not divide the constant difference,
@@ -249,7 +275,11 @@ pub fn test_dependence(ref_a: &MemRef, ref_b: &MemRef) -> DepResult {
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 { a } else { gcd(b, a % b) }
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,17 +317,26 @@ pub fn fusion_legal(
     let refs_b_raw = collect_mem_refs(func, body_b, &ivs_b);
 
     // Remap iv_b → iv_a in B's subscripts so the comparison works.
-    let refs_b: Vec<MemRef> = refs_b_raw.into_iter().map(|mut r| {
-        for term in &mut r.subscript.terms {
-            if term.1 == iv_b { term.1 = iv_a; }
-        }
-        r
-    }).collect();
+    let refs_b: Vec<MemRef> = refs_b_raw
+        .into_iter()
+        .map(|mut r| {
+            for term in &mut r.subscript.terms {
+                if term.1 == iv_b {
+                    term.1 = iv_a;
+                }
+            }
+            r
+        })
+        .collect();
 
     for ra in &refs_a {
         for rb in &refs_b {
-            if !ra.is_write && !rb.is_write { continue; }
-            if ra.base != rb.base { continue; }
+            if !ra.is_write && !rb.is_write {
+                continue;
+            }
+            if ra.base != rb.base {
+                continue;
+            }
 
             let diff = rb.subscript.sub(&ra.subscript);
 
@@ -330,9 +369,13 @@ pub fn interchange_legal(
 
     // For each pair of refs where at least one is a write:
     for i in 0..refs.len() {
-        for j in (i+1)..refs.len() {
-            if !refs[i].is_write && !refs[j].is_write { continue; }
-            if refs[i].base != refs[j].base { continue; }
+        for j in (i + 1)..refs.len() {
+            if !refs[i].is_write && !refs[j].is_write {
+                continue;
+            }
+            if refs[i].base != refs[j].base {
+                continue;
+            }
 
             // Both refs share a base and at least one is a write.
             // Check if the subscript difference has non-zero
@@ -370,8 +413,14 @@ mod tests {
     #[test]
     fn affine_add_sub() {
         let iv = ValueId(100);
-        let a = AffineExpr { constant: 3, terms: vec![(2, iv)] };
-        let b = AffineExpr { constant: 1, terms: vec![(1, iv)] };
+        let a = AffineExpr {
+            constant: 3,
+            terms: vec![(2, iv)],
+        };
+        let b = AffineExpr {
+            constant: 1,
+            terms: vec![(1, iv)],
+        };
         let sum = a.add(&b);
         assert_eq!(sum.constant, 4);
         assert_eq!(sum.terms.len(), 1);
@@ -386,7 +435,10 @@ mod tests {
     #[test]
     fn affine_scale() {
         let iv = ValueId(100);
-        let a = AffineExpr { constant: 2, terms: vec![(3, iv)] };
+        let a = AffineExpr {
+            constant: 2,
+            terms: vec![(3, iv)],
+        };
         let scaled = a.scale(4);
         assert_eq!(scaled.constant, 8);
         assert_eq!(scaled.terms[0], (12, iv));
@@ -399,13 +451,21 @@ mod tests {
         // constant = 1 ≠ 0 → independent.
         let iv = ValueId(100);
         let ref_a = MemRef {
-            inst_id: ValueId(0), base: ValueId(50),
-            subscript: AffineExpr { constant: 1, terms: vec![(2, iv)] },
+            inst_id: ValueId(0),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 1,
+                terms: vec![(2, iv)],
+            },
             is_write: true,
         };
         let ref_b = MemRef {
-            inst_id: ValueId(1), base: ValueId(50),
-            subscript: AffineExpr { constant: 2, terms: vec![(2, iv)] },
+            inst_id: ValueId(1),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 2,
+                terms: vec![(2, iv)],
+            },
             is_write: false,
         };
         let dep = test_dependence(&ref_a, &ref_b);
@@ -417,13 +477,21 @@ mod tests {
         // a(i) vs a(i): same subscript → always dependent.
         let iv = ValueId(100);
         let ref_a = MemRef {
-            inst_id: ValueId(0), base: ValueId(50),
-            subscript: AffineExpr { constant: 0, terms: vec![(1, iv)] },
+            inst_id: ValueId(0),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 0,
+                terms: vec![(1, iv)],
+            },
             is_write: true,
         };
         let ref_b = MemRef {
-            inst_id: ValueId(1), base: ValueId(50),
-            subscript: AffineExpr { constant: 0, terms: vec![(1, iv)] },
+            inst_id: ValueId(1),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 0,
+                terms: vec![(1, iv)],
+            },
             is_write: false,
         };
         let dep = test_dependence(&ref_a, &ref_b);
@@ -436,33 +504,55 @@ mod tests {
         // (they cancel: 3-3=0). So diff = constant 1, no terms → independent.
         let iv = ValueId(100);
         let ref_a = MemRef {
-            inst_id: ValueId(0), base: ValueId(50),
-            subscript: AffineExpr { constant: 0, terms: vec![(3, iv)] },
+            inst_id: ValueId(0),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 0,
+                terms: vec![(3, iv)],
+            },
             is_write: true,
         };
         let ref_b = MemRef {
-            inst_id: ValueId(1), base: ValueId(50),
-            subscript: AffineExpr { constant: 1, terms: vec![(3, iv)] },
+            inst_id: ValueId(1),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 1,
+                terms: vec![(3, iv)],
+            },
             is_write: false,
         };
         let dep = test_dependence(&ref_a, &ref_b);
-        assert!(!dep.dependent, "a(3i) and a(3i+1) should be independent by GCD test");
+        assert!(
+            !dep.dependent,
+            "a(3i) and a(3i+1) should be independent by GCD test"
+        );
     }
 
     #[test]
     fn distinct_bases_independent() {
         let iv = ValueId(100);
         let ref_a = MemRef {
-            inst_id: ValueId(0), base: ValueId(50),
-            subscript: AffineExpr { constant: 0, terms: vec![(1, iv)] },
+            inst_id: ValueId(0),
+            base: ValueId(50),
+            subscript: AffineExpr {
+                constant: 0,
+                terms: vec![(1, iv)],
+            },
             is_write: true,
         };
         let ref_b = MemRef {
-            inst_id: ValueId(1), base: ValueId(60), // different base
-            subscript: AffineExpr { constant: 0, terms: vec![(1, iv)] },
+            inst_id: ValueId(1),
+            base: ValueId(60), // different base
+            subscript: AffineExpr {
+                constant: 0,
+                terms: vec![(1, iv)],
+            },
             is_write: false,
         };
         let dep = test_dependence(&ref_a, &ref_b);
-        assert!(!dep.dependent, "distinct bases should be independent (Fortran no-alias)");
+        assert!(
+            !dep.dependent,
+            "distinct bases should be independent (Fortran no-alias)"
+        );
     }
 }

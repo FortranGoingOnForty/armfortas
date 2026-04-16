@@ -4,8 +4,8 @@
 //! program units, and all Fortran constructs. Every node
 //! carries a Span for source location tracking.
 
-pub mod expr;
 pub mod decl;
+pub mod expr;
 pub mod stmt;
 pub mod unit;
 

@@ -6,26 +6,35 @@
 
 #![cfg(test)]
 
-use crate::ir::inst::*;
-use crate::ir::types::{IrType, IntWidth, FloatWidth};
-use crate::lexer::{Span, Position};
-use crate::ir::verify::verify_module;
-use super::pass::Pass;
 use super::const_fold::ConstFold;
 use super::const_prop::ConstProp;
 use super::dce::Dce;
-use super::strength_reduce::StrengthReduce;
 use super::licm::Licm;
+use super::pass::Pass;
+use super::strength_reduce::StrengthReduce;
+use crate::ir::inst::*;
+use crate::ir::types::{FloatWidth, IntWidth, IrType};
+use crate::ir::verify::verify_module;
+use crate::lexer::{Position, Span};
 
 fn dummy_span() -> Span {
     let p = Position { line: 1, col: 1 };
-    Span { start: p, end: p, file_id: 0 }
+    Span {
+        start: p,
+        end: p,
+        file_id: 0,
+    }
 }
 
 fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
     let id = f.next_value_id();
     let entry = f.entry;
-    f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+    f.block_mut(entry).insts.push(Inst {
+        id,
+        kind,
+        ty,
+        span: dummy_span(),
+    });
     id
 }
 
@@ -41,18 +50,33 @@ fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
 fn audit_const_fold_int_to_f32_must_round() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
-    let i = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cv = push(&mut f, InstKind::IntToFloat(i, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let i = push(
+        &mut f,
+        InstKind::ConstInt(16_777_217, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cv = push(
+        &mut f,
+        InstKind::IntToFloat(i, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(cv)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == cv).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == cv)
+        .unwrap();
     match folded.kind {
         InstKind::ConstFloat(v, FloatWidth::F32) => {
-            assert_eq!(v, 16_777_216.0,
-                "expected f32-precision result 16_777_216.0, got {}", v);
+            assert_eq!(
+                v, 16_777_216.0,
+                "expected f32-precision result 16_777_216.0, got {}",
+                v
+            );
         }
         ref other => panic!("expected ConstFloat, got {:?}", other),
     }
@@ -67,14 +91,26 @@ fn audit_const_fold_int_to_f32_must_round() {
 fn audit_const_fold_float_trunc_must_round() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
-    let d = push(&mut f, InstKind::ConstFloat(16_777_217.0, FloatWidth::F64), IrType::Float(FloatWidth::F64));
-    let cv = push(&mut f, InstKind::FloatTrunc(d, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let d = push(
+        &mut f,
+        InstKind::ConstFloat(16_777_217.0, FloatWidth::F64),
+        IrType::Float(FloatWidth::F64),
+    );
+    let cv = push(
+        &mut f,
+        InstKind::FloatTrunc(d, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(cv)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == cv).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == cv)
+        .unwrap();
     match folded.kind {
         InstKind::ConstFloat(v, FloatWidth::F32) => {
             assert_eq!(v, 16_777_216.0, "expected f32-rounded value, got {}", v);
@@ -93,13 +129,37 @@ fn audit_const_fold_float_trunc_must_round() {
 fn audit_strength_reduce_chained_identities() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let x  = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let one1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let x = push(
+        &mut f,
+        InstKind::ConstInt(7, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let one1 = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let mul1 = push(&mut f, InstKind::IMul(x, one1), IrType::Int(IntWidth::I32));
-    let one2 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let mul2 = push(&mut f, InstKind::IMul(mul1, one2), IrType::Int(IntWidth::I32));
-    let zero = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let add  = push(&mut f, InstKind::IAdd(mul2, zero), IrType::Int(IntWidth::I32));
+    let one2 = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let mul2 = push(
+        &mut f,
+        InstKind::IMul(mul1, one2),
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = push(
+        &mut f,
+        InstKind::ConstInt(0, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let add = push(
+        &mut f,
+        InstKind::IAdd(mul2, zero),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(add)));
     m.add_function(f);
@@ -108,13 +168,18 @@ fn audit_strength_reduce_chained_identities() {
     // After three chained identities, the return must reference x.
     let term = m.functions[0].blocks[0].terminator.as_ref().unwrap();
     match term {
-        Terminator::Return(Some(v)) => assert_eq!(*v, x,
-            "expected return %{} (x), got %{}", x.0, v.0),
+        Terminator::Return(Some(v)) => {
+            assert_eq!(*v, x, "expected return %{} (x), got %{}", x.0, v.0)
+        }
         other => panic!("expected Return(x), got {:?}", other),
     }
     // And the IR must still verify.
     let errs = verify_module(&m);
-    assert!(errs.is_empty(), "verifier errors after chained rewrites: {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "verifier errors after chained rewrites: {:?}",
+        errs
+    );
 }
 
 // =============================================================
@@ -131,11 +196,27 @@ fn audit_strength_reduce_mixed_shl_and_identity_in_block() {
     // ret %4
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let x = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let eight = push(&mut f, InstKind::ConstInt(8, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let x = push(
+        &mut f,
+        InstKind::ConstInt(7, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let eight = push(
+        &mut f,
+        InstKind::ConstInt(8, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let mul1 = push(&mut f, InstKind::IMul(x, eight), IrType::Int(IntWidth::I32));
-    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let mul2 = push(&mut f, InstKind::IMul(mul1, one), IrType::Int(IntWidth::I32));
+    let one = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let mul2 = push(
+        &mut f,
+        InstKind::IMul(mul1, one),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul2)));
     m.add_function(f);
@@ -151,8 +232,11 @@ fn audit_strength_reduce_mixed_shl_and_identity_in_block() {
         _ => panic!(),
     };
     let term_kind = &block.insts.iter().find(|i| i.id == term_val).unwrap().kind;
-    assert!(matches!(term_kind, InstKind::Shl(..)),
-        "expected return value to define a Shl, got {:?}", term_kind);
+    assert!(
+        matches!(term_kind, InstKind::Shl(..)),
+        "expected return value to define a Shl, got {:?}",
+        term_kind
+    );
 }
 
 // =============================================================
@@ -165,20 +249,33 @@ fn audit_strength_reduce_mixed_shl_and_identity_in_block() {
 fn audit_const_fold_idiv_i8_min_neg_one() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
-    let a = push(&mut f, InstKind::ConstInt(-128, IntWidth::I8), IrType::Int(IntWidth::I8));
-    let b = push(&mut f, InstKind::ConstInt(-1, IntWidth::I8), IrType::Int(IntWidth::I8));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(-128, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(-1, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
     let q = push(&mut f, InstKind::IDiv(a, b), IrType::Int(IntWidth::I8));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(q)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == q).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == q)
+        .unwrap();
     // Either we fold to -128 (match hardware), or we leave the IDiv alone.
     // Anything else would be a divergence.
     match folded.kind {
-        InstKind::ConstInt(v, IntWidth::I8) => assert_eq!(v, -128,
-            "expected -128 (i8 wraparound), got {}", v),
+        InstKind::ConstInt(v, IntWidth::I8) => {
+            assert_eq!(v, -128, "expected -128 (i8 wraparound), got {}", v)
+        }
         InstKind::IDiv(..) => { /* left alone, also acceptable */ }
         ref other => panic!("unexpected fold: {:?}", other),
     }
@@ -198,7 +295,11 @@ fn audit_dce_removes_dead_block_param() {
         id: param_id,
         ty: IrType::Int(IntWidth::I32),
     });
-    let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let init = push(
+        &mut f,
+        InstKind::ConstInt(0, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![init]));
     f.block_mut(target).terminator = Some(Terminator::Return(None));
@@ -206,19 +307,31 @@ fn audit_dce_removes_dead_block_param() {
 
     assert!(Dce.run(&mut m), "DCE should report change");
     let f = &m.functions[0];
-    assert_eq!(f.block(target).params.len(), 0, "dead block param must be removed");
+    assert_eq!(
+        f.block(target).params.len(),
+        0,
+        "dead block param must be removed"
+    );
     // The predecessor's branch arg list must shrink in lockstep.
     let entry_term = f.block(f.entry).terminator.as_ref().unwrap();
     match entry_term {
-        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
-            "predecessor branch arg must be dropped alongside the dead param"),
+        Terminator::Branch(_, args) => assert_eq!(
+            args.len(),
+            0,
+            "predecessor branch arg must be dropped alongside the dead param"
+        ),
         _ => panic!(),
     }
     // The const(0) inst is now unreferenced and should also be DCE'd.
-    let const_remains = f.blocks.iter()
+    let const_remains = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .any(|i| matches!(i.kind, InstKind::ConstInt(0, _)));
-    assert!(!const_remains, "const(0) should also be DCE'd after its only use disappears");
+    assert!(
+        !const_remains,
+        "const(0) should also be DCE'd after its only use disappears"
+    );
 }
 
 #[test]
@@ -232,7 +345,11 @@ fn audit_dce_keeps_live_block_param() {
         id: param_id,
         ty: IrType::Int(IntWidth::I32),
     });
-    let init = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let init = push(
+        &mut f,
+        InstKind::ConstInt(7, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![init]));
     f.block_mut(target).terminator = Some(Terminator::Return(Some(param_id)));
@@ -240,7 +357,11 @@ fn audit_dce_keeps_live_block_param() {
 
     Dce.run(&mut m);
     let f = &m.functions[0];
-    assert_eq!(f.block(target).params.len(), 1, "live block param must survive");
+    assert_eq!(
+        f.block(target).params.len(),
+        1,
+        "live block param must survive"
+    );
 }
 
 #[test]
@@ -254,10 +375,24 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
     let target = f.create_block("target");
     let p0 = f.next_value_id();
     let p1 = f.next_value_id();
-    f.block_mut(target).params.push(BlockParam { id: p0, ty: IrType::Int(IntWidth::I32) });
-    f.block_mut(target).params.push(BlockParam { id: p1, ty: IrType::Int(IntWidth::I32) });
-    let c0 = push(&mut f, InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let c1 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+    f.block_mut(target).params.push(BlockParam {
+        id: p0,
+        ty: IrType::Int(IntWidth::I32),
+    });
+    f.block_mut(target).params.push(BlockParam {
+        id: p1,
+        ty: IrType::Int(IntWidth::I32),
+    });
+    let c0 = push(
+        &mut f,
+        InstKind::ConstInt(10, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let c1 = push(
+        &mut f,
+        InstKind::ConstInt(20, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Branch(target, vec![c0, c1]));
     f.block_mut(target).terminator = Some(Terminator::Return(Some(p1)));
@@ -281,10 +416,15 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
 
     // Now const(10) is dead — should also be gone after the
     // outer-loop re-runs the inner DCE.
-    let c0_remains = f.blocks.iter()
+    let c0_remains = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .any(|i| i.id == c0);
-    assert!(!c0_remains, "const(10) should be DCE'd after its arg slot is gone");
+    assert!(
+        !c0_remains,
+        "const(10) should be DCE'd after its arg slot is gone"
+    );
 }
 
 // =============================================================
@@ -324,25 +464,33 @@ fn audit_dce_cascading_across_outer_iterations() {
     let mut f = Function::new("f".into(), vec![], IrType::Void);
 
     // entry: computes %c, branches to other
-    let c = push(&mut f, InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let c = push(
+        &mut f,
+        InstKind::ConstInt(5, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
 
     // other: has param p_other, computes %u = ineg p_other, branches to target
     let other = f.create_block("other");
     let p_other = f.next_value_id();
     f.block_mut(other).params.push(BlockParam {
-        id: p_other, ty: IrType::Int(IntWidth::I32),
+        id: p_other,
+        ty: IrType::Int(IntWidth::I32),
     });
     let u = f.next_value_id();
     f.block_mut(other).insts.push(Inst {
-        id: u, kind: InstKind::INeg(p_other),
-        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        id: u,
+        kind: InstKind::INeg(p_other),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
     });
 
     // target: has param p_target, returns (p_target never used).
     let target = f.create_block("target");
     let p_target = f.next_value_id();
     f.block_mut(target).params.push(BlockParam {
-        id: p_target, ty: IrType::Int(IntWidth::I32),
+        id: p_target,
+        ty: IrType::Int(IntWidth::I32),
     });
     f.block_mut(target).terminator = Some(Terminator::Return(None));
 
@@ -357,30 +505,46 @@ fn audit_dce_cascading_across_outer_iterations() {
     let f = &m.functions[0];
 
     // Both block params must be gone.
-    assert_eq!(f.block(target).params.len(), 0,
-        "p_target should be removed in round 1");
-    assert_eq!(f.block(other).params.len(), 0,
-        "p_other should be removed in round 2 (cascading)");
+    assert_eq!(
+        f.block(target).params.len(),
+        0,
+        "p_target should be removed in round 1"
+    );
+    assert_eq!(
+        f.block(other).params.len(),
+        0,
+        "p_other should be removed in round 2 (cascading)"
+    );
 
     // Entry's branch arg list must be empty.
     match f.block(f.entry).terminator.as_ref().unwrap() {
-        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
-            "entry's branch to other should have no args after cascade"),
+        Terminator::Branch(_, args) => assert_eq!(
+            args.len(),
+            0,
+            "entry's branch to other should have no args after cascade"
+        ),
         _ => panic!(),
     }
     // other's branch to target must also have no args.
     match f.block(other).terminator.as_ref().unwrap() {
-        Terminator::Branch(_, args) => assert_eq!(args.len(), 0,
-            "other's branch to target should have no args"),
+        Terminator::Branch(_, args) => assert_eq!(
+            args.len(),
+            0,
+            "other's branch to target should have no args"
+        ),
         _ => panic!(),
     }
 
     // All formerly-live values should be DCE'd: %c, %u.
-    let any_inst = f.blocks.iter()
+    let any_inst = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .any(|i| i.id == c || i.id == u);
-    assert!(!any_inst,
-        "dead instructions %c (const) and %u (ineg) should be DCE'd after the cascade");
+    assert!(
+        !any_inst,
+        "dead instructions %c (const) and %u (ineg) should be DCE'd after the cascade"
+    );
 }
 
 // =============================================================
@@ -471,26 +635,45 @@ fn audit_licm_nested_loop_body_computation() {
     assert_eq!(loops.len(), 2, "expected exactly two natural loops");
 
     // Find the inner and outer loops by their headers.
-    let inner = loops.iter().find(|l| l.header == inner_header).expect("inner loop not found");
-    let outer = loops.iter().find(|l| l.header == outer_header).expect("outer loop not found");
+    let inner = loops
+        .iter()
+        .find(|l| l.header == inner_header)
+        .expect("inner loop not found");
+    let outer = loops
+        .iter()
+        .find(|l| l.header == outer_header)
+        .expect("outer loop not found");
 
     // Inner loop body: {inner_header, inner_latch}.
-    assert_eq!(inner.body.len(), 2,
-        "inner body should be {{inner_header, inner_latch}}, got {:?}", inner.body);
+    assert_eq!(
+        inner.body.len(),
+        2,
+        "inner body should be {{inner_header, inner_latch}}, got {:?}",
+        inner.body
+    );
     assert!(inner.body.contains(&inner_header));
     assert!(inner.body.contains(&inner_latch));
 
     // Outer loop body: {outer_header, inner_header, inner_latch, outer_latch}.
     // MUST NOT contain entry or exit.
-    assert_eq!(outer.body.len(), 4,
+    assert_eq!(
+        outer.body.len(),
+        4,
         "outer body should be {{outer_header, inner_header, inner_latch, outer_latch}}, got {:?}",
-        outer.body);
+        outer.body
+    );
     assert!(outer.body.contains(&outer_header));
     assert!(outer.body.contains(&inner_header));
     assert!(outer.body.contains(&inner_latch));
     assert!(outer.body.contains(&outer_latch));
-    assert!(!outer.body.contains(&entry), "outer body must not include entry");
-    assert!(!outer.body.contains(&exit), "outer body must not include exit");
+    assert!(
+        !outer.body.contains(&entry),
+        "outer body must not include entry"
+    );
+    assert!(
+        !outer.body.contains(&exit),
+        "outer body must not include exit"
+    );
 }
 
 // =============================================================
@@ -560,9 +743,15 @@ fn audit_licm_multi_latch_with_self_loop() {
     assert_eq!(lp.header, header);
     // Body must include header and other, NOT entry.
     assert!(lp.body.contains(&header), "body must include header");
-    assert!(lp.body.contains(&other),  "body must include other");
-    assert!(!lp.body.contains(&entry), "body must NOT include the preheader (entry)");
-    assert!(!lp.body.contains(&exit),  "body must NOT include the exit block");
+    assert!(lp.body.contains(&other), "body must include other");
+    assert!(
+        !lp.body.contains(&entry),
+        "body must NOT include the preheader (entry)"
+    );
+    assert!(
+        !lp.body.contains(&exit),
+        "body must NOT include the exit block"
+    );
     // Latches: both header (self-loop) and other (back edge).
     assert_eq!(lp.latches.len(), 2, "expected two latches");
     assert!(lp.latches.contains(&header));
@@ -581,15 +770,24 @@ fn audit_licm_multi_latch_with_self_loop() {
 fn audit_licm_hoists_clean_alloca_load() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Void);
-    let slot = push(&mut f,
+    let slot = push(
+        &mut f,
         InstKind::Alloca(IrType::Int(IntWidth::I32)),
-        IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-    let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+    );
+    let init = push(
+        &mut f,
+        InstKind::ConstInt(0, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     push(&mut f, InstKind::Store(init, slot), IrType::Void);
 
     let header = f.create_block("header");
     let i_param = f.next_value_id();
-    f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(header).params.push(BlockParam {
+        id: i_param,
+        ty: IrType::Int(IntWidth::I32),
+    });
     let v = f.next_value_id();
     f.block_mut(header).insts.push(Inst {
         id: v,
@@ -627,20 +825,32 @@ fn audit_licm_hoists_clean_alloca_load() {
     // The const(1) inside the header IS loop-invariant — LICM should hoist it.
     Licm.run(&mut m);
     let entry_block = m.functions[0].block(m.functions[0].entry);
-    let const1_in_entry = entry_block.insts.iter()
+    let const1_in_entry = entry_block
+        .insts
+        .iter()
         .any(|i| matches!(i.kind, InstKind::ConstInt(1, IntWidth::I32)));
-    assert!(const1_in_entry,
-        "LICM should have hoisted const(1) into the preheader");
+    assert!(
+        const1_in_entry,
+        "LICM should have hoisted const(1) into the preheader"
+    );
     // The load is now loop-invariant too: no loop store/call can clobber it.
     let header_block = &m.functions[0].blocks[1];
-    let load_still_in_header = header_block.insts.iter()
+    let load_still_in_header = header_block
+        .insts
+        .iter()
         .any(|i| matches!(i.kind, InstKind::Load(_)));
-    assert!(!load_still_in_header,
-        "LICM should hoist a load when the loop is memory-clean");
-    let load_in_entry = entry_block.insts.iter()
+    assert!(
+        !load_still_in_header,
+        "LICM should hoist a load when the loop is memory-clean"
+    );
+    let load_in_entry = entry_block
+        .insts
+        .iter()
         .any(|i| matches!(i.kind, InstKind::Load(_)));
-    assert!(load_in_entry,
-        "LICM should move the memory-clean load into the preheader");
+    assert!(
+        load_in_entry,
+        "LICM should move the memory-clean load into the preheader"
+    );
 }
 
 // =============================================================
@@ -660,11 +870,18 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
     //                         %d=icmp ge %i, %lim; cbr %d, exit, latch(%i2) }
     //        latch(%i_in:i32) { %1=const 1; %n=iadd %i_in, %1; br header(%n) }
     //        exit { ret }
-    let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let init = push(
+        &mut f,
+        InstKind::ConstInt(0, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
 
     let header = f.create_block("header");
     let i_param = f.next_value_id();
-    f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(header).params.push(BlockParam {
+        id: i_param,
+        ty: IrType::Int(IntWidth::I32),
+    });
 
     let k = f.next_value_id();
     f.block_mut(header).insts.push(Inst {
@@ -697,7 +914,10 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
 
     let latch = f.create_block("latch");
     let i_in = f.next_value_id();
-    f.block_mut(latch).params.push(BlockParam { id: i_in, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(latch).params.push(BlockParam {
+        id: i_in,
+        ty: IrType::Int(IntWidth::I32),
+    });
     let one = f.next_value_id();
     f.block_mut(latch).insts.push(Inst {
         id: one,
@@ -736,7 +956,11 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
 
     // Final IR must verify.
     let errs = verify_module(&m);
-    assert!(errs.is_empty(), "O2 pipeline left an invalid module: {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "O2 pipeline left an invalid module: {:?}",
+        errs
+    );
 }
 
 // =============================================================
@@ -755,7 +979,11 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
     // This constant is ONLY used in the about-to-be-dead else block.
-    let dead_only = push(&mut f, InstKind::ConstInt(99, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let dead_only = push(
+        &mut f,
+        InstKind::ConstInt(99, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
 
     let then_b = f.create_block("then");
     let else_b = f.create_block("else");
@@ -789,11 +1017,19 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
 
     // After: else block gone, const(99) and ineg gone too.
     let f = &m.functions[0];
-    assert!(!f.blocks.iter().any(|b| b.id == else_b), "else block should be pruned");
-    let dead_remains = f.blocks.iter()
+    assert!(
+        !f.blocks.iter().any(|b| b.id == else_b),
+        "else block should be pruned"
+    );
+    let dead_remains = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .any(|i| matches!(i.kind, InstKind::ConstInt(99, _)));
-    assert!(!dead_remains, "const(99) should be DCE'd after const_prop drops its only use");
+    assert!(
+        !dead_remains,
+        "const(99) should be DCE'd after const_prop drops its only use"
+    );
 }
 
 // =============================================================
@@ -806,8 +1042,16 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
 
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let x = push(
+        &mut f,
+        InstKind::ConstInt(42, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let one = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let mul = push(&mut f, InstKind::IMul(x, one), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul)));
@@ -830,11 +1074,15 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
     assert_eq!(term_val, x, "expected return to be x directly");
 
     // The orphan placeholder should be gone.
-    let extra_const = f.blocks[0].insts.iter()
+    let extra_const = f.blocks[0]
+        .insts
+        .iter()
         .filter(|i| matches!(i.kind, InstKind::ConstInt(0, _)))
         .count();
-    assert_eq!(extra_const, 0,
-        "strength_reduce orphan placeholder Const(0) should be DCE'd");
+    assert_eq!(
+        extra_const, 0,
+        "strength_reduce orphan placeholder Const(0) should be DCE'd"
+    );
 }
 
 // =============================================================
@@ -847,15 +1095,27 @@ fn audit_const_fold_shl_at_width_bails() {
     // so the runtime answer is 1. The fold MUST NOT silently emit 0.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cnt = push(&mut f, InstKind::ConstInt(32, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cnt = push(
+        &mut f,
+        InstKind::ConstInt(32, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let s = push(&mut f, InstKind::Shl(v, cnt), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     // Acceptable outcomes: leave the Shl alone, OR mask the count.
     // NOT acceptable: ConstInt(0, _).
     if let InstKind::ConstInt(0, _) = folded.kind {
@@ -870,15 +1130,27 @@ fn audit_const_fold_shl_at_width_bails() {
 fn audit_const_fold_shl_negative_count_bails() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cnt = push(&mut f, InstKind::ConstInt(-1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(7, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cnt = push(
+        &mut f,
+        InstKind::ConstInt(-1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let s = push(&mut f, InstKind::Shl(v, cnt), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     if let InstKind::ConstInt(0, _) = folded.kind {
         panic!("audit M-C: shl with negative count folded to 0 — wrong on AArch64");
     }
@@ -891,15 +1163,27 @@ fn audit_const_fold_shl_negative_count_bails() {
 fn audit_const_fold_lshr_negative_count_bails() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(64, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cnt = push(&mut f, InstKind::ConstInt(-2, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(64, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cnt = push(
+        &mut f,
+        InstKind::ConstInt(-2, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let s = push(&mut f, InstKind::LShr(v, cnt), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     if let InstKind::ConstInt(0, _) = folded.kind {
         panic!("audit M-C: lshr with negative count folded to 0");
     }
@@ -932,25 +1216,35 @@ fn audit_const_fold_width_drift_iadd() {
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: a,
+        kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let b = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: b, kind: InstKind::ConstInt(2, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: b,
+        kind: InstKind::ConstInt(2, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let sum = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: sum, kind: InstKind::IAdd(a, b),
-        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        id: sum,
+        kind: InstKind::IAdd(a, b),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
     });
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == sum).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == sum)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(1, IntWidth::I32) => { /* good */ }
         InstKind::ConstInt(v, w) => panic!(
@@ -970,28 +1264,41 @@ fn audit_const_fold_width_drift_isub() {
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: a, kind: InstKind::ConstInt(250, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: a,
+        kind: InstKind::ConstInt(250, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let b = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: b, kind: InstKind::ConstInt(1, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: b,
+        kind: InstKind::ConstInt(1, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let diff = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: diff, kind: InstKind::ISub(a, b),
-        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        id: diff,
+        kind: InstKind::ISub(a, b),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
     });
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(diff)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == diff).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == diff)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(-7, IntWidth::I32) => { /* good */ }
-        ref other => panic!("audit N-1 ISub: expected ConstInt(-7, I32), got {:?}", other),
+        ref other => panic!(
+            "audit N-1 ISub: expected ConstInt(-7, I32), got {:?}",
+            other
+        ),
     }
 }
 
@@ -1004,28 +1311,41 @@ fn audit_const_fold_width_drift_imul() {
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: a,
+        kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let b = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: b, kind: InstKind::ConstInt(3, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: b,
+        kind: InstKind::ConstInt(3, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let prod = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: prod, kind: InstKind::IMul(a, b),
-        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        id: prod,
+        kind: InstKind::IMul(a, b),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
     });
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(prod)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == prod).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == prod)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(-3, IntWidth::I32) => { /* good */ }
-        ref other => panic!("audit N-1 IMul: expected ConstInt(-3, I32), got {:?}", other),
+        ref other => panic!(
+            "audit N-1 IMul: expected ConstInt(-3, I32), got {:?}",
+            other
+        ),
     }
 }
 
@@ -1039,25 +1359,35 @@ fn audit_const_fold_width_drift_idiv() {
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: a,
+        kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let b = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: b, kind: InstKind::ConstInt(2, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: b,
+        kind: InstKind::ConstInt(2, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let q = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: q, kind: InstKind::IDiv(a, b),
-        ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+        id: q,
+        kind: InstKind::IDiv(a, b),
+        ty: IrType::Int(IntWidth::I32),
+        span: dummy_span(),
     });
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(q)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == q).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == q)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(0, IntWidth::I32) => { /* good */ }
         ref other => panic!("audit N-1 IDiv: expected ConstInt(0, I32), got {:?}", other),
@@ -1074,25 +1404,35 @@ fn audit_const_fold_width_drift_icmp() {
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: a, kind: InstKind::ConstInt(255, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: a,
+        kind: InstKind::ConstInt(255, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let b = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: b, kind: InstKind::ConstInt(0, IntWidth::I8),
-        ty: IrType::Int(IntWidth::I8), span: dummy_span(),
+        id: b,
+        kind: InstKind::ConstInt(0, IntWidth::I8),
+        ty: IrType::Int(IntWidth::I8),
+        span: dummy_span(),
     });
     let lt = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
-        id: lt, kind: InstKind::ICmp(CmpOp::Lt, a, b),
-        ty: IrType::Bool, span: dummy_span(),
+        id: lt,
+        kind: InstKind::ICmp(CmpOp::Lt, a, b),
+        ty: IrType::Bool,
+        span: dummy_span(),
     });
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(lt)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == lt).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == lt)
+        .unwrap();
     match folded.kind {
         InstKind::ConstBool(true) => { /* good */ }
         ref other => panic!("audit N-1 ICmp: expected ConstBool(true), got {:?}", other),
@@ -1112,13 +1452,25 @@ fn audit_cse_dedupes_const_int_bit_pattern() {
     use crate::opt::LocalCse;
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
-    let a = push(&mut f, InstKind::ConstInt(255, IntWidth::I8), IrType::Int(IntWidth::I8));
-    let b = push(&mut f, InstKind::ConstInt(-1,  IntWidth::I8), IrType::Int(IntWidth::I8));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(255, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(-1, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
     // Use a in some op and b in another so neither is dead.
     let neg_a = push(&mut f, InstKind::INeg(a), IrType::Int(IntWidth::I8));
     let neg_b = push(&mut f, InstKind::INeg(b), IrType::Int(IntWidth::I8));
     // Add them so both are live to the terminator.
-    let sum = push(&mut f, InstKind::IAdd(neg_a, neg_b), IrType::Int(IntWidth::I8));
+    let sum = push(
+        &mut f,
+        InstKind::IAdd(neg_a, neg_b),
+        IrType::Int(IntWidth::I8),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
     m.add_function(f);
@@ -1130,11 +1482,19 @@ fn audit_cse_dedupes_const_int_bit_pattern() {
     let f = &m.functions[0];
     let neg_a_inst = f.blocks[0].insts.iter().find(|i| i.id == neg_a).unwrap();
     let neg_b_inst = f.blocks[0].insts.iter().find(|i| i.id == neg_b).unwrap();
-    let neg_a_op = match &neg_a_inst.kind { InstKind::INeg(v) => *v, _ => panic!() };
-    let neg_b_op = match &neg_b_inst.kind { InstKind::INeg(v) => *v, _ => panic!() };
-    assert_eq!(neg_a_op, neg_b_op,
+    let neg_a_op = match &neg_a_inst.kind {
+        InstKind::INeg(v) => *v,
+        _ => panic!(),
+    };
+    let neg_b_op = match &neg_b_inst.kind {
+        InstKind::INeg(v) => *v,
+        _ => panic!(),
+    };
+    assert_eq!(
+        neg_a_op, neg_b_op,
         "audit B-8: ConstInt(255, I8) and ConstInt(-1, I8) should CSE-dedupe \
-         (both represent -1 at i8 precision), but the INeg operands differ");
+         (both represent -1 at i8 precision), but the INeg operands differ"
+    );
 }
 
 // =============================================================
@@ -1144,15 +1504,27 @@ fn audit_cse_dedupes_const_int_bit_pattern() {
 fn audit_const_fold_ashr_negative_count_bails() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(-128, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cnt = push(&mut f, InstKind::ConstInt(-3, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(-128, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cnt = push(
+        &mut f,
+        InstKind::ConstInt(-3, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let s = push(&mut f, InstKind::AShr(v, cnt), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     if let InstKind::ConstInt(0, _) = folded.kind {
         panic!("audit M-C: ashr with negative count folded to 0 — wrong on AArch64");
     }
@@ -1169,13 +1541,28 @@ fn audit_licm_does_not_hoist_idiv() {
     // skipped it (causing SIGFPE on b == 0).
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Void);
-    let a = push(&mut f, InstKind::ConstInt(100, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let b = push(&mut f, InstKind::ConstInt(5,   IntWidth::I32), IrType::Int(IntWidth::I32));
-    let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(100, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(5, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let init = push(
+        &mut f,
+        InstKind::ConstInt(0, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
 
     let header = f.create_block("header");
     let i_param = f.next_value_id();
-    f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(header).params.push(BlockParam {
+        id: i_param,
+        ty: IrType::Int(IntWidth::I32),
+    });
 
     // Inside the body: %q = idiv a, b — both operands invariant.
     let q = f.next_value_id();
@@ -1224,12 +1611,28 @@ fn audit_licm_does_not_hoist_idiv() {
     Licm.run(&mut m);
     let f = &m.functions[0];
     // The IDiv must STILL be in the header block, not in entry.
-    let header_block = f.blocks.iter().find(|b| b.name.starts_with("header")).unwrap();
+    let header_block = f
+        .blocks
+        .iter()
+        .find(|b| b.name.starts_with("header"))
+        .unwrap();
     let entry_block = f.block(f.entry);
-    let idiv_in_header = header_block.insts.iter().any(|i| matches!(i.kind, InstKind::IDiv(..)));
-    let idiv_in_entry  = entry_block.insts.iter().any(|i| matches!(i.kind, InstKind::IDiv(..)));
-    assert!(idiv_in_header, "audit Med-6: LICM should leave IDiv in body (trap-prone)");
-    assert!(!idiv_in_entry, "audit Med-6: LICM must not hoist IDiv into preheader");
+    let idiv_in_header = header_block
+        .insts
+        .iter()
+        .any(|i| matches!(i.kind, InstKind::IDiv(..)));
+    let idiv_in_entry = entry_block
+        .insts
+        .iter()
+        .any(|i| matches!(i.kind, InstKind::IDiv(..)));
+    assert!(
+        idiv_in_header,
+        "audit Med-6: LICM should leave IDiv in body (trap-prone)"
+    );
+    assert!(
+        !idiv_in_entry,
+        "audit Med-6: LICM must not hoist IDiv into preheader"
+    );
 }
 
 // =============================================================
@@ -1243,16 +1646,32 @@ fn audit_licm_does_not_hoist_idiv() {
 fn audit_const_fold_select_uses_declared_type() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let a = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let b = push(&mut f, InstKind::ConstInt(99, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(99, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
-    let sel = push(&mut f, InstKind::Select(cond, a, b), IrType::Int(IntWidth::I32));
+    let sel = push(
+        &mut f,
+        InstKind::Select(cond, a, b),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(sel)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == sel).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == sel)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(1, IntWidth::I32) => { /* good */ }
         ref other => panic!("expected ConstInt(1, I32), got {:?}", other),
@@ -1292,7 +1711,11 @@ fn audit_const_fold_select_width_drift_int() {
         ty: IrType::Int(IntWidth::I8),
         span: dummy_span(),
     });
-    let b = push(&mut f, InstKind::ConstInt(99, IntWidth::I64), IrType::Int(IntWidth::I64));
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(99, IntWidth::I64),
+        IrType::Int(IntWidth::I64),
+    );
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
 
     // Select declared as i64, chosen branch is i8 (255 → -1).
@@ -1307,7 +1730,11 @@ fn audit_const_fold_select_width_drift_int() {
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == sel).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == sel)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(-1, IntWidth::I64) => { /* good — i8 -1 sign-extended to i64 */ }
         InstKind::ConstInt(v, w) => panic!(
@@ -1338,8 +1765,16 @@ fn audit_const_fold_select_width_drift_int() {
 fn audit_strength_reduce_identity_does_not_write_placeholder() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let x = push(
+        &mut f,
+        InstKind::ConstInt(42, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let one = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let mul = push(&mut f, InstKind::IMul(x, one), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul)));
@@ -1349,7 +1784,11 @@ fn audit_strength_reduce_identity_does_not_write_placeholder() {
     // The orphan instruction at `mul`'s ID must still exist and
     // have its original kind. The earlier (broken) version would
     // have replaced its kind with ConstInt(0, _).
-    let orphan = m.functions[0].blocks[0].insts.iter().find(|i| i.id == mul).unwrap();
+    let orphan = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == mul)
+        .unwrap();
     match orphan.kind {
         InstKind::IMul(_, _) => { /* good — original kind preserved */ }
         InstKind::ConstInt(0, _) => panic!(
@@ -1369,15 +1808,26 @@ fn audit_strength_reduce_identity_does_not_write_placeholder() {
 fn audit_strength_reduce_identity_reports_changed() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let x = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let x = push(
+        &mut f,
+        InstKind::ConstInt(42, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let one = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let mul = push(&mut f, InstKind::IMul(x, one), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul)));
     m.add_function(f);
 
     let changed = StrengthReduce.run(&mut m);
-    assert!(changed, "strength_reduce must report `changed = true` after Identity rewrite");
+    assert!(
+        changed,
+        "strength_reduce must report `changed = true` after Identity rewrite"
+    );
 
     // The terminator now references x.
     match m.functions[0].blocks[0].terminator.as_ref().unwrap() {
@@ -1403,15 +1853,27 @@ fn audit_const_fold_icmp_uses_each_operand_width() {
     // be FALSE: 255 != -1.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
-    let a = push(&mut f, InstKind::ConstInt(255, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let b = push(&mut f, InstKind::ConstInt(255, IntWidth::I8),  IrType::Int(IntWidth::I8));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(255, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(255, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
     let eq = push(&mut f, InstKind::ICmp(CmpOp::Eq, a, b), IrType::Bool);
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(eq)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == eq).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == eq)
+        .unwrap();
     match folded.kind {
         // After the M-D fix: bv sign-extended at i8 → -1; av at i32 → 255.
         // 255 == -1 → false.
@@ -1436,18 +1898,37 @@ fn audit_const_fold_fcmp_f32_after_m1_fix() {
     // ConstFloat(16777216.0, F32) should now return true.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
-    let i = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let fv_a = push(&mut f, InstKind::IntToFloat(i, FloatWidth::F32), IrType::Float(FloatWidth::F32));
-    let fv_b = push(&mut f, InstKind::ConstFloat(16_777_216.0, FloatWidth::F32), IrType::Float(FloatWidth::F32));
+    let i = push(
+        &mut f,
+        InstKind::ConstInt(16_777_217, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let fv_a = push(
+        &mut f,
+        InstKind::IntToFloat(i, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
+    let fv_b = push(
+        &mut f,
+        InstKind::ConstFloat(16_777_216.0, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
     let eq = push(&mut f, InstKind::FCmp(CmpOp::Eq, fv_a, fv_b), IrType::Bool);
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(eq)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == eq).unwrap();
-    assert!(matches!(folded.kind, InstKind::ConstBool(true)),
-        "audit M-E: FCmp on f32-rounded values should return true, got {:?}", folded.kind);
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == eq)
+        .unwrap();
+    assert!(
+        matches!(folded.kind, InstKind::ConstBool(true)),
+        "audit M-E: FCmp on f32-rounded values should return true, got {:?}",
+        folded.kind
+    );
 }
 
 // =============================================================
@@ -1460,18 +1941,37 @@ fn audit_const_fold_floattoint_from_f32_after_m1_fix() {
     // FloatToInt(_, I32) should produce 16777216, not 16777217.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let i = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let fv = push(&mut f, InstKind::IntToFloat(i, FloatWidth::F32), IrType::Float(FloatWidth::F32));
-    let back = push(&mut f, InstKind::FloatToInt(fv, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let i = push(
+        &mut f,
+        InstKind::ConstInt(16_777_217, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let fv = push(
+        &mut f,
+        InstKind::IntToFloat(i, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
+    let back = push(
+        &mut f,
+        InstKind::FloatToInt(fv, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(back)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == back).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == back)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(16_777_216, IntWidth::I32) => { /* good */ }
-        ref other => panic!("audit M-F: expected ConstInt(16777216, I32), got {:?}", other),
+        ref other => panic!(
+            "audit M-F: expected ConstInt(16777216, I32), got {:?}",
+            other
+        ),
     }
 }
 
@@ -1486,14 +1986,22 @@ fn audit_const_fold_popcount_uses_inst_ty() {
     // change makes the source carry a different width.
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(0xFF, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(0xFF, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let pc = push(&mut f, InstKind::PopCount(v), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(pc)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == pc).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == pc)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(8, IntWidth::I32) => { /* good */ }
         ref other => panic!("expected ConstInt(8, I32), got {:?}", other),
@@ -1514,23 +2022,50 @@ fn audit_const_fold_popcount_uses_inst_ty() {
 fn audit_int_to_f32_then_fsub_wrong_answer_today() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
-    let i_a = push(&mut f, InstKind::ConstInt(16_777_217, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let i_b = push(&mut f, InstKind::ConstInt(16_777_216, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let f_a = push(&mut f, InstKind::IntToFloat(i_a, FloatWidth::F32), IrType::Float(FloatWidth::F32));
-    let f_b = push(&mut f, InstKind::IntToFloat(i_b, FloatWidth::F32), IrType::Float(FloatWidth::F32));
-    let diff = push(&mut f, InstKind::FSub(f_a, f_b), IrType::Float(FloatWidth::F32));
+    let i_a = push(
+        &mut f,
+        InstKind::ConstInt(16_777_217, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let i_b = push(
+        &mut f,
+        InstKind::ConstInt(16_777_216, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let f_a = push(
+        &mut f,
+        InstKind::IntToFloat(i_a, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
+    let f_b = push(
+        &mut f,
+        InstKind::IntToFloat(i_b, FloatWidth::F32),
+        IrType::Float(FloatWidth::F32),
+    );
+    let diff = push(
+        &mut f,
+        InstKind::FSub(f_a, f_b),
+        IrType::Float(FloatWidth::F32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(diff)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
 
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == diff).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == diff)
+        .unwrap();
     match folded.kind {
         // Expected: 0.0 (after correct f32 rounding both inputs are 16777216).
         // Bug:      1.0 (without rounding 16777217.0 - 16777216.0 = 1.0).
-        InstKind::ConstFloat(v, FloatWidth::F32) => assert_eq!(v, 0.0,
-            "expected 0.0 (both inputs round to 16777216 in f32), got {}", v),
+        InstKind::ConstFloat(v, FloatWidth::F32) => assert_eq!(
+            v, 0.0,
+            "expected 0.0 (both inputs round to 16777216 in f32), got {}",
+            v
+        ),
         ref other => panic!("expected ConstFloat, got {:?}", other),
     }
 }
@@ -1542,15 +2077,27 @@ fn audit_int_to_f32_then_fsub_wrong_answer_today() {
 fn audit_const_fold_imul_i8_overflow_wraps() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
-    let a = push(&mut f, InstKind::ConstInt(100, IntWidth::I8), IrType::Int(IntWidth::I8));
-    let b = push(&mut f, InstKind::ConstInt(100, IntWidth::I8), IrType::Int(IntWidth::I8));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(100, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(100, IntWidth::I8),
+        IrType::Int(IntWidth::I8),
+    );
     let p = push(&mut f, InstKind::IMul(a, b), IrType::Int(IntWidth::I8));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(p)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == p).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == p)
+        .unwrap();
     match folded.kind {
         // 100 * 100 = 10000; low byte = 0x10 = 16; sext = 16
         InstKind::ConstInt(v, IntWidth::I8) => assert_eq!(v, 16, "expected i8 wrap, got {}", v),
@@ -1583,7 +2130,11 @@ fn audit_const_fold_non_rpo_block_order() {
 
     let a_block = f.create_block("a");
     let b_block = f.create_block("b");
-    let one = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let one = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Branch(a_block, vec![]));
 
@@ -1616,20 +2167,28 @@ fn audit_const_fold_non_rpo_block_order() {
     pm.run(&mut m);
 
     let post = verify_module(&m);
-    assert!(post.is_empty(), "non-RPO block order broke optimization: {:?}", post);
+    assert!(
+        post.is_empty(),
+        "non-RPO block order broke optimization: {:?}",
+        post
+    );
 
     // The fold MUST have converged: the IAdd's defining instruction
     // (still carrying `sum_id`) should now be the constant `3`, or
     // the entire dead chain should have been DCE'd and the terminator
     // should reference a const(3) directly.
     let f = &m.functions[0];
-    let terminator_val = f.blocks.iter()
+    let terminator_val = f
+        .blocks
+        .iter()
         .find_map(|b| match &b.terminator {
             Some(Terminator::Return(Some(v))) => Some(*v),
             _ => None,
         })
         .expect("no Return terminator");
-    let term_kind = f.blocks.iter()
+    let term_kind = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .find(|i| i.id == terminator_val)
         .map(|i| i.kind.clone())
@@ -1705,7 +2264,7 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
     let a_sum = f.next_value_id();
     f.block_mut(a_block).insts.push(Inst {
         id: a_sum,
-        kind: InstKind::IAdd(c1, c2),    // folds to const(30)
+        kind: InstKind::IAdd(c1, c2), // folds to const(30)
         ty: IrType::Int(IntWidth::I32),
         span: dummy_span(),
     });
@@ -1722,7 +2281,7 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
     });
     f.block_mut(b_block).insts.push(Inst {
         id: b_sum,
-        kind: InstKind::IAdd(a_sum, seven),  // folds to const(37)
+        kind: InstKind::IAdd(a_sum, seven), // folds to const(37)
         ty: IrType::Int(IntWidth::I32),
         span: dummy_span(),
     });
@@ -1762,13 +2321,17 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
     // The fold MUST converge in a single `ConstFold.run()` call —
     // the terminator's value should now define ConstInt(37) (= 10+20+7).
     let f = &m.functions[0];
-    let terminator_val = f.blocks.iter()
+    let terminator_val = f
+        .blocks
+        .iter()
         .find_map(|blk| match &blk.terminator {
             Some(Terminator::Return(Some(v))) => Some(*v),
             _ => None,
         })
         .expect("no Return terminator");
-    let term_kind = f.blocks.iter()
+    let term_kind = f
+        .blocks
+        .iter()
         .flat_map(|b| b.insts.iter())
         .find(|i| i.id == terminator_val)
         .map(|i| i.kind.clone())
@@ -1793,15 +2356,27 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
 fn audit_const_fold_shl_full_width_wrap() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-    let v = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let cnt = push(&mut f, InstKind::ConstInt(31, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v = push(
+        &mut f,
+        InstKind::ConstInt(1, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let cnt = push(
+        &mut f,
+        InstKind::ConstInt(31, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
     let s = push(&mut f, InstKind::Shl(v, cnt), IrType::Int(IntWidth::I32));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(v, IntWidth::I32) => {
             // 1 << 31 in i32 is INT_MIN = -2147483648.
@@ -1818,15 +2393,27 @@ fn audit_const_fold_shl_full_width_wrap() {
 fn audit_const_fold_iadd_i16_overflow() {
     let mut m = Module::new("t".into());
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I16));
-    let a = push(&mut f, InstKind::ConstInt(32000, IntWidth::I16), IrType::Int(IntWidth::I16));
-    let b = push(&mut f, InstKind::ConstInt(1000,  IntWidth::I16), IrType::Int(IntWidth::I16));
+    let a = push(
+        &mut f,
+        InstKind::ConstInt(32000, IntWidth::I16),
+        IrType::Int(IntWidth::I16),
+    );
+    let b = push(
+        &mut f,
+        InstKind::ConstInt(1000, IntWidth::I16),
+        IrType::Int(IntWidth::I16),
+    );
     let s = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I16));
     let entry = f.entry;
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(s)));
     m.add_function(f);
 
     ConstFold.run(&mut m);
-    let folded = m.functions[0].blocks[0].insts.iter().find(|i| i.id == s).unwrap();
+    let folded = m.functions[0].blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.id == s)
+        .unwrap();
     match folded.kind {
         InstKind::ConstInt(v, IntWidth::I16) => {
             // 32000 + 1000 = 33000, wraps in i16 to -32536
@@ -1850,14 +2437,25 @@ fn audit_const_prop_merge_after_drop() {
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
-    let v_a = push(&mut f, InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
-    let v_b = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+    let v_a = push(
+        &mut f,
+        InstKind::ConstInt(10, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
+    let v_b = push(
+        &mut f,
+        InstKind::ConstInt(20, IntWidth::I32),
+        IrType::Int(IntWidth::I32),
+    );
 
     let a = f.create_block("a");
     let b = f.create_block("b");
     let merge = f.create_block("merge");
     let m_param = f.next_value_id();
-    f.block_mut(merge).params.push(BlockParam { id: m_param, ty: IrType::Int(IntWidth::I32) });
+    f.block_mut(merge).params.push(BlockParam {
+        id: m_param,
+        ty: IrType::Int(IntWidth::I32),
+    });
 
     f.block_mut(a).terminator = Some(Terminator::Branch(merge, vec![v_a]));
     f.block_mut(b).terminator = Some(Terminator::Branch(merge, vec![v_b]));
@@ -1879,11 +2477,20 @@ fn audit_const_prop_merge_after_drop() {
     ConstProp.run(&mut m);
 
     let post = verify_module(&m);
-    assert!(post.is_empty(),
-        "const_prop produced an invalid module after dropping the false arm: {:?}", post);
+    assert!(
+        post.is_empty(),
+        "const_prop produced an invalid module after dropping the false arm: {:?}",
+        post
+    );
 
     // After folding, B should be gone but merge should still exist.
     let f = &m.functions[0];
-    assert!(!f.blocks.iter().any(|bk| bk.id == b), "block B should be pruned");
-    assert!(f.blocks.iter().any(|bk| bk.id == merge), "merge should remain");
+    assert!(
+        !f.blocks.iter().any(|bk| bk.id == b),
+        "block B should be pruned"
+    );
+    assert!(
+        f.blocks.iter().any(|bk| bk.id == merge),
+        "merge should remain"
+    );
 }

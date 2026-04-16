@@ -63,13 +63,29 @@ struct Key {
 /// instruction is impure or otherwise not a CSE candidate.
 fn key_of(inst: &Inst) -> Option<Key> {
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
-        Some(Key { tag, operands: ops, aux, name: None, ty: inst.ty.clone() })
+        Some(Key {
+            tag,
+            operands: ops,
+            aux,
+            name: None,
+            ty: inst.ty.clone(),
+        })
     };
     let mk_named = |tag: u32, name: String| -> Option<Key> {
-        Some(Key { tag, operands: vec![], aux: 0, name: Some(name), ty: inst.ty.clone() })
+        Some(Key {
+            tag,
+            operands: vec![],
+            aux: 0,
+            name: Some(name),
+            ty: inst.ty.clone(),
+        })
     };
     let canon = |a: ValueId, b: ValueId| -> Vec<ValueId> {
-        if a.0 <= b.0 { vec![a, b] } else { vec![b, a] }
+        if a.0 <= b.0 {
+            vec![a, b]
+        } else {
+            vec![b, a]
+        }
     };
 
     match &inst.kind {
@@ -87,7 +103,7 @@ fn key_of(inst: &Inst) -> Option<Key> {
         // at different bit patterns dedupe. Example: `ConstInt(255, I8)`
         // and `ConstInt(-1, I8)` both represent -1 in i8 — keying on
         // the raw `*v` fails to dedupe them.
-        InstKind::ConstInt(v, w)   => {
+        InstKind::ConstInt(v, w) => {
             let bits = w.bits();
             // Sign-extend at width: low `bits` bits → i64 sign-extended.
             let signed = if bits >= 128 {
@@ -99,7 +115,7 @@ fn key_of(inst: &Inst) -> Option<Key> {
             mk(1, vec![], signed)
         }
         InstKind::ConstFloat(v, _) => mk(2, vec![], v.to_bits() as i128),
-        InstKind::ConstBool(b)     => mk(3, vec![], if *b { 1 } else { 0 }),
+        InstKind::ConstBool(b) => mk(3, vec![], if *b { 1 } else { 0 }),
 
         // Integer arithmetic --------------------------------------------
         InstKind::IAdd(a, b) => mk(10, canon(*a, *b), 0),
@@ -107,58 +123,66 @@ fn key_of(inst: &Inst) -> Option<Key> {
         InstKind::IMul(a, b) => mk(12, canon(*a, *b), 0),
         InstKind::IDiv(a, b) => mk(13, vec![*a, *b], 0),
         InstKind::IMod(a, b) => mk(14, vec![*a, *b], 0),
-        InstKind::INeg(a)    => mk(15, vec![*a], 0),
+        InstKind::INeg(a) => mk(15, vec![*a], 0),
 
         // Float arithmetic ----------------------------------------------
         InstKind::FAdd(a, b) => mk(20, canon(*a, *b), 0),
         InstKind::FSub(a, b) => mk(21, vec![*a, *b], 0),
         InstKind::FMul(a, b) => mk(22, canon(*a, *b), 0),
         InstKind::FDiv(a, b) => mk(23, vec![*a, *b], 0),
-        InstKind::FNeg(a)    => mk(24, vec![*a], 0),
-        InstKind::FAbs(a)    => mk(25, vec![*a], 0),
-        InstKind::FSqrt(a)   => mk(26, vec![*a], 0),
+        InstKind::FNeg(a) => mk(24, vec![*a], 0),
+        InstKind::FAbs(a) => mk(25, vec![*a], 0),
+        InstKind::FSqrt(a) => mk(26, vec![*a], 0),
         InstKind::FPow(a, b) => mk(27, vec![*a, *b], 0),
 
         // Comparisons ---------------------------------------------------
         InstKind::ICmp(op, a, b) => {
             let aux = *op as i128;
-            let ops = match op { CmpOp::Eq | CmpOp::Ne => canon(*a, *b), _ => vec![*a, *b] };
+            let ops = match op {
+                CmpOp::Eq | CmpOp::Ne => canon(*a, *b),
+                _ => vec![*a, *b],
+            };
             mk(30, ops, aux)
         }
         InstKind::FCmp(op, a, b) => {
             let aux = *op as i128;
-            let ops = match op { CmpOp::Eq | CmpOp::Ne => canon(*a, *b), _ => vec![*a, *b] };
+            let ops = match op {
+                CmpOp::Eq | CmpOp::Ne => canon(*a, *b),
+                _ => vec![*a, *b],
+            };
             mk(31, ops, aux)
         }
 
         // Logic ---------------------------------------------------------
         InstKind::And(a, b) => mk(40, canon(*a, *b), 0),
-        InstKind::Or(a, b)  => mk(41, canon(*a, *b), 0),
-        InstKind::Not(a)    => mk(42, vec![*a], 0),
+        InstKind::Or(a, b) => mk(41, canon(*a, *b), 0),
+        InstKind::Not(a) => mk(42, vec![*a], 0),
 
         InstKind::Select(c, t, f) => mk(43, vec![*c, *t, *f], 0),
 
         // Bitwise -------------------------------------------------------
         InstKind::BitAnd(a, b) => mk(50, canon(*a, *b), 0),
-        InstKind::BitOr(a, b)  => mk(51, canon(*a, *b), 0),
+        InstKind::BitOr(a, b) => mk(51, canon(*a, *b), 0),
         InstKind::BitXor(a, b) => mk(52, canon(*a, *b), 0),
-        InstKind::BitNot(a)    => mk(53, vec![*a], 0),
-        InstKind::Shl(a, b)    => mk(54, vec![*a, *b], 0),
-        InstKind::LShr(a, b)   => mk(55, vec![*a, *b], 0),
-        InstKind::AShr(a, b)   => mk(56, vec![*a, *b], 0),
-        InstKind::CountLeadingZeros(a)  => mk(57, vec![*a], 0),
+        InstKind::BitNot(a) => mk(53, vec![*a], 0),
+        InstKind::Shl(a, b) => mk(54, vec![*a, *b], 0),
+        InstKind::LShr(a, b) => mk(55, vec![*a, *b], 0),
+        InstKind::AShr(a, b) => mk(56, vec![*a, *b], 0),
+        InstKind::CountLeadingZeros(a) => mk(57, vec![*a], 0),
         InstKind::CountTrailingZeros(a) => mk(58, vec![*a], 0),
-        InstKind::PopCount(a)           => mk(59, vec![*a], 0),
+        InstKind::PopCount(a) => mk(59, vec![*a], 0),
 
         // Conversions ---------------------------------------------------
-        InstKind::IntToFloat(v, fw)     => mk(60, vec![*v], fw.bits() as i128),
-        InstKind::FloatToInt(v, w)      => mk(61, vec![*v], w.bits() as i128),
-        InstKind::FloatExtend(v, fw)    => mk(62, vec![*v], fw.bits() as i128),
-        InstKind::FloatTrunc(v, fw)     => mk(63, vec![*v], fw.bits() as i128),
-        InstKind::IntExtend(v, w, sgn)  => mk(64, vec![*v], (w.bits() as i128) | ((*sgn as i128) << 32)),
-        InstKind::IntTrunc(v, w)        => mk(65, vec![*v], w.bits() as i128),
-        InstKind::PtrToInt(v)           => mk(66, vec![*v], 0),
-        InstKind::IntToPtr(v, _)        => mk(67, vec![*v], 0),
+        InstKind::IntToFloat(v, fw) => mk(60, vec![*v], fw.bits() as i128),
+        InstKind::FloatToInt(v, w) => mk(61, vec![*v], w.bits() as i128),
+        InstKind::FloatExtend(v, fw) => mk(62, vec![*v], fw.bits() as i128),
+        InstKind::FloatTrunc(v, fw) => mk(63, vec![*v], fw.bits() as i128),
+        InstKind::IntExtend(v, w, sgn) => {
+            mk(64, vec![*v], (w.bits() as i128) | ((*sgn as i128) << 32))
+        }
+        InstKind::IntTrunc(v, w) => mk(65, vec![*v], w.bits() as i128),
+        InstKind::PtrToInt(v) => mk(66, vec![*v], 0),
+        InstKind::IntToPtr(v, _) => mk(67, vec![*v], 0),
 
         // Address arithmetic --------------------------------------------
         InstKind::GetElementPtr(base, idxs) => {
@@ -188,7 +212,9 @@ fn key_of(inst: &Inst) -> Option<Key> {
 pub struct LocalCse;
 
 impl Pass for LocalCse {
-    fn name(&self) -> &'static str { "local-cse" }
+    fn name(&self) -> &'static str {
+        "local-cse"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -211,7 +237,9 @@ impl Pass for LocalCse {
                     }
                 }
             }
-            if rewrite_map.is_empty() { continue; }
+            if rewrite_map.is_empty() {
+                continue;
+            }
 
             // Audit B-7: in **local** CSE, every entry maps a later
             // duplicate to its block's *first* occurrence — and that
@@ -261,18 +289,27 @@ fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth, FloatWidth};
-    use crate::lexer::{Span, Position};
+    use crate::ir::types::{FloatWidth, IntWidth, IrType};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
@@ -285,8 +322,16 @@ mod tests {
         // ret %3 → after CSE → ret %2 (and %3 is dead)
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-        let a = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let c1 = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I32));
         let c2 = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I32));
         let entry = f.entry;
@@ -308,8 +353,16 @@ mod tests {
         // Should canonicalize to the same key.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-        let a = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let c1 = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I32));
         let c2 = push(&mut f, InstKind::IAdd(b, a), IrType::Int(IntWidth::I32));
         let _ = c2;
@@ -328,8 +381,16 @@ mod tests {
     fn non_commutative_isub_does_not_dedupe_swapped() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-        let a = push(&mut f, InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut f, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut f,
+            InstKind::ConstInt(5, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstInt(3, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let _c1 = push(&mut f, InstKind::ISub(a, b), IrType::Int(IntWidth::I32));
         let c2 = push(&mut f, InstKind::ISub(b, a), IrType::Int(IntWidth::I32));
         let entry = f.entry;
@@ -345,7 +406,8 @@ mod tests {
         // Loads must NOT be deduplicated by local CSE.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        let addr = push(&mut f,
+        let addr = push(
+            &mut f,
             InstKind::Alloca(IrType::Int(IntWidth::I32)),
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
         );
@@ -362,8 +424,16 @@ mod tests {
     fn fmul_dedupes() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F64));
-        let a = push(&mut f, InstKind::ConstFloat(1.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
-        let b = push(&mut f, InstKind::ConstFloat(2.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
+        let a = push(
+            &mut f,
+            InstKind::ConstFloat(1.5, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstFloat(2.5, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
         let m1 = push(&mut f, InstKind::FMul(a, b), IrType::Float(FloatWidth::F64));
         let m2 = push(&mut f, InstKind::FMul(b, a), IrType::Float(FloatWidth::F64));
         let entry = f.entry;
@@ -382,8 +452,16 @@ mod tests {
         // Lt is not commutative — must not collapse.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Bool);
-        let a = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let _c1 = push(&mut f, InstKind::ICmp(CmpOp::Lt, a, b), IrType::Bool);
         let c2 = push(&mut f, InstKind::ICmp(CmpOp::Lt, b, a), IrType::Bool);
         let entry = f.entry;

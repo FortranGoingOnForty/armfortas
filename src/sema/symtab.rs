@@ -4,8 +4,8 @@
 //! mechanisms: local declaration, USE association, host association, and
 //! IMPORT. Handles implicit typing and case-insensitive lookup.
 
-use std::collections::HashMap;
 use crate::lexer::Span;
+use std::collections::HashMap;
 
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
@@ -30,16 +30,20 @@ impl SymbolTable {
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
         };
-        Self { scopes: vec![global], current: 0 }
+        Self {
+            scopes: vec![global],
+            current: 0,
+        }
     }
 }
 
 impl Default for SymbolTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SymbolTable {
-
     /// Create a new child scope of the current scope.
     pub fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
         let id = self.scopes.len();
@@ -161,7 +165,10 @@ impl SymbolTable {
             // 2. Direct USE association.
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
-                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name) {
+                    if let Some(sym) = self.scopes[assoc.source_scope]
+                        .symbols
+                        .get(&assoc.original_name)
+                    {
                         if sym.attrs.access != Access::Private || assoc.is_submodule_access {
                             return Some(sym);
                         }
@@ -232,7 +239,10 @@ impl SymbolTable {
         for scope in &self.scopes {
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
-                    if let Some(sym) = self.scopes[assoc.source_scope].symbols.get(&assoc.original_name) {
+                    if let Some(sym) = self.scopes[assoc.source_scope]
+                        .symbols
+                        .get(&assoc.original_name)
+                    {
                         return Some(sym);
                     }
                 }
@@ -284,7 +294,10 @@ impl SymbolTable {
     pub fn set_implicit_rule(&mut self, start: char, end: char, itype: ImplicitType) {
         let scope = &mut self.scopes[self.current];
         for c in start..=end {
-            scope.implicit_rules.rules.insert(c.to_ascii_lowercase(), itype);
+            scope
+                .implicit_rules
+                .rules
+                .insert(c.to_ascii_lowercase(), itype);
         }
     }
 
@@ -336,8 +349,14 @@ impl SymbolTable {
         let key = name.to_lowercase();
         self.scopes.iter().find_map(|s| {
             if let ScopeKind::Module(ref n) = s.kind {
-                if n.to_lowercase() == key { Some(s.id) } else { None }
-            } else { None }
+                if n.to_lowercase() == key {
+                    Some(s.id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         })
     }
 }
@@ -509,15 +528,27 @@ impl ImplicitRules {
     /// Standard Fortran default: I-N integer, everything else real.
     pub fn default_fortran() -> Self {
         let mut rules = HashMap::new();
-        for c in 'a'..='h' { rules.insert(c, ImplicitType::Real); }
-        for c in 'i'..='n' { rules.insert(c, ImplicitType::Integer); }
-        for c in 'o'..='z' { rules.insert(c, ImplicitType::Real); }
-        Self { none_type: false, none_external: false, rules }
+        for c in 'a'..='h' {
+            rules.insert(c, ImplicitType::Real);
+        }
+        for c in 'i'..='n' {
+            rules.insert(c, ImplicitType::Integer);
+        }
+        for c in 'o'..='z' {
+            rules.insert(c, ImplicitType::Real);
+        }
+        Self {
+            none_type: false,
+            none_external: false,
+            rules,
+        }
     }
 
     /// Look up the implicit type for a name's first letter.
     pub fn type_for(&self, name: &str) -> Option<ImplicitType> {
-        if self.none_type { return None; }
+        if self.none_type {
+            return None;
+        }
         let first = name.chars().next()?.to_ascii_lowercase();
         self.rules.get(&first).copied()
     }
@@ -543,7 +574,11 @@ pub struct SemaError {
 
 impl std::fmt::Display for SemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}: error: {}", self.span.start.line, self.span.start.col, self.msg)
+        write!(
+            f,
+            "{}:{}: error: {}",
+            self.span.start.line, self.span.start.col, self.msg
+        )
     }
 }
 
@@ -555,7 +590,11 @@ mod tests {
     use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
-        Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } }
+        Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        }
     }
 
     fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
@@ -596,7 +635,8 @@ mod tests {
     fn case_insensitive_lookup() {
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Program("main".into()));
-        st.define(make_symbol("MyVar", SymbolKind::Variable)).unwrap();
+        st.define(make_symbol("MyVar", SymbolKind::Variable))
+            .unwrap();
         assert!(st.lookup("myvar").is_some());
         assert!(st.lookup("MYVAR").is_some());
         assert!(st.lookup("MyVar").is_some());
@@ -707,7 +747,8 @@ mod tests {
         let mut st = SymbolTable::new();
 
         let mod_scope = st.push_scope(ScopeKind::Module("mymod".into()));
-        st.define(make_symbol("original_name", SymbolKind::Variable)).unwrap();
+        st.define(make_symbol("original_name", SymbolKind::Variable))
+            .unwrap();
         st.pop_scope();
 
         st.push_scope(ScopeKind::Program("main".into()));
@@ -775,11 +816,23 @@ mod tests {
     fn implicit_default_rules() {
         let st = SymbolTable::new();
         // i-n → integer.
-        assert_eq!(st.scopes[0].implicit_rules.type_for("index"), Some(ImplicitType::Integer));
-        assert_eq!(st.scopes[0].implicit_rules.type_for("jmax"), Some(ImplicitType::Integer));
+        assert_eq!(
+            st.scopes[0].implicit_rules.type_for("index"),
+            Some(ImplicitType::Integer)
+        );
+        assert_eq!(
+            st.scopes[0].implicit_rules.type_for("jmax"),
+            Some(ImplicitType::Integer)
+        );
         // a-h, o-z → real.
-        assert_eq!(st.scopes[0].implicit_rules.type_for("x"), Some(ImplicitType::Real));
-        assert_eq!(st.scopes[0].implicit_rules.type_for("alpha"), Some(ImplicitType::Real));
+        assert_eq!(
+            st.scopes[0].implicit_rules.type_for("x"),
+            Some(ImplicitType::Real)
+        );
+        assert_eq!(
+            st.scopes[0].implicit_rules.type_for("alpha"),
+            Some(ImplicitType::Real)
+        );
     }
 
     #[test]
@@ -797,7 +850,10 @@ mod tests {
         st.push_scope(ScopeKind::Program("main".into()));
         st.set_implicit_rule('a', 'z', ImplicitType::DoublePrecision);
         assert_eq!(st.implicit_type("x"), Some(ImplicitType::DoublePrecision));
-        assert_eq!(st.implicit_type("index"), Some(ImplicitType::DoublePrecision));
+        assert_eq!(
+            st.implicit_type("index"),
+            Some(ImplicitType::DoublePrecision)
+        );
     }
 
     // ---- Module scope finding ----

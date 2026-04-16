@@ -9,23 +9,27 @@
 //!
 //! This avoids splicing instructions between blocks entirely.
 
-use std::collections::HashSet;
-use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors};
+use super::dep_analysis;
 use super::loop_utils::remap_inst_kind;
 use super::loop_utils::{find_preheader, resolve_const_int};
-use super::dep_analysis;
 use super::pass::Pass;
+use crate::ir::inst::*;
+use crate::ir::walk::{find_natural_loops, predecessors};
+use std::collections::HashSet;
 
 pub struct LoopFusion;
 
 impl Pass for LoopFusion {
-    fn name(&self) -> &'static str { "loop-fusion" }
+    fn name(&self) -> &'static str {
+        "loop-fusion"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if fusion_in_function(func) { changed = true; }
+            if fusion_in_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -33,63 +37,99 @@ impl Pass for LoopFusion {
 
 fn fusion_in_function(func: &mut Function) -> bool {
     let loops = find_natural_loops(func);
-    if loops.len() < 2 { return false; }
+    if loops.len() < 2 {
+        return false;
+    }
     let preds = predecessors(func);
 
     for i in 0..loops.len() {
-        for j in (i+1)..loops.len() {
+        for j in (i + 1)..loops.len() {
             let lp_a = &loops[i];
             let lp_b = &loops[j];
 
             // Both need preheaders and single latches.
-            let Some(_ph_a) = find_preheader(func, lp_a, &preds) else { continue };
-            let Some(ph_b) = find_preheader(func, lp_b, &preds) else { continue };
-            if lp_a.latches.len() != 1 || lp_b.latches.len() != 1 { continue; }
+            let Some(_ph_a) = find_preheader(func, lp_a, &preds) else {
+                continue;
+            };
+            let Some(ph_b) = find_preheader(func, lp_b, &preds) else {
+                continue;
+            };
+            if lp_a.latches.len() != 1 || lp_b.latches.len() != 1 {
+                continue;
+            }
             let latch_a = lp_a.latches[0];
             let latch_b = lp_b.latches[0];
 
             // Both headers must have exactly 1 block param (IV).
             let hdr_a = func.block(lp_a.header);
             let hdr_b = func.block(lp_b.header);
-            if hdr_a.params.len() != 1 || hdr_b.params.len() != 1 { continue; }
+            if hdr_a.params.len() != 1 || hdr_b.params.len() != 1 {
+                continue;
+            }
             let iv_a = hdr_a.params[0].id;
             let iv_b = hdr_b.params[0].id;
 
             // Neither loop should be nested inside the other.
-            if lp_a.body.iter().any(|b| lp_b.body.contains(b)) { continue; }
-            if lp_b.body.iter().any(|b| lp_a.body.contains(b)) { continue; }
+            if lp_a.body.iter().any(|b| lp_b.body.contains(b)) {
+                continue;
+            }
+            if lp_b.body.iter().any(|b| lp_a.body.contains(b)) {
+                continue;
+            }
 
             // Neither loop should contain inner loops. Fusing loops
             // with nested inner loops requires more complex handling
             // (inner loop blocks need reparenting). V1: simple only.
-            let has_inner_a = loops.iter().any(|other|
-                other.header != lp_a.header && lp_a.body.is_superset(&other.body));
-            let has_inner_b = loops.iter().any(|other|
-                other.header != lp_b.header && lp_b.body.is_superset(&other.body));
-            if has_inner_a || has_inner_b { continue; }
+            let has_inner_a = loops
+                .iter()
+                .any(|other| other.header != lp_a.header && lp_a.body.is_superset(&other.body));
+            let has_inner_b = loops
+                .iter()
+                .any(|other| other.header != lp_b.header && lp_b.body.is_superset(&other.body));
+            if has_inner_a || has_inner_b {
+                continue;
+            }
 
             // Skip loops produced by fission in the same pipeline
             // iteration — they have clone/bridge blocks that fusion
             // can't handle safely.
-            let has_clone_a = lp_a.body.iter().any(|&b|
-                func.block(b).name.contains("clone") || func.block(b).name.contains("fission"));
-            let has_clone_b = lp_b.body.iter().any(|&b|
-                func.block(b).name.contains("clone") || func.block(b).name.contains("fission"));
-            if has_clone_a || has_clone_b { continue; }
+            let has_clone_a = lp_a.body.iter().any(|&b| {
+                func.block(b).name.contains("clone") || func.block(b).name.contains("fission")
+            });
+            let has_clone_b = lp_b.body.iter().any(|&b| {
+                func.block(b).name.contains("clone") || func.block(b).name.contains("fission")
+            });
+            if has_clone_a || has_clone_b {
+                continue;
+            }
 
             // Loop A's exit must be (or flow to) loop B's preheader.
             let exit_a = find_loop_exit(func, lp_a);
             let Some(exit_a) = exit_a else { continue };
-            if exit_a != ph_b && !flows_to(func, exit_a, ph_b) { continue; }
+            if exit_a != ph_b && !flows_to(func, exit_a, ph_b) {
+                continue;
+            }
 
             // Matching iteration spaces.
-            let Some(init_a) = get_init_const(func, lp_a, &preds) else { continue };
-            let Some(init_b) = get_init_const(func, lp_b, &preds) else { continue };
-            if init_a != init_b { continue; }
+            let Some(init_a) = get_init_const(func, lp_a, &preds) else {
+                continue;
+            };
+            let Some(init_b) = get_init_const(func, lp_b, &preds) else {
+                continue;
+            };
+            if init_a != init_b {
+                continue;
+            }
 
-            let Some(bound_a) = find_bound_const(func, lp_a, iv_a) else { continue };
-            let Some(bound_b) = find_bound_const(func, lp_b, iv_b) else { continue };
-            if bound_a != bound_b { continue; }
+            let Some(bound_a) = find_bound_const(func, lp_a, iv_a) else {
+                continue;
+            };
+            let Some(bound_b) = find_bound_const(func, lp_b, iv_b) else {
+                continue;
+            };
+            if bound_a != bound_b {
+                continue;
+            }
 
             // Dep analysis: fusion legal?
             if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, iv_a, iv_b) {
@@ -123,11 +163,7 @@ fn fusion_in_function(func: &mut Function) -> bool {
 
             // ---- Perform fusion via latch redirect ----
             do_fusion_latch_redirect(
-                func, lp_a, lp_b,
-                latch_a, latch_b,
-                iv_a, iv_b,
-                body_b_id, cmp_b_id,
-                exit_a, exit_b,
+                func, lp_a, lp_b, latch_a, latch_b, iv_a, iv_b, body_b_id, cmp_b_id, exit_a, exit_b,
             );
             return true;
         }
@@ -158,10 +194,16 @@ fn do_fusion_latch_redirect(
     sub_map.insert(iv_b, iv_a);
     for &bid in &lp_b.body {
         let old_insts: Vec<Inst> = func.block(bid).insts.clone();
-        let new_insts: Vec<Inst> = old_insts.into_iter().map(|inst| {
-            let new_kind = remap_inst_kind(&inst.kind, &sub_map);
-            Inst { kind: new_kind, ..inst }
-        }).collect();
+        let new_insts: Vec<Inst> = old_insts
+            .into_iter()
+            .map(|inst| {
+                let new_kind = remap_inst_kind(&inst.kind, &sub_map);
+                Inst {
+                    kind: new_kind,
+                    ..inst
+                }
+            })
+            .collect();
         func.block_mut(bid).insts = new_insts;
         // Also remap terminator operands.
         let old_term = func.block(bid).terminator.clone();
@@ -210,7 +252,9 @@ fn do_fusion_latch_redirect(
 
     // Find the block that branches to latch_a (A's body exit).
     let a_body_exit = find_branch_to(func, lp_a, latch_a);
-    let Some(a_body_exit_id) = a_body_exit else { return };
+    let Some(a_body_exit_id) = a_body_exit else {
+        return;
+    };
 
     // Redirect A's body exit → B's body.
     redirect_branch(func, a_body_exit_id, latch_a, body_b_id);
@@ -220,8 +264,7 @@ fn do_fusion_latch_redirect(
     // But B's latch's iv_next_b should be discarded — A's latch will
     // compute iv_next_a. So B's latch should just branch to A's latch
     // with no args.
-    func.block_mut(latch_b).terminator =
-        Some(Terminator::Branch(latch_a, vec![]));
+    func.block_mut(latch_b).terminator = Some(Terminator::Branch(latch_a, vec![]));
 
     // Step 3: A's cmp exit (exit_a) should now go to B's exit (exit_b)
     // since B's header/cmp are bypassed. Copy B's exit block content
@@ -235,7 +278,9 @@ fn do_fusion_latch_redirect(
     func.block_mut(lp_b.header).terminator = Some(Terminator::Unreachable);
     // Mark B's cmp blocks too.
     for &bid in &lp_b.body {
-        if bid == body_b_id || bid == latch_b { continue; }
+        if bid == body_b_id || bid == latch_b {
+            continue;
+        }
         func.block_mut(bid).terminator = Some(Terminator::Unreachable);
     }
 
@@ -248,7 +293,9 @@ fn find_branch_to(
     target: BlockId,
 ) -> Option<BlockId> {
     for &bid in &lp.body {
-        if bid == target { continue; }
+        if bid == target {
+            continue;
+        }
         let block = func.block(bid);
         match &block.terminator {
             Some(Terminator::Branch(dest, _)) if *dest == target => return Some(bid),
@@ -272,7 +319,9 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
     for &bid in &lp.body {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch { false_dest, .. }) = &block.terminator {
-            if !lp.body.contains(false_dest) { return Some(*false_dest); }
+            if !lp.body.contains(false_dest) {
+                return Some(*false_dest);
+            }
         }
     }
     None
@@ -282,7 +331,9 @@ fn flows_to(func: &Function, from: BlockId, to: BlockId) -> bool {
     let block = func.block(from);
     match &block.terminator {
         Some(Terminator::Branch(dest, _)) => {
-            if *dest == to { return true; }
+            if *dest == to {
+                return true;
+            }
             let mid = func.block(*dest);
             if let Some(Terminator::Branch(dest2, _)) = &mid.terminator {
                 return *dest2 == to;
@@ -306,12 +357,22 @@ fn get_init_const(
     resolve_const_int(func, init_val)
 }
 
-fn find_bound_const(func: &Function, lp: &crate::ir::walk::NaturalLoop, iv: ValueId) -> Option<i64> {
+fn find_bound_const(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    iv: ValueId,
+) -> Option<i64> {
     for &bid in &lp.body {
         let block = func.block(bid);
         for inst in &block.insts {
             if let InstKind::ICmp(_, a, b) = &inst.kind {
-                let bound_val = if *a == iv { *b } else if *b == iv { *a } else { continue };
+                let bound_val = if *a == iv {
+                    *b
+                } else if *b == iv {
+                    *a
+                } else {
+                    continue;
+                };
                 return resolve_const_int(func, bound_val);
             }
         }
@@ -325,9 +386,15 @@ fn find_body_block(
     latch_id: BlockId,
 ) -> Option<BlockId> {
     for &bid in &lp.body {
-        if bid == lp.header || bid == latch_id { continue; }
+        if bid == lp.header || bid == latch_id {
+            continue;
+        }
         let block = func.block(bid);
-        if block.insts.iter().any(|i| matches!(i.kind, InstKind::Store(..))) {
+        if block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::Store(..)))
+        {
             return Some(bid);
         }
     }
@@ -337,7 +404,11 @@ fn find_body_block(
 fn find_cmp_block(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
     for &bid in &lp.body {
         let block = func.block(bid);
-        if block.insts.iter().any(|i| matches!(i.kind, InstKind::ICmp(..))) {
+        if block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::ICmp(..)))
+        {
             return Some(bid);
         }
     }

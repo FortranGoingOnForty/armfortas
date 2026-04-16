@@ -59,36 +59,36 @@ pub enum TokenKind {
     Identifier,
 
     // ---- Operators ----
-    Plus,           // +
-    Minus,          // -
-    Star,           // *
-    Slash,          // /
-    Power,          // **
-    Concat,         // //
-    Eq,             // ==
-    Ne,             // /=
-    Lt,             // <
-    Gt,             // >
-    Le,             // <=
-    Ge,             // >=
+    Plus,   // +
+    Minus,  // -
+    Star,   // *
+    Slash,  // /
+    Power,  // **
+    Concat, // //
+    Eq,     // ==
+    Ne,     // /=
+    Lt,     // <
+    Gt,     // >
+    Le,     // <=
+    Ge,     // >=
     /// .eq. .ne. .lt. .gt. .le. .ge. .and. .or. .not. .eqv. .neqv.
     DotOp(String),
     /// User-defined operator: .myop.
     DefinedOp(String),
 
     // ---- Punctuation ----
-    LParen,         // (
-    RParen,         // )
-    LBracket,       // [
-    RBracket,       // ]
-    Comma,          // ,
-    Colon,          // :
-    ColonColon,     // ::
-    Semicolon,      // ;
-    Percent,        // %
-    Arrow,          // =>
-    Assign,         // =
-    Ampersand,      // & (when not continuation)
+    LParen,     // (
+    RParen,     // )
+    LBracket,   // [
+    RBracket,   // ]
+    Comma,      // ,
+    Colon,      // :
+    ColonColon, // ::
+    Semicolon,  // ;
+    Percent,    // %
+    Arrow,      // =>
+    Assign,     // =
+    Ampersand,  // & (when not continuation)
 
     // ---- Special ----
     Newline,
@@ -144,34 +144,123 @@ impl fmt::Display for TokenKind {
 /// The lexer provides `is_keyword()` as a helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
-    Program, EndProgram, Module, EndModule, Submodule, EndSubmodule,
-    Subroutine, EndSubroutine, Function, EndFunction, BlockData, EndBlockData,
-    Contains, Use, Only, Import,
-    Implicit, None,
-    Integer, Real, DoublePrecision, DoubleComplex, Complex, Character, Logical, Type, Class,
-    Dimension, Allocatable, Pointer, Target, Intent, In, Out, InOut,
-    Optional, Save, Parameter, Value, Volatile, Asynchronous, Protected,
-    Contiguous, External, Intrinsic, Bind,
-    Public, Private,
-    If, Then, Else, ElseIf, EndIf,
-    Do, EndDo, While, Concurrent,
-    Select, Case, EndSelect, Default,
-    Where, EndWhere, Elsewhere,
-    Forall, EndForall,
-    Block, EndBlock,
-    Associate, EndAssociate,
-    Critical, EndCritical,
+    Program,
+    EndProgram,
+    Module,
+    EndModule,
+    Submodule,
+    EndSubmodule,
+    Subroutine,
+    EndSubroutine,
+    Function,
+    EndFunction,
+    BlockData,
+    EndBlockData,
+    Contains,
+    Use,
+    Only,
+    Import,
+    Implicit,
+    None,
+    Integer,
+    Real,
+    DoublePrecision,
+    DoubleComplex,
+    Complex,
+    Character,
+    Logical,
+    Type,
+    Class,
+    Dimension,
+    Allocatable,
+    Pointer,
+    Target,
+    Intent,
+    In,
+    Out,
+    InOut,
+    Optional,
+    Save,
+    Parameter,
+    Value,
+    Volatile,
+    Asynchronous,
+    Protected,
+    Contiguous,
+    External,
+    Intrinsic,
+    Bind,
+    Public,
+    Private,
+    If,
+    Then,
+    Else,
+    ElseIf,
+    EndIf,
+    Do,
+    EndDo,
+    While,
+    Concurrent,
+    Select,
+    Case,
+    EndSelect,
+    Default,
+    Where,
+    EndWhere,
+    Elsewhere,
+    Forall,
+    EndForall,
+    Block,
+    EndBlock,
+    Associate,
+    EndAssociate,
+    Critical,
+    EndCritical,
     Continue,
-    Exit, Cycle, Stop, ErrorStop, Return, GoTo,
-    Call, Print, Write, Read, Open, Close, Inquire,
-    Rewind, Backspace, Endfile, Flush, Wait,
-    Allocate, Deallocate, Nullify,
-    Data, Common, Equivalence, Namelist, Sequence,
+    Exit,
+    Cycle,
+    Stop,
+    ErrorStop,
+    Return,
+    GoTo,
+    Call,
+    Print,
+    Write,
+    Read,
+    Open,
+    Close,
+    Inquire,
+    Rewind,
+    Backspace,
+    Endfile,
+    Flush,
+    Wait,
+    Allocate,
+    Deallocate,
+    Nullify,
+    Data,
+    Common,
+    Equivalence,
+    Namelist,
+    Sequence,
     Format,
-    Pure, Impure, Elemental, Recursive, NonRecursive,
-    Abstract, Interface, EndInterface, Procedure, Generic, Operator, Assignment,
-    Entry, Result,
-    Enum, Enumerator, EndEnum,
+    Pure,
+    Impure,
+    Elemental,
+    Recursive,
+    NonRecursive,
+    Abstract,
+    Interface,
+    EndInterface,
+    Procedure,
+    Generic,
+    Operator,
+    Assignment,
+    Entry,
+    Result,
+    Enum,
+    Enumerator,
+    EndEnum,
     End,
 }
 
@@ -303,10 +392,21 @@ pub fn is_keyword(name: &str) -> Option<Keyword> {
 // ---- Known dot-operators ----
 
 fn is_known_dot_op(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(),
-        "and" | "or" | "not" | "eqv" | "neqv" |
-        "eq" | "ne" | "lt" | "gt" | "le" | "ge" |
-        "true" | "false"
+    matches!(
+        name.to_lowercase().as_str(),
+        "and"
+            | "or"
+            | "not"
+            | "eqv"
+            | "neqv"
+            | "eq"
+            | "ne"
+            | "lt"
+            | "gt"
+            | "le"
+            | "ge"
+            | "true"
+            | "false"
     )
 }
 
@@ -320,7 +420,11 @@ pub struct LexError {
 
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: error: {}", self.span.start.line, self.span.start.col, self.msg)
+        write!(
+            f,
+            "{}:{}: error: {}",
+            self.span.start.line, self.span.start.col, self.msg
+        )
     }
 }
 
@@ -371,7 +475,13 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str, file_id: u32) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1, col: 1, file_id }
+        Self {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+            file_id,
+        }
     }
 
     /// Tokenize the entire source into a Vec.
@@ -382,29 +492,49 @@ impl<'a> Lexer<'a> {
             let tok = lexer.next_token()?;
             let is_eof = tok.kind == TokenKind::Eof;
             tokens.push(tok);
-            if is_eof { break; }
+            if is_eof {
+                break;
+            }
         }
         Ok(tokens)
     }
 
     fn pos(&self) -> Position {
-        Position { line: self.line, col: self.col }
+        Position {
+            line: self.line,
+            col: self.col,
+        }
     }
 
     fn span_from(&self, start: Position) -> Span {
-        Span { file_id: self.file_id, start, end: self.pos() }
+        Span {
+            file_id: self.file_id,
+            start,
+            end: self.pos(),
+        }
     }
 
     fn err(&self, start: Position, msg: String) -> LexError {
-        LexError { span: self.span_from(start), msg }
+        LexError {
+            span: self.span_from(start),
+            msg,
+        }
     }
 
     fn peek(&self) -> u8 {
-        if self.pos < self.src.len() { self.src[self.pos] } else { 0 }
+        if self.pos < self.src.len() {
+            self.src[self.pos]
+        } else {
+            0
+        }
     }
 
     fn peek2(&self) -> u8 {
-        if self.pos + 1 < self.src.len() { self.src[self.pos + 1] } else { 0 }
+        if self.pos + 1 < self.src.len() {
+            self.src[self.pos + 1]
+        } else {
+            0
+        }
     }
 
     fn advance(&mut self) -> u8 {
@@ -432,7 +562,9 @@ impl<'a> Lexer<'a> {
     /// Skip a continuation: & at end of line, optional comment, newline, optional leading &.
     /// Returns true if a continuation was consumed.
     fn try_continuation(&mut self) -> bool {
-        if self.peek() != b'&' { return false; }
+        if self.peek() != b'&' {
+            return false;
+        }
 
         // Save position in case this isn't a continuation.
         let save_pos = self.pos;
@@ -487,7 +619,9 @@ impl<'a> Lexer<'a> {
                 while !self.at_end() && self.peek() != b'\n' {
                     self.advance();
                 }
-                if !self.at_end() { self.advance(); }
+                if !self.at_end() {
+                    self.advance();
+                }
                 continue;
             }
             break;
@@ -600,17 +734,17 @@ impl<'a> Lexer<'a> {
                 let save_col = self.col;
 
                 self.advance(); // &
-                // String-continuation check. A lone `&` ending the
-                // current physical line (optionally with trailing
-                // whitespace and/or a `!comment`) continues the
-                // string on the next line. Anything else — notably a
-                // closing quote before the newline — means the `&`
-                // is a literal character of the string.
-                //
-                // Scan from the current pos without committing: find
-                // the earliest of quote, `!`, or newline. Only newline
-                // (possibly preceded by whitespace or a comment) keeps
-                // is_cont true.
+                                // String-continuation check. A lone `&` ending the
+                                // current physical line (optionally with trailing
+                                // whitespace and/or a `!comment`) continues the
+                                // string on the next line. Anything else — notably a
+                                // closing quote before the newline — means the `&`
+                                // is a literal character of the string.
+                                //
+                                // Scan from the current pos without committing: find
+                                // the earliest of quote, `!`, or newline. Only newline
+                                // (possibly preceded by whitespace or a comment) keeps
+                                // is_cont true.
                 let mut is_cont = false;
                 let mut scan = self.pos;
                 let src_bytes = self.src;
@@ -669,7 +803,9 @@ impl<'a> Lexer<'a> {
                 if is_cont && !self.at_end() {
                     self.advance(); // newline
                     self.skip_spaces();
-                    if self.peek() == b'&' { self.advance(); }
+                    if self.peek() == b'&' {
+                        self.advance();
+                    }
                     continue;
                 }
                 // Not a continuation — restore and treat & as literal character.
@@ -731,7 +867,11 @@ impl<'a> Lexer<'a> {
                 // Could be 1.0e5 (exponent) or 1.eq.2 (dot-operator).
                 // Lookahead past the e/d: if next is digit or +/-, it's an exponent.
                 // If it's another letter (like 'q' in 'eq'), it's a dot-operator.
-                let after_ed = if self.pos + 2 < self.src.len() { self.src[self.pos + 2] } else { 0 };
+                let after_ed = if self.pos + 2 < self.src.len() {
+                    self.src[self.pos + 2]
+                } else {
+                    0
+                };
                 matches!(after_ed, b'0'..=b'9' | b'+' | b'-')
             } else if !next.is_ascii_alphabetic() {
                 // 5. followed by space/operator/newline/EOF — trailing dot real.
@@ -781,7 +921,11 @@ impl<'a> Lexer<'a> {
         }
 
         Ok(Token {
-            kind: if is_real { TokenKind::RealLiteral } else { TokenKind::IntegerLiteral },
+            kind: if is_real {
+                TokenKind::RealLiteral
+            } else {
+                TokenKind::IntegerLiteral
+            },
             text,
             span: self.span_from(start),
         })
@@ -830,7 +974,11 @@ impl<'a> Lexer<'a> {
                 return Ok(Token {
                     kind: TokenKind::Identifier,
                     text: "..".into(),
-                    span: Span { start, end: self.pos(), file_id: self.file_id },
+                    span: Span {
+                        start,
+                        end: self.pos(),
+                        file_id: self.file_id,
+                    },
                 });
             }
             return Err(self.err(start, "unexpected '.'".into()));
@@ -904,24 +1052,48 @@ impl<'a> Lexer<'a> {
         let (kind, text) = match ch {
             b'+' => (TokenKind::Plus, "+"),
             b'-' => (TokenKind::Minus, "-"),
-            b'*' if next == b'*' => { self.advance(); (TokenKind::Power, "**") }
+            b'*' if next == b'*' => {
+                self.advance();
+                (TokenKind::Power, "**")
+            }
             b'*' => (TokenKind::Star, "*"),
-            b'/' if next == b'/' => { self.advance(); (TokenKind::Concat, "//") }
-            b'/' if next == b'=' => { self.advance(); (TokenKind::Ne, "/=") }
+            b'/' if next == b'/' => {
+                self.advance();
+                (TokenKind::Concat, "//")
+            }
+            b'/' if next == b'=' => {
+                self.advance();
+                (TokenKind::Ne, "/=")
+            }
             b'/' => (TokenKind::Slash, "/"),
-            b'=' if next == b'=' => { self.advance(); (TokenKind::Eq, "==") }
-            b'=' if next == b'>' => { self.advance(); (TokenKind::Arrow, "=>") }
+            b'=' if next == b'=' => {
+                self.advance();
+                (TokenKind::Eq, "==")
+            }
+            b'=' if next == b'>' => {
+                self.advance();
+                (TokenKind::Arrow, "=>")
+            }
             b'=' => (TokenKind::Assign, "="),
-            b'<' if next == b'=' => { self.advance(); (TokenKind::Le, "<=") }
+            b'<' if next == b'=' => {
+                self.advance();
+                (TokenKind::Le, "<=")
+            }
             b'<' => (TokenKind::Lt, "<"),
-            b'>' if next == b'=' => { self.advance(); (TokenKind::Ge, ">=") }
+            b'>' if next == b'=' => {
+                self.advance();
+                (TokenKind::Ge, ">=")
+            }
             b'>' => (TokenKind::Gt, ">"),
             b'(' => (TokenKind::LParen, "("),
             b')' => (TokenKind::RParen, ")"),
             b'[' => (TokenKind::LBracket, "["),
             b']' => (TokenKind::RBracket, "]"),
             b',' => (TokenKind::Comma, ","),
-            b':' if next == b':' => { self.advance(); (TokenKind::ColonColon, "::") }
+            b':' if next == b':' => {
+                self.advance();
+                (TokenKind::ColonColon, "::")
+            }
             b':' => (TokenKind::Colon, ":"),
             b';' => (TokenKind::Semicolon, ";"),
             b'%' => (TokenKind::Percent, "%"),
@@ -948,11 +1120,19 @@ mod tests {
     }
 
     fn kinds(src: &str) -> Vec<TokenKind> {
-        toks(src).into_iter().map(|t| t.kind).filter(|k| !matches!(k, TokenKind::Eof)).collect()
+        toks(src)
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Eof))
+            .collect()
     }
 
     fn texts(src: &str) -> Vec<String> {
-        toks(src).into_iter().map(|t| t.text).filter(|t| !t.is_empty()).collect()
+        toks(src)
+            .into_iter()
+            .map(|t| t.text)
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 
     // ---- Identifiers ----
@@ -972,10 +1152,15 @@ mod tests {
     fn keyword_is_identifier() {
         // Keywords are not reserved — lexed as identifiers.
         let toks = kinds("integer real do if");
-        assert_eq!(toks, vec![
-            TokenKind::Identifier, TokenKind::Identifier,
-            TokenKind::Identifier, TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            toks,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Identifier,
+                TokenKind::Identifier,
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
@@ -1158,9 +1343,15 @@ mod tests {
 
     #[test]
     fn arithmetic_operators() {
-        assert_eq!(kinds("+ - * /"), vec![
-            TokenKind::Plus, TokenKind::Minus, TokenKind::Star, TokenKind::Slash,
-        ]);
+        assert_eq!(
+            kinds("+ - * /"),
+            vec![
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+            ]
+        );
     }
 
     #[test]
@@ -1175,34 +1366,55 @@ mod tests {
 
     #[test]
     fn comparison_operators() {
-        assert_eq!(kinds("== /= < > <= >="), vec![
-            TokenKind::Eq, TokenKind::Ne, TokenKind::Lt, TokenKind::Gt,
-            TokenKind::Le, TokenKind::Ge,
-        ]);
+        assert_eq!(
+            kinds("== /= < > <= >="),
+            vec![
+                TokenKind::Eq,
+                TokenKind::Ne,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::Le,
+                TokenKind::Ge,
+            ]
+        );
     }
 
     #[test]
     fn dot_comparison_operators() {
-        assert_eq!(kinds(".eq. .ne. .lt. .gt. .le. .ge."), vec![
-            TokenKind::DotOp("eq".into()), TokenKind::DotOp("ne".into()),
-            TokenKind::DotOp("lt".into()), TokenKind::DotOp("gt".into()),
-            TokenKind::DotOp("le".into()), TokenKind::DotOp("ge".into()),
-        ]);
+        assert_eq!(
+            kinds(".eq. .ne. .lt. .gt. .le. .ge."),
+            vec![
+                TokenKind::DotOp("eq".into()),
+                TokenKind::DotOp("ne".into()),
+                TokenKind::DotOp("lt".into()),
+                TokenKind::DotOp("gt".into()),
+                TokenKind::DotOp("le".into()),
+                TokenKind::DotOp("ge".into()),
+            ]
+        );
     }
 
     #[test]
     fn dot_logical_operators() {
-        assert_eq!(kinds(".and. .or. .not."), vec![
-            TokenKind::DotOp("and".into()), TokenKind::DotOp("or".into()),
-            TokenKind::DotOp("not".into()),
-        ]);
+        assert_eq!(
+            kinds(".and. .or. .not."),
+            vec![
+                TokenKind::DotOp("and".into()),
+                TokenKind::DotOp("or".into()),
+                TokenKind::DotOp("not".into()),
+            ]
+        );
     }
 
     #[test]
     fn dot_eqv_neqv() {
-        assert_eq!(kinds(".eqv. .neqv."), vec![
-            TokenKind::DotOp("eqv".into()), TokenKind::DotOp("neqv".into()),
-        ]);
+        assert_eq!(
+            kinds(".eqv. .neqv."),
+            vec![
+                TokenKind::DotOp("eqv".into()),
+                TokenKind::DotOp("neqv".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1214,11 +1426,19 @@ mod tests {
 
     #[test]
     fn punctuation() {
-        assert_eq!(kinds("( ) [ ] , : ; %"), vec![
-            TokenKind::LParen, TokenKind::RParen,
-            TokenKind::LBracket, TokenKind::RBracket,
-            TokenKind::Comma, TokenKind::Colon, TokenKind::Semicolon, TokenKind::Percent,
-        ]);
+        assert_eq!(
+            kinds("( ) [ ] , : ; %"),
+            vec![
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                TokenKind::Comma,
+                TokenKind::Colon,
+                TokenKind::Semicolon,
+                TokenKind::Percent,
+            ]
+        );
     }
 
     #[test]
@@ -1249,16 +1469,26 @@ mod tests {
 
     #[test]
     fn newline_is_statement_terminator() {
-        assert_eq!(kinds("x\ny"), vec![
-            TokenKind::Identifier, TokenKind::Newline, TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            kinds("x\ny"),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Newline,
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
     fn semicolon_is_statement_separator() {
-        assert_eq!(kinds("x; y"), vec![
-            TokenKind::Identifier, TokenKind::Semicolon, TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            kinds("x; y"),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Semicolon,
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     // ---- Continuation lines ----
@@ -1266,19 +1496,40 @@ mod tests {
     #[test]
     fn continuation_joins_tokens() {
         let k = kinds("x + &\n  y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn continuation_with_leading_ampersand() {
         let k = kinds("x + &\n  &y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn continuation_with_comment() {
         let k = kinds("x + & ! comment\n  y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     // ---- Source locations ----
@@ -1299,34 +1550,64 @@ mod tests {
     #[test]
     fn complex_declaration() {
         let k = kinds("integer, allocatable :: x(:,:)");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::Comma, TokenKind::Identifier,
-            TokenKind::ColonColon,
-            TokenKind::Identifier, TokenKind::LParen, TokenKind::Colon,
-            TokenKind::Comma, TokenKind::Colon, TokenKind::RParen,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Comma,
+                TokenKind::Identifier,
+                TokenKind::ColonColon,
+                TokenKind::Identifier,
+                TokenKind::LParen,
+                TokenKind::Colon,
+                TokenKind::Comma,
+                TokenKind::Colon,
+                TokenKind::RParen,
+            ]
+        );
     }
 
     #[test]
     fn pointer_assignment() {
         let k = kinds("ptr => target");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Arrow, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Arrow,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn component_access() {
         let k = kinds("obj%member");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Percent, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Percent,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn array_constructor_bracket() {
         let k = kinds("[1, 2, 3]");
-        assert_eq!(k, vec![
-            TokenKind::LBracket, TokenKind::IntegerLiteral, TokenKind::Comma,
-            TokenKind::IntegerLiteral, TokenKind::Comma, TokenKind::IntegerLiteral,
-            TokenKind::RBracket,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::LBracket,
+                TokenKind::IntegerLiteral,
+                TokenKind::Comma,
+                TokenKind::IntegerLiteral,
+                TokenKind::Comma,
+                TokenKind::IntegerLiteral,
+                TokenKind::RBracket,
+            ]
+        );
     }
 
     // ---- Ambiguity cases from spec ----
@@ -1341,9 +1622,14 @@ mod tests {
     #[test]
     fn integer_dot_and_with_spaces() {
         let k = kinds("a .and. b");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::DotOp("and".into()), TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::DotOp("and".into()),
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
@@ -1351,25 +1637,40 @@ mod tests {
         // Critical ambiguity: 1.eq.2 must NOT be parsed as a real with exponent.
         // It's: integer(1), .eq., integer(2)
         let k = kinds("1.eq.2");
-        assert_eq!(k, vec![
-            TokenKind::IntegerLiteral, TokenKind::DotOp("eq".into()), TokenKind::IntegerLiteral,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::IntegerLiteral,
+                TokenKind::DotOp("eq".into()),
+                TokenKind::IntegerLiteral,
+            ]
+        );
     }
 
     #[test]
     fn integer_dot_and_no_spaces() {
         let k = kinds("1.and.2");
-        assert_eq!(k, vec![
-            TokenKind::IntegerLiteral, TokenKind::DotOp("and".into()), TokenKind::IntegerLiteral,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::IntegerLiteral,
+                TokenKind::DotOp("and".into()),
+                TokenKind::IntegerLiteral,
+            ]
+        );
     }
 
     #[test]
     fn integer_dot_ne_no_spaces() {
         let k = kinds("x.ne.y");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::DotOp("ne".into()), TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::DotOp("ne".into()),
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
@@ -1396,9 +1697,14 @@ mod tests {
     fn five_dot_eq_three() {
         // 5.eq.3 — integer, .eq., integer (not a real)
         let k = kinds("5.eq.3");
-        assert_eq!(k, vec![
-            TokenKind::IntegerLiteral, TokenKind::DotOp("eq".into()), TokenKind::IntegerLiteral,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::IntegerLiteral,
+                TokenKind::DotOp("eq".into()),
+                TokenKind::IntegerLiteral,
+            ]
+        );
     }
 
     // ---- Error cases ----
@@ -1428,9 +1734,20 @@ program hello
 end program hello
 ";
         let tokens = Lexer::tokenize(src, 0).unwrap();
-        let ident_count = tokens.iter().filter(|t| t.kind == TokenKind::Identifier).count();
-        assert!(ident_count >= 8, "expected 8+ identifiers, got {}", ident_count);
-        let last_non_eof = tokens.iter().rev().find(|t| t.kind != TokenKind::Eof && t.kind != TokenKind::Newline).unwrap();
+        let ident_count = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Identifier)
+            .count();
+        assert!(
+            ident_count >= 8,
+            "expected 8+ identifiers, got {}",
+            ident_count
+        );
+        let last_non_eof = tokens
+            .iter()
+            .rev()
+            .find(|t| t.kind != TokenKind::Eof && t.kind != TokenKind::Newline)
+            .unwrap();
         assert_eq!(last_non_eof.text, "hello");
     }
 
@@ -1438,17 +1755,22 @@ end program hello
 
     /// Try to tokenize a fortsh source file. Strips preprocessor directives first.
     fn try_lex_fortsh_file(path: &str) -> Result<usize, String> {
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("{}: {}", path, e))?;
+        let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
 
         // Strip preprocessor directives (lexer expects preprocessed input).
-        let filtered: String = src.lines()
-            .map(|line| if line.trim_start().starts_with('#') { "" } else { line })
+        let filtered: String = src
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with('#') {
+                    ""
+                } else {
+                    line
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
-        let tokens = Lexer::tokenize(&filtered, 0)
-            .map_err(|e| format!("{}: {}", path, e))?;
+        let tokens = Lexer::tokenize(&filtered, 0).map_err(|e| format!("{}: {}", path, e))?;
 
         Ok(tokens.len())
     }
@@ -1545,12 +1867,18 @@ end program hello
     #[test]
     fn multiple_continuations() {
         let k = kinds("x = a + &\n    b + &\n    c");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::Assign,
-            TokenKind::Identifier, TokenKind::Plus,
-            TokenKind::Identifier, TokenKind::Plus,
-            TokenKind::Identifier,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier,
+            ]
+        );
     }
 
     #[test]
@@ -1575,11 +1903,17 @@ end program hello
     #[test]
     fn spec_ambiguity_real_function_call() {
         let k = kinds("x = real(i)");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::Assign,
-            TokenKind::Identifier, TokenKind::LParen,
-            TokenKind::Identifier, TokenKind::RParen,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::Identifier,
+                TokenKind::LParen,
+                TokenKind::Identifier,
+                TokenKind::RParen,
+            ]
+        );
     }
 
     #[test]
@@ -1595,7 +1929,8 @@ end program hello
         assert!(k.contains(&TokenKind::Comma));
         // "do" and "i" are both identifiers.
         let tokens = toks("do i = 1, 10");
-        let idents: Vec<_> = tokens.iter()
+        let idents: Vec<_> = tokens
+            .iter()
             .filter(|t| t.kind == TokenKind::Identifier)
             .map(|t| t.text.as_str())
             .collect();
@@ -1606,9 +1941,14 @@ end program hello
     #[test]
     fn spec_ambiguity_do_as_variable() {
         let k = kinds("do = 3.14");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::Assign, TokenKind::RealLiteral,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::RealLiteral,
+            ]
+        );
         assert_eq!(toks("do = 3.14")[0].text, "do");
     }
 
@@ -1629,11 +1969,18 @@ end program hello
     #[test]
     fn semicolon_separates_statements() {
         let k = kinds("x = 1; y = 2");
-        assert_eq!(k, vec![
-            TokenKind::Identifier, TokenKind::Assign, TokenKind::IntegerLiteral,
-            TokenKind::Semicolon,
-            TokenKind::Identifier, TokenKind::Assign, TokenKind::IntegerLiteral,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::IntegerLiteral,
+                TokenKind::Semicolon,
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::IntegerLiteral,
+            ]
+        );
     }
 
     // ---- Performance ----
@@ -1642,7 +1989,9 @@ end program hello
     fn performance_fortsh_under_one_second() {
         let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src");
         let root = std::path::Path::new(src_dir);
-        if !root.exists() { return; }
+        if !root.exists() {
+            return;
+        }
 
         // Collect all source.
         let mut all_source = String::new();
@@ -1650,12 +1999,21 @@ end program hello
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() { collect(&path, buf); }
-                    else if path.extension().map_or(false, |e| e == "f90") {
+                    if path.is_dir() {
+                        collect(&path, buf);
+                    } else if path.extension().map_or(false, |e| e == "f90") {
                         if let Ok(src) = std::fs::read_to_string(&path) {
-                            let filtered: String = src.lines()
-                                .map(|l| if l.trim_start().starts_with('#') { "" } else { l })
-                                .collect::<Vec<_>>().join("\n");
+                            let filtered: String = src
+                                .lines()
+                                .map(|l| {
+                                    if l.trim_start().starts_with('#') {
+                                        ""
+                                    } else {
+                                        l
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             buf.push_str(&filtered);
                             buf.push('\n');
                         }
@@ -1671,10 +2029,17 @@ end program hello
 
         assert!(result.is_ok(), "failed to tokenize: {:?}", result.err());
         let tokens = result.unwrap();
-        eprintln!("lexed {} tokens from ~{} lines in {:?}",
-            tokens.len(), all_source.lines().count(), elapsed);
-        assert!(elapsed.as_secs_f64() < 1.0,
-            "too slow: {:?} (must be < 1s)", elapsed);
+        eprintln!(
+            "lexed {} tokens from ~{} lines in {:?}",
+            tokens.len(),
+            all_source.lines().count(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "too slow: {:?} (must be < 1s)",
+            elapsed
+        );
     }
 
     // ======================================================================
@@ -1685,19 +2050,40 @@ end program hello
     fn continuation_over_comment_line() {
         // Per F2018 6.3.2.4: comment lines between continued lines are allowed.
         let k = kinds("x + & \n! this is a comment\n  y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn continuation_over_blank_line() {
         let k = kinds("x + &\n\n  y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
     fn continuation_over_multiple_comments_and_blanks() {
         let k = kinds("x + &\n! comment 1\n\n! comment 2\n  y");
-        assert_eq!(k, vec![TokenKind::Identifier, TokenKind::Plus, TokenKind::Identifier]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Plus,
+                TokenKind::Identifier
+            ]
+        );
     }
 
     #[test]
@@ -1721,19 +2107,31 @@ end program hello
         // Round-trip: tokens -> text -> tokens should produce identical kinds.
         let src = "integer :: x = 42\n";
         let tokens1 = Lexer::tokenize(src, 0).unwrap();
-        let reconstructed: String = tokens1.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let reconstructed: String = tokens1
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let tokens2 = Lexer::tokenize(&reconstructed, 0).unwrap();
 
         let kinds1: Vec<_> = tokens1.iter().map(|t| &t.kind).collect();
         let kinds2: Vec<_> = tokens2.iter().map(|t| &t.kind).collect();
-        assert_eq!(kinds1, kinds2, "round-trip failed:\n  original: {:?}\n  reconstructed: {:?}", src, reconstructed);
+        assert_eq!(
+            kinds1, kinds2,
+            "round-trip failed:\n  original: {:?}\n  reconstructed: {:?}",
+            src, reconstructed
+        );
     }
 
     #[test]
     fn round_trip_operators() {
         let src = "x = a + b * c ** d // e\n";
         let tokens1 = Lexer::tokenize(src, 0).unwrap();
-        let reconstructed: String = tokens1.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let reconstructed: String = tokens1
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let tokens2 = Lexer::tokenize(&reconstructed, 0).unwrap();
 
         let kinds1: Vec<_> = tokens1.iter().map(|t| &t.kind).collect();
@@ -1751,19 +2149,31 @@ end program hello
 
     #[test]
     fn tokenize_fortsh_types() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common/types.f90");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fortsh/src/common/types.f90"
+        );
         if !std::path::Path::new(path).exists() {
             // fortsh not available — skip gracefully.
             return;
         }
         let count = try_lex_fortsh_file(path).unwrap();
-        assert!(count > 100, "expected 100+ tokens from types.f90, got {}", count);
+        assert!(
+            count > 100,
+            "expected 100+ tokens from types.f90, got {}",
+            count
+        );
     }
 
     #[test]
     fn tokenize_fortsh_error_handling() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common/error_handling.f90");
-        if !std::path::Path::new(path).exists() { return; }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fortsh/src/common/error_handling.f90"
+        );
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
         let count = try_lex_fortsh_file(path).unwrap();
         assert!(count > 50, "expected 50+ tokens, got {}", count);
     }
@@ -1772,7 +2182,9 @@ end program hello
     fn tokenize_fortsh_all_common() {
         let common_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src/common");
         let dir = std::path::Path::new(common_dir);
-        if !dir.exists() { return; }
+        if !dir.exists() {
+            return;
+        }
 
         let mut files_tested = 0;
         let mut total_tokens = 0;
@@ -1791,20 +2203,30 @@ end program hello
             }
         }
         assert!(files_tested > 0, "no .f90 files found in fortsh/src/common");
-        eprintln!("tokenized {} fortsh common/ files, {} total tokens", files_tested, total_tokens);
+        eprintln!(
+            "tokenized {} fortsh common/ files, {} total tokens",
+            files_tested, total_tokens
+        );
     }
 
     #[test]
     fn tokenize_fortsh_all_sources() {
         let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src");
         let root = std::path::Path::new(src_dir);
-        if !root.exists() { return; }
+        if !root.exists() {
+            return;
+        }
 
         let mut files_tested = 0;
         let mut total_tokens = 0;
         let mut failures = Vec::new();
 
-        fn visit_dir(dir: &std::path::Path, files_tested: &mut usize, total_tokens: &mut usize, failures: &mut Vec<String>) {
+        fn visit_dir(
+            dir: &std::path::Path,
+            files_tested: &mut usize,
+            total_tokens: &mut usize,
+            failures: &mut Vec<String>,
+        ) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -1827,11 +2249,22 @@ end program hello
         visit_dir(root, &mut files_tested, &mut total_tokens, &mut failures);
 
         if !failures.is_empty() {
-            panic!("{} of {} files failed to tokenize:\n{}", failures.len(), files_tested + failures.len(),
-                failures.join("\n"));
+            panic!(
+                "{} of {} files failed to tokenize:\n{}",
+                failures.len(),
+                files_tested + failures.len(),
+                failures.join("\n")
+            );
         }
 
-        assert!(files_tested > 40, "expected 40+ .f90 files, found {}", files_tested);
-        eprintln!("tokenized ALL {} fortsh .f90 files, {} total tokens", files_tested, total_tokens);
+        assert!(
+            files_tested > 40,
+            "expected 40+ .f90 files, found {}",
+            files_tested
+        );
+        eprintln!(
+            "tokenized ALL {} fortsh .f90 files, {} total tokens",
+            files_tested, total_tokens
+        );
     }
 }

@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::codegen::mir::MachineFunction;
+use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
@@ -278,7 +278,8 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-D" => {
                 i += 1;
                 let spec = args.get(i).ok_or("-D requires a macro name")?;
-                opts.preprocessor_defines.push(parse_preprocessor_define(spec)?);
+                opts.preprocessor_defines
+                    .push(parse_preprocessor_define(spec)?);
             }
             arg if arg.starts_with("-D") => {
                 opts.preprocessor_defines
@@ -400,9 +401,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.diagnostics_format = match val {
                     "text" => DiagnosticsFormat::Text,
                     "json" => DiagnosticsFormat::Json,
-                    other => {
-                        return Err(format!("unknown --diagnostics-format value: {}", other))
-                    }
+                    other => return Err(format!("unknown --diagnostics-format value: {}", other)),
                 };
             }
 
@@ -441,11 +440,17 @@ fn parse_preprocessor_define(spec: &str) -> Result<(String, String), String> {
         None => (spec, "1"),
     };
     if name.is_empty() {
-        return Err(format!("invalid macro definition '{}': missing macro name", spec));
+        return Err(format!(
+            "invalid macro definition '{}': missing macro name",
+            spec
+        ));
     }
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return Err(format!("invalid macro definition '{}': missing macro name", spec));
+        return Err(format!(
+            "invalid macro definition '{}': missing macro name",
+            spec
+        ));
     };
     if !(first == '_' || first.is_ascii_alphabetic()) {
         return Err(format!(
@@ -807,7 +812,11 @@ impl PhaseTimer {
         eprintln!("─────────────────────────────────");
         for (name, d) in &self.samples {
             let ms = d.as_secs_f64() * 1000.0;
-            let pct = if total_ms > 0.0 { ms / total_ms * 100.0 } else { 0.0 };
+            let pct = if total_ms > 0.0 {
+                ms / total_ms * 100.0
+            } else {
+                0.0
+            };
             eprintln!("{:<16} {:>8.2} {:>4.0}%", name, ms, pct);
         }
         eprintln!("─────────────────────────────────");
@@ -1013,8 +1022,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         for t in &tokens {
             buf.push_str(&format!("{:?}\n", t));
         }
-        fs::write(&out, &buf)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
         return Ok(());
     }
 
@@ -1040,8 +1048,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         for u in &units {
             buf.push_str(&format!("{:#?}\n", u));
         }
-        fs::write(&out, &buf)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
         return Ok(());
     }
 
@@ -1085,8 +1092,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         };
         // span_len is best-effort: end.col >= start.col on the same
         // line gives a nice underline, otherwise default to 1.
-        let span_len = if d.span.end.line == d.span.start.line
-            && d.span.end.col > d.span.start.col
+        let span_len = if d.span.end.line == d.span.start.line && d.span.end.col > d.span.start.col
         {
             (d.span.end.col - d.span.start.col) as usize
         } else {
@@ -1100,7 +1106,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
     if had_error {
-        return Err(format!("aborting due to errors in {}", opts.input.display()));
+        return Err(format!(
+            "aborting due to errors in {}",
+            opts.input.display()
+        ));
     }
     phase.end(&mut phases);
     if opts.verbose {
@@ -1114,7 +1123,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
     }
 
-    let (mut ir_module, module_globals) = lower::lower_file(&units, &st, &type_layouts, external_globals, external_char_len_star);
+    let (mut ir_module, module_globals) = lower::lower_file(
+        &units,
+        &st,
+        &type_layouts,
+        external_globals,
+        external_char_len_star,
+    );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
@@ -1138,11 +1153,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     {
         use crate::opt::pipeline::OptLevel as IrOpt;
         let ir_opt = match opts.opt_level {
-            OptLevel::O0    => IrOpt::O0,
-            OptLevel::O1    => IrOpt::O1,
-            OptLevel::O2    => IrOpt::O2,
-            OptLevel::O3    => IrOpt::O3,
-            OptLevel::Os    => IrOpt::Os,
+            OptLevel::O0 => IrOpt::O0,
+            OptLevel::O1 => IrOpt::O1,
+            OptLevel::O2 => IrOpt::O2,
+            OptLevel::O3 => IrOpt::O3,
+            OptLevel::Os => IrOpt::Os,
             OptLevel::Ofast => IrOpt::Ofast,
         };
         let pm = if ir_module.contains_i128_outside_globals() && opts.opt_level != OptLevel::O0 {
@@ -1172,8 +1187,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     if module_has_i128 && !ir_module.i128_backend_o0_supported() {
         return Err(
-            "backend does not yet support integer(16) / i128 codegen; use --emit-ir for now"
-                .into(),
+            "backend does not yet support integer(16) / i128 codegen; use --emit-ir for now".into(),
         );
     }
 
@@ -1338,10 +1352,8 @@ _main:
                         &ir_module,
                         &std::collections::HashMap::new(), // char_len_star computed by writer from scope
                     );
-                    let amod_dir: std::path::PathBuf = opts
-                        .module_output_dir
-                        .clone()
-                        .unwrap_or_else(|| {
+                    let amod_dir: std::path::PathBuf =
+                        opts.module_output_dir.clone().unwrap_or_else(|| {
                             opts.output_path()
                                 .parent()
                                 .unwrap_or_else(|| std::path::Path::new("."))
@@ -1465,7 +1477,8 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
     // Scan dependencies.
-    let file_deps: Vec<dep_scan::FileDeps> = all_inputs.iter()
+    let file_deps: Vec<dep_scan::FileDeps> = all_inputs
+        .iter()
         .map(|p| dep_scan::scan_file(p))
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1474,13 +1487,16 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
 
     // Compile each file in order.
     let tmp_dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
-    fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("cannot create temp dir: {}", e))?;
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for &idx in &order {
         let src = &file_deps[idx].path;
-        let stem = src.file_stem().unwrap_or_default().to_str().unwrap_or("out");
+        let stem = src
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("out");
         let obj_path = tmp_dir.join(format!("{}.o", stem));
 
         // Build a single-file Options for this source by inheriting
@@ -1524,7 +1540,10 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     }
 
     // Link all object files.
-    let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("a.out"));
     link_multi(&object_files, &output, opts)?;
 
     // Cleanup.
@@ -1592,13 +1611,11 @@ fn find_runtime_lib() -> Result<String, String> {
         }
     }
 
-    Err(
-        "cannot find libarmfortas_rt.a. Searched: \
+    Err("cannot find libarmfortas_rt.a. Searched: \
          $AFS_RUNTIME_PATH, cargo workspace, next to the compiler \
          binary, and /usr/local/lib. Build with \
          'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
-            .into(),
-    )
+        .into())
 }
 
 fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
@@ -1611,7 +1628,9 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
         return Ok(());
     };
     let debug_archive = workspace_root.join("target/debug/libarmfortas_rt.a");
-    let archive_mtime = fs::metadata(&debug_archive).ok().and_then(|meta| meta.modified().ok());
+    let archive_mtime = fs::metadata(&debug_archive)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
 
     if archive_mtime.is_some_and(|mtime| mtime >= source_mtime) {
         return Ok(());
@@ -1661,7 +1680,8 @@ fn find_workspace_root() -> Option<PathBuf> {
 
     for base in bases {
         for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists() {
+            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
+            {
                 return Some(ancestor.to_path_buf());
             }
         }
@@ -1744,7 +1764,11 @@ mod tests {
 
         compile(&opts).expect("O0 --emit-ir should support integer(16) staging");
         let ir = fs::read_to_string(&output).expect("missing emitted IR");
-        assert!(ir.contains("i128"), "emitted IR should expose integer(16) as i128:\n{}", ir);
+        assert!(
+            ir.contains("i128"),
+            "emitted IR should expose integer(16) as i128:\n{}",
+            ir
+        );
         let _ = fs::remove_file(output);
     }
 
@@ -1768,7 +1792,8 @@ mod tests {
             ..Options::default()
         };
 
-        let err = compile(&opts).expect_err("backend should reject integer(16) until i128 codegen lands");
+        let err =
+            compile(&opts).expect_err("backend should reject integer(16) until i128 codegen lands");
         assert!(
             err.contains("backend does not yet support integer(16) / i128 codegen"),
             "unexpected backend rejection:\n{}",
@@ -1798,7 +1823,11 @@ mod tests {
 
         compile(&opts).expect("simple integer(16) memory traffic should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        assert!(asm.contains("stp x16, x17"), "expected paired i128 store in asm:\n{}", asm);
+        assert!(
+            asm.contains("stp x16, x17"),
+            "expected paired i128 store in asm:\n{}",
+            asm
+        );
         let _ = fs::remove_file(output);
     }
 
@@ -1824,7 +1853,11 @@ mod tests {
 
         compile(&opts).expect("simple integer(16) add should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        assert!(asm.contains("adds x16, x16, x8"), "expected i128 add carry chain in asm:\n{}", asm);
+        assert!(
+            asm.contains("adds x16, x16, x8"),
+            "expected i128 add carry chain in asm:\n{}",
+            asm
+        );
         let _ = fs::remove_file(output);
     }
 
@@ -1850,8 +1883,16 @@ mod tests {
 
         compile(&opts).expect("internal integer(16) call should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        assert!(asm.contains("bl _add_one"), "expected internal helper call in asm:\n{}", asm);
-        assert!(asm.contains("stp x0, x1"), "expected pair-register i128 ABI spill in asm:\n{}", asm);
+        assert!(
+            asm.contains("bl _add_one"),
+            "expected internal helper call in asm:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("stp x0, x1"),
+            "expected pair-register i128 ABI spill in asm:\n{}",
+            asm
+        );
         let _ = fs::remove_file(output);
     }
 
@@ -1877,8 +1918,16 @@ mod tests {
 
         compile(&opts).expect("external integer(16) call should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        assert!(asm.contains("bl _add_ext"), "expected external helper call in asm:\n{}", asm);
-        assert!(asm.contains("stp x0, x1"), "expected pair-register i128 ABI spill in asm:\n{}", asm);
+        assert!(
+            asm.contains("bl _add_ext"),
+            "expected external helper call in asm:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("stp x0, x1"),
+            "expected pair-register i128 ABI spill in asm:\n{}",
+            asm
+        );
         let _ = fs::remove_file(output);
     }
 
@@ -1904,8 +1953,16 @@ mod tests {
 
         compile(&opts).expect("integer(16) multiply should codegen at O1 after const fold");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
-        assert!(asm.contains("movz x16, #42"), "expected folded i128 constant in asm:\n{}", asm);
-        assert!(!asm.contains("mul "), "expected O1 i128 multiply to fold away before backend:\n{}", asm);
+        assert!(
+            asm.contains("movz x16, #42"),
+            "expected folded i128 constant in asm:\n{}",
+            asm
+        );
+        assert!(
+            !asm.contains("mul "),
+            "expected O1 i128 multiply to fold away before backend:\n{}",
+            asm
+        );
         let _ = fs::remove_file(output);
     }
 

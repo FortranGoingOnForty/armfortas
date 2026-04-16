@@ -4,12 +4,12 @@
 //! constraints, label validation, and standard conformance. Runs after
 //! symbol resolution (resolve.rs) and type checking (types.rs).
 
-use crate::ast::unit::*;
-use crate::ast::stmt::*;
-use crate::ast::expr::Expr;
-use crate::ast::decl::{Decl, Attribute, TypeAttr, TypeSpec};
-use crate::lexer::Span;
 use super::symtab::*;
+use crate::ast::decl::{Attribute, Decl, TypeAttr, TypeSpec};
+use crate::ast::expr::Expr;
+use crate::ast::stmt::*;
+use crate::ast::unit::*;
+use crate::lexer::Span;
 use std::cell::RefCell;
 
 /// Fortran standard level for --std= conformance checking.
@@ -60,7 +60,11 @@ impl std::fmt::Display for Diagnostic {
             DiagKind::Error => "error",
             DiagKind::Warning => "warning",
         };
-        write!(f, "{}:{}: {}: {}", self.span.start.line, self.span.start.col, label, self.msg)
+        write!(
+            f,
+            "{}:{}: {}: {}",
+            self.span.start.line, self.span.start.col, label, self.msg
+        )
     }
 }
 
@@ -128,7 +132,10 @@ impl<'a> Ctx<'a> {
     fn require_std(&mut self, span: Span, min: FortranStandard, feature: &str) {
         if let Some(selected) = self.std {
             if selected < min {
-                self.error(span, format!("{} requires --std={:?} or later", feature, min));
+                self.error(
+                    span,
+                    format!("{} requires --std={:?} or later", feature, min),
+                );
             }
         }
     }
@@ -145,11 +152,19 @@ impl<'a> Ctx<'a> {
     }
 
     fn error(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags.push(Diagnostic { span, kind: DiagKind::Error, msg: msg.into() });
+        self.diags.push(Diagnostic {
+            span,
+            kind: DiagKind::Error,
+            msg: msg.into(),
+        });
     }
 
     fn warning(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags.push(Diagnostic { span, kind: DiagKind::Warning, msg: msg.into() });
+        self.diags.push(Diagnostic {
+            span,
+            kind: DiagKind::Warning,
+            msg: msg.into(),
+        });
     }
 }
 
@@ -190,14 +205,7 @@ pub fn validate_file_with_layouts(
     std: Option<FortranStandard>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Vec<Diagnostic> {
-    validate_file_with_layouts_and_warning_groups(
-        units,
-        st,
-        std,
-        type_layouts,
-        false,
-        false,
-    )
+    validate_file_with_layouts_and_warning_groups(units, st, std, type_layouts, false, false)
 }
 
 pub fn validate_file_with_layouts_and_warning_groups(
@@ -208,13 +216,7 @@ pub fn validate_file_with_layouts_and_warning_groups(
     warn_pedantic: bool,
     warn_deprecated: bool,
 ) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new_with_layouts(
-        st,
-        std,
-        type_layouts,
-        warn_pedantic,
-        warn_deprecated,
-    );
+    let mut ctx = Ctx::new_with_layouts(st, std, type_layouts, warn_pedantic, warn_deprecated);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -231,10 +233,7 @@ fn decl_attrs_contain(attrs: &[Attribute], needle: Attribute) -> bool {
     attrs.iter().any(|attr| *attr == needle)
 }
 
-fn is_deferred_char_pointer_component(
-    type_spec: &TypeSpec,
-    attrs: &[Attribute],
-) -> bool {
+fn is_deferred_char_pointer_component(type_spec: &TypeSpec, attrs: &[Attribute]) -> bool {
     decl_attrs_contain(attrs, Attribute::Pointer)
         && matches!(
             type_spec,
@@ -340,15 +339,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(
-                        implicit_stmt.span,
-                        FortranStandard::F90,
-                        "IMPLICIT NONE",
-                    );
+                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
                 }
             }
             if !contains.is_empty() {
-                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+                ctx.require_std(
+                    unit.span,
+                    FortranStandard::F90,
+                    "CONTAINS/internal procedures",
+                );
             }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
@@ -361,7 +360,9 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         ProgramUnit::Module {
             uses,
             implicit,
-            decls, contains, ..
+            decls,
+            contains,
+            ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F90, "MODULE");
             for use_stmt in uses {
@@ -369,11 +370,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(
-                        implicit_stmt.span,
-                        FortranStandard::F90,
-                        "IMPLICIT NONE",
-                    );
+                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
                 }
             }
             validate_decls(ctx, decls);
@@ -422,15 +419,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(
-                        implicit_stmt.span,
-                        FortranStandard::F90,
-                        "IMPLICIT NONE",
-                    );
+                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
                 }
             }
             if !contains.is_empty() {
-                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+                ctx.require_std(
+                    unit.span,
+                    FortranStandard::F90,
+                    "CONTAINS/internal procedures",
+                );
             }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
@@ -483,15 +480,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(
-                        implicit_stmt.span,
-                        FortranStandard::F90,
-                        "IMPLICIT NONE",
-                    );
+                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
                 }
             }
             if !contains.is_empty() {
-                ctx.require_std(unit.span, FortranStandard::F90, "CONTAINS/internal procedures");
+                ctx.require_std(
+                    unit.span,
+                    FortranStandard::F90,
+                    "CONTAINS/internal procedures",
+                );
             }
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
@@ -505,7 +502,9 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         }
         ProgramUnit::Submodule {
             uses,
-            decls, contains, ..
+            decls,
+            contains,
+            ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F2008, "SUBMODULE");
             for use_stmt in uses {
@@ -701,7 +700,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Assignment { target, value } => {
             validate_assignment_target(ctx, target, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "assignment");
-            if ctx.in_pure { check_pure_expr_calls(ctx, value); }
+            if ctx.in_pure {
+                check_pure_expr_calls(ctx, value);
+            }
         }
         Stmt::PointerAssignment { target, value, .. } => {
             validate_pointer_assignment(ctx, target, value, stmt.span);
@@ -728,10 +729,17 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- I/O in pure ----
-        Stmt::Write { .. } | Stmt::Read { .. } | Stmt::Print { .. } |
-        Stmt::Open { .. } | Stmt::Close { .. } | Stmt::Inquire { .. } |
-        Stmt::Rewind { .. } | Stmt::Backspace { .. } | Stmt::Endfile { .. } |
-        Stmt::Flush { .. } | Stmt::Wait { .. } => {
+        Stmt::Write { .. }
+        | Stmt::Read { .. }
+        | Stmt::Print { .. }
+        | Stmt::Open { .. }
+        | Stmt::Close { .. }
+        | Stmt::Inquire { .. }
+        | Stmt::Rewind { .. }
+        | Stmt::Backspace { .. }
+        | Stmt::Endfile { .. }
+        | Stmt::Flush { .. }
+        | Stmt::Wait { .. } => {
             if ctx.in_pure {
                 ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
             }
@@ -775,7 +783,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- Control flow — recurse into bodies ----
-        Stmt::IfConstruct { then_body, else_ifs, else_body, .. } => {
+        Stmt::IfConstruct {
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } => {
             validate_stmts(ctx, then_body);
             for (_, body) in else_ifs {
                 validate_stmts(ctx, body);
@@ -813,7 +826,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.require_std(stmt.span, FortranStandard::F95, "FORALL statement");
             validate_stmt(ctx, inner);
         }
-        Stmt::Block { uses, ifaces, implicit, decls, body, .. } => {
+        Stmt::Block {
+            uses,
+            ifaces,
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
             validate_decls(ctx, uses);
             validate_decls(ctx, implicit);
@@ -847,9 +867,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if let Some(ref name) = extract_base_name(item) {
                     let is_pointer = ctx.lookup(name).map(|s| s.attrs.pointer).unwrap_or(true);
                     if !is_pointer {
-                        ctx.error(item.span, format!(
-                            "NULLIFY target '{}' must have pointer attribute", name
-                        ));
+                        ctx.error(
+                            item.span,
+                            format!("NULLIFY target '{}' must have pointer attribute", name),
+                        );
                     }
                 }
             }
@@ -871,17 +892,22 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 /// variable's intent/parameter status applies to all parts.
 fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedExpr, span: Span) {
     if let Some(name) = extract_base_name(target) {
-        let (is_intent_in, is_parameter, is_pointer) = ctx.lookup(&name)
-            .map(|sym| (
-                matches!(sym.attrs.intent, Some(Intent::In)),
-                sym.attrs.parameter,
-                sym.attrs.pointer,
-            ))
+        let (is_intent_in, is_parameter, is_pointer) = ctx
+            .lookup(&name)
+            .map(|sym| {
+                (
+                    matches!(sym.attrs.intent, Some(Intent::In)),
+                    sym.attrs.parameter,
+                    sym.attrs.pointer,
+                )
+            })
             .unwrap_or((false, false, false));
-        let writes_through_pointer_target =
-            is_pointer && !matches!(target.node, Expr::Name { .. });
+        let writes_through_pointer_target = is_pointer && !matches!(target.node, Expr::Name { .. });
         if is_intent_in && !writes_through_pointer_target {
-            ctx.error(span, format!("cannot assign to intent(in) variable '{}'", name));
+            ctx.error(
+                span,
+                format!("cannot assign to intent(in) variable '{}'", name),
+            );
         }
         if is_parameter {
             ctx.error(span, format!("cannot assign to named constant '{}'", name));
@@ -903,16 +929,25 @@ fn validate_pointer_assignment(
     if expr_selects_component(target) {
         if let Some(leaf) = leaf_field_layout(ctx, target) {
             if !leaf.field.pointer {
-                ctx.error(span, format!(
-                    "pointer assignment target component '{}' must have pointer attribute",
-                    leaf.field.name
-                ));
+                ctx.error(
+                    span,
+                    format!(
+                        "pointer assignment target component '{}' must have pointer attribute",
+                        leaf.field.name
+                    ),
+                );
             }
         }
     } else if let Some(name) = extract_base_name(target) {
         let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
         if !is_pointer {
-            ctx.error(span, format!("pointer assignment target '{}' must have pointer attribute", name));
+            ctx.error(
+                span,
+                format!(
+                    "pointer assignment target '{}' must have pointer attribute",
+                    name
+                ),
+            );
         }
     }
 
@@ -956,9 +991,18 @@ fn validate_pointer_assignment(
                 return;
             }
         }
-        let ok = ctx.lookup(&name).map(|s| s.attrs.target || s.attrs.pointer).unwrap_or(true);
+        let ok = ctx
+            .lookup(&name)
+            .map(|s| s.attrs.target || s.attrs.pointer)
+            .unwrap_or(true);
         if !ok {
-            ctx.error(span, format!("pointer assignment source '{}' must have target or pointer attribute", name));
+            ctx.error(
+                span,
+                format!(
+                    "pointer assignment source '{}' must have target or pointer attribute",
+                    name
+                ),
+            );
         }
     }
 }
@@ -976,24 +1020,32 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
     if expr_selects_component(item) {
         if let Some(leaf) = leaf_field_layout(ctx, item) {
             if !leaf.field.allocatable && !leaf.field.pointer {
-                ctx.error(item.span, format!(
+                ctx.error(
+                    item.span,
+                    format!(
                     "only allocatable or pointer components can appear in {}, but '{}' is neither",
                     stmt_name.to_uppercase(), leaf.field.name
-                ));
+                ),
+                );
             }
         }
         return;
     }
     let base_name = extract_base_name(item);
     if let Some(ref name) = base_name {
-        let ok = ctx.lookup(name)
+        let ok = ctx
+            .lookup(name)
             .map(|s| s.attrs.allocatable || s.attrs.pointer)
             .unwrap_or(true); // unknown symbol — skip
         if !ok {
-            ctx.error(item.span, format!(
-                "only allocatable or pointer variables can appear in {}, but '{}' is neither",
-                stmt_name.to_uppercase(), name
-            ));
+            ctx.error(
+                item.span,
+                format!(
+                    "only allocatable or pointer variables can appear in {}, but '{}' is neither",
+                    stmt_name.to_uppercase(),
+                    name
+                ),
+            );
         }
     }
 }
@@ -1050,7 +1102,9 @@ fn leaf_field_layout<'a>(
         }
     };
     chain.reverse();
-    if chain.is_empty() { return None; }
+    if chain.is_empty() {
+        return None;
+    }
     // Resolve the base variable's derived type via the symbol table.
     let sym = ctx.lookup(base_name)?;
     let base_type = match sym.type_info.as_ref()? {
@@ -1069,8 +1123,12 @@ fn leaf_field_layout<'a>(
         // so the leaf check can honour inherited target-ness.
         let is_terminal = i + 1 == chain.len();
         if !is_terminal {
-            if field.target { ancestor_is_target = true; }
-            if field.allocatable { ancestor_is_allocatable = true; }
+            if field.target {
+                ancestor_is_target = true;
+            }
+            if field.allocatable {
+                ancestor_is_allocatable = true;
+            }
         }
         leaf = Some(field);
         match &field.type_info {
@@ -1123,8 +1181,12 @@ fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, spa
     // symbol that is NOT marked pure/elemental/intrinsic, reject.
     // Unknown callees (external without an interface) are left
     // alone — the programmer's responsibility per F2018 §15.4.
-    let Some(name) = extract_base_name(callee) else { return; };
-    let Some(sym) = ctx.lookup(&name) else { return; };
+    let Some(name) = extract_base_name(callee) else {
+        return;
+    };
+    let Some(sym) = ctx.lookup(&name) else {
+        return;
+    };
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => {
             if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic {
@@ -1138,7 +1200,7 @@ fn validate_pure_call(ctx: &mut Ctx, callee: &crate::ast::expr::SpannedExpr, spa
             }
         }
         SymbolKind::IntrinsicProc => {} // always OK
-        _ => {} // external / unknown — can't check
+        _ => {}                         // external / unknown — can't check
     }
 }
 
@@ -1183,12 +1245,19 @@ fn reject_pure_nonlocal_definition(
     if !ctx.in_pure {
         return;
     }
-    let Some(name) = extract_base_name(target) else { return; };
-    let Some(sym) = ctx.lookup(&name) else { return; };
+    let Some(name) = extract_base_name(target) else {
+        return;
+    };
+    let Some(sym) = ctx.lookup(&name) else {
+        return;
+    };
     // Only variables and COMMON blocks can be "defined"; function
     // names get definition semantics too but those are the pure
     // function's own result variable (always local).
-    if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::CommonBlock) {
+    if !matches!(
+        sym.kind,
+        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::CommonBlock
+    ) {
         return;
     }
     if symbol_is_non_local_to_procedure(ctx.st, sym, ctx.scope_id) {
@@ -1212,7 +1281,11 @@ fn validate_call_site_intent(
     span: Span,
 ) {
     // Look up the callee to find its dummy argument intents.
-    let callee_name = if let Expr::Name { name } = &callee.node { name.clone() } else { return; };
+    let callee_name = if let Expr::Name { name } = &callee.node {
+        name.clone()
+    } else {
+        return;
+    };
 
     // For each actual argument, check if it's an lvalue when the dummy requires out/inout.
     // We can only check this if the callee's dummy arg info is in the symbol table.
@@ -1223,15 +1296,22 @@ fn validate_call_site_intent(
             _ => continue,
         };
         // Check if actual is a literal (not an lvalue).
-        let is_literal = matches!(actual.node,
-            Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } |
-            Expr::StringLiteral { .. } | Expr::LogicalLiteral { .. } |
-            Expr::ComplexLiteral { .. }
+        let is_literal = matches!(
+            actual.node,
+            Expr::IntegerLiteral { .. }
+                | Expr::RealLiteral { .. }
+                | Expr::StringLiteral { .. }
+                | Expr::LogicalLiteral { .. }
+                | Expr::ComplexLiteral { .. }
         );
         // Check if actual is a named constant (parameter).
         let is_parameter = if let Some(name) = extract_base_name(actual) {
-            ctx.lookup(&name).map(|s| s.attrs.parameter).unwrap_or(false)
-        } else { false };
+            ctx.lookup(&name)
+                .map(|s| s.attrs.parameter)
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         if is_literal || is_parameter {
             // We can't tell without the callee's interface whether this arg is
@@ -1256,17 +1336,24 @@ fn validate_elemental_args(
     for arg in args {
         if let DummyArg::Name(arg_name) = arg {
             for decl in decls {
-                if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+                if let Decl::TypeDecl {
+                    attrs, entities, ..
+                } = &decl.node
+                {
                     for entity in entities {
                         if entity.name.eq_ignore_ascii_case(arg_name) {
                             // Check for dimension attribute or explicit array spec on entity.
-                            let has_dimension = attrs.iter().any(|a| matches!(a, Attribute::Dimension(_)));
+                            let has_dimension =
+                                attrs.iter().any(|a| matches!(a, Attribute::Dimension(_)));
                             let has_entity_dims = entity.array_spec.is_some();
                             if has_dimension || has_entity_dims {
-                                ctx.error(span, format!(
-                                    "elemental procedure argument '{}' must be scalar",
-                                    arg_name
-                                ));
+                                ctx.error(
+                                    span,
+                                    format!(
+                                        "elemental procedure argument '{}' must be scalar",
+                                        arg_name
+                                    ),
+                                );
                             }
                         }
                     }
@@ -1288,9 +1375,16 @@ fn register_label(ctx: &mut Ctx, label: u64, span: Span) {
 /// At the end of a scope, verify all GOTO labels have targets.
 fn validate_label_consistency(ctx: &mut Ctx, _scope_span: Span) {
     // Collect errors first to avoid borrow conflict.
-    let errors: Vec<(Span, String)> = ctx.labels_referenced.iter()
+    let errors: Vec<(Span, String)> = ctx
+        .labels_referenced
+        .iter()
         .filter(|(label, _)| !ctx.labels_defined.contains(label))
-        .map(|(label, span)| (*span, format!("GOTO target label {} not defined in this scope", label)))
+        .map(|(label, span)| {
+            (
+                *span,
+                format!("GOTO target label {} not defined in this scope", label),
+            )
+        })
         .collect();
     for (span, msg) in errors {
         ctx.error(span, msg);
@@ -1321,34 +1415,46 @@ fn validate_operator_interface(
                 match &sub.node {
                     ProgramUnit::Function { args, .. } => {
                         if is_assignment {
-                            ctx.error(sub.span, format!(
+                            ctx.error(
+                                sub.span,
+                                format!(
                                 "ASSIGNMENT({}) interface must contain subroutines, not functions",
                                 "="
-                            ));
+                            ),
+                            );
                             continue;
                         }
                         // Operator functions: unary = 1 arg, binary = 2 args.
                         let nargs = args.len();
                         if !(1..=2).contains(&nargs) {
-                            ctx.error(sub.span, format!(
+                            ctx.error(
+                                sub.span,
+                                format!(
                                 "operator interface function must have 1 or 2 arguments, got {}",
                                 nargs
-                            ));
+                            ),
+                            );
                         }
                         // All arguments must be intent(in) — checked by looking at decls.
                         // Deferred: would need to walk the function's decls to check intent.
                     }
                     ProgramUnit::Subroutine { args, .. } => {
                         if !is_assignment {
-                            ctx.error(sub.span, "operator interface must contain functions, not subroutines");
+                            ctx.error(
+                                sub.span,
+                                "operator interface must contain functions, not subroutines",
+                            );
                             continue;
                         }
                         // Assignment subroutines must have exactly 2 arguments.
                         if args.len() != 2 {
-                            ctx.error(sub.span, format!(
+                            ctx.error(
+                                sub.span,
+                                format!(
                                 "ASSIGNMENT(=) interface subroutine must have 2 arguments, got {}",
                                 args.len()
-                            ));
+                            ),
+                            );
                         }
                     }
                     _ => {
@@ -1380,10 +1486,13 @@ fn validate_derived_type(
         // Deferred procedures only allowed in abstract types.
         let is_deferred = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("deferred"));
         if is_deferred && !is_abstract {
-            ctx.error(span, format!(
-                "type-bound procedure '{}' is DEFERRED but type '{}' is not ABSTRACT",
-                tbp.name, name
-            ));
+            ctx.error(
+                span,
+                format!(
+                    "type-bound procedure '{}' is DEFERRED but type '{}' is not ABSTRACT",
+                    tbp.name, name
+                ),
+            );
         }
 
         // PASS and NOPASS are mutually exclusive.
@@ -1393,18 +1502,24 @@ fn validate_derived_type(
         });
         let has_nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
         if has_pass && has_nopass {
-            ctx.error(span, format!(
-                "type-bound procedure '{}' cannot have both PASS and NOPASS",
-                tbp.name
-            ));
+            ctx.error(
+                span,
+                format!(
+                    "type-bound procedure '{}' cannot have both PASS and NOPASS",
+                    tbp.name
+                ),
+            );
         }
 
         // Deferred procedures must have an interface (binding).
         if is_deferred && tbp.binding.is_none() {
-            ctx.error(span, format!(
-                "DEFERRED type-bound procedure '{}' must specify an interface",
-                tbp.name
-            ));
+            ctx.error(
+                span,
+                format!(
+                    "DEFERRED type-bound procedure '{}' must specify an interface",
+                    tbp.name
+                ),
+            );
         }
     }
 }
@@ -1438,8 +1553,14 @@ fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
 
 /// Check that all variable references in a statement list are declared
 /// when IMPLICIT NONE is active in the current scope.
-fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast::decl::SpannedDecl]) {
-    if !ctx.st.is_implicit_none(ctx.scope_id) { return; }
+fn check_implicit_none(
+    ctx: &mut Ctx,
+    stmts: &[SpannedStmt],
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    if !ctx.st.is_implicit_none(ctx.scope_id) {
+        return;
+    }
 
     // Collect declared names in this scope (from declarations).
     let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1451,7 +1572,10 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     // should have them via resolve. We also check decls for
     // EXTERNAL statements.
     for decl in decls {
-        if let Decl::TypeDecl { attrs, entities, .. } = &decl.node {
+        if let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        {
             if attrs.iter().any(|a| matches!(a, Attribute::External)) {
                 for e in entities {
                     declared.insert(e.name.to_lowercase());
@@ -1463,8 +1587,7 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     let mut undeclared = Vec::new();
     let mut resolution_cache: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    let outer_implicit_letters: std::collections::HashSet<char> =
-        std::collections::HashSet::new();
+    let outer_implicit_letters: std::collections::HashSet<char> = std::collections::HashSet::new();
     for stmt in stmts {
         walk_stmt_for_undeclared(
             ctx.st,
@@ -1482,9 +1605,13 @@ fn check_implicit_none(ctx: &mut Ctx, stmts: &[SpannedStmt], decls: &[crate::ast
     for (name, span) in &undeclared {
         let key = name.to_lowercase();
         if reported.insert(key) {
-            ctx.error(*span, format!(
-                "variable '{}' used but not declared (IMPLICIT NONE is active)", name
-            ));
+            ctx.error(
+                *span,
+                format!(
+                    "variable '{}' used but not declared (IMPLICIT NONE is active)",
+                    name
+                ),
+            );
         }
     }
 }
@@ -1524,8 +1651,7 @@ fn extend_declared_names_from_ifaces(
         for body in bodies {
             match body {
                 InterfaceBody::Subprogram(sub) => match &sub.node {
-                    ProgramUnit::Function { name, .. }
-                    | ProgramUnit::Subroutine { name, .. } => {
+                    ProgramUnit::Function { name, .. } | ProgramUnit::Subroutine { name, .. } => {
                         declared.insert(name.to_lowercase());
                     }
                     _ => {}
@@ -1577,41 +1703,80 @@ fn walk_stmt_for_undeclared(
     }
     match &stmt.node {
         Stmt::Assignment { target, value } => {
-            chk!(target); chk!(value);
+            chk!(target);
+            chk!(value);
         }
         Stmt::PointerAssignment { target, value, .. } => {
-            chk!(target); chk!(value);
+            chk!(target);
+            chk!(value);
         }
         Stmt::Print { items, .. } => {
-            for item in items { chk!(item); }
+            for item in items {
+                chk!(item);
+            }
         }
-        Stmt::Write { items, controls, .. } => {
-            for item in items { chk!(item); }
-            for ctrl in controls { chk!(&ctrl.value); }
+        Stmt::Write {
+            items, controls, ..
+        } => {
+            for item in items {
+                chk!(item);
+            }
+            for ctrl in controls {
+                chk!(&ctrl.value);
+            }
         }
-        Stmt::Read { items, controls, .. } => {
-            for item in items { chk!(item); }
-            for ctrl in controls { chk!(&ctrl.value); }
+        Stmt::Read {
+            items, controls, ..
+        } => {
+            for item in items {
+                chk!(item);
+            }
+            for ctrl in controls {
+                chk!(&ctrl.value);
+            }
         }
-        Stmt::IfConstruct { condition, then_body, else_ifs, else_body, .. } => {
+        Stmt::IfConstruct {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } => {
             chk!(condition);
-            for s in then_body { recurse!(s); }
+            for s in then_body {
+                recurse!(s);
+            }
             for (cond, body) in else_ifs {
                 chk!(cond);
-                for s in body { recurse!(s); }
+                for s in body {
+                    recurse!(s);
+                }
             }
             if let Some(body) = else_body {
-                for s in body { recurse!(s); }
+                for s in body {
+                    recurse!(s);
+                }
             }
         }
         Stmt::IfStmt { condition, action } => {
-            chk!(condition); recurse!(action);
+            chk!(condition);
+            recurse!(action);
         }
-        Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } |
-        Stmt::DoConcurrent { body, .. } => {
-            for s in body { recurse!(s); }
+        Stmt::DoLoop { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::DoConcurrent { body, .. } => {
+            for s in body {
+                recurse!(s);
+            }
         }
-        Stmt::Block { uses, ifaces, implicit, decls, body, .. } => {
+        Stmt::Block {
+            uses,
+            ifaces,
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
             // F2018 §11.1.4: a BLOCK construct establishes its own
             // scope with an independent implicit-typing environment.
             // Layer the block's declared names AND any IMPLICIT
@@ -1672,10 +1837,14 @@ fn walk_stmt_for_undeclared(
                 );
             }
         }
-        Stmt::SelectCase { selector, cases, .. } => {
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
             chk!(selector);
             for case in cases {
-                for s in &case.body { recurse!(s); }
+                for s in &case.body {
+                    recurse!(s);
+                }
             }
         }
         Stmt::Call { args, .. } => {
@@ -1685,13 +1854,26 @@ fn walk_stmt_for_undeclared(
                 }
             }
         }
-        Stmt::Labeled { stmt: inner, .. } => { recurse!(inner); }
-        Stmt::WhereConstruct { mask, body, elsewhere, .. } => {
+        Stmt::Labeled { stmt: inner, .. } => {
+            recurse!(inner);
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
             chk!(mask);
-            for s in body { recurse!(s); }
+            for s in body {
+                recurse!(s);
+            }
             for (m, b) in elsewhere {
-                if let Some(m) = m { chk!(m); }
-                for s in b { recurse!(s); }
+                if let Some(m) = m {
+                    chk!(m);
+                }
+                for s in b {
+                    recurse!(s);
+                }
             }
         }
         _ => {}
@@ -1707,7 +1889,13 @@ fn block_use_imported_names(
 
     let mut imported = std::collections::HashSet::new();
     for use_decl in uses {
-        let crate::ast::decl::Decl::UseStmt { module, renames, only, .. } = &use_decl.node else {
+        let crate::ast::decl::Decl::UseStmt {
+            module,
+            renames,
+            only,
+            ..
+        } = &use_decl.node
+        else {
             continue;
         };
         if let Some(only_items) = only {
@@ -1752,9 +1940,15 @@ fn check_expr_names(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             // Skip format specifier * (appears in WRITE(*, *) / READ(*, *)).
-            if key == "*" { return; }
-            if declared.contains(&key) { return; }
-            if is_intrinsic_name(&key) { return; }
+            if key == "*" {
+                return;
+            }
+            if declared.contains(&key) {
+                return;
+            }
+            if is_intrinsic_name(&key) {
+                return;
+            }
             // F2018 §11.1.4: a BLOCK-scoped IMPLICIT statement gives
             // names whose first letter is in the covered range an
             // implicit type, even if the enclosing scope is
@@ -1862,7 +2056,8 @@ fn check_expr_names(
 }
 
 pub fn is_intrinsic_name(name: &str) -> bool {
-    matches!(name,
+    matches!(
+        name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
         "cos" | "sin" | "tan" | "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
@@ -1906,12 +2101,14 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let rr = resolve::resolve_file(&units, &[]).unwrap(); let st = rr.st;
+        let rr = resolve::resolve_file(&units, &[]).unwrap();
+        let st = rr.st;
         validate_file(&units, &st)
     }
 
     fn errors_from(src: &str) -> Vec<String> {
-        validate_source(src).iter()
+        validate_source(src)
+            .iter()
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
@@ -1921,7 +2118,8 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        let rr = resolve::resolve_file(&units, &[]).unwrap(); let st = rr.st;
+        let rr = resolve::resolve_file(&units, &[]).unwrap();
+        let st = rr.st;
         validate_file_with_std(&units, &st, Some(std))
             .iter()
             .filter(|d| d.kind == DiagKind::Error)
@@ -1933,29 +2131,34 @@ mod tests {
 
     #[test]
     fn assign_to_intent_in_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 subroutine foo(x)
   real, intent(in) :: x
   x = 1.0
 end subroutine
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("intent(in)")));
     }
 
     #[test]
     fn assign_to_intent_inout_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 subroutine foo(x)
   real, intent(inout) :: x
   x = 1.0
 end subroutine
-");
+",
+        );
         assert!(errs.is_empty());
     }
 
     #[test]
     fn assign_through_intent_in_pointer_target_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   type :: t
     integer :: x
@@ -1966,19 +2169,22 @@ contains
     p%x = 1
   end subroutine
 end module
-");
+",
+        );
         assert!(!errs.iter().any(|e| e.contains("intent(in)")), "{:?}", errs);
     }
 
     #[test]
     fn assign_to_parameter_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   integer, parameter :: n = 10
   n = 20
 end program
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("named constant")));
     }
 
@@ -1986,88 +2192,106 @@ end program
 
     #[test]
     fn allocate_non_allocatable_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real :: x(10)
   allocate(x(20))
 end program
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("allocatable or pointer")));
     }
 
     #[test]
     fn allocate_allocatable_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real, allocatable :: x(:)
   allocate(x(10))
 end program
-");
+",
+        );
         assert!(errs.is_empty());
     }
 
     #[test]
     fn allocatable_and_pointer_forbidden() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real, allocatable, pointer :: x
 end program
-");
-        assert!(errs.iter().any(|e| e.contains("both allocatable and pointer")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("both allocatable and pointer")));
     }
 
     #[test]
     fn parameter_allocatable_forbidden() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   integer, parameter, allocatable :: x = 10
 end program
-");
-        assert!(errs.iter().any(|e| e.contains("parameter") && e.contains("allocatable")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("parameter") && e.contains("allocatable")));
     }
 
     // ---- Pointer assignment ----
 
     #[test]
     fn pointer_assignment_non_pointer_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real :: x
   real, target :: y
   x => y
 end program
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("pointer attribute")));
     }
 
     #[test]
     fn pointer_assignment_non_target_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real, pointer :: p
   real :: x
   p => x
 end program
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("target or pointer")));
     }
 
     #[test]
     fn pointer_assignment_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   real, pointer :: p
   real, target :: x
   p => x
 end program
-");
+",
+        );
         assert!(errs.is_empty());
     }
 
@@ -2075,54 +2299,67 @@ end program
 
     #[test]
     fn io_in_pure_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 pure subroutine foo(x)
   real, intent(in) :: x
   print *, x
 end subroutine
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("I/O") && e.contains("pure")));
     }
 
     #[test]
     fn stop_in_pure_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 pure function bar(x) result(y)
   real, intent(in) :: x
   real :: y
   y = x
   stop
 end function
-");
-        assert!(errs.iter().any(|e| e.contains("STOP") && e.contains("pure")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("STOP") && e.contains("pure")));
     }
 
     #[test]
     fn save_in_pure_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 pure subroutine foo(x)
   real, intent(in) :: x
   real, save :: counter
 end subroutine
-");
-        assert!(errs.iter().any(|e| e.contains("SAVE") && e.contains("pure")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("SAVE") && e.contains("pure")));
     }
 
     #[test]
     fn pure_without_violations_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 pure function square(x) result(y)
   real, intent(in) :: x
   real :: y
   y = x * x
 end function
-");
+",
+        );
         assert!(errs.is_empty());
     }
 
     #[test]
     fn pure_write_to_module_variable_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   integer :: counter = 0
 contains
@@ -2131,9 +2368,12 @@ contains
     r = counter
   end function
 end module
-");
+",
+        );
         assert!(
-            errs.iter().any(|e| e.contains("counter") && e.contains("pure") && e.contains("host or use association")),
+            errs.iter().any(|e| e.contains("counter")
+                && e.contains("pure")
+                && e.contains("host or use association")),
             "expected pure+module-write error, got {:?}",
             errs,
         );
@@ -2144,7 +2384,8 @@ end module
         // F2018 15.7 permits a pure procedure to *reference* a
         // variable accessed by use association; only definition
         // is forbidden.  reads_counter is a legal pure function.
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   integer :: counter = 0
 contains
@@ -2152,13 +2393,19 @@ contains
     r = counter
   end function
 end module
-");
-        assert!(errs.is_empty(), "pure read of module variable should be legal, got {:?}", errs);
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "pure read of module variable should be legal, got {:?}",
+            errs
+        );
     }
 
     #[test]
     fn pure_write_to_host_variable_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program p
   integer :: host_var
   host_var = 0
@@ -2168,9 +2415,12 @@ contains
     host_var = 42
   end subroutine
 end program
-");
+",
+        );
         assert!(
-            errs.iter().any(|e| e.contains("host_var") && e.contains("pure") && e.contains("host or use association")),
+            errs.iter().any(|e| e.contains("host_var")
+                && e.contains("pure")
+                && e.contains("host or use association")),
             "expected pure+host-write error, got {:?}",
             errs,
         );
@@ -2178,7 +2428,8 @@ end program
 
     #[test]
     fn pure_pointer_reassoc_of_module_pointer_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   integer, pointer :: module_p
 contains
@@ -2187,9 +2438,12 @@ contains
     module_p => t
   end subroutine
 end module
-");
+",
+        );
         assert!(
-            errs.iter().any(|e| e.contains("module_p") && e.contains("pure") && e.contains("pointer assignment")),
+            errs.iter().any(|e| e.contains("module_p")
+                && e.contains("pure")
+                && e.contains("pointer assignment")),
             "expected pure+module-pointer error, got {:?}",
             errs,
         );
@@ -2199,7 +2453,8 @@ end module
     fn pure_local_pointer_reassoc_ok() {
         // Associating a LOCAL pointer with a module TARGET is
         // legal — `q => counter` does not modify `counter`.
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   integer, target :: counter = 0
 contains
@@ -2209,42 +2464,57 @@ contains
     r = 0
   end function
 end module
-");
-        assert!(errs.is_empty(), "pure local pointer reassoc should be legal, got {:?}", errs);
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "pure local pointer reassoc should be legal, got {:?}",
+            errs
+        );
     }
 
     #[test]
     fn pure_intent_out_dummy_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 pure subroutine zero_it(x)
   integer, intent(out) :: x
   x = 0
 end subroutine
-");
-        assert!(errs.is_empty(), "pure write to intent(out) dummy should be legal, got {:?}", errs);
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "pure write to intent(out) dummy should be legal, got {:?}",
+            errs
+        );
     }
 
     // ---- Deferred length character ----
 
     #[test]
     fn deferred_len_without_allocatable_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   character(len=:) :: s
 end program
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("deferred-length")));
     }
 
     #[test]
     fn deferred_len_with_allocatable_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   character(len=:), allocatable :: s
 end program
-");
+",
+        );
         assert!(errs.is_empty());
     }
 
@@ -2292,10 +2562,14 @@ end program
 
     #[test]
     fn duplicate_label_detected() {
-        use crate::lexer::{Span, Position};
+        use crate::lexer::{Position, Span};
         let st = SymbolTable::new();
         let mut ctx = Ctx::new(&st, None, false, false);
-        let span = Span { file_id: 0, start: Position { line: 1, col: 1 }, end: Position { line: 1, col: 1 } };
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
 
         register_label(&mut ctx, 10, span);
         register_label(&mut ctx, 10, span); // duplicate
@@ -2306,7 +2580,8 @@ end program
 
     #[test]
     fn clean_program_no_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   integer :: i, n
@@ -2316,13 +2591,15 @@ program test
     x = real(i) * 2.0
   end do
 end program
-");
+",
+        );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
     #[test]
     fn module_with_subroutine_no_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module mymod
   implicit none
   integer :: shared
@@ -2332,13 +2609,15 @@ contains
     shared = val
   end subroutine
 end module
-");
+",
+        );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
     #[test]
     fn module_parameter_visible_in_contained_subroutine() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   use iso_c_binding, only: c_int
   implicit none
@@ -2351,7 +2630,8 @@ contains
     print *, color_red
   end subroutine
 end module
-");
+",
+        );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
@@ -2363,65 +2643,79 @@ end module
     #[test]
     fn operator_interface_subroutine_errors() {
         // Parse a top-level interface block with operator name.
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 interface operator(+)
   subroutine bad_add(a, b)
     integer, intent(in) :: a, b
   end subroutine
 end interface
-");
-        assert!(errs.iter().any(|e| e.contains("functions, not subroutines")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("functions, not subroutines")));
     }
 
     #[test]
     fn operator_interface_wrong_arg_count() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 interface operator(+)
   function add3(a, b, c) result(r)
     integer, intent(in) :: a, b, c
     integer :: r
   end function
 end interface
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("1 or 2 arguments")));
     }
 
     #[test]
     fn operator_interface_valid_binary() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 interface operator(+)
   function add_vec(a, b) result(c)
     integer, intent(in) :: a, b
     integer :: c
   end function
 end interface
-");
+",
+        );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
     #[test]
     fn assignment_interface_function_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 interface assignment(=)
   function bad_assign(a, b) result(c)
     integer, intent(in) :: a, b
     integer :: c
   end function
 end interface
-");
-        assert!(errs.iter().any(|e| e.contains("subroutines, not functions")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("subroutines, not functions")));
     }
 
     #[test]
     fn assignment_interface_wrong_arg_count() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 interface assignment(=)
   subroutine bad_assign(a, b, c)
     integer, intent(inout) :: a
     integer, intent(in) :: b, c
   end subroutine
 end interface
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("2 arguments")));
     }
 
@@ -2429,7 +2723,8 @@ end interface
 
     #[test]
     fn deferred_in_non_abstract_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   implicit none
   type :: shape
@@ -2437,13 +2732,17 @@ module m
     procedure, deferred :: area
   end type
 end module
-");
-        assert!(errs.iter().any(|e| e.contains("DEFERRED") && e.contains("not ABSTRACT")));
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("DEFERRED") && e.contains("not ABSTRACT")));
     }
 
     #[test]
     fn deferred_in_abstract_ok() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   implicit none
   type, abstract :: shape
@@ -2451,7 +2750,8 @@ module m
     procedure, deferred :: area
   end type
 end module
-");
+",
+        );
         // No error for deferred in abstract type (the "must specify interface"
         // error is expected since our parser stores binding as None for simple
         // deferred procedures — that's a parser representation issue).
@@ -2460,7 +2760,8 @@ end module
 
     #[test]
     fn pass_and_nopass_together_errors() {
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 module m
   implicit none
   type :: thing
@@ -2468,7 +2769,8 @@ module m
     procedure, pass, nopass :: method
   end type
 end module
-");
+",
+        );
         assert!(errs.iter().any(|e| e.contains("both PASS and NOPASS")));
     }
 
@@ -2476,57 +2778,76 @@ end module
 
     #[test]
     fn do_concurrent_requires_f2008() {
-        let errs = errors_with_std("\
+        let errs = errors_with_std(
+            "\
 program test
   implicit none
   integer :: i
   do concurrent (i = 1:10)
   end do
 end program
-", FortranStandard::F95);
-        assert!(errs.iter().any(|e| e.contains("DO CONCURRENT") && e.contains("F2008")));
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("DO CONCURRENT") && e.contains("F2008")));
     }
 
     #[test]
     fn do_concurrent_ok_with_f2008() {
-        let errs = errors_with_std("\
+        let errs = errors_with_std(
+            "\
 program test
   implicit none
   integer :: i
   do concurrent (i = 1:10)
   end do
 end program
-", FortranStandard::F2008);
+",
+            FortranStandard::F2008,
+        );
         assert!(!errs.iter().any(|e| e.contains("DO CONCURRENT")));
     }
 
     #[test]
     fn error_stop_requires_f2008() {
-        let errs = errors_with_std("\
+        let errs = errors_with_std(
+            "\
 program test
   implicit none
   error stop
 end program
-", FortranStandard::F95);
-        assert!(errs.iter().any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
     }
 
     #[test]
     fn block_construct_requires_f2008() {
-        let errs = errors_with_std("\
+        let errs = errors_with_std(
+            "\
 program test
   implicit none
   block
     x = 1
   end block
 end program
-", FortranStandard::F95);
-        assert!(errs.iter().any(|e| e.contains("BLOCK") && e.contains("F2008")));
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("BLOCK") && e.contains("F2008")));
     }
 
     #[test]
     fn associate_requires_f2003() {
-        let errs = errors_with_std("\
+        let errs = errors_with_std(
+            "\
 program test
   implicit none
   integer :: n
@@ -2534,14 +2855,19 @@ program test
   associate (m => n)
   end associate
 end program
-", FortranStandard::F95);
-        assert!(errs.iter().any(|e| e.contains("ASSOCIATE") && e.contains("F2003")));
+",
+            FortranStandard::F95,
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("ASSOCIATE") && e.contains("F2003")));
     }
 
     #[test]
     fn no_std_violations_when_unset() {
         // With no --std= set, everything is allowed.
-        let errs = errors_from("\
+        let errs = errors_from(
+            "\
 program test
   implicit none
   integer :: i
@@ -2565,7 +2891,9 @@ end subroutine
 ",
             FortranStandard::F95,
         );
-        assert!(errs.iter().any(|e| e.contains("IMPURE") && e.contains("F2008")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("IMPURE") && e.contains("F2008")));
     }
 
     #[test]
@@ -2588,13 +2916,16 @@ end subroutine
             },
             span,
         );
-        let diags = validate_file_with_std(&[unit], &SymbolTable::new(), Some(FortranStandard::F95));
+        let diags =
+            validate_file_with_std(&[unit], &SymbolTable::new(), Some(FortranStandard::F95));
         let errs: Vec<_> = diags
             .into_iter()
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg)
             .collect();
-        assert!(errs.iter().any(|e| e.contains("SUBMODULE") && e.contains("F2008")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("SUBMODULE") && e.contains("F2008")));
     }
 
     #[test]
@@ -2701,7 +3032,9 @@ end program
 ",
             FortranStandard::F95,
         );
-        assert!(errs.iter().any(|e| e.contains("MOVE_ALLOC") && e.contains("F2003")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("MOVE_ALLOC") && e.contains("F2003")));
     }
 
     // ---- Elemental ----

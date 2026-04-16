@@ -41,10 +41,7 @@ pub extern "C" fn afs_deallocate(ptr: *mut u8) {
 /// Concatenate two strings. Returns a newly allocated string.
 /// Caller is responsible for freeing the result.
 #[no_mangle]
-pub extern "C" fn afs_string_concat(
-    a: *const u8, alen: i64,
-    b: *const u8, blen: i64,
-) -> *mut u8 {
+pub extern "C" fn afs_string_concat(a: *const u8, alen: i64, b: *const u8, blen: i64) -> *mut u8 {
     let total = (alen + blen) as usize;
     let result = afs_allocate(total as i64);
     if !a.is_null() && alen > 0 {
@@ -59,10 +56,7 @@ pub extern "C" fn afs_string_concat(
 /// Copy a string into a fixed-length buffer, padding with spaces.
 /// Used for character assignment to fixed-length variables.
 #[no_mangle]
-pub extern "C" fn afs_string_copy(
-    dest: *mut u8, dest_len: i64,
-    src: *const u8, src_len: i64,
-) {
+pub extern "C" fn afs_string_copy(dest: *mut u8, dest_len: i64, src: *const u8, src_len: i64) {
     if dest.is_null() || dest_len <= 0 {
         return;
     }
@@ -81,15 +75,16 @@ pub extern "C" fn afs_string_copy(
 /// Compare two strings lexicographically.
 /// Returns negative, zero, or positive (like strcmp but for counted strings).
 #[no_mangle]
-pub extern "C" fn afs_string_compare(
-    a: *const u8, alen: i64,
-    b: *const u8, blen: i64,
-) -> i32 {
+pub extern "C" fn afs_string_compare(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
     let sa = if !a.is_null() && alen > 0 {
         unsafe { std::slice::from_raw_parts(a, alen as usize) }
-    } else { &[] };
+    } else {
+        &[]
+    };
     let sb = if !b.is_null() && blen > 0 {
         unsafe { std::slice::from_raw_parts(b, blen as usize) }
-    } else { &[] };
+    } else {
+        &[]
+    };
     sa.cmp(sb) as i32
 }

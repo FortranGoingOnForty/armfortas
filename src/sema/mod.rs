@@ -3,10 +3,10 @@
 //! Symbol tables, scoping, type checking, module resolution,
 //! interface validation, and standard conformance checks.
 
-pub mod symtab;
+pub mod amod;
+pub mod intrinsic_modules;
 pub mod resolve;
+pub mod symtab;
+pub mod type_layout;
 pub mod types;
 pub mod validate;
-pub mod intrinsic_modules;
-pub mod type_layout;
-pub mod amod;

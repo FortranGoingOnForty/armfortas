@@ -3,9 +3,9 @@
 //! Used by the AST→IR lowering pass and by tests. Manages ValueId
 //! allocation, block insertion, and instruction emission.
 
-use crate::lexer::{Span, Position};
-use super::types::*;
 use super::inst::*;
+use super::types::*;
+use crate::lexer::{Position, Span};
 
 /// Builder for constructing a function's IR.
 pub struct FuncBuilder<'a> {
@@ -16,7 +16,10 @@ pub struct FuncBuilder<'a> {
 impl<'a> FuncBuilder<'a> {
     pub fn new(func: &'a mut Function) -> Self {
         let entry = func.entry;
-        Self { func, current_block: entry }
+        Self {
+            func,
+            current_block: entry,
+        }
     }
 
     /// Switch to emitting into a different block.
@@ -38,19 +41,29 @@ impl<'a> FuncBuilder<'a> {
     pub fn add_block_param(&mut self, block: BlockId, ty: IrType) -> ValueId {
         let id = self.func.next_value_id();
         self.func.register_type(id, ty.clone());
-        self.func.block_mut(block).params.push(BlockParam { id, ty });
+        self.func
+            .block_mut(block)
+            .params
+            .push(BlockParam { id, ty });
         id
     }
 
     /// Get the underlying function.
-    pub fn func(&self) -> &Function { self.func }
+    pub fn func(&self) -> &Function {
+        self.func
+    }
 
     // ---- Instruction emission ----
 
     fn emit(&mut self, kind: InstKind, ty: IrType) -> ValueId {
         let id = self.func.next_value_id();
         self.func.register_type(id, ty.clone());
-        let inst = Inst { id, kind, ty, span: dummy_span() };
+        let inst = Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        };
         self.func.block_mut(self.current_block).insts.push(inst);
         id
     }
@@ -110,74 +123,116 @@ impl<'a> FuncBuilder<'a> {
     // ---- Integer arithmetic ----
 
     pub fn iadd(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::IAdd(lhs, rhs), ty)
     }
 
     pub fn isub(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::ISub(lhs, rhs), ty)
     }
 
     pub fn imul(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::IMul(lhs, rhs), ty)
     }
 
     pub fn idiv(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::IDiv(lhs, rhs), ty)
     }
 
     pub fn imod(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::IMod(lhs, rhs), ty)
     }
 
     pub fn ineg(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::INeg(val), ty)
     }
 
     // ---- Float arithmetic ----
 
     pub fn fadd(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Float(FloatWidth::F32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Float(FloatWidth::F32));
         self.emit(InstKind::FAdd(lhs, rhs), ty)
     }
 
     pub fn fsub(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Float(FloatWidth::F32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Float(FloatWidth::F32));
         self.emit(InstKind::FSub(lhs, rhs), ty)
     }
 
     pub fn fmul(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Float(FloatWidth::F32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Float(FloatWidth::F32));
         self.emit(InstKind::FMul(lhs, rhs), ty)
     }
 
     pub fn fdiv(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Float(FloatWidth::F32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Float(FloatWidth::F32));
         self.emit(InstKind::FDiv(lhs, rhs), ty)
     }
 
     pub fn fneg(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Float(FloatWidth::F32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Float(FloatWidth::F32));
         self.emit(InstKind::FNeg(val), ty)
     }
 
     pub fn fabs(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Float(FloatWidth::F64));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Float(FloatWidth::F64));
         self.emit(InstKind::FAbs(val), ty)
     }
 
     pub fn fsqrt(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Float(FloatWidth::F64));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Float(FloatWidth::F64));
         self.emit(InstKind::FSqrt(val), ty)
     }
 
     pub fn fpow(&mut self, base: ValueId, exp: ValueId) -> ValueId {
-        let ty = self.func.value_type(base).unwrap_or(IrType::Float(FloatWidth::F64));
+        let ty = self
+            .func
+            .value_type(base)
+            .unwrap_or(IrType::Float(FloatWidth::F64));
         self.emit(InstKind::FPow(base, exp), ty)
     }
 
@@ -195,7 +250,10 @@ impl<'a> FuncBuilder<'a> {
 
     /// Conditional select: cond ? true_val : false_val
     pub fn select(&mut self, cond: ValueId, true_val: ValueId, false_val: ValueId) -> ValueId {
-        let ty = self.func.value_type(true_val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(true_val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::Select(cond, true_val, false_val), ty)
     }
 
@@ -216,47 +274,74 @@ impl<'a> FuncBuilder<'a> {
     // ---- Bitwise ----
 
     pub fn bit_and(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::BitAnd(lhs, rhs), ty)
     }
 
     pub fn bit_or(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::BitOr(lhs, rhs), ty)
     }
 
     pub fn bit_xor(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::BitXor(lhs, rhs), ty)
     }
 
     pub fn shl(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::Shl(lhs, rhs), ty)
     }
 
     pub fn bit_not(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::BitNot(val), ty)
     }
 
     pub fn lshr(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.func.value_type(lhs).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(lhs)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::LShr(lhs, rhs), ty)
     }
 
     pub fn clz(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::CountLeadingZeros(val), ty)
     }
 
     pub fn ctz(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::CountTrailingZeros(val), ty)
     }
 
     pub fn popcount(&mut self, val: ValueId) -> ValueId {
-        let ty = self.func.value_type(val).unwrap_or(IrType::Int(IntWidth::I32));
+        let ty = self
+            .func
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
         self.emit(InstKind::PopCount(val), ty)
     }
 
@@ -330,7 +415,10 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn gep(&mut self, base: ValueId, indices: Vec<ValueId>, result_ty: IrType) -> ValueId {
-        self.emit(InstKind::GetElementPtr(base, indices), IrType::Ptr(Box::new(result_ty)))
+        self.emit(
+            InstKind::GetElementPtr(base, indices),
+            IrType::Ptr(Box::new(result_ty)),
+        )
     }
 
     // ---- Calls ----
@@ -339,7 +427,12 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::Call(func_ref, args), ret_ty)
     }
 
-    pub fn runtime_call(&mut self, func: RuntimeFunc, args: Vec<ValueId>, ret_ty: IrType) -> ValueId {
+    pub fn runtime_call(
+        &mut self,
+        func: RuntimeFunc,
+        args: Vec<ValueId>,
+        ret_ty: IrType,
+    ) -> ValueId {
         self.emit(InstKind::RuntimeCall(func, args), ret_ty)
     }
 
@@ -365,8 +458,7 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn branch(&mut self, dest: BlockId, args: Vec<ValueId>) {
-        self.func.block_mut(self.current_block).terminator =
-            Some(Terminator::Branch(dest, args));
+        self.func.block_mut(self.current_block).terminator = Some(Terminator::Branch(dest, args));
     }
 
     pub fn cond_branch(
@@ -377,13 +469,21 @@ impl<'a> FuncBuilder<'a> {
         false_dest: BlockId,
         false_args: Vec<ValueId>,
     ) {
-        self.func.block_mut(self.current_block).terminator =
-            Some(Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args });
+        self.func.block_mut(self.current_block).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        });
     }
 
     pub fn switch(&mut self, selector: ValueId, cases: Vec<(i64, BlockId)>, default: BlockId) {
-        self.func.block_mut(self.current_block).terminator =
-            Some(Terminator::Switch { selector, cases, default });
+        self.func.block_mut(self.current_block).terminator = Some(Terminator::Switch {
+            selector,
+            cases,
+            default,
+        });
     }
 
     pub fn unreachable(&mut self) {
@@ -403,7 +503,11 @@ impl<'a> FuncBuilder<'a> {
 }
 
 fn dummy_span() -> Span {
-    Span { file_id: 0, start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } }
+    Span {
+        file_id: 0,
+        start: Position { line: 0, col: 0 },
+        end: Position { line: 0, col: 0 },
+    }
 }
 
 #[cfg(test)]

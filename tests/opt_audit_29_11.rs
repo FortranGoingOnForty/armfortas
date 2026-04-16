@@ -25,9 +25,7 @@ fn function_slice<'a>(ir: &'a str, name: &str) -> &'a str {
         .find(&marker)
         .unwrap_or_else(|| panic!("missing function {} in IR:\n{}", name, ir));
     let rest = &ir[start..];
-    let end = rest
-        .find("\n  func @")
-        .unwrap_or(rest.len());
+    let end = rest.find("\n  func @").unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -112,7 +110,10 @@ fn sasum_cleanup_eliminates_chunked_loop_bounds_checks_at_o2() {
 
 #[test]
 fn realworld_29_8_kernels_have_deterministic_o2_objects() {
-    for name in ["realworld_sasum_cleanup.f90", "realworld_three_point_apply.f90"] {
+    for name in [
+        "realworld_sasum_cleanup.f90",
+        "realworld_three_point_apply.f90",
+    ] {
         let source = fixture(name);
         let first = capture_text(
             CaptureRequest {

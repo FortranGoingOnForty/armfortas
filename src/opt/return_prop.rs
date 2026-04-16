@@ -17,7 +17,9 @@ use super::util::substitute_uses;
 pub struct ReturnPropagate;
 
 impl Pass for ReturnPropagate {
-    fn name(&self) -> &'static str { "return-prop" }
+    fn name(&self) -> &'static str {
+        "return-prop"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let plans = collect_plans(module);
@@ -101,11 +103,19 @@ fn const_value_of(func: &Function, value: ValueId) -> Option<ScalarConst> {
 }
 
 fn side_effect_free(kind: &InstKind) -> bool {
-    !matches!(kind, InstKind::Store(..) | InstKind::Call(..) | InstKind::RuntimeCall(..))
+    !matches!(
+        kind,
+        InstKind::Store(..) | InstKind::Call(..) | InstKind::RuntimeCall(..)
+    )
 }
 
 fn classify_return_source(func: &Function, value: ValueId) -> Option<ReturnSource> {
-    if let Some((idx, param)) = func.params.iter().enumerate().find(|(_, param)| param.id == value) {
+    if let Some((idx, param)) = func
+        .params
+        .iter()
+        .enumerate()
+        .find(|(_, param)| param.id == value)
+    {
         if !param.ty.is_ptr() && is_scalar_type(&param.ty) {
             return Some(ReturnSource::Param(idx));
         }
@@ -115,7 +125,11 @@ fn classify_return_source(func: &Function, value: ValueId) -> Option<ReturnSourc
     let inst = defs.get(&value)?;
     match inst.kind {
         InstKind::Load(addr) => {
-            let (idx, param) = func.params.iter().enumerate().find(|(_, param)| param.id == addr)?;
+            let (idx, param) = func
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, param)| param.id == addr)?;
             let IrType::Ptr(inner) = &param.ty else {
                 return None;
             };
@@ -135,7 +149,12 @@ fn collect_plans(module: &Module) -> Vec<Option<ReturnSource>> {
         if !func.internal_only || matches!(func.return_type, IrType::Void) {
             continue;
         }
-        if func.blocks.iter().flat_map(|block| block.insts.iter()).any(|inst| !side_effect_free(&inst.kind)) {
+        if func
+            .blocks
+            .iter()
+            .flat_map(|block| block.insts.iter())
+            .any(|inst| !side_effect_free(&inst.kind))
+        {
             continue;
         }
 
@@ -211,7 +230,11 @@ fn default_span(func: &Function) -> Span {
         span
     } else {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 }
 
@@ -279,11 +302,10 @@ fn rewrite_caller(module: &mut Module, caller_idx: usize, plans: &[Option<Return
     for (call_id, args, plan) in scheduled {
         let replacement = match plan {
             ReturnSource::Param(param_idx) => args.get(param_idx).copied(),
-            ReturnSource::LoadParam(param_idx) => {
-                args.get(param_idx)
-                    .copied()
-                    .and_then(|ptr| wrapper_value_for_call(caller, ptr, call_id))
-            }
+            ReturnSource::LoadParam(param_idx) => args
+                .get(param_idx)
+                .copied()
+                .and_then(|ptr| wrapper_value_for_call(caller, ptr, call_id)),
             ReturnSource::Const(value) => Some(ensure_const_in_entry(caller, &mut cache, value)),
         };
         let Some(replacement) = replacement else {
@@ -327,13 +349,22 @@ mod tests {
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty: ty.clone(), span: span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty: ty.clone(),
+            span: span(),
+        });
         f.register_type(id, ty);
         id
     }
@@ -350,13 +381,21 @@ mod tests {
         }];
         let mut callee = Function::new("passthrough".into(), params, IrType::Int(IntWidth::I32));
         callee.internal_only = true;
-        let loaded = push(&mut callee, InstKind::Load(ValueId(0)), IrType::Int(IntWidth::I32));
+        let loaded = push(
+            &mut callee,
+            InstKind::Load(ValueId(0)),
+            IrType::Int(IntWidth::I32),
+        );
         let callee_entry = callee.entry;
         callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(loaded)));
         module.add_function(callee);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
-        let c7 = push(&mut caller, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c7 = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let slot = push(
             &mut caller,
             InstKind::Alloca(IrType::Int(IntWidth::I32)),
@@ -375,7 +414,9 @@ mod tests {
         assert!(ReturnPropagate.run(&mut module));
         let caller_insts = &module.functions[1].blocks[0].insts;
         assert!(
-            !caller_insts.iter().any(|inst| matches!(inst.kind, InstKind::Call(..))),
+            !caller_insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call(..))),
             "call should be removed after return propagation"
         );
         assert!(
@@ -390,7 +431,11 @@ mod tests {
 
         let mut callee = Function::new("const_fn".into(), vec![], IrType::Int(IntWidth::I32));
         callee.internal_only = true;
-        let c42 = push(&mut callee, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c42 = push(
+            &mut callee,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let callee_entry = callee.entry;
         callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(c42)));
         module.add_function(callee);
@@ -408,11 +453,15 @@ mod tests {
         assert!(ReturnPropagate.run(&mut module));
         let caller_insts = &module.functions[1].blocks[0].insts;
         assert!(
-            !caller_insts.iter().any(|inst| matches!(inst.kind, InstKind::Call(..))),
+            !caller_insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call(..))),
             "constant helper call should be removed"
         );
         assert!(
-            caller_insts.iter().any(|inst| matches!(inst.kind, InstKind::ConstInt(42, IntWidth::I32))),
+            caller_insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::ConstInt(42, IntWidth::I32))),
             "caller should materialize the propagated constant"
         );
     }

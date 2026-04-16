@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use armfortas::driver::{compile, OptLevel, Options};
@@ -100,7 +100,9 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path) {
         return;
     };
     let debug_archive = workspace_root.join("target/debug/libarmfortas_rt.a");
-    let archive_mtime = fs::metadata(&debug_archive).ok().and_then(|meta| meta.modified().ok());
+    let archive_mtime = fs::metadata(&debug_archive)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
 
     if archive_mtime.is_some_and(|mtime| mtime >= source_mtime) {
         return;
@@ -208,13 +210,23 @@ fn run_cross_object_case_named(
     opt_level: OptLevel,
     expected_score: char,
 ) {
-    let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = CROSS_OBJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let program = fixture(program_name);
     let helper = fixture(helper_name);
     let stem = program.file_stem().unwrap().to_str().unwrap();
-    let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
+    let fortran_obj = unique_temp_path(
+        "i128_cross_object",
+        &format!("{}_{}", stem, opt_label(opt_level)),
+        ".o",
+    );
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
-    let binary = unique_temp_path("i128_cross_object_bin", &format!("{}_{}", stem, opt_label(opt_level)), "");
+    let binary = unique_temp_path(
+        "i128_cross_object_bin",
+        &format!("{}_{}", stem, opt_label(opt_level)),
+        "",
+    );
 
     compile_fortran_object(&program, &fortran_obj, opt_level);
     compile_c_object(&helper, &helper_obj);
@@ -249,14 +261,28 @@ fn run_cross_object_case(opt_level: OptLevel) {
     );
 }
 
-fn deterministic_cross_object_case_named(program_name: &str, helper_name: &str, opt_level: OptLevel) {
-    let _guard = CROSS_OBJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+fn deterministic_cross_object_case_named(
+    program_name: &str,
+    helper_name: &str,
+    opt_level: OptLevel,
+) {
+    let _guard = CROSS_OBJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let program = fixture(program_name);
     let helper = fixture(helper_name);
     let stem = program.file_stem().unwrap().to_str().unwrap();
-    let fortran_obj = unique_temp_path("i128_cross_object", &format!("{}_{}", stem, opt_label(opt_level)), ".o");
+    let fortran_obj = unique_temp_path(
+        "i128_cross_object",
+        &format!("{}_{}", stem, opt_label(opt_level)),
+        ".o",
+    );
     let helper_obj = unique_temp_path("i128_cross_object_helper", stem, ".o");
-    let binary = unique_temp_path("i128_cross_object_bin", &format!("{}_{}", stem, opt_label(opt_level)), "");
+    let binary = unique_temp_path(
+        "i128_cross_object_bin",
+        &format!("{}_{}", stem, opt_label(opt_level)),
+        "",
+    );
 
     compile_fortran_object(&program, &fortran_obj, opt_level);
     compile_c_object(&helper, &helper_obj);

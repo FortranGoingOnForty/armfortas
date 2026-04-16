@@ -3,7 +3,7 @@
 //! Every instruction produces a value (ValueId) in SSA form.
 //! Basic blocks end with exactly one Terminator.
 
-use super::types::{IrType, IntWidth, FloatWidth};
+use super::types::{FloatWidth, IntWidth, IrType};
 use crate::lexer::Span;
 use std::collections::HashMap;
 
@@ -125,7 +125,7 @@ pub enum InstKind {
     FloatToInt(ValueId, IntWidth),
     FloatExtend(ValueId, FloatWidth),
     FloatTrunc(ValueId, FloatWidth),
-    IntExtend(ValueId, IntWidth, bool),   // bool = signed
+    IntExtend(ValueId, IntWidth, bool), // bool = signed
     IntTrunc(ValueId, IntWidth),
     /// Convert a pointer to an integer (address as i64).
     PtrToInt(ValueId),
@@ -283,12 +283,18 @@ impl Function {
     /// Get a block by ID. Panics if the ID is not present — use
     /// `try_block` for graceful degradation.
     pub fn block(&self, id: BlockId) -> &BasicBlock {
-        self.blocks.iter().find(|b| b.id == id).expect("block not found")
+        self.blocks
+            .iter()
+            .find(|b| b.id == id)
+            .expect("block not found")
     }
 
     /// Get a mutable block by ID. Panics if the ID is not present.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
-        self.blocks.iter_mut().find(|b| b.id == id).expect("block not found")
+        self.blocks
+            .iter_mut()
+            .find(|b| b.id == id)
+            .expect("block not found")
     }
 
     /// Get a block by ID, returning `None` if the ID is not
@@ -337,14 +343,20 @@ impl Function {
         // pointer-type bugs for entire compilation units. Recompute
         // on-demand so consumers always get a consistent answer.
         for p in &self.params {
-            if p.id == id { return Some(p.ty.clone()); }
+            if p.id == id {
+                return Some(p.ty.clone());
+            }
         }
         for block in &self.blocks {
             for bp in &block.params {
-                if bp.id == id { return Some(bp.ty.clone()); }
+                if bp.id == id {
+                    return Some(bp.ty.clone());
+                }
             }
             for inst in &block.insts {
-                if inst.id == id { return Some(inst.ty.clone()); }
+                if inst.id == id {
+                    return Some(inst.ty.clone());
+                }
             }
         }
         None
@@ -354,7 +366,9 @@ impl Function {
     pub fn find_defining_inst(&self, id: ValueId) -> Option<&Inst> {
         for block in &self.blocks {
             for inst in &block.insts {
-                if inst.id == id { return Some(inst); }
+                if inst.id == id {
+                    return Some(inst);
+                }
             }
         }
         None
@@ -435,14 +449,28 @@ impl Module {
 
     /// True when any live IR surface in the module uses `i128`.
     pub fn contains_i128(&self) -> bool {
-        self.globals.iter().any(|global| type_contains_i128(self, &global.ty))
-            || self.extern_funcs.iter().any(|func| sig_contains_i128(self, &func.sig))
+        self.globals
+            .iter()
+            .any(|global| type_contains_i128(self, &global.ty))
+            || self
+                .extern_funcs
+                .iter()
+                .any(|func| sig_contains_i128(self, &func.sig))
             || self.functions.iter().any(|func| {
                 type_contains_i128(self, &func.return_type)
-                    || func.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                    || func
+                        .params
+                        .iter()
+                        .any(|param| type_contains_i128(self, &param.ty))
                     || func.blocks.iter().any(|block| {
-                        block.params.iter().any(|param| type_contains_i128(self, &param.ty))
-                            || block.insts.iter().any(|inst| type_contains_i128(self, &inst.ty))
+                        block
+                            .params
+                            .iter()
+                            .any(|param| type_contains_i128(self, &param.ty))
+                            || block
+                                .insts
+                                .iter()
+                                .any(|inst| type_contains_i128(self, &inst.ty))
                     })
             })
     }
@@ -454,13 +482,24 @@ impl Module {
     /// Parameters, returns, instruction results, block params, and extern
     /// signatures still imply unsupported ABI or codegen work.
     pub fn contains_i128_outside_globals(&self) -> bool {
-        self.extern_funcs.iter().any(|func| sig_contains_i128(self, &func.sig))
+        self.extern_funcs
+            .iter()
+            .any(|func| sig_contains_i128(self, &func.sig))
             || self.functions.iter().any(|func| {
                 type_contains_i128(self, &func.return_type)
-                    || func.params.iter().any(|param| type_contains_i128(self, &param.ty))
+                    || func
+                        .params
+                        .iter()
+                        .any(|param| type_contains_i128(self, &param.ty))
                     || func.blocks.iter().any(|block| {
-                        block.params.iter().any(|param| type_contains_i128(self, &param.ty))
-                            || block.insts.iter().any(|inst| type_contains_i128(self, &inst.ty))
+                        block
+                            .params
+                            .iter()
+                            .any(|param| type_contains_i128(self, &param.ty))
+                            || block
+                                .insts
+                                .iter()
+                                .any(|inst| type_contains_i128(self, &inst.ty))
                     })
             })
     }
@@ -494,17 +533,14 @@ impl Module {
         self.globals
             .iter()
             .all(|global| global_i128_backend_data_supported(self, global))
-            && self
-                .extern_funcs
-                .iter()
-                .all(|func| {
-                    abi_type_i128_backend_o0_supported(self, &func.sig.ret, true)
-                        && func
-                            .sig
-                            .params
-                            .iter()
-                            .all(|param| abi_type_i128_backend_o0_supported(self, param, true))
-                })
+            && self.extern_funcs.iter().all(|func| {
+                abi_type_i128_backend_o0_supported(self, &func.sig.ret, true)
+                    && func
+                        .sig
+                        .params
+                        .iter()
+                        .all(|param| abi_type_i128_backend_o0_supported(self, param, true))
+            })
             && self
                 .functions
                 .iter()
@@ -514,17 +550,21 @@ impl Module {
 
 fn sig_contains_i128(module: &Module, sig: &super::types::FuncSig) -> bool {
     type_contains_i128(module, &sig.ret)
-        || sig.params.iter().any(|param| type_contains_i128(module, param))
+        || sig
+            .params
+            .iter()
+            .any(|param| type_contains_i128(module, param))
 }
 
 fn type_contains_i128(module: &Module, ty: &IrType) -> bool {
     match ty {
         IrType::Int(IntWidth::I128) => true,
         IrType::Ptr(inner) | IrType::Array(inner, _) => type_contains_i128(module, inner),
-        IrType::Struct(id) => module
-            .struct_defs
-            .get(*id as usize)
-            .is_some_and(|def| def.fields.iter().any(|(_, field_ty)| type_contains_i128(module, field_ty))),
+        IrType::Struct(id) => module.struct_defs.get(*id as usize).is_some_and(|def| {
+            def.fields
+                .iter()
+                .any(|(_, field_ty)| type_contains_i128(module, field_ty))
+        }),
         IrType::FuncPtr(sig) => sig_contains_i128(module, sig),
         _ => false,
     }
@@ -586,12 +626,14 @@ fn runtime_call_i128_backend_o0_supported(
     result_ty: &IrType,
 ) -> bool {
     match rf {
-        RuntimeFunc::PrintInt => matches!(result_ty, IrType::Void)
-            && args.len() == 1
-            && args
-                .iter()
-                .filter_map(|arg| func.value_type(*arg))
-                .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, true)),
+        RuntimeFunc::PrintInt => {
+            matches!(result_ty, IrType::Void)
+                && args.len() == 1
+                && args
+                    .iter()
+                    .filter_map(|arg| func.value_type(*arg))
+                    .all(|ty| abi_type_i128_backend_o0_supported(module, &ty, true))
+        }
         _ => false,
     }
 }
@@ -640,7 +682,10 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         // dereferencing an sret-style hidden result-buffer pointer.
         InstKind::Load(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
-            if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
+        {
+            true
+        }
         InstKind::ICmp(..) if uses_i128 => true,
         InstKind::Select(..) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Call(callee, args) if inst_ty_has_i128 || uses_i128 => {
@@ -678,7 +723,11 @@ fn terminator_i128_backend_o0_supported(
             .iter()
             .filter_map(|arg| func.value_type(*arg))
             .all(|ty| ssa_type_i128_backend_o0_supported(module, &ty)),
-        Terminator::CondBranch { true_args, false_args, .. } => true_args
+        Terminator::CondBranch {
+            true_args,
+            false_args,
+            ..
+        } => true_args
             .iter()
             .chain(false_args.iter())
             .filter_map(|arg| func.value_type(*arg))

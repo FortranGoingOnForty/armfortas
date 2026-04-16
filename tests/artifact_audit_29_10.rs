@@ -115,7 +115,14 @@ fn optimized_object_snapshot_removes_inlined_helper_symbol() {
 fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
     let source = fixture("module_init.f90");
 
-    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+    for opt in [
+        OptLevel::O0,
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
         let first = capture_text(
             CaptureRequest {
                 input: source.clone(),
@@ -133,7 +140,8 @@ fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
             Stage::Obj,
         );
         assert_eq!(
-            first, second,
+            first,
+            second,
             "object snapshot should be deterministic for module globals at {}",
             opt_name(opt)
         );

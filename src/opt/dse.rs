@@ -25,8 +25,8 @@
 //! initialization sequences where a variable is zeroed and then
 //! immediately written with the real value.
 
-use super::pass::Pass;
 use super::alias::{self, AliasResult};
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use std::collections::HashSet;
@@ -58,7 +58,10 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
                         }
                     }
                 }
-                next_pending.push(PendingStore { ptr: *ptr, inst_idx: i });
+                next_pending.push(PendingStore {
+                    ptr: *ptr,
+                    inst_idx: i,
+                });
                 pending = next_pending;
             }
 
@@ -82,18 +85,13 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
                 let pointer_args: Vec<ValueId> = args
                     .iter()
                     .copied()
-                    .filter(|arg| {
-                        matches!(
-                            func.value_type(*arg),
-                            Some(IrType::Ptr(_))
-                        )
-                    })
+                    .filter(|arg| matches!(func.value_type(*arg), Some(IrType::Ptr(_))))
                     .collect();
                 if !pointer_args.is_empty() {
                     pending.retain(|entry| {
-                        pointer_args.iter().all(|arg| {
-                            !alias::may_reach_through_call_arg(func, entry.ptr, *arg)
-                        })
+                        pointer_args
+                            .iter()
+                            .all(|arg| !alias::may_reach_through_call_arg(func, entry.ptr, *arg))
                     });
                 }
             }
@@ -136,11 +134,15 @@ fn dse_function(func: &mut Function) -> bool {
 pub struct Dse;
 
 impl Pass for Dse {
-    fn name(&self) -> &'static str { "dse" }
+    fn name(&self) -> &'static str {
+        "dse"
+    }
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if dse_function(func) { changed = true; }
+            if dse_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -149,24 +151,39 @@ impl Pass for Dse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
-    use crate::lexer::{Span, Position};
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
-    fn ptr_ty() -> IrType { IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))) }
-    fn alloca_ty() -> IrType { IrType::Int(IntWidth::I32) }
-    fn i32_ty() -> IrType { IrType::Int(IntWidth::I32) }
+    fn ptr_ty() -> IrType {
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))
+    }
+    fn alloca_ty() -> IrType {
+        IrType::Int(IntWidth::I32)
+    }
+    fn i32_ty() -> IrType {
+        IrType::Int(IntWidth::I32)
+    }
 
     /// %ptr = alloca i32
     /// store 1, %ptr
@@ -177,10 +194,10 @@ mod tests {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
-        let v1  = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
-        let v2  = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
-        push(&mut f, InstKind::Store(v1, ptr), IrType::Void);   // dead
-        push(&mut f, InstKind::Store(v2, ptr), IrType::Void);   // live
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, ptr), IrType::Void); // dead
+        push(&mut f, InstKind::Store(v2, ptr), IrType::Void); // live
         let _loaded = push(&mut f, InstKind::Load(ptr), i32_ty());
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
@@ -191,7 +208,10 @@ mod tests {
         let insts = &m.functions[0].blocks[0].insts;
         assert_eq!(insts.len(), 5, "first store should be eliminated");
         // The surviving Store should use v2.
-        let stores: Vec<_> = insts.iter().filter(|i| matches!(i.kind, InstKind::Store(..))).collect();
+        let stores: Vec<_> = insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::Store(..)))
+            .collect();
         assert_eq!(stores.len(), 1);
         assert!(matches!(stores[0].kind, InstKind::Store(v, _) if v == v2));
     }
@@ -202,7 +222,7 @@ mod tests {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], i32_ty());
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
-        let v1  = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), i32_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), i32_ty());
         push(&mut f, InstKind::Store(v1, ptr), IrType::Void);
         let loaded = push(&mut f, InstKind::Load(ptr), i32_ty());
         let entry = f.entry;
@@ -223,23 +243,35 @@ mod tests {
         let ptr = push(&mut f, InstKind::Alloca(arr_ty), arr_ptr_ty);
         let off0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), i32_ty());
         let off1 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), i32_ty());
-        let gep0 = push(&mut f, InstKind::GetElementPtr(ptr, vec![off0]),
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-        let gep1 = push(&mut f, InstKind::GetElementPtr(ptr, vec![off1]),
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let gep0 = push(
+            &mut f,
+            InstKind::GetElementPtr(ptr, vec![off0]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let gep1 = push(
+            &mut f,
+            InstKind::GetElementPtr(ptr, vec![off1]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
         let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
         let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
-        push(&mut f, InstKind::Store(v1, gep0), IrType::Void);  // dead
-        push(&mut f, InstKind::Store(v2, gep1), IrType::Void);  // live
+        push(&mut f, InstKind::Store(v1, gep0), IrType::Void); // dead
+        push(&mut f, InstKind::Store(v2, gep1), IrType::Void); // live
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
 
         assert!(Dse.run(&mut m));
-        let stores: Vec<_> = m.functions[0].blocks[0].insts.iter()
+        let stores: Vec<_> = m.functions[0].blocks[0]
+            .insts
+            .iter()
             .filter(|i| matches!(i.kind, InstKind::Store(..)))
             .collect();
-        assert_eq!(stores.len(), 1, "must-alias GEP overwrite should kill the first store");
+        assert_eq!(
+            stores.len(),
+            1,
+            "must-alias GEP overwrite should kill the first store"
+        );
         assert!(matches!(stores[0].kind, InstKind::Store(v, _) if v == v2));
     }
 
@@ -249,12 +281,12 @@ mod tests {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
-        let v1  = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
-        let v2  = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
-        let v3  = push(&mut f, InstKind::ConstInt(3, IntWidth::I32), i32_ty());
-        push(&mut f, InstKind::Store(v1, ptr), IrType::Void);  // dead
-        push(&mut f, InstKind::Store(v2, ptr), IrType::Void);  // dead
-        push(&mut f, InstKind::Store(v3, ptr), IrType::Void);  // live (block exit)
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        let v3 = push(&mut f, InstKind::ConstInt(3, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, ptr), IrType::Void); // dead
+        push(&mut f, InstKind::Store(v2, ptr), IrType::Void); // dead
+        push(&mut f, InstKind::Store(v3, ptr), IrType::Void); // live (block exit)
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -263,7 +295,9 @@ mod tests {
         // (stores of v1 and v2 are dead; store of v3 remains because it
         //  might be read in a successor — we don't do cross-block analysis)
         assert!(Dse.run(&mut m));
-        let stores: Vec<_> = m.functions[0].blocks[0].insts.iter()
+        let stores: Vec<_> = m.functions[0].blocks[0]
+            .insts
+            .iter()
             .filter(|i| matches!(i.kind, InstKind::Store(..)))
             .collect();
         // Two dead stores removed, one survives.

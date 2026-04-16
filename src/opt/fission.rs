@@ -10,24 +10,28 @@
 //!
 //! This avoids SSA domination bugs from selective instruction removal.
 
-use std::collections::HashSet;
+use super::dep_analysis::{collect_mem_refs, test_dependence};
+use super::loop_utils::{clone_loop, find_preheader};
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
-use super::loop_utils::{find_preheader, clone_loop};
-use super::dep_analysis::{collect_mem_refs, test_dependence};
-use super::pass::Pass;
+use std::collections::HashSet;
 
 const FISSION_MIN_BODY: usize = 4;
 
 pub struct LoopFission;
 
 impl Pass for LoopFission {
-    fn name(&self) -> &'static str { "loop-fission" }
+    fn name(&self) -> &'static str {
+        "loop-fission"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if fission_in_function(func) { changed = true; }
+            if fission_in_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -38,12 +42,18 @@ fn fission_in_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
-        let Some(_ph_id) = find_preheader(func, lp, &preds) else { continue };
-        if lp.latches.len() != 1 { continue; }
+        let Some(_ph_id) = find_preheader(func, lp, &preds) else {
+            continue;
+        };
+        if lp.latches.len() != 1 {
+            continue;
+        }
         let latch_id = lp.latches[0];
 
         let hdr = func.block(lp.header);
-        if hdr.params.len() != 1 { continue; }
+        if hdr.params.len() != 1 {
+            continue;
+        }
         let iv = hdr.params[0].id;
 
         // Find the single computation body block.
@@ -51,34 +61,56 @@ fn fission_in_function(func: &mut Function) -> bool {
         let Some(body_bid) = body_block else { continue };
 
         let block = func.block(body_bid);
-        if block.insts.len() < FISSION_MIN_BODY { continue; }
+        if block.insts.len() < FISSION_MIN_BODY {
+            continue;
+        }
 
         // Need exactly 2 stores to different arrays.
-        let stores: Vec<(usize, ValueId)> = block.insts.iter().enumerate()
+        let stores: Vec<(usize, ValueId)> = block
+            .insts
+            .iter()
+            .enumerate()
             .filter(|(_, i)| matches!(i.kind, InstKind::Store(..)))
             .map(|(idx, i)| (idx, i.id))
             .collect();
-        if stores.len() != 2 { continue; }
+        if stores.len() != 2 {
+            continue;
+        }
 
         // Check independence via dep analysis.
         let mut ivs = HashSet::new();
         ivs.insert(iv);
         let mem_refs = collect_mem_refs(func, &lp.body, &ivs);
         let writes: Vec<_> = mem_refs.iter().filter(|r| r.is_write).collect();
-        if writes.len() != 2 { continue; }
-        if writes[0].base == writes[1].base { continue; }
+        if writes.len() != 2 {
+            continue;
+        }
+        if writes[0].base == writes[1].base {
+            continue;
+        }
 
         let mut has_cross_dep = false;
         for i in 0..mem_refs.len() {
-            for j in (i+1)..mem_refs.len() {
-                if !mem_refs[i].is_write && !mem_refs[j].is_write { continue; }
-                if mem_refs[i].base == mem_refs[j].base { continue; }
+            for j in (i + 1)..mem_refs.len() {
+                if !mem_refs[i].is_write && !mem_refs[j].is_write {
+                    continue;
+                }
+                if mem_refs[i].base == mem_refs[j].base {
+                    continue;
+                }
                 let dep = test_dependence(&mem_refs[i], &mem_refs[j]);
-                if dep.dependent { has_cross_dep = true; break; }
+                if dep.dependent {
+                    has_cross_dep = true;
+                    break;
+                }
             }
-            if has_cross_dep { break; }
+            if has_cross_dep {
+                break;
+            }
         }
-        if has_cross_dep { continue; }
+        if has_cross_dep {
+            continue;
+        }
 
         // Find the exit block.
         let exit_id = find_loop_exit(func, lp);
@@ -104,8 +136,7 @@ fn fission_in_function(func: &mut Function) -> bool {
         };
 
         let bridge = func.create_block("fission_bridge");
-        func.block_mut(bridge).terminator =
-            Some(Terminator::Branch(clone_header, vec![init_val]));
+        func.block_mut(bridge).terminator = Some(Terminator::Branch(clone_header, vec![init_val]));
 
         // Redirect original cmp's exit → bridge.
         for &bid in &lp.body {
@@ -130,7 +161,9 @@ fn fission_in_function(func: &mut Function) -> bool {
 /// making it a dead store that DSE/DCE can clean up.
 fn neutralize_store(func: &mut Function, block_id: BlockId, store_idx: usize) {
     let block = func.block_mut(block_id);
-    if store_idx >= block.insts.len() { return; }
+    if store_idx >= block.insts.len() {
+        return;
+    }
     if let InstKind::Store(_, _) = block.insts[store_idx].kind {
         // Replace with a store of undef — the store is now dead.
         // We keep the store instruction (not remove it) to preserve
@@ -152,21 +185,35 @@ fn find_computation_block(
 ) -> Option<BlockId> {
     let mut comp = None;
     for &bid in &lp.body {
-        if bid == lp.header || bid == latch_id { continue; }
+        if bid == lp.header || bid == latch_id {
+            continue;
+        }
         let block = func.block(bid);
-        if block.insts.iter().any(|i| matches!(i.kind, InstKind::Store(..))) {
-            if comp.is_some() { return None; }
+        if block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::Store(..)))
+        {
+            if comp.is_some() {
+                return None;
+            }
             comp = Some(bid);
         }
     }
     comp
 }
 
-fn backward_slice(func: &Function, root: ValueId, loop_defs: &HashSet<ValueId>) -> HashSet<ValueId> {
+fn backward_slice(
+    func: &Function,
+    root: ValueId,
+    loop_defs: &HashSet<ValueId>,
+) -> HashSet<ValueId> {
     let mut slice = HashSet::new();
     let mut worklist = vec![root];
     while let Some(vid) = worklist.pop() {
-        if !slice.insert(vid) { continue; }
+        if !slice.insert(vid) {
+            continue;
+        }
         for block in &func.blocks {
             for inst in &block.insts {
                 if inst.id == vid {
@@ -186,7 +233,9 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
     for &bid in &lp.body {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch { false_dest, .. }) = &block.terminator {
-            if !lp.body.contains(false_dest) { return Some(*false_dest); }
+            if !lp.body.contains(false_dest) {
+                return Some(*false_dest);
+            }
         }
     }
     None

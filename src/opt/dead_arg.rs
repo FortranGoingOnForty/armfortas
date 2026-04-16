@@ -10,7 +10,9 @@ use super::pass::Pass;
 pub struct DeadArgElim;
 
 impl Pass for DeadArgElim {
-    fn name(&self) -> &'static str { "dead-arg-elim" }
+    fn name(&self) -> &'static str {
+        "dead-arg-elim"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut live_masks: Vec<Vec<bool>> = module
@@ -196,9 +198,12 @@ fn block_terminator_uses_param(term: &Option<Terminator>, param_id: ValueId) -> 
     match term {
         Some(Terminator::Return(Some(v))) => *v == param_id,
         Some(Terminator::Branch(_, args)) => args.contains(&param_id),
-        Some(Terminator::CondBranch { cond, true_args, false_args, .. }) => {
-            *cond == param_id || true_args.contains(&param_id) || false_args.contains(&param_id)
-        }
+        Some(Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        }) => *cond == param_id || true_args.contains(&param_id) || false_args.contains(&param_id),
         Some(Terminator::Switch { selector, .. }) => *selector == param_id,
         _ => false,
     }
@@ -207,18 +212,27 @@ fn block_terminator_uses_param(term: &Option<Terminator>, param_id: ValueId) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::lexer::{Position, Span};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty: ty.clone(), span: span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty: ty.clone(),
+            span: span(),
+        });
         f.register_type(id, ty);
         id
     }
@@ -248,8 +262,16 @@ mod tests {
         module.add_function(callee);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
-        let a = push(&mut caller, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut caller, InstKind::ConstInt(9, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut caller,
+            InstKind::ConstInt(9, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let call = push(
             &mut caller,
             InstKind::Call(FuncRef::Internal(0), vec![a, b]),

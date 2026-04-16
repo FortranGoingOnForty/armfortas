@@ -92,5 +92,8 @@ fn o3_vectorizes_full_extent_do_loop_and_keeps_objects_deterministic() {
         "O3 assembly should reference the bulk add kernel:\n{}",
         o3_asm
     );
-    assert_eq!(o3_obj_a, o3_obj_b, "O3 vectorized object snapshot should stay deterministic");
+    assert_eq!(
+        o3_obj_a, o3_obj_b,
+        "O3 vectorized object snapshot should stay deterministic"
+    );
 }

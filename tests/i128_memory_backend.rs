@@ -203,7 +203,11 @@ fn simple_local_i128_ordered_branch_runs_at_o0() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful ordered branch run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful ordered branch run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('4'),
         "ordered i128 branch program should print score 4:\n{}",
@@ -257,7 +261,11 @@ fn simple_local_i128_select_runs_at_o0() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful integer(16) select run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful integer(16) select run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('1'),
         "integer(16) select program should print score 1:\n{}",
@@ -333,7 +341,11 @@ fn simple_internal_i128_call_runs_at_o0() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful internal integer(16) call run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful internal integer(16) call run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('1'),
         "internal integer(16) call program should print score 1:\n{}",

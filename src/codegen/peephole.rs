@@ -23,7 +23,7 @@
 //! After fusion the FMUL instruction is removed and the FADD/FSUB is
 //! replaced by the three-source FMA instruction.
 
-use super::mir::{MachineFunction, MachineInst, MachineOperand, ArmOpcode, VRegId};
+use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, VRegId};
 use std::collections::HashMap;
 
 /// Run all peephole passes on a machine function.
@@ -67,7 +67,10 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
 
     // Map: vreg defined by a fmul instruction → (block-instruction-index, precision)
     #[derive(Clone, Copy)]
-    enum Prec { S, D }
+    enum Prec {
+        S,
+        D,
+    }
     let mut fmul_defs: HashMap<VRegId, (usize, Prec)> = HashMap::new();
 
     for (i, inst) in block.insts.iter().enumerate() {
@@ -108,18 +111,28 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
             ArmOpcode::FsubD => (false, true, false),
             _ => continue,
         };
-        if inst.operands.len() < 3 { continue; }
+        if inst.operands.len() < 3 {
+            continue;
+        }
 
         // operands: [dest, src0, src1]
-        let src0 = match &inst.operands[1] { MachineOperand::VReg(v) => *v, _ => continue };
-        let src1 = match &inst.operands[2] { MachineOperand::VReg(v) => *v, _ => continue };
+        let src0 = match &inst.operands[1] {
+            MachineOperand::VReg(v) => *v,
+            _ => continue,
+        };
+        let src1 = match &inst.operands[2] {
+            MachineOperand::VReg(v) => *v,
+            _ => continue,
+        };
 
         // Check if src0 is a single-use fmul result.
-        let try_fuse_src0 = fmul_defs.get(&src0)
+        let try_fuse_src0 = fmul_defs
+            .get(&src0)
             .filter(|_| use_count.get(&src0).copied().unwrap_or(0) == 1);
         // Check if src1 is a single-use fmul result.
         let try_fuse_src1 = if is_add {
-            fmul_defs.get(&src1)
+            fmul_defs
+                .get(&src1)
                 .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1)
         } else {
             None // fsub(c, fmul(a,b)): src0=c, src1=fmul → handled separately
@@ -129,50 +142,120 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
             // fadd(fmul(a,b), c) → FMADD(a, b, c)
             if let Some(&(mul_idx, _)) = try_fuse_src0 {
                 let mul_inst = &block.insts[mul_idx];
-                let n = match &mul_inst.operands[1] { MachineOperand::VReg(v) => *v, _ => continue };
-                let m = match &mul_inst.operands[2] { MachineOperand::VReg(v) => *v, _ => continue };
-                let opcode = if prec_s { ArmOpcode::FmaddS } else { ArmOpcode::FmaddD };
-                plans.push(FusionPlan { add_idx: i, mul_idx, new_opcode: opcode, n, m, a: src1 });
+                let n = match &mul_inst.operands[1] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let m = match &mul_inst.operands[2] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let opcode = if prec_s {
+                    ArmOpcode::FmaddS
+                } else {
+                    ArmOpcode::FmaddD
+                };
+                plans.push(FusionPlan {
+                    add_idx: i,
+                    mul_idx,
+                    new_opcode: opcode,
+                    n,
+                    m,
+                    a: src1,
+                });
             } else if let Some(&(mul_idx, _)) = try_fuse_src1 {
                 // fadd(c, fmul(a,b)) → FMADD(a, b, c)  [commuted]
                 let mul_inst = &block.insts[mul_idx];
-                let n = match &mul_inst.operands[1] { MachineOperand::VReg(v) => *v, _ => continue };
-                let m = match &mul_inst.operands[2] { MachineOperand::VReg(v) => *v, _ => continue };
-                let opcode = if prec_s { ArmOpcode::FmaddS } else { ArmOpcode::FmaddD };
-                plans.push(FusionPlan { add_idx: i, mul_idx, new_opcode: opcode, n, m, a: src0 });
+                let n = match &mul_inst.operands[1] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let m = match &mul_inst.operands[2] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let opcode = if prec_s {
+                    ArmOpcode::FmaddS
+                } else {
+                    ArmOpcode::FmaddD
+                };
+                plans.push(FusionPlan {
+                    add_idx: i,
+                    mul_idx,
+                    new_opcode: opcode,
+                    n,
+                    m,
+                    a: src0,
+                });
             }
         } else if is_sub {
             // fsub(fmul(a,b), c) → FNMSUB(a, b, c)  [result = a*b - c]
             if let Some(&(mul_idx, _)) = try_fuse_src0 {
                 let mul_inst = &block.insts[mul_idx];
-                let n = match &mul_inst.operands[1] { MachineOperand::VReg(v) => *v, _ => continue };
-                let m = match &mul_inst.operands[2] { MachineOperand::VReg(v) => *v, _ => continue };
-                let opcode = if prec_s { ArmOpcode::FnmsubS } else { ArmOpcode::FnmsubD };
-                plans.push(FusionPlan { add_idx: i, mul_idx, new_opcode: opcode, n, m, a: src1 });
+                let n = match &mul_inst.operands[1] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let m = match &mul_inst.operands[2] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let opcode = if prec_s {
+                    ArmOpcode::FnmsubS
+                } else {
+                    ArmOpcode::FnmsubD
+                };
+                plans.push(FusionPlan {
+                    add_idx: i,
+                    mul_idx,
+                    new_opcode: opcode,
+                    n,
+                    m,
+                    a: src1,
+                });
             }
             // fsub(c, fmul(a,b)) → FMSUB(a, b, c)  [result = c - a*b]
             // src0=c, src1=fmul_result
-            let try_fuse_sub1 = fmul_defs.get(&src1)
+            let try_fuse_sub1 = fmul_defs
+                .get(&src1)
                 .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1);
             if let Some(&(mul_idx, _)) = try_fuse_sub1 {
                 let mul_inst = &block.insts[mul_idx];
-                let n = match &mul_inst.operands[1] { MachineOperand::VReg(v) => *v, _ => continue };
-                let m = match &mul_inst.operands[2] { MachineOperand::VReg(v) => *v, _ => continue };
-                let opcode = if prec_s { ArmOpcode::FmsubS } else { ArmOpcode::FmsubD };
-                plans.push(FusionPlan { add_idx: i, mul_idx, new_opcode: opcode, n, m, a: src0 });
+                let n = match &mul_inst.operands[1] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let m = match &mul_inst.operands[2] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => continue,
+                };
+                let opcode = if prec_s {
+                    ArmOpcode::FmsubS
+                } else {
+                    ArmOpcode::FmsubD
+                };
+                plans.push(FusionPlan {
+                    add_idx: i,
+                    mul_idx,
+                    new_opcode: opcode,
+                    n,
+                    m,
+                    a: src0,
+                });
             }
         }
     }
 
-    if plans.is_empty() { return; }
+    if plans.is_empty() {
+        return;
+    }
 
     // Apply plans in reverse order of add_idx to keep indices stable.
     plans.sort_by(|a, b| b.add_idx.cmp(&a.add_idx));
 
     // Collect mul_idxs to remove.
-    let mut remove_idxs: std::collections::HashSet<usize> = plans.iter()
-        .map(|p| p.mul_idx)
-        .collect();
+    let mut remove_idxs: std::collections::HashSet<usize> =
+        plans.iter().map(|p| p.mul_idx).collect();
 
     // Rewrite the block.
     let block = &mut mf.blocks[mb_idx];
@@ -201,8 +284,9 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::mir::{MachineFunction, MachineBlock, MachineInst,
-        MachineOperand, ArmOpcode, MBlockId, RegClass};
+    use crate::codegen::mir::{
+        ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand, RegClass,
+    };
 
     fn mf_with_insts(insts: Vec<MachineInst>) -> MachineFunction {
         let mut mf = MachineFunction::new("test".into());
@@ -211,12 +295,20 @@ mod tests {
             mf.new_vreg(RegClass::Fp32);
         }
         let bid = MBlockId(0);
-        mf.blocks = vec![MachineBlock { id: bid, label: "entry".into(), insts }];
+        mf.blocks = vec![MachineBlock {
+            id: bid,
+            label: "entry".into(),
+            insts,
+        }];
         mf
     }
 
-    fn vreg(v: u32) -> MachineOperand { MachineOperand::VReg(VRegId(v)) }
-    fn vid(v: u32) -> VRegId { VRegId(v) }
+    fn vreg(v: u32) -> MachineOperand {
+        MachineOperand::VReg(VRegId(v))
+    }
+    fn vid(v: u32) -> VRegId {
+        VRegId(v)
+    }
 
     /// fadd(fmul(v1, v2), v3) → fmadd(v1, v2, v3)
     #[test]

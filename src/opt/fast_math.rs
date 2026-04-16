@@ -24,7 +24,9 @@ use super::util::substitute_uses;
 pub struct FastMathReassoc;
 
 impl Pass for FastMathReassoc {
-    fn name(&self) -> &'static str { "fast-math-reassoc" }
+    fn name(&self) -> &'static str {
+        "fast-math-reassoc"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -83,7 +85,10 @@ struct SignedFloatConst {
 
 impl SignedFloatConst {
     fn positive(constant: FloatConst) -> Self {
-        Self { constant, negative: false }
+        Self {
+            constant,
+            negative: false,
+        }
     }
 
     fn negated(self) -> Self {
@@ -221,13 +226,13 @@ fn collect_chain(
         });
     }
 
-        let Some(inst) = defs.get(&value) else {
-            return Some(AddChain {
-                base: Some(value),
-                terms: Vec::new(),
-                additive_nodes: 0,
-            });
-        };
+    let Some(inst) = defs.get(&value) else {
+        return Some(AddChain {
+            base: Some(value),
+            terms: Vec::new(),
+            additive_nodes: 0,
+        });
+    };
     match inst.kind {
         InstKind::FAdd(lhs, rhs) if inst.ty == IrType::Float(width) => {
             let lhs_chain = collect_chain(defs, lhs, width)?;
@@ -278,7 +283,9 @@ fn const_float_of(
 ) -> Option<FloatConst> {
     let inst = defs.get(&value)?;
     match inst.kind {
-        InstKind::ConstFloat(value, inst_width) if inst_width == width => FloatConst::from_value(value, width),
+        InstKind::ConstFloat(value, inst_width) if inst_width == width => {
+            FloatConst::from_value(value, width)
+        }
         _ => None,
     }
 }
@@ -359,13 +366,22 @@ mod tests {
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty: ty.clone(), span: span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty: ty.clone(),
+            span: span(),
+        });
         f.register_type(id, ty);
         id
     }
@@ -408,7 +424,9 @@ mod tests {
         let func = &module.functions[0];
         let insts = &func.blocks[0].insts;
         assert!(
-            insts.iter().any(|inst| matches!(inst.kind, InstKind::ConstFloat(v, FloatWidth::F64) if v == 5.0)),
+            insts.iter().any(
+                |inst| matches!(inst.kind, InstKind::ConstFloat(v, FloatWidth::F64) if v == 5.0)
+            ),
             "reassociated chain should materialize a combined constant:\n{:?}",
             insts
         );
@@ -416,7 +434,10 @@ mod tests {
             matches!(func.blocks[0].terminator, Some(Terminator::Return(Some(v))) if v == add2),
             "outer value should stay the return root"
         );
-        let outer = insts.iter().find(|inst| inst.id == add2).expect("outer add should remain");
+        let outer = insts
+            .iter()
+            .find(|inst| inst.id == add2)
+            .expect("outer add should remain");
         assert!(
             matches!(outer.kind, InstKind::FAdd(ValueId(0), _)),
             "outer add should become x + const, got {:?}",

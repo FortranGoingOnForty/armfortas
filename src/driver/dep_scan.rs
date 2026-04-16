@@ -29,12 +29,15 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
     for line in content.lines() {
         let trimmed = line.trim().to_lowercase();
         // Skip comments and empty lines.
-        if trimmed.starts_with('!') || trimmed.is_empty() { continue; }
+        if trimmed.starts_with('!') || trimmed.is_empty() {
+            continue;
+        }
 
         // MODULE <name> — but not "module procedure" or "module function"
         if let Some(rest) = trimmed.strip_prefix("module ") {
             let rest = rest.trim();
-            if rest.starts_with("procedure") || rest.starts_with("function")
+            if rest.starts_with("procedure")
+                || rest.starts_with("function")
                 || rest.starts_with("subroutine")
             {
                 continue;
@@ -66,7 +69,10 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
             if rest.starts_with("::") {
                 rest = rest[2..].trim();
             }
-            if let Some(name) = rest.split(|c: char| c == ',' || c == ':' || c.is_whitespace()).next() {
+            if let Some(name) = rest
+                .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
+                .next()
+            {
                 let clean = name.trim();
                 if !clean.is_empty() && clean != "only" {
                     // Skip intrinsic modules — they don't need .amod files.
@@ -84,13 +90,21 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
     defines.sort();
     defines.dedup();
 
-    Ok(FileDeps { path: path.to_path_buf(), defines, uses })
+    Ok(FileDeps {
+        path: path.to_path_buf(),
+        defines,
+        uses,
+    })
 }
 
 fn is_intrinsic_module(name: &str) -> bool {
-    matches!(name,
-        "iso_c_binding" | "iso_fortran_env" |
-        "ieee_arithmetic" | "ieee_exceptions" | "ieee_features"
+    matches!(
+        name,
+        "iso_c_binding"
+            | "iso_fortran_env"
+            | "ieee_arithmetic"
+            | "ieee_exceptions"
+            | "ieee_features"
     )
 }
 
@@ -148,7 +162,14 @@ pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, Strin
         // Cycle detected — find the modules involved.
         let cycle_files: Vec<&str> = (0..n)
             .filter(|i| in_degree[*i] > 0)
-            .map(|i| files[i].path.file_name().unwrap_or_default().to_str().unwrap_or("?"))
+            .map(|i| {
+                files[i]
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_str()
+                    .unwrap_or("?")
+            })
             .collect();
         return Err(format!(
             "circular module dependency detected among: {}",
@@ -168,7 +189,11 @@ mod tests {
         let dir = std::env::temp_dir().join("dep_scan_test_1");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("mod.f90");
-        std::fs::write(&f, "module mymod\n  use other_mod\n  implicit none\nend module\n").unwrap();
+        std::fs::write(
+            &f,
+            "module mymod\n  use other_mod\n  implicit none\nend module\n",
+        )
+        .unwrap();
         let deps = scan_file(&f).unwrap();
         assert_eq!(deps.defines, vec!["mymod"]);
         assert_eq!(deps.uses, vec!["other_mod"]);
@@ -178,9 +203,21 @@ mod tests {
     #[test]
     fn topo_sort_chain() {
         let files = vec![
-            FileDeps { path: "c.f90".into(), defines: vec!["c".into()], uses: vec![] },
-            FileDeps { path: "b.f90".into(), defines: vec!["b".into()], uses: vec!["c".into()] },
-            FileDeps { path: "a.f90".into(), defines: vec!["a".into()], uses: vec!["b".into()] },
+            FileDeps {
+                path: "c.f90".into(),
+                defines: vec!["c".into()],
+                uses: vec![],
+            },
+            FileDeps {
+                path: "b.f90".into(),
+                defines: vec!["b".into()],
+                uses: vec!["c".into()],
+            },
+            FileDeps {
+                path: "a.f90".into(),
+                defines: vec!["a".into()],
+                uses: vec!["b".into()],
+            },
         ];
         let order = resolve_compilation_order(&files).unwrap();
         // c must come before b, b before a.
@@ -194,20 +231,48 @@ mod tests {
     #[test]
     fn topo_sort_cycle() {
         let files = vec![
-            FileDeps { path: "a.f90".into(), defines: vec!["a".into()], uses: vec!["b".into()] },
-            FileDeps { path: "b.f90".into(), defines: vec!["b".into()], uses: vec!["a".into()] },
+            FileDeps {
+                path: "a.f90".into(),
+                defines: vec!["a".into()],
+                uses: vec!["b".into()],
+            },
+            FileDeps {
+                path: "b.f90".into(),
+                defines: vec!["b".into()],
+                uses: vec!["a".into()],
+            },
         ];
         let err = resolve_compilation_order(&files).unwrap_err();
-        assert!(err.contains("circular"), "expected cycle error, got: {}", err);
+        assert!(
+            err.contains("circular"),
+            "expected cycle error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn topo_sort_diamond() {
         let files = vec![
-            FileDeps { path: "d.f90".into(), defines: vec!["d".into()], uses: vec![] },
-            FileDeps { path: "b.f90".into(), defines: vec!["b".into()], uses: vec!["d".into()] },
-            FileDeps { path: "c.f90".into(), defines: vec!["c".into()], uses: vec!["d".into()] },
-            FileDeps { path: "a.f90".into(), defines: vec!["a".into()], uses: vec!["b".into(), "c".into()] },
+            FileDeps {
+                path: "d.f90".into(),
+                defines: vec!["d".into()],
+                uses: vec![],
+            },
+            FileDeps {
+                path: "b.f90".into(),
+                defines: vec!["b".into()],
+                uses: vec!["d".into()],
+            },
+            FileDeps {
+                path: "c.f90".into(),
+                defines: vec!["c".into()],
+                uses: vec!["d".into()],
+            },
+            FileDeps {
+                path: "a.f90".into(),
+                defines: vec!["a".into()],
+                uses: vec!["b".into(), "c".into()],
+            },
         ];
         let order = resolve_compilation_order(&files).unwrap();
         let pos_d = order.iter().position(|&i| i == 0).unwrap();

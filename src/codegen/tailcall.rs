@@ -37,8 +37,8 @@
 //! * Gate: we don't fire on non-void calls where a non-trivial result-capture
 //!   sequence remains (e.g., `MOV x1, x0`) — those are left alone.
 
-use std::collections::HashSet;
 use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, PhysReg};
+use std::collections::HashSet;
 
 /// Run tail call optimization on a single machine function.
 ///
@@ -47,11 +47,17 @@ use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, PhysRe
 pub fn tail_call_opt(mf: &mut MachineFunction) {
     for block in &mut mf.blocks {
         let n = block.insts.len();
-        if n < 2 { continue; }
+        if n < 2 {
+            continue;
+        }
 
         // Epilogue is always `LdpPost; Ret` at the very end.
-        if block.insts[n - 1].opcode != ArmOpcode::Ret { continue; }
-        if block.insts[n - 2].opcode != ArmOpcode::LdpPost { continue; }
+        if block.insts[n - 1].opcode != ArmOpcode::Ret {
+            continue;
+        }
+        if block.insts[n - 2].opcode != ArmOpcode::LdpPost {
+            continue;
+        }
 
         let ldp_idx = n - 2;
 
@@ -62,9 +68,7 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         while bl_candidate > 0 {
             bl_candidate -= 1;
             match block.insts[bl_candidate].opcode {
-                ArmOpcode::LdpOffset
-                | ArmOpcode::LdrImm
-                | ArmOpcode::LdrFpImm => {
+                ArmOpcode::LdpOffset | ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
                     // Callee-save restore — keep scanning backwards.
                 }
                 ArmOpcode::Bl => {
@@ -80,8 +84,12 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         }
 
         // Sentinel or scanned to index 0 without finding Bl.
-        if bl_candidate == usize::MAX { continue; }
-        if block.insts[bl_candidate].opcode != ArmOpcode::Bl { continue; }
+        if bl_candidate == usize::MAX {
+            continue;
+        }
+        if block.insts[bl_candidate].opcode != ArmOpcode::Bl {
+            continue;
+        }
 
         // SAFETY: reject TCO when any argument register (x0–x7) holds a value
         // derived from our frame pointer (e.g. a pointer to a stack-allocated
@@ -97,7 +105,7 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         // Extract the call target from the Bl operand.
         let label = match block.insts[bl_candidate].operands.first() {
             Some(MachineOperand::Extern(s)) => s.clone(),
-            _ => continue,  // indirect call or unexpected operand — skip
+            _ => continue, // indirect call or unexpected operand — skip
         };
 
         // Transform:
@@ -149,7 +157,9 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
             // sub xN, x29, #imm  →  xN holds a frame-relative address.
             ArmOpcode::SubImm => {
                 if op_is_fp(inst, 1) {
-                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                    if let Some(n) = op_gp(inst, 0) {
+                        tainted_regs.insert(n);
+                    }
                 }
             }
             // add xN, xM, xP  (GEP: propagate taint from either source)
@@ -157,21 +167,25 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
                 if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
                     || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n))
                 {
-                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                    if let Some(n) = op_gp(inst, 0) {
+                        tainted_regs.insert(n);
+                    }
                 }
             }
             // add xN, xM, #imm  (GEP with constant offset / address arithmetic)
             ArmOpcode::AddImm => {
-                if op_is_fp(inst, 1)
-                    || op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
-                {
-                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                if op_is_fp(inst, 1) || op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n)) {
+                    if let Some(n) = op_gp(inst, 0) {
+                        tainted_regs.insert(n);
+                    }
                 }
             }
             // mov xN, xM  (register copy — propagates taint to arg reg)
             ArmOpcode::MovReg => {
                 if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n)) {
-                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                    if let Some(n) = op_gp(inst, 0) {
+                        tainted_regs.insert(n);
+                    }
                 }
             }
             // mul xN, xM, xP  (index computation in GEP; conservative)
@@ -179,15 +193,17 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
                 if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
                     || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n))
                 {
-                    if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                    if let Some(n) = op_gp(inst, 0) {
+                        tainted_regs.insert(n);
+                    }
                 }
             }
             // str xN, [x29, #off] — if xN is tainted, the slot becomes tainted.
             ArmOpcode::StrImm => {
-                if op_gp(inst, 0).is_some_and(|n| tainted_regs.contains(&n))
-                    && op_is_fp(inst, 1)
-                {
-                    if let Some(off) = op_fp_offset(inst, 2) { tainted_slots.insert(off); }
+                if op_gp(inst, 0).is_some_and(|n| tainted_regs.contains(&n)) && op_is_fp(inst, 1) {
+                    if let Some(off) = op_fp_offset(inst, 2) {
+                        tainted_slots.insert(off);
+                    }
                 }
             }
             // ldr xN, [x29, #off] — if the slot is tainted, xN becomes tainted.
@@ -195,7 +211,9 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
                 if op_is_fp(inst, 1) {
                     if let Some(off) = op_fp_offset(inst, 2) {
                         if tainted_slots.contains(&off) {
-                            if let Some(n) = op_gp(inst, 0) { tainted_regs.insert(n); }
+                            if let Some(n) = op_gp(inst, 0) {
+                                tainted_regs.insert(n);
+                            }
                         }
                     }
                 }
@@ -247,7 +265,11 @@ mod tests {
     use crate::codegen::mir::*;
 
     fn make_block(insts: Vec<MachineInst>) -> MachineBlock {
-        MachineBlock { label: "test".into(), insts, id: MBlockId(0) }
+        MachineBlock {
+            label: "test".into(),
+            insts,
+            id: MBlockId(0),
+        }
     }
 
     fn bl(label: &str) -> MachineInst {
@@ -271,7 +293,11 @@ mod tests {
     }
 
     fn ret() -> MachineInst {
-        MachineInst { opcode: ArmOpcode::Ret, operands: vec![], def: None }
+        MachineInst {
+            opcode: ArmOpcode::Ret,
+            operands: vec![],
+            def: None,
+        }
     }
 
     fn ldr_callee_restore() -> MachineInst {
@@ -300,27 +326,25 @@ mod tests {
     #[test]
     fn void_tail_call_no_callee_saves() {
         // Pattern: Bl; LdpPost; Ret → LdpPost; B
-        let mut mf = build_mf(vec![
-            vec![bl("_foo"), ldp_post(), ret()],
-        ]);
+        let mut mf = build_mf(vec![vec![bl("_foo"), ldp_post(), ret()]]);
         tail_call_opt(&mut mf);
         let insts = &mf.blocks[0].insts;
         // Should now be: LdpPost, B _foo
         assert_eq!(insts.len(), 2);
         assert_eq!(insts[0].opcode, ArmOpcode::LdpPost);
         assert_eq!(insts[1].opcode, ArmOpcode::B);
-        assert_eq!(
-            insts[1].operands[0],
-            MachineOperand::Extern("_foo".into())
-        );
+        assert_eq!(insts[1].operands[0], MachineOperand::Extern("_foo".into()));
     }
 
     #[test]
     fn void_tail_call_with_callee_restore() {
         // Pattern: Bl; LdrImm(restore); LdpPost; Ret → LdrImm; LdpPost; B
-        let mut mf = build_mf(vec![
-            vec![bl("_bar"), ldr_callee_restore(), ldp_post(), ret()],
-        ]);
+        let mut mf = build_mf(vec![vec![
+            bl("_bar"),
+            ldr_callee_restore(),
+            ldp_post(),
+            ret(),
+        ]]);
         tail_call_opt(&mut mf);
         let insts = &mf.blocks[0].insts;
         assert_eq!(insts.len(), 3);
@@ -340,16 +364,18 @@ mod tests {
             ],
             def: None,
         };
-        let mut mf = build_mf(vec![
-            vec![bl("_baz"), mov_result, ldp_post(), ret()],
-        ]);
+        let mut mf = build_mf(vec![vec![bl("_baz"), mov_result, ldp_post(), ret()]]);
         tail_call_opt(&mut mf);
         let insts = &mf.blocks[0].insts;
         // No transformation — Bl should still be present.
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
-            "Bl should NOT be removed when result is captured in non-return register");
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
-            "Ret should still be present");
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
+            "Bl should NOT be removed when result is captured in non-return register"
+        );
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            "Ret should still be present"
+        );
     }
 
     #[test]
@@ -360,9 +386,7 @@ mod tests {
             operands: vec![MachineOperand::BlockRef(MBlockId(1))],
             def: None,
         };
-        let mut mf = build_mf(vec![
-            vec![bl("_qux"), ldp_post(), b_inst],
-        ]);
+        let mut mf = build_mf(vec![vec![bl("_qux"), ldp_post(), b_inst]]);
         tail_call_opt(&mut mf);
         // Should still have Bl (TCO not fired because no Ret).
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));

@@ -65,15 +65,21 @@ fn fuzz_parser_deterministic(seed: u64, count: usize) {
 /// Runs without threads — each input goes directly through the parser.
 fn fuzz_parser_with_fortran_fragments(count: usize) {
     let fragments = [
-        "program p\nend program\n", "module m\nend module\n",
-        "integer :: x\n", "real, allocatable :: a(:,:)\n",
-        "do i = 1, 10\nend do\n", "if (x > 0) then\nend if\n",
+        "program p\nend program\n",
+        "module m\nend module\n",
+        "integer :: x\n",
+        "real, allocatable :: a(:,:)\n",
+        "do i = 1, 10\nend do\n",
+        "if (x > 0) then\nend if\n",
         "select case (x)\ncase (1)\nend select\n",
         "type :: t\n  integer :: f\nend type\n",
         "interface\nend interface\n",
-        "goto 100\n", "100 continue\n",
+        "goto 100\n",
+        "100 continue\n",
         "use iso_c_binding, only: c_int\n",
-        "", "!\n", "! comment\n",
+        "",
+        "!\n",
+        "! comment\n",
         "end\n",
         "do concurrent (i = 1:10)\nend do\n",
         "block\n  integer :: local\nend block\n",
@@ -98,7 +104,9 @@ fn fuzz_parser_with_fortran_fragments(count: usize) {
         }
 
         if let Ok(tokens) = lexer::tokenize(&src, 0, SourceForm::FreeForm) {
-            if tokens.len() > 100 { continue; }
+            if tokens.len() > 100 {
+                continue;
+            }
             let mut parser = Parser::new(&tokens);
             let _ = parser.parse_file();
         }

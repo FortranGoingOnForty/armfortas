@@ -12,22 +12,26 @@
 //! peeled iteration. Later const-prop folds `iv=init_const` through the
 //! clone, turning `if (i==1)` into `if (true)` and eliminating dead code.
 
-use std::collections::HashSet;
+use super::loop_utils::{clone_loop, find_preheader, loop_defined_values, resolve_const_int};
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{find_natural_loops, predecessors};
-use super::loop_utils::{find_preheader, resolve_const_int, loop_defined_values, clone_loop};
-use super::pass::Pass;
+use std::collections::HashSet;
 
 pub struct LoopPeel;
 
 impl Pass for LoopPeel {
-    fn name(&self) -> &'static str { "loop-peel" }
+    fn name(&self) -> &'static str {
+        "loop-peel"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if peel_in_function(func) { changed = true; }
+            if peel_in_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -38,31 +42,41 @@ fn peel_in_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
-        let Some(ph_id) = find_preheader(func, lp, &preds) else { continue };
+        let Some(ph_id) = find_preheader(func, lp, &preds) else {
+            continue;
+        };
 
         // Header must have exactly 1 block param (the IV).
         let hdr = func.block(lp.header);
-        if hdr.params.len() != 1 { continue; }
+        if hdr.params.len() != 1 {
+            continue;
+        }
         let iv = hdr.params[0].id;
 
         // Get the init value from the preheader's branch to header.
         let init_val = match &func.block(ph_id).terminator {
-            Some(Terminator::Branch(dest, args)) if *dest == lp.header && args.len() == 1 =>
-                args[0],
+            Some(Terminator::Branch(dest, args)) if *dest == lp.header && args.len() == 1 => {
+                args[0]
+            }
             _ => continue,
         };
 
         // Init must be a compile-time constant.
-        let Some(init_const) = resolve_const_int(func, init_val) else { continue };
+        let Some(init_const) = resolve_const_int(func, init_val) else {
+            continue;
+        };
 
         // Must have a single latch.
-        if lp.latches.len() != 1 { continue; }
+        if lp.latches.len() != 1 {
+            continue;
+        }
         let latch_id = lp.latches[0];
 
         // Latch must branch back to header with one arg.
         let next_iv = match &func.block(latch_id).terminator {
-            Some(Terminator::Branch(dest, args)) if *dest == lp.header && args.len() == 1 =>
-                args[0],
+            Some(Terminator::Branch(dest, args)) if *dest == lp.header && args.len() == 1 => {
+                args[0]
+            }
             _ => continue,
         };
 
@@ -72,8 +86,11 @@ fn peel_in_function(func: &mut Function) -> bool {
             for inst in &func.block(latch_id).insts {
                 if inst.id == next_iv {
                     if let InstKind::IAdd(a, b) = &inst.kind {
-                        if *a == iv { found = resolve_const_int(func, *b); }
-                        else if *b == iv { found = resolve_const_int(func, *a); }
+                        if *a == iv {
+                            found = resolve_const_int(func, *b);
+                        } else if *b == iv {
+                            found = resolve_const_int(func, *a);
+                        }
                     }
                     break;
                 }
@@ -116,19 +133,29 @@ fn has_first_iter_conditional(
         for inst in &block.insts {
             if let InstKind::ICmp(CmpOp::Eq, a, b) = &inst.kind {
                 // One operand must be the IV.
-                let (is_iv, other) = if *a == iv { (true, *b) }
-                    else if *b == iv { (true, *a) }
-                    else { (false, ValueId(0)) };
-                if !is_iv { continue; }
+                let (is_iv, other) = if *a == iv {
+                    (true, *b)
+                } else if *b == iv {
+                    (true, *a)
+                } else {
+                    (false, ValueId(0))
+                };
+                if !is_iv {
+                    continue;
+                }
 
                 // The other operand must resolve to the init constant
                 // and be loop-invariant.
-                if loop_defs.contains(&other) { continue; }
+                if loop_defs.contains(&other) {
+                    continue;
+                }
                 if let Some(c) = resolve_const_int(func, other) {
                     if c == init_const {
                         // Must feed a CondBranch in this block.
                         if let Some(Terminator::CondBranch { cond, .. }) = &block.terminator {
-                            if *cond == inst.id { return true; }
+                            if *cond == inst.id {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -152,10 +179,19 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
 }
 
 /// Get the args passed to the exit block from the cmp's false-branch.
-fn find_exit_args(func: &Function, lp: &crate::ir::walk::NaturalLoop, exit_id: BlockId) -> Vec<ValueId> {
+fn find_exit_args(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    exit_id: BlockId,
+) -> Vec<ValueId> {
     for &bid in &lp.body {
         let block = func.block(bid);
-        if let Some(Terminator::CondBranch { false_dest, false_args, .. }) = &block.terminator {
+        if let Some(Terminator::CondBranch {
+            false_dest,
+            false_args,
+            ..
+        }) = &block.terminator
+        {
             if *false_dest == exit_id {
                 return false_args.clone();
             }
@@ -186,7 +222,10 @@ fn do_peel(
     // The IV type (needed to emit the init+stride constant).
     let hdr = func.block(lp.header);
     let iv_ty = hdr.params[0].ty.clone();
-    let iv_width = match &iv_ty { IrType::Int(w) => *w, _ => return };
+    let iv_width = match &iv_ty {
+        IrType::Int(w) => *w,
+        _ => return,
+    };
     let init_const = resolve_const_int(func, init_val).unwrap();
 
     // Emit init+stride constant in a helper block so it's available.
@@ -247,8 +286,7 @@ fn do_peel(
 
     // --- Wire preheader → clone's header ---
     let clone_header = block_map[&lp.header];
-    func.block_mut(ph_id).terminator =
-        Some(Terminator::Branch(clone_header, vec![init_val]));
+    func.block_mut(ph_id).terminator = Some(Terminator::Branch(clone_header, vec![init_val]));
 }
 
 // ---------------------------------------------------------------------------
@@ -258,14 +296,18 @@ fn do_peel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
     use crate::ir::inst::*;
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
-    use crate::lexer::{Span, Position};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     #[test]
@@ -295,45 +337,60 @@ mod tests {
         let c1 = f.next_value_id();
         f.register_type(c1, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c1, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let c10 = f.next_value_id();
         f.register_type(c10, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c10, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(10, IntWidth::I32),
         });
         f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![c1]));
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
         f.block_mut(header).terminator = Some(Terminator::Branch(cmp, vec![]));
 
         let cmp_v = f.next_value_id();
         f.register_type(cmp_v, IrType::Bool);
         f.block_mut(cmp).insts.push(Inst {
-            id: cmp_v, ty: IrType::Bool, span: span(),
+            id: cmp_v,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c10),
         });
         f.block_mut(cmp).terminator = Some(Terminator::CondBranch {
             cond: cmp_v,
-            true_dest: body, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
 
         // Body has NO equality check — just a store.
         let alloca = f.next_value_id();
         f.register_type(alloca, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
         f.block_mut(body).insts.push(Inst {
-            id: alloca, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), span: span(),
+            id: alloca,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
             kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
         });
         let store_id = f.next_value_id();
         f.register_type(store_id, IrType::Void);
         f.block_mut(body).insts.push(Inst {
-            id: store_id, ty: IrType::Void, span: span(),
+            id: store_id,
+            ty: IrType::Void,
+            span: span(),
             kind: InstKind::Store(iv, alloca),
         });
         f.block_mut(body).terminator = Some(Terminator::Branch(latch, vec![]));
@@ -341,7 +398,9 @@ mod tests {
         let nxt = f.next_value_id();
         f.register_type(nxt, IrType::Int(IntWidth::I32));
         f.block_mut(latch).insts.push(Inst {
-            id: nxt, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::IAdd(iv, c1),
         });
         f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));

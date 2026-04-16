@@ -58,14 +58,18 @@
 use super::pass::Pass;
 use super::util::{find_natural_loops, predecessors, NaturalLoop};
 use crate::ir::inst::*;
-use crate::ir::types::{IrType, IntWidth};
+use crate::ir::types::{IntWidth, IrType};
 use crate::ir::walk::prune_unreachable;
-use crate::lexer::{Span, Position};
+use crate::lexer::{Position, Span};
 use std::collections::{HashMap, HashSet};
 
 fn dummy_span() -> Span {
     let pos = Position { line: 0, col: 0 };
-    Span { file_id: 0, start: pos, end: pos }
+    Span {
+        file_id: 0,
+        start: pos,
+        end: pos,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +98,9 @@ const BODY_SIZE_MAX: usize = 30;
 pub struct LoopUnroll;
 
 impl Pass for LoopUnroll {
-    fn name(&self) -> &'static str { "loop-unroll" }
+    fn name(&self) -> &'static str {
+        "loop-unroll"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -135,23 +141,23 @@ fn unroll_in_function(func: &mut Function) -> bool {
 
 #[derive(Debug)]
 struct LoopShape {
-    preheader:   BlockId,
-    header:      BlockId,   // block with IV block param; branches to cmp_block
-    cmp_block:   BlockId,   // block with icmp + condBr to body/exit
+    preheader: BlockId,
+    header: BlockId,    // block with IV block param; branches to cmp_block
+    cmp_block: BlockId, // block with icmp + condBr to body/exit
     /// The computation blocks (everything that is not header, cmp_block, or
     /// latch). Ordered in CFG traversal order from cmp_block's true-successor
     /// to latch's predecessor. For most Fortran DO loops this is a single
     /// block ("do_body"). Multi-block bodies are supported as long as the
     /// sub-CFG is a linear chain with no branches to outside.
     body_blocks: Vec<BlockId>,
-    latch:       BlockId,   // iadd IV, 1 + br header(IV_next)
-    exit:        BlockId,   // cond_br false target
-    iv_param:    ValueId,
-    iv_ty:       IrType,
-    iv_init:     i64,
-    iv_bound:    i64,       // inclusive upper bound
-    trip_count:  usize,
-    exit_args:   Vec<ValueId>, // args from cmp_block's false branch to exit
+    latch: BlockId, // iadd IV, 1 + br header(IV_next)
+    exit: BlockId,  // cond_br false target
+    iv_param: ValueId,
+    iv_ty: IrType,
+    iv_init: i64,
+    iv_bound: i64, // inclusive upper bound
+    trip_count: usize,
+    exit_args: Vec<ValueId>, // args from cmp_block's false branch to exit
 }
 
 fn is_do_concurrent_loop(
@@ -178,37 +184,51 @@ fn detect_simple_loop(
     preds: &HashMap<BlockId, Vec<BlockId>>,
 ) -> Option<LoopShape> {
     // ---- structural requirements ----------------------------------------
-    if nl.latches.len() != 1 { return None; }
+    if nl.latches.len() != 1 {
+        return None;
+    }
     let latch = nl.latches[0];
-    if latch == nl.header { return None; }    // no self-loop
-    // Body must have between 2 (header+latch) and 5 (header+cmp+body×N+latch) blocks.
-    if nl.body.len() < 2 || nl.body.len() > 5 { return None; }
+    if latch == nl.header {
+        return None;
+    } // no self-loop
+      // Body must have between 2 (header+latch) and 5 (header+cmp+body×N+latch) blocks.
+    if nl.body.len() < 2 || nl.body.len() > 5 {
+        return None;
+    }
 
     let header = nl.header;
 
     // ---- header must have exactly 1 block param (the IV) ----------------
     let hdr = func.block(header);
-    if hdr.params.len() != 1 { return None; }
+    if hdr.params.len() != 1 {
+        return None;
+    }
     let iv_param = hdr.params[0].id;
-    let iv_ty    = hdr.params[0].ty.clone();
-    if !matches!(iv_ty, IrType::Int(_)) { return None; }
+    let iv_ty = hdr.params[0].ty.clone();
+    if !matches!(iv_ty, IrType::Int(_)) {
+        return None;
+    }
 
     // ---- find preheader -------------------------------------------------
     let header_preds = preds.get(&header)?;
-    let mut outside: Vec<BlockId> = header_preds.iter()
+    let mut outside: Vec<BlockId> = header_preds
+        .iter()
         .copied()
         .filter(|p| !nl.body.contains(p))
         .collect();
     outside.sort_by_key(|b| b.0);
     outside.dedup();
-    if outside.len() != 1 { return None; }
+    if outside.len() != 1 {
+        return None;
+    }
     let preheader = outside[0];
 
     // Preheader must branch to header with exactly 1 arg (the initial IV).
     let ph_blk = func.block(preheader);
     let iv_init = match &ph_blk.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 =>
-            resolve_const_int(func, args[0])?,
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 => {
+            resolve_const_int(func, args[0])?
+        }
         _ => return None,
     };
 
@@ -229,21 +249,29 @@ fn detect_simple_loop(
         } else {
             // Case (b): header must be a transparent relay.
             let hdr_blk = func.block(header);
-            if !hdr_blk.insts.is_empty() { return None; } // must have 0 instructions
+            if !hdr_blk.insts.is_empty() {
+                return None;
+            } // must have 0 instructions
             let relay_target = match &hdr_blk.terminator {
                 Some(Terminator::Branch(t, args)) if args.is_empty() => *t,
                 _ => return None,
             };
-            if !nl.body.contains(&relay_target) { return None; }
+            if !nl.body.contains(&relay_target) {
+                return None;
+            }
             let (bound, ex, args) = detect_bound_and_exit(func, relay_target, iv_param)?;
             (relay_target, bound, ex, args)
         }
     };
 
-    if nl.body.contains(&exit) { return None; }
+    if nl.body.contains(&exit) {
+        return None;
+    }
 
     // ---- latch: stride-1 increment, passes only iv back to header ------
-    if !check_latch(func, latch, header, iv_param) { return None; }
+    if !check_latch(func, latch, header, iv_param) {
+        return None;
+    }
 
     // ---- compute body_blocks: body − {header, cmp_block, latch} --------
     //
@@ -264,19 +292,22 @@ fn detect_simple_loop(
     // mem2reg may have threaded into OUTER loop latches via dominance-frontier
     // placement. If that param is used outside nl.body, the header's block param
     // becomes undefined after we discard the header block.
-    for &bb in body_blocks.iter()
+    for &bb in body_blocks
+        .iter()
         .chain(std::iter::once(&header))
         .chain(std::iter::once(&cmp_block))
         .chain(std::iter::once(&latch))
     {
-        if has_escaping_values(func, bb, &nl.body, preds) { return None; }
+        if has_escaping_values(func, bb, &nl.body, preds) {
+            return None;
+        }
     }
 
     // ---- size check ------------------------------------------------------
-    let total_insts: usize = body_blocks.iter()
-        .map(|&b| func.block(b).insts.len())
-        .sum();
-    if total_insts > BODY_SIZE_MAX { return None; }
+    let total_insts: usize = body_blocks.iter().map(|&b| func.block(b).insts.len()).sum();
+    if total_insts > BODY_SIZE_MAX {
+        return None;
+    }
 
     let full_unroll_max = if is_do_concurrent {
         DO_CONCURRENT_FULL_UNROLL_MAX
@@ -286,8 +317,12 @@ fn detect_simple_loop(
 
     // ---- trip count ------------------------------------------------------
     let trip_count_i64 = iv_bound - iv_init + 1;
-    if trip_count_i64 <= 0 { return None; }
-    if trip_count_i64 > full_unroll_max { return None; }
+    if trip_count_i64 <= 0 {
+        return None;
+    }
+    if trip_count_i64 > full_unroll_max {
+        return None;
+    }
 
     Some(LoopShape {
         preheader,
@@ -333,7 +368,9 @@ fn collect_body_chain(
         Some(Terminator::CondBranch { true_dest, .. }) => *true_dest,
         _ => return None,
     };
-    if !loop_body.contains(&first) { return None; }
+    if !loop_body.contains(&first) {
+        return None;
+    }
 
     if first == latch {
         // Case (a): the cmp's true-successor is the latch itself.
@@ -347,12 +384,18 @@ fn collect_body_chain(
     let mut chain = Vec::new();
     let mut cur = first;
     loop {
-        if !loop_body.contains(&cur) { return None; }
+        if !loop_body.contains(&cur) {
+            return None;
+        }
         chain.push(cur);
-        if cur == latch { break; }
+        if cur == latch {
+            break;
+        }
         let blk = func.block(cur);
         // Each block in the chain must have no params (no join point).
-        if !blk.params.is_empty() { return None; }
+        if !blk.params.is_empty() {
+            return None;
+        }
         // Its terminator must be an unconditional branch to the next block.
         match &blk.terminator {
             Some(Terminator::Branch(next, args)) if args.is_empty() => {
@@ -360,7 +403,9 @@ fn collect_body_chain(
             }
             _ => return None,
         }
-        if chain.len() > 4 { return None; } // safety limit
+        if chain.len() > 4 {
+            return None;
+        } // safety limit
     }
     Some(chain)
 }
@@ -388,8 +433,8 @@ fn detect_bound_and_exit(
 
     // Find the single ICmp that involves the IV.
     let mut cmp_id: Option<ValueId> = None;
-    let mut bound: Option<i64>     = None;
-    let mut is_lt = false;  // true when we need bound-1
+    let mut bound: Option<i64> = None;
+    let mut is_lt = false; // true when we need bound-1
 
     for inst in &hdr.insts {
         if let InstKind::ICmp(op, a, b) = &inst.kind {
@@ -402,10 +447,22 @@ fn detect_bound_and_exit(
             };
             let c = resolve_const_int(func, other)?;
             match op {
-                CmpOp::Le => { bound = Some(c); is_lt = false; }
-                CmpOp::Lt => { bound = Some(c); is_lt = true; }
-                CmpOp::Ge => { bound = Some(c); is_lt = false; } // iv >= c means upper = c when commuted
-                CmpOp::Gt => { bound = Some(c); is_lt = true; }  // iv > c means upper = c-1 commuted
+                CmpOp::Le => {
+                    bound = Some(c);
+                    is_lt = false;
+                }
+                CmpOp::Lt => {
+                    bound = Some(c);
+                    is_lt = true;
+                }
+                CmpOp::Ge => {
+                    bound = Some(c);
+                    is_lt = false;
+                } // iv >= c means upper = c when commuted
+                CmpOp::Gt => {
+                    bound = Some(c);
+                    is_lt = true;
+                } // iv > c means upper = c-1 commuted
                 _ => return None,
             }
             cmp_id = Some(inst.id);
@@ -418,9 +475,13 @@ fn detect_bound_and_exit(
 
     // Terminator must be CondBranch on that cmp.
     match &hdr.terminator {
-        Some(Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args })
-            if *cond == cmp_id =>
-        {
+        Some(Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) if *cond == cmp_id => {
             // true → body (latch), false → exit.
             // Check which side is the latch. We don't have the latch id here;
             // we'll accept either ordering and return the "false" side as exit.
@@ -445,8 +506,7 @@ fn check_latch(func: &Function, latch: BlockId, header: BlockId, iv: ValueId) ->
 
     // Terminator must be unconditional branch to header with exactly 1 arg.
     let iv_next = match &blk.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 =>
-            args[0],
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 => args[0],
         _ => return false,
     };
 
@@ -455,8 +515,16 @@ fn check_latch(func: &Function, latch: BlockId, header: BlockId, iv: ValueId) ->
         if inst.id == iv_next {
             match &inst.kind {
                 InstKind::IAdd(a, b) => {
-                    let (is_iv, other) = if *a == iv { (true, *b) } else if *b == iv { (true, *a) } else { (false, *a) };
-                    if !is_iv { return false; }
+                    let (is_iv, other) = if *a == iv {
+                        (true, *b)
+                    } else if *b == iv {
+                        (true, *a)
+                    } else {
+                        (false, *a)
+                    };
+                    if !is_iv {
+                        return false;
+                    }
                     return resolve_const_int(func, other) == Some(1);
                 }
                 _ => return false,
@@ -484,24 +552,36 @@ fn has_escaping_values(
     // latch it becomes undefined after unrolling removes the block.
     let latch_blk = func.block(latch);
     let mut latch_defs: HashSet<ValueId> = HashSet::new();
-    for bp   in &latch_blk.params { latch_defs.insert(bp.id); }
-    for inst in &latch_blk.insts  { latch_defs.insert(inst.id); }
+    for bp in &latch_blk.params {
+        latch_defs.insert(bp.id);
+    }
+    for inst in &latch_blk.insts {
+        latch_defs.insert(inst.id);
+    }
 
-    if latch_defs.is_empty() { return false; }
+    if latch_defs.is_empty() {
+        return false;
+    }
 
     // Check every block outside the loop body for uses of those values.
     for block in &func.blocks {
-        if body.contains(&block.id) { continue; }
+        if body.contains(&block.id) {
+            continue;
+        }
         // Check instruction operands.
         for inst in &block.insts {
             for use_id in inst_uses(&inst.kind) {
-                if latch_defs.contains(&use_id) { return true; }
+                if latch_defs.contains(&use_id) {
+                    return true;
+                }
             }
         }
         // Check terminator operands.
         if let Some(term) = &block.terminator {
             for &use_id in terminator_uses_vec(term).iter() {
-                if latch_defs.contains(&use_id) { return true; }
+                if latch_defs.contains(&use_id) {
+                    return true;
+                }
             }
         }
         // Also check block params of outside blocks that receive args from latch.
@@ -526,15 +606,20 @@ fn block_contains_load(func: &Function, block: BlockId) -> bool {
 fn terminator_uses_vec(term: &Terminator) -> Vec<ValueId> {
     let mut out = Vec::new();
     match term {
-        Terminator::Return(Some(v))          => out.push(*v),
-        Terminator::Branch(_, args)           => out.extend(args),
-        Terminator::CondBranch { cond, true_args, false_args, .. } => {
+        Terminator::Return(Some(v)) => out.push(*v),
+        Terminator::Branch(_, args) => out.extend(args),
+        Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
             out.push(*cond);
             out.extend(true_args);
             out.extend(false_args);
         }
-        Terminator::Switch { selector, .. }  => out.push(*selector),
-        _                                    => {}
+        Terminator::Switch { selector, .. } => out.push(*selector),
+        _ => {}
     }
     out
 }
@@ -550,12 +635,17 @@ fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
 
 fn do_unroll(func: &mut Function, shape: LoopShape) {
     // Collect per-body-block instructions once (before we mutate func).
-    let body_snapshots: Vec<Vec<Inst>> = shape.body_blocks.iter()
+    let body_snapshots: Vec<Vec<Inst>> = shape
+        .body_blocks
+        .iter()
         .map(|&b| func.block(b).insts.clone())
         .collect();
 
     // Determine the IV width.
-    let iv_width = match &shape.iv_ty { IrType::Int(w) => *w, _ => IntWidth::I32 };
+    let iv_width = match &shape.iv_ty {
+        IrType::Int(w) => *w,
+        _ => IntWidth::I32,
+    };
 
     // For each iteration, we create one new block per body block, cloned
     // with the IV substituted by a constant. The chain is:
@@ -673,8 +763,7 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
                     (after_iter, exit_args.clone())
                 };
                 let _ = original_body_next[bi]; // consumed above
-                func.block_mut(cur_blk).terminator =
-                    Some(Terminator::Branch(next_blk, args));
+                func.block_mut(cur_blk).terminator = Some(Terminator::Branch(next_blk, args));
             }
         }
     }
@@ -690,9 +779,9 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
         Some(Terminator::Branch(first_block, preheader_args));
 
     // Mark loop control blocks as Unreachable → prune_unreachable removes them.
-    func.block_mut(shape.header).terminator   = Some(Terminator::Unreachable);
+    func.block_mut(shape.header).terminator = Some(Terminator::Unreachable);
     func.block_mut(shape.cmp_block).terminator = Some(Terminator::Unreachable);
-    func.block_mut(shape.latch).terminator     = Some(Terminator::Unreachable);
+    func.block_mut(shape.latch).terminator = Some(Terminator::Unreachable);
     for &b in &shape.body_blocks {
         func.block_mut(b).terminator = Some(Terminator::Unreachable);
     }
@@ -703,30 +792,30 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
     let r = |v: &ValueId| *subst.get(v).unwrap_or(v);
     match kind {
         // Constants — no operands.
-        InstKind::ConstInt(v, w)     => InstKind::ConstInt(*v, *w),
-        InstKind::ConstFloat(v, w)   => InstKind::ConstFloat(*v, *w),
-        InstKind::ConstBool(v)       => InstKind::ConstBool(*v),
-        InstKind::ConstString(v)     => InstKind::ConstString(v.clone()),
-        InstKind::Undef(t)           => InstKind::Undef(t.clone()),
-        InstKind::GlobalAddr(s)      => InstKind::GlobalAddr(s.clone()),
+        InstKind::ConstInt(v, w) => InstKind::ConstInt(*v, *w),
+        InstKind::ConstFloat(v, w) => InstKind::ConstFloat(*v, *w),
+        InstKind::ConstBool(v) => InstKind::ConstBool(*v),
+        InstKind::ConstString(v) => InstKind::ConstString(v.clone()),
+        InstKind::Undef(t) => InstKind::Undef(t.clone()),
+        InstKind::GlobalAddr(s) => InstKind::GlobalAddr(s.clone()),
 
         // Integer arithmetic.
-        InstKind::IAdd(a, b)  => InstKind::IAdd(r(a), r(b)),
-        InstKind::ISub(a, b)  => InstKind::ISub(r(a), r(b)),
-        InstKind::IMul(a, b)  => InstKind::IMul(r(a), r(b)),
-        InstKind::IDiv(a, b)  => InstKind::IDiv(r(a), r(b)),
-        InstKind::IMod(a, b)  => InstKind::IMod(r(a), r(b)),
-        InstKind::INeg(a)     => InstKind::INeg(r(a)),
+        InstKind::IAdd(a, b) => InstKind::IAdd(r(a), r(b)),
+        InstKind::ISub(a, b) => InstKind::ISub(r(a), r(b)),
+        InstKind::IMul(a, b) => InstKind::IMul(r(a), r(b)),
+        InstKind::IDiv(a, b) => InstKind::IDiv(r(a), r(b)),
+        InstKind::IMod(a, b) => InstKind::IMod(r(a), r(b)),
+        InstKind::INeg(a) => InstKind::INeg(r(a)),
 
         // Float arithmetic.
-        InstKind::FAdd(a, b)  => InstKind::FAdd(r(a), r(b)),
-        InstKind::FSub(a, b)  => InstKind::FSub(r(a), r(b)),
-        InstKind::FMul(a, b)  => InstKind::FMul(r(a), r(b)),
-        InstKind::FDiv(a, b)  => InstKind::FDiv(r(a), r(b)),
-        InstKind::FNeg(a)     => InstKind::FNeg(r(a)),
-        InstKind::FAbs(a)     => InstKind::FAbs(r(a)),
-        InstKind::FSqrt(a)    => InstKind::FSqrt(r(a)),
-        InstKind::FPow(a, b)  => InstKind::FPow(r(a), r(b)),
+        InstKind::FAdd(a, b) => InstKind::FAdd(r(a), r(b)),
+        InstKind::FSub(a, b) => InstKind::FSub(r(a), r(b)),
+        InstKind::FMul(a, b) => InstKind::FMul(r(a), r(b)),
+        InstKind::FDiv(a, b) => InstKind::FDiv(r(a), r(b)),
+        InstKind::FNeg(a) => InstKind::FNeg(r(a)),
+        InstKind::FAbs(a) => InstKind::FAbs(r(a)),
+        InstKind::FSqrt(a) => InstKind::FSqrt(r(a)),
+        InstKind::FPow(a, b) => InstKind::FPow(r(a), r(b)),
 
         // Comparison.
         InstKind::ICmp(op, a, b) => InstKind::ICmp(*op, r(a), r(b)),
@@ -734,49 +823,50 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
 
         // Logic.
         InstKind::And(a, b) => InstKind::And(r(a), r(b)),
-        InstKind::Or(a, b)  => InstKind::Or(r(a), r(b)),
-        InstKind::Not(a)    => InstKind::Not(r(a)),
+        InstKind::Or(a, b) => InstKind::Or(r(a), r(b)),
+        InstKind::Not(a) => InstKind::Not(r(a)),
 
         // Select.
         InstKind::Select(c, t, f) => InstKind::Select(r(c), r(t), r(f)),
 
         // Bitwise.
-        InstKind::BitAnd(a, b)           => InstKind::BitAnd(r(a), r(b)),
-        InstKind::BitOr(a, b)            => InstKind::BitOr(r(a), r(b)),
-        InstKind::BitXor(a, b)           => InstKind::BitXor(r(a), r(b)),
-        InstKind::BitNot(a)              => InstKind::BitNot(r(a)),
-        InstKind::Shl(a, b)              => InstKind::Shl(r(a), r(b)),
-        InstKind::LShr(a, b)             => InstKind::LShr(r(a), r(b)),
-        InstKind::AShr(a, b)             => InstKind::AShr(r(a), r(b)),
-        InstKind::CountLeadingZeros(a)   => InstKind::CountLeadingZeros(r(a)),
-        InstKind::CountTrailingZeros(a)  => InstKind::CountTrailingZeros(r(a)),
-        InstKind::PopCount(a)            => InstKind::PopCount(r(a)),
+        InstKind::BitAnd(a, b) => InstKind::BitAnd(r(a), r(b)),
+        InstKind::BitOr(a, b) => InstKind::BitOr(r(a), r(b)),
+        InstKind::BitXor(a, b) => InstKind::BitXor(r(a), r(b)),
+        InstKind::BitNot(a) => InstKind::BitNot(r(a)),
+        InstKind::Shl(a, b) => InstKind::Shl(r(a), r(b)),
+        InstKind::LShr(a, b) => InstKind::LShr(r(a), r(b)),
+        InstKind::AShr(a, b) => InstKind::AShr(r(a), r(b)),
+        InstKind::CountLeadingZeros(a) => InstKind::CountLeadingZeros(r(a)),
+        InstKind::CountTrailingZeros(a) => InstKind::CountTrailingZeros(r(a)),
+        InstKind::PopCount(a) => InstKind::PopCount(r(a)),
 
         // Conversions.
-        InstKind::IntToFloat(a, w)    => InstKind::IntToFloat(r(a), *w),
-        InstKind::FloatToInt(a, w)    => InstKind::FloatToInt(r(a), *w),
-        InstKind::FloatExtend(a, w)   => InstKind::FloatExtend(r(a), *w),
-        InstKind::FloatTrunc(a, w)    => InstKind::FloatTrunc(r(a), *w),
-        InstKind::IntExtend(a, w, s)  => InstKind::IntExtend(r(a), *w, *s),
-        InstKind::IntTrunc(a, w)      => InstKind::IntTrunc(r(a), *w),
-        InstKind::PtrToInt(a)         => InstKind::PtrToInt(r(a)),
-        InstKind::IntToPtr(a, ty)     => InstKind::IntToPtr(r(a), ty.clone()),
+        InstKind::IntToFloat(a, w) => InstKind::IntToFloat(r(a), *w),
+        InstKind::FloatToInt(a, w) => InstKind::FloatToInt(r(a), *w),
+        InstKind::FloatExtend(a, w) => InstKind::FloatExtend(r(a), *w),
+        InstKind::FloatTrunc(a, w) => InstKind::FloatTrunc(r(a), *w),
+        InstKind::IntExtend(a, w, s) => InstKind::IntExtend(r(a), *w, *s),
+        InstKind::IntTrunc(a, w) => InstKind::IntTrunc(r(a), *w),
+        InstKind::PtrToInt(a) => InstKind::PtrToInt(r(a)),
+        InstKind::IntToPtr(a, ty) => InstKind::IntToPtr(r(a), ty.clone()),
 
         // Memory.
-        InstKind::Alloca(t)  => InstKind::Alloca(t.clone()),
-        InstKind::Load(a)    => InstKind::Load(r(a)),
+        InstKind::Alloca(t) => InstKind::Alloca(t.clone()),
+        InstKind::Load(a) => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
-        InstKind::GetElementPtr(base, idxs) =>
-            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect()),
+        InstKind::GetElementPtr(base, idxs) => {
+            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect())
+        }
 
         // Calls.
-        InstKind::Call(f, args) =>
-            InstKind::Call(f.clone(), args.iter().map(&r).collect()),
-        InstKind::RuntimeCall(f, args) =>
-            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect()),
+        InstKind::Call(f, args) => InstKind::Call(f.clone(), args.iter().map(&r).collect()),
+        InstKind::RuntimeCall(f, args) => {
+            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect())
+        }
 
         // Aggregates.
-        InstKind::ExtractField(v, idx)     => InstKind::ExtractField(r(v), *idx),
+        InstKind::ExtractField(v, idx) => InstKind::ExtractField(r(v), *idx),
         InstKind::InsertField(v, idx, fld) => InstKind::InsertField(r(v), *idx, r(fld)),
     }
 }
@@ -788,11 +878,13 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
-    use crate::opt::pass::Pass;
+    use crate::ir::types::{IntWidth, IrType};
     use crate::lexer::Span;
+    use crate::opt::pass::Pass;
 
-    fn span() -> Span { super::dummy_span() }
+    fn span() -> Span {
+        super::dummy_span()
+    }
 
     /// Build a minimal Module with one function containing a simple
     /// counted loop: do i = 1, N; a(i_offset) = const(42); end do
@@ -806,77 +898,94 @@ mod tests {
 
         // Allocate block IDs.
         let header_id = f.create_block(&format!("{}_check", prefix));
-        let latch_id  = f.create_block(&format!("{}_body", prefix));
-        let exit_id   = f.create_block("exit");
-        let entry_id  = f.entry; // preheader
+        let latch_id = f.create_block(&format!("{}_body", prefix));
+        let exit_id = f.create_block("exit");
+        let entry_id = f.entry; // preheader
 
         // ---- entry (preheader) -------------------------------------------
         // const lo
         let lo_val = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
-            id: lo_val, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: lo_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(lo as i128, IntWidth::I64),
         });
         // alloca for the "array" (just a slot we store into)
         let alloca_val = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
-            id: alloca_val, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))), span: span(),
+            id: alloca_val,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
             kind: InstKind::Alloca(IrType::Int(IntWidth::I64)),
         });
         // br header(lo)
-        f.block_mut(entry_id).terminator =
-            Some(Terminator::Branch(header_id, vec![lo_val]));
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo_val]));
 
         // ---- header (%i) -------------------------------------------------
         let iv_param = f.next_value_id();
         f.block_mut(header_id).params.push(BlockParam {
-            id: iv_param, ty: IrType::Int(IntWidth::I64),
+            id: iv_param,
+            ty: IrType::Int(IntWidth::I64),
         });
         // const hi
         let hi_val = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: hi_val, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: hi_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(hi as i128, IntWidth::I64),
         });
         // %cmp = icmp.sle %i, hi
         let cmp_val = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: cmp_val, ty: IrType::Bool, span: span(),
+            id: cmp_val,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv_param, hi_val),
         });
         // condBr %cmp, latch, exit
         f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
             cond: cmp_val,
-            true_dest: latch_id, true_args: vec![],
-            false_dest: exit_id, false_args: vec![],
+            true_dest: latch_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![],
         });
 
         // ---- latch -------------------------------------------------------
         // Store 42 to the alloca (simulates a(i) = 42).
         let const42 = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: const42, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: const42,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(42, IntWidth::I64),
         });
         let store_id = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: store_id, ty: IrType::Void, span: span(),
+            id: store_id,
+            ty: IrType::Void,
+            span: span(),
             kind: InstKind::Store(const42, alloca_val),
         });
         // %i_next = iadd %i, 1
         let one = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: one, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: one,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I64),
         });
         let i_next = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: i_next, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: i_next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::IAdd(iv_param, one),
         });
         // br header(%i_next)
-        f.block_mut(latch_id).terminator =
-            Some(Terminator::Branch(header_id, vec![i_next]));
+        f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![i_next]));
 
         // ---- exit --------------------------------------------------------
         f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
@@ -902,9 +1011,17 @@ mod tests {
         assert_eq!(f.blocks.len(), 6, "expected entry + 4 iter blocks + exit");
 
         // Each iteration block has a ConstInt for that iteration's IV value.
-        let all_iv_consts: Vec<i128> = f.blocks.iter()
+        let all_iv_consts: Vec<i128> = f
+            .blocks
+            .iter()
             .flat_map(|b| b.insts.iter())
-            .filter_map(|i| if let InstKind::ConstInt(v, _) = i.kind { Some(v) } else { None })
+            .filter_map(|i| {
+                if let InstKind::ConstInt(v, _) = i.kind {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert!(all_iv_consts.contains(&1), "IV=1 should appear");
         assert!(all_iv_consts.contains(&2), "IV=2 should appear");
@@ -925,7 +1042,10 @@ mod tests {
         let mut m = build_counted_loop_with_prefix(1, 10, "doconc");
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
-        assert!(changed, "DO CONCURRENT trip-count-10 loop should fully unroll");
+        assert!(
+            changed,
+            "DO CONCURRENT trip-count-10 loop should fully unroll"
+        );
 
         let f = &m.functions[0];
         assert_eq!(f.blocks.len(), 12, "expected entry + 10 iter blocks + exit");
@@ -946,59 +1066,80 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("reduce".into(), vec![], IrType::Void);
         let header_id = f.create_block("header");
-        let latch_id  = f.create_block("latch");
-        let exit_id   = f.create_block("exit");
-        let entry_id  = f.entry;
+        let latch_id = f.create_block("latch");
+        let exit_id = f.create_block("exit");
+        let entry_id = f.entry;
 
         // Entry: br header(1, 0)
         let lo = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
-            id: lo, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I64),
         });
         let z = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
-            id: z, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: z,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(0, IntWidth::I64),
         });
-        f.block_mut(entry_id).terminator =
-            Some(Terminator::Branch(header_id, vec![lo, z]));
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo, z]));
 
         // Header: 2 params (iv, acc)
-        let iv  = f.next_value_id();
+        let iv = f.next_value_id();
         let acc = f.next_value_id();
-        f.block_mut(header_id).params.push(BlockParam { id: iv,  ty: IrType::Int(IntWidth::I64) });
-        f.block_mut(header_id).params.push(BlockParam { id: acc, ty: IrType::Int(IntWidth::I64) });
+        f.block_mut(header_id).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        f.block_mut(header_id).params.push(BlockParam {
+            id: acc,
+            ty: IrType::Int(IntWidth::I64),
+        });
         let hi = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: hi, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(4, IntWidth::I64),
         });
         let cmp = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: cmp, ty: IrType::Bool, span: span(),
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, hi),
         });
         f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
             cond: cmp,
-            true_dest: latch_id, true_args: vec![],
-            false_dest: exit_id, false_args: vec![acc],
+            true_dest: latch_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![acc],
         });
 
         // Latch: acc_next = acc + iv; i_next = iv + 1; br header(i_next, acc_next)
         let one = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: one, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: one,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I64),
         });
         let acc_next = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: acc_next, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: acc_next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::IAdd(acc, iv),
         });
         let i_next = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: i_next, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: i_next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::IAdd(iv, one),
         });
         f.block_mut(latch_id).terminator =
@@ -1006,14 +1147,20 @@ mod tests {
 
         // Exit: acc param, return
         let acc_out = f.next_value_id();
-        f.block_mut(exit_id).params.push(BlockParam { id: acc_out, ty: IrType::Int(IntWidth::I64) });
+        f.block_mut(exit_id).params.push(BlockParam {
+            id: acc_out,
+            ty: IrType::Int(IntWidth::I64),
+        });
         f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
 
         m.add_function(f);
 
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
-        assert!(!changed, "reduction loop with 2 header params should not be unrolled");
+        assert!(
+            !changed,
+            "reduction loop with 2 header params should not be unrolled"
+        );
     }
 
     #[test]
@@ -1185,56 +1332,67 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("escape_test".into(), vec![], IrType::Void);
 
-        let header_id   = f.create_block("header");
-        let latch_id    = f.create_block("latch");
-        let exit_id     = f.create_block("exit");
+        let header_id = f.create_block("header");
+        let latch_id = f.create_block("latch");
+        let exit_id = f.create_block("exit");
         let outer_latch = f.create_block("outer_latch");
-        let outer_dest  = f.create_block("outer_dest");
-        let entry_id    = f.entry;
+        let outer_dest = f.create_block("outer_dest");
+        let entry_id = f.entry;
 
         // Entry: const 1; br header(1)
         let lo = f.next_value_id();
         f.block_mut(entry_id).insts.push(Inst {
-            id: lo, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I64),
         });
-        f.block_mut(entry_id).terminator =
-            Some(Terminator::Branch(header_id, vec![lo]));
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo]));
 
         // Header: block param %iv; icmp %iv ≤ 3; condBr latch, exit
         let iv = f.next_value_id();
         f.block_mut(header_id).params.push(BlockParam {
-            id: iv, ty: IrType::Int(IntWidth::I64),
+            id: iv,
+            ty: IrType::Int(IntWidth::I64),
         });
         let hi_c = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: hi_c, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: hi_c,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(3, IntWidth::I64),
         });
         let cmp = f.next_value_id();
         f.block_mut(header_id).insts.push(Inst {
-            id: cmp, ty: IrType::Bool, span: span(),
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, hi_c),
         });
         f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
             cond: cmp,
-            true_dest: latch_id, true_args: vec![],
-            false_dest: exit_id, false_args: vec![],
+            true_dest: latch_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![],
         });
 
         // Latch: %next = iadd %iv, 1; br header(%next)
         let one = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: one, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: one,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I64),
         });
         let nxt = f.next_value_id();
         f.block_mut(latch_id).insts.push(Inst {
-            id: nxt, ty: IrType::Int(IntWidth::I64), span: span(),
+            id: nxt,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
             kind: InstKind::IAdd(iv, one),
         });
-        f.block_mut(latch_id).terminator =
-            Some(Terminator::Branch(header_id, vec![nxt]));
+        f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![nxt]));
 
         // Exit: ret void
         f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
@@ -1242,13 +1400,13 @@ mod tests {
         // outer_latch: br outer_dest(%iv)
         // Simulates an outer-loop latch that mem2reg threaded %iv through.
         // %iv is the header's block param — it escapes into this external block.
-        f.block_mut(outer_latch).terminator =
-            Some(Terminator::Branch(outer_dest, vec![iv]));
+        f.block_mut(outer_latch).terminator = Some(Terminator::Branch(outer_dest, vec![iv]));
 
         // outer_dest(%x): ret void
         let x = f.next_value_id();
         f.block_mut(outer_dest).params.push(BlockParam {
-            id: x, ty: IrType::Int(IntWidth::I64),
+            id: x,
+            ty: IrType::Int(IntWidth::I64),
         });
         f.block_mut(outer_dest).terminator = Some(Terminator::Return(None));
 

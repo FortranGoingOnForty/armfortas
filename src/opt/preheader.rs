@@ -7,21 +7,25 @@
 //! Run early at O2+ so downstream passes (LICM, unswitching, interchange)
 //! can assume every loop has a preheader.
 
-use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors};
 use super::loop_utils::find_preheader;
 use super::pass::Pass;
+use crate::ir::inst::*;
+use crate::ir::walk::{find_natural_loops, predecessors};
 
 /// Preheader insertion pass.
 pub struct PreheaderInsert;
 
 impl Pass for PreheaderInsert {
-    fn name(&self) -> &'static str { "preheader-insert" }
+    fn name(&self) -> &'static str {
+        "preheader-insert"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if insert_preheaders(func) { changed = true; }
+            if insert_preheaders(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -47,14 +51,17 @@ fn insert_preheaders(func: &mut Function) -> bool {
             Some(p) => p,
             None => continue,
         };
-        let mut outside: Vec<BlockId> = header_preds.iter()
+        let mut outside: Vec<BlockId> = header_preds
+            .iter()
             .copied()
             .filter(|p| !lp.body.contains(p))
             .collect();
         outside.sort_by_key(|b| b.0);
         outside.dedup();
 
-        if outside.is_empty() { continue; }
+        if outside.is_empty() {
+            continue;
+        }
 
         // Create the preheader block. It receives the same block params
         // as the header and unconditionally branches to the header,
@@ -77,8 +84,7 @@ fn insert_preheaders(func: &mut Function) -> bool {
 
         // Preheader terminates with unconditional branch to header,
         // passing its params through.
-        func.block_mut(ph_id).terminator =
-            Some(Terminator::Branch(lp.header, ph_param_ids));
+        func.block_mut(ph_id).terminator = Some(Terminator::Branch(lp.header, ph_param_ids));
 
         // Redirect each out-of-loop predecessor to branch to the
         // preheader instead of the header.
@@ -103,16 +109,30 @@ fn redirect_terminator(func: &mut Function, block: BlockId, old_dest: BlockId, n
     };
     match term {
         Terminator::Branch(dest, _) => {
-            if *dest == old_dest { *dest = new_dest; }
+            if *dest == old_dest {
+                *dest = new_dest;
+            }
         }
-        Terminator::CondBranch { true_dest, false_dest, .. } => {
-            if *true_dest == old_dest { *true_dest = new_dest; }
-            if *false_dest == old_dest { *false_dest = new_dest; }
+        Terminator::CondBranch {
+            true_dest,
+            false_dest,
+            ..
+        } => {
+            if *true_dest == old_dest {
+                *true_dest = new_dest;
+            }
+            if *false_dest == old_dest {
+                *false_dest = new_dest;
+            }
         }
         Terminator::Switch { default, cases, .. } => {
-            if *default == old_dest { *default = new_dest; }
+            if *default == old_dest {
+                *default = new_dest;
+            }
             for (_, dest) in cases.iter_mut() {
-                if *dest == old_dest { *dest = new_dest; }
+                if *dest == old_dest {
+                    *dest = new_dest;
+                }
             }
         }
         _ => {}
@@ -126,13 +146,17 @@ fn redirect_terminator(func: &mut Function, block: BlockId, old_dest: BlockId, n
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::ir::walk::predecessors;
-    use crate::lexer::{Span, Position};
+    use crate::lexer::{Position, Span};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     /// Build a function where the loop header has TWO out-of-loop
@@ -142,36 +166,44 @@ mod tests {
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let header = f.create_block("header");
-        let body   = f.create_block("body");
-        let latch  = f.create_block("latch");
-        let exit   = f.create_block("exit");
-        let alt    = f.create_block("alt_entry");
-        let entry  = f.entry;
+        let body = f.create_block("body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let alt = f.create_block("alt_entry");
+        let entry = f.entry;
 
         // Entry: const 1, condBr → header(1) or alt_entry
         let c1 = f.next_value_id();
         f.register_type(c1, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c1, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let cond = f.next_value_id();
         f.register_type(cond, IrType::Bool);
         f.block_mut(entry).insts.push(Inst {
-            id: cond, ty: IrType::Bool, span: span(),
+            id: cond,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ConstBool(true),
         });
         f.block_mut(entry).terminator = Some(Terminator::CondBranch {
             cond,
-            true_dest: header, true_args: vec![c1],
-            false_dest: alt, false_args: vec![],
+            true_dest: header,
+            true_args: vec![c1],
+            false_dest: alt,
+            false_args: vec![],
         });
 
         // Alt entry: const 5, br header(5)
         let c5 = f.next_value_id();
         f.register_type(c5, IrType::Int(IntWidth::I32));
         f.block_mut(alt).insts.push(Inst {
-            id: c5, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c5,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(5, IntWidth::I32),
         });
         f.block_mut(alt).terminator = Some(Terminator::Branch(header, vec![c5]));
@@ -180,24 +212,31 @@ mod tests {
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
         f.block_mut(header).params.push(BlockParam {
-            id: iv, ty: IrType::Int(IntWidth::I32),
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
         });
         let c10 = f.next_value_id();
         f.register_type(c10, IrType::Int(IntWidth::I32));
         f.block_mut(header).insts.push(Inst {
-            id: c10, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(10, IntWidth::I32),
         });
         let cmp = f.next_value_id();
         f.register_type(cmp, IrType::Bool);
         f.block_mut(header).insts.push(Inst {
-            id: cmp, ty: IrType::Bool, span: span(),
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c10),
         });
         f.block_mut(header).terminator = Some(Terminator::CondBranch {
             cond: cmp,
-            true_dest: body, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
 
         // Body → latch
@@ -207,13 +246,17 @@ mod tests {
         let one_l = f.next_value_id();
         f.register_type(one_l, IrType::Int(IntWidth::I32));
         f.block_mut(latch).insts.push(Inst {
-            id: one_l, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: one_l,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let nxt = f.next_value_id();
         f.register_type(nxt, IrType::Int(IntWidth::I32));
         f.block_mut(latch).insts.push(Inst {
-            id: nxt, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::IAdd(iv, one_l),
         });
         f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));
@@ -234,8 +277,10 @@ mod tests {
         let loops = find_natural_loops(f);
         let preds = predecessors(f);
         assert_eq!(loops.len(), 1);
-        assert!(find_preheader(f, &loops[0], &preds).is_none(),
-            "should have no preheader before insertion");
+        assert!(
+            find_preheader(f, &loops[0], &preds).is_none(),
+            "should have no preheader before insertion"
+        );
 
         let pass = PreheaderInsert;
         let changed = pass.run(&mut m);

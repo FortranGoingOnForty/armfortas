@@ -21,7 +21,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")

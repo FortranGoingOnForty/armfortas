@@ -5,10 +5,10 @@
 //! unary operators, function calls, array constructors, and
 //! component access chains.
 
-use crate::ast::Spanned;
+use super::{ParseError, Parser};
 use crate::ast::expr::*;
-use crate::lexer::{TokenKind, Span};
-use super::{Parser, ParseError};
+use crate::ast::Spanned;
+use crate::lexer::{Span, TokenKind};
 
 /// Binding power for Pratt parsing.
 /// Higher = tighter binding. Each level has left and right binding power.
@@ -24,18 +24,33 @@ pub(crate) struct Bp {
 // Precedence levels (from Fortran standard, lowest to highest).
 // We use even numbers for left bp, odd for right, to create the half-levels
 // needed for associativity.
-const BP_DEFINED_BINARY: Bp = Bp { left: 2, right: 3 };  // .myop. (binary)
-const BP_EQV: Bp = Bp { left: 4, right: 5 };             // .eqv., .neqv.
-const BP_OR: Bp = Bp { left: 6, right: 7 };              // .or.
-const BP_AND: Bp = Bp { left: 8, right: 9 };             // .and.
-const BP_NOT: u8 = 10;                                    // .not. (unary, right)
-const BP_COMPARISON: Bp = Bp { left: 12, right: 12 };    // ==, /=, <, >, <=, >= (non-assoc)
-const BP_CONCAT: Bp = Bp { left: 14, right: 15 };        // //
-const BP_ADD: Bp = Bp { left: 16, right: 17 };           // +, - (binary)
-const BP_UNARY_ADD: u8 = 18;                              // +, - (unary)
-pub(crate) const BP_MUL: Bp = Bp { left: 20, right: 21 };           // *, /
-const BP_POW: Bp = Bp { left: 23, right: 22 };           // ** (RIGHT-assoc: left > right)
-const BP_DEFINED_UNARY: u8 = 24;                          // .myop. (unary)
+const BP_DEFINED_BINARY: Bp = Bp { left: 2, right: 3 }; // .myop. (binary)
+const BP_EQV: Bp = Bp { left: 4, right: 5 }; // .eqv., .neqv.
+const BP_OR: Bp = Bp { left: 6, right: 7 }; // .or.
+const BP_AND: Bp = Bp { left: 8, right: 9 }; // .and.
+const BP_NOT: u8 = 10; // .not. (unary, right)
+const BP_COMPARISON: Bp = Bp {
+    left: 12,
+    right: 12,
+}; // ==, /=, <, >, <=, >= (non-assoc)
+const BP_CONCAT: Bp = Bp {
+    left: 14,
+    right: 15,
+}; // //
+const BP_ADD: Bp = Bp {
+    left: 16,
+    right: 17,
+}; // +, - (binary)
+const BP_UNARY_ADD: u8 = 18; // +, - (unary)
+pub(crate) const BP_MUL: Bp = Bp {
+    left: 20,
+    right: 21,
+}; // *, /
+const BP_POW: Bp = Bp {
+    left: 23,
+    right: 22,
+}; // ** (RIGHT-assoc: left > right)
+const BP_DEFINED_UNARY: u8 = 24; // .myop. (unary)
 
 impl<'a> Parser<'a> {
     /// Parse an expression.
@@ -55,13 +70,16 @@ impl<'a> Parser<'a> {
 
             // Check for infix operator.
             let Some(bp) = self.infix_bp() else { break };
-            if bp.left < min_bp { break; }
+            if bp.left < min_bp {
+                break;
+            }
 
             // Non-associative operators: if left_bp == right_bp and we're at the
             // same precedence level, reject chaining (e.g., a < b < c is illegal).
             if bp.left == bp.right && bp.left == min_bp {
                 return Err(self.error(
-                    "chained comparison operators are not allowed in Fortran (non-associative)".into()
+                    "chained comparison operators are not allowed in Fortran (non-associative)"
+                        .into(),
                 ));
             }
 
@@ -75,11 +93,14 @@ impl<'a> Parser<'a> {
                 end: right.span.end,
             };
 
-            left = Spanned::new(Expr::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            }, span);
+            left = Spanned::new(
+                Expr::BinaryOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            );
         }
 
         Ok(left)
@@ -95,38 +116,50 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let operand = self.parse_expr_bp(BP_UNARY_ADD)?;
                 let span = span_from_to(start, operand.span);
-                Ok(Spanned::new(Expr::UnaryOp {
-                    op: UnaryOp::Plus,
-                    operand: Box::new(operand),
-                }, span))
+                Ok(Spanned::new(
+                    Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ))
             }
             TokenKind::Minus => {
                 self.advance();
                 let operand = self.parse_expr_bp(BP_UNARY_ADD)?;
                 let span = span_from_to(start, operand.span);
-                Ok(Spanned::new(Expr::UnaryOp {
-                    op: UnaryOp::Minus,
-                    operand: Box::new(operand),
-                }, span))
+                Ok(Spanned::new(
+                    Expr::UnaryOp {
+                        op: UnaryOp::Minus,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ))
             }
             TokenKind::DotOp(ref name) if name == "not" => {
                 self.advance();
                 let operand = self.parse_expr_bp(BP_NOT)?;
                 let span = span_from_to(start, operand.span);
-                Ok(Spanned::new(Expr::UnaryOp {
-                    op: UnaryOp::Not,
-                    operand: Box::new(operand),
-                }, span))
+                Ok(Spanned::new(
+                    Expr::UnaryOp {
+                        op: UnaryOp::Not,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ))
             }
             TokenKind::DefinedOp(ref name) => {
                 let op_name = name.clone();
                 self.advance();
                 let operand = self.parse_expr_bp(BP_DEFINED_UNARY)?;
                 let span = span_from_to(start, operand.span);
-                Ok(Spanned::new(Expr::UnaryOp {
-                    op: UnaryOp::Defined(op_name),
-                    operand: Box::new(operand),
-                }, span))
+                Ok(Spanned::new(
+                    Expr::UnaryOp {
+                        op: UnaryOp::Defined(op_name),
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ))
             }
 
             // Parenthesized expression or array constructor (/ ... /).
@@ -142,16 +175,22 @@ impl<'a> Parser<'a> {
                     let imag = self.parse_expr()?;
                     self.expect(&TokenKind::RParen)?;
                     let span = span_from_to(start, self.prev_span());
-                    return Ok(Spanned::new(Expr::ComplexLiteral {
-                        real: Box::new(inner),
-                        imag: Box::new(imag),
-                    }, span));
+                    return Ok(Spanned::new(
+                        Expr::ComplexLiteral {
+                            real: Box::new(inner),
+                            imag: Box::new(imag),
+                        },
+                        span,
+                    ));
                 }
                 self.expect(&TokenKind::RParen)?;
                 let span = span_from_to(start, self.prev_span());
-                Ok(Spanned::new(Expr::ParenExpr {
-                    inner: Box::new(inner),
-                }, span))
+                Ok(Spanned::new(
+                    Expr::ParenExpr {
+                        inner: Box::new(inner),
+                    },
+                    span,
+                ))
             }
 
             // Array constructor [...]
@@ -184,10 +223,13 @@ impl<'a> Parser<'a> {
                     let args = self.parse_argument_list()?;
                     self.expect(&TokenKind::RParen)?;
                     let span = span_from_to(expr.span, self.prev_span());
-                    expr = Spanned::new(Expr::FunctionCall {
-                        callee: Box::new(expr),
-                        args,
-                    }, span);
+                    expr = Spanned::new(
+                        Expr::FunctionCall {
+                            callee: Box::new(expr),
+                            args,
+                        },
+                        span,
+                    );
                 }
                 // Component access: expr%name
                 TokenKind::Percent => {
@@ -200,10 +242,13 @@ impl<'a> Parser<'a> {
                         });
                     }
                     let span = span_from_to(expr.span, name_tok.span);
-                    expr = Spanned::new(Expr::ComponentAccess {
-                        base: Box::new(expr),
-                        component: name_tok.text,
-                    }, span);
+                    expr = Spanned::new(
+                        Expr::ComponentAccess {
+                            base: Box::new(expr),
+                            component: name_tok.text,
+                        },
+                        span,
+                    );
                 }
                 _ => break,
             }
@@ -220,8 +265,12 @@ impl<'a> Parser<'a> {
             TokenKind::Plus => Some(BP_ADD),
             TokenKind::Minus => Some(BP_ADD),
             TokenKind::Concat => Some(BP_CONCAT),
-            TokenKind::Eq | TokenKind::Ne | TokenKind::Lt |
-            TokenKind::Le | TokenKind::Gt | TokenKind::Ge => Some(BP_COMPARISON),
+            TokenKind::Eq
+            | TokenKind::Ne
+            | TokenKind::Lt
+            | TokenKind::Le
+            | TokenKind::Gt
+            | TokenKind::Ge => Some(BP_COMPARISON),
             TokenKind::DotOp(ref name) => match name.as_str() {
                 "eq" | "ne" | "lt" | "le" | "gt" | "ge" => Some(BP_COMPARISON),
                 "and" => Some(BP_AND),
@@ -253,20 +302,25 @@ impl<'a> Parser<'a> {
         let tok = self.advance().clone();
         // Strip outer quotes for the value.
         let value = if tok.text.len() >= 2 {
-            tok.text[1..tok.text.len()-1].replace("''", "'").replace("\"\"", "\"")
+            tok.text[1..tok.text.len() - 1]
+                .replace("''", "'")
+                .replace("\"\"", "\"")
         } else {
             tok.text.clone()
         };
-        Ok(Spanned::new(Expr::StringLiteral { value, kind: None }, tok.span))
+        Ok(Spanned::new(
+            Expr::StringLiteral { value, kind: None },
+            tok.span,
+        ))
     }
 
     fn parse_logical_literal(&mut self) -> Result<SpannedExpr, ParseError> {
         let tok = self.advance().clone();
         let lower = tok.text.to_lowercase();
         let value = lower.contains("true");
-        let kind = lower.find("._").map(|pos| {
-            lower[pos+2..].trim_end_matches('.').to_string()
-        });
+        let kind = lower
+            .find("._")
+            .map(|pos| lower[pos + 2..].trim_end_matches('.').to_string());
         Ok(Spanned::new(Expr::LogicalLiteral { value, kind }, tok.span))
     }
 
@@ -278,7 +332,13 @@ impl<'a> Parser<'a> {
             b'Z' | b'z' => BozBase::Hex,
             _ => BozBase::Hex,
         };
-        Ok(Spanned::new(Expr::BozLiteral { text: tok.text, base }, tok.span))
+        Ok(Spanned::new(
+            Expr::BozLiteral {
+                text: tok.text,
+                base,
+            },
+            tok.span,
+        ))
     }
 
     fn parse_name(&mut self) -> Result<SpannedExpr, ParseError> {
@@ -297,7 +357,9 @@ impl<'a> Parser<'a> {
         loop {
             let arg = self.parse_argument()?;
             args.push(arg);
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         Ok(args)
     }
@@ -320,7 +382,10 @@ impl<'a> Parser<'a> {
         // Leading colon → range with no start: :end or : or ::stride
         if matches!(self.peek(), TokenKind::Colon | TokenKind::ColonColon) {
             let sub = self.parse_range(None)?;
-            return Ok(Argument { keyword: None, value: sub });
+            return Ok(Argument {
+                keyword: None,
+                value: sub,
+            });
         }
 
         // Parse an expression.
@@ -329,11 +394,17 @@ impl<'a> Parser<'a> {
         // If followed by colon, it's a range: start:end[:stride]
         if self.peek() == &TokenKind::Colon {
             let sub = self.parse_range(Some(expr))?;
-            return Ok(Argument { keyword: None, value: sub });
+            return Ok(Argument {
+                keyword: None,
+                value: sub,
+            });
         }
 
         // Plain element.
-        Ok(Argument { keyword: None, value: SectionSubscript::Element(expr) })
+        Ok(Argument {
+            keyword: None,
+            value: SectionSubscript::Element(expr),
+        })
     }
 
     /// Parse a range subscript: [start]:end[:stride] or [start]: or :
@@ -341,23 +412,32 @@ impl<'a> Parser<'a> {
     fn parse_range(&mut self, start: Option<SpannedExpr>) -> Result<SectionSubscript, ParseError> {
         // Handle :: (ColonColon token) as two colons — means start::stride with no end.
         if self.eat(&TokenKind::ColonColon) {
-            let stride = if !matches!(self.peek(),
-                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket)
-            {
+            let stride = if !matches!(
+                self.peek(),
+                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket
+            ) {
                 Some(self.parse_expr()?)
             } else {
                 None
             };
-            return Ok(SectionSubscript::Range { start, end: None, stride });
+            return Ok(SectionSubscript::Range {
+                start,
+                end: None,
+                stride,
+            });
         }
 
         self.expect(&TokenKind::Colon)?; // consume first colon
 
         // Parse end (optional — absent if next is colon, comma, ), ], or ::).
-        let end = if !matches!(self.peek(),
-            TokenKind::Colon | TokenKind::ColonColon | TokenKind::Comma |
-            TokenKind::RParen | TokenKind::RBracket)
-        {
+        let end = if !matches!(
+            self.peek(),
+            TokenKind::Colon
+                | TokenKind::ColonColon
+                | TokenKind::Comma
+                | TokenKind::RParen
+                | TokenKind::RBracket
+        ) {
             Some(self.parse_expr()?)
         } else {
             None
@@ -365,9 +445,10 @@ impl<'a> Parser<'a> {
 
         // Parse stride (optional, after second colon).
         let stride = if self.eat(&TokenKind::Colon) {
-            if !matches!(self.peek(),
-                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket)
-            {
+            if !matches!(
+                self.peek(),
+                TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket
+            ) {
                 Some(self.parse_expr()?)
             } else {
                 None
@@ -389,12 +470,17 @@ impl<'a> Parser<'a> {
         if self.peek() != &TokenKind::RBracket {
             loop {
                 values.push(self.parse_ac_value()?);
-                if !self.eat(&TokenKind::Comma) { break; }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
         }
         self.expect(&TokenKind::RBracket)?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Expr::ArrayConstructor { type_spec, values }, span))
+        Ok(Spanned::new(
+            Expr::ArrayConstructor { type_spec, values },
+            span,
+        ))
     }
 
     fn parse_array_constructor_slash(&mut self, start: Span) -> Result<SpannedExpr, ParseError> {
@@ -409,14 +495,24 @@ impl<'a> Parser<'a> {
         // parenthesised implied-do form and errored on `=`.
         let mut values = Vec::new();
         loop {
-            if matches!(self.peek(), TokenKind::Slash) { break; }
+            if matches!(self.peek(), TokenKind::Slash) {
+                break;
+            }
             values.push(self.parse_ac_value_bracketed(BP_MUL.right)?);
-            if !self.eat(&TokenKind::Comma) { break; }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
         }
         self.expect(&TokenKind::Slash)?;
         self.expect(&TokenKind::RParen)?;
         let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Expr::ArrayConstructor { type_spec: None, values }, span))
+        Ok(Spanned::new(
+            Expr::ArrayConstructor {
+                type_spec: None,
+                values,
+            },
+            span,
+        ))
     }
 
     /// Variant of parse_ac_value that honours a minimum binding
@@ -534,17 +630,23 @@ fn token_to_binary_op(tok: &crate::lexer::Token) -> Result<BinaryOp, ParseError>
             "or" => Ok(BinaryOp::Or),
             "eqv" => Ok(BinaryOp::Eqv),
             "neqv" => Ok(BinaryOp::Neqv),
-            _ => Err(ParseError { span: tok.span, msg: format!("unknown dot-operator .{}.", name) }),
+            _ => Err(ParseError {
+                span: tok.span,
+                msg: format!("unknown dot-operator .{}.", name),
+            }),
         },
         TokenKind::DefinedOp(name) => Ok(BinaryOp::Defined(name.clone())),
-        _ => Err(ParseError { span: tok.span, msg: format!("expected operator, got {}", tok.kind) }),
+        _ => Err(ParseError {
+            span: tok.span,
+            msg: format!("expected operator, got {}", tok.kind),
+        }),
     }
 }
 
 fn split_kind_suffix(text: &str) -> (String, Option<String>) {
     if let Some(pos) = text.find('_') {
         let num = text[..pos].to_string();
-        let kind = text[pos+1..].to_string();
+        let kind = text[pos + 1..].to_string();
         if kind.is_empty() {
             (text.to_string(), None)
         } else {
@@ -580,19 +682,58 @@ mod tests {
 
     // ---- Literals ----
 
-    #[test] fn integer() { assert_eq!(sexpr("42"), "42"); }
-    #[test] fn integer_kind() { assert_eq!(sexpr("42_8"), "42"); }
-    #[test] fn real() { assert_eq!(sexpr("3.14"), "3.14"); }
-    #[test] fn real_exp() { assert_eq!(sexpr("1.0e5"), "1.0e5"); }
-    #[test] fn real_double() { assert_eq!(sexpr("1.0d0"), "1.0d0"); }
-    #[test] fn string_single() { assert_eq!(sexpr("'hello'"), "'hello'"); }
-    #[test] fn string_double() { assert_eq!(sexpr("\"hello\""), "'hello'"); }
-    #[test] fn logical_true() { assert_eq!(sexpr(".true."), ".true."); }
-    #[test] fn logical_false() { assert_eq!(sexpr(".false."), ".false."); }
-    #[test] fn boz() { assert_eq!(sexpr("B'1010'"), "B'1010'"); }
-    #[test] fn complex_literal() { assert_eq!(sexpr("(1.0, 2.0)"), "(1.0, 2.0)"); }
-    #[test] fn complex_literal_exprs() { assert_eq!(sexpr("(a + b, c * d)"), "((a + b), (c * d))"); }
-    #[test] fn name() { assert_eq!(sexpr("x"), "x"); }
+    #[test]
+    fn integer() {
+        assert_eq!(sexpr("42"), "42");
+    }
+    #[test]
+    fn integer_kind() {
+        assert_eq!(sexpr("42_8"), "42");
+    }
+    #[test]
+    fn real() {
+        assert_eq!(sexpr("3.14"), "3.14");
+    }
+    #[test]
+    fn real_exp() {
+        assert_eq!(sexpr("1.0e5"), "1.0e5");
+    }
+    #[test]
+    fn real_double() {
+        assert_eq!(sexpr("1.0d0"), "1.0d0");
+    }
+    #[test]
+    fn string_single() {
+        assert_eq!(sexpr("'hello'"), "'hello'");
+    }
+    #[test]
+    fn string_double() {
+        assert_eq!(sexpr("\"hello\""), "'hello'");
+    }
+    #[test]
+    fn logical_true() {
+        assert_eq!(sexpr(".true."), ".true.");
+    }
+    #[test]
+    fn logical_false() {
+        assert_eq!(sexpr(".false."), ".false.");
+    }
+    #[test]
+    fn boz() {
+        assert_eq!(sexpr("B'1010'"), "B'1010'");
+    }
+    #[test]
+    fn complex_literal() {
+        assert_eq!(sexpr("(1.0, 2.0)"), "(1.0, 2.0)");
+    }
+    #[test]
+    fn complex_literal_exprs() {
+        assert_eq!(sexpr("(a + b, c * d)"), "((a + b), (c * d))");
+    }
+    #[test]
+    fn name() {
+        assert_eq!(sexpr("x"), "x");
+    }
 
     // ---- Arithmetic precedence ----
 
@@ -813,10 +954,7 @@ mod tests {
 
     #[test]
     fn mixed_comparison_and_logical() {
-        assert_eq!(
-            sexpr("x > 0 .and. y < 10"),
-            "((x > 0) .and. (y < 10))"
-        );
+        assert_eq!(sexpr("x > 0 .and. y < 10"), "((x > 0) .and. (y < 10))");
     }
 
     #[test]
@@ -878,12 +1016,24 @@ mod tests {
     }
 
     // ---- BOZ variants ----
-    #[test] fn boz_octal() { assert_eq!(sexpr("O'777'"), "O'777'"); }
-    #[test] fn boz_hex() { assert_eq!(sexpr("Z'FF'"), "Z'FF'"); }
+    #[test]
+    fn boz_octal() {
+        assert_eq!(sexpr("O'777'"), "O'777'");
+    }
+    #[test]
+    fn boz_hex() {
+        assert_eq!(sexpr("Z'FF'"), "Z'FF'");
+    }
 
     // ---- Real literal edge cases ----
-    #[test] fn real_leading_dot() { assert_eq!(sexpr(".5"), ".5"); }
-    #[test] fn real_trailing_dot() { assert_eq!(sexpr("5."), "5."); }
+    #[test]
+    fn real_leading_dot() {
+        assert_eq!(sexpr(".5"), ".5");
+    }
+    #[test]
+    fn real_trailing_dot() {
+        assert_eq!(sexpr("5."), "5.");
+    }
 
     // ---- Mixed postfix chains ----
     #[test]

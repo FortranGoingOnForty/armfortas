@@ -10,8 +10,8 @@
 //!
 //! This will be replaced by linear scan allocation in Sprint 21.
 
-use std::collections::HashMap;
 use super::mir::*;
+use std::collections::HashMap;
 
 /// Integer scratch registers (caller-saved, safe to clobber).
 const GP_SCRATCH: [u8; 3] = [9, 10, 11];
@@ -36,9 +36,8 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
     }
 
     // Build class map for quick lookup.
-    let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
-        .map(|v| (v.id, v.class))
-        .collect();
+    let vreg_classes: HashMap<VRegId, RegClass> =
+        mf.vregs.iter().map(|v| (v.id, v.class)).collect();
 
     // Phase 2: rewrite each block's instructions.
     for block_idx in 0..mf.blocks.len() {
@@ -114,7 +113,10 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
             // Replace the def operand (first operand if it matches def).
             let def_scratch = if let Some(def_vid) = def_vreg {
                 if let Some(&offset) = vreg_slots.get(&def_vid) {
-                    let class = vreg_classes.get(&def_vid).copied().unwrap_or(RegClass::Gp64);
+                    let class = vreg_classes
+                        .get(&def_vid)
+                        .copied()
+                        .unwrap_or(RegClass::Gp64);
                     let scratch = match class {
                         RegClass::Fp64 => PhysReg::Fp(FP_SCRATCH[0]),
                         RegClass::Fp32 => PhysReg::Fp32(FP_SCRATCH[0]),
@@ -130,8 +132,12 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
                     }
 
                     Some((scratch, offset, class))
-                } else { None }
-            } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Emit the rewritten instruction.
             rewritten.def = None; // physical regs don't track defs
@@ -162,10 +168,10 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::*;
-    use crate::ir::inst::*;
-    use crate::ir::builder::FuncBuilder;
     use crate::codegen::isel::select_function;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::inst::*;
+    use crate::ir::types::*;
 
     #[test]
     fn regalloc_replaces_vregs() {
@@ -184,8 +190,11 @@ mod tests {
         for block in &mf.blocks {
             for inst in &block.insts {
                 for op in &inst.operands {
-                    assert!(!matches!(op, MachineOperand::VReg(_)),
-                        "vreg still present after regalloc: {:?}", inst);
+                    assert!(
+                        !matches!(op, MachineOperand::VReg(_)),
+                        "vreg still present after regalloc: {:?}",
+                        inst
+                    );
                 }
             }
         }
@@ -204,7 +213,10 @@ mod tests {
         let mut mf = select_function(&func);
         let before = mf.frame.size;
         regalloc_naive(&mut mf);
-        assert!(mf.frame.size >= before, "frame should grow to accommodate spill slots");
+        assert!(
+            mf.frame.size >= before,
+            "frame should grow to accommodate spill slots"
+        );
     }
 
     #[test]
@@ -223,16 +235,22 @@ mod tests {
         // Should use x9, x10, x11 as scratch registers.
         let uses_scratch = mf.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
-                i.operands.iter().any(|op| matches!(op,
-                    MachineOperand::PhysReg(PhysReg::Gp(9)) |
-                    MachineOperand::PhysReg(PhysReg::Gp(10)) |
-                    MachineOperand::PhysReg(PhysReg::Gp(11)) |
-                    MachineOperand::PhysReg(PhysReg::Gp32(9)) |
-                    MachineOperand::PhysReg(PhysReg::Gp32(10)) |
-                    MachineOperand::PhysReg(PhysReg::Gp32(11))
-                ))
+                i.operands.iter().any(|op| {
+                    matches!(
+                        op,
+                        MachineOperand::PhysReg(PhysReg::Gp(9))
+                            | MachineOperand::PhysReg(PhysReg::Gp(10))
+                            | MachineOperand::PhysReg(PhysReg::Gp(11))
+                            | MachineOperand::PhysReg(PhysReg::Gp32(9))
+                            | MachineOperand::PhysReg(PhysReg::Gp32(10))
+                            | MachineOperand::PhysReg(PhysReg::Gp32(11))
+                    )
+                })
             })
         });
-        assert!(uses_scratch, "should use scratch registers x9-x11 or w9-w11");
+        assert!(
+            uses_scratch,
+            "should use scratch registers x9-x11 or w9-w11"
+        );
     }
 }

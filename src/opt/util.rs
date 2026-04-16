@@ -14,18 +14,8 @@
 // flagged it as dead code from this module's perspective.
 #[allow(unused_imports)]
 pub use crate::ir::walk::{
-    inst_uses,
-    terminator_uses,
-    terminator_targets,
-    for_each_operand_mut,
-    for_each_terminator_operand_mut,
-    substitute_uses,
-    predecessors,
-    compute_dominators,
-    compute_immediate_dominators,
-    dominator_tree_children,
-    compute_dominance_frontiers,
-    find_natural_loops,
-    NaturalLoop,
-    prune_unreachable,
+    compute_dominance_frontiers, compute_dominators, compute_immediate_dominators,
+    dominator_tree_children, find_natural_loops, for_each_operand_mut,
+    for_each_terminator_operand_mut, inst_uses, predecessors, prune_unreachable, substitute_uses,
+    terminator_targets, terminator_uses, NaturalLoop,
 };

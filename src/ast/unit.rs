@@ -3,9 +3,9 @@
 //! Top-level compilation units: programs, modules, submodules,
 //! subroutines, functions, block data, and interface blocks.
 
-use super::Spanned;
 use super::decl::{SpannedDecl, TypeSpec};
 use super::stmt::SpannedStmt;
+use super::Spanned;
 
 /// A spanned program unit.
 pub type SpannedUnit = Spanned<ProgramUnit>;
@@ -119,8 +119,8 @@ pub enum InterfaceBody {
 /// IMPORT statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportStmt {
-    Default(Vec<String>),    // import :: name1, name2
-    All,                      // import, all
-    None,                     // import, none
-    Only(Vec<String>),        // import, only: name1, name2
+    Default(Vec<String>), // import :: name1, name2
+    All,                  // import, all
+    None,                 // import, none
+    Only(Vec<String>),    // import, only: name1, name2
 }

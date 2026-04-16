@@ -21,7 +21,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")
@@ -35,13 +37,12 @@ fn call_arg_counts_for(func_section: &str, callee_marker: &str) -> Vec<usize> {
         .filter_map(|line| {
             let line = line.trim();
             let call = line.find(&format!("call {}", callee_marker))?;
-            let inside = line[call..]
-                .split_once('(')?
-                .1
-                .split_once(')')?
-                .0
-                .trim();
-            Some(if inside.is_empty() { 0 } else { inside.split(", ").count() })
+            let inside = line[call..].split_once('(')?.1.split_once(')')?.0.trim();
+            Some(if inside.is_empty() {
+                0
+            } else {
+                inside.split(", ").count()
+            })
         })
         .collect()
 }
@@ -103,5 +104,8 @@ fn o2_propagates_trivial_return_and_deletes_helper() {
         "optimized caller should no longer call the passthrough helper:\n{}",
         opt_main
     );
-    assert_eq!(obj_a, obj_b, "O2 object snapshot should stay deterministic after return propagation");
+    assert_eq!(
+        obj_a, obj_b,
+        "O2 object snapshot should stay deterministic after return propagation"
+    );
 }

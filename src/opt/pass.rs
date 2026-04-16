@@ -95,7 +95,10 @@ impl PassManager {
             }
         }
 
-        PassRunResult { change_count, iterations }
+        PassRunResult {
+            change_count,
+            iterations,
+        }
     }
 
     fn verify_or_panic(&self, module: &Module, after: &str) {
@@ -104,10 +107,7 @@ impl PassManager {
         }
         let errors: Vec<VerifyError> = verify_module(module);
         if !errors.is_empty() {
-            let mut msg = format!(
-                "IR verifier failed after pass `{}`:\n",
-                after
-            );
+            let mut msg = format!("IR verifier failed after pass `{}`:\n", after);
             for e in &errors {
                 msg.push_str("  - ");
                 msg.push_str(&e.msg);
@@ -133,8 +133,12 @@ mod tests {
     /// A pass that does nothing — used to test infrastructure plumbing.
     struct NoopPass;
     impl Pass for NoopPass {
-        fn name(&self) -> &'static str { "noop" }
-        fn run(&self, _module: &mut Module) -> bool { false }
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn run(&self, _module: &mut Module) -> bool {
+            false
+        }
     }
 
     /// A pass that claims it changed once, then is idle.
@@ -142,9 +146,16 @@ mod tests {
         fired: std::cell::Cell<bool>,
     }
     impl Pass for OneShotPass {
-        fn name(&self) -> &'static str { "oneshot" }
+        fn name(&self) -> &'static str {
+            "oneshot"
+        }
         fn run(&self, _module: &mut Module) -> bool {
-            if self.fired.get() { false } else { self.fired.set(true); true }
+            if self.fired.get() {
+                false
+            } else {
+                self.fired.set(true);
+                true
+            }
         }
     }
 
@@ -182,7 +193,9 @@ mod tests {
     #[test]
     fn oneshot_runs_then_terminates() {
         let mut pm = PassManager::new();
-        pm.add(Box::new(OneShotPass { fired: std::cell::Cell::new(false) }));
+        pm.add(Box::new(OneShotPass {
+            fired: std::cell::Cell::new(false),
+        }));
         let mut m = empty_module();
         let r = pm.run(&mut m);
         assert_eq!(r.change_count, 1);

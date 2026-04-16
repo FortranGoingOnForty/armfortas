@@ -4,35 +4,35 @@
 //! configured `PassManager`. Adding a new pass to a level is a one-line
 //! change here, which keeps the dispatch logic in one place.
 
-use super::pass::PassManager;
+use super::bce::Bce;
+use super::call_resolve::CallResolve;
+use super::const_arg::ConstArgSpecialize;
 use super::const_fold::ConstFold;
 use super::const_prop::ConstProp;
-use super::dce::Dce;
 use super::cse::LocalCse;
-use super::strength_reduce::StrengthReduce;
-use super::licm::Licm;
-use super::mem2reg::Mem2Reg;
-use super::dse::Dse;
-use super::lsf::LocalLsf;
-use super::unroll::LoopUnroll;
-use super::preheader::PreheaderInsert;
-use super::unswitch::LoopUnswitch;
-use super::interchange::LoopInterchange;
-use super::peel::LoopPeel;
-use super::call_resolve::CallResolve;
-use super::inline::Inline;
-use super::simplify_cfg::SimplifyCfg;
-use super::dead_func::DeadFuncElim;
+use super::dce::Dce;
 use super::dead_arg::DeadArgElim;
-use super::const_arg::ConstArgSpecialize;
-use super::return_prop::ReturnPropagate;
+use super::dead_func::DeadFuncElim;
+use super::dse::Dse;
 use super::fast_math::FastMathReassoc;
-use super::sroa::Sroa;
-use super::gvn::Gvn;
-use super::global_lsf::GlobalLsf;
-use super::bce::Bce;
 use super::fission::LoopFission;
 use super::fusion::LoopFusion;
+use super::global_lsf::GlobalLsf;
+use super::gvn::Gvn;
+use super::inline::Inline;
+use super::interchange::LoopInterchange;
+use super::licm::Licm;
+use super::lsf::LocalLsf;
+use super::mem2reg::Mem2Reg;
+use super::pass::PassManager;
+use super::peel::LoopPeel;
+use super::preheader::PreheaderInsert;
+use super::return_prop::ReturnPropagate;
+use super::simplify_cfg::SimplifyCfg;
+use super::sroa::Sroa;
+use super::strength_reduce::StrengthReduce;
+use super::unroll::LoopUnroll;
+use super::unswitch::LoopUnswitch;
 use super::vectorize::Vectorize;
 
 /// Compiler optimization levels.
@@ -90,7 +90,10 @@ impl OptLevel {
     /// builder below will gate registration on this. Same for the
     /// other two predicates.
     pub fn inlining(self) -> bool {
-        matches!(self, Self::O1 | Self::O2 | Self::O3 | Self::Os | Self::Ofast)
+        matches!(
+            self,
+            Self::O1 | Self::O2 | Self::O3 | Self::Os | Self::Ofast
+        )
     }
 
     /// Does this level enable loop vectorization (NEON)?
@@ -145,7 +148,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
-            pm.add(Box::new(Sroa));    // after SSA + const fold (GCC pattern)
+            pm.add(Box::new(Sroa)); // after SSA + const fold (GCC pattern)
             pm.add(Box::new(Mem2Reg)); // re-promote SROA-created scalar allocas
             pm.add(Box::new(Inline::for_level(OptLevel::O2)));
             pm.add(Box::new(ConstArgSpecialize));
@@ -168,7 +171,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
-            pm.add(Box::new(Gvn));  // after loop passes to avoid SSA conflicts
+            pm.add(Box::new(Gvn)); // after loop passes to avoid SSA conflicts
             pm.add(Box::new(Dce));
         }
         OptLevel::Os => {
@@ -314,9 +317,19 @@ mod tests {
     fn pipelines_build() {
         // O0 has no passes; every other level has at least one.
         assert!(build_pipeline(OptLevel::O0).is_empty());
-        for lvl in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+        for lvl in [
+            OptLevel::O1,
+            OptLevel::O2,
+            OptLevel::O3,
+            OptLevel::Os,
+            OptLevel::Ofast,
+        ] {
             let pm = build_pipeline(lvl);
-            assert!(!pm.is_empty(), "pipeline {:?} should have at least one pass", lvl);
+            assert!(
+                !pm.is_empty(),
+                "pipeline {:?} should have at least one pass",
+                lvl
+            );
         }
     }
 

@@ -75,15 +75,26 @@ fn integer16_formatted_read_runs_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("formatted integer(16) input should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "formatted integer(16) input should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) read run at {:?}:\n{:#?}", level, run);
-        assert!(run.stdout.contains("170141183460469231731687303715884105727"));
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful formatted integer(16) read run at {:?}:\n{:#?}",
+            level, run
+        );
+        assert!(run
+            .stdout
+            .contains("170141183460469231731687303715884105727"));
         assert!(run.stdout.contains("42"));
     }
 }
@@ -161,14 +172,23 @@ fn integer16_formatted_read_targets_run_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("formatted integer(16) lvalue read should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "formatted integer(16) lvalue read should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) lvalue read run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful formatted integer(16) lvalue read run at {:?}:\n{:#?}",
+            level, run
+        );
         for needle in [
             "11",
             "-170141183460469231731687303715884105727",
@@ -255,16 +275,29 @@ fn integer16_formatted_read_arrays_run_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("formatted integer(16) array reads should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "formatted integer(16) array reads should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) array read run at {:?}:\n{:#?}", level, run);
-        assert!(run.stdout.contains("11 170141183460469231731687303715884105727 33"));
-        assert!(run.stdout.contains("66 -170141183460469231731687303715884105727 44"));
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful formatted integer(16) array read run at {:?}:\n{:#?}",
+            level, run
+        );
+        assert!(run
+            .stdout
+            .contains("11 170141183460469231731687303715884105727 33"));
+        assert!(run
+            .stdout
+            .contains("66 -170141183460469231731687303715884105727 44"));
     }
 }
 
@@ -335,14 +368,23 @@ fn integer16_formatted_read_sections_run_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("formatted integer(16) section reads should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "formatted integer(16) section reads should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) section read run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful formatted integer(16) section read run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(run.stdout.contains("101 202"));
         assert!(run.stdout.contains("606 505 404 303"));
     }
@@ -459,14 +501,23 @@ fn integer16_formatted_read_alloc_reverse_section_runs_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("allocatable formatted integer(16) reverse section read should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "allocatable formatted integer(16) reverse section read should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful allocatable reverse section read run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful allocatable reverse section read run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(run.stdout.contains("8"));
     }
 }

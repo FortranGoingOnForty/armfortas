@@ -28,7 +28,9 @@ fn find_compiler() -> PathBuf {
 fn find_test_programs() -> PathBuf {
     for c in &["test_programs", "../test_programs"] {
         let p = PathBuf::from(c);
-        if p.is_dir() { return p; }
+        if p.is_dir() {
+            return p;
+        }
     }
     panic!("cannot find test_programs/ directory");
 }
@@ -36,7 +38,11 @@ fn find_test_programs() -> PathBuf {
 fn unique_path(prefix: &str, ext: &str) -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "afs_det_{}_{}_{}{}", prefix, std::process::id(), id, ext
+        "afs_det_{}_{}_{}{}",
+        prefix,
+        std::process::id(),
+        id,
+        ext
     ))
 }
 
@@ -45,7 +51,13 @@ fn unique_path(prefix: &str, ext: &str) -> PathBuf {
 fn compile_to_asm(compiler: &Path, source: &Path, opt: &str) -> Option<Vec<u8>> {
     let out = unique_path("sweep", ".s");
     let result = Command::new(compiler)
-        .args([source.to_str().unwrap(), opt, "-S", "-o", out.to_str().unwrap()])
+        .args([
+            source.to_str().unwrap(),
+            opt,
+            "-S",
+            "-o",
+            out.to_str().unwrap(),
+        ])
         .output()
         .expect("compiler launch failed");
     if !result.status.success() {
@@ -112,7 +124,9 @@ fn all_programs_deterministic_at_o2() {
         if first != second {
             failures.push(format!(
                 "{}: assembly differs between two -O2 compilations ({} vs {} bytes)",
-                name, first.len(), second.len(),
+                name,
+                first.len(),
+                second.len(),
             ));
         } else {
             checked += 1;
@@ -121,14 +135,14 @@ fn all_programs_deterministic_at_o2() {
 
     eprintln!(
         "\nDeterminism sweep: {} checked, {} skipped, {} failures out of {} programs",
-        checked, skipped, failures.len(), sources.len(),
+        checked,
+        skipped,
+        failures.len(),
+        sources.len(),
     );
 
     if !failures.is_empty() {
-        panic!(
-            "Determinism failures:\n{}",
-            failures.join("\n"),
-        );
+        panic!("Determinism failures:\n{}", failures.join("\n"),);
     }
 
     // Sanity: we should have checked a substantial portion.

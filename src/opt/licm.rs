@@ -45,7 +45,7 @@
 
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
-use super::util::{find_natural_loops, predecessors, inst_uses, NaturalLoop};
+use super::util::{find_natural_loops, inst_uses, predecessors, NaturalLoop};
 use crate::ir::inst::*;
 use std::collections::{HashMap, HashSet};
 
@@ -140,7 +140,9 @@ fn licm_function(func: &mut Function) -> bool {
     let pruned = super::util::prune_unreachable(func);
 
     let loops = find_natural_loops(func);
-    if loops.is_empty() { return pruned; }
+    if loops.is_empty() {
+        return pruned;
+    }
 
     let preds = predecessors(func);
     let mut any_hoisted = pruned;
@@ -152,14 +154,18 @@ fn licm_function(func: &mut Function) -> bool {
     // we'd "rebuild per iteration" — that was always aspirational
     // and would only matter if a future variant of LICM started
     // mutating the block vector.
-    let block_index: HashMap<BlockId, usize> = func.blocks.iter()
+    let block_index: HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
         .enumerate()
         .map(|(i, b)| (b.id, i))
         .collect();
 
     for lp in &loops {
         // Need a preheader to hoist into.
-        let Some(ph_id) = find_preheader(func, lp, &preds) else { continue; };
+        let Some(ph_id) = find_preheader(func, lp, &preds) else {
+            continue;
+        };
 
         // Iteratively find invariant instructions until a full pass
         // turns up nothing new. After each round we mark the hoisted
@@ -170,7 +176,9 @@ fn licm_function(func: &mut Function) -> bool {
         loop {
             let mut hoists: Vec<Hoist> = Vec::new();
             for (bi, block) in func.blocks.iter().enumerate() {
-                if !lp.body.contains(&block.id) { continue; }
+                if !lp.body.contains(&block.id) {
+                    continue;
+                }
                 for (ii, inst) in block.insts.iter().enumerate() {
                     if !loop_defs.contains(&inst.id) {
                         // Already hoisted (we mark it removed from
@@ -181,16 +189,25 @@ fn licm_function(func: &mut Function) -> bool {
                     // not in the loop_defs set (i.e., previously
                     // hoisted, or defined outside).
                     let operands = inst_uses(&inst.kind);
-                    if operands.iter().any(|v| loop_defs.contains(v)) { continue; }
+                    if operands.iter().any(|v| loop_defs.contains(v)) {
+                        continue;
+                    }
                     let hoistable = match &inst.kind {
                         InstKind::Load(ptr) => load_is_loop_invariant(func, lp, inst.id, *ptr),
                         _ => is_non_memory_hoist_candidate(&inst.kind),
                     };
-                    if !hoistable { continue; }
-                    hoists.push(Hoist { block_idx: bi, inst_idx: ii });
+                    if !hoistable {
+                        continue;
+                    }
+                    hoists.push(Hoist {
+                        block_idx: bi,
+                        inst_idx: ii,
+                    });
                 }
             }
-            if hoists.is_empty() { break; }
+            if hoists.is_empty() {
+                break;
+            }
 
             // Apply hoists: remove from source blocks (in reverse
             // index order so earlier indices remain valid), then
@@ -241,12 +258,16 @@ fn licm_function(func: &mut Function) -> bool {
 pub struct Licm;
 
 impl Pass for Licm {
-    fn name(&self) -> &'static str { "licm" }
+    fn name(&self) -> &'static str {
+        "licm"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if licm_function(func) { changed = true; }
+            if licm_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -255,12 +276,16 @@ impl Pass for Licm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
-    use crate::lexer::{Span, Position};
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
@@ -318,7 +343,10 @@ mod tests {
         // Header.
         let header = f.create_block("header");
         let i_param = f.next_value_id();
-        f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: i_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
         let k = f.next_value_id();
         let tmp = f.next_value_id();
         let done = f.next_value_id();
@@ -344,7 +372,10 @@ mod tests {
         // Latch.
         let latch = f.create_block("latch");
         let i_in = f.next_value_id();
-        f.block_mut(latch).params.push(BlockParam { id: i_in, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(latch).params.push(BlockParam {
+            id: i_in,
+            ty: IrType::Int(IntWidth::I32),
+        });
         let one = f.next_value_id();
         let next = f.next_value_id();
         f.block_mut(latch).insts.push(Inst {
@@ -389,11 +420,20 @@ mod tests {
         let entry_block = f.block(f.entry);
         // The const(5) should now live in the entry block (which is
         // the natural preheader), not the header.
-        let in_entry_const5 = entry_block.insts.iter().any(|i| matches!(i.kind, InstKind::ConstInt(5, IntWidth::I32)));
-        assert!(in_entry_const5, "const(5) should be hoisted into preheader (entry)");
+        let in_entry_const5 = entry_block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::ConstInt(5, IntWidth::I32)));
+        assert!(
+            in_entry_const5,
+            "const(5) should be hoisted into preheader (entry)"
+        );
 
         let header_block = f.block(header);
-        let in_header_const5 = header_block.insts.iter().any(|i| matches!(i.kind, InstKind::ConstInt(5, IntWidth::I32)));
+        let in_header_const5 = header_block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::ConstInt(5, IntWidth::I32)));
         assert!(!in_header_const5, "const(5) should be removed from header");
     }
 
@@ -405,8 +445,14 @@ mod tests {
         Licm.run(&mut m);
         let f = &m.functions[0];
         let header_block = f.block(header);
-        let header_has_iadd = header_block.insts.iter().any(|i| matches!(i.kind, InstKind::IAdd(..)));
-        assert!(header_has_iadd, "IAdd(i_param, k) must remain in the header");
+        let header_has_iadd = header_block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::IAdd(..)));
+        assert!(
+            header_has_iadd,
+            "IAdd(i_param, k) must remain in the header"
+        );
     }
 
     #[test]
@@ -459,7 +505,10 @@ mod tests {
 
         let header = f.create_block("header");
         let i_param = f.next_value_id();
-        f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: i_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
         let v = f.next_value_id();
         f.block_mut(header).insts.push(Inst {
             id: v,
@@ -503,9 +552,14 @@ mod tests {
         // The Load must still be in the header after LICM.
         let f = &m.functions[0];
         let header_block = f.block(header);
-        let load_in_header = header_block.insts.iter()
+        let load_in_header = header_block
+            .insts
+            .iter()
             .any(|i| matches!(i.kind, InstKind::Load(_)));
-        assert!(load_in_header, "ambiguous loop load should not have been hoisted");
+        assert!(
+            load_in_header,
+            "ambiguous loop load should not have been hoisted"
+        );
     }
 
     #[test]
@@ -554,7 +608,10 @@ mod tests {
 
         let header = f.create_block("header");
         let i_param = f.next_value_id();
-        f.block_mut(header).params.push(BlockParam { id: i_param, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: i_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
         let v = f.next_value_id();
         f.block_mut(header).insts.push(Inst {
             id: v,
@@ -584,7 +641,10 @@ mod tests {
 
         m.add_function(f);
 
-        assert!(Licm.run(&mut m), "LICM should report that it hoisted the loop-invariant load");
+        assert!(
+            Licm.run(&mut m),
+            "LICM should report that it hoisted the loop-invariant load"
+        );
 
         // The Load must have moved out of the header — into the
         // preheader or the entry block (LICM hoists into the
@@ -596,14 +656,20 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i.kind, InstKind::Load(_)));
-        assert!(!load_still_in_header, "invariant load should have left the header");
+        assert!(
+            !load_still_in_header,
+            "invariant load should have left the header"
+        );
         let load_somewhere_else = f
             .blocks
             .iter()
             .filter(|b| b.id != header)
             .flat_map(|b| b.insts.iter())
             .any(|i| matches!(i.kind, InstKind::Load(_)));
-        assert!(load_somewhere_else, "invariant load should have been placed in a dominating block");
+        assert!(
+            load_somewhere_else,
+            "invariant load should have been placed in a dominating block"
+        );
     }
 
     #[test]
@@ -625,8 +691,16 @@ mod tests {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), params, IrType::Void);
 
-        let init = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let limit = push(&mut f, InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let init = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let limit = push(
+            &mut f,
+            InstKind::ConstInt(10, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
 
         let header = f.create_block("header");
         let i_param = f.next_value_id();
@@ -685,7 +759,10 @@ mod tests {
 
         m.add_function(f);
 
-        assert!(Licm.run(&mut m), "LICM should hoist the invariant dummy-arg load");
+        assert!(
+            Licm.run(&mut m),
+            "LICM should hoist the invariant dummy-arg load"
+        );
 
         let f = &m.functions[0];
         let entry_block = f.block(f.entry);
@@ -721,16 +798,22 @@ mod tests {
         let init = f.next_value_id();
         let entry = f.entry;
         f.block_mut(entry).insts.push(Inst {
-            id: a, kind: InstKind::ConstInt(3, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: a,
+            kind: InstKind::ConstInt(3, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(entry).insts.push(Inst {
-            id: bv, kind: InstKind::ConstInt(4, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: bv,
+            kind: InstKind::ConstInt(4, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(entry).insts.push(Inst {
-            id: init, kind: InstKind::ConstInt(0, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: init,
+            kind: InstKind::ConstInt(0, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
 
         // Header: i_param, then `prod = a * b` (invariant), then
@@ -738,44 +821,58 @@ mod tests {
         let header = f.create_block("header");
         let i_param = f.next_value_id();
         f.block_mut(header).params.push(BlockParam {
-            id: i_param, ty: IrType::Int(IntWidth::I32),
+            id: i_param,
+            ty: IrType::Int(IntWidth::I32),
         });
         let prod = f.next_value_id();
         let tmp = f.next_value_id();
         let limit = f.next_value_id();
         let done = f.next_value_id();
         f.block_mut(header).insts.push(Inst {
-            id: prod, kind: InstKind::IMul(a, bv),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: prod,
+            kind: InstKind::IMul(a, bv),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(header).insts.push(Inst {
-            id: tmp, kind: InstKind::IAdd(i_param, prod),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: tmp,
+            kind: InstKind::IAdd(i_param, prod),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(header).insts.push(Inst {
-            id: limit, kind: InstKind::ConstInt(10, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: limit,
+            kind: InstKind::ConstInt(10, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(header).insts.push(Inst {
-            id: done, kind: InstKind::ICmp(CmpOp::Ge, i_param, limit),
-            ty: IrType::Bool, span: dummy_span(),
+            id: done,
+            kind: InstKind::ICmp(CmpOp::Ge, i_param, limit),
+            ty: IrType::Bool,
+            span: dummy_span(),
         });
 
         // Latch: increment i and loop back.
         let latch = f.create_block("latch");
         let i_in = f.next_value_id();
         f.block_mut(latch).params.push(BlockParam {
-            id: i_in, ty: IrType::Int(IntWidth::I32),
+            id: i_in,
+            ty: IrType::Int(IntWidth::I32),
         });
         let one = f.next_value_id();
         let next = f.next_value_id();
         f.block_mut(latch).insts.push(Inst {
-            id: one, kind: InstKind::ConstInt(1, IntWidth::I32),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: one,
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(latch).insts.push(Inst {
-            id: next, kind: InstKind::IAdd(i_in, one),
-            ty: IrType::Int(IntWidth::I32), span: dummy_span(),
+            id: next,
+            kind: InstKind::IAdd(i_in, one),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
         });
         f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![next]));
 
@@ -785,8 +882,10 @@ mod tests {
         f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![init]));
         f.block_mut(header).terminator = Some(Terminator::CondBranch {
             cond: done,
-            true_dest: exit, true_args: vec![],
-            false_dest: latch, false_args: vec![i_param],
+            true_dest: exit,
+            true_args: vec![],
+            false_dest: latch,
+            false_args: vec![i_param],
         });
 
         m.add_function(f);
@@ -797,23 +896,35 @@ mod tests {
         // The IMul must have moved out of the header into the entry
         // (the natural preheader).
         let header_block = f.block(header);
-        let imul_in_header = header_block.insts.iter()
+        let imul_in_header = header_block
+            .insts
+            .iter()
             .any(|i| matches!(i.kind, InstKind::IMul(..)));
-        assert!(!imul_in_header,
+        assert!(
+            !imul_in_header,
             "invariant IMul should be hoisted out of the header: {:?}",
-            header_block.insts);
+            header_block.insts
+        );
 
         let entry_block = f.block(f.entry);
-        let imul_in_entry = entry_block.insts.iter()
+        let imul_in_entry = entry_block
+            .insts
+            .iter()
             .any(|i| matches!(i.kind, InstKind::IMul(..)));
-        assert!(imul_in_entry,
+        assert!(
+            imul_in_entry,
             "invariant IMul should land in entry/preheader after hoist: {:?}",
-            entry_block.insts);
+            entry_block.insts
+        );
 
         // The loop-dependent IAdd must NOT have moved.
-        let iadd_in_header = header_block.insts.iter()
+        let iadd_in_header = header_block
+            .insts
+            .iter()
             .any(|i| matches!(i.kind, InstKind::IAdd(_, _)));
-        assert!(iadd_in_header,
-            "loop-dependent IAdd(i_param, prod) should still be in the header");
+        assert!(
+            iadd_in_header,
+            "loop-dependent IAdd(i_param, prod) should still be in the header"
+        );
     }
 }

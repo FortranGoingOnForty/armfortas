@@ -30,7 +30,9 @@ fn capture_run(request: CaptureRequest) -> RunCapture {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")
@@ -109,7 +111,18 @@ fn ofast_reassociates_float_constant_chain_but_o3_stays_strict() {
         Stage::Obj,
     );
 
-    assert_eq!(parse_last_int(&o3_run.stdout), 0, "strict O3 run should keep IEEE-style rounding loss");
-    assert_eq!(parse_last_int(&ofast_run.stdout), 1, "Ofast run should expose fast-math reassociation");
-    assert_eq!(ofast_obj_a, ofast_obj_b, "Ofast object snapshot should stay deterministic");
+    assert_eq!(
+        parse_last_int(&o3_run.stdout),
+        0,
+        "strict O3 run should keep IEEE-style rounding loss"
+    );
+    assert_eq!(
+        parse_last_int(&ofast_run.stdout),
+        1,
+        "Ofast run should expose fast-math reassociation"
+    );
+    assert_eq!(
+        ofast_obj_a, ofast_obj_b,
+        "Ofast object snapshot should stay deterministic"
+    );
 }

@@ -82,11 +82,16 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
         msg = message,
     );
 
-    if let Some((gutter, line_text, caret_indent, caret_len)) =
-        snippet_for(source, span, span_len)
+    if let Some((gutter, line_text, caret_indent, caret_len)) = snippet_for(source, span, span_len)
     {
         let blue = if color { "\x1b[34m" } else { "" };
-        eprintln!("{blue}{gutter:>5} |{reset} {line}", gutter = gutter, reset = reset, blue = blue, line = line_text);
+        eprintln!(
+            "{blue}{gutter:>5} |{reset} {line}",
+            gutter = gutter,
+            reset = reset,
+            blue = blue,
+            line = line_text
+        );
         let mut caret = String::new();
         for _ in 0..caret_indent {
             caret.push(' ');
@@ -94,7 +99,13 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
         for _ in 0..caret_len.max(1) {
             caret.push('^');
         }
-        eprintln!("{blue}      |{reset} {col_start}{caret}{reset}", blue = blue, reset = reset, col_start = col_start, caret = caret);
+        eprintln!(
+            "{blue}      |{reset} {col_start}{caret}{reset}",
+            blue = blue,
+            reset = reset,
+            col_start = col_start,
+            caret = caret
+        );
     }
 }
 
@@ -102,11 +113,7 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
 /// Returns `(line_number, line_text, caret_indent, caret_len)`.
 /// caret_indent is in display columns assuming a tab is replaced by
 /// 4 spaces, matching how the line_text is emitted.
-fn snippet_for(
-    source: &str,
-    span: Span,
-    span_len: usize,
-) -> Option<(u32, String, usize, usize)> {
+fn snippet_for(source: &str, span: Span, span_len: usize) -> Option<(u32, String, usize, usize)> {
     if span.start.line == 0 {
         return None;
     }

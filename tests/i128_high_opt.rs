@@ -121,7 +121,11 @@ fn high_opt_backend_runs_internal_integer16_call() {
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful {} integer(16) run:\n{:#?}", label, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful {} integer(16) run:\n{:#?}",
+            label, run
+        );
         assert!(
             run.stdout.contains('1'),
             "{} integer(16) internal call program should print score 1:\n{}",

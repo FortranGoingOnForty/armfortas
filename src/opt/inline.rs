@@ -13,14 +13,14 @@
 //!   5. Split the call-containing block: pre-call instructions +
 //!      branch to cloned entry, post-call block receives return value
 
-use std::collections::HashMap;
-use crate::ir::inst::*;
-use crate::ir::types::IrType;
-use crate::ir::walk::prune_unreachable;
 use super::callgraph::CallGraph;
 use super::loop_utils::{remap_inst_kind, remap_terminator};
 use super::pass::Pass;
 use super::pipeline::OptLevel;
+use crate::ir::inst::*;
+use crate::ir::types::IrType;
+use crate::ir::walk::prune_unreachable;
+use std::collections::HashMap;
 
 /// Maximum callee instruction count for inlining.
 const INLINE_THRESHOLD_O1: usize = 20;
@@ -43,10 +43,14 @@ impl Inline {
 }
 
 impl Pass for Inline {
-    fn name(&self) -> &'static str { "inline" }
+    fn name(&self) -> &'static str {
+        "inline"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
-        if self.threshold == 0 { return false; }
+        if self.threshold == 0 {
+            return false;
+        }
 
         let cg = CallGraph::build(module);
         let order = cg.bottom_up_order();
@@ -77,11 +81,17 @@ fn inline_calls_in_function(
                 if let InstKind::Call(FuncRef::Internal(callee_idx), args) = &inst.kind {
                     let ci = *callee_idx;
                     // Don't inline recursive functions.
-                    if cg.is_recursive(ci) { continue; }
+                    if cg.is_recursive(ci) {
+                        continue;
+                    }
                     // Don't self-inline.
-                    if ci == caller_idx { continue; }
+                    if ci == caller_idx {
+                        continue;
+                    }
                     // Cost check.
-                    if cg.inline_cost(ci) > threshold { continue; }
+                    if cg.inline_cost(ci) > threshold {
+                        continue;
+                    }
                     // Argument/parameter type agreement.  When a
                     // Fortran OPTIONAL parameter is absent at a call
                     // site, the caller passes `const_i64 0` as a null
@@ -94,14 +104,19 @@ fn inline_calls_in_function(
                     // callee param type exactly.  The same check also
                     // guards any future call-boundary coercion shims.
                     let callee = &module.functions[ci as usize];
-                    if callee.params.len() != args.len() { continue; }
-                    let mismatched = callee.params.iter().zip(args.iter()).any(|(p, a)| {
-                        match caller.value_type(*a) {
-                            Some(ty) => ty != p.ty,
-                            None => true,
-                        }
-                    });
-                    if mismatched { continue; }
+                    if callee.params.len() != args.len() {
+                        continue;
+                    }
+                    let mismatched =
+                        callee.params.iter().zip(args.iter()).any(|(p, a)| {
+                            match caller.value_type(*a) {
+                                Some(ty) => ty != p.ty,
+                                None => true,
+                            }
+                        });
+                    if mismatched {
+                        continue;
+                    }
                     sites.push((block.id, inst_idx, ci, args.clone()));
                 }
             }
@@ -109,7 +124,9 @@ fn inline_calls_in_function(
         sites
     };
 
-    if call_sites.is_empty() { return false; }
+    if call_sites.is_empty() {
+        return false;
+    }
 
     // Inline one call site, then return true to let the pass manager
     // re-run us. Processing multiple sites in one invocation is unsafe:
@@ -117,139 +134,133 @@ fn inline_calls_in_function(
     // same block. The pass manager's fixpoint loop handles re-invocation.
     let (call_block_id, call_inst_idx, callee_idx, caller_args) = call_sites[0].clone();
     {
+        // Clone the callee's body into the caller.
+        let callee = &module.functions[callee_idx as usize];
+        let callee_entry = callee.entry;
+        let callee_blocks: Vec<BasicBlock> = callee.blocks.clone();
+        let callee_params: Vec<Param> = callee.params.clone();
+        let callee_return_ty = callee.return_type.clone();
 
-    // Clone the callee's body into the caller.
-    let callee = &module.functions[callee_idx as usize];
-    let callee_entry = callee.entry;
-    let callee_blocks: Vec<BasicBlock> = callee.blocks.clone();
-    let callee_params: Vec<Param> = callee.params.clone();
-    let callee_return_ty = callee.return_type.clone();
+        let caller = &mut module.functions[caller_idx as usize];
 
-    let caller = &mut module.functions[caller_idx as usize];
-
-    // Build value map: callee params → caller args.
-    let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
-    for (param, &arg) in callee_params.iter().zip(caller_args.iter()) {
-        val_map.insert(param.id, arg);
-    }
-
-    // Allocate fresh IDs for all callee values.
-    let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
-    for cb in &callee_blocks {
-        let new_bid = caller.create_block(&format!("inline_{}", cb.name));
-        block_map.insert(cb.id, new_bid);
-    }
-
-    // Create post-call block to receive the return value.
-    let post_call = caller.create_block("inline_post");
-    let has_return_val = !matches!(callee_return_ty, IrType::Void);
-
-    let result_param_id = if has_return_val {
-        let pid = caller.next_value_id();
-        caller.register_type(pid, callee_return_ty.clone());
-        caller.block_mut(post_call).params.push(BlockParam {
-            id: pid,
-            ty: callee_return_ty.clone(),
-        });
-        Some(pid)
-    } else {
-        None
-    };
-
-    // Clone block params and instructions.
-    for cb in &callee_blocks {
-        let new_bid = block_map[&cb.id];
-        // Clone block params.
-        for bp in &cb.params {
-            let new_id = caller.next_value_id();
-            caller.register_type(new_id, bp.ty.clone());
-            val_map.insert(bp.id, new_id);
-            caller.block_mut(new_bid).params.push(BlockParam {
-                id: new_id,
-                ty: bp.ty.clone(),
-            });
+        // Build value map: callee params → caller args.
+        let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+        for (param, &arg) in callee_params.iter().zip(caller_args.iter()) {
+            val_map.insert(param.id, arg);
         }
-        // Clone instructions.
-        for inst in &cb.insts {
-            let new_id = caller.next_value_id();
-            caller.register_type(new_id, inst.ty.clone());
-            val_map.insert(inst.id, new_id);
-            let new_kind = remap_inst_kind(&inst.kind, &val_map);
-            caller.block_mut(new_bid).insts.push(Inst {
-                id: new_id,
+
+        // Allocate fresh IDs for all callee values.
+        let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
+        for cb in &callee_blocks {
+            let new_bid = caller.create_block(&format!("inline_{}", cb.name));
+            block_map.insert(cb.id, new_bid);
+        }
+
+        // Create post-call block to receive the return value.
+        let post_call = caller.create_block("inline_post");
+        let has_return_val = !matches!(callee_return_ty, IrType::Void);
+
+        let result_param_id = if has_return_val {
+            let pid = caller.next_value_id();
+            caller.register_type(pid, callee_return_ty.clone());
+            caller.block_mut(post_call).params.push(BlockParam {
+                id: pid,
+                ty: callee_return_ty.clone(),
+            });
+            Some(pid)
+        } else {
+            None
+        };
+
+        // Clone block params and instructions.
+        for cb in &callee_blocks {
+            let new_bid = block_map[&cb.id];
+            // Clone block params.
+            for bp in &cb.params {
+                let new_id = caller.next_value_id();
+                caller.register_type(new_id, bp.ty.clone());
+                val_map.insert(bp.id, new_id);
+                caller.block_mut(new_bid).params.push(BlockParam {
+                    id: new_id,
+                    ty: bp.ty.clone(),
+                });
+            }
+            // Clone instructions.
+            for inst in &cb.insts {
+                let new_id = caller.next_value_id();
+                caller.register_type(new_id, inst.ty.clone());
+                val_map.insert(inst.id, new_id);
+                let new_kind = remap_inst_kind(&inst.kind, &val_map);
+                caller.block_mut(new_bid).insts.push(Inst {
+                    id: new_id,
+                    kind: new_kind,
+                    ty: inst.ty.clone(),
+                    span: inst.span,
+                });
+            }
+        }
+
+        // Clone terminators, replacing Return with Branch to post_call.
+        for cb in &callee_blocks {
+            let new_bid = block_map[&cb.id];
+            let new_term = match &cb.terminator {
+                Some(Terminator::Return(Some(val))) => {
+                    let remapped = *val_map.get(val).unwrap_or(val);
+                    Terminator::Branch(post_call, vec![remapped])
+                }
+                Some(Terminator::Return(None)) => Terminator::Branch(post_call, vec![]),
+                Some(other) => remap_terminator(other, &block_map, &val_map),
+                None => Terminator::Unreachable,
+            };
+            caller.block_mut(new_bid).terminator = Some(new_term);
+        }
+
+        // Split the call-containing block: move instructions after the call
+        // into the post-call block.
+        let call_block = caller.block_mut(call_block_id);
+        let call_result_id = call_block.insts[call_inst_idx].id;
+
+        // Move post-call instructions to the new block.
+        let post_insts: Vec<Inst> = call_block.insts.split_off(call_inst_idx + 1);
+        let old_term = call_block.terminator.take();
+
+        // Remove the call instruction itself.
+        call_block.insts.pop(); // removes the call at call_inst_idx
+
+        // Add branch from call block to inlined entry.
+        let inlined_entry = block_map[&callee_entry];
+        caller.block_mut(call_block_id).terminator =
+            Some(Terminator::Branch(inlined_entry, vec![]));
+
+        // Populate post-call block with remaining instructions and terminator.
+        // Remap uses of the call result to the post-call block param.
+        let mut post_remap: HashMap<ValueId, ValueId> = HashMap::new();
+        if let Some(param_id) = result_param_id {
+            post_remap.insert(call_result_id, param_id);
+        }
+
+        for inst in post_insts {
+            let new_kind = if post_remap.is_empty() {
+                inst.kind.clone()
+            } else {
+                remap_inst_kind(&inst.kind, &post_remap)
+            };
+            caller.block_mut(post_call).insts.push(Inst {
+                id: inst.id,
                 kind: new_kind,
-                ty: inst.ty.clone(),
+                ty: inst.ty,
                 span: inst.span,
             });
         }
-    }
 
-    // Clone terminators, replacing Return with Branch to post_call.
-    for cb in &callee_blocks {
-        let new_bid = block_map[&cb.id];
-        let new_term = match &cb.terminator {
-            Some(Terminator::Return(Some(val))) => {
-                let remapped = *val_map.get(val).unwrap_or(val);
-                Terminator::Branch(post_call, vec![remapped])
-            }
-            Some(Terminator::Return(None)) => {
-                Terminator::Branch(post_call, vec![])
-            }
-            Some(other) => {
-                remap_terminator(other, &block_map, &val_map)
-            }
-            None => Terminator::Unreachable,
-        };
-        caller.block_mut(new_bid).terminator = Some(new_term);
-    }
-
-    // Split the call-containing block: move instructions after the call
-    // into the post-call block.
-    let call_block = caller.block_mut(call_block_id);
-    let call_result_id = call_block.insts[call_inst_idx].id;
-
-    // Move post-call instructions to the new block.
-    let post_insts: Vec<Inst> = call_block.insts.split_off(call_inst_idx + 1);
-    let old_term = call_block.terminator.take();
-
-    // Remove the call instruction itself.
-    call_block.insts.pop(); // removes the call at call_inst_idx
-
-    // Add branch from call block to inlined entry.
-    let inlined_entry = block_map[&callee_entry];
-    caller.block_mut(call_block_id).terminator =
-        Some(Terminator::Branch(inlined_entry, vec![]));
-
-    // Populate post-call block with remaining instructions and terminator.
-    // Remap uses of the call result to the post-call block param.
-    let mut post_remap: HashMap<ValueId, ValueId> = HashMap::new();
-    if let Some(param_id) = result_param_id {
-        post_remap.insert(call_result_id, param_id);
-    }
-
-    for inst in post_insts {
-        let new_kind = if post_remap.is_empty() {
-            inst.kind.clone()
-        } else {
-            remap_inst_kind(&inst.kind, &post_remap)
-        };
-        caller.block_mut(post_call).insts.push(Inst {
-            id: inst.id,
-            kind: new_kind,
-            ty: inst.ty,
-            span: inst.span,
-        });
-    }
-
-    if let Some(term) = old_term {
-        let new_term = if post_remap.is_empty() {
-            term
-        } else {
-            remap_terminator(&term, &HashMap::new(), &post_remap)
-        };
-        caller.block_mut(post_call).terminator = Some(new_term);
-    }
-
+        if let Some(term) = old_term {
+            let new_term = if post_remap.is_empty() {
+                term
+            } else {
+                remap_terminator(&term, &HashMap::new(), &post_remap)
+            };
+            caller.block_mut(post_call).terminator = Some(new_term);
+        }
     } // end single inline
 
     let caller = &mut module.functions[caller_idx as usize];
@@ -260,7 +271,7 @@ fn inline_calls_in_function(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 
     #[test]

@@ -18,9 +18,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir() -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "afs_incr_{}_{}", std::process::id(), id
-    ));
+    let dir = std::env::temp_dir().join(format!("afs_incr_{}_{}", std::process::id(), id));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -28,7 +26,9 @@ fn unique_dir() -> PathBuf {
 fn find_compiler() -> PathBuf {
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
-        if p.exists() { return fs::canonicalize(&p).unwrap(); }
+        if p.exists() {
+            return fs::canonicalize(&p).unwrap();
+        }
     }
     panic!("armfortas binary not found");
 }
@@ -36,8 +36,11 @@ fn find_compiler() -> PathBuf {
 fn compile(compiler: &Path, source: &Path, obj: &Path, search: &Path) {
     let result = Command::new(compiler)
         .args([
-            source.to_str().unwrap(), "-c", "-O0",
-            "-o", obj.to_str().unwrap(),
+            source.to_str().unwrap(),
+            "-c",
+            "-O0",
+            "-o",
+            obj.to_str().unwrap(),
             &format!("-I{}", search.display()),
         ])
         .output()
@@ -96,7 +99,10 @@ fn changed_public_interface_changes_amod() {
     let amod1 = compile_module(&compiler, &dir, "m", v1);
     let amod2 = compile_module(&compiler, &dir, "m", v2);
 
-    assert_ne!(amod1, amod2, ".amod should differ when public interface changes");
+    assert_ne!(
+        amod1, amod2,
+        ".amod should differ when public interface changes"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -134,7 +140,10 @@ end module
     // header from the body) should be identical.
     let body1 = extract_amod_body(&amod1);
     let body2 = extract_amod_body(&amod2);
-    assert_eq!(body1, body2, ".amod interface body changed but only private impl differs");
+    assert_eq!(
+        body1, body2,
+        ".amod interface body changed but only private impl differs"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -160,7 +169,10 @@ fn consumer_object_stable_when_amod_unchanged() {
     compile(&compiler, &main_f90, &main_o, &dir);
     let obj2 = fs::read(&main_o).unwrap();
 
-    assert_eq!(obj1, obj2, "consumer .o changed despite no source/amod change");
+    assert_eq!(
+        obj1, obj2,
+        "consumer .o changed despite no source/amod change"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -170,7 +182,8 @@ fn consumer_object_changes_when_amod_changes() {
     let dir = unique_dir();
 
     let mod_v1 = "module m\n  implicit none\n  integer :: x = 42\nend module\n";
-    let mod_v2 = "module m\n  implicit none\n  integer :: x = 42\n  integer :: y = 99\nend module\n";
+    let mod_v2 =
+        "module m\n  implicit none\n  integer :: x = 42\n  integer :: y = 99\nend module\n";
     let main_src = "program p\n  use m\n  implicit none\n  print *, x\nend program\n";
 
     // Compile module v1 and consumer.

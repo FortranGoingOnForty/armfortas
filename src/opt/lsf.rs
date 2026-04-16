@@ -43,8 +43,8 @@
 //! %x = iadd %42, %1
 //! ```
 
+use super::alias::{self, may_reach_through_call_arg, AliasResult};
 use super::pass::Pass;
-use super::alias::{self, AliasResult, may_reach_through_call_arg};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
@@ -53,7 +53,9 @@ use std::collections::HashMap;
 pub struct LocalLsf;
 
 impl Pass for LocalLsf {
-    fn name(&self) -> &'static str { "load-store-fwd" }
+    fn name(&self) -> &'static str {
+        "load-store-fwd"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -85,13 +87,19 @@ fn lsf_in_function(func: &mut Function) -> bool {
                     available.retain(|entry| {
                         matches!(alias::query(func, entry.ptr, eff_ptr), AliasResult::NoAlias)
                     });
-                    available.push(AvailableStore { ptr: eff_ptr, val: eff_val });
+                    available.push(AvailableStore {
+                        ptr: eff_ptr,
+                        val: eff_val,
+                    });
                 }
 
                 InstKind::Load(ptr) => {
                     let eff_ptr = resolve(&all_rewrites, *ptr);
                     if let Some(entry) = available.iter().rev().find(|entry| {
-                        matches!(alias::query(func, entry.ptr, eff_ptr), AliasResult::MustAlias)
+                        matches!(
+                            alias::query(func, entry.ptr, eff_ptr),
+                            AliasResult::MustAlias
+                        )
                     }) {
                         all_rewrites.insert(inst.id, entry.val);
                         changed = true;
@@ -113,9 +121,9 @@ fn lsf_in_function(func: &mut Function) -> bool {
                         // so a precise "different GEP offset →
                         // NoAlias" answer is unsound here.
                         available.retain(|entry| {
-                            pointer_args.iter().all(|arg| {
-                                !may_reach_through_call_arg(func, entry.ptr, *arg)
-                            })
+                            pointer_args
+                                .iter()
+                                .all(|arg| !may_reach_through_call_arg(func, entry.ptr, *arg))
                         });
                     }
                 }
@@ -145,7 +153,9 @@ fn resolve(rewrites: &HashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
     while let Some(&next) = rewrites.get(&v) {
         v = next;
         steps += 1;
-        if steps > 64 { break; } // cycle guard (SSA has none, but be safe)
+        if steps > 64 {
+            break;
+        } // cycle guard (SSA has none, but be safe)
     }
     v
 }
@@ -175,10 +185,17 @@ fn value_is_pointer(func: &Function, value: ValueId) -> bool {
     if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
         return true;
     }
-    if func.params.iter().any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_))) {
+    if func
+        .params
+        .iter()
+        .any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_)))
+    {
         return true;
     }
-    func.blocks.iter().flat_map(|block| block.insts.iter()).find(|inst| inst.id == value)
+    func.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .find(|inst| inst.id == value)
         .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
         .unwrap_or(false)
 }
@@ -190,19 +207,28 @@ fn value_is_pointer(func: &Function, value: ValueId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
-    use crate::opt::pass::Pass;
+    use crate::ir::types::{IntWidth, IrType};
     use crate::lexer::{Position, Span};
+    use crate::opt::pass::Pass;
 
     fn dummy_span() -> Span {
         let p = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: p, end: p }
+        Span {
+            file_id: 0,
+            start: p,
+            end: p,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
@@ -223,16 +249,29 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
-        let alloca = push(&mut f, InstKind::Alloca(IrType::Int(IntWidth::I32)),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let val42  = push(&mut f, InstKind::ConstInt(42, IntWidth::I32),
-                          IrType::Int(IntWidth::I32));
-        let one    = push(&mut f, InstKind::ConstInt(1, IntWidth::I32),
-                          IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let val42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(val42, alloca), IrType::Void);
-        let load   = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
-        let add    = push(&mut f, InstKind::IAdd(load, one), IrType::Int(IntWidth::I32));
-        let entry  = f.entry;
+        let load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
+        let add = push(
+            &mut f,
+            InstKind::IAdd(load, one),
+            IrType::Int(IntWidth::I32),
+        );
+        let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(add)));
         m.add_function(f);
 
@@ -246,7 +285,8 @@ mod tests {
         let add_inst = insts.iter().find(|i| i.id == add).unwrap();
         assert!(
             matches!(&add_inst.kind, InstKind::IAdd(a, _) if *a == val42),
-            "IAdd operand should be forwarded to val42, got {:?}", add_inst.kind
+            "IAdd operand should be forwarded to val42, got {:?}",
+            add_inst.kind
         );
     }
 
@@ -258,12 +298,21 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
-        let alloca = push(&mut f, InstKind::Alloca(IrType::Int(IntWidth::I32)),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32),
-                       IrType::Int(IntWidth::I32));
-        let v99 = push(&mut f, InstKind::ConstInt(99, IntWidth::I32),
-                       IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let v99 = push(
+            &mut f,
+            InstKind::ConstInt(99, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v42, alloca), IrType::Void);
         push(&mut f, InstKind::Store(v99, alloca), IrType::Void);
         let load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
@@ -279,7 +328,8 @@ mod tests {
         let term = func.block(func.entry).terminator.as_ref().unwrap();
         assert!(
             matches!(term, Terminator::Return(Some(v)) if *v == v99),
-            "Return should use v99 (the latest store), got {:?}", term
+            "Return should use v99 (the latest store), got {:?}",
+            term
         );
     }
 
@@ -291,15 +341,23 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
-        let alloca = push(&mut f, InstKind::Alloca(IrType::Int(IntWidth::I32)),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32),
-                       IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v42, alloca), IrType::Void);
         // A call that might write to the alloca.
-        push(&mut f, InstKind::Call(
-            FuncRef::External("ext".into()), vec![alloca]
-        ), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("ext".into()), vec![alloca]),
+            IrType::Void,
+        );
         let load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
@@ -317,8 +375,11 @@ mod tests {
         let mut m = Module::new("test".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
-        let alloca = push(&mut f, InstKind::Alloca(IrType::Int(IntWidth::I32)),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
         let load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
@@ -337,8 +398,16 @@ mod tests {
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 4);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
         let ptr = push(&mut f, InstKind::Alloca(arr_ty), arr_ptr_ty);
-        let zero0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let zero1 = push(&mut f, InstKind::ConstInt(0, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let zero0 = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let zero1 = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let gep0 = push(
             &mut f,
             InstKind::GetElementPtr(ptr, vec![zero0]),
@@ -349,15 +418,26 @@ mod tests {
             InstKind::GetElementPtr(ptr, vec![zero1]),
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         );
-        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let v42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v42, gep0), IrType::Void);
         let load = push(&mut f, InstKind::Load(gep1), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
         m.add_function(f);
 
-        assert!(LocalLsf.run(&mut m), "LSF should forward across must-alias GEPs");
-        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        assert!(
+            LocalLsf.run(&mut m),
+            "LSF should forward across must-alias GEPs"
+        );
+        let term = m.functions[0]
+            .block(m.functions[0].entry)
+            .terminator
+            .as_ref()
+            .unwrap();
         assert!(
             matches!(term, Terminator::Return(Some(v)) if *v == v42),
             "return should use the stored value after forwarding, got {:?}",
@@ -378,24 +458,53 @@ mod tests {
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
-        let alloca = push(&mut f, InstKind::Alloca(arr_ty.clone()),
-                          IrType::Ptr(Box::new(arr_ty)));
-        let c0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I64), IrType::Int(IntWidth::I64));
-        let c1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I64), IrType::Int(IntWidth::I64));
-        let g0 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c0]),
-                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let g1 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c1]),
-                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let v20 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(arr_ty.clone()),
+            IrType::Ptr(Box::new(arr_ty)),
+        );
+        let c0 = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let c1 = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let g0 = push(
+            &mut f,
+            InstKind::GetElementPtr(alloca, vec![c0]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let g1 = push(
+            &mut f,
+            InstKind::GetElementPtr(alloca, vec![c1]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v20 = push(
+            &mut f,
+            InstKind::ConstInt(20, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v20, g1), IrType::Void);
-        push(&mut f, InstKind::Call(FuncRef::External("touch".into()), vec![g0]), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("touch".into()), vec![g0]),
+            IrType::Void,
+        );
         let load = push(&mut f, InstKind::Load(g1), IrType::Int(IntWidth::I32));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
         m.add_function(f);
 
         LocalLsf.run(&mut m);
-        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        let term = m.functions[0]
+            .block(m.functions[0].entry)
+            .terminator
+            .as_ref()
+            .unwrap();
         if let Terminator::Return(Some(v)) = term {
             assert_ne!(*v, v20, "LSF forwarded arr[1] load to the caller's pre-call constant across a call that received arr[0]; callee could have walked to arr[1]");
         } else {
@@ -425,26 +534,61 @@ mod tests {
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
-        let alloca = push(&mut f, InstKind::Alloca(arr_ty.clone()),
-                          IrType::Ptr(Box::new(arr_ty)));
-        let c0 = push(&mut f, InstKind::ConstInt(0, IntWidth::I64), IrType::Int(IntWidth::I64));
-        let c1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I64), IrType::Int(IntWidth::I64));
-        let g0 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c0]),
-                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let g1 = push(&mut f, InstKind::GetElementPtr(alloca, vec![c1]),
-                      IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(arr_ty.clone()),
+            IrType::Ptr(Box::new(arr_ty)),
+        );
+        let c0 = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let c1 = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let g0 = push(
+            &mut f,
+            InstKind::GetElementPtr(alloca, vec![c0]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let g1 = push(
+            &mut f,
+            InstKind::GetElementPtr(alloca, vec![c1]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
 
-        let v20 = push(&mut f, InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let v20 = push(
+            &mut f,
+            InstKind::ConstInt(20, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v20, g1), IrType::Void);
 
-        let chain0 = push(&mut f, InstKind::GetElementPtr(g0, vec![c0]),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let v11 = push(&mut f, InstKind::ConstInt(11, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let chain0 = push(
+            &mut f,
+            InstKind::GetElementPtr(g0, vec![c0]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v11 = push(
+            &mut f,
+            InstKind::ConstInt(11, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v11, chain0), IrType::Void);
 
-        let chain1 = push(&mut f, InstKind::GetElementPtr(g0, vec![c1]),
-                          IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        let v31 = push(&mut f, InstKind::ConstInt(31, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let chain1 = push(
+            &mut f,
+            InstKind::GetElementPtr(g0, vec![c1]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let v31 = push(
+            &mut f,
+            InstKind::ConstInt(31, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v31, chain1), IrType::Void);
 
         let load = push(&mut f, InstKind::Load(g1), IrType::Int(IntWidth::I32));
@@ -453,7 +597,11 @@ mod tests {
         m.add_function(f);
 
         LocalLsf.run(&mut m);
-        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        let term = m.functions[0]
+            .block(m.functions[0].entry)
+            .terminator
+            .as_ref()
+            .unwrap();
         // The load must either remain or be forwarded to v31 — never
         // to v20.
         if let Terminator::Return(Some(v)) = term {
@@ -472,14 +620,22 @@ mod tests {
             IrType::Int(IntWidth::I32),
         );
 
-        let v42 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let v42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v42, ValueId(0)), IrType::Void);
         push(
             &mut f,
             InstKind::Call(FuncRef::External("touch".into()), vec![ValueId(1)]),
             IrType::Void,
         );
-        let load = push(&mut f, InstKind::Load(ValueId(0)), IrType::Int(IntWidth::I32));
+        let load = push(
+            &mut f,
+            InstKind::Load(ValueId(0)),
+            IrType::Int(IntWidth::I32),
+        );
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
         m.add_function(f);
@@ -488,7 +644,11 @@ mod tests {
             LocalLsf.run(&mut m),
             "LSF should preserve the stored value across a noalias pointer call"
         );
-        let term = m.functions[0].block(m.functions[0].entry).terminator.as_ref().unwrap();
+        let term = m.functions[0]
+            .block(m.functions[0].entry)
+            .terminator
+            .as_ref()
+            .unwrap();
         assert!(
             matches!(term, Terminator::Return(Some(v)) if *v == v42),
             "return should use the forwarded value across the noalias call, got {:?}",

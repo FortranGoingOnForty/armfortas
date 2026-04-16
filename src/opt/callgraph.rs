@@ -4,9 +4,9 @@
 //! Detects recursive functions via DFS cycle detection. Provides
 //! reverse post-order iteration for bottom-up inlining (callees first).
 
-use std::collections::HashSet;
 use crate::ir::inst::*;
 use crate::ir::walk::find_natural_loops;
+use std::collections::HashSet;
 
 /// A node in the call graph — one per function in the module.
 #[derive(Debug)]
@@ -33,13 +33,15 @@ impl CallGraph {
     /// Build the call graph from a module.
     pub fn build(module: &Module) -> Self {
         let n = module.functions.len();
-        let mut nodes: Vec<CallNode> = (0..n).map(|i| CallNode {
-            func_idx: i as u32,
-            callees: Vec::new(),
-            callers: Vec::new(),
-            inst_count: 0,
-            is_recursive: false,
-        }).collect();
+        let mut nodes: Vec<CallNode> = (0..n)
+            .map(|i| CallNode {
+                func_idx: i as u32,
+                callees: Vec::new(),
+                callers: Vec::new(),
+                inst_count: 0,
+                is_recursive: false,
+            })
+            .collect();
 
         // Scan each function for Call(Internal) instructions.
         for (i, func) in module.functions.iter().enumerate() {
@@ -122,7 +124,9 @@ impl CallGraph {
 }
 
 fn rpo_dfs(nodes: &[CallNode], idx: u32, visited: &mut [bool], order: &mut Vec<u32>) {
-    if visited[idx as usize] { return; }
+    if visited[idx as usize] {
+        return;
+    }
     visited[idx as usize] = true;
     for &callee in &nodes[idx as usize].callees {
         if (callee as usize) < nodes.len() {
@@ -154,12 +158,16 @@ fn dfs_cycle(nodes: &[CallNode], idx: u32, visiting: &mut HashSet<u32>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
-    use crate::lexer::{Span, Position};
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     #[test]
@@ -170,14 +178,19 @@ mod tests {
         let call_id = f.next_value_id();
         f.register_type(call_id, IrType::Int(IntWidth::I32));
         f.block_mut(f.entry).insts.push(Inst {
-            id: call_id, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: call_id,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::Call(FuncRef::Internal(0), vec![]),
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(Some(call_id)));
         m.add_function(f);
 
         let cg = CallGraph::build(&m);
-        assert!(cg.is_recursive(0), "self-calling function should be recursive");
+        assert!(
+            cg.is_recursive(0),
+            "self-calling function should be recursive"
+        );
     }
 
     #[test]
@@ -193,7 +206,9 @@ mod tests {
         let call_id = caller.next_value_id();
         caller.register_type(call_id, IrType::Int(IntWidth::I32));
         caller.block_mut(caller.entry).insts.push(Inst {
-            id: call_id, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: call_id,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::Call(FuncRef::Internal(0), vec![]),
         });
         caller.block_mut(caller.entry).terminator = Some(Terminator::Return(None));
@@ -218,7 +233,9 @@ mod tests {
         let cid = caller.next_value_id();
         caller.register_type(cid, IrType::Void);
         caller.block_mut(caller.entry).insts.push(Inst {
-            id: cid, ty: IrType::Void, span: span(),
+            id: cid,
+            ty: IrType::Void,
+            span: span(),
             kind: InstKind::Call(FuncRef::Internal(0), vec![]),
         });
         caller.block_mut(caller.entry).terminator = Some(Terminator::Return(None));
@@ -229,6 +246,9 @@ mod tests {
         // Callee should come before caller in RPO.
         let callee_pos = rpo.iter().position(|&i| i == 0).unwrap();
         let caller_pos = rpo.iter().position(|&i| i == 1).unwrap();
-        assert!(callee_pos < caller_pos, "callee should come before caller in RPO");
+        assert!(
+            callee_pos < caller_pos,
+            "callee should come before caller in RPO"
+        );
     }
 }

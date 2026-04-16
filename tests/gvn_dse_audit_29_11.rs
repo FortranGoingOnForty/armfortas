@@ -38,10 +38,7 @@ fn block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     for (idx, _line) in func_section.match_indices('\n') {
         let line_start = idx + 1;
         let tail = &func_section[line_start..];
-        let line_text = tail
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(tail);
+        let line_text = tail.split_once('\n').map(|(line, _)| line).unwrap_or(tail);
 
         if start.is_none() {
             if line_text.starts_with("    ")
@@ -74,10 +71,7 @@ fn last_block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     for (idx, _line) in func_section.match_indices('\n') {
         let line_start = idx + 1;
         let tail = &func_section[line_start..];
-        let line_text = tail
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(tail);
+        let line_text = tail.split_once('\n').map(|(line, _)| line).unwrap_or(tail);
         if line_text.starts_with("    ")
             && !line_text.starts_with("      ")
             && line_text[4..].starts_with(prefix)

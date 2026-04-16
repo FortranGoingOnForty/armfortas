@@ -11,24 +11,28 @@
 //!
 //! After SROA, a second Mem2Reg pass promotes the new scalar allocas.
 
-use std::collections::HashMap;
+use super::loop_utils::resolve_const_int;
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::inst_uses;
-use super::loop_utils::resolve_const_int;
-use super::pass::Pass;
+use std::collections::HashMap;
 
 const SROA_MAX_FIELDS: u64 = 8;
 
 pub struct Sroa;
 
 impl Pass for Sroa {
-    fn name(&self) -> &'static str { "sroa" }
+    fn name(&self) -> &'static str {
+        "sroa"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if sroa_function(func) { changed = true; }
+            if sroa_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -37,7 +41,9 @@ impl Pass for Sroa {
 fn sroa_function(func: &mut Function) -> bool {
     // Collect candidate allocas: Array type, small, all constant-index GEPs.
     let candidates = find_candidates(func);
-    if candidates.is_empty() { return false; }
+    if candidates.is_empty() {
+        return false;
+    }
 
     let mut changed = false;
     for cand in candidates {
@@ -85,14 +91,18 @@ fn is_eligible(func: &Function, alloca_id: ValueId) -> bool {
     for block in &func.blocks {
         for inst in &block.insts {
             let uses = inst_uses(&inst.kind);
-            if !uses.contains(&alloca_id) { continue; }
+            if !uses.contains(&alloca_id) {
+                continue;
+            }
 
             // Classify this use of the alloca.
             match &inst.kind {
                 // GEP with the alloca as base: OK if single constant index
                 // AND the result type matches the element type (not byte-level).
                 InstKind::GetElementPtr(base, indices) if *base == alloca_id => {
-                    if indices.len() != 1 { return false; }
+                    if indices.len() != 1 {
+                        return false;
+                    }
                     if resolve_const_int(func, indices[0]).is_none() {
                         return false;
                     }
@@ -150,8 +160,16 @@ fn gep_result_escapes(func: &Function, gep_id: ValueId) -> bool {
             match term {
                 Terminator::Return(Some(v)) if *v == gep_id => return true,
                 Terminator::Branch(_, args) if args.contains(&gep_id) => return true,
-                Terminator::CondBranch { cond, true_args, false_args, .. } => {
-                    if *cond == gep_id || true_args.contains(&gep_id) || false_args.contains(&gep_id) {
+                Terminator::CondBranch {
+                    cond,
+                    true_args,
+                    false_args,
+                    ..
+                } => {
+                    if *cond == gep_id
+                        || true_args.contains(&gep_id)
+                        || false_args.contains(&gep_id)
+                    {
                         return true;
                     }
                 }
@@ -180,12 +198,15 @@ fn decompose_alloca(func: &mut Function, cand: &SroaCandidate) -> bool {
         let new_id = func.next_value_id();
         let ptr_ty = IrType::Ptr(Box::new(cand.elem_ty.clone()));
         func.register_type(new_id, ptr_ty.clone());
-        func.block_mut(cand.alloca_block).insts.insert(insert_pos + i as usize, Inst {
-            id: new_id,
-            kind: InstKind::Alloca(cand.elem_ty.clone()),
-            ty: ptr_ty,
-            span,
-        });
+        func.block_mut(cand.alloca_block).insts.insert(
+            insert_pos + i as usize,
+            Inst {
+                id: new_id,
+                kind: InstKind::Alloca(cand.elem_ty.clone()),
+                ty: ptr_ty,
+                span,
+            },
+        );
         field_allocas.push(new_id);
     }
 
@@ -207,7 +228,9 @@ fn decompose_alloca(func: &mut Function, cand: &SroaCandidate) -> bool {
         }
     }
 
-    if gep_to_field.is_empty() { return false; }
+    if gep_to_field.is_empty() {
+        return false;
+    }
 
     // Rewrite all uses of GEP results to use the field allocas.
     for block in &mut func.blocks {
@@ -243,12 +266,16 @@ fn decompose_alloca(func: &mut Function, cand: &SroaCandidate) -> bool {
 mod tests {
     use super::*;
     use crate::ir::types::IntWidth;
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
-    use crate::lexer::{Span, Position};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     #[test]
@@ -258,7 +285,9 @@ mod tests {
         let a = f.next_value_id();
         f.register_type(a, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
         f.block_mut(f.entry).insts.push(Inst {
-            id: a, ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))), span: span(),
+            id: a,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
             kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
@@ -297,7 +326,10 @@ mod tests {
         });
 
         let gep = f.next_value_id();
-        f.register_type(gep, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))));
+        f.register_type(
+            gep,
+            IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))),
+        );
         f.block_mut(f.entry).insts.push(Inst {
             id: gep,
             ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))),
@@ -306,12 +338,21 @@ mod tests {
         });
 
         let sink = f.next_value_id();
-        f.register_type(sink, IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))))));
+        f.register_type(
+            sink,
+            IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(
+                IrType::Int(IntWidth::I8),
+            )))))),
+        );
         f.block_mut(f.entry).insts.push(Inst {
             id: sink,
-            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))))),
+            ty: IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Ptr(Box::new(
+                IrType::Int(IntWidth::I8),
+            )))))),
             span: span(),
-            kind: InstKind::Alloca(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))),
+            kind: InstKind::Alloca(IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(
+                IntWidth::I8,
+            )))))),
         });
 
         let escape_store = f.next_value_id();
@@ -326,6 +367,9 @@ mod tests {
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
 
-        assert!(!Sroa.run(&mut m), "GEP addresses that escape should block SROA");
+        assert!(
+            !Sroa.run(&mut m),
+            "GEP addresses that escape should block SROA"
+        );
     }
 }

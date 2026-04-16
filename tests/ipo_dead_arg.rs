@@ -21,7 +21,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")
@@ -49,13 +51,12 @@ fn call_arg_counts_for(func_section: &str, callee_marker: &str) -> Vec<usize> {
         .filter_map(|line| {
             let line = line.trim();
             let call = line.find(&format!("call {}", callee_marker))?;
-            let inside = line[call..]
-                .split_once('(')?
-                .1
-                .split_once(')')?
-                .0
-                .trim();
-            Some(if inside.is_empty() { 0 } else { inside.split(", ").count() })
+            let inside = line[call..].split_once('(')?.1.split_once(')')?.0.trim();
+            Some(if inside.is_empty() {
+                0
+            } else {
+                inside.split(", ").count()
+            })
         })
         .collect()
 }
@@ -86,8 +87,18 @@ fn o2_elides_dead_dummy_arg_from_recursive_internal_helper() {
     let opt_main = function_section(&opt_ir, "__prog_ipo_dead_arg");
     let opt_helper = function_section(&opt_ir, "helper");
 
-    assert_eq!(param_count(raw_helper), 3, "raw helper should keep all dummy args:\n{}", raw_helper);
-    assert_eq!(param_count(opt_helper), 2, "optimized helper should drop the dead dummy arg:\n{}", opt_helper);
+    assert_eq!(
+        param_count(raw_helper),
+        3,
+        "raw helper should keep all dummy args:\n{}",
+        raw_helper
+    );
+    assert_eq!(
+        param_count(opt_helper),
+        2,
+        "optimized helper should drop the dead dummy arg:\n{}",
+        opt_helper
+    );
 
     let raw_call_counts = [
         call_arg_counts_for(raw_main, "@helper"),
@@ -103,6 +114,14 @@ fn o2_elides_dead_dummy_arg_from_recursive_internal_helper() {
     ]
     .concat();
 
-    assert_eq!(raw_call_counts, vec![3, 3], "raw IR should pass all three args at both call sites");
-    assert_eq!(opt_call_counts, vec![2, 2], "optimized IR should trim the dead arg at both call sites");
+    assert_eq!(
+        raw_call_counts,
+        vec![3, 3],
+        "raw IR should pass all three args at both call sites"
+    );
+    assert_eq!(
+        opt_call_counts,
+        vec![2, 2],
+        "optimized IR should trim the dead arg at both call sites"
+    );
 }

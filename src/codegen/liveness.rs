@@ -3,16 +3,16 @@
 //! Computes live intervals for each virtual register using backward
 //! dataflow. Used by the linear scan register allocator.
 
-use std::collections::{HashMap, BTreeSet};
 use super::mir::*;
+use std::collections::{BTreeSet, HashMap};
 
 /// A live interval: the range of instruction positions where a vreg is live.
 #[derive(Debug, Clone)]
 pub struct LiveInterval {
     pub vreg: VRegId,
     pub class: RegClass,
-    pub start: u32,   // first instruction position (definition)
-    pub end: u32,     // last instruction position (final use)
+    pub start: u32,         // first instruction position (definition)
+    pub end: u32,           // last instruction position (final use)
     pub crosses_call: bool, // true if a BL instruction falls within [start, end]
     /// Preferred physical register (hint). If set, the allocator tries this register first.
     /// Used to avoid unnecessary moves (e.g., arg values prefer xN, return values prefer x0).
@@ -142,16 +142,26 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         // Vregs live-in to this block: extend their interval to block start.
         if let Some(lin) = live_in.get(&block.id) {
             for &vreg in lin {
-                ends.entry(vreg).and_modify(|e| *e = (*e).max(b_end)).or_insert(b_end);
-                starts.entry(vreg).and_modify(|s| *s = (*s).min(b_start)).or_insert(b_start);
+                ends.entry(vreg)
+                    .and_modify(|e| *e = (*e).max(b_end))
+                    .or_insert(b_end);
+                starts
+                    .entry(vreg)
+                    .and_modify(|s| *s = (*s).min(b_start))
+                    .or_insert(b_start);
             }
         }
 
         // Vregs live-out of this block: extend their interval to block end.
         if let Some(lout) = live_out.get(&block.id) {
             for &vreg in lout {
-                ends.entry(vreg).and_modify(|e| *e = (*e).max(b_end)).or_insert(b_end);
-                starts.entry(vreg).and_modify(|s| *s = (*s).min(b_start)).or_insert(b_start);
+                ends.entry(vreg)
+                    .and_modify(|e| *e = (*e).max(b_end))
+                    .or_insert(b_end);
+                starts
+                    .entry(vreg)
+                    .and_modify(|s| *s = (*s).min(b_start))
+                    .or_insert(b_start);
             }
         }
 
@@ -159,13 +169,23 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         for (i, inst) in block.insts.iter().enumerate() {
             let p = position_map[&(block.id, i)];
             if let Some(def) = &inst.def {
-                starts.entry(*def).and_modify(|s| *s = (*s).min(p)).or_insert(p);
-                ends.entry(*def).and_modify(|e| *e = (*e).max(p)).or_insert(p);
+                starts
+                    .entry(*def)
+                    .and_modify(|s| *s = (*s).min(p))
+                    .or_insert(p);
+                ends.entry(*def)
+                    .and_modify(|e| *e = (*e).max(p))
+                    .or_insert(p);
             }
             for op in &inst.operands {
                 if let MachineOperand::VReg(vid) = op {
-                    ends.entry(*vid).and_modify(|e| *e = (*e).max(p)).or_insert(p);
-                    starts.entry(*vid).and_modify(|s| *s = (*s).min(p)).or_insert(p);
+                    ends.entry(*vid)
+                        .and_modify(|e| *e = (*e).max(p))
+                        .or_insert(p);
+                    starts
+                        .entry(*vid)
+                        .and_modify(|s| *s = (*s).min(p))
+                        .or_insert(p);
                 }
             }
         }
@@ -185,17 +205,24 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
     call_positions.sort();
 
     // Build intervals.
-    let vreg_classes: HashMap<VRegId, RegClass> = mf.vregs.iter()
-        .map(|v| (v.id, v.class))
-        .collect();
+    let vreg_classes: HashMap<VRegId, RegClass> =
+        mf.vregs.iter().map(|v| (v.id, v.class)).collect();
 
-    let mut intervals: Vec<LiveInterval> = starts.iter()
+    let mut intervals: Vec<LiveInterval> = starts
+        .iter()
         .filter_map(|(&vreg, &start)| {
             let end = ends.get(&vreg).copied()?;
             let class = vreg_classes.get(&vreg).copied().unwrap_or(RegClass::Gp64);
             // Check if any call falls within [start, end].
             let crosses_call = call_positions.iter().any(|&cp| cp > start && cp < end);
-            Some(LiveInterval { vreg, class, start, end, crosses_call, hint: None })
+            Some(LiveInterval {
+                vreg,
+                class,
+                start,
+                end,
+                crosses_call,
+                hint: None,
+            })
         })
         .collect();
 
@@ -210,16 +237,19 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
     // exposed clearly when mem2reg started perturbing vreg counts.
     intervals.sort_by_key(|i| (i.start, i.vreg.0));
 
-    LivenessResult { intervals, num_positions }
+    LivenessResult {
+        intervals,
+        num_positions,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::*;
-    use crate::ir::inst::*;
-    use crate::ir::builder::FuncBuilder;
     use crate::codegen::isel::select_function;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::inst::*;
+    use crate::ir::types::*;
 
     #[test]
     fn liveness_simple_function() {
@@ -250,8 +280,10 @@ mod tests {
         let mf = select_function(&func);
         let result = compute_liveness(&mf);
         // Should have some Fp64 intervals.
-        assert!(result.intervals.iter().any(|i| i.class == RegClass::Fp64),
-            "should have Fp64 intervals");
+        assert!(
+            result.intervals.iter().any(|i| i.class == RegClass::Fp64),
+            "should have Fp64 intervals"
+        );
     }
 
     #[test]

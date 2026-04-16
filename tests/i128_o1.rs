@@ -69,7 +69,11 @@ fn o1_backend_runs_internal_integer16_call() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful O1 integer(16) run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful O1 integer(16) run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('1'),
         "O1 integer(16) internal call program should print score 1:\n{}",
@@ -158,7 +162,11 @@ fn o1_branchy_integer16_program_runs_after_mem2reg() {
         .and_then(CapturedStage::as_run)
         .expect("missing run capture");
 
-    assert_eq!(run.exit_code, 0, "expected successful O1 branchy integer(16) run:\n{:#?}", run);
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful O1 branchy integer(16) run:\n{:#?}",
+        run
+    );
     assert!(
         run.stdout.contains('1'),
         "branchy O1 integer(16) program should print score 1:\n{}",

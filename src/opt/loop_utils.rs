@@ -4,9 +4,9 @@
 //! (from unroll.rs) into public shared functions so all loop passes
 //! use the same logic.
 
-use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
 use crate::ir::walk::NaturalLoop;
+use std::collections::{HashMap, HashSet};
 
 /// Find the unique preheader for a natural loop, if one exists.
 ///
@@ -28,9 +28,13 @@ pub fn find_preheader(
         .collect();
     outside.sort_by_key(|b| b.0);
     outside.dedup();
-    if outside.len() != 1 { return None; }
+    if outside.len() != 1 {
+        return None;
+    }
     let ph = outside[0];
-    if ph == lp.header { return None; }
+    if ph == lp.header {
+        return None;
+    }
     let ph_block = func.block(ph);
     match &ph_block.terminator {
         Some(Terminator::Branch(dest, _)) if *dest == lp.header => Some(ph),
@@ -60,8 +64,12 @@ pub fn loop_defined_values(func: &Function, lp: &NaturalLoop) -> HashSet<ValueId
     let mut defs = HashSet::new();
     for &bid in &lp.body {
         let block = func.block(bid);
-        for bp in &block.params { defs.insert(bp.id); }
-        for inst in &block.insts { defs.insert(inst.id); }
+        for bp in &block.params {
+            defs.insert(bp.id);
+        }
+        for inst in &block.insts {
+            defs.insert(inst.id);
+        }
     }
     defs
 }
@@ -167,60 +175,61 @@ pub fn build_value_map(
 pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> InstKind {
     let r = |v: &ValueId| *map.get(v).unwrap_or(v);
     match kind {
-        InstKind::ConstInt(v, w)     => InstKind::ConstInt(*v, *w),
-        InstKind::ConstFloat(v, w)   => InstKind::ConstFloat(*v, *w),
-        InstKind::ConstBool(v)       => InstKind::ConstBool(*v),
-        InstKind::ConstString(v)     => InstKind::ConstString(v.clone()),
-        InstKind::Undef(t)           => InstKind::Undef(t.clone()),
-        InstKind::GlobalAddr(s)      => InstKind::GlobalAddr(s.clone()),
-        InstKind::IAdd(a, b)  => InstKind::IAdd(r(a), r(b)),
-        InstKind::ISub(a, b)  => InstKind::ISub(r(a), r(b)),
-        InstKind::IMul(a, b)  => InstKind::IMul(r(a), r(b)),
-        InstKind::IDiv(a, b)  => InstKind::IDiv(r(a), r(b)),
-        InstKind::IMod(a, b)  => InstKind::IMod(r(a), r(b)),
-        InstKind::INeg(a)     => InstKind::INeg(r(a)),
-        InstKind::FAdd(a, b)  => InstKind::FAdd(r(a), r(b)),
-        InstKind::FSub(a, b)  => InstKind::FSub(r(a), r(b)),
-        InstKind::FMul(a, b)  => InstKind::FMul(r(a), r(b)),
-        InstKind::FDiv(a, b)  => InstKind::FDiv(r(a), r(b)),
-        InstKind::FNeg(a)     => InstKind::FNeg(r(a)),
-        InstKind::FAbs(a)     => InstKind::FAbs(r(a)),
-        InstKind::FSqrt(a)    => InstKind::FSqrt(r(a)),
-        InstKind::FPow(a, b)  => InstKind::FPow(r(a), r(b)),
+        InstKind::ConstInt(v, w) => InstKind::ConstInt(*v, *w),
+        InstKind::ConstFloat(v, w) => InstKind::ConstFloat(*v, *w),
+        InstKind::ConstBool(v) => InstKind::ConstBool(*v),
+        InstKind::ConstString(v) => InstKind::ConstString(v.clone()),
+        InstKind::Undef(t) => InstKind::Undef(t.clone()),
+        InstKind::GlobalAddr(s) => InstKind::GlobalAddr(s.clone()),
+        InstKind::IAdd(a, b) => InstKind::IAdd(r(a), r(b)),
+        InstKind::ISub(a, b) => InstKind::ISub(r(a), r(b)),
+        InstKind::IMul(a, b) => InstKind::IMul(r(a), r(b)),
+        InstKind::IDiv(a, b) => InstKind::IDiv(r(a), r(b)),
+        InstKind::IMod(a, b) => InstKind::IMod(r(a), r(b)),
+        InstKind::INeg(a) => InstKind::INeg(r(a)),
+        InstKind::FAdd(a, b) => InstKind::FAdd(r(a), r(b)),
+        InstKind::FSub(a, b) => InstKind::FSub(r(a), r(b)),
+        InstKind::FMul(a, b) => InstKind::FMul(r(a), r(b)),
+        InstKind::FDiv(a, b) => InstKind::FDiv(r(a), r(b)),
+        InstKind::FNeg(a) => InstKind::FNeg(r(a)),
+        InstKind::FAbs(a) => InstKind::FAbs(r(a)),
+        InstKind::FSqrt(a) => InstKind::FSqrt(r(a)),
+        InstKind::FPow(a, b) => InstKind::FPow(r(a), r(b)),
         InstKind::ICmp(op, a, b) => InstKind::ICmp(*op, r(a), r(b)),
         InstKind::FCmp(op, a, b) => InstKind::FCmp(*op, r(a), r(b)),
         InstKind::And(a, b) => InstKind::And(r(a), r(b)),
-        InstKind::Or(a, b)  => InstKind::Or(r(a), r(b)),
-        InstKind::Not(a)    => InstKind::Not(r(a)),
+        InstKind::Or(a, b) => InstKind::Or(r(a), r(b)),
+        InstKind::Not(a) => InstKind::Not(r(a)),
         InstKind::Select(c, t, f) => InstKind::Select(r(c), r(t), r(f)),
-        InstKind::BitAnd(a, b)           => InstKind::BitAnd(r(a), r(b)),
-        InstKind::BitOr(a, b)            => InstKind::BitOr(r(a), r(b)),
-        InstKind::BitXor(a, b)           => InstKind::BitXor(r(a), r(b)),
-        InstKind::BitNot(a)              => InstKind::BitNot(r(a)),
-        InstKind::Shl(a, b)              => InstKind::Shl(r(a), r(b)),
-        InstKind::LShr(a, b)             => InstKind::LShr(r(a), r(b)),
-        InstKind::AShr(a, b)             => InstKind::AShr(r(a), r(b)),
-        InstKind::CountLeadingZeros(a)   => InstKind::CountLeadingZeros(r(a)),
-        InstKind::CountTrailingZeros(a)  => InstKind::CountTrailingZeros(r(a)),
-        InstKind::PopCount(a)            => InstKind::PopCount(r(a)),
-        InstKind::IntToFloat(a, w)    => InstKind::IntToFloat(r(a), *w),
-        InstKind::FloatToInt(a, w)    => InstKind::FloatToInt(r(a), *w),
-        InstKind::FloatExtend(a, w)   => InstKind::FloatExtend(r(a), *w),
-        InstKind::FloatTrunc(a, w)    => InstKind::FloatTrunc(r(a), *w),
-        InstKind::IntExtend(a, w, s)  => InstKind::IntExtend(r(a), *w, *s),
-        InstKind::IntTrunc(a, w)      => InstKind::IntTrunc(r(a), *w),
-        InstKind::PtrToInt(a)         => InstKind::PtrToInt(r(a)),
-        InstKind::IntToPtr(a, ty)     => InstKind::IntToPtr(r(a), ty.clone()),
-        InstKind::Alloca(t)  => InstKind::Alloca(t.clone()),
-        InstKind::Load(a)    => InstKind::Load(r(a)),
+        InstKind::BitAnd(a, b) => InstKind::BitAnd(r(a), r(b)),
+        InstKind::BitOr(a, b) => InstKind::BitOr(r(a), r(b)),
+        InstKind::BitXor(a, b) => InstKind::BitXor(r(a), r(b)),
+        InstKind::BitNot(a) => InstKind::BitNot(r(a)),
+        InstKind::Shl(a, b) => InstKind::Shl(r(a), r(b)),
+        InstKind::LShr(a, b) => InstKind::LShr(r(a), r(b)),
+        InstKind::AShr(a, b) => InstKind::AShr(r(a), r(b)),
+        InstKind::CountLeadingZeros(a) => InstKind::CountLeadingZeros(r(a)),
+        InstKind::CountTrailingZeros(a) => InstKind::CountTrailingZeros(r(a)),
+        InstKind::PopCount(a) => InstKind::PopCount(r(a)),
+        InstKind::IntToFloat(a, w) => InstKind::IntToFloat(r(a), *w),
+        InstKind::FloatToInt(a, w) => InstKind::FloatToInt(r(a), *w),
+        InstKind::FloatExtend(a, w) => InstKind::FloatExtend(r(a), *w),
+        InstKind::FloatTrunc(a, w) => InstKind::FloatTrunc(r(a), *w),
+        InstKind::IntExtend(a, w, s) => InstKind::IntExtend(r(a), *w, *s),
+        InstKind::IntTrunc(a, w) => InstKind::IntTrunc(r(a), *w),
+        InstKind::PtrToInt(a) => InstKind::PtrToInt(r(a)),
+        InstKind::IntToPtr(a, ty) => InstKind::IntToPtr(r(a), ty.clone()),
+        InstKind::Alloca(t) => InstKind::Alloca(t.clone()),
+        InstKind::Load(a) => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
-        InstKind::GetElementPtr(base, idxs) =>
-            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect()),
-        InstKind::Call(f, args) =>
-            InstKind::Call(f.clone(), args.iter().map(&r).collect()),
-        InstKind::RuntimeCall(f, args) =>
-            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect()),
-        InstKind::ExtractField(v, idx)     => InstKind::ExtractField(r(v), *idx),
+        InstKind::GetElementPtr(base, idxs) => {
+            InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect())
+        }
+        InstKind::Call(f, args) => InstKind::Call(f.clone(), args.iter().map(&r).collect()),
+        InstKind::RuntimeCall(f, args) => {
+            InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect())
+        }
+        InstKind::ExtractField(v, idx) => InstKind::ExtractField(r(v), *idx),
         InstKind::InsertField(v, idx, fld) => InstKind::InsertField(r(v), *idx, r(fld)),
     }
 }
@@ -237,20 +246,28 @@ pub fn remap_terminator(
     match term {
         Terminator::Return(v) => Terminator::Return(v.map(|x| rv(&x))),
         Terminator::Branch(dest, args) => Terminator::Branch(rb(dest), rvs(args)),
-        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } =>
-            Terminator::CondBranch {
-                cond: rv(cond),
-                true_dest: rb(true_dest),
-                true_args: rvs(true_args),
-                false_dest: rb(false_dest),
-                false_args: rvs(false_args),
-            },
-        Terminator::Switch { selector, default, cases } =>
-            Terminator::Switch {
-                selector: rv(selector),
-                default: rb(default),
-                cases: cases.iter().map(|(v, d)| (*v, rb(d))).collect(),
-            },
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => Terminator::CondBranch {
+            cond: rv(cond),
+            true_dest: rb(true_dest),
+            true_args: rvs(true_args),
+            false_dest: rb(false_dest),
+            false_args: rvs(false_args),
+        },
+        Terminator::Switch {
+            selector,
+            default,
+            cases,
+        } => Terminator::Switch {
+            selector: rv(selector),
+            default: rb(default),
+            cases: cases.iter().map(|(v, d)| (*v, rb(d))).collect(),
+        },
         Terminator::Unreachable => Terminator::Unreachable,
     }
 }

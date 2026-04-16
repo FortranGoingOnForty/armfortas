@@ -17,53 +17,78 @@ pub fn register_intrinsic_modules(st: &mut SymbolTable) {
 
 fn builtin_span() -> Span {
     let pos = crate::lexer::Position { line: 0, col: 0 };
-    Span { start: pos, end: pos, file_id: 0 }
+    Span {
+        start: pos,
+        end: pos,
+        file_id: 0,
+    }
 }
 
 fn insert_param(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo) {
     insert_param_val(st, mod_id, name, ti, None);
 }
 
-fn insert_param_val(st: &mut SymbolTable, mod_id: ScopeId, name: &str, ti: TypeInfo, val: Option<i64>) {
+fn insert_param_val(
+    st: &mut SymbolTable,
+    mod_id: ScopeId,
+    name: &str,
+    ti: TypeInfo,
+    val: Option<i64>,
+) {
     let span = builtin_span();
-    st.scope_mut(mod_id).symbols.insert(name.to_lowercase(), Symbol {
-        name: name.to_string(),
-        kind: SymbolKind::Parameter,
-        type_info: Some(ti),
-        attrs: SymbolAttrs { parameter: true, ..Default::default() },
-        defined_at: span,
-        scope: mod_id,
-        arg_names: vec![],
-        const_value: val,
-    });
+    st.scope_mut(mod_id).symbols.insert(
+        name.to_lowercase(),
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Parameter,
+            type_info: Some(ti),
+            attrs: SymbolAttrs {
+                parameter: true,
+                ..Default::default()
+            },
+            defined_at: span,
+            scope: mod_id,
+            arg_names: vec![],
+            const_value: val,
+        },
+    );
 }
 
 fn insert_type(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
     let span = builtin_span();
-    st.scope_mut(mod_id).symbols.insert(name.to_lowercase(), Symbol {
-        name: name.to_string(),
-        kind: SymbolKind::DerivedType,
-        type_info: Some(TypeInfo::Derived(name.to_string())),
-        attrs: Default::default(),
-        defined_at: span,
-        scope: mod_id,
-        arg_names: vec![],
-        const_value: None,
-    });
+    st.scope_mut(mod_id).symbols.insert(
+        name.to_lowercase(),
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::DerivedType,
+            type_info: Some(TypeInfo::Derived(name.to_string())),
+            attrs: Default::default(),
+            defined_at: span,
+            scope: mod_id,
+            arg_names: vec![],
+            const_value: None,
+        },
+    );
 }
 
 fn insert_proc(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
     let span = builtin_span();
-    st.scope_mut(mod_id).symbols.insert(name.to_lowercase(), Symbol {
-        name: name.to_string(),
-        kind: SymbolKind::IntrinsicProc,
-        type_info: None,
-        attrs: SymbolAttrs { intrinsic: true, ..Default::default() },
-        defined_at: span,
-        scope: mod_id,
-        arg_names: vec![],
-        const_value: None,
-    });
+    st.scope_mut(mod_id).symbols.insert(
+        name.to_lowercase(),
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::IntrinsicProc,
+            type_info: None,
+            attrs: SymbolAttrs {
+                intrinsic: true,
+                ..Default::default()
+            },
+            defined_at: span,
+            scope: mod_id,
+            arg_names: vec![],
+            const_value: None,
+        },
+    );
 }
 
 /// Populate the iso_c_binding module scope.
@@ -74,36 +99,65 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     // Each constant's VALUE is the kind number (e.g., c_int = 4 means kind=4 = 4 bytes).
     let ik = |k: u8| TypeInfo::Integer { kind: Some(k) };
     for (name, kind) in [
-        ("c_int", 4u8), ("c_short", 2), ("c_long", 8), ("c_long_long", 8),
+        ("c_int", 4u8),
+        ("c_short", 2),
+        ("c_long", 8),
+        ("c_long_long", 8),
         ("c_signed_char", 1),
-        ("c_int8_t", 1), ("c_int16_t", 2), ("c_int32_t", 4), ("c_int64_t", 8),
-        ("c_size_t", 8), ("c_intptr_t", 8), ("c_ptrdiff_t", 8),
+        ("c_int8_t", 1),
+        ("c_int16_t", 2),
+        ("c_int32_t", 4),
+        ("c_int64_t", 8),
+        ("c_size_t", 8),
+        ("c_intptr_t", 8),
+        ("c_ptrdiff_t", 8),
     ] {
         insert_param_val(st, m, name, ik(4), Some(kind as i64));
     }
 
     // ---- Real kind parameters ----
-    for (name, kind) in [
-        ("c_float", 4u8), ("c_double", 8), ("c_long_double", 8),
-    ] {
-        insert_param_val(st, m, name, TypeInfo::Integer { kind: Some(4) }, Some(kind as i64));
+    for (name, kind) in [("c_float", 4u8), ("c_double", 8), ("c_long_double", 8)] {
+        insert_param_val(
+            st,
+            m,
+            name,
+            TypeInfo::Integer { kind: Some(4) },
+            Some(kind as i64),
+        );
     }
 
     // ---- Complex kind parameters ----
     for (name, kind) in [
-        ("c_float_complex", 4u8), ("c_double_complex", 8), ("c_long_double_complex", 8),
+        ("c_float_complex", 4u8),
+        ("c_double_complex", 8),
+        ("c_long_double_complex", 8),
     ] {
-        insert_param_val(st, m, name, TypeInfo::Integer { kind: Some(4) }, Some(kind as i64));
+        insert_param_val(
+            st,
+            m,
+            name,
+            TypeInfo::Integer { kind: Some(4) },
+            Some(kind as i64),
+        );
     }
 
     // ---- Character and logical kinds ----
     // c_char is an integer kind parameter (value = 1), not a character type.
     insert_param_val(st, m, "c_char", ik(4), Some(1));
-    insert_param_val(st, m, "c_bool", TypeInfo::Integer { kind: Some(4) }, Some(1));
+    insert_param_val(
+        st,
+        m,
+        "c_bool",
+        TypeInfo::Integer { kind: Some(4) },
+        Some(1),
+    );
 
     // ---- Character constants (c_null_char, etc.) ----
     // Each constant's value is its ASCII byte code.
-    let ck = TypeInfo::Character { len: Some(1), kind: Some(1) };
+    let ck = TypeInfo::Character {
+        len: Some(1),
+        kind: Some(1),
+    };
     for (name, ascii) in [
         ("c_null_char", 0i64),
         ("c_alert", 7),
@@ -126,7 +180,14 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     insert_param(st, m, "c_null_funptr", ik(8));
 
     // ---- Procedures ----
-    for name in ["c_loc", "c_funloc", "c_f_pointer", "c_f_procpointer", "c_associated", "c_sizeof"] {
+    for name in [
+        "c_loc",
+        "c_funloc",
+        "c_f_pointer",
+        "c_f_procpointer",
+        "c_associated",
+        "c_sizeof",
+    ] {
         insert_proc(st, m, name);
     }
 
@@ -204,10 +265,19 @@ fn register_ieee_stubs(st: &mut SymbolTable) {
                 insert_proc(st, m, "ieee_set_halting_mode");
             }
             "ieee_features" => {
-                for feat in ["ieee_datatype", "ieee_denormal", "ieee_divide",
-                             "ieee_halting", "ieee_inexact_flag", "ieee_inf",
-                             "ieee_invalid_flag", "ieee_nan", "ieee_rounding",
-                             "ieee_sqrt", "ieee_underflow_flag"] {
+                for feat in [
+                    "ieee_datatype",
+                    "ieee_denormal",
+                    "ieee_divide",
+                    "ieee_halting",
+                    "ieee_inexact_flag",
+                    "ieee_inf",
+                    "ieee_invalid_flag",
+                    "ieee_nan",
+                    "ieee_rounding",
+                    "ieee_sqrt",
+                    "ieee_underflow_flag",
+                ] {
                     insert_param(st, m, feat, TypeInfo::Logical { kind: Some(4) });
                 }
             }

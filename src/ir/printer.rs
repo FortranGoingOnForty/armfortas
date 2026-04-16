@@ -2,8 +2,8 @@
 //!
 //! Used by `-emit-ir` and in test assertions.
 
-use std::fmt::Write;
 use super::inst::*;
+use std::fmt::Write;
 
 /// Print a module to a string.
 pub fn print_module(module: &Module) -> String {
@@ -13,7 +13,9 @@ pub fn print_module(module: &Module) -> String {
     for sd in &module.struct_defs {
         write!(out, "  struct {} {{ ", sd.name).unwrap();
         for (i, (name, ty)) in sd.fields.iter().enumerate() {
-            if i > 0 { write!(out, ", ").unwrap(); }
+            if i > 0 {
+                write!(out, ", ").unwrap();
+            }
             write!(out, "{}: {}", name, ty).unwrap();
         }
         writeln!(out, " }}").unwrap();
@@ -26,7 +28,9 @@ pub fn print_module(module: &Module) -> String {
                 GlobalInit::Zero => write!(out, " = zeroinit").unwrap(),
                 GlobalInit::Int(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::Float(v) => write!(out, " = {}", v).unwrap(),
-                GlobalInit::String(s) => write!(out, " = {:?}", String::from_utf8_lossy(s)).unwrap(),
+                GlobalInit::String(s) => {
+                    write!(out, " = {:?}", String::from_utf8_lossy(s)).unwrap()
+                }
                 GlobalInit::IntArray(vs) => {
                     let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
                     write!(out, " = [{}]", s.join(", ")).unwrap();
@@ -43,7 +47,9 @@ pub fn print_module(module: &Module) -> String {
     for ef in &module.extern_funcs {
         write!(out, "  extern fn @{}(", ef.name).unwrap();
         for (i, p) in ef.sig.params.iter().enumerate() {
-            if i > 0 { write!(out, ", ").unwrap(); }
+            if i > 0 {
+                write!(out, ", ").unwrap();
+            }
             write!(out, "{}", p).unwrap();
         }
         writeln!(out, ") -> {}", ef.sig.ret).unwrap();
@@ -61,12 +67,22 @@ fn print_function_in(module: &Module, func: &Function) -> String {
     let mut out = String::new();
     // Print function attributes.
     let mut attrs = Vec::new();
-    if func.is_pure { attrs.push("pure"); }
-    if func.is_elemental { attrs.push("elemental"); }
-    let attr_str = if attrs.is_empty() { String::new() } else { format!(" [{}]", attrs.join(", ")) };
+    if func.is_pure {
+        attrs.push("pure");
+    }
+    if func.is_elemental {
+        attrs.push("elemental");
+    }
+    let attr_str = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", attrs.join(", "))
+    };
     write!(out, "  func @{}{}(", func.name, attr_str).unwrap();
     for (i, p) in func.params.iter().enumerate() {
-        if i > 0 { write!(out, ", ").unwrap(); }
+        if i > 0 {
+            write!(out, ", ").unwrap();
+        }
         write!(out, "%{}: {}", p.id.0, p.ty).unwrap();
     }
     writeln!(out, ") -> {} {{", func.return_type).unwrap();
@@ -93,11 +109,17 @@ fn print_block_with_module(block: &BasicBlock, func: &Function, module: &Module)
     print_block_with_module_opt(block, func, Some(module))
 }
 
-fn print_block_with_module_opt(block: &BasicBlock, func: &Function, module: Option<&Module>) -> String {
+fn print_block_with_module_opt(
+    block: &BasicBlock,
+    func: &Function,
+    module: Option<&Module>,
+) -> String {
     let mut out = String::new();
     write!(out, "    {}(", block.name).unwrap();
     for (i, bp) in block.params.iter().enumerate() {
-        if i > 0 { write!(out, ", ").unwrap(); }
+        if i > 0 {
+            write!(out, ", ").unwrap();
+        }
         write!(out, "%{}: {}", bp.id.0, bp.ty).unwrap();
     }
     writeln!(out, "):").unwrap();
@@ -118,7 +140,9 @@ pub fn print_block(block: &BasicBlock) -> String {
     let mut out = String::new();
     write!(out, "    {}(", block.name).unwrap();
     for (i, bp) in block.params.iter().enumerate() {
-        if i > 0 { write!(out, ", ").unwrap(); }
+        if i > 0 {
+            write!(out, ", ").unwrap();
+        }
         write!(out, "%{}: {}", bp.id.0, bp.ty).unwrap();
     }
     writeln!(out, "):").unwrap();
@@ -143,12 +167,22 @@ fn print_function_with_module_opt(module: Option<&Module>, func: &Function) -> S
     let mut out = String::new();
     // Print function attributes.
     let mut attrs = Vec::new();
-    if func.is_pure { attrs.push("pure"); }
-    if func.is_elemental { attrs.push("elemental"); }
-    let attr_str = if attrs.is_empty() { String::new() } else { format!(" [{}]", attrs.join(", ")) };
+    if func.is_pure {
+        attrs.push("pure");
+    }
+    if func.is_elemental {
+        attrs.push("elemental");
+    }
+    let attr_str = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", attrs.join(", "))
+    };
     write!(out, "  func @{}{}(", func.name, attr_str).unwrap();
     for (i, p) in func.params.iter().enumerate() {
-        if i > 0 { write!(out, ", ").unwrap(); }
+        if i > 0 {
+            write!(out, ", ").unwrap();
+        }
         write!(out, "%{}: {}", p.id.0, p.ty).unwrap();
     }
     writeln!(out, ") -> {} {{", func.return_type).unwrap();
@@ -210,7 +244,12 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::FloatToInt(v, w) => format!("float_to_int %{} : {}", v.0, w),
         InstKind::FloatExtend(v, w) => format!("float_extend %{} : {}", v.0, w),
         InstKind::FloatTrunc(v, w) => format!("float_trunc %{} : {}", v.0, w),
-        InstKind::IntExtend(v, w, s) => format!("int_extend %{} : {} {}", v.0, w, if *s { "signed" } else { "unsigned" }),
+        InstKind::IntExtend(v, w, s) => format!(
+            "int_extend %{} : {} {}",
+            v.0,
+            w,
+            if *s { "signed" } else { "unsigned" }
+        ),
         InstKind::IntTrunc(v, w) => format!("int_trunc %{} : {}", v.0, w),
         InstKind::PtrToInt(v) => format!("ptr_to_int %{}", v.0),
         InstKind::IntToPtr(v, ty) => format!("int_to_ptr %{} : {}", v.0, ty),
@@ -238,11 +277,17 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         }
         InstKind::RuntimeCall(rf, args) => {
             let args_str: Vec<String> = args.iter().map(|a| format!("%{}", a.0)).collect();
-            format!("rt_call @{}({})", runtime_func_name(rf), args_str.join(", "))
+            format!(
+                "rt_call @{}({})",
+                runtime_func_name(rf),
+                args_str.join(", ")
+            )
         }
 
         InstKind::ExtractField(agg, idx) => format!("extract_field %{}, {}", agg.0, idx),
-        InstKind::InsertField(agg, idx, val) => format!("insert_field %{}, {}, %{}", agg.0, idx, val.0),
+        InstKind::InsertField(agg, idx, val) => {
+            format!("insert_field %{}, {}, %{}", agg.0, idx, val.0)
+        }
     };
 
     if inst.ty == super::types::IrType::Void {
@@ -266,17 +311,39 @@ pub fn print_terminator_with_names(term: &Terminator, func: &Function) -> String
                 format!("br {}({})", bname(dest), args_str.join(", "))
             }
         }
-        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => {
             let ta: Vec<String> = true_args.iter().map(|a| format!("%{}", a.0)).collect();
             let fa: Vec<String> = false_args.iter().map(|a| format!("%{}", a.0)).collect();
-            format!("cond_br %{}, {}({}), {}({})",
-                cond.0, bname(true_dest), ta.join(", "), bname(false_dest), fa.join(", "))
+            format!(
+                "cond_br %{}, {}({}), {}({})",
+                cond.0,
+                bname(true_dest),
+                ta.join(", "),
+                bname(false_dest),
+                fa.join(", ")
+            )
         }
-        Terminator::Switch { selector, cases, default } => {
-            let cases_str: Vec<String> = cases.iter()
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
+            let cases_str: Vec<String> = cases
+                .iter()
                 .map(|(v, b)| format!("{} -> {}", v, bname(b)))
                 .collect();
-            format!("switch %{}, [{}], default {}", selector.0, cases_str.join(", "), bname(default))
+            format!(
+                "switch %{}, [{}], default {}",
+                selector.0,
+                cases_str.join(", "),
+                bname(default)
+            )
         }
         Terminator::Unreachable => "unreachable".into(),
     }
@@ -295,17 +362,39 @@ pub fn print_terminator(term: &Terminator) -> String {
                 format!("br bb{}({})", dest.0, args_str.join(", "))
             }
         }
-        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => {
             let ta: Vec<String> = true_args.iter().map(|a| format!("%{}", a.0)).collect();
             let fa: Vec<String> = false_args.iter().map(|a| format!("%{}", a.0)).collect();
-            format!("cond_br %{}, bb{}({}), bb{}({})",
-                cond.0, true_dest.0, ta.join(", "), false_dest.0, fa.join(", "))
+            format!(
+                "cond_br %{}, bb{}({}), bb{}({})",
+                cond.0,
+                true_dest.0,
+                ta.join(", "),
+                false_dest.0,
+                fa.join(", ")
+            )
         }
-        Terminator::Switch { selector, cases, default } => {
-            let cases_str: Vec<String> = cases.iter()
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
+            let cases_str: Vec<String> = cases
+                .iter()
                 .map(|(v, b)| format!("{} -> bb{}", v, b.0))
                 .collect();
-            format!("switch %{}, [{}], default bb{}", selector.0, cases_str.join(", "), default.0)
+            format!(
+                "switch %{}, [{}], default bb{}",
+                selector.0,
+                cases_str.join(", "),
+                default.0
+            )
         }
         Terminator::Unreachable => "unreachable".into(),
     }
@@ -342,9 +431,9 @@ fn runtime_func_name(rf: &RuntimeFunc) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::types::*;
     use super::super::builder::FuncBuilder;
+    use super::super::types::*;
+    use super::*;
 
     #[test]
     fn print_simple_function() {
@@ -422,7 +511,11 @@ mod tests {
         let output = print_function(&func);
         assert!(output.contains("header_1(%"));
         assert!(output.contains(": i32)"));
-        assert!(output.contains("br header_1("), "expected 'br header_1(' in:\n{}", output);
+        assert!(
+            output.contains("br header_1("),
+            "expected 'br header_1(' in:\n{}",
+            output
+        );
     }
 
     #[test]
@@ -443,13 +536,25 @@ mod tests {
         {
             let mut b = FuncBuilder::new(&mut caller);
             let arg = b.const_i32(7);
-            let _ = b.call(FuncRef::Internal(callee_idx), vec![arg], IrType::Int(IntWidth::I32));
+            let _ = b.call(
+                FuncRef::Internal(callee_idx),
+                vec![arg],
+                IrType::Int(IntWidth::I32),
+            );
             b.ret_void();
         }
         module.add_function(caller);
 
         let output = print_module(&module);
-        assert!(output.contains("call @callee("), "expected named internal call in:\n{}", output);
-        assert!(!output.contains("@func_0"), "unexpected fallback name in:\n{}", output);
+        assert!(
+            output.contains("call @callee("),
+            "expected named internal call in:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("@func_0"),
+            "unexpected fallback name in:\n{}",
+            output
+        );
     }
 }

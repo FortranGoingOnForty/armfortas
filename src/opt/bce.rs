@@ -13,20 +13,24 @@
 //! element accesses. This pass removes the checks when the index is
 //! provably safe.
 
-use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors};
 use super::loop_utils::{find_preheader, resolve_const_int};
 use super::pass::Pass;
+use crate::ir::inst::*;
+use crate::ir::walk::{find_natural_loops, predecessors};
 
 pub struct Bce;
 
 impl Pass for Bce {
-    fn name(&self) -> &'static str { "bce" }
+    fn name(&self) -> &'static str {
+        "bce"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if bce_function(func) { changed = true; }
+            if bce_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -53,7 +57,9 @@ fn bce_function(func: &mut Function) -> bool {
         }
     }
 
-    if to_remove.is_empty() { return false; }
+    if to_remove.is_empty() {
+        return false;
+    }
 
     // Remove in reverse order to preserve indices.
     to_remove.sort_by(|a, b| b.1.cmp(&a.1));
@@ -86,8 +92,12 @@ fn is_provably_safe(
 
     // Case 2: index is a canonical loop IV, and the loop's closed range
     // stays within the checked bounds.
-    let Some(lo_const) = resolve_int_scalar(func, lower) else { return false; };
-    let Some(hi_const) = resolve_int_scalar(func, upper) else { return false; };
+    let Some(lo_const) = resolve_int_scalar(func, lower) else {
+        return false;
+    };
+    let Some(hi_const) = resolve_int_scalar(func, upper) else {
+        return false;
+    };
     for lp in loops {
         let Some((range_lo, range_hi)) = loop_index_range(func, lp, preds, index) else {
             continue;
@@ -178,9 +188,7 @@ fn loop_init_const(
 ) -> Option<i64> {
     let preheader = find_preheader(func, lp, preds)?;
     match &func.block(preheader).terminator {
-        Some(Terminator::Branch(dest, args))
-            if *dest == lp.header && param_idx < args.len() =>
-        {
+        Some(Terminator::Branch(dest, args)) if *dest == lp.header && param_idx < args.len() => {
             resolve_int_scalar(func, args[param_idx])
         }
         _ => None,
@@ -193,18 +201,15 @@ enum LoopDir {
     Descending,
 }
 
-fn loop_bound_const(
-    func: &Function,
-    header: BlockId,
-    index: ValueId,
-) -> Option<(i64, LoopDir)> {
+fn loop_bound_const(func: &Function, header: BlockId, index: ValueId) -> Option<(i64, LoopDir)> {
     for inst in &func.block(header).insts {
-        let InstKind::ICmp(op, lhs, rhs) = &inst.kind else { continue };
+        let InstKind::ICmp(op, lhs, rhs) = &inst.kind else {
+            continue;
+        };
         match op {
             CmpOp::Le => {
                 if *lhs == index {
-                    return resolve_int_scalar(func, *rhs)
-                        .map(|bound| (bound, LoopDir::Ascending));
+                    return resolve_int_scalar(func, *rhs).map(|bound| (bound, LoopDir::Ascending));
                 }
                 if *rhs == index {
                     return resolve_int_scalar(func, *lhs)
@@ -217,8 +222,7 @@ fn loop_bound_const(
                         .map(|bound| (bound, LoopDir::Descending));
                 }
                 if *rhs == index {
-                    return resolve_int_scalar(func, *lhs)
-                        .map(|bound| (bound, LoopDir::Ascending));
+                    return resolve_int_scalar(func, *lhs).map(|bound| (bound, LoopDir::Ascending));
                 }
             }
             _ => {}
@@ -235,8 +239,7 @@ fn loop_step_const(
 ) -> Option<i64> {
     let mut step: Option<i64> = None;
     for &latch in &lp.latches {
-        let next =
-            edge_arg_value(func.block(latch).terminator.as_ref()?, lp.header, param_idx)?;
+        let next = edge_arg_value(func.block(latch).terminator.as_ref()?, lp.header, param_idx)?;
         let latch_step = update_step_const(func, index, next)?;
         if latch_step == 0 {
             return None;
@@ -309,7 +312,9 @@ fn resolve_int_scalar(func: &Function, value: ValueId) -> Option<i64> {
 
 fn strip_int_casts(func: &Function, mut value: ValueId) -> ValueId {
     loop {
-        let Some(kind) = find_inst_kind(func, value) else { return value };
+        let Some(kind) = find_inst_kind(func, value) else {
+            return value;
+        };
         match kind {
             InstKind::IntExtend(src, _, _) | InstKind::IntTrunc(src, _) => value = *src,
             _ => return value,
@@ -331,7 +336,7 @@ fn find_inst_kind(func: &Function, value: ValueId) -> Option<&InstKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 
     #[test]
@@ -358,25 +363,33 @@ mod tests {
         let idx = f.next_value_id();
         f.register_type(idx, IrType::Int(IntWidth::I32));
         f.block_mut(f.entry).insts.push(Inst {
-            id: idx, ty: IrType::Int(IntWidth::I32), span,
+            id: idx,
+            ty: IrType::Int(IntWidth::I32),
+            span,
             kind: InstKind::ConstInt(3, IntWidth::I32),
         });
         let lo = f.next_value_id();
         f.register_type(lo, IrType::Int(IntWidth::I32));
         f.block_mut(f.entry).insts.push(Inst {
-            id: lo, ty: IrType::Int(IntWidth::I32), span,
+            id: lo,
+            ty: IrType::Int(IntWidth::I32),
+            span,
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let hi = f.next_value_id();
         f.register_type(hi, IrType::Int(IntWidth::I32));
         f.block_mut(f.entry).insts.push(Inst {
-            id: hi, ty: IrType::Int(IntWidth::I32), span,
+            id: hi,
+            ty: IrType::Int(IntWidth::I32),
+            span,
             kind: InstKind::ConstInt(10, IntWidth::I32),
         });
         let check = f.next_value_id();
         f.register_type(check, IrType::Void);
         f.block_mut(f.entry).insts.push(Inst {
-            id: check, ty: IrType::Void, span,
+            id: check,
+            ty: IrType::Void,
+            span,
             kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![idx, lo, hi]),
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
@@ -387,7 +400,9 @@ mod tests {
         assert!(changed, "constant 3 in [1,10] should be eliminated");
 
         // Verify the CheckBounds call was removed.
-        let has_check = m.functions[0].blocks[0].insts.iter()
+        let has_check = m.functions[0].blocks[0]
+            .insts
+            .iter()
             .any(|i| matches!(i.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)));
         assert!(!has_check, "CheckBounds should be removed");
     }
@@ -428,8 +443,14 @@ mod tests {
         f.register_type(iv, IrType::Int(IntWidth::I32));
         let sum = f.next_value_id();
         f.register_type(sum, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
-        f.block_mut(header).params.push(BlockParam { id: sum, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(header).params.push(BlockParam {
+            id: sum,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -511,15 +532,20 @@ mod tests {
             span,
             kind: InstKind::IAdd(sum, step),
         });
-        f.block_mut(body).terminator =
-            Some(Terminator::Branch(header, vec![next_iv, next_sum]));
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv, next_sum]));
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
         m.add_function(f);
 
         let pass = Bce;
-        assert!(pass.run(&mut m), "canonical counted-loop bounds check should be removed");
+        assert!(
+            pass.run(&mut m),
+            "canonical counted-loop bounds check should be removed"
+        );
         let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
-            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+            matches!(
+                inst.kind,
+                InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+            )
         });
         assert!(!has_check, "loop body should no longer contain CheckBounds");
     }
@@ -560,8 +586,14 @@ mod tests {
         f.register_type(iv, IrType::Int(IntWidth::I32));
         let sum = f.next_value_id();
         f.register_type(sum, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
-        f.block_mut(header).params.push(BlockParam { id: sum, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(header).params.push(BlockParam {
+            id: sum,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -643,8 +675,7 @@ mod tests {
             span,
             kind: InstKind::IAdd(sum, step),
         });
-        f.block_mut(body).terminator =
-            Some(Terminator::Branch(header, vec![next_iv, next_sum]));
+        f.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next_iv, next_sum]));
         f.block_mut(exit).terminator = Some(Terminator::Return(None));
         m.add_function(f);
 
@@ -681,7 +712,10 @@ mod tests {
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -768,9 +802,15 @@ mod tests {
         m.add_function(f);
 
         let pass = Bce;
-        assert!(pass.run(&mut m), "iv+1 check should be removed for trip range 2..7 and checked bounds 1..8");
+        assert!(
+            pass.run(&mut m),
+            "iv+1 check should be removed for trip range 2..7 and checked bounds 1..8"
+        );
         let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
-            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+            matches!(
+                inst.kind,
+                InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+            )
         });
         assert!(!has_check, "loop body should no longer contain CheckBounds");
     }
@@ -801,7 +841,10 @@ mod tests {
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -888,9 +931,15 @@ mod tests {
         m.add_function(f);
 
         let pass = Bce;
-        assert!(pass.run(&mut m), "iv-1 check should be removed for trip range 2..7 and checked bounds 1..8");
+        assert!(
+            pass.run(&mut m),
+            "iv-1 check should be removed for trip range 2..7 and checked bounds 1..8"
+        );
         let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
-            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+            matches!(
+                inst.kind,
+                InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+            )
         });
         assert!(!has_check, "loop body should no longer contain CheckBounds");
     }
@@ -921,7 +970,10 @@ mod tests {
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -1048,7 +1100,10 @@ mod tests {
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
 
         let bound = f.next_value_id();
         f.register_type(bound, IrType::Int(IntWidth::I32));
@@ -1148,7 +1203,10 @@ mod tests {
             "iv+5 check should be removed when the trip sequence is only 5 and checked bounds are 1..10"
         );
         let has_check = m.functions[0].block(body).insts.iter().any(|inst| {
-            matches!(inst.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _))
+            matches!(
+                inst.kind,
+                InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+            )
         });
         assert!(!has_check, "loop body should no longer contain CheckBounds");
     }

@@ -88,7 +88,9 @@ fn collect_consts(func: &Function) -> HashMap<ValueId, Const> {
 pub struct ConstProp;
 
 impl Pass for ConstProp {
-    fn name(&self) -> &'static str { "const-prop" }
+    fn name(&self) -> &'static str {
+        "const-prop"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -96,7 +98,9 @@ impl Pass for ConstProp {
             let consts = collect_consts(func);
             let mut local_changed = false;
             for block in &mut func.blocks {
-                let Some(term) = block.terminator.take() else { continue };
+                let Some(term) = block.terminator.take() else {
+                    continue;
+                };
                 let new_term = simplify_terminator(term, &consts, &mut local_changed);
                 block.terminator = Some(new_term);
             }
@@ -118,7 +122,13 @@ fn simplify_terminator(
     changed: &mut bool,
 ) -> Terminator {
     match term {
-        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => {
             if let Some(Const::Bool(c)) = consts.get(&cond).copied() {
                 *changed = true;
                 if c {
@@ -127,10 +137,20 @@ fn simplify_terminator(
                     Terminator::Branch(false_dest, false_args)
                 }
             } else {
-                Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args }
+                Terminator::CondBranch {
+                    cond,
+                    true_dest,
+                    true_args,
+                    false_dest,
+                    false_args,
+                }
             }
         }
-        Terminator::Switch { selector, cases, default } => {
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
             if let Some(Const::Int(sv, w)) = consts.get(&selector).copied() {
                 // `sv` is already canonical (sign-extended at width)
                 // thanks to the M4-4 normalization in `Const::from_inst`.
@@ -138,14 +158,20 @@ fn simplify_terminator(
                 // canonical, so we still normalize them before
                 // comparing.
                 *changed = true;
-                let target = cases.iter().find(|(k, _)| sext(*k, w.bits()) == sv)
+                let target = cases
+                    .iter()
+                    .find(|(k, _)| sext(*k, w.bits()) == sv)
                     .map(|(_, b)| *b)
                     .unwrap_or(default);
                 // Switch targets in our IR cannot have block params, so
                 // an empty arg vec is correct.
                 Terminator::Branch(target, vec![])
             } else {
-                Terminator::Switch { selector, cases, default }
+                Terminator::Switch {
+                    selector,
+                    cases,
+                    default,
+                }
             }
         }
         other => other,
@@ -153,8 +179,9 @@ fn simplify_terminator(
 }
 
 fn sext(v: i64, bits: u32) -> i64 {
-    if bits >= 64 { v }
-    else {
+    if bits >= 64 {
+        v
+    } else {
         let shift = 64 - bits;
         (v << shift) >> shift
     }
@@ -164,11 +191,15 @@ fn sext(v: i64, bits: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
-    use crate::lexer::{Span, Position};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     #[test]

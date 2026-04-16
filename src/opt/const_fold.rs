@@ -27,7 +27,7 @@
 
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::types::{IrType, IntWidth, FloatWidth};
+use crate::ir::types::{FloatWidth, IntWidth, IrType};
 use std::collections::HashMap;
 
 /// Compile-time constant value, normalized for folding.
@@ -56,12 +56,8 @@ impl Const {
     ///    the producer-side guarantee from M-1.
     fn from_inst(kind: &InstKind) -> Option<Self> {
         match kind {
-            InstKind::ConstInt(v, w) => {
-                Some(Const::Int(sext(*v, w.bits()), *w))
-            }
-            InstKind::ConstFloat(v, w) => {
-                Some(Const::Float(round_for_width(*v, *w), *w))
-            }
+            InstKind::ConstInt(v, w) => Some(Const::Int(sext(*v, w.bits()), *w)),
+            InstKind::ConstFloat(v, w) => Some(Const::Float(round_for_width(*v, *w), *w)),
             InstKind::ConstBool(b) => Some(Const::Bool(*b)),
             _ => None,
         }
@@ -71,8 +67,9 @@ impl Const {
 /// Sign-extend `v` from `bits` to a full i128. Used so that comparisons
 /// and arithmetic on narrower integer types match hardware behavior.
 fn sext(v: i128, bits: u32) -> i128 {
-    if bits >= 128 { v }
-    else {
+    if bits >= 128 {
+        v
+    } else {
         let shift = 128 - bits;
         (v << shift) >> shift
     }
@@ -81,8 +78,11 @@ fn sext(v: i128, bits: u32) -> i128 {
 /// Mask `v` down to `bits` low bits. The IR stores integers as i128 but
 /// arithmetic must wrap at the declared width.
 fn mask(v: i128, bits: u32) -> i128 {
-    if bits >= 128 { v }
-    else { v & ((1i128 << bits) - 1) }
+    if bits >= 128 {
+        v
+    } else {
+        v & ((1i128 << bits) - 1)
+    }
 }
 
 /// Truncate-then-sign-extend a wide arithmetic result back to its
@@ -149,8 +149,12 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::IDiv(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    if bv == 0 { return None; } // leave divide-by-zero to runtime
-                    if av == signed_min(*w) && bv == -1 { return None; }
+                    if bv == 0 {
+                        return None;
+                    } // leave divide-by-zero to runtime
+                    if av == signed_min(*w) && bv == -1 {
+                        return None;
+                    }
                     return Some(InstKind::ConstInt(norm(av / bv, *w), *w));
                 }
             }
@@ -159,8 +163,12 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::IMod(a, b) => {
             if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (get(a), get(b)) {
                 if let IrType::Int(w) = ty {
-                    if bv == 0 { return None; }
-                    if av == signed_min(*w) && bv == -1 { return None; }
+                    if bv == 0 {
+                        return None;
+                    }
+                    if av == signed_min(*w) && bv == -1 {
+                        return None;
+                    }
                     return Some(InstKind::ConstInt(norm(av % bv, *w), *w));
                 }
             }
@@ -255,7 +263,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
 
         // Bitwise ---------------------------------------------------------
         InstKind::BitAnd(a, b) => fold_int_bin(get(a), get(b), ty, |x, y| x & y),
-        InstKind::BitOr(a, b)  => fold_int_bin(get(a), get(b), ty, |x, y| x | y),
+        InstKind::BitOr(a, b) => fold_int_bin(get(a), get(b), ty, |x, y| x | y),
         InstKind::BitXor(a, b) => fold_int_bin(get(a), get(b), ty, |x, y| x ^ y),
         InstKind::BitNot(a) => {
             if let Some(Const::Int(av, _)) = get(a) {
@@ -278,10 +286,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                 if let IrType::Int(w) = ty {
                     let bits = w.bits() as i128;
                     if (0..bits).contains(&bv) {
-                        return Some(InstKind::ConstInt(
-                            norm(av.wrapping_shl(bv as u32), *w),
-                            *w,
-                        ));
+                        return Some(InstKind::ConstInt(norm(av.wrapping_shl(bv as u32), *w), *w));
                     }
                     return None;
                 }
@@ -324,7 +329,10 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         InstKind::PopCount(a) => {
             if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
                 let val = mask(av, src_w.bits()) as u128;
-                return Some(InstKind::ConstInt(norm(val.count_ones() as i128, *out_w), *out_w));
+                return Some(InstKind::ConstInt(
+                    norm(val.count_ones() as i128, *out_w),
+                    *out_w,
+                ));
             }
             None
         }
@@ -345,7 +353,11 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
             if let (Some(Const::Int(av, src_w)), IrType::Int(out_w)) = (get(a), ty) {
                 let bits = src_w.bits();
                 let val = mask(av, bits) as u128;
-                let tz = if val == 0 { bits as i128 } else { val.trailing_zeros() as i128 };
+                let tz = if val == 0 {
+                    bits as i128
+                } else {
+                    val.trailing_zeros() as i128
+                };
                 return Some(InstKind::ConstInt(norm(tz, *out_w), *out_w));
             }
             None
@@ -377,7 +389,9 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         }
         InstKind::FloatToInt(a, w) => {
             if let Some(Const::Float(av, src_fw)) = get(a) {
-                if av.is_nan() || av.is_infinite() { return None; }
+                if av.is_nan() || av.is_infinite() {
+                    return None;
+                }
                 // Audit B-3 (defense in depth): re-round at the
                 // source float width before truncating. The M-1
                 // invariant says any f32-tagged Const::Float is
@@ -388,20 +402,22 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                 // Fortran INT() truncates toward zero. Match.
                 let truncd = av.trunc();
                 let lo = match w {
-                    IntWidth::I8  => i8::MIN  as f64,
+                    IntWidth::I8 => i8::MIN as f64,
                     IntWidth::I16 => i16::MIN as f64,
                     IntWidth::I32 => i32::MIN as f64,
                     IntWidth::I64 => i64::MIN as f64,
                     IntWidth::I128 => return None,
                 };
                 let hi = match w {
-                    IntWidth::I8  => i8::MAX  as f64,
+                    IntWidth::I8 => i8::MAX as f64,
                     IntWidth::I16 => i16::MAX as f64,
                     IntWidth::I32 => i32::MAX as f64,
                     IntWidth::I64 => i64::MAX as f64,
                     IntWidth::I128 => return None,
                 };
-                if truncd < lo || truncd > hi { return None; }
+                if truncd < lo || truncd > hi {
+                    return None;
+                }
                 return Some(InstKind::ConstInt(norm(truncd as i128, *w), *w));
             }
             None
@@ -418,7 +434,11 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
         }
         InstKind::IntExtend(a, w, signed) => {
             if let Some(Const::Int(av, src_w)) = get(a) {
-                let v = if *signed { sext(av, src_w.bits()) } else { mask(av, src_w.bits()) };
+                let v = if *signed {
+                    sext(av, src_w.bits())
+                } else {
+                    mask(av, src_w.bits())
+                };
                 return Some(InstKind::ConstInt(norm(v, *w), *w));
             }
             None
@@ -467,9 +487,7 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
                         (IrType::Float(FloatWidth::F64), Const::Float(v, _)) => {
                             Some(InstKind::ConstFloat(v, FloatWidth::F64))
                         }
-                        (IrType::Bool, Const::Bool(b)) => {
-                            Some(InstKind::ConstBool(b))
-                        }
+                        (IrType::Bool, Const::Bool(b)) => Some(InstKind::ConstBool(b)),
                         // Type categories disagree — bail rather than
                         // type-pun. The verifier doesn't catch the
                         // mismatch (it only checks `is_int`/`is_float`
@@ -496,7 +514,8 @@ fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> O
 // f32 destinations because the op itself can produce a value
 // outside f32's representable range.
 fn fold_float_bin<F>(a: Option<Const>, b: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
-where F: FnOnce(f64, f64) -> f64
+where
+    F: FnOnce(f64, f64) -> f64,
 {
     if let (Some(Const::Float(av, _)), Some(Const::Float(bv, _))) = (a, b) {
         if let IrType::Float(w) = ty {
@@ -509,7 +528,8 @@ where F: FnOnce(f64, f64) -> f64
 }
 
 fn fold_float_un<F>(a: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
-where F: FnOnce(f64) -> f64
+where
+    F: FnOnce(f64) -> f64,
 {
     if let Some(Const::Float(av, _)) = a {
         if let IrType::Float(w) = ty {
@@ -522,7 +542,8 @@ where F: FnOnce(f64) -> f64
 }
 
 fn fold_int_bin<F>(a: Option<Const>, b: Option<Const>, ty: &IrType, op: F) -> Option<InstKind>
-where F: FnOnce(i128, i128) -> i128
+where
+    F: FnOnce(i128, i128) -> i128,
 {
     if let (Some(Const::Int(av, _)), Some(Const::Int(bv, _))) = (a, b) {
         if let IrType::Int(w) = ty {
@@ -536,7 +557,9 @@ where F: FnOnce(i128, i128) -> i128
 pub struct ConstFold;
 
 impl Pass for ConstFold {
-    fn name(&self) -> &'static str { "const-fold" }
+    fn name(&self) -> &'static str {
+        "const-fold"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
@@ -573,7 +596,9 @@ impl Pass for ConstFold {
                 inner_changed = false;
                 for block in &mut func.blocks {
                     for inst in &mut block.insts {
-                        if consts.contains_key(&inst.id) { continue; }
+                        if consts.contains_key(&inst.id) {
+                            continue;
+                        }
                         if let Some(new_kind) = try_fold(&inst.kind, &inst.ty, &consts) {
                             if let Some(c) = Const::from_inst(&new_kind) {
                                 consts.insert(inst.id, c);
@@ -597,7 +622,11 @@ mod tests {
 
     fn dummy_span() -> crate::lexer::Span {
         let p = crate::lexer::Position { line: 1, col: 1 };
-        crate::lexer::Span { start: p, end: p, file_id: 0 }
+        crate::lexer::Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn make_module_with(insts: Vec<(InstKind, IrType)>) -> (Module, Vec<ValueId>) {
@@ -608,7 +637,12 @@ mod tests {
         for (kind, ty) in insts {
             let id = f.next_value_id();
             ids.push(id);
-            f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+            f.block_mut(entry).insts.push(Inst {
+                id,
+                kind,
+                ty,
+                span: dummy_span(),
+            });
         }
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -616,15 +650,28 @@ mod tests {
     }
 
     fn first_block_kinds(m: &Module) -> Vec<InstKind> {
-        m.functions[0].blocks[0].insts.iter().map(|i| i.kind.clone()).collect()
+        m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .map(|i| i.kind.clone())
+            .collect()
     }
 
     #[test]
     fn folds_iadd_i32() {
         let (mut m, ids) = make_module_with(vec![
-            (InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(4, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::IAdd(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstInt(3, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(4, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::IAdd(ValueId(0), ValueId(1)),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         let _ = ids;
         assert!(ConstFold.run(&mut m));
@@ -636,9 +683,18 @@ mod tests {
     fn integer_overflow_wraps_at_width() {
         // i8: 100 + 50 = 150 → wraps to -106
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(100, IntWidth::I8), IrType::Int(IntWidth::I8)),
-            (InstKind::ConstInt(50,  IntWidth::I8), IrType::Int(IntWidth::I8)),
-            (InstKind::IAdd(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I8)),
+            (
+                InstKind::ConstInt(100, IntWidth::I8),
+                IrType::Int(IntWidth::I8),
+            ),
+            (
+                InstKind::ConstInt(50, IntWidth::I8),
+                IrType::Int(IntWidth::I8),
+            ),
+            (
+                InstKind::IAdd(ValueId(0), ValueId(1)),
+                IrType::Int(IntWidth::I8),
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
         let kinds = first_block_kinds(&m);
@@ -651,9 +707,18 @@ mod tests {
     #[test]
     fn idiv_by_zero_left_alone() {
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(0,  IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::IDiv(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstInt(10, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(0, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::IDiv(ValueId(0), ValueId(1)),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         assert!(!ConstFold.run(&mut m));
         let kinds = first_block_kinds(&m);
@@ -663,9 +728,18 @@ mod tests {
     #[test]
     fn fmul_f64() {
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstFloat(2.0, FloatWidth::F64), IrType::Float(FloatWidth::F64)),
-            (InstKind::ConstFloat(3.14, FloatWidth::F64), IrType::Float(FloatWidth::F64)),
-            (InstKind::FMul(ValueId(0), ValueId(1)), IrType::Float(FloatWidth::F64)),
+            (
+                InstKind::ConstFloat(2.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(3.14, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FMul(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
         let kinds = first_block_kinds(&m);
@@ -678,12 +752,24 @@ mod tests {
     #[test]
     fn icmp_eq_true() {
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(5, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ICmp(CmpOp::Eq, ValueId(0), ValueId(1)), IrType::Bool),
+            (
+                InstKind::ConstInt(5, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(5, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ICmp(CmpOp::Eq, ValueId(0), ValueId(1)),
+                IrType::Bool,
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
-        assert!(matches!(first_block_kinds(&m)[2], InstKind::ConstBool(true)));
+        assert!(matches!(
+            first_block_kinds(&m)[2],
+            InstKind::ConstBool(true)
+        ));
     }
 
     #[test]
@@ -691,20 +777,41 @@ mod tests {
         // i8 representation: -1 stored as 0xff (255). Without sign-extension,
         // a naive (av < bv) would compare 255 < 1 → false; correct is true.
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(-1, IntWidth::I8), IrType::Int(IntWidth::I8)),
-            (InstKind::ConstInt(1,  IntWidth::I8), IrType::Int(IntWidth::I8)),
-            (InstKind::ICmp(CmpOp::Lt, ValueId(0), ValueId(1)), IrType::Bool),
+            (
+                InstKind::ConstInt(-1, IntWidth::I8),
+                IrType::Int(IntWidth::I8),
+            ),
+            (
+                InstKind::ConstInt(1, IntWidth::I8),
+                IrType::Int(IntWidth::I8),
+            ),
+            (
+                InstKind::ICmp(CmpOp::Lt, ValueId(0), ValueId(1)),
+                IrType::Bool,
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
-        assert!(matches!(first_block_kinds(&m)[2], InstKind::ConstBool(true)));
+        assert!(matches!(
+            first_block_kinds(&m)[2],
+            InstKind::ConstBool(true)
+        ));
     }
 
     #[test]
     fn shl_power_of_two() {
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::Shl(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstInt(1, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(3, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::Shl(ValueId(0), ValueId(1)),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
         match first_block_kinds(&m)[2] {
@@ -717,8 +824,14 @@ mod tests {
     fn int_to_float_chain() {
         // const(42:i32) → int_to_float → const(42.0:f64)
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(42, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::IntToFloat(ValueId(0), FloatWidth::F64), IrType::Float(FloatWidth::F64)),
+            (
+                InstKind::ConstInt(42, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::IntToFloat(ValueId(0), FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
         match first_block_kinds(&m)[1] {
@@ -731,9 +844,18 @@ mod tests {
     fn select_on_known_cond_picks_branch() {
         let (mut m, _) = make_module_with(vec![
             (InstKind::ConstBool(true), IrType::Bool),
-            (InstKind::ConstInt(10, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(20, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::Select(ValueId(0), ValueId(1), ValueId(2)), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstInt(10, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(20, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::Select(ValueId(0), ValueId(1), ValueId(2)),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         assert!(ConstFold.run(&mut m));
         match first_block_kinds(&m)[3] {
@@ -746,24 +868,45 @@ mod tests {
     fn fixpoint_via_chained_constants() {
         // (3 + 4) * 2 = 14, where the inner add must fold first.
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(4, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::IAdd(ValueId(0), ValueId(1)), IrType::Int(IntWidth::I32)),
-            (InstKind::ConstInt(2, IntWidth::I32), IrType::Int(IntWidth::I32)),
-            (InstKind::IMul(ValueId(2), ValueId(3)), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstInt(3, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(4, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::IAdd(ValueId(0), ValueId(1)),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(2, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::IMul(ValueId(2), ValueId(3)),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         // A single pass already handles this because we walk in order.
         assert!(ConstFold.run(&mut m));
         let kinds = first_block_kinds(&m);
-        assert!(matches!(kinds[2], InstKind::ConstInt(7,  IntWidth::I32)));
+        assert!(matches!(kinds[2], InstKind::ConstInt(7, IntWidth::I32)));
         assert!(matches!(kinds[4], InstKind::ConstInt(14, IntWidth::I32)));
     }
 
     #[test]
     fn nan_float_to_int_left_alone() {
         let (mut m, _) = make_module_with(vec![
-            (InstKind::ConstFloat(f64::NAN, FloatWidth::F64), IrType::Float(FloatWidth::F64)),
-            (InstKind::FloatToInt(ValueId(0), IntWidth::I32), IrType::Int(IntWidth::I32)),
+            (
+                InstKind::ConstFloat(f64::NAN, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FloatToInt(ValueId(0), IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
         ]);
         assert!(!ConstFold.run(&mut m));
         assert!(matches!(first_block_kinds(&m)[1], InstKind::FloatToInt(..)));

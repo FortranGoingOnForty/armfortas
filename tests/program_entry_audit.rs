@@ -67,7 +67,10 @@ fn capture_program_entry_fixture_runs_at_o2() {
         opt_level: OptLevel::O2,
     });
 
-    assert_eq!(run.exit_code, 0, "program should run successfully:\n{run:#?}");
+    assert_eq!(
+        run.exit_code, 0,
+        "program should run successfully:\n{run:#?}"
+    );
     assert!(
         run.stdout.split_whitespace().any(|field| field == "99"),
         "program body should execute and print the helper-written value:\n{}",

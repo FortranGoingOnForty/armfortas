@@ -13,15 +13,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::codegen::mir::{
-    ArmCond, ConstPoolEntry, MachineFunction, MachineInst, MachineOperand, MBlockId, PhysReg,
+    ArmCond, ConstPoolEntry, MBlockId, MachineFunction, MachineInst, MachineOperand, PhysReg,
     RegClass,
 };
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
-use crate::opt::{build_i128_pipeline, build_pipeline};
-use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
+use crate::opt::pipeline::OptLevel as IrOptLevel;
+use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 
@@ -243,7 +243,10 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     let mut stages = BTreeMap::new();
     let wants = |stage| request.requested.contains(&stage);
     let needs_backend = request.requested.iter().any(|stage| {
-        matches!(stage, Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run)
+        matches!(
+            stage,
+            Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run
+        )
     });
     let input = request.input.clone();
     let source_form = detect_source_form(&input.to_string_lossy());
@@ -338,7 +341,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         });
     }
 
-    let (ir_module, _module_globals) = lower::lower_file(&units, &st, &type_layouts, std::collections::HashMap::new(), std::collections::HashMap::new());
+    let (ir_module, _module_globals) = lower::lower_file(
+        &units,
+        &st,
+        &type_layouts,
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         let msg = ir_errors
@@ -360,14 +369,12 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Ir, CapturedStage::Text(ir_text.clone()));
     }
     let module_has_i128 = ir_module.contains_i128();
-    let needs_optimized_pipeline =
-        request.requested.iter().any(|stage| {
-            matches!(
-                stage,
-                Stage::OptIr | Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run
-            )
-        })
-        && request.opt_level != OptLevel::O0;
+    let needs_optimized_pipeline = request.requested.iter().any(|stage| {
+        matches!(
+            stage,
+            Stage::OptIr | Stage::Mir | Stage::Regalloc | Stage::Asm | Stage::Obj | Stage::Run
+        )
+    }) && request.opt_level != OptLevel::O0;
 
     let optimized_module = if needs_optimized_pipeline {
         let mut optimized = ir_module.clone();
@@ -422,7 +429,9 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             input: input.clone(),
             opt_level: request.opt_level,
             stage: FailureStage::Ir,
-            detail: "backend does not yet support integer(16) / i128 codegen; capture IR at O0 for now".into(),
+            detail:
+                "backend does not yet support integer(16) / i128 codegen; capture IR at O0 for now"
+                    .into(),
             stages,
         });
     }
@@ -560,10 +569,7 @@ fn collect_sandbox_files(
             collect_sandbox_files(root, &path, out)?;
         } else {
             let rel = path.strip_prefix(root).unwrap();
-            out.insert(
-                rel.to_string_lossy().replace('\\', "/"),
-                fs::read(&path)?,
-            );
+            out.insert(rel.to_string_lossy().replace('\\', "/"), fs::read(&path)?);
         }
     }
     Ok(())
@@ -942,7 +948,9 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
         return Ok(());
     };
     let debug_archive = workspace_root.join("target/debug/libarmfortas_rt.a");
-    let archive_mtime = fs::metadata(&debug_archive).ok().and_then(|meta| meta.modified().ok());
+    let archive_mtime = fs::metadata(&debug_archive)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
 
     if archive_mtime.is_some_and(|mtime| mtime >= source_mtime) {
         return Ok(());
@@ -992,7 +1000,8 @@ fn find_workspace_root() -> Option<PathBuf> {
 
     for base in bases {
         for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists() {
+            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
+            {
                 return Some(ancestor.to_path_buf());
             }
         }

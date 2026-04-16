@@ -21,7 +21,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")
@@ -49,13 +51,12 @@ fn call_arg_counts_for(func_section: &str, callee_marker: &str) -> Vec<usize> {
         .filter_map(|line| {
             let line = line.trim();
             let call = line.find(&format!("call {}", callee_marker))?;
-            let inside = line[call..]
-                .split_once('(')?
-                .1
-                .split_once(')')?
-                .0
-                .trim();
-            Some(if inside.is_empty() { 0 } else { inside.split(", ").count() })
+            let inside = line[call..].split_once('(')?.1.split_once(')')?.0.trim();
+            Some(if inside.is_empty() {
+                0
+            } else {
+                inside.split(", ").count()
+            })
         })
         .collect()
 }
@@ -102,8 +103,18 @@ fn o2_specializes_constant_dummy_and_trims_internal_calls() {
     let opt_main = function_section(&opt_ir, "__prog_ipo_const_arg");
     let opt_compute = function_section(&opt_ir, "compute");
 
-    assert_eq!(param_count(raw_compute), 2, "raw helper should keep both dummies:\n{}", raw_compute);
-    assert_eq!(param_count(opt_compute), 1, "optimized helper should specialize the constant dummy:\n{}", opt_compute);
+    assert_eq!(
+        param_count(raw_compute),
+        2,
+        "raw helper should keep both dummies:\n{}",
+        raw_compute
+    );
+    assert_eq!(
+        param_count(opt_compute),
+        1,
+        "optimized helper should specialize the constant dummy:\n{}",
+        opt_compute
+    );
     assert!(
         opt_compute.contains("const_int 4"),
         "optimized helper should materialize the specialized constant directly:\n{}",
@@ -132,5 +143,8 @@ fn o2_specializes_constant_dummy_and_trims_internal_calls() {
         opt_main
     );
 
-    assert_eq!(obj_o2_a, obj_o2_b, "specialized O2 object snapshot should stay deterministic");
+    assert_eq!(
+        obj_o2_a, obj_o2_b,
+        "specialized O2 object snapshot should stay deterministic"
+    );
 }

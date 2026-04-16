@@ -99,7 +99,8 @@ impl<'a> Parser<'a> {
                     Some(TokenKind::Identifier)
                 );
                 if looks_like_entry_stmt {
-                    Err(self.error("ENTRY statements are recognized but not yet implemented".into()))
+                    Err(self
+                        .error("ENTRY statements are recognized but not yet implemented".into()))
                 } else {
                     self.parse_assignment_or_call(start)
                 }
@@ -178,7 +179,10 @@ impl<'a> Parser<'a> {
                 let span = span_from_to(start, self.prev_span());
                 Ok(Spanned::new(Stmt::Continue { label: None }, span))
             }
-            "sync" => Err(self.error("coarray SYNC statements are recognized but not yet implemented".into())),
+            "sync" => {
+                Err(self
+                    .error("coarray SYNC statements are recognized but not yet implemented".into()))
+            }
             _ => self.parse_assignment_or_call(start),
         }
     }
@@ -1179,9 +1183,10 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_newlines();
             if self.peek() == &TokenKind::Eof {
-                return Err(
-                    self.error(format!("expected statement with terminating label {}", label))
-                );
+                return Err(self.error(format!(
+                    "expected statement with terminating label {}",
+                    label
+                )));
             }
 
             let is_terminator = self.peek() == &TokenKind::IntegerLiteral
@@ -2310,7 +2315,9 @@ end if
         let tokens = Lexer::tokenize("entry g(y)\n", 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let err = parser.parse_stmt().expect_err("ENTRY should not parse yet");
-        assert!(err.msg.contains("ENTRY statements are recognized but not yet implemented"));
+        assert!(err
+            .msg
+            .contains("ENTRY statements are recognized but not yet implemented"));
     }
 
     #[test]

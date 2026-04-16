@@ -12,13 +12,24 @@ fn fixture(name: &str) -> PathBuf {
 
 #[test]
 fn optimized_i128_capture_is_available_through_ofast() {
-    for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+    for level in [
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
         capture_from_path(&CaptureRequest {
             input: fixture("integer16_mul.f90"),
             requested: BTreeSet::from([Stage::OptIr]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("optimized i128 capture should succeed at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "optimized i128 capture should succeed at {:?}:\n{}",
+                level, e
+            )
+        });
     }
 }
 
@@ -33,7 +44,8 @@ fn backend_i128_capture_is_rejected_for_now() {
 
     assert_eq!(err.stage, FailureStage::Ir);
     assert!(
-        err.detail.contains("backend does not yet support integer(16) / i128 codegen"),
+        err.detail
+            .contains("backend does not yet support integer(16) / i128 codegen"),
         "unexpected capture failure:\n{}",
         err
     );

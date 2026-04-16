@@ -16,19 +16,23 @@
 //!
 //! This eliminates the empty block chains left by inlining.
 
+use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::predecessors;
-use super::pass::Pass;
 
 pub struct SimplifyCfg;
 
 impl Pass for SimplifyCfg {
-    fn name(&self) -> &'static str { "simplify-cfg" }
+    fn name(&self) -> &'static str {
+        "simplify-cfg"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if simplify_function(func) { changed = true; }
+            if simplify_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -44,9 +48,15 @@ fn simplify_function(func: &mut Function) -> bool {
         let mut redirect: Option<(BlockId, BlockId)> = None;
 
         for block in &func.blocks {
-            if block.id == func.entry { continue; }
-            if !block.insts.is_empty() { continue; }
-            if !block.params.is_empty() { continue; }
+            if block.id == func.entry {
+                continue;
+            }
+            if !block.insts.is_empty() {
+                continue;
+            }
+            if !block.params.is_empty() {
+                continue;
+            }
             if let Some(Terminator::Branch(target, args)) = &block.terminator {
                 if args.is_empty() {
                     // This block is empty and just forwards to target.
@@ -56,11 +66,15 @@ fn simplify_function(func: &mut Function) -> bool {
             }
         }
 
-        let Some((empty_block, target)) = redirect else { break };
+        let Some((empty_block, target)) = redirect else {
+            break;
+        };
 
         // Redirect all predecessors of empty_block to target instead.
         for block in &mut func.blocks {
-            if block.id == empty_block { continue; } // don't redirect self
+            if block.id == empty_block {
+                continue;
+            } // don't redirect self
             let term = match &mut block.terminator {
                 Some(t) => t,
                 None => continue,
@@ -97,7 +111,9 @@ fn simplify_function(func: &mut Function) -> bool {
             }
         }
 
-        let Some((pred_id, succ_id)) = merge else { break };
+        let Some((pred_id, succ_id)) = merge else {
+            break;
+        };
 
         // Merge: append successor's instructions and terminator to predecessor.
         let succ_insts = func.block(succ_id).insts.clone();
@@ -124,16 +140,30 @@ fn simplify_function(func: &mut Function) -> bool {
 fn redirect_terminator(term: &mut Terminator, old: BlockId, new: BlockId) {
     match term {
         Terminator::Branch(dest, _) => {
-            if *dest == old { *dest = new; }
+            if *dest == old {
+                *dest = new;
+            }
         }
-        Terminator::CondBranch { true_dest, false_dest, .. } => {
-            if *true_dest == old { *true_dest = new; }
-            if *false_dest == old { *false_dest = new; }
+        Terminator::CondBranch {
+            true_dest,
+            false_dest,
+            ..
+        } => {
+            if *true_dest == old {
+                *true_dest = new;
+            }
+            if *false_dest == old {
+                *false_dest = new;
+            }
         }
         Terminator::Switch { default, cases, .. } => {
-            if *default == old { *default = new; }
+            if *default == old {
+                *default = new;
+            }
             for (_, dest) in cases.iter_mut() {
-                if *dest == old { *dest = new; }
+                if *dest == old {
+                    *dest = new;
+                }
             }
         }
         _ => {}
@@ -143,7 +173,7 @@ fn redirect_terminator(term: &mut Terminator, old: BlockId, new: BlockId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 
     #[test]
@@ -166,7 +196,11 @@ mod tests {
         // contain the ret directly).
         let f = &m.functions[0];
         // The chain should be collapsed.
-        assert!(f.blocks.len() <= 2, "should merge empty chain, got {} blocks", f.blocks.len());
+        assert!(
+            f.blocks.len() <= 2,
+            "should merge empty chain, got {} blocks",
+            f.blocks.len()
+        );
     }
 
     #[test]
@@ -179,7 +213,8 @@ mod tests {
         let id = f.next_value_id();
         f.register_type(id, IrType::Int(IntWidth::I32));
         f.block_mut(b).insts.push(Inst {
-            id, ty: IrType::Int(IntWidth::I32),
+            id,
+            ty: IrType::Int(IntWidth::I32),
             span: crate::lexer::Span {
                 file_id: 0,
                 start: crate::lexer::Position { line: 0, col: 0 },
@@ -195,8 +230,11 @@ mod tests {
         // Body block may be merged into entry (single pred + unconditional branch).
         // But the instruction should be preserved.
         let f = &m.functions[0];
-        let has_const = f.blocks.iter().any(|bl|
-            bl.insts.iter().any(|i| matches!(i.kind, InstKind::ConstInt(42, _))));
+        let has_const = f.blocks.iter().any(|bl| {
+            bl.insts
+                .iter()
+                .any(|i| matches!(i.kind, InstKind::ConstInt(42, _)))
+        });
         assert!(has_const, "const instruction must be preserved");
     }
 }

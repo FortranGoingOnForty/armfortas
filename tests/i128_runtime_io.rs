@@ -74,15 +74,21 @@ fn integer16_print_runs_across_all_opt_levels() {
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful integer(16) print run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful integer(16) print run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(
-            run.stdout.contains("170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("170141183460469231731687303715884105727"),
             "wide positive integer(16) print should survive at {:?}:\n{}",
             level,
             run.stdout
         );
         assert!(
-            run.stdout.contains("-170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("-170141183460469231731687303715884105727"),
             "wide negative integer(16) print should survive at {:?}:\n{}",
             level,
             run.stdout
@@ -164,22 +170,33 @@ fn integer16_formatted_write_runs_across_all_opt_levels() {
             requested: BTreeSet::from([Stage::Run]),
             opt_level: level,
         })
-        .unwrap_or_else(|e| panic!("formatted integer(16) write should run at {:?}:\n{}", level, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "formatted integer(16) write should run at {:?}:\n{}",
+                level, e
+            )
+        });
 
         let run = result
             .get(Stage::Run)
             .and_then(CapturedStage::as_run)
             .expect("missing run capture");
 
-        assert_eq!(run.exit_code, 0, "expected successful formatted integer(16) write run at {:?}:\n{:#?}", level, run);
+        assert_eq!(
+            run.exit_code, 0,
+            "expected successful formatted integer(16) write run at {:?}:\n{:#?}",
+            level, run
+        );
         assert!(
-            run.stdout.contains("170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("170141183460469231731687303715884105727"),
             "wide positive formatted integer(16) output should survive at {:?}:\n{}",
             level,
             run.stdout
         );
         assert!(
-            run.stdout.contains("-170141183460469231731687303715884105727"),
+            run.stdout
+                .contains("-170141183460469231731687303715884105727"),
             "wide negative formatted integer(16) output should survive at {:?}:\n{}",
             level,
             run.stdout

@@ -221,13 +221,25 @@ mod tests {
 
     #[test]
     fn dim_extent() {
-        let dim = DimDescriptor { lower_bound: 1, upper_bound: 10, stride: 1 };
+        let dim = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 10,
+            stride: 1,
+        };
         assert_eq!(dim.extent(), 10);
 
-        let dim2 = DimDescriptor { lower_bound: 1, upper_bound: 10, stride: 2 };
+        let dim2 = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 10,
+            stride: 2,
+        };
         assert_eq!(dim2.extent(), 5);
 
-        let dim3 = DimDescriptor { lower_bound: 5, upper_bound: 3, stride: 1 };
+        let dim3 = DimDescriptor {
+            lower_bound: 5,
+            upper_bound: 3,
+            stride: 1,
+        };
         assert_eq!(dim3.extent(), 0); // empty
     }
 
@@ -256,7 +268,7 @@ mod tests {
         let mut d = ArrayDescriptor::zeroed();
         d.elem_size = 8; // f64
         d.set_bounds(&[(1, 3), (1, 4)]); // 3x4 matrix
-        // Column-major: a(1,1)=0, a(2,1)=8, a(3,1)=16, a(1,2)=24
+                                         // Column-major: a(1,1)=0, a(2,1)=8, a(3,1)=16, a(1,2)=24
         assert_eq!(d.element_offset(&[1, 1]), 0);
         assert_eq!(d.element_offset(&[2, 1]), 8);
         assert_eq!(d.element_offset(&[3, 1]), 16);

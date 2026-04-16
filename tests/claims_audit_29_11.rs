@@ -21,7 +21,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
-    let start = ir.find(&header).unwrap_or_else(|| panic!("missing function section for {}", name));
+    let start = ir
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing function section for {}", name));
     let rest = &ir[start..];
     let end = rest
         .find("\n  }\n")
@@ -137,7 +139,10 @@ fn o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper() {
         "optimized IR should remove the trivial wrapper helper:\n{}",
         opt_ir
     );
-    assert_eq!(obj_a, obj_b, "IPO-audited O2 object snapshot should stay deterministic");
+    assert_eq!(
+        obj_a, obj_b,
+        "IPO-audited O2 object snapshot should stay deterministic"
+    );
 }
 
 #[test]
@@ -236,5 +241,8 @@ fn o3_vectorizes_realworld_explicit_do_stage() {
         "vectorized O3 assembly should reference the bulk add kernel:\n{}",
         o3_asm
     );
-    assert_eq!(o3_obj_a, o3_obj_b, "vectorized O3 object snapshot should stay deterministic");
+    assert_eq!(
+        o3_obj_a, o3_obj_b,
+        "vectorized O3 object snapshot should stay deterministic"
+    );
 }

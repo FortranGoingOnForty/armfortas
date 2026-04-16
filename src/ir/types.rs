@@ -55,7 +55,10 @@ pub enum FloatWidth {
 
 impl FloatWidth {
     pub fn bits(self) -> u32 {
-        match self { Self::F32 => 32, Self::F64 => 64 }
+        match self {
+            Self::F32 => 32,
+            Self::F64 => 64,
+        }
     }
 
     pub fn bytes(self) -> u32 {
@@ -90,7 +93,9 @@ impl IrType {
             Self::Float(w) => w.bytes() as u64,
             Self::Ptr(_) => 8, // 64-bit pointers
             Self::Array(elem, count) => elem.size_bytes() * count,
-            Self::Struct(_) => panic!("Struct size requires struct_defs; use Module::struct_size()"),
+            Self::Struct(_) => {
+                panic!("Struct size requires struct_defs; use Module::struct_size()")
+            }
             Self::FuncPtr(_) => 8,
         }
     }
@@ -102,17 +107,27 @@ impl IrType {
 
     /// Extract the IntWidth if this is an integer type.
     pub fn int_width(&self) -> Option<IntWidth> {
-        if let Self::Int(w) = self { Some(*w) } else { None }
+        if let Self::Int(w) = self {
+            Some(*w)
+        } else {
+            None
+        }
     }
 
     /// Is this an integer type?
-    pub fn is_int(&self) -> bool { matches!(self, Self::Int(_)) }
+    pub fn is_int(&self) -> bool {
+        matches!(self, Self::Int(_))
+    }
 
     /// Is this a float type?
-    pub fn is_float(&self) -> bool { matches!(self, Self::Float(_)) }
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float(_))
+    }
 
     /// Is this a pointer type?
-    pub fn is_ptr(&self) -> bool { matches!(self, Self::Ptr(_)) }
+    pub fn is_ptr(&self) -> bool {
+        matches!(self, Self::Ptr(_))
+    }
 
     /// Fortran integer(1) → i8, integer(2) → i16, integer(4) → i32,
     /// integer(8) → i64, integer(16) → i128.
@@ -149,7 +164,9 @@ impl std::fmt::Display for IrType {
             Self::FuncPtr(sig) => {
                 write!(f, "fn(")?;
                 for (i, p) in sig.params.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", p)?;
                 }
                 write!(f, ") -> {}", sig.ret)

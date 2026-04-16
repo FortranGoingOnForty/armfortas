@@ -611,7 +611,9 @@ pub extern "C" fn afs_fill_i32(dest: *mut i32, n: i64, value: i32) {
     if len == 0 {
         return;
     }
-    unsafe { fill_i32_impl(dest, len, value); }
+    unsafe {
+        fill_i32_impl(dest, len, value);
+    }
 }
 
 #[no_mangle]
@@ -623,7 +625,9 @@ pub extern "C" fn afs_fill_f32(dest: *mut f32, n: i64, value: f32) {
     if len == 0 {
         return;
     }
-    unsafe { fill_f32_impl(dest, len, value); }
+    unsafe {
+        fill_f32_impl(dest, len, value);
+    }
 }
 
 #[no_mangle]
@@ -635,7 +639,9 @@ pub extern "C" fn afs_fill_f64(dest: *mut f64, n: i64, value: f64) {
     if len == 0 {
         return;
     }
-    unsafe { fill_f64_impl(dest, len, value); }
+    unsafe {
+        fill_f64_impl(dest, len, value);
+    }
 }
 
 #[no_mangle]
@@ -647,7 +653,9 @@ pub extern "C" fn afs_array_add_i32(dest: *mut i32, lhs: *const i32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { add_i32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        add_i32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -659,7 +667,9 @@ pub extern "C" fn afs_array_add_f32(dest: *mut f32, lhs: *const f32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { add_f32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        add_f32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -671,7 +681,9 @@ pub extern "C" fn afs_array_add_f64(dest: *mut f64, lhs: *const f64, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { add_f64_impl(dest, lhs, rhs, len); }
+    unsafe {
+        add_f64_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -683,7 +695,9 @@ pub extern "C" fn afs_array_sub_i32(dest: *mut i32, lhs: *const i32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { sub_i32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        sub_i32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -695,7 +709,9 @@ pub extern "C" fn afs_array_sub_f32(dest: *mut f32, lhs: *const f32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { sub_f32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        sub_f32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -707,7 +723,9 @@ pub extern "C" fn afs_array_sub_f64(dest: *mut f64, lhs: *const f64, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { sub_f64_impl(dest, lhs, rhs, len); }
+    unsafe {
+        sub_f64_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -719,7 +737,9 @@ pub extern "C" fn afs_array_mul_i32(dest: *mut i32, lhs: *const i32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { mul_i32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        mul_i32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -731,7 +751,9 @@ pub extern "C" fn afs_array_mul_f32(dest: *mut f32, lhs: *const f32, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { mul_f32_impl(dest, lhs, rhs, len); }
+    unsafe {
+        mul_f32_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -743,7 +765,9 @@ pub extern "C" fn afs_array_mul_f64(dest: *mut f64, lhs: *const f64, rhs: *const
     if len == 0 {
         return;
     }
-    unsafe { mul_f64_impl(dest, lhs, rhs, len); }
+    unsafe {
+        mul_f64_impl(dest, lhs, rhs, len);
+    }
 }
 
 #[no_mangle]
@@ -755,7 +779,9 @@ pub extern "C" fn afs_array_add_scalar_i32(dest: *mut i32, src: *const i32, scal
     if len == 0 {
         return;
     }
-    unsafe { add_scalar_i32_impl(dest, src, scalar, len); }
+    unsafe {
+        add_scalar_i32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -767,7 +793,9 @@ pub extern "C" fn afs_array_add_scalar_f32(dest: *mut f32, src: *const f32, scal
     if len == 0 {
         return;
     }
-    unsafe { add_scalar_f32_impl(dest, src, scalar, len); }
+    unsafe {
+        add_scalar_f32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -779,7 +807,9 @@ pub extern "C" fn afs_array_add_scalar_f64(dest: *mut f64, src: *const f64, scal
     if len == 0 {
         return;
     }
-    unsafe { add_scalar_f64_impl(dest, src, scalar, len); }
+    unsafe {
+        add_scalar_f64_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -791,7 +821,9 @@ pub extern "C" fn afs_array_sub_scalar_i32(dest: *mut i32, src: *const i32, scal
     if len == 0 {
         return;
     }
-    unsafe { sub_scalar_i32_impl(dest, src, scalar, len); }
+    unsafe {
+        sub_scalar_i32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -803,7 +835,9 @@ pub extern "C" fn afs_array_sub_scalar_f32(dest: *mut f32, src: *const f32, scal
     if len == 0 {
         return;
     }
-    unsafe { sub_scalar_f32_impl(dest, src, scalar, len); }
+    unsafe {
+        sub_scalar_f32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -815,7 +849,9 @@ pub extern "C" fn afs_array_sub_scalar_f64(dest: *mut f64, src: *const f64, scal
     if len == 0 {
         return;
     }
-    unsafe { sub_scalar_f64_impl(dest, src, scalar, len); }
+    unsafe {
+        sub_scalar_f64_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -827,7 +863,9 @@ pub extern "C" fn afs_scalar_sub_array_i32(dest: *mut i32, scalar: i32, src: *co
     if len == 0 {
         return;
     }
-    unsafe { scalar_sub_i32_impl(dest, scalar, src, len); }
+    unsafe {
+        scalar_sub_i32_impl(dest, scalar, src, len);
+    }
 }
 
 #[no_mangle]
@@ -839,7 +877,9 @@ pub extern "C" fn afs_scalar_sub_array_f32(dest: *mut f32, scalar: f32, src: *co
     if len == 0 {
         return;
     }
-    unsafe { scalar_sub_f32_impl(dest, scalar, src, len); }
+    unsafe {
+        scalar_sub_f32_impl(dest, scalar, src, len);
+    }
 }
 
 #[no_mangle]
@@ -851,7 +891,9 @@ pub extern "C" fn afs_scalar_sub_array_f64(dest: *mut f64, scalar: f64, src: *co
     if len == 0 {
         return;
     }
-    unsafe { scalar_sub_f64_impl(dest, scalar, src, len); }
+    unsafe {
+        scalar_sub_f64_impl(dest, scalar, src, len);
+    }
 }
 
 #[no_mangle]
@@ -863,7 +905,9 @@ pub extern "C" fn afs_array_mul_scalar_i32(dest: *mut i32, src: *const i32, scal
     if len == 0 {
         return;
     }
-    unsafe { mul_scalar_i32_impl(dest, src, scalar, len); }
+    unsafe {
+        mul_scalar_i32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -875,7 +919,9 @@ pub extern "C" fn afs_array_mul_scalar_f32(dest: *mut f32, src: *const f32, scal
     if len == 0 {
         return;
     }
-    unsafe { mul_scalar_f32_impl(dest, src, scalar, len); }
+    unsafe {
+        mul_scalar_f32_impl(dest, src, scalar, len);
+    }
 }
 
 #[no_mangle]
@@ -887,7 +933,9 @@ pub extern "C" fn afs_array_mul_scalar_f64(dest: *mut f64, src: *const f64, scal
     if len == 0 {
         return;
     }
-    unsafe { mul_scalar_f64_impl(dest, src, scalar, len); }
+    unsafe {
+        mul_scalar_f64_impl(dest, src, scalar, len);
+    }
 }
 
 // ---- ALLOCATE ----
@@ -909,7 +957,11 @@ pub extern "C" fn afs_allocate_array(
     stat: *mut i32,
 ) {
     if desc.is_null() {
-        if !stat.is_null() { unsafe { *stat = 1; } }
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+        }
         return;
     }
 
@@ -918,7 +970,9 @@ pub extern "C" fn afs_allocate_array(
     // Check if already allocated.
     if desc.is_allocated() {
         if !stat.is_null() {
-            unsafe { *stat = 2; } // already allocated
+            unsafe {
+                *stat = 2;
+            } // already allocated
             return;
         }
         eprintln!("ALLOCATE: array is already allocated");
@@ -943,7 +997,11 @@ pub extern "C" fn afs_allocate_array(
         // Zero-size allocation: valid but produces a null/empty array.
         desc.base_addr = ptr::null_mut();
         desc.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
-        if !stat.is_null() { unsafe { *stat = 0; } }
+        if !stat.is_null() {
+            unsafe {
+                *stat = 0;
+            }
+        }
         return;
     }
 
@@ -951,7 +1009,9 @@ pub extern "C" fn afs_allocate_array(
     let ptr = unsafe { libc_malloc(bytes as usize) };
     if ptr.is_null() {
         if !stat.is_null() {
-            unsafe { *stat = 3; } // allocation failed
+            unsafe {
+                *stat = 3;
+            } // allocation failed
             return;
         }
         eprintln!("ALLOCATE: out of memory ({} bytes)", bytes);
@@ -959,24 +1019,36 @@ pub extern "C" fn afs_allocate_array(
     }
 
     // Zero-initialize (Fortran doesn't require this, but it's safer).
-    unsafe { ptr::write_bytes(ptr, 0, bytes as usize); }
+    unsafe {
+        ptr::write_bytes(ptr, 0, bytes as usize);
+    }
 
     desc.base_addr = ptr;
     desc.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
 
-    if !stat.is_null() { unsafe { *stat = 0; } }
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
 }
 
 /// Simplified allocate for a 1D array with given element count.
 /// Used by generated code for simple `allocate(a(n))` patterns.
 #[no_mangle]
-pub extern "C" fn afs_allocate_1d(
-    desc: *mut ArrayDescriptor,
-    elem_size: i64,
-    n: i64,
-) {
-    let dim = DimDescriptor { lower_bound: 1, upper_bound: n, stride: 1 };
-    afs_allocate_array(desc, elem_size, 1, &dim as *const DimDescriptor, ptr::null_mut());
+pub extern "C" fn afs_allocate_1d(desc: *mut ArrayDescriptor, elem_size: i64, n: i64) {
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n,
+        stride: 1,
+    };
+    afs_allocate_array(
+        desc,
+        elem_size,
+        1,
+        &dim as *const DimDescriptor,
+        ptr::null_mut(),
+    );
 }
 
 // ---- DEALLOCATE ----
@@ -985,12 +1057,13 @@ pub extern "C" fn afs_allocate_1d(
 ///
 /// Safe to call on an already-deallocated descriptor (no-op with stat=0).
 #[no_mangle]
-pub extern "C" fn afs_deallocate_array(
-    desc: *mut ArrayDescriptor,
-    stat: *mut i32,
-) {
+pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i32) {
     if desc.is_null() {
-        if !stat.is_null() { unsafe { *stat = 1; } }
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+        }
         return;
     }
 
@@ -999,7 +1072,9 @@ pub extern "C" fn afs_deallocate_array(
     if !desc.is_allocated() {
         // Not allocated — not an error with STAT, abort without STAT.
         if !stat.is_null() {
-            unsafe { *stat = 0; }
+            unsafe {
+                *stat = 0;
+            }
             return;
         }
         // Without STAT, deallocating an unallocated array is an error.
@@ -1009,7 +1084,9 @@ pub extern "C" fn afs_deallocate_array(
 
     // Free the data.
     if !desc.base_addr.is_null() {
-        unsafe { libc_free(desc.base_addr); }
+        unsafe {
+            libc_free(desc.base_addr);
+        }
     }
 
     // Clear the descriptor.
@@ -1017,7 +1094,11 @@ pub extern "C" fn afs_deallocate_array(
     desc.flags &= !DESC_ALLOCATED;
     // Leave rank, elem_size, dims intact (they describe the shape for future allocate).
 
-    if !stat.is_null() { unsafe { *stat = 0; } }
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
 }
 
 // ---- ALLOCATABLE ASSIGNMENT ----
@@ -1031,22 +1112,24 @@ pub extern "C" fn afs_assign_allocatable(
     dest: *mut ArrayDescriptor,
     source: *const ArrayDescriptor,
 ) {
-    if dest.is_null() || source.is_null() { return; }
+    if dest.is_null() || source.is_null() {
+        return;
+    }
 
     let dest = unsafe { &mut *dest };
     let source = unsafe { &*source };
 
     // Check if shapes match.
     let shapes_match = dest.rank == source.rank && {
-        (0..dest.rank as usize).all(|i| {
-            dest.dims[i].extent() == source.dims[i].extent()
-        })
+        (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent())
     };
 
     if !shapes_match || !dest.is_allocated() {
         // Deallocate dest if allocated.
         if dest.is_allocated() && !dest.base_addr.is_null() {
-            unsafe { libc_free(dest.base_addr); }
+            unsafe {
+                libc_free(dest.base_addr);
+            }
             dest.base_addr = ptr::null_mut();
             dest.flags &= !DESC_ALLOCATED;
         }
@@ -1087,18 +1170,19 @@ pub extern "C" fn afs_assign_allocatable(
 /// `to` is deallocated if allocated, then receives `from`'s descriptor.
 /// `from` is cleared (becomes unallocated).
 #[no_mangle]
-pub extern "C" fn afs_move_alloc(
-    from: *mut ArrayDescriptor,
-    to: *mut ArrayDescriptor,
-) {
-    if from.is_null() || to.is_null() { return; }
+pub extern "C" fn afs_move_alloc(from: *mut ArrayDescriptor, to: *mut ArrayDescriptor) {
+    if from.is_null() || to.is_null() {
+        return;
+    }
 
     let from_desc = unsafe { &mut *from };
     let to_desc = unsafe { &mut *to };
 
     // Deallocate `to` if allocated.
     if to_desc.is_allocated() && !to_desc.base_addr.is_null() {
-        unsafe { libc_free(to_desc.base_addr); }
+        unsafe {
+            libc_free(to_desc.base_addr);
+        }
     }
 
     // Copy descriptor from `from` to `to`.
@@ -1114,7 +1198,9 @@ pub extern "C" fn afs_move_alloc(
 /// Check if an array is allocated. Returns 1 (true) or 0 (false).
 #[no_mangle]
 pub extern "C" fn afs_allocated(desc: *const ArrayDescriptor) -> i32 {
-    if desc.is_null() { return 0; }
+    if desc.is_null() {
+        return 0;
+    }
     unsafe { (*desc).is_allocated() as i32 }
 }
 
@@ -1140,7 +1226,9 @@ pub extern "C" fn afs_create_section(
     specs: *const SectionSpec,
     n_dims: i32,
 ) {
-    if source.is_null() || result.is_null() || specs.is_null() { return; }
+    if source.is_null() || result.is_null() || specs.is_null() {
+        return;
+    }
 
     let source = unsafe { &*source };
     let result = unsafe { &mut *result };
@@ -1149,7 +1237,7 @@ pub extern "C" fn afs_create_section(
     result.elem_size = source.elem_size;
     result.rank = n_dims;
     result.flags = DESC_CONTIGUOUS; // sections may not be contiguous
-    // Don't set DESC_ALLOCATED — section doesn't own the data.
+                                    // Don't set DESC_ALLOCATED — section doesn't own the data.
 
     // Compute base address offset and new dims.
     let mut byte_offset: i64 = 0;
@@ -1168,7 +1256,8 @@ pub extern "C" fn afs_create_section(
         let extent = if spec.stride == 0 {
             1
         } else if (spec.stride > 0 && spec.start > spec.end)
-            || (spec.stride < 0 && spec.start < spec.end) {
+            || (spec.stride < 0 && spec.start < spec.end)
+        {
             0 // empty section
         } else {
             (spec.end - spec.start) / spec.stride + 1
@@ -1234,8 +1323,16 @@ mod tests {
     fn allocate_2d() {
         let mut desc = ArrayDescriptor::zeroed();
         let dims = [
-            DimDescriptor { lower_bound: 1, upper_bound: 3, stride: 1 },
-            DimDescriptor { lower_bound: 1, upper_bound: 4, stride: 1 },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 3,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 4,
+                stride: 1,
+            },
         ];
         afs_allocate_array(&mut desc, 8, 2, dims.as_ptr(), ptr::null_mut());
         assert!(desc.is_allocated());
@@ -1250,7 +1347,11 @@ mod tests {
         let mut stat: i32 = -1;
         afs_allocate_1d(&mut desc, 4, 10);
         // Allocating again should fail with stat.
-        let dim = DimDescriptor { lower_bound: 1, upper_bound: 10, stride: 1 };
+        let dim = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 10,
+            stride: 1,
+        };
         afs_allocate_array(&mut desc, 4, 1, &dim, &mut stat);
         assert_eq!(stat, 2); // already allocated
         afs_deallocate_array(&mut desc, ptr::null_mut());
@@ -1333,7 +1434,12 @@ mod tests {
         let lhs = [1_i32, 2, 3, 4, 5, 6, 7, 8];
         let rhs = [10_i32, 20, 30, 40, 50, 60, 70, 80];
         let mut out = [0_i32; 8];
-        afs_array_add_i32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        afs_array_add_i32(
+            out.as_mut_ptr(),
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.len() as i64,
+        );
         assert_eq!(out, [11, 22, 33, 44, 55, 66, 77, 88]);
     }
 
@@ -1342,7 +1448,12 @@ mod tests {
         let lhs = [1.5_f64, 2.5, 3.5, 4.5];
         let rhs = [10.0_f64, 20.0, 30.0, 40.0];
         let mut out = [0.0_f64; 4];
-        afs_array_add_f64(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        afs_array_add_f64(
+            out.as_mut_ptr(),
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.len() as i64,
+        );
         assert_eq!(out, [11.5, 22.5, 33.5, 44.5]);
     }
 
@@ -1351,7 +1462,12 @@ mod tests {
         let lhs = [11_i32, 22, 33, 44, 55, 66, 77, 88];
         let rhs = [1_i32, 2, 3, 4, 5, 6, 7, 8];
         let mut out = [0_i32; 8];
-        afs_array_sub_i32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        afs_array_sub_i32(
+            out.as_mut_ptr(),
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.len() as i64,
+        );
         assert_eq!(out, [10, 20, 30, 40, 50, 60, 70, 80]);
     }
 
@@ -1360,7 +1476,12 @@ mod tests {
         let lhs = [1.0_f32, 2.0, 3.0, 4.0];
         let rhs = [2.0_f32, 3.0, 4.0, 5.0];
         let mut out = [0.0_f32; 4];
-        afs_array_mul_f32(out.as_mut_ptr(), lhs.as_ptr(), rhs.as_ptr(), out.len() as i64);
+        afs_array_mul_f32(
+            out.as_mut_ptr(),
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.len() as i64,
+        );
         assert_eq!(out, [2.0, 6.0, 12.0, 20.0]);
     }
 
@@ -1394,43 +1515,63 @@ mod tests {
 /// SIZE(array) — total number of elements.
 #[no_mangle]
 pub extern "C" fn afs_array_size(desc: *const ArrayDescriptor) -> i64 {
-    if desc.is_null() { return 0; }
+    if desc.is_null() {
+        return 0;
+    }
     unsafe { (*desc).total_elements() }
 }
 
 /// SIZE(array, dim) — number of elements along dimension `dim` (1-based).
 #[no_mangle]
 pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> i64 {
-    if desc.is_null() || dim < 1 { return 0; }
+    if desc.is_null() || dim < 1 {
+        return 0;
+    }
     let d = unsafe { &*desc };
     let idx = (dim - 1) as usize;
     if idx < d.rank as usize {
         d.dims[idx].extent()
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 /// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
 #[no_mangle]
 pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
-    if desc.is_null() || dim < 1 { return 1; }
+    if desc.is_null() || dim < 1 {
+        return 1;
+    }
     let d = unsafe { &*desc };
     let idx = (dim - 1) as usize;
-    if idx < d.rank as usize { d.dims[idx].lower_bound } else { 1 }
+    if idx < d.rank as usize {
+        d.dims[idx].lower_bound
+    } else {
+        1
+    }
 }
 
 /// UBOUND(array, dim) — upper bound along dimension `dim` (1-based).
 #[no_mangle]
 pub extern "C" fn afs_array_ubound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
-    if desc.is_null() || dim < 1 { return 0; }
+    if desc.is_null() || dim < 1 {
+        return 0;
+    }
     let d = unsafe { &*desc };
     let idx = (dim - 1) as usize;
-    if idx < d.rank as usize { d.dims[idx].upper_bound } else { 0 }
+    if idx < d.rank as usize {
+        d.dims[idx].upper_bound
+    } else {
+        0
+    }
 }
 
 /// ALLOCATED(array) — check if array is allocated (returns 1 or 0).
 #[no_mangle]
 pub extern "C" fn afs_array_allocated(desc: *const ArrayDescriptor) -> i32 {
-    if desc.is_null() { return 0; }
+    if desc.is_null() {
+        return 0;
+    }
     unsafe { (*desc).is_allocated() as i32 }
 }
 
@@ -1438,9 +1579,13 @@ pub extern "C" fn afs_array_allocated(desc: *const ArrayDescriptor) -> i32 {
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
-    if desc.is_null() { return 0.0; }
+    if desc.is_null() {
+        return 0.0;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return 0.0; }
+    if d.base_addr.is_null() {
+        return 0.0;
+    }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const f64;
@@ -1455,9 +1600,13 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
-    if desc.is_null() { return 0; }
+    if desc.is_null() {
+        return 0;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return 0; }
+    if d.base_addr.is_null() {
+        return 0;
+    }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const i32;
@@ -1471,9 +1620,13 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
 /// PRODUCT(array) — product of all elements (real(8) version).
 #[no_mangle]
 pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
-    if desc.is_null() { return 1.0; }
+    if desc.is_null() {
+        return 1.0;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return 1.0; }
+    if d.base_addr.is_null() {
+        return 1.0;
+    }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const f64;
@@ -1487,11 +1640,17 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
 /// PRODUCT(array) — product of all elements (integer(4) version).
 #[no_mangle]
 pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
-    if desc.is_null() { return 1; }
+    if desc.is_null() {
+        return 1;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return 1; }
+    if d.base_addr.is_null() {
+        return 1;
+    }
     let n = d.total_elements() as usize;
-    if n == 0 { return 1; }
+    if n == 0 {
+        return 1;
+    }
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const i32;
     let mut prod: i64 = 1;
@@ -1504,17 +1663,25 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
 /// MAXVAL(array) — maximum element (real(8) version). Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
-    if desc.is_null() { return f64::NEG_INFINITY; }
+    if desc.is_null() {
+        return f64::NEG_INFINITY;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return f64::NEG_INFINITY; }
+    if d.base_addr.is_null() {
+        return f64::NEG_INFINITY;
+    }
     let n = d.total_elements() as usize;
-    if n == 0 { return f64::NEG_INFINITY; }
+    if n == 0 {
+        return f64::NEG_INFINITY;
+    }
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const f64;
     let mut max = unsafe { *ptr };
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
-        if v > max { max = v; }
+        if v > max {
+            max = v;
+        }
     }
     max
 }
@@ -1522,17 +1689,25 @@ pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
 /// MINVAL(array) — minimum element (real(8) version). Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
-    if desc.is_null() { return f64::INFINITY; }
+    if desc.is_null() {
+        return f64::INFINITY;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return f64::INFINITY; }
+    if d.base_addr.is_null() {
+        return f64::INFINITY;
+    }
     let n = d.total_elements() as usize;
-    if n == 0 { return f64::INFINITY; }
+    if n == 0 {
+        return f64::INFINITY;
+    }
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const f64;
     let mut min = unsafe { *ptr };
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
-        if v < min { min = v; }
+        if v < min {
+            min = v;
+        }
     }
     min
 }
@@ -1540,17 +1715,25 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
 /// MAXVAL(array) — maximum element (integer(4) version). Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
-    if desc.is_null() { return i32::MIN; }
+    if desc.is_null() {
+        return i32::MIN;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return i32::MIN; }
+    if d.base_addr.is_null() {
+        return i32::MIN;
+    }
     let n = d.total_elements() as usize;
-    if n == 0 { return i32::MIN; }
+    if n == 0 {
+        return i32::MIN;
+    }
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const i32;
     let mut max = unsafe { *ptr };
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
-        if v > max { max = v; }
+        if v > max {
+            max = v;
+        }
     }
     max
 }
@@ -1558,17 +1741,25 @@ pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
 /// MINVAL(array) — minimum element (integer(4) version). Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
-    if desc.is_null() { return i32::MAX; }
+    if desc.is_null() {
+        return i32::MAX;
+    }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() { return i32::MAX; }
+    if d.base_addr.is_null() {
+        return i32::MAX;
+    }
     let n = d.total_elements() as usize;
-    if n == 0 { return i32::MAX; }
+    if n == 0 {
+        return i32::MAX;
+    }
     let stride = d.dims[0].stride.max(1) as usize;
     let ptr = d.base_addr as *const i32;
     let mut min = unsafe { *ptr };
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
-        if v < min { min = v; }
+        if v < min {
+            min = v;
+        }
     }
     min
 }
@@ -1580,9 +1771,13 @@ pub extern "C" fn afs_transpose_real8(
     source: *const ArrayDescriptor,
     result: *mut ArrayDescriptor,
 ) {
-    if source.is_null() || result.is_null() { return; }
+    if source.is_null() || result.is_null() {
+        return;
+    }
     let src = unsafe { &*source };
-    if src.rank < 2 || src.base_addr.is_null() { return; }
+    if src.rank < 2 || src.base_addr.is_null() {
+        return;
+    }
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
@@ -1592,13 +1787,23 @@ pub extern "C" fn afs_transpose_real8(
     afs_allocate_1d(result, 8, (n * m) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
-    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
-    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
     let rp = res.base_addr as *mut f64;
 
     for i in 0..m {
         for j in 0..n {
-            unsafe { *rp.add(j * m + i) = *sp.add(i * n + j); }
+            unsafe {
+                *rp.add(j * m + i) = *sp.add(i * n + j);
+            }
         }
     }
 }
@@ -1611,14 +1816,26 @@ pub extern "C" fn afs_matmul_real8(
     b: *const ArrayDescriptor,
     result: *mut ArrayDescriptor,
 ) {
-    if a.is_null() || b.is_null() || result.is_null() { return; }
+    if a.is_null() || b.is_null() || result.is_null() {
+        return;
+    }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    if da.base_addr.is_null() || db.base_addr.is_null() { return; }
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
 
     let m = da.dims[0].extent() as usize;
-    let k = if da.rank >= 2 { da.dims[1].extent() as usize } else { 1 };
-    let n = if db.rank >= 2 { db.dims[1].extent() as usize } else { db.dims[0].extent() as usize };
+    let k = if da.rank >= 2 {
+        da.dims[1].extent() as usize
+    } else {
+        1
+    };
+    let n = if db.rank >= 2 {
+        db.dims[1].extent() as usize
+    } else {
+        db.dims[0].extent() as usize
+    };
 
     // For vector * matrix or matrix * vector, adjust dimensions.
     let ap = da.base_addr as *const f64;
@@ -1628,8 +1845,16 @@ pub extern "C" fn afs_matmul_real8(
     afs_allocate_1d(result, 8, (m * n) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
-    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
-    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
     let rp = res.base_addr as *mut f64;
 
     // Triple loop: C(i,j) = sum_l A(i,l) * B(l,j)
@@ -1641,7 +1866,9 @@ pub extern "C" fn afs_matmul_real8(
                 let b_val = unsafe { *bp.add(l * n + j) };
                 sum += a_val * b_val;
             }
-            unsafe { *rp.add(i * n + j) = sum; }
+            unsafe {
+                *rp.add(i * n + j) = sum;
+            }
         }
     }
 }
@@ -1653,14 +1880,26 @@ pub extern "C" fn afs_matmul_int(
     b: *const ArrayDescriptor,
     result: *mut ArrayDescriptor,
 ) {
-    if a.is_null() || b.is_null() || result.is_null() { return; }
+    if a.is_null() || b.is_null() || result.is_null() {
+        return;
+    }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    if da.base_addr.is_null() || db.base_addr.is_null() { return; }
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
 
     let m = da.dims[0].extent() as usize;
-    let k = if da.rank >= 2 { da.dims[1].extent() as usize } else { 1 };
-    let n = if db.rank >= 2 { db.dims[1].extent() as usize } else { db.dims[0].extent() as usize };
+    let k = if da.rank >= 2 {
+        da.dims[1].extent() as usize
+    } else {
+        1
+    };
+    let n = if db.rank >= 2 {
+        db.dims[1].extent() as usize
+    } else {
+        db.dims[0].extent() as usize
+    };
 
     let ap = da.base_addr as *const i32;
     let bp = db.base_addr as *const i32;
@@ -1668,8 +1907,16 @@ pub extern "C" fn afs_matmul_int(
     afs_allocate_1d(result, 4, (m * n) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
-    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
-    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
     let rp = res.base_addr as *mut i32;
 
     for i in 0..m {
@@ -1680,20 +1927,23 @@ pub extern "C" fn afs_matmul_int(
                 let b_val = unsafe { *bp.add(l * n + j) as i64 };
                 sum += a_val * b_val;
             }
-            unsafe { *rp.add(i * n + j) = sum as i32; }
+            unsafe {
+                *rp.add(i * n + j) = sum as i32;
+            }
         }
     }
 }
 
 /// TRANSPOSE(source, result) — matrix transpose (integer(4) version).
 #[no_mangle]
-pub extern "C" fn afs_transpose_int(
-    source: *const ArrayDescriptor,
-    result: *mut ArrayDescriptor,
-) {
-    if source.is_null() || result.is_null() { return; }
+pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut ArrayDescriptor) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
     let src = unsafe { &*source };
-    if src.rank < 2 || src.base_addr.is_null() { return; }
+    if src.rank < 2 || src.base_addr.is_null() {
+        return;
+    }
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
@@ -1702,13 +1952,23 @@ pub extern "C" fn afs_transpose_int(
     afs_allocate_1d(result, 4, (n * m) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
-    res.dims[0] = DimDescriptor { lower_bound: 1, upper_bound: n as i64, stride: 1 };
-    res.dims[1] = DimDescriptor { lower_bound: 1, upper_bound: m as i64, stride: 1 };
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
     let rp = res.base_addr as *mut i32;
 
     for i in 0..m {
         for j in 0..n {
-            unsafe { *rp.add(j * m + i) = *sp.add(i * n + j); }
+            unsafe {
+                *rp.add(j * m + i) = *sp.add(i * n + j);
+            }
         }
     }
 }
@@ -1720,10 +1980,14 @@ pub extern "C" fn afs_dot_product_real8(
     a: *const ArrayDescriptor,
     b: *const ArrayDescriptor,
 ) -> f64 {
-    if a.is_null() || b.is_null() { return 0.0; }
+    if a.is_null() || b.is_null() {
+        return 0.0;
+    }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    if da.base_addr.is_null() || db.base_addr.is_null() { return 0.0; }
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return 0.0;
+    }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
     let stride_a = da.dims[0].stride.max(1) as usize;
     let stride_b = db.dims[0].stride.max(1) as usize;
@@ -1742,10 +2006,14 @@ pub extern "C" fn afs_dot_product_real4(
     a: *const ArrayDescriptor,
     b: *const ArrayDescriptor,
 ) -> f32 {
-    if a.is_null() || b.is_null() { return 0.0; }
+    if a.is_null() || b.is_null() {
+        return 0.0;
+    }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    if da.base_addr.is_null() || db.base_addr.is_null() { return 0.0; }
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return 0.0;
+    }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
     let stride_a = da.dims[0].stride.max(1) as usize;
     let stride_b = db.dims[0].stride.max(1) as usize;
@@ -1760,14 +2028,15 @@ pub extern "C" fn afs_dot_product_real4(
 
 /// DOT_PRODUCT(a, b) — vector dot product (integer(4) version).
 #[no_mangle]
-pub extern "C" fn afs_dot_product_int(
-    a: *const ArrayDescriptor,
-    b: *const ArrayDescriptor,
-) -> i64 {
-    if a.is_null() || b.is_null() { return 0; }
+pub extern "C" fn afs_dot_product_int(a: *const ArrayDescriptor, b: *const ArrayDescriptor) -> i64 {
+    if a.is_null() || b.is_null() {
+        return 0;
+    }
     let da = unsafe { &*a };
     let db = unsafe { &*b };
-    if da.base_addr.is_null() || db.base_addr.is_null() { return 0; }
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return 0;
+    }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
     let stride_a = da.dims[0].stride.max(1) as usize;
     let stride_b = db.dims[0].stride.max(1) as usize;

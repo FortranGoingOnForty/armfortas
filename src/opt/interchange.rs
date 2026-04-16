@@ -24,20 +24,24 @@
 //! use both IVs as simple direct subscripts with no cross-iteration
 //! read-before-write. This avoids needing full dependence analysis.
 
-use crate::ir::inst::*;
-use crate::ir::walk::predecessors;
 use super::loop_tree::build_loop_tree;
 use super::pass::Pass;
+use crate::ir::inst::*;
+use crate::ir::walk::predecessors;
 
 pub struct LoopInterchange;
 
 impl Pass for LoopInterchange {
-    fn name(&self) -> &'static str { "loop-interchange" }
+    fn name(&self) -> &'static str {
+        "loop-interchange"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if interchange_in_function(func) { changed = true; }
+            if interchange_in_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -54,8 +58,12 @@ fn interchange_in_function(func: &mut Function) -> bool {
 
         // Both loops must have a recognized counted-loop structure:
         // header(%iv) → cmp_block(icmp, condBr) → body → latch(iadd, br header)
-        let Some(outer_shape) = detect_loop_shape(func, outer, &preds) else { continue };
-        let Some(inner_shape) = detect_loop_shape(func, inner, &preds) else { continue };
+        let Some(outer_shape) = detect_loop_shape(func, outer, &preds) else {
+            continue;
+        };
+        let Some(inner_shape) = detect_loop_shape(func, inner, &preds) else {
+            continue;
+        };
 
         // Check profitability: is the outer IV used as the first (fast)
         // subscript of a multi-dimensional array GEP?
@@ -80,11 +88,11 @@ fn interchange_in_function(func: &mut Function) -> bool {
 struct LoopShape {
     header: BlockId,
     cmp_block: BlockId,
-    iv: ValueId,          // block param on header
-    bound: ValueId,       // the upper-bound value in the comparison
+    iv: ValueId,    // block param on header
+    bound: ValueId, // the upper-bound value in the comparison
     latch: BlockId,
     /// The value passed to the header from the preheader (initial IV).
-    init_arg_idx: usize,  // index in preheader's branch args
+    init_arg_idx: usize, // index in preheader's branch args
 }
 
 fn detect_loop_shape(
@@ -96,16 +104,22 @@ fn detect_loop_shape(
     let hdr = func.block(header);
 
     // Header must have exactly 1 block param (the IV).
-    if hdr.params.len() != 1 { return None; }
+    if hdr.params.len() != 1 {
+        return None;
+    }
     let iv = hdr.params[0].id;
 
     // Header must be a relay (0 instructions, branch to cmp_block).
-    if !hdr.insts.is_empty() { return None; }
+    if !hdr.insts.is_empty() {
+        return None;
+    }
     let cmp_block = match &hdr.terminator {
         Some(Terminator::Branch(t, args)) if args.is_empty() => *t,
         _ => return None,
     };
-    if !node.body.contains(&cmp_block) { return None; }
+    if !node.body.contains(&cmp_block) {
+        return None;
+    }
 
     // Cmp block must have icmp + condBr.
     let cmp_blk = func.block(cmp_block);
@@ -114,15 +128,20 @@ fn detect_loop_shape(
         for inst in &cmp_blk.insts {
             if let InstKind::ICmp(_, a, b) = &inst.kind {
                 // One operand should be the IV, the other is the bound.
-                if *a == iv { found_bound = Some(*b); }
-                else if *b == iv { found_bound = Some(*a); }
+                if *a == iv {
+                    found_bound = Some(*b);
+                } else if *b == iv {
+                    found_bound = Some(*a);
+                }
             }
         }
         found_bound?
     };
 
     // Find the single latch.
-    if node.latches.len() != 1 { return None; }
+    if node.latches.len() != 1 {
+        return None;
+    }
     let latch = node.latches[0];
 
     Some(LoopShape {
@@ -185,7 +204,9 @@ fn uses_iv_in_fast_position(
     _inner_iv: ValueId,
 ) -> bool {
     // Find the instruction that produces `offset`.
-    let Some(inst) = find_inst(func, offset) else { return false };
+    let Some(inst) = find_inst(func, offset) else {
+        return false;
+    };
 
     // The offset should be an iadd of two parts.
     let (a, b) = match &inst.kind {
@@ -199,9 +220,13 @@ fn uses_iv_in_fast_position(
     let b_uses_mul = trace_involves_mul(func, b);
 
     // The fast part is the one WITHOUT multiplication.
-    let fast_part = if !a_uses_mul && b_uses_mul { a }
-                    else if a_uses_mul && !b_uses_mul { b }
-                    else { return false };
+    let fast_part = if !a_uses_mul && b_uses_mul {
+        a
+    } else if a_uses_mul && !b_uses_mul {
+        b
+    } else {
+        return false;
+    };
 
     // Does the fast part trace back to the outer IV?
     traces_to_iv(func, fast_part, outer_iv)
@@ -209,11 +234,14 @@ fn uses_iv_in_fast_position(
 
 /// Check if a value's computation involves an IMul somewhere.
 fn trace_involves_mul(func: &Function, val: ValueId) -> bool {
-    let Some(inst) = find_inst(func, val) else { return false };
+    let Some(inst) = find_inst(func, val) else {
+        return false;
+    };
     match &inst.kind {
         InstKind::IMul(..) => true,
-        InstKind::IAdd(a, b) | InstKind::ISub(a, b) =>
-            trace_involves_mul(func, *a) || trace_involves_mul(func, *b),
+        InstKind::IAdd(a, b) | InstKind::ISub(a, b) => {
+            trace_involves_mul(func, *a) || trace_involves_mul(func, *b)
+        }
         InstKind::IntExtend(a, _, _) => trace_involves_mul(func, *a),
         _ => false,
     }
@@ -221,8 +249,12 @@ fn trace_involves_mul(func: &Function, val: ValueId) -> bool {
 
 /// Check if a value traces back to a specific IV (through isub, int_extend).
 fn traces_to_iv(func: &Function, val: ValueId, iv: ValueId) -> bool {
-    if val == iv { return true; }
-    let Some(inst) = find_inst(func, val) else { return false };
+    if val == iv {
+        return true;
+    }
+    let Some(inst) = find_inst(func, val) else {
+        return false;
+    };
     match &inst.kind {
         InstKind::ISub(a, _) => traces_to_iv(func, *a, iv),
         InstKind::IntExtend(a, _, _) => traces_to_iv(func, *a, iv),
@@ -234,7 +266,9 @@ fn traces_to_iv(func: &Function, val: ValueId, iv: ValueId) -> bool {
 fn find_inst(func: &Function, vid: ValueId) -> Option<&Inst> {
     for block in &func.blocks {
         for inst in &block.insts {
-            if inst.id == vid { return Some(inst); }
+            if inst.id == vid {
+                return Some(inst);
+            }
         }
     }
     None
@@ -253,7 +287,9 @@ fn is_interchange_legal(
 
 /// Trace through a GEP chain to find the base array pointer.
 fn trace_gep_base(func: &Function, ptr: ValueId) -> Option<ValueId> {
-    let Some(inst) = find_inst(func, ptr) else { return Some(ptr); };
+    let Some(inst) = find_inst(func, ptr) else {
+        return Some(ptr);
+    };
     match &inst.kind {
         InstKind::GetElementPtr(base, _) => Some(*base),
         _ => Some(ptr),
@@ -277,7 +313,12 @@ fn do_interchange(func: &mut Function, outer: &LoopShape, inner: &LoopShape) {
                     break;
                 }
             }
-            if let Some(Terminator::CondBranch { true_dest, false_dest, .. }) = &block.terminator {
+            if let Some(Terminator::CondBranch {
+                true_dest,
+                false_dest,
+                ..
+            }) = &block.terminator
+            {
                 if *true_dest == outer.header || *false_dest == outer.header {
                     // Could be a condBr preheader from preheader insertion
                     // but we need the unconditional one.
@@ -286,7 +327,9 @@ fn do_interchange(func: &mut Function, outer: &LoopShape, inner: &LoopShape) {
         }
         ph
     };
-    let Some(outer_ph) = outer_preheader else { return; };
+    let Some(outer_ph) = outer_preheader else {
+        return;
+    };
 
     // Find the block that branches to the inner header with the inner
     // IV init value (this is the outer loop's "body entry" block).
@@ -299,7 +342,12 @@ fn do_interchange(func: &mut Function, outer: &LoopShape, inner: &LoopShape) {
                     break;
                 }
             }
-            if let Some(Terminator::CondBranch { true_dest, true_args, .. }) = &block.terminator {
+            if let Some(Terminator::CondBranch {
+                true_dest,
+                true_args,
+                ..
+            }) = &block.terminator
+            {
                 if *true_dest == inner.header && !true_args.is_empty() {
                     ie = Some(block.id);
                     break;
@@ -308,13 +356,19 @@ fn do_interchange(func: &mut Function, outer: &LoopShape, inner: &LoopShape) {
         }
         ie
     };
-    let Some(inner_entry_block) = inner_entry else { return; };
+    let Some(inner_entry_block) = inner_entry else {
+        return;
+    };
 
     // Get current init values.
     let outer_init = get_branch_arg_to(func, outer_ph, outer.header, 0);
     let inner_init = get_branch_arg_to(func, inner_entry_block, inner.header, 0);
-    let Some(outer_init_val) = outer_init else { return };
-    let Some(inner_init_val) = inner_init else { return };
+    let Some(outer_init_val) = outer_init else {
+        return;
+    };
+    let Some(inner_init_val) = inner_init else {
+        return;
+    };
 
     // Swap init values: outer preheader now passes inner's init to
     // outer's header, and inner entry now passes outer's init to
@@ -332,10 +386,20 @@ fn get_branch_arg_to(func: &Function, from: BlockId, to: BlockId, idx: usize) ->
     let block = func.block(from);
     match &block.terminator {
         Some(Terminator::Branch(dest, args)) if *dest == to => args.get(idx).copied(),
-        Some(Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. }) => {
-            if *true_dest == to { true_args.get(idx).copied() }
-            else if *false_dest == to { false_args.get(idx).copied() }
-            else { None }
+        Some(Terminator::CondBranch {
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+            ..
+        }) => {
+            if *true_dest == to {
+                true_args.get(idx).copied()
+            } else if *false_dest == to {
+                false_args.get(idx).copied()
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -346,18 +410,35 @@ fn set_branch_arg_to(func: &mut Function, from: BlockId, to: BlockId, idx: usize
     let block = func.block_mut(from);
     match &mut block.terminator {
         Some(Terminator::Branch(dest, args)) if *dest == to => {
-            if idx < args.len() { args[idx] = val; }
+            if idx < args.len() {
+                args[idx] = val;
+            }
         }
-        Some(Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. }) => {
-            if *true_dest == to && idx < true_args.len() { true_args[idx] = val; }
-            else if *false_dest == to && idx < false_args.len() { false_args[idx] = val; }
+        Some(Terminator::CondBranch {
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+            ..
+        }) => {
+            if *true_dest == to && idx < true_args.len() {
+                true_args[idx] = val;
+            } else if *false_dest == to && idx < false_args.len() {
+                false_args[idx] = val;
+            }
         }
         _ => {}
     }
 }
 
 /// Swap the bound value in a comparison block's ICmp instruction.
-fn swap_bound(func: &mut Function, cmp_block: BlockId, iv: ValueId, old_bound: ValueId, new_bound: ValueId) {
+fn swap_bound(
+    func: &mut Function,
+    cmp_block: BlockId,
+    iv: ValueId,
+    old_bound: ValueId,
+    new_bound: ValueId,
+) {
     let block = func.block_mut(cmp_block);
     for inst in &mut block.insts {
         if let InstKind::ICmp(_op, a, b) = &mut inst.kind {
@@ -380,12 +461,16 @@ fn swap_bound(func: &mut Function, cmp_block: BlockId, iv: ValueId, old_bound: V
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
-    use crate::lexer::{Span, Position};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     #[test]

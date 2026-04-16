@@ -4,12 +4,12 @@
 //! Expression parsing uses a Pratt parser with 12 precedence levels
 //! matching the Fortran standard exactly.
 
-pub mod expr;
 pub mod decl;
+pub mod expr;
 pub mod stmt;
 pub mod unit;
 
-use crate::lexer::{Token, TokenKind, Span};
+use crate::lexer::{Span, Token, TokenKind};
 
 use std::fmt;
 
@@ -22,7 +22,11 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: error: {}", self.span.start.line, self.span.start.col, self.msg)
+        write!(
+            f,
+            "{}:{}: error: {}",
+            self.span.start.line, self.span.start.col, self.msg
+        )
     }
 }
 
@@ -111,7 +115,10 @@ impl<'a> Parser<'a> {
     /// F2018 §6.3.2: a semicolon separates statements on the same line
     /// and is semantically equivalent to a newline.
     pub fn skip_newlines(&mut self) {
-        while matches!(self.peek(), TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon) {
+        while matches!(
+            self.peek(),
+            TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon
+        ) {
             self.advance();
         }
     }
@@ -140,13 +147,21 @@ impl<'a> Parser<'a> {
 
     /// Check if we're at a statement-ending token.
     pub fn at_stmt_end(&self) -> bool {
-        matches!(self.peek(), TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment)
+        matches!(
+            self.peek(),
+            TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment
+        )
     }
 
     /// Check if the token at offset `n` from current position is a statement terminator.
     pub fn at_stmt_end_after(&self, n: usize) -> bool {
         let idx = self.pos + n;
-        if idx >= self.tokens.len() { return true; }
-        matches!(self.tokens[idx].kind, TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment)
+        if idx >= self.tokens.len() {
+            return true;
+        }
+        matches!(
+            self.tokens[idx].kind,
+            TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof | TokenKind::Comment
+        )
     }
 }

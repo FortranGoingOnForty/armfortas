@@ -26,11 +26,11 @@
 //! Gated on body size (≤ UNSWITCH_MAX_BODY instructions) to prevent
 //! code bloat. Fires at O2+.
 
-use std::collections::{HashMap, HashSet};
-use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors, prune_unreachable};
 use super::loop_utils::{find_preheader, loop_defined_values};
 use super::pass::Pass;
+use crate::ir::inst::*;
+use crate::ir::walk::{find_natural_loops, predecessors, prune_unreachable};
+use std::collections::{HashMap, HashSet};
 
 /// Maximum number of instructions in the loop body to consider for
 /// unswitching. Unswitching doubles the code, so keep this tight.
@@ -38,15 +38,26 @@ const UNSWITCH_MAX_BODY: usize = 50;
 
 pub struct LoopUnswitch;
 
-type UnswitchCandidate = (BlockId, ValueId, BlockId, Vec<ValueId>, BlockId, Vec<ValueId>);
+type UnswitchCandidate = (
+    BlockId,
+    ValueId,
+    BlockId,
+    Vec<ValueId>,
+    BlockId,
+    Vec<ValueId>,
+);
 
 impl Pass for LoopUnswitch {
-    fn name(&self) -> &'static str { "loop-unswitch" }
+    fn name(&self) -> &'static str {
+        "loop-unswitch"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if unswitch_in_function(func) { changed = true; }
+            if unswitch_in_function(func) {
+                changed = true;
+            }
         }
         changed
     }
@@ -60,19 +71,22 @@ fn unswitch_in_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
-        let Some(ph_id) = find_preheader(func, lp, &preds) else { continue };
+        let Some(ph_id) = find_preheader(func, lp, &preds) else {
+            continue;
+        };
 
         // Size guard.
-        let total_insts: usize = lp.body.iter()
-            .map(|&b| func.block(b).insts.len())
-            .sum();
-        if total_insts > UNSWITCH_MAX_BODY { continue; }
+        let total_insts: usize = lp.body.iter().map(|&b| func.block(b).insts.len()).sum();
+        if total_insts > UNSWITCH_MAX_BODY {
+            continue;
+        }
 
         // Find a CondBranch inside the loop whose condition is invariant.
         let loop_defs = loop_defined_values(func, lp);
 
         let candidate = find_unswitch_candidate(func, lp, &loop_defs);
-        let Some((cond_block, cond_val, true_dest, true_args, false_dest, false_args)) = candidate else {
+        let Some((cond_block, cond_val, true_dest, true_args, false_dest, false_args)) = candidate
+        else {
             continue;
         };
 
@@ -91,7 +105,8 @@ fn unswitch_in_function(func: &mut Function) -> bool {
         let true_cond_block = true_map[&cond_block];
         let true_true_dest = true_map[&true_dest];
         let true_val_map = build_value_map(func, lp, &true_blocks, &true_map);
-        let remapped_true_args: Vec<ValueId> = true_args.iter()
+        let remapped_true_args: Vec<ValueId> = true_args
+            .iter()
             .map(|v| *true_val_map.get(v).unwrap_or(v))
             .collect();
         func.block_mut(true_cond_block).terminator =
@@ -102,7 +117,8 @@ fn unswitch_in_function(func: &mut Function) -> bool {
         let false_cond_block = false_map[&cond_block];
         let false_false_dest = false_map[&false_dest];
         let false_val_map = build_value_map(func, lp, &false_blocks, &false_map);
-        let remapped_false_args: Vec<ValueId> = false_args.iter()
+        let remapped_false_args: Vec<ValueId> = false_args
+            .iter()
             .map(|v| *false_val_map.get(v).unwrap_or(v))
             .collect();
         func.block_mut(false_cond_block).terminator =
@@ -147,14 +163,25 @@ fn find_unswitch_candidate(
     for &bid in &lp.body {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch {
-            cond, true_dest, true_args, false_dest, false_args,
-        }) = &block.terminator {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) = &block.terminator
+        {
             // Condition must be loop-invariant (not defined in the loop).
             if !loop_defs.contains(cond) {
                 // Both targets must be in the loop (not the loop exit).
                 if lp.body.contains(true_dest) && lp.body.contains(false_dest) {
-                    return Some((bid, *cond, *true_dest, true_args.clone(),
-                                 *false_dest, false_args.clone()));
+                    return Some((
+                        bid,
+                        *cond,
+                        *true_dest,
+                        true_args.clone(),
+                        *false_dest,
+                        false_args.clone(),
+                    ));
                 }
             }
         }
@@ -190,13 +217,17 @@ fn build_value_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
-    use crate::lexer::{Span, Position};
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
-        Span { file_id: 0, start: pos, end: pos }
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
     }
 
     /// Build: entry → preheader → header(%i) → cmp → body → cond_branch(flag, t_body, f_body) →
@@ -208,32 +239,38 @@ mod tests {
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let preheader = f.create_block("preheader");
-        let header    = f.create_block("header");
-        let cmp_blk   = f.create_block("cmp");
-        let body      = f.create_block("body");
-        let t_body    = f.create_block("t_body");
-        let f_body    = f.create_block("f_body");
-        let latch     = f.create_block("latch");
-        let exit      = f.create_block("exit");
-        let entry     = f.entry;
+        let header = f.create_block("header");
+        let cmp_blk = f.create_block("cmp");
+        let body = f.create_block("body");
+        let t_body = f.create_block("t_body");
+        let f_body = f.create_block("f_body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let entry = f.entry;
 
         // Entry: flag = const_bool(true), c1 = const 1, c10 = const 10
         let flag = f.next_value_id();
         f.register_type(flag, IrType::Bool);
         f.block_mut(entry).insts.push(Inst {
-            id: flag, ty: IrType::Bool, span: span(),
+            id: flag,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ConstBool(true),
         });
         let c1 = f.next_value_id();
         f.register_type(c1, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c1, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let c10 = f.next_value_id();
         f.register_type(c10, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c10, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(10, IntWidth::I32),
         });
         f.block_mut(entry).terminator = Some(Terminator::Branch(preheader, vec![]));
@@ -244,27 +281,36 @@ mod tests {
         // Header(%i) → cmp
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
         f.block_mut(header).terminator = Some(Terminator::Branch(cmp_blk, vec![]));
 
         // Cmp: icmp le %i, 10; condBr body, exit
         let cmp_v = f.next_value_id();
         f.register_type(cmp_v, IrType::Bool);
         f.block_mut(cmp_blk).insts.push(Inst {
-            id: cmp_v, ty: IrType::Bool, span: span(),
+            id: cmp_v,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c10),
         });
         f.block_mut(cmp_blk).terminator = Some(Terminator::CondBranch {
             cond: cmp_v,
-            true_dest: body, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
 
         // Body: condBr flag, t_body, f_body  ← the unswitchable conditional
         f.block_mut(body).terminator = Some(Terminator::CondBranch {
             cond: flag,
-            true_dest: t_body, true_args: vec![],
-            false_dest: f_body, false_args: vec![],
+            true_dest: t_body,
+            true_args: vec![],
+            false_dest: f_body,
+            false_args: vec![],
         });
 
         // t_body → latch
@@ -277,7 +323,9 @@ mod tests {
         let nxt = f.next_value_id();
         f.register_type(nxt, IrType::Int(IntWidth::I32));
         f.block_mut(latch).insts.push(Inst {
-            id: nxt, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::IAdd(iv, c1),
         });
         f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));
@@ -298,10 +346,15 @@ mod tests {
 
         // After unswitching, the preheader should have a CondBranch (not a Branch).
         let f = &m.functions[0];
-        let preheader = f.blocks.iter().find(|b| b.name.contains("preheader")).unwrap();
+        let preheader = f
+            .blocks
+            .iter()
+            .find(|b| b.name.contains("preheader"))
+            .unwrap();
         assert!(
             matches!(&preheader.terminator, Some(Terminator::CondBranch { .. })),
-            "preheader should now have a CondBranch: {:?}", preheader.terminator
+            "preheader should now have a CondBranch: {:?}",
+            preheader.terminator
         );
     }
 
@@ -321,49 +374,66 @@ mod tests {
         let c1 = f.next_value_id();
         f.register_type(c1, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c1, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(1, IntWidth::I32),
         });
         let c10 = f.next_value_id();
         f.register_type(c10, IrType::Int(IntWidth::I32));
         f.block_mut(entry).insts.push(Inst {
-            id: c10, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::ConstInt(10, IntWidth::I32),
         });
         f.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![c1]));
 
         let iv = f.next_value_id();
         f.register_type(iv, IrType::Int(IntWidth::I32));
-        f.block_mut(header).params.push(BlockParam { id: iv, ty: IrType::Int(IntWidth::I32) });
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
         let cmp_v = f.next_value_id();
         f.register_type(cmp_v, IrType::Bool);
         f.block_mut(header).insts.push(Inst {
-            id: cmp_v, ty: IrType::Bool, span: span(),
+            id: cmp_v,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c10),
         });
         f.block_mut(header).terminator = Some(Terminator::CondBranch {
             cond: cmp_v,
-            true_dest: body, true_args: vec![],
-            false_dest: exit, false_args: vec![],
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
         });
 
         // Body: the "conditional" uses the IV (loop-variant).
         let iv_cmp = f.next_value_id();
         f.register_type(iv_cmp, IrType::Bool);
         f.block_mut(body).insts.push(Inst {
-            id: iv_cmp, ty: IrType::Bool, span: span(),
+            id: iv_cmp,
+            ty: IrType::Bool,
+            span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c1),
         });
         f.block_mut(body).terminator = Some(Terminator::CondBranch {
             cond: iv_cmp,
-            true_dest: latch, true_args: vec![],
-            false_dest: latch, false_args: vec![],
+            true_dest: latch,
+            true_args: vec![],
+            false_dest: latch,
+            false_args: vec![],
         });
 
         let nxt = f.next_value_id();
         f.register_type(nxt, IrType::Int(IntWidth::I32));
         f.block_mut(latch).insts.push(Inst {
-            id: nxt, ty: IrType::Int(IntWidth::I32), span: span(),
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
             kind: InstKind::IAdd(iv, c1),
         });
         f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));

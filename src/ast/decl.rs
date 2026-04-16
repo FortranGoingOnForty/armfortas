@@ -3,8 +3,8 @@
 //! Types, attributes, entity declarations, USE statements, IMPLICIT,
 //! derived type definitions, and legacy declaration forms.
 
-use super::Spanned;
 use super::expr::SpannedExpr;
+use super::Spanned;
 
 /// A spanned declaration.
 pub type SpannedDecl = Spanned<Decl>;
@@ -26,18 +26,16 @@ pub enum Decl {
 
     /// `PUBLIC :: name1, name2` or `PRIVATE :: name1, name2` — sets
     /// access on specific names.
-    AccessList { access: Attribute, names: Vec<String> },
+    AccessList {
+        access: Attribute,
+        names: Vec<String>,
+    },
 
     /// `implicit none` or `implicit none(type, external)`
-    ImplicitNone {
-        external: bool,
-        type_: bool,
-    },
+    ImplicitNone { external: bool, type_: bool },
 
     /// `implicit double precision (a-h, o-z)`
-    ImplicitStmt {
-        specs: Vec<ImplicitSpec>,
-    },
+    ImplicitStmt { specs: Vec<ImplicitSpec> },
 
     /// Derived type definition
     DerivedTypeDef {
@@ -58,9 +56,7 @@ pub enum Decl {
     },
 
     /// `parameter (pi = 3.14159, e = 2.71828)`
-    ParameterStmt {
-        pairs: Vec<(String, SpannedExpr)>,
-    },
+    ParameterStmt { pairs: Vec<(String, SpannedExpr)> },
 
     /// `common /block_name/ x, y, z`
     CommonBlock {
@@ -69,14 +65,10 @@ pub enum Decl {
     },
 
     /// `equivalence (a, b), (c, d)`
-    EquivalenceStmt {
-        groups: Vec<Vec<SpannedExpr>>,
-    },
+    EquivalenceStmt { groups: Vec<Vec<SpannedExpr>> },
 
     /// `data x /1.0/, y /2.0/`
-    DataStmt {
-        sets: Vec<DataSet>,
-    },
+    DataStmt { sets: Vec<DataSet> },
 
     /// `enum, bind(c)`
     EnumDef {
@@ -130,8 +122,8 @@ pub struct CharSelector {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LenSpec {
     Expr(SpannedExpr),
-    Star,   // len=* (assumed length)
-    Colon,  // len=: (deferred length)
+    Star,  // len=* (assumed length)
+    Colon, // len=: (deferred length)
 }
 
 // ---- Attributes ----
@@ -176,13 +168,9 @@ pub enum ArraySpec {
         upper: SpannedExpr,
     },
     /// `(:)` — assumed shape (for dummy arguments)
-    AssumedShape {
-        lower: Option<SpannedExpr>,
-    },
+    AssumedShape { lower: Option<SpannedExpr> },
     /// `(*)` — assumed size (last dimension only)
-    AssumedSize {
-        lower: Option<SpannedExpr>,
-    },
+    AssumedSize { lower: Option<SpannedExpr> },
     /// `(:)` with allocatable/pointer — deferred shape
     Deferred,
     /// `(..)` — assumed rank (F2018)
@@ -196,9 +184,9 @@ pub enum ArraySpec {
 pub struct EntityDecl {
     pub name: String,
     pub array_spec: Option<Vec<ArraySpec>>,
-    pub char_len: Option<LenSpec>,      // character entity-specific length
-    pub init: Option<SpannedExpr>,      // = expr
-    pub ptr_init: Option<SpannedExpr>,  // => expr
+    pub char_len: Option<LenSpec>, // character entity-specific length
+    pub init: Option<SpannedExpr>, // = expr
+    pub ptr_init: Option<SpannedExpr>, // => expr
 }
 
 // ---- Derived type parts ----
@@ -217,8 +205,8 @@ pub enum TypeAttr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeBoundProc {
     pub name: String,
-    pub binding: Option<String>,  // procedure :: name => binding
-    pub attrs: Vec<String>,       // pass, nopass, deferred, etc.
+    pub binding: Option<String>, // procedure :: name => binding
+    pub attrs: Vec<String>,      // pass, nopass, deferred, etc.
     pub is_generic: bool,
 }
 

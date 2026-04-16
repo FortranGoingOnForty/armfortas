@@ -60,11 +60,21 @@ pub struct MacroDef {
 
 impl MacroDef {
     pub fn object(body: &str) -> Self {
-        Self { body: body.into(), params: Vec::new(), is_function: false, is_variadic: false }
+        Self {
+            body: body.into(),
+            params: Vec::new(),
+            is_function: false,
+            is_variadic: false,
+        }
     }
 
     pub fn function(params: Vec<String>, body: &str) -> Self {
-        Self { body: body.into(), params, is_function: true, is_variadic: false }
+        Self {
+            body: body.into(),
+            params,
+            is_function: true,
+            is_variadic: false,
+        }
     }
 }
 
@@ -155,10 +165,20 @@ impl Preprocessor {
 
     fn make_source_loc(&self, filename: &str, line: u32) -> SourceLoc {
         if let Some((override_line, ref override_file)) = self.line_override {
-            let fname = if override_file.is_empty() { filename } else { override_file.as_str() };
-            SourceLoc { filename: fname.into(), line: override_line }
+            let fname = if override_file.is_empty() {
+                filename
+            } else {
+                override_file.as_str()
+            };
+            SourceLoc {
+                filename: fname.into(),
+                line: override_line,
+            }
         } else {
-            SourceLoc { filename: filename.into(), line }
+            SourceLoc {
+                filename: filename.into(),
+                line,
+            }
         }
     }
 
@@ -176,11 +196,17 @@ impl Preprocessor {
             return Err(PreprocError {
                 filename: filename.into(),
                 line: source.lines().count() as u32,
-                msg: format!("unterminated #if/#ifdef ({} level(s) still open)", self.cond_stack.len()),
+                msg: format!(
+                    "unterminated #if/#ifdef ({} level(s) still open)",
+                    self.cond_stack.len()
+                ),
             });
         }
 
-        Ok(PreprocOutput { text: output, source_map })
+        Ok(PreprocOutput {
+            text: output,
+            source_map,
+        })
     }
 
     fn process_into(
@@ -191,11 +217,20 @@ impl Preprocessor {
         source_map: &mut Vec<SourceLoc>,
     ) -> Result<(), PreprocError> {
         // Set dynamic macros.
-        self.defines.insert("__FILE__".into(), MacroDef::object(&format!("\"{}\"", filename)));
+        self.defines.insert(
+            "__FILE__".into(),
+            MacroDef::object(&format!("\"{}\"", filename)),
+        );
 
         let now = current_datetime();
-        self.defines.insert("__DATE__".into(), MacroDef::object(&format!("\"{}\"", now.0)));
-        self.defines.insert("__TIME__".into(), MacroDef::object(&format!("\"{}\"", now.1)));
+        self.defines.insert(
+            "__DATE__".into(),
+            MacroDef::object(&format!("\"{}\"", now.0)),
+        );
+        self.defines.insert(
+            "__TIME__".into(),
+            MacroDef::object(&format!("\"{}\"", now.1)),
+        );
 
         // Process lines with inline backslash continuation joining,
         // tracking original line numbers so __LINE__ and source_map are correct.
@@ -238,7 +273,10 @@ impl Preprocessor {
             }
 
             // Update __LINE__ to the original starting line of this logical line.
-            self.defines.insert("__LINE__".into(), MacroDef::object(&orig_line_num.to_string()));
+            self.defines.insert(
+                "__LINE__".into(),
+                MacroDef::object(&orig_line_num.to_string()),
+            );
 
             // Fixed-form: C, c, or * in column 1 is a comment line.
             if self.fixed_form {
@@ -307,7 +345,8 @@ impl Preprocessor {
             "undef" => self.do_undef(args),
             "include" => self.do_include(args, filename, line_num, output, source_map),
             "error" => Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: format!("#error {}", args),
             }),
             "warning" => {
@@ -316,14 +355,16 @@ impl Preprocessor {
             }
             "line" => self.do_line(args, filename, line_num),
             "" => Ok(()), // bare # is allowed (null directive)
-            _ => Ok(()), // unknown directives are ignored (like #pragma)
+            _ => Ok(()),  // unknown directives are ignored (like #pragma)
         }
     }
 
     // ---- Conditional directive helpers (maintain skip_depth counter) ----
 
     fn push_cond(&mut self, state: CondState) {
-        if !matches!(state, CondState::Active) { self.skip_depth += 1; }
+        if !matches!(state, CondState::Active) {
+            self.skip_depth += 1;
+        }
         self.cond_stack.push(state);
     }
 
@@ -341,7 +382,9 @@ impl Preprocessor {
 
     fn pop_cond(&mut self) -> Option<CondState> {
         let popped = self.cond_stack.pop()?;
-        if !matches!(popped, CondState::Active) { self.skip_depth -= 1; }
+        if !matches!(popped, CondState::Active) {
+            self.skip_depth -= 1;
+        }
         Some(popped)
     }
 
@@ -355,7 +398,11 @@ impl Preprocessor {
         }
         let defined = self.defines.contains_key(name);
         let condition = if negate { !defined } else { defined };
-        self.push_cond(if condition { CondState::Active } else { CondState::Skipping });
+        self.push_cond(if condition {
+            CondState::Active
+        } else {
+            CondState::Skipping
+        });
         Ok(())
     }
 
@@ -365,14 +412,19 @@ impl Preprocessor {
             return Ok(());
         }
         let val = self.eval_condition(args, filename, line_num)?;
-        self.push_cond(if val { CondState::Active } else { CondState::Skipping });
+        self.push_cond(if val {
+            CondState::Active
+        } else {
+            CondState::Skipping
+        });
         Ok(())
     }
 
     fn do_elif(&mut self, args: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
         match self.cond_stack.last().copied() {
             None => Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "#elif without matching #if".into(),
             }),
             Some(CondState::ParentSkipping) => Ok(()),
@@ -383,7 +435,11 @@ impl Preprocessor {
             Some(CondState::Done) => Ok(()),
             Some(CondState::Skipping) => {
                 let val = self.eval_condition(args, filename, line_num)?;
-                self.set_top_cond(if val { CondState::Active } else { CondState::Skipping });
+                self.set_top_cond(if val {
+                    CondState::Active
+                } else {
+                    CondState::Skipping
+                });
                 Ok(())
             }
         }
@@ -392,7 +448,8 @@ impl Preprocessor {
     fn do_else(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
         match self.cond_stack.last().copied() {
             None => Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "#else without matching #if".into(),
             }),
             Some(CondState::ParentSkipping) => Ok(()),
@@ -411,7 +468,8 @@ impl Preprocessor {
     fn do_endif(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
         if self.pop_cond().is_none() {
             return Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "#endif without matching #if".into(),
             });
         }
@@ -434,7 +492,8 @@ impl Preprocessor {
                 let rest = &args[paren_pos + 1..];
                 if let Some(close) = rest.find(')') {
                     let params_str = &rest[..close];
-                    let mut params: Vec<String> = params_str.split(',')
+                    let mut params: Vec<String> = params_str
+                        .split(',')
                         .map(|p| p.trim().to_string())
                         .filter(|p| !p.is_empty())
                         .collect();
@@ -495,42 +554,48 @@ impl Preprocessor {
         let args = args.trim();
         let (path_str, search_system) = if let Some(rest) = args.strip_prefix('"') {
             let end = rest.find('"').ok_or_else(|| PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "unterminated #include string".into(),
             })?;
             (&rest[..end], false)
         } else if let Some(rest) = args.strip_prefix('<') {
             let end = rest.find('>').ok_or_else(|| PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "unterminated #include <path>".into(),
             })?;
             (&rest[..end], true)
         } else {
             return Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: format!("expected \"file\" or <file> after #include, got: {}", args),
             });
         };
 
         if self.include_depth >= 64 {
             return Err(PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: "include depth limit exceeded (possible recursion)".into(),
             });
         }
 
         // Search for the file.
-        let resolved = self.resolve_include(path_str, filename, search_system)
+        let resolved = self
+            .resolve_include(path_str, filename, search_system)
             .ok_or_else(|| PreprocError {
-                filename: filename.into(), line: line_num,
+                filename: filename.into(),
+                line: line_num,
                 msg: format!("cannot find include file: {}", path_str),
             })?;
 
-        let content = std::fs::read_to_string(&resolved)
-            .map_err(|e| PreprocError {
-                filename: filename.into(), line: line_num,
-                msg: format!("reading {}: {}", resolved.display(), e),
-            })?;
+        let content = std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
+            filename: filename.into(),
+            line: line_num,
+            msg: format!("reading {}: {}", resolved.display(), e),
+        })?;
 
         // Save __FILE__ so it's restored after the include returns.
         let saved_file = self.defines.get("__FILE__").cloned();
@@ -571,12 +636,18 @@ impl Preprocessor {
 
     // ---- Condition expression evaluator ----
 
-    fn eval_condition(&self, expr: &str, filename: &str, line_num: u32) -> Result<bool, PreprocError> {
+    fn eval_condition(
+        &self,
+        expr: &str,
+        filename: &str,
+        line_num: u32,
+    ) -> Result<bool, PreprocError> {
         // Expand macros in the expression first.
         let expanded = self.expand_condition_macros(expr);
         // Parse and evaluate the expression.
         eval_expr(&expanded).map_err(|msg| PreprocError {
-            filename: filename.into(), line: line_num,
+            filename: filename.into(),
+            line: line_num,
             msg: format!("in #if expression: {}", msg),
         })
     }
@@ -657,7 +728,11 @@ impl Preprocessor {
 
                 if mode == MacroExpandMode::ConditionExpr && ident == "defined" {
                     let (name, new_i) = parse_defined_operand(line, i);
-                    result.push_str(if self.defines.contains_key(name) { "1" } else { "0" });
+                    result.push_str(if self.defines.contains_key(name) {
+                        "1"
+                    } else {
+                        "0"
+                    });
                     i = new_i;
                     continue;
                 }
@@ -671,11 +746,17 @@ impl Preprocessor {
                 if let Some(def) = self.defines.get(ident) {
                     if def.is_function {
                         if i < bytes.len() && bytes[i] == b'(' {
-                            if let Some((expanded, new_i)) = self.expand_function_macro(def, line, i) {
+                            if let Some((expanded, new_i)) =
+                                self.expand_function_macro(def, line, i)
+                            {
                                 // Re-expand the result with this macro marked as expanding.
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
-                                result.push_str(&self.expand_macros_inner(&expanded, &next_expanding, mode));
+                                result.push_str(&self.expand_macros_inner(
+                                    &expanded,
+                                    &next_expanding,
+                                    mode,
+                                ));
                                 i = new_i;
                                 continue;
                             }
@@ -685,7 +766,11 @@ impl Preprocessor {
                         // Re-expand object macro body with this macro marked as expanding.
                         let mut next_expanding = expanding.clone();
                         next_expanding.insert(ident.to_string());
-                        result.push_str(&self.expand_macros_inner(&def.body, &next_expanding, mode));
+                        result.push_str(&self.expand_macros_inner(
+                            &def.body,
+                            &next_expanding,
+                            mode,
+                        ));
                     }
                 } else {
                     result.push_str(ident);
@@ -700,7 +785,12 @@ impl Preprocessor {
         result
     }
 
-    fn expand_function_macro(&self, def: &MacroDef, line: &str, paren_start: usize) -> Option<(String, usize)> {
+    fn expand_function_macro(
+        &self,
+        def: &MacroDef,
+        line: &str,
+        paren_start: usize,
+    ) -> Option<(String, usize)> {
         let bytes = line.as_bytes();
         let mut i = paren_start + 1; // skip '('
         let mut args: Vec<String> = Vec::new();
@@ -709,10 +799,15 @@ impl Preprocessor {
 
         while i < bytes.len() && depth > 0 {
             match bytes[i] {
-                b'(' => { depth += 1; current_arg.push('('); }
+                b'(' => {
+                    depth += 1;
+                    current_arg.push('(');
+                }
                 b')' => {
                     depth -= 1;
-                    if depth > 0 { current_arg.push(')'); }
+                    if depth > 0 {
+                        current_arg.push(')');
+                    }
                 }
                 b',' if depth == 1 => {
                     args.push(current_arg.trim().to_string());
@@ -723,7 +818,9 @@ impl Preprocessor {
             i += 1;
         }
 
-        if depth != 0 { return None; }
+        if depth != 0 {
+            return None;
+        }
         args.push(current_arg.trim().to_string());
 
         // Build parameter lookup table.
@@ -753,13 +850,18 @@ impl Preprocessor {
                     id_start += 1;
                 }
                 let mut id_end = id_start;
-                while id_end < body_bytes.len() && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_') {
+                while id_end < body_bytes.len()
+                    && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_')
+                {
                     id_end += 1;
                 }
                 if id_end > id_start {
                     let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
                     if let Some(&pi) = param_map.get(id) {
-                        body.push_str(&format!("\"{}\"", args.get(pi).map(|s| s.as_str()).unwrap_or("")));
+                        body.push_str(&format!(
+                            "\"{}\"",
+                            args.get(pi).map(|s| s.as_str()).unwrap_or("")
+                        ));
                         bi = id_end;
                         continue;
                     }
@@ -781,7 +883,9 @@ impl Preprocessor {
             // Identifier: check if it's a parameter name.
             if body_bytes[bi].is_ascii_alphabetic() || body_bytes[bi] == b'_' {
                 let id_start = bi;
-                while bi < body_bytes.len() && (body_bytes[bi].is_ascii_alphanumeric() || body_bytes[bi] == b'_') {
+                while bi < body_bytes.len()
+                    && (body_bytes[bi].is_ascii_alphanumeric() || body_bytes[bi] == b'_')
+                {
                     bi += 1;
                 }
                 let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
@@ -870,7 +974,14 @@ fn eval_and(expr: &str) -> Result<i64, String> {
 
 fn eval_comparison(expr: &str) -> Result<i64, String> {
     // Scan right-to-left for left-associative evaluation.
-    for (op, op_len) in [("==", 2), ("!=", 2), (">=", 2), ("<=", 2), (">", 1), ("<", 1)] {
+    for (op, op_len) in [
+        ("==", 2),
+        ("!=", 2),
+        (">=", 2),
+        ("<=", 2),
+        (">", 1),
+        ("<", 1),
+    ] {
         if let Some(pos) = find_op_right(expr, op) {
             let left = eval_comparison(&expr[..pos])?;
             let right = eval_additive(&expr[pos + op_len..])?;
@@ -917,13 +1028,17 @@ fn eval_multiplicative(expr: &str) -> Result<i64, String> {
     if let Some(pos) = find_op_right(expr, "/") {
         let left = eval_multiplicative(&expr[..pos])?;
         let right = eval_unary(&expr[pos + 1..])?;
-        if right == 0 { return Err("division by zero in #if expression".into()); }
+        if right == 0 {
+            return Err("division by zero in #if expression".into());
+        }
         return Ok(left / right);
     }
     if let Some(pos) = find_op_right(expr, "%") {
         let left = eval_multiplicative(&expr[..pos])?;
         let right = eval_unary(&expr[pos + 1..])?;
-        if right == 0 { return Err("modulo by zero in #if expression".into()); }
+        if right == 0 {
+            return Err("modulo by zero in #if expression".into());
+        }
         return Ok(left % right);
     }
     eval_unary(expr)
@@ -954,8 +1069,8 @@ fn eval_primary(expr: &str) -> Result<i64, String> {
 
     // Parenthesized expression.
     if trimmed.starts_with('(') {
-        let close = find_matching_paren(trimmed)
-            .ok_or("unmatched parenthesis in #if expression")?;
+        let close =
+            find_matching_paren(trimmed).ok_or("unmatched parenthesis in #if expression")?;
         return eval_or(&trimmed[1..close]);
     }
 
@@ -1039,7 +1154,9 @@ fn find_matching_paren(s: &str) -> Option<usize> {
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
-                if depth == 0 { return Some(i); }
+                if depth == 0 {
+                    return Some(i);
+                }
             }
             _ => {}
         }
@@ -1176,8 +1293,9 @@ fn current_datetime() -> (String, String) {
     // Days since epoch to year/month/day (simplified Gregorian).
     let (year, month, day) = epoch_days_to_date(days);
 
-    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let month_name = months.get(month as usize).unwrap_or(&"???");
 
     let date = format!("{} {:2} {}", month_name, day, year);
@@ -1398,7 +1516,10 @@ mod tests {
 
     #[test]
     fn if_arithmetic() {
-        let out = pp_with("#if MAX > 512\nbig\n#else\nsmall\n#endif\n", &[("MAX", "1024")]);
+        let out = pp_with(
+            "#if MAX > 512\nbig\n#else\nsmall\n#endif\n",
+            &[("MAX", "1024")],
+        );
         assert!(lines(&out).contains(&"big"));
     }
 
@@ -1482,7 +1603,11 @@ mod tests {
         // Regression test: the '' must not cause early string termination.
         let out = pp_with("x = 'he said ''hello'' there' + FOO\n", &[("FOO", "1")]);
         assert!(out.contains("'he said ''hello'' there'"), "got: {:?}", out);
-        assert!(out.contains("+ 1"), "FOO after string should expand, got: {:?}", out);
+        assert!(
+            out.contains("+ 1"),
+            "FOO after string should expand, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1669,7 +1794,10 @@ end module
 
     #[test]
     fn if_with_arithmetic() {
-        let out = pp_with("#if MAX + 1 > 512\nbig\n#else\nsmall\n#endif\n", &[("MAX", "1024")]);
+        let out = pp_with(
+            "#if MAX + 1 > 512\nbig\n#else\nsmall\n#endif\n",
+            &[("MAX", "1024")],
+        );
         assert!(lines(&out).contains(&"big"));
     }
 
@@ -1677,26 +1805,44 @@ end module
     fn if_chained_macros() {
         // A -> 1, B -> A. #if B should expand B->A->1, evaluating to true.
         let out = pp_with("#if B\nyes\n#endif\n", &[("A", "1"), ("B", "A")]);
-        assert!(lines(&out).contains(&"yes"), "chained macro in #if failed, got: {:?}", lines(&out));
+        assert!(
+            lines(&out).contains(&"yes"),
+            "chained macro in #if failed, got: {:?}",
+            lines(&out)
+        );
     }
 
     #[test]
     fn if_chained_three_levels() {
-        let out = pp_with("#if C > 10\nyes\n#endif\n", &[("A", "42"), ("B", "A"), ("C", "B")]);
-        assert!(lines(&out).contains(&"yes"), "3-level chain in #if failed, got: {:?}", lines(&out));
+        let out = pp_with(
+            "#if C > 10\nyes\n#endif\n",
+            &[("A", "42"), ("B", "A"), ("C", "B")],
+        );
+        assert!(
+            lines(&out).contains(&"yes"),
+            "3-level chain in #if failed, got: {:?}",
+            lines(&out)
+        );
     }
 
     #[test]
     fn if_defined_and_value() {
         // Common real-world pattern: #if defined(FOO) && FOO > 5
-        let out = pp_with("#if defined(FOO) && FOO > 5\nyes\n#endif\n", &[("FOO", "10")]);
+        let out = pp_with(
+            "#if defined(FOO) && FOO > 5\nyes\n#endif\n",
+            &[("FOO", "10")],
+        );
         assert!(lines(&out).contains(&"yes"));
     }
 
     #[test]
     fn if_function_macro_expands() {
         let out = pp("#define INC(x) ((x) + 1)\n#if INC(41) > 41\nyes\n#endif\n");
-        assert!(lines(&out).contains(&"yes"), "function macro in #if failed, got: {:?}", lines(&out));
+        assert!(
+            lines(&out).contains(&"yes"),
+            "function macro in #if failed, got: {:?}",
+            lines(&out)
+        );
     }
 
     #[test]
@@ -1773,7 +1919,11 @@ end module
         // After continuation joining, the define body is "    ((a) +      (b))"
         // with leading/trailing whitespace from the continuation lines.
         // The body gets trimmed during define processing, so it becomes "((a) +      (b))".
-        assert!(out.contains("((1) +"), "got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(
+            out.contains("((1) +"),
+            "got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
         assert!(out.contains("(2))"));
     }
 
@@ -1781,7 +1931,11 @@ end module
     fn line_number_correct_after_continuation() {
         // Lines 1-3 are a continued #define. Line 4 should report __LINE__ = 4.
         let out = pp("#define M \\\n    42\na\nb = __LINE__\n");
-        assert!(out.contains("b = 4"), "got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(
+            out.contains("b = 4"),
+            "got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
     }
 
     // ---- Self-referencing macro (no infinite loop) ----
@@ -1853,7 +2007,11 @@ deep
         config.include_paths.push(dir);
         let src = "#include \"test_pp_include.inc\"\nreal :: x\n";
         let result = preprocess(src, &config).unwrap();
-        assert!(result.text.contains("integer :: included_var"), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("integer :: included_var"),
+            "got: {:?}",
+            result.text
+        );
         assert!(result.text.contains("real :: x"));
     }
 
@@ -1887,8 +2045,16 @@ deep
         config.filename = "parent.f90".into();
         let src = "before = __FILE__\n#include \"test_pp_file_restore.inc\"\nafter = __FILE__\n";
         let result = preprocess(src, &config).unwrap();
-        assert!(result.text.contains("before = \"parent.f90\""), "got: {:?}", result.text);
-        assert!(result.text.contains("after = \"parent.f90\""), "__FILE__ not restored, got: {:?}", result.text);
+        assert!(
+            result.text.contains("before = \"parent.f90\""),
+            "got: {:?}",
+            result.text
+        );
+        assert!(
+            result.text.contains("after = \"parent.f90\""),
+            "__FILE__ not restored, got: {:?}",
+            result.text
+        );
     }
 
     // ---- Fixed-form awareness ----
@@ -1900,7 +2066,11 @@ deep
         config.defines.insert("FOO".into(), MacroDef::object("BAR"));
         let result = preprocess("C     FOO is a comment\n      x = FOO\n", &config).unwrap();
         // C-line should not have FOO expanded.
-        assert!(result.text.contains("C     FOO is a comment"), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("C     FOO is a comment"),
+            "got: {:?}",
+            result.text
+        );
         // Continuation line should expand FOO.
         assert!(result.text.contains("x = BAR"), "got: {:?}", result.text);
     }
@@ -1911,7 +2081,11 @@ deep
         config.fixed_form = true;
         config.defines.insert("FOO".into(), MacroDef::object("BAR"));
         let result = preprocess("*     FOO is a comment\n", &config).unwrap();
-        assert!(result.text.contains("*     FOO is a comment"), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("*     FOO is a comment"),
+            "got: {:?}",
+            result.text
+        );
     }
 
     // ---- Fortran & continuation ----
@@ -1919,23 +2093,43 @@ deep
     #[test]
     fn fortran_ampersand_continuation() {
         let out = pp_with("x = FOO + &\n    BAR\n", &[("FOO", "1"), ("BAR", "2")]);
-        assert!(out.contains("x = 1 + 2"), "got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(
+            out.contains("x = 1 + 2"),
+            "got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn ampersand_in_string_not_continued() {
         // & inside a string literal must NOT trigger continuation.
         let out = pp("x = 'hello &'\ny = 2\n");
-        assert!(out.contains("'hello &'"), "string corrupted, got: {:?}", out.lines().collect::<Vec<_>>());
-        assert!(out.contains("y = 2"), "next line missing, got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(
+            out.contains("'hello &'"),
+            "string corrupted, got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
+        assert!(
+            out.contains("y = 2"),
+            "next line missing, got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn ampersand_in_comment_not_continued() {
         // & after ! comment must NOT trigger continuation.
         let out = pp("x = 1 ! comment &\ny = 2\n");
-        assert!(out.contains("! comment &"), "comment corrupted, got: {:?}", out.lines().collect::<Vec<_>>());
-        assert!(out.contains("y = 2"), "next line missing, got: {:?}", out.lines().collect::<Vec<_>>());
+        assert!(
+            out.contains("! comment &"),
+            "comment corrupted, got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
+        assert!(
+            out.contains("y = 2"),
+            "next line missing, got: {:?}",
+            out.lines().collect::<Vec<_>>()
+        );
     }
 
     // ---- __DATE__ and __TIME__ ----
@@ -1961,7 +2155,11 @@ deep
         let mut config = PreprocConfig::default();
         config.filename = "test.f90".into();
         let result = preprocess("x = __FILE__\n", &config).unwrap();
-        assert!(result.text.contains("\"test.f90\""), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("\"test.f90\""),
+            "got: {:?}",
+            result.text
+        );
     }
 
     // ---- defined without parens ----
@@ -2070,6 +2268,10 @@ deep
         let result = preprocess("#include \"test_pp_recurse.inc\"\n", &config);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.msg.contains("depth") || err.msg.contains("recursion"), "got: {}", err.msg);
+        assert!(
+            err.msg.contains("depth") || err.msg.contains("recursion"),
+            "got: {}",
+            err.msg
+        );
     }
 }

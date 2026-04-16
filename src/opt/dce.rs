@@ -36,7 +36,7 @@
 //! refine this.
 
 use super::pass::Pass;
-use super::util::{inst_uses, terminator_uses, prune_unreachable};
+use super::util::{inst_uses, prune_unreachable, terminator_uses};
 use crate::ir::inst::*;
 use std::collections::{HashMap, HashSet};
 
@@ -52,9 +52,10 @@ fn has_side_effect(kind: &InstKind, pure_internal_calls: &[bool]) -> bool {
             // future store/call). Treat as side-effecting for safety.
             | InstKind::Alloca(..)
     ) || match kind {
-        InstKind::Call(FuncRef::Internal(idx), _) => {
-            !pure_internal_calls.get(*idx as usize).copied().unwrap_or(false)
-        }
+        InstKind::Call(FuncRef::Internal(idx), _) => !pure_internal_calls
+            .get(*idx as usize)
+            .copied()
+            .unwrap_or(false),
         InstKind::Call(..) => true,
         _ => false,
     }
@@ -109,8 +110,12 @@ fn dce_function(func: &mut Function, pure_internal_calls: &[bool]) -> bool {
             for block in &mut func.blocks {
                 let before = block.insts.len();
                 block.insts.retain(|inst| {
-                    if has_side_effect(&inst.kind, pure_internal_calls) { return true; }
-                    if live.contains(&inst.id) { return true; }
+                    if has_side_effect(&inst.kind, pure_internal_calls) {
+                        return true;
+                    }
+                    if live.contains(&inst.id) {
+                        return true;
+                    }
                     false
                 });
                 if block.insts.len() != before {
@@ -126,7 +131,9 @@ fn dce_function(func: &mut Function, pure_internal_calls: &[bool]) -> bool {
             outer_changed = true;
         }
     }
-    if prune_unreachable(func) { any_change = true; }
+    if prune_unreachable(func) {
+        any_change = true;
+    }
     any_change
 }
 
@@ -146,19 +153,25 @@ fn remove_dead_block_params(func: &mut Function) -> bool {
 
     let mut by_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
     for block in func.blocks.iter() {
-        if block.id == func.entry { continue; }
+        if block.id == func.entry {
+            continue;
+        }
         for (idx, p) in block.params.iter().enumerate() {
             if !live.contains(&p.id) {
                 by_block.entry(block.id).or_default().push(idx);
             }
         }
     }
-    if by_block.is_empty() { return false; }
+    if by_block.is_empty() {
+        return false;
+    }
 
     // Map BlockId → vec index. LICM/DCE never structurally reorder
     // `func.blocks`; only the inst vectors change. So this stays
     // valid for the lifetime of this call.
-    let block_index: HashMap<BlockId, usize> = func.blocks.iter()
+    let block_index: HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
         .enumerate()
         .map(|(i, b)| (b.id, i))
         .collect();
@@ -199,20 +212,38 @@ fn remove_dead_block_params(func: &mut Function) -> bool {
 fn drop_branch_arg(term: &mut Terminator, target: BlockId, idx: usize) {
     match term {
         Terminator::Branch(d, args) if *d == target => {
-            debug_assert!(idx < args.len(),
-                "drop_branch_arg: branch arg list out of sync with target params");
-            if idx < args.len() { args.remove(idx); }
+            debug_assert!(
+                idx < args.len(),
+                "drop_branch_arg: branch arg list out of sync with target params"
+            );
+            if idx < args.len() {
+                args.remove(idx);
+            }
         }
-        Terminator::CondBranch { true_dest, true_args, false_dest, false_args, .. } => {
+        Terminator::CondBranch {
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+            ..
+        } => {
             if *true_dest == target {
-                debug_assert!(idx < true_args.len(),
-                    "drop_branch_arg: cond_branch true_args out of sync");
-                if idx < true_args.len() { true_args.remove(idx); }
+                debug_assert!(
+                    idx < true_args.len(),
+                    "drop_branch_arg: cond_branch true_args out of sync"
+                );
+                if idx < true_args.len() {
+                    true_args.remove(idx);
+                }
             }
             if *false_dest == target {
-                debug_assert!(idx < false_args.len(),
-                    "drop_branch_arg: cond_branch false_args out of sync");
-                if idx < false_args.len() { false_args.remove(idx); }
+                debug_assert!(
+                    idx < false_args.len(),
+                    "drop_branch_arg: cond_branch false_args out of sync"
+                );
+                if idx < false_args.len() {
+                    false_args.remove(idx);
+                }
             }
         }
         Terminator::Switch { cases, default, .. } => {
@@ -221,11 +252,12 @@ fn drop_branch_arg(term: &mut Terminator, target: BlockId, idx: usize) {
             // M-6: if we ever see a Switch that branches into a
             // block we're stripping params from, that's a real IR
             // validity bug. Assert instead of silently skipping.
-            let touches_target = cases.iter().any(|(_, b)| *b == target)
-                || *default == target;
-            debug_assert!(!touches_target,
+            let touches_target = cases.iter().any(|(_, b)| *b == target) || *default == target;
+            debug_assert!(
+                !touches_target,
                 "drop_branch_arg: Switch terminator branches to a block with params \
-                 — verifier should reject this construction");
+                 — verifier should reject this construction"
+            );
         }
         _ => {}
     }
@@ -234,12 +266,17 @@ fn drop_branch_arg(term: &mut Terminator, target: BlockId, idx: usize) {
 pub struct Dce;
 
 impl Pass for Dce {
-    fn name(&self) -> &'static str { "dce" }
+    fn name(&self) -> &'static str {
+        "dce"
+    }
     fn run(&self, module: &mut Module) -> bool {
-        let pure_internal_calls: Vec<bool> = module.functions.iter().map(|func| func.is_pure).collect();
+        let pure_internal_calls: Vec<bool> =
+            module.functions.iter().map(|func| func.is_pure).collect();
         let mut changed = false;
         for func in &mut module.functions {
-            if dce_function(func, &pure_internal_calls) { changed = true; }
+            if dce_function(func, &pure_internal_calls) {
+                changed = true;
+            }
         }
         changed
     }
@@ -248,18 +285,27 @@ impl Pass for Dce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth, FloatWidth};
-    use crate::lexer::{Span, Position};
+    use crate::ir::types::{FloatWidth, IntWidth, IrType};
+    use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
         let p = Position { line: 1, col: 1 };
-        Span { start: p, end: p, file_id: 0 }
+        Span {
+            start: p,
+            end: p,
+            file_id: 0,
+        }
     }
 
     fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
         let id = f.next_value_id();
         let entry = f.entry;
-        f.block_mut(entry).insts.push(Inst { id, kind, ty, span: dummy_span() });
+        f.block_mut(entry).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
         id
     }
 
@@ -267,7 +313,11 @@ mod tests {
     fn removes_unused_const() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -280,7 +330,11 @@ mod tests {
     fn keeps_const_used_by_return() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
-        let v = push(&mut f, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let v = push(
+            &mut f,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(Some(v)));
         m.add_function(f);
@@ -294,11 +348,16 @@ mod tests {
         // Alloca + Store should both stay even though no one loads.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        let addr = push(&mut f,
+        let addr = push(
+            &mut f,
             InstKind::Alloca(IrType::Int(IntWidth::I32)),
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
         );
-        let v = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let v = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         push(&mut f, InstKind::Store(v, addr), IrType::Void);
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));
@@ -317,8 +376,16 @@ mod tests {
         // After DCE: only the terminator remains.
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        let a = push(&mut f, InstKind::ConstInt(3, IntWidth::I32), IrType::Int(IntWidth::I32));
-        let b = push(&mut f, InstKind::ConstInt(4, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let a = push(
+            &mut f,
+            InstKind::ConstInt(3, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstInt(4, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let c = push(&mut f, InstKind::IAdd(a, b), IrType::Int(IntWidth::I32));
         let _d = push(&mut f, InstKind::INeg(c), IrType::Int(IntWidth::I32));
         let entry = f.entry;
@@ -333,7 +400,8 @@ mod tests {
     fn keeps_call_even_if_result_unused() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        push(&mut f,
+        push(
+            &mut f,
             InstKind::RuntimeCall(RuntimeFunc::PrintNewline, vec![]),
             IrType::Void,
         );
@@ -351,7 +419,11 @@ mod tests {
 
         let mut callee = Function::new("pure_fn".into(), vec![], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
-        let c = push(&mut callee, InstKind::ConstInt(7, IntWidth::I32), IrType::Int(IntWidth::I32));
+        let c = push(
+            &mut callee,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
         let callee_entry = callee.entry;
         callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(c)));
         m.add_function(callee);
@@ -367,15 +439,26 @@ mod tests {
         m.add_function(caller);
 
         assert!(Dce.run(&mut m));
-        assert!(m.functions[1].blocks[0].insts.is_empty(), "unused PURE call should be removed");
+        assert!(
+            m.functions[1].blocks[0].insts.is_empty(),
+            "unused PURE call should be removed"
+        );
     }
 
     #[test]
     fn float_chain_is_dead() {
         let mut m = Module::new("t".into());
         let mut f = Function::new("f".into(), vec![], IrType::Void);
-        let a = push(&mut f, InstKind::ConstFloat(1.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
-        let b = push(&mut f, InstKind::ConstFloat(2.5, FloatWidth::F64), IrType::Float(FloatWidth::F64));
+        let a = push(
+            &mut f,
+            InstKind::ConstFloat(1.5, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstFloat(2.5, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
         let _ = push(&mut f, InstKind::FAdd(a, b), IrType::Float(FloatWidth::F64));
         let entry = f.entry;
         f.block_mut(entry).terminator = Some(Terminator::Return(None));

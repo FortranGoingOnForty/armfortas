@@ -7,18 +7,22 @@
 //!
 //! Runs as the first pass at O1+ (before Mem2Reg).
 
-use std::collections::HashMap;
-use crate::ir::inst::*;
 use super::pass::Pass;
+use crate::ir::inst::*;
+use std::collections::HashMap;
 
 pub struct CallResolve;
 
 impl Pass for CallResolve {
-    fn name(&self) -> &'static str { "call-resolve" }
+    fn name(&self) -> &'static str {
+        "call-resolve"
+    }
 
     fn run(&self, module: &mut Module) -> bool {
         // Build name → index mapping for all functions in the module.
-        let name_to_idx: HashMap<String, u32> = module.functions.iter()
+        let name_to_idx: HashMap<String, u32> = module
+            .functions
+            .iter()
             .enumerate()
             .map(|(i, f)| (f.name.clone(), i as u32))
             .collect();
@@ -47,8 +51,8 @@ impl Pass for CallResolve {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IrType, IntWidth};
     use crate::ir::inst::*;
+    use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 
     #[test]
