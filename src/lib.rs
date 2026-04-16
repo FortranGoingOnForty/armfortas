@@ -77,13 +77,7 @@ pub fn cli_entry() -> ! {
             // compile thunk so we can include it in any ICE report.
             let input_for_ice = opts.input.display().to_string();
             install_ice_hook();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                if opts.extra_inputs.is_empty() {
-                    driver::compile(&opts)
-                } else {
-                    driver::compile_multi(&opts)
-                }
-            }));
+            let result = catch_unwind(AssertUnwindSafe(|| driver::execute(&opts)));
             match result {
                 Ok(Ok(())) => process::exit(0),
                 Ok(Err(e)) => {

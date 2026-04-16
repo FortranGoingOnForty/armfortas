@@ -90,6 +90,12 @@ pub enum ParsedCli {
     Info(InfoAction),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliInputKind {
+    FortranSource,
+    LinkArtifact,
+}
+
 /// Compilation options.
 pub struct Options {
     // ---- I/O ----
@@ -831,6 +837,82 @@ fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
         .map(|func| func.name.as_str())
 }
 
+fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
+    let mut inputs = vec![opts.input.clone()];
+    inputs.extend(opts.extra_inputs.iter().cloned());
+    inputs
+}
+
+fn classify_cli_input(path: &Path) -> CliInputKind {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("o" | "obj" | "a" | "dylib" | "so") => CliInputKind::LinkArtifact,
+        _ => CliInputKind::FortranSource,
+    }
+}
+
+fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
+    if opts.preprocess_only {
+        return Err("-E cannot be used when all inputs are prebuilt objects or archives".into());
+    }
+    if opts.emit_tokens {
+        return Err(
+            "--emit-tokens cannot be used when all inputs are prebuilt objects or archives".into(),
+        );
+    }
+    if opts.emit_ast {
+        return Err(
+            "--emit-ast cannot be used when all inputs are prebuilt objects or archives".into(),
+        );
+    }
+    if opts.emit_ir {
+        return Err(
+            "--emit-ir cannot be used when all inputs are prebuilt objects or archives".into(),
+        );
+    }
+    if opts.emit_asm {
+        return Err("-S cannot be used when all inputs are prebuilt objects or archives".into());
+    }
+    if opts.emit_obj {
+        return Err("-c cannot be used when all inputs are prebuilt objects or archives".into());
+    }
+    Ok(())
+}
+
+/// Execute a fully parsed CLI job, dispatching between source
+/// compilation and pure link steps based on the positional inputs.
+pub fn execute(opts: &Options) -> Result<(), String> {
+    let inputs = all_input_paths(opts);
+    let has_source = inputs
+        .iter()
+        .any(|path| classify_cli_input(path) == CliInputKind::FortranSource);
+    let has_link_artifact = inputs
+        .iter()
+        .any(|path| classify_cli_input(path) == CliInputKind::LinkArtifact);
+
+    match (has_source, has_link_artifact) {
+        (true, false) => {
+            if opts.extra_inputs.is_empty() {
+                compile(opts)
+            } else {
+                compile_multi(opts)
+            }
+        }
+        (false, true) => {
+            validate_link_only_inputs(opts)?;
+            let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+            link_inputs(&inputs, &output, opts)
+        }
+        (true, true) => Err(
+            "mixing Fortran sources with prebuilt object/archive inputs is not yet supported; compile the sources first and then link the resulting objects".into(),
+        ),
+        (false, false) => unreachable!("parse_cli guarantees at least one input"),
+    }
+}
+
 /// Compile a Fortran source file through the full pipeline.
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
@@ -1299,6 +1381,12 @@ _main:
 /// `opts` contributes the user-supplied `-L`, `-l`, `-rpath`,
 /// `-shared`, and `-static` flags that need to make it through to ld.
 fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
+    link_inputs(&[obj.to_path_buf()], output, opts)
+}
+
+/// Link prebuilt objects and archives with the runtime to produce a
+/// binary or shared library, preserving the user-supplied input order.
+fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
     let rt_path = find_runtime_lib()?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
@@ -1306,8 +1394,11 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
         .map_err(|e| format!("cannot run xcrun: {}", e))?;
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
-    let mut args: Vec<String> = vec![
-        obj.to_string_lossy().into_owned(),
+    let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
+    for input in inputs {
+        args.push(input.to_string_lossy().into_owned());
+    }
+    args.extend([
         rt_path,
         "-lSystem".into(),
         "-no_uuid".into(),
@@ -1315,9 +1406,7 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
         sysroot,
         "-e".into(),
         "_main".into(),
-        "-o".into(),
-        output.to_string_lossy().into_owned(),
-    ];
+    ]);
     push_link_flags(&mut args, opts);
 
     let ld_result = Command::new("ld")
@@ -1361,38 +1450,7 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
 
 /// Link multiple object files with the runtime to produce a binary.
 fn link_multi(objs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
-    let rt_path = find_runtime_lib()?;
-    let sdk = Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
-        .map_err(|e| format!("cannot run xcrun: {}", e))?;
-    let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
-
-    let mut args: Vec<String> = vec![
-        "-o".into(), output.to_str().unwrap().into(),
-    ];
-    for obj in objs {
-        args.push(obj.to_str().unwrap().into());
-    }
-    args.extend([
-        rt_path,
-        "-lSystem".into(),
-        "-no_uuid".into(),
-        "-syslibroot".into(),
-        sysroot,
-        "-e".into(),
-        "_main".into(),
-    ]);
-    push_link_flags(&mut args, opts);
-    let ld_result = Command::new("ld")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("cannot run linker: {}", e))?;
-    if !ld_result.status.success() {
-        let stderr = String::from_utf8_lossy(&ld_result.stderr);
-        return Err(format!("linker failed:\n{}", stderr));
-    }
-    Ok(())
+    link_inputs(objs, output, opts)
 }
 
 /// Compile multiple Fortran source files with automatic dependency

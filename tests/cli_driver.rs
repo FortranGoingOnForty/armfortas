@@ -373,6 +373,122 @@ fn multi_input_dash_c_with_o_is_rejected() {
 }
 
 #[test]
+fn prebuilt_object_input_links_cleanly() {
+    let src = write_program("program p\n  print *, 9\nend program\n", "f90");
+    let obj = unique_path("link_only_obj", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("object compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = unique_path("link_only_obj", "bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([obj.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("link-only spawn failed");
+    assert!(
+        link.status.success(),
+        "prebuilt object link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    assert!(exe.exists(), "prebuilt object link should write the binary");
+
+    let _ = std::fs::remove_file(&exe);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn prebuilt_archive_input_links_after_objects() {
+    let dir = unique_dir("link_only_archive");
+    let helper_src = write_program_in(
+        &dir,
+        "helper.f90",
+        "subroutine helper()\n  print *, 7\nend subroutine helper\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  call helper()\nend program p\n",
+    );
+
+    let helper_obj = dir.join("helper.o");
+    let compile_helper = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            helper_src.to_str().unwrap(),
+            "-o",
+            helper_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("helper compile spawn failed");
+    assert!(
+        compile_helper.status.success(),
+        "helper compile failed: {}",
+        String::from_utf8_lossy(&compile_helper.stderr)
+    );
+
+    let archive = dir.join("libhelper.a");
+    let ar = Command::new("ar")
+        .current_dir(&dir)
+        .args([
+            "rcs",
+            archive.to_str().unwrap(),
+            helper_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("archive spawn failed");
+    assert!(
+        ar.status.success(),
+        "archive creation failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("linked_archive");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("archive link spawn failed");
+    assert!(
+        link.status.success(),
+        "prebuilt archive link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    assert!(exe.exists(), "prebuilt archive link should write the binary");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dash_capital_s_produces_assembly_text() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("asm", "s");
