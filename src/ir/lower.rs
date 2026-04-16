@@ -983,6 +983,14 @@ pub struct ModuleGlobalInfo {
     pub external: bool,
 }
 
+fn pointer_slot_type(value_ty: &IrType) -> IrType {
+    if value_ty.is_ptr() {
+        value_ty.clone()
+    } else {
+        IrType::Ptr(Box::new(value_ty.clone()))
+    }
+}
+
 /// Walk a module's declarations and emit a global per variable.
 /// Handles scalars (with literal initializers) and fixed-size
 /// arrays (with array-constructor initializers). Resolves the
@@ -1408,12 +1416,13 @@ fn collect_module_globals(
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
-                // Audit MAJOR-5: module-level allocatable arrays.
-                // Emit a 384-byte zero-init descriptor as the
-                // global; runtime allocate() populates it. The
-                // shape (deferred or fixed) doesn't matter for
-                // emission — the descriptor stores it at runtime.
-                if is_allocatable && array_spec.is_some() {
+                // Module-level allocatable and pointer arrays both
+                // live in a 384-byte descriptor slot. For pointers
+                // we also mark allocatable=true so the existing
+                // descriptor helpers treat the global storage as the
+                // descriptor body rather than an extra layer of
+                // indirection.
+                if (is_allocatable || is_pointer) && array_spec.is_some() {
                     let desc_ty = IrType::Array(
                         Box::new(IrType::Int(IntWidth::I8)),
                         384,
@@ -1567,6 +1576,29 @@ fn collect_module_globals(
                     );
                 } else {
                     // Scalar module variable.
+                    if is_pointer {
+                        let slot_ty = pointer_slot_type(&ir_ty);
+                        module.add_global(Global {
+                            name: symbol.clone(),
+                            ty: slot_ty,
+                            initializer: Some(GlobalInit::Zero),
+                        });
+                        globals.insert(
+                            (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                            ModuleGlobalInfo {
+                                symbol,
+                                ty: ir_ty.clone(),
+                                dims: vec![],
+                                allocatable: false,
+                                is_pointer: true,
+                                deferred_char: false,
+                                derived_type: derived_type_name.clone(),
+                                char_kind: global_char_kind.clone(),
+                                external: false,
+                            },
+                        );
+                        continue;
+                    }
                     if let Some(type_name) = &derived_type_name {
                         if let Some(layout) = type_layouts.get(type_name) {
                             let scalar_ty = IrType::Array(
@@ -3202,6 +3234,8 @@ fn install_one_global(
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
     } else if info.deferred_char {
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32)
+    } else if info.is_pointer {
+        pointer_slot_type(&info.ty)
     } else {
         info.ty.clone()
     };
@@ -13148,6 +13182,50 @@ fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     }
 }
 
+fn lower_fixed_component_array_element_ptr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    base_ptr: ValueId,
+    dims: &[(i64, i64)],
+    elem_bytes: i64,
+) -> Option<ValueId> {
+    if dims.is_empty() || args.len() != dims.len() {
+        return None;
+    }
+    let mut linear_idx: Option<ValueId> = None;
+    let mut stride = 1i64;
+    for (arg, (lower, extent)) in args.iter().zip(dims.iter()) {
+        let crate::ast::expr::SectionSubscript::Element(idx_expr) = &arg.value else {
+            return None;
+        };
+        let idx = lower_expr(b, locals, idx_expr, st);
+        let idx64 = match b.func().value_type(idx) {
+            Some(IrType::Int(IntWidth::I64)) => idx,
+            _ => b.int_extend(idx, IntWidth::I64, true),
+        };
+        let lo = b.const_i64(*lower);
+        let hi = b.const_i64(lower + extent - 1);
+        b.runtime_call(RuntimeFunc::CheckBounds, vec![idx64, lo, hi], IrType::Void);
+        let zero_based = b.isub(idx64, lo);
+        let contrib = if stride == 1 {
+            zero_based
+        } else {
+            let stride_val = b.const_i64(stride);
+            b.imul(zero_based, stride_val)
+        };
+        linear_idx = Some(match linear_idx {
+            Some(cur) => b.iadd(cur, contrib),
+            None => contrib,
+        });
+        stride = stride.saturating_mul(*extent);
+    }
+    let elem_bytes_val = b.const_i64(elem_bytes);
+    let byte_off = b.imul(linear_idx?, elem_bytes_val);
+    Some(b.gep(base_ptr, vec![byte_off], IrType::Int(IntWidth::I8)))
+}
+
 /// Resolve a component access base expression to (struct_address, type_name).
 /// Handles both direct names (x%field) and chained access (x%inner%field).
 fn resolve_component_base(
@@ -13190,14 +13268,6 @@ fn resolve_component_base(
             }
         }
         Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
-                return None;
-            };
-            let info = locals.get(&name.to_lowercase())?;
-            let type_name = info.derived_type.as_ref()?.clone();
-            if info.dims.is_empty() && !local_uses_array_descriptor(info) {
-                return None;
-            }
             if args.iter().any(|arg| {
                 !matches!(
                     arg.value,
@@ -13206,8 +13276,34 @@ fn resolve_component_base(
             }) {
                 return None;
             }
-            let elem_addr = lower_array_element(b, locals, info, args, st);
-            Some((elem_addr, type_name))
+            if let Expr::Name { name } = &callee.node {
+                let info = locals.get(&name.to_lowercase())?;
+                let type_name = info.derived_type.as_ref()?.clone();
+                if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+                    return None;
+                }
+                let elem_addr = lower_array_element(b, locals, info, args, st);
+                return Some((elem_addr, type_name));
+            }
+            if let Expr::ComponentAccess { .. } = &callee.node {
+                let (field_ptr, field) =
+                    resolve_component_field_access(b, locals, callee, st, tl)?;
+                let crate::sema::symtab::TypeInfo::Derived(type_name) = &field.type_info else {
+                    return None;
+                };
+                let layout = tl.get(type_name)?;
+                let elem_addr = lower_fixed_component_array_element_ptr(
+                    b,
+                    locals,
+                    args,
+                    st,
+                    field_ptr,
+                    &field.dims,
+                    layout.size as i64,
+                )?;
+                return Some((elem_addr, type_name.clone()));
+            }
+            None
         }
         _ => None,
     }
@@ -13454,14 +13550,6 @@ fn resolve_component_base_for_method(
             }
         }
         Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
-                return None;
-            };
-            let info = locals.get(&name.to_lowercase())?;
-            let type_name = info.derived_type.as_ref()?.clone();
-            if info.dims.is_empty() && !local_uses_array_descriptor(info) {
-                return None;
-            }
             if args.iter().any(|arg| {
                 !matches!(
                     arg.value,
@@ -13470,8 +13558,34 @@ fn resolve_component_base_for_method(
             }) {
                 return None;
             }
-            let elem_addr = lower_array_element(b, locals, info, args, st);
-            Some((elem_addr, type_name))
+            if let Expr::Name { name } = &callee.node {
+                let info = locals.get(&name.to_lowercase())?;
+                let type_name = info.derived_type.as_ref()?.clone();
+                if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+                    return None;
+                }
+                let elem_addr = lower_array_element(b, locals, info, args, st);
+                return Some((elem_addr, type_name));
+            }
+            if let Expr::ComponentAccess { .. } = &callee.node {
+                let (field_ptr, field) =
+                    resolve_component_field_access(b, locals, callee, st, tl)?;
+                let crate::sema::symtab::TypeInfo::Derived(type_name) = &field.type_info else {
+                    return None;
+                };
+                let layout = tl.get(type_name)?;
+                let elem_addr = lower_fixed_component_array_element_ptr(
+                    b,
+                    locals,
+                    args,
+                    st,
+                    field_ptr,
+                    &field.dims,
+                    layout.size as i64,
+                )?;
+                return Some((elem_addr, type_name.clone()));
+            }
+            None
         }
         _ => None,
     }

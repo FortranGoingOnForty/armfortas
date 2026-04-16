@@ -12,6 +12,7 @@ pub struct FieldLayout {
     pub name: String,
     pub offset: usize,
     pub size: usize,
+    pub dims: Vec<(i64, i64)>,
     pub type_info: TypeInfo,
     /// F2018 §7.5.4.5 / §7.5.4.6 attributes on the component, carried
     /// per-field because validation of `obj%comp` as an ALLOCATE
@@ -214,6 +215,32 @@ fn eval_const_int_expr(
     }
 }
 
+fn eval_explicit_array_dims(
+    specs: Option<&Vec<crate::ast::decl::ArraySpec>>,
+    const_params: &HashMap<String, i64>,
+) -> Vec<(i64, i64)> {
+    let Some(specs) = specs else {
+        return Vec::new();
+    };
+    let mut dims = Vec::new();
+    for spec in specs {
+        let crate::ast::decl::ArraySpec::Explicit { lower, upper } = spec else {
+            return Vec::new();
+        };
+        let lower_val = lower
+            .as_ref()
+            .and_then(|expr| eval_const_int_expr(expr, const_params))
+            .unwrap_or(1);
+        let upper_val = match eval_const_int_expr(upper, const_params) {
+            Some(value) => value,
+            None => return Vec::new(),
+        };
+        let extent = (upper_val - lower_val + 1).max(0);
+        dims.push((lower_val, extent));
+    }
+    dims
+}
+
 /// Convert a TypeSpec AST node to TypeInfo for layout computation.
 fn type_spec_to_type_info(
     ts: &crate::ast::decl::TypeSpec,
@@ -311,6 +338,11 @@ pub fn compute_layout(
 
             let ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
+                let dims = if is_allocatable || is_pointer {
+                    Vec::new()
+                } else {
+                    eval_explicit_array_dims(entity.array_spec.as_ref(), const_params)
+                };
                 let (elem_size, elem_align) = if matches!(
                     &ti,
                     TypeInfo::Character { len: None, .. }
@@ -329,17 +361,26 @@ pub fn compute_layout(
                 let padding = (elem_align - (offset % elem_align)) % elem_align;
                 offset += padding;
                 max_align = max_align.max(elem_align);
+                let elem_count = if dims.is_empty() {
+                    1usize
+                } else {
+                    dims.iter()
+                        .map(|(_, extent)| (*extent).max(0) as usize)
+                        .product::<usize>()
+                };
+                let field_size = elem_size.saturating_mul(elem_count.max(1));
 
                 fields.push(FieldLayout {
                     name: entity.name.clone(),
                     offset,
-                    size: elem_size,
+                    size: field_size,
+                    dims,
                     type_info: ti.clone(),
                     allocatable: is_allocatable,
                     pointer: is_pointer,
                     target: is_target,
                 });
-                offset += elem_size;
+                offset += field_size;
             }
         }
     }
@@ -396,8 +437,8 @@ mod tests {
             size: 8,
             align: 4,
             fields: vec![
-                FieldLayout { name: "x".into(), offset: 0, size: 4, type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "y".into(), offset: 4, size: 4, type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "x".into(), offset: 0, size: 4, dims: vec![], type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "y".into(), offset: 4, size: 4, dims: vec![], type_info: TypeInfo::Real { kind: Some(4) }, allocatable: false, pointer: false, target: false },
             ],
             bound_procs: vec![],
             final_procs: vec![],
@@ -422,9 +463,9 @@ mod tests {
             size: 24,
             align: 8,
             fields: vec![
-                FieldLayout { name: "a".into(), offset: 0, size: 1, type_info: TypeInfo::Integer { kind: Some(1) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "b".into(), offset: 8, size: 8, type_info: TypeInfo::Real { kind: Some(8) }, allocatable: false, pointer: false, target: false },
-                FieldLayout { name: "c".into(), offset: 16, size: 4, type_info: TypeInfo::Integer { kind: Some(4) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "a".into(), offset: 0, size: 1, dims: vec![], type_info: TypeInfo::Integer { kind: Some(1) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "b".into(), offset: 8, size: 8, dims: vec![], type_info: TypeInfo::Real { kind: Some(8) }, allocatable: false, pointer: false, target: false },
+                FieldLayout { name: "c".into(), offset: 16, size: 4, dims: vec![], type_info: TypeInfo::Integer { kind: Some(4) }, allocatable: false, pointer: false, target: false },
             ],
             bound_procs: vec![],
             final_procs: vec![],

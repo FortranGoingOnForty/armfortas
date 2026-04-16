@@ -433,6 +433,27 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
 }
 
 #[test]
+fn fixed_component_array_element_assignment_compiles() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: command_t\n    integer :: code = 0\n  end type command_t\n  type :: trap_table_t\n    type(command_t) :: commands(3)\n  end type trap_table_t\ncontains\n  subroutine set_code(tab, i, v)\n    type(trap_table_t), intent(inout) :: tab\n    integer, intent(in) :: i, v\n    tab%commands(i)%code = v\n  end subroutine set_code\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("fixed_component_array", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed component array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed component array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_char_component_ops_and_achar_compile() {
     let src = write_program(
         "module m\n  implicit none\n  type :: shell_t\n    character(len=8) :: ifs = ''\n  end type shell_t\ncontains\n  subroutine f(shell, sep)\n    type(shell_t), intent(in) :: shell\n    character(len=1), intent(out) :: sep\n    if (len_trim(shell%ifs) > 0) then\n      sep = shell%ifs(1:1)\n    else\n      sep = achar(0)\n    end if\n  end subroutine f\nend module m\n",
@@ -2596,6 +2617,63 @@ fn procedure_pointer_module_export_survives_amod_import() {
     assert!(
         compile_user.status.success(),
         "imported module procedure pointers should survive .amod export/import: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn derived_pointer_module_global_survives_amod_import() {
+    let dir = unique_dir("derived_ptr_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "state_mod.f90",
+        "module state_mod\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\n  type(node_t), target, save :: backing\n  type(node_t), pointer, public, save :: current => null()\ncontains\n  subroutine init_state()\n    current => backing\n    current%value = 1\n  end subroutine init_state\nend module state_mod\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user_mod.f90",
+        "module user_mod\n  implicit none\ncontains\n  subroutine bump()\n    use state_mod\n    if (.not. associated(current)) call init_state()\n    current%value = current%value + 1\n  end subroutine bump\nend module user_mod\n",
+    );
+
+    let mod_obj = dir.join("state_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("state module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "derived-pointer module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("user_mod.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("state user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "imported derived-pointer module globals should survive .amod export/import: {}",
         String::from_utf8_lossy(&compile_user.stderr)
     );
 

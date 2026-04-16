@@ -351,14 +351,28 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         }
         for field in &layout.fields {
             let ft = type_info_to_string(Some(&field.type_info));
+            let dims = if field.dims.is_empty() {
+                String::new()
+            } else {
+                let rendered = field
+                    .dims
+                    .iter()
+                    .map(|(lower, extent)| {
+                        let upper = lower + extent - 1;
+                        format!("{}:{}", lower, upper)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(" @dims {}", rendered)
+            };
             let mut attrs = String::new();
             if field.allocatable { attrs.push_str(" @allocatable"); }
             if field.pointer { attrs.push_str(" @pointer"); }
             if field.target { attrs.push_str(" @target"); }
             writeln!(
                 out,
-                "  @field {} : {} @offset {} @size {}{}",
-                field.name, ft, field.offset, field.size, attrs
+                "  @field {} : {} @offset {} @size {}{}{}",
+                field.name, ft, field.offset, field.size, dims, attrs
             ).unwrap();
         }
         for bp in &layout.bound_procs {
@@ -814,8 +828,25 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
                     None => (offset_part, "0"),
                 };
                 let mut size_str = after_offset;
+                let mut dims: Vec<(i64, i64)> = Vec::new();
                 let mut flag_tail: &str = "";
-                if let Some(idx) = after_offset.find(" @") {
+                if let Some(idx) = after_offset.find(" @dims ") {
+                    size_str = &after_offset[..idx];
+                    let dims_part = &after_offset[idx + 7..];
+                    let (dims_str, tail) = if let Some(flag_idx) = dims_part.find(" @") {
+                        (&dims_part[..flag_idx], &dims_part[flag_idx..])
+                    } else {
+                        (dims_part, "")
+                    };
+                    for dim in dims_str.split(',').map(str::trim).filter(|dim| !dim.is_empty()) {
+                        if let Some((lower_str, upper_str)) = dim.split_once(':') {
+                            let lower = lower_str.trim().parse().unwrap_or(1);
+                            let upper = upper_str.trim().parse().unwrap_or(lower - 1);
+                            dims.push((lower, (upper - lower + 1).max(0)));
+                        }
+                    }
+                    flag_tail = tail;
+                } else if let Some(idx) = after_offset.find(" @") {
                     size_str = &after_offset[..idx];
                     flag_tail = &after_offset[idx..];
                 }
@@ -827,6 +858,7 @@ fn parse_type(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
                     name: fname.trim().to_string(),
                     offset: offset_str.trim().parse().unwrap_or(0),
                     size: size_str.trim().parse().unwrap_or(0),
+                    dims,
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
                     allocatable,
                     pointer,
@@ -925,6 +957,16 @@ pub fn extract_module_globals(
                 crate::ir::types::IrType::Ptr(Box::new(
                     crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8),
                 ))
+            } else if var.pointer {
+                match derived_type.as_deref() {
+                    Some("c_ptr") | Some("c_funptr") => {
+                        crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I64)
+                    }
+                    Some(_) => crate::ir::types::IrType::Ptr(Box::new(
+                        crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8),
+                    )),
+                    None => type_info_to_ir_type(var.type_info.as_ref()),
+                }
             } else if let Some(type_name) = &derived_type {
                 if let Some(layout) = iface
                     .types
@@ -993,6 +1035,14 @@ pub fn extract_char_len_star_params(
 fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
     use crate::ir::types::{IrType, IntWidth, FloatWidth};
     match info {
+        Some(TypeInfo::Derived(name)) => {
+            let lower = name.to_lowercase();
+            if lower == "c_ptr" || lower == "c_funptr" {
+                IrType::Int(IntWidth::I64)
+            } else {
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+            }
+        }
         Some(TypeInfo::Integer { kind }) => IrType::Int(match kind {
             Some(1) => IntWidth::I8,
             Some(2) => IntWidth::I16,
