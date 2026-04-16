@@ -354,10 +354,32 @@ fn extract_multifile_link(source: &str) -> Option<Vec<String>> {
     None
 }
 
+fn candidate_target_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if matches!(name, "debug" | "release") {
+                dirs.push(ancestor.to_path_buf());
+                break;
+            }
+        }
+    }
+    for dir in ["target/release", "target/debug"] {
+        let candidate = PathBuf::from(dir);
+        if !dirs.iter().any(|existing| existing == &candidate) {
+            dirs.push(candidate);
+        }
+    }
+    dirs
+}
+
 /// Find the static runtime library.
 fn find_runtime() -> PathBuf {
-    for dir in &["target/release", "target/debug"] {
-        let p = PathBuf::from(dir).join("libarmfortas_rt.a");
+    for dir in candidate_target_dirs() {
+        let p = dir.join("libarmfortas_rt.a");
         if p.exists() {
             return p;
         }
@@ -1479,10 +1501,8 @@ fn match_checks(
 
 /// Find the armfortas binary.
 fn find_compiler() -> PathBuf {
-    // Look in cargo's target directory.
-    let candidates = ["target/debug/armfortas", "target/release/armfortas"];
-    for c in &candidates {
-        let p = PathBuf::from(c);
+    for dir in candidate_target_dirs() {
+        let p = dir.join("armfortas");
         if p.exists() {
             return fs::canonicalize(&p).unwrap_or_else(|e| {
                 panic!("cannot canonicalize compiler path {}: {}", p.display(), e)
