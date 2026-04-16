@@ -914,6 +914,13 @@ pub fn extract_module_globals(
                     dims: var.dims.clone(),
                     allocatable: var.allocatable,
                     deferred_char: var.deferred_char,
+                    char_kind: match var.type_info.as_ref() {
+                        Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => {
+                            crate::ir::lower::CharKind::Fixed(*n)
+                        }
+                        _ if var.deferred_char => crate::ir::lower::CharKind::Deferred,
+                        _ => crate::ir::lower::CharKind::None,
+                    },
                     external: true,
                 },
             );

@@ -28,7 +28,7 @@ struct LoopScope {
 
 /// Character variable kind: how string storage is managed.
 #[derive(Clone, PartialEq)]
-enum CharKind {
+pub(crate) enum CharKind {
     /// Not a character variable.
     None,
     /// Fixed-length character(N): addr points to N-byte stack buffer.
@@ -956,6 +956,7 @@ pub struct ModuleGlobalInfo {
     pub dims: Vec<(i64, i64)>,
     pub allocatable: bool,
     pub deferred_char: bool,
+    pub(crate) char_kind: CharKind,
     /// External modules (from .amod files) — skip emitting Global
     /// data entries since the storage lives in the other .o file.
     pub external: bool,
@@ -1358,6 +1359,21 @@ fn collect_module_globals(
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
+            let global_char_kind = match type_spec {
+                TypeSpec::Character(Some(sel)) => match &sel.len {
+                    Some(crate::ast::decl::LenSpec::Expr(e)) => match &e.node {
+                        crate::ast::expr::Expr::IntegerLiteral { text, .. } => {
+                            text.parse::<i64>().ok().map(CharKind::Fixed).unwrap_or(CharKind::None)
+                        }
+                        _ => CharKind::None,
+                    },
+                    Some(crate::ast::decl::LenSpec::Colon) => CharKind::Deferred,
+                    Some(crate::ast::decl::LenSpec::Star) => CharKind::None,
+                    None => CharKind::Fixed(1),
+                },
+                TypeSpec::Character(None) => CharKind::Fixed(1),
+                _ => CharKind::None,
+            };
             for entity in entities {
                 let symbol = format!("afs_mod_{}_{}",
                     mod_name.to_lowercase(),
@@ -1388,6 +1404,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: true,
                             deferred_char: false,
+                            char_kind: global_char_kind.clone(),
                             external: false,
                         },
                     );
@@ -1414,6 +1431,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: true,
+                            char_kind: CharKind::Deferred,
                             external: false,
                         },
                     );
@@ -1478,6 +1496,7 @@ fn collect_module_globals(
                             dims,
                             allocatable: false,
                             deferred_char: false,
+                            char_kind: global_char_kind.clone(),
                             external: false,
                         },
                     );
@@ -1498,6 +1517,7 @@ fn collect_module_globals(
                             dims: vec![],
                             allocatable: false,
                             deferred_char: false,
+                            char_kind: global_char_kind.clone(),
                             external: false,
                         },
                     );
@@ -3023,7 +3043,6 @@ fn install_one_global(
         info.ty.clone()
     };
     let addr = b.global_addr(&info.symbol, addr_ty);
-    let ck = if info.deferred_char { CharKind::Deferred } else { CharKind::None };
     locals.insert(local_key, LocalInfo {
         addr,
         ty: info.ty.clone(),
@@ -3031,7 +3050,7 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: ck, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
+        char_kind: info.char_kind.clone(), derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![],
     });
 }
 
@@ -6245,6 +6264,48 @@ fn lower_string_expr(
                         }
                     }
                 }
+                // Alternate parser shape for substring of a character
+                // array element: arr(i, lo:hi) encoded as a single
+                // FunctionCall with an element subscript followed by
+                // a substring range.
+                if args.len() == 2 {
+                    if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &args[0].value {
+                        if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[1].value {
+                            if let Some(info) = locals.get(&key) {
+                                if matches!(info.char_kind, CharKind::Fixed(_))
+                                    && (!info.dims.is_empty() || info.allocatable)
+                                {
+                                    let idx = lower_expr(b, locals, idx_expr, st);
+                                    let idx64 = match b.func().value_type(idx) {
+                                        Some(IrType::Int(IntWidth::I64)) => idx,
+                                        _ => b.int_extend(idx, IntWidth::I64, true),
+                                    };
+                                    let one = b.const_i64(1);
+                                    let idx0 = b.isub(idx64, one);
+                                    let base = array_base_addr(b, info);
+                                    let elem_slot = b.gep(base, vec![idx0], info.ty.clone());
+                                    let elem_ptr = b.load_typed(
+                                        elem_slot,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    let elem_len = match info.char_kind {
+                                        CharKind::Fixed(n) => b.const_i64(n),
+                                        _ => b.const_i64(0),
+                                    };
+                                    return lower_substring(
+                                        b,
+                                        locals,
+                                        st,
+                                        elem_ptr,
+                                        elem_len,
+                                        start.as_ref(),
+                                        end.as_ref(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Nested FunctionCall: arr(i)(lo:hi) — substring of a
             // character array element. The outer callee is itself a
@@ -6752,6 +6813,32 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                         }
+                    } else if let Expr::ComponentAccess { .. } = &callee.node {
+                        if args.len() == 1
+                            && matches!(args[0].value, crate::ast::expr::SectionSubscript::Range { .. })
+                        {
+                            if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[0].value {
+                                if let Some((field_ptr, field)) =
+                                    resolve_component_field_access(b, &ctx.locals, callee, ctx.type_layouts)
+                                {
+                                    if is_deferred_char_component_field(&field) {
+                                        let (base_ptr, base_len) = load_string_descriptor_view(b, field_ptr);
+                                        let (dest_ptr, dest_len) = lower_substring(
+                                            b, &ctx.locals, ctx.st,
+                                            base_ptr, base_len,
+                                            start.as_ref(), end.as_ref(),
+                                        );
+                                        let (src_ptr, src_len) =
+                                            lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                        b.call(
+                                            FuncRef::External("afs_assign_char_fixed".into()),
+                                            vec![dest_ptr, dest_len, src_ptr, src_len],
+                                            IrType::Void,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Expr::ComponentAccess { base, component } => {
@@ -6770,6 +6857,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
                                         vec![field_ptr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                } else if is_deferred_char_component_field(field) {
+                                    let (dest_ptr, dest_len) = load_string_descriptor_view(b, field_ptr);
+                                    let (src_ptr, src_len) =
+                                        lower_string_expr(b, &ctx.locals, value, ctx.st);
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![dest_ptr, dest_len, src_ptr, src_len],
                                         IrType::Void,
                                     );
                                 } else {
@@ -7821,6 +7917,86 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             //
             // In both cases the target must be a simple Name for now;
             // component-access and slice targets are follow-up work.
+            if let Some((tgt_field_ptr, tgt_field)) =
+                resolve_component_field_access(b, &ctx.locals, target, ctx.type_layouts)
+            {
+                if !tgt_field.pointer {
+                    return;
+                }
+                if is_deferred_char_component_field(&tgt_field) {
+                    if let Expr::FunctionCall { callee, .. } = &value.node {
+                        if let Expr::Name { name } = &callee.node {
+                            if name.eq_ignore_ascii_case("null") {
+                                let zero = b.const_i64(0);
+                                let null = b.int_to_ptr(
+                                    zero,
+                                    IrType::Int(IntWidth::I8),
+                                );
+                                store_string_descriptor_view(b, tgt_field_ptr, null, zero);
+                                return;
+                            }
+                        }
+                    }
+                    if let Expr::FunctionCall { callee, args } = &value.node {
+                        if let Expr::FunctionCall { callee: inner_callee, args: inner_args } = &callee.node {
+                            if let Expr::Name { name: arr_name } = &inner_callee.node {
+                                let akey = arr_name.to_lowercase();
+                                if let Some(info) = ctx.locals.get(&akey) {
+                                    if matches!(info.char_kind, CharKind::Fixed(_))
+                                        && (!info.dims.is_empty() || info.allocatable)
+                                        && args.len() == 1
+                                    {
+                                        if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[0].value {
+                                            let idx64 = if inner_args.len() == 1 {
+                                                if let crate::ast::expr::SectionSubscript::Element(idx_expr) = &inner_args[0].value {
+                                                    let idx = lower_expr_ctx(b, ctx, idx_expr);
+                                                    let idx_wide = match b.func().value_type(idx) {
+                                                        Some(IrType::Int(IntWidth::I64)) => idx,
+                                                        _ => b.int_extend(idx, IntWidth::I64, true),
+                                                    };
+                                                    let one = b.const_i64(1);
+                                                    b.isub(idx_wide, one)
+                                                } else { b.const_i64(0) }
+                                            } else { b.const_i64(0) };
+                                            let base = array_base_addr(b, info);
+                                            let elem_slot = b.gep(base, vec![idx64], info.ty.clone());
+                                            let elem_ptr = b.load_typed(elem_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                                            let elem_len = match info.char_kind {
+                                                CharKind::Fixed(n) => b.const_i64(n),
+                                                _ => b.const_i64(0),
+                                            };
+                                            let (ptr, len) = lower_substring(
+                                                b,
+                                                &ctx.locals,
+                                                ctx.st,
+                                                elem_ptr,
+                                                elem_len,
+                                                start.as_ref(),
+                                                end.as_ref(),
+                                            );
+                                            store_string_descriptor_view(b, tgt_field_ptr, ptr, len);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some((src_field_ptr, src_field)) =
+                        resolve_component_field_access(b, &ctx.locals, value, ctx.type_layouts)
+                    {
+                        if is_deferred_char_component_field(&src_field) {
+                            let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
+                            store_string_descriptor_view(b, tgt_field_ptr, ptr, len);
+                            return;
+                        }
+                    }
+                    let (ptr, len) = lower_string_expr(b, &ctx.locals, value, ctx.st);
+                    store_string_descriptor_view(b, tgt_field_ptr, ptr, len);
+                    return;
+                }
+            }
+
             let Expr::Name { name: tgt_name } = &target.node else { return; };
             let tgt_key = tgt_name.to_lowercase();
             let Some(tgt_info) = ctx.locals.get(&tgt_key).cloned() else { return; };
@@ -7921,6 +8097,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         if let Some(field) = layout.field(component) {
                             let offset = b.const_i64(field.offset as i64);
                             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+                            if is_deferred_char_component_field(field) {
+                                let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
+                                b.store(ptr, tgt_info.addr);
+                                return;
+                            }
                             // Cast ptr<i8> → ptr<tgt_ty> via zero-offset GEP
                             // so the store type matches the pointer slot.
                             let zero = b.const_i64(0);
@@ -11733,6 +11914,7 @@ fn lower_pointer_intrinsic(
     locals: &HashMap<String, LocalInfo>,
     name: &str,
     args: &[crate::ast::expr::Argument],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<ValueId> {
     if name != "associated" {
         return None;
@@ -11741,15 +11923,30 @@ fn lower_pointer_intrinsic(
     // two-argument form ASSOCIATED(p, target) is deferred.
     let first = args.first()?;
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else { return None; };
-    let Expr::Name { name: ptr_name } = &expr.node else { return None; };
-    let info = locals.get(&ptr_name.to_lowercase())?.clone();
-    if !info.is_pointer {
+    let raw = if let Expr::Name { name: ptr_name } = &expr.node {
+        let info = locals.get(&ptr_name.to_lowercase())?.clone();
+        if !info.is_pointer {
+            return None;
+        }
+        let zero_off = b.const_i64(0);
+        let base_ptr = b.gep(info.addr, vec![zero_off], IrType::Int(IntWidth::I64));
+        b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
+    } else if let Some(tl) = type_layouts {
+        let (field_ptr, field) = resolve_component_field_access(b, locals, expr, tl)?;
+        if !field.pointer {
+            return None;
+        }
+        if is_deferred_char_component_field(&field) {
+            let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
+            coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64))
+        } else {
+            let zero_off = b.const_i64(0);
+            let base_ptr = b.gep(field_ptr, vec![zero_off], IrType::Int(IntWidth::I64));
+            b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
+        }
+    } else {
         return None;
-    }
-    // Load the pointer's stored target address (byte offset 0).
-    let zero_off = b.const_i64(0);
-    let base_ptr = b.gep(info.addr, vec![zero_off], IrType::Int(IntWidth::I64));
-    let raw = b.load_typed(base_ptr, IrType::Int(IntWidth::I64));
+    };
     let zero = b.const_i64(0);
 
     if args.len() >= 2 {
@@ -11775,7 +11972,7 @@ fn lower_pointer_intrinsic(
             let tgt_slot = b.gep(tgt_info.addr, vec![off], IrType::Int(IntWidth::I64));
             b.load_typed(tgt_slot, IrType::Int(IntWidth::I64))
         } else {
-            let scratch = b.alloca(IrType::Ptr(Box::new(info.ty.clone())));
+            let scratch = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             b.store(tgt_info.addr, scratch);
             b.load_typed(scratch, IrType::Int(IntWidth::I64))
         };
@@ -12134,6 +12331,61 @@ fn resolve_component_base(
         }
         _ => None,
     }
+}
+
+fn resolve_component_field_access(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, crate::sema::type_layout::FieldLayout)> {
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return None;
+    };
+    let (base_addr, type_name) = resolve_component_base(b, locals, base, tl)?;
+    let layout = tl.get(&type_name)?;
+    let field = layout.field(component)?.clone();
+    let offset = b.const_i64(field.offset as i64);
+    let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+    Some((field_ptr, field))
+}
+
+fn is_deferred_char_component_field(field: &crate::sema::type_layout::FieldLayout) -> bool {
+    field.pointer
+        && matches!(
+            field.type_info,
+            crate::sema::symtab::TypeInfo::Character { len: None, .. }
+        )
+}
+
+fn load_string_descriptor_view(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+) -> (ValueId, ValueId) {
+    let ptr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let eight = b.const_i64(8);
+    let len_ptr = b.gep(desc, vec![eight], IrType::Int(IntWidth::I8));
+    let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+    (ptr, len)
+}
+
+fn store_string_descriptor_view(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    ptr: ValueId,
+    len: ValueId,
+) {
+    let flags = b.const_i32(2); // STR_DEFERRED without STR_ALLOCATED
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        ptr,
+    );
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I32), flags);
 }
 
 /// Resolve a base expression for a type-bound procedure call.
@@ -12676,7 +12928,7 @@ fn lower_expr_full(
                 // Check for pointer intrinsics (ASSOCIATED) first —
                 // these work on every pointer shape and don't care
                 // about the array-intrinsic filter.
-                if let Some(result) = lower_pointer_intrinsic(b, locals, &key, args) {
+                if let Some(result) = lower_pointer_intrinsic(b, locals, &key, args, type_layouts) {
                     return result;
                 }
 
@@ -12944,6 +13196,11 @@ fn lower_expr_full(
                             // (for chained access like x%inner%field).
                             if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
                                 return field_ptr;
+                            }
+
+                            if is_deferred_char_component_field(field) {
+                                let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
+                                return ptr;
                             }
 
                             // Character fields: return the pointer to the inline

@@ -197,7 +197,12 @@ pub fn compute_layout(
             let is_target = attrs.iter().any(|a| matches!(a, crate::ast::decl::Attribute::Target));
 
             let ti = type_spec_to_type_info(type_spec);
-            let (elem_size, elem_align) = if is_allocatable || is_pointer {
+            let (elem_size, elem_align) = if matches!(
+                &ti,
+                TypeInfo::Character { len: None, .. }
+            ) && (is_allocatable || is_pointer) {
+                (32, 8) // StringDescriptor for deferred-length char allocatable/pointer components
+            } else if is_allocatable || is_pointer {
                 (384, 8) // ArrayDescriptor size for allocatable/pointer components
             } else if let TypeInfo::Derived(ref dname) = ti {
                 registry.get(dname)

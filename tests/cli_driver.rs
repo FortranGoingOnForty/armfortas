@@ -1867,9 +1867,9 @@ fn procedure_pointer_decl_compiles_through_wrapper_calls() {
 }
 
 #[test]
-fn deferred_char_pointer_component_reports_not_implemented() {
+fn deferred_char_pointer_component_compiles_string_pool_style_ops() {
     let src = write_program(
-        "module m\n  implicit none\n  type :: string_ref\n    character(:), pointer :: data => null()\n  end type string_ref\nend module\n",
+        "module m\n  implicit none\n  type :: string_ref\n    integer :: str_len = 0\n    character(:), pointer :: data => null()\n  end type string_ref\n  character(len=16), target :: pool(1)\ncontains\n  subroutine bind_pool(ref, n)\n    type(string_ref), intent(inout) :: ref\n    integer, intent(in) :: n\n    ref%str_len = n\n    ref%data => pool(1)(1:n)\n    if (associated(ref%data)) then\n      ref%data = ' '\n      ref%data(1:1) = 'x'\n    end if\n  end subroutine bind_pool\n\n  subroutine own_alloc(ref, n)\n    type(string_ref), intent(inout) :: ref\n    integer, intent(in) :: n\n    if (associated(ref%data)) deallocate(ref%data)\n    allocate(character(len=n) :: ref%data)\n    ref%data = 'abc'\n  end subroutine own_alloc\nend module\n",
         "f90",
     );
     let out = unique_path("deferred_char_pointer_component", "o");
@@ -1879,16 +1879,9 @@ fn deferred_char_pointer_component_reports_not_implemented() {
         .output()
         .expect("spawn failed");
     assert!(
-        !result.status.success(),
-        "deferred char pointer components should fail honestly"
-    );
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(
-        stderr.contains(
-            "derived-type deferred-length character pointer components are recognized but not yet implemented"
-        ),
-        "expected explicit deferred-character component diagnostic: {}",
-        stderr
+        result.status.success(),
+        "deferred char pointer components should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);

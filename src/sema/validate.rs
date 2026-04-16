@@ -238,19 +238,7 @@ fn validate_unsupported_component_forms(
     ctx: &mut Ctx<'_>,
     components: &[crate::ast::decl::SpannedDecl],
 ) {
-    for component in components {
-        if let Decl::TypeDecl {
-            type_spec, attrs, ..
-        } = &component.node
-        {
-            if is_deferred_char_pointer_component(type_spec, attrs) {
-                ctx.error(
-                    component.span,
-                    "derived-type deferred-length character pointer components are recognized but not yet implemented",
-                );
-            }
-        }
-    }
+    let _ = (ctx, components);
 }
 
 /// Find the scope ID for a program unit, preferring children of `parent_scope`.
