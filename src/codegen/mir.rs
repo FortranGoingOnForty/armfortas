@@ -31,24 +31,24 @@ pub enum RegClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArmOpcode {
     // ---- Integer arithmetic ----
-    AddReg,      // ADD Xd, Xn, Xm
-    AddsReg,     // ADDS Xd, Xn, Xm (sets flags)
-    AdcReg,      // ADC Xd, Xn, Xm
-    AddImm,      // ADD Xd, Xn, #imm
-    SubReg,      // SUB Xd, Xn, Xm
-    SubsReg,     // SUBS Xd, Xn, Xm (sets flags)
-    SbcReg,      // SBC Xd, Xn, Xm
-    SubImm,      // SUB Xd, Xn, #imm
-    Mul,         // MUL Xd, Xn, Xm
-    Sdiv,        // SDIV Xd, Xn, Xm
-    Msub,        // MSUB Xd, Xn, Xm, Xa  (for imod: a - (a/b)*b)
-    Neg,         // NEG Xd, Xm  (alias: SUB Xd, XZR, Xm)
+    AddReg,  // ADD Xd, Xn, Xm
+    AddsReg, // ADDS Xd, Xn, Xm (sets flags)
+    AdcReg,  // ADC Xd, Xn, Xm
+    AddImm,  // ADD Xd, Xn, #imm
+    SubReg,  // SUB Xd, Xn, Xm
+    SubsReg, // SUBS Xd, Xn, Xm (sets flags)
+    SbcReg,  // SBC Xd, Xn, Xm
+    SubImm,  // SUB Xd, Xn, #imm
+    Mul,     // MUL Xd, Xn, Xm
+    Sdiv,    // SDIV Xd, Xn, Xm
+    Msub,    // MSUB Xd, Xn, Xm, Xa  (for imod: a - (a/b)*b)
+    Neg,     // NEG Xd, Xm  (alias: SUB Xd, XZR, Xm)
 
     // ---- Logic ----
     AndReg,
     OrrReg,
     EorReg,
-    OrnReg,      // MVN is ORN Xd, XZR, Xm
+    OrnReg, // MVN is ORN Xd, XZR, Xm
 
     // ---- Shifts ----
     LslReg,
@@ -56,89 +56,110 @@ pub enum ArmOpcode {
     AsrReg,
 
     // ---- Bit manipulation ----
-    Mvn,         // MVN Xd, Xm  (bitwise NOT, alias: ORN Xd, XZR, Xm)
-    Clz,         // CLZ Xd, Xn  (count leading zeros)
-    Rbit,        // RBIT Xd, Xn (reverse bits)
+    Mvn,  // MVN Xd, Xm  (bitwise NOT, alias: ORN Xd, XZR, Xm)
+    Clz,  // CLZ Xd, Xn  (count leading zeros)
+    Rbit, // RBIT Xd, Xn (reverse bits)
 
     // ---- Comparison & select ----
-    CmpReg,      // CMP Xn, Xm  (alias: SUBS XZR, Xn, Xm)
-    CmpImm,      // CMP Xn, #imm
-    Cset,        // CSET Xd, cond
-    CselReg,     // CSEL Xd, Xn, Xm, cond
-    FCmpReg,     // FCMP Dn, Dm
-    FCset,       // CSET Xd, cond  (after FCMP)
-    FcselReg,    // FCSEL Dd, Dn, Dm, cond
+    CmpReg,   // CMP Xn, Xm  (alias: SUBS XZR, Xn, Xm)
+    CmpImm,   // CMP Xn, #imm
+    Cset,     // CSET Xd, cond
+    CselReg,  // CSEL Xd, Xn, Xm, cond
+    FCmpReg,  // FCMP Dn, Dm
+    FCset,    // CSET Xd, cond  (after FCMP)
+    FcselReg, // FCSEL Dd, Dn, Dm, cond
 
     // ---- Float arithmetic ----
-    FaddS, FaddD,
-    FsubS, FsubD,
-    FmulS, FmulD,
-    FdivS, FdivD,
-    FnegS, FnegD,
-    FabsS, FabsD,
-    FsqrtS, FsqrtD,
+    FaddS,
+    FaddD,
+    FsubS,
+    FsubD,
+    FmulS,
+    FmulD,
+    FdivS,
+    FdivD,
+    FnegS,
+    FnegD,
+    FabsS,
+    FabsD,
+    FsqrtS,
+    FsqrtD,
     // Fused multiply-add/subtract (FMADD/FMSUB/FNMSUB).
     // 3-source: dest = Sa ± Sn*Sm.
-    FmaddS, FmaddD,   // FMADD:  dest = Sa + Sn*Sm
-    FmsubS, FmsubD,   // FMSUB:  dest = Sa - Sn*Sm
-    FnmsubS, FnmsubD, // FNMSUB: dest = Sn*Sm - Sa
+    FmaddS,
+    FmaddD, // FMADD:  dest = Sa + Sn*Sm
+    FmsubS,
+    FmsubD, // FMSUB:  dest = Sa - Sn*Sm
+    FnmsubS,
+    FnmsubD, // FNMSUB: dest = Sn*Sm - Sa
 
     // ---- Conversions ----
-    ScvtfSW, ScvtfDW,   // signed int32 → float
-    ScvtfSX, ScvtfDX,   // signed int64 → float
-    FcvtzsWS, FcvtzsWD, // float → int32
-    FcvtzsXS, FcvtzsXD, // float → int64
-    FcvtSD, FcvtDS,     // float↔double
+    ScvtfSW,
+    ScvtfDW, // signed int32 → float
+    ScvtfSX,
+    ScvtfDX, // signed int64 → float
+    FcvtzsWS,
+    FcvtzsWD, // float → int32
+    FcvtzsXS,
+    FcvtzsXD, // float → int64
+    FcvtSD,
+    FcvtDS, // float↔double
 
     // ---- Move ----
-    Movz,        // MOVZ Xd, #imm16, LSL #shift
-    Movk,        // MOVK Xd, #imm16, LSL #shift
-    Movn,        // MOVN Xd, #imm16, LSL #shift
-    MovReg,      // MOV Xd, Xm  (alias: ORR Xd, XZR, Xm)
-    FmovReg,     // FMOV Dd, Dm
+    Movz,    // MOVZ Xd, #imm16, LSL #shift
+    Movk,    // MOVK Xd, #imm16, LSL #shift
+    Movn,    // MOVN Xd, #imm16, LSL #shift
+    MovReg,  // MOV Xd, Xm  (alias: ORR Xd, XZR, Xm)
+    FmovReg, // FMOV Dd, Dm
 
     // ---- Memory ----
-    StrImm,      // STR Xt, [Xn, #imm]
-    LdrImm,      // LDR Xt, [Xn, #imm]
-    StrhImm,     // STRH Wt, [Xn, #imm]  (store 16-bit half)
-    LdrshImm,    // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
-    StrbImm,     // STRB Wt, [Xn, #imm]  (store 8-bit byte)
-    LdrsbImm,    // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
-    StrFpImm,    // STR Dt, [Xn, #imm]  (float store)
-    LdrFpImm,    // LDR Dt, [Xn, #imm]  (float load)
-    StpPre,      // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
-    LdpPost,     // LDP Xt1, Xt2, [Xn], #imm   (post-index)
-    StpOffset,   // STP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)
-    LdpOffset,   // LDP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)
-    AdrpLdr,     // ADRP + LDR sequence (load value from PC-relative address)
-    AdrpAdd,     // ADRP + ADD sequence (compute PC-relative address)
+    StrImm,    // STR Xt, [Xn, #imm]
+    LdrImm,    // LDR Xt, [Xn, #imm]
+    StrhImm,   // STRH Wt, [Xn, #imm]  (store 16-bit half)
+    LdrshImm,  // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
+    StrbImm,   // STRB Wt, [Xn, #imm]  (store 8-bit byte)
+    LdrsbImm,  // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
+    StrFpImm,  // STR Dt, [Xn, #imm]  (float store)
+    LdrFpImm,  // LDR Dt, [Xn, #imm]  (float load)
+    StpPre,    // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
+    LdpPost,   // LDP Xt1, Xt2, [Xn], #imm   (post-index)
+    StpOffset, // STP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)
+    LdpOffset, // LDP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)
+    AdrpLdr,   // ADRP + LDR sequence (load value from PC-relative address)
+    AdrpAdd,   // ADRP + ADD sequence (compute PC-relative address)
 
     // ---- Branch ----
-    B,           // B label
-    BCond,       // B.cond label
-    Bl,          // BL label  (call)
-    Blr,         // BLR reg   (indirect call)
-    Ret,         // RET
+    B,     // B label
+    BCond, // B.cond label
+    Bl,    // BL label  (call)
+    Blr,   // BLR reg   (indirect call)
+    Ret,   // RET
 
     // ---- Extend ----
-    Sxtw,        // SXTW Xd, Wn (sign-extend 32→64)
-    Sxth,        // SXTH Wd|Xd, Wn (sign-extend 16→32 or 16→64)
-    Sxtb,        // SXTB Wd|Xd, Wn (sign-extend 8→32 or 8→64)
+    Sxtw, // SXTW Xd, Wn (sign-extend 32→64)
+    Sxth, // SXTH Wd|Xd, Wn (sign-extend 16→32 or 16→64)
+    Sxtb, // SXTB Wd|Xd, Wn (sign-extend 8→32 or 8→64)
 
     // ---- Special ----
     Nop,
-    Brk,         // BRK #imm16  (debug trap)
+    Brk, // BRK #imm16  (debug trap)
 }
 
 /// ARM64 condition codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArmCond {
-    Eq, Ne,
-    Hs, Lo,      // unsigned >=, <
-    Mi, Pl,      // negative, positive
-    Hi, Ls,      // unsigned >, <=
-    Ge, Lt,      // signed >=, <
-    Gt, Le,      // signed >, <=
+    Eq,
+    Ne,
+    Hs,
+    Lo, // unsigned >=, <
+    Mi,
+    Pl, // negative, positive
+    Hi,
+    Ls, // unsigned >, <=
+    Ge,
+    Lt, // signed >=, <
+    Gt,
+    Le, // signed >, <=
 }
 
 /// A machine operand.
@@ -215,7 +236,11 @@ pub struct MachineBlock {
 
 impl MachineBlock {
     pub fn new(id: MBlockId, label: String) -> Self {
-        Self { id, label, insts: Vec::new() }
+        Self {
+            id,
+            label,
+            insts: Vec::new(),
+        }
     }
 }
 
@@ -244,8 +269,8 @@ pub struct StackFrame {
 /// A stack frame slot.
 #[derive(Debug, Clone)]
 pub struct FrameSlot {
-    pub offset: i32,  // negative offset from FP
-    pub size: u32,    // size in bytes
+    pub offset: i32, // negative offset from FP
+    pub size: u32,   // size in bytes
 }
 
 impl StackFrame {
@@ -268,12 +293,19 @@ impl StackFrame {
         // Epilogue: ldp x29, x30, [sp, #FRAME_SIZE - 16]
         //           add sp, sp, #FRAME_SIZE
         //           ret
-        Self { locals: Vec::new(), size: 16, next_offset: 0, outgoing_arg_size: 0 }
+        Self {
+            locals: Vec::new(),
+            size: 16,
+            next_offset: 0,
+            outgoing_arg_size: 0,
+        }
     }
 }
 
 impl Default for StackFrame {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StackFrame {
@@ -313,6 +345,7 @@ pub struct MachineFunction {
     pub frame: StackFrame,
     pub vregs: Vec<VReg>,
     pub const_pool: Vec<ConstPoolEntry>,
+    pub internal_only: bool,
     next_vreg: u32,
     next_block: u32,
 }
@@ -326,6 +359,7 @@ impl MachineFunction {
             frame: StackFrame::new(),
             vregs: Vec::new(),
             const_pool: Vec::new(),
+            internal_only: false,
             next_vreg: 0,
             next_block: 1,
         }
@@ -349,12 +383,18 @@ impl MachineFunction {
 
     /// Get a block by ID.
     pub fn block(&self, id: MBlockId) -> &MachineBlock {
-        self.blocks.iter().find(|b| b.id == id).expect("machine block not found")
+        self.blocks
+            .iter()
+            .find(|b| b.id == id)
+            .expect("machine block not found")
     }
 
     /// Get a mutable block by ID.
     pub fn block_mut(&mut self, id: MBlockId) -> &mut MachineBlock {
-        self.blocks.iter_mut().find(|b| b.id == id).expect("machine block not found")
+        self.blocks
+            .iter_mut()
+            .find(|b| b.id == id)
+            .expect("machine block not found")
     }
 
     /// Add a constant pool entry, return its index.
@@ -383,7 +423,12 @@ mod tests {
     fn stack_frame_alignment() {
         let mut frame = StackFrame::new();
         frame.alloc_local(4); // i32
-        assert_eq!(frame.size % 16, 0, "frame size {} not 16-byte aligned", frame.size);
+        assert_eq!(
+            frame.size % 16,
+            0,
+            "frame size {} not 16-byte aligned",
+            frame.size
+        );
 
         frame.alloc_local(8); // i64
         assert_eq!(frame.size % 16, 0);

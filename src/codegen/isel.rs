@@ -7,18 +7,18 @@
 //! Strategy: naive spill-everything. Every vreg lives on the stack.
 //! Load before use, store after def. Correct but slow — optimized later.
 
-use std::collections::{HashMap, HashSet};
-use crate::ir::types::*;
-use crate::ir::inst::*;
 use super::mir::*;
+use crate::ir::inst::*;
+use crate::ir::types::*;
+use std::collections::{HashMap, HashSet};
 
 /// Select machine instructions for an entire IR module.
 pub fn select_module(module: &Module) -> Vec<MachineFunction> {
     // Build function name table for resolving Internal call refs.
-    let func_names: Vec<String> = module.functions.iter()
-        .map(|f| f.name.clone())
-        .collect();
-    module.functions.iter()
+    let func_names: Vec<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+    module
+        .functions
+        .iter()
         .map(|f| select_function_with_names(f, &func_names))
         .collect()
 }
@@ -29,7 +29,9 @@ fn select_function_with_names(func: &Function, func_names: &[String]) -> Machine
     for block in &mut mf.blocks {
         for inst in &mut block.insts {
             if let super::mir::ArmOpcode::Bl = inst.opcode {
-                if let Some(super::mir::MachineOperand::Extern(ref mut name)) = inst.operands.first_mut() {
+                if let Some(super::mir::MachineOperand::Extern(ref mut name)) =
+                    inst.operands.first_mut()
+                {
                     // Check if this is a placeholder "_func_N" name from isel.
                     if name.starts_with("_func_") {
                         if let Ok(idx) = name[6..].parse::<usize>() {
@@ -155,6 +157,7 @@ fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function) -> MachineFunction {
     let mut mf = MachineFunction::new(func.name.clone());
+    mf.internal_only = func.internal_only;
     let mut ctx = ISelCtx::new();
 
     // Phase 1: allocate stack slots for all IR alloca instructions.
@@ -293,7 +296,10 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 );
             }
             IncomingParam::Wide(_, other) => {
-                panic!("isel: unexpected ABI loc {:?} for incoming i128 param", other);
+                panic!(
+                    "isel: unexpected ABI loc {:?} for incoming i128 param",
+                    other
+                );
             }
             IncomingParam::Narrow(_, class, other) => {
                 panic!(
@@ -335,10 +341,14 @@ pub fn select_function(func: &Function) -> MachineFunction {
         for inst in &block.insts {
             // Allocas are special: they're handled by Phase 1
             // (stack-slot allocation). They don't get vregs.
-            if matches!(inst.kind, InstKind::Alloca(_)) { continue; }
+            if matches!(inst.kind, InstKind::Alloca(_)) {
+                continue;
+            }
             // Void-typed insts (Store, RuntimeCall returning void,
             // etc.) don't produce a usable value.
-            if matches!(inst.ty, IrType::Void) { continue; }
+            if matches!(inst.ty, IrType::Void) {
+                continue;
+            }
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
                 let offset = mf.alloc_local(16);
                 ctx.wide_value_slots.insert(inst.id, offset);
@@ -554,10 +564,7 @@ fn select_call_inst(
         };
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,
-            operands: vec![
-                MachineOperand::VReg(dest),
-                MachineOperand::PhysReg(src_reg),
-            ],
+            operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(src_reg)],
             def: Some(dest),
         });
     } else {
@@ -617,7 +624,8 @@ impl ISelCtx {
                 mf.vregs.iter().find(|v| v.id == vreg).map(|v| v.class) == Some(class),
                 "isel: vreg class mismatch for IR value %{} (existing class \
                  differs from requested {:?}) — phase 4a/4b disagreement",
-                val.0, class,
+                val.0,
+                class,
             );
             return vreg;
         }
@@ -635,7 +643,8 @@ impl ISelCtx {
                  currently mapped. This usually means a forward reference, \
                  a missing block param, or a value defined in an unreachable \
                  block.",
-                val.0, self.value_map.len(),
+                val.0,
+                self.value_map.len(),
             )
         })
     }
@@ -657,7 +666,13 @@ impl ISelCtx {
 }
 
 /// Select machine instructions for a single IR instruction.
-fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, func: &Function) {
+fn select_inst(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    func: &Function,
+) {
     if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
         match &inst.kind {
             InstKind::ConstInt(val, IntWidth::I128) => {
@@ -759,12 +774,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                     PhysReg::Gp(16),
                     PhysReg::Gp(17),
                 );
-                emit_i128_neg(
-                    mf,
-                    mb,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
+                emit_i128_neg(mf, mb, PhysReg::Gp(16), PhysReg::Gp(17));
                 emit_store_phys_i128_pair(
                     mf,
                     mb,
@@ -1028,19 +1038,56 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let va = ctx.lookup_vreg(*a);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::Neg,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::VReg(va),
-                ],
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(va)],
                 def: Some(dest),
             });
         }
 
         // ---- Float arithmetic ----
-        InstKind::FAdd(a, b) => emit_float_binop(mf, ctx, mb, inst, &inst.ty, *a, *b, ArmOpcode::FaddS, ArmOpcode::FaddD),
-        InstKind::FSub(a, b) => emit_float_binop(mf, ctx, mb, inst, &inst.ty, *a, *b, ArmOpcode::FsubS, ArmOpcode::FsubD),
-        InstKind::FMul(a, b) => emit_float_binop(mf, ctx, mb, inst, &inst.ty, *a, *b, ArmOpcode::FmulS, ArmOpcode::FmulD),
-        InstKind::FDiv(a, b) => emit_float_binop(mf, ctx, mb, inst, &inst.ty, *a, *b, ArmOpcode::FdivS, ArmOpcode::FdivD),
+        InstKind::FAdd(a, b) => emit_float_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            &inst.ty,
+            *a,
+            *b,
+            ArmOpcode::FaddS,
+            ArmOpcode::FaddD,
+        ),
+        InstKind::FSub(a, b) => emit_float_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            &inst.ty,
+            *a,
+            *b,
+            ArmOpcode::FsubS,
+            ArmOpcode::FsubD,
+        ),
+        InstKind::FMul(a, b) => emit_float_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            &inst.ty,
+            *a,
+            *b,
+            ArmOpcode::FmulS,
+            ArmOpcode::FmulD,
+        ),
+        InstKind::FDiv(a, b) => emit_float_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            &inst.ty,
+            *a,
+            *b,
+            ArmOpcode::FdivS,
+            ArmOpcode::FdivD,
+        ),
         InstKind::FNeg(a) => {
             let (class, opcode) = match &inst.ty {
                 IrType::Float(FloatWidth::F32) => (RegClass::Fp32, ArmOpcode::FnegS),
@@ -1060,7 +1107,9 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let va = ctx.lookup_vreg(*a);
             let vb = ctx.lookup_vreg(*b);
             let (func_name, arg0, arg1, ret) = match &inst.ty {
-                IrType::Float(FloatWidth::F32) => ("powf", PhysReg::Fp32(0), PhysReg::Fp32(1), PhysReg::Fp32(0)),
+                IrType::Float(FloatWidth::F32) => {
+                    ("powf", PhysReg::Fp32(0), PhysReg::Fp32(1), PhysReg::Fp32(0))
+                }
                 _ => ("pow", PhysReg::Fp(0), PhysReg::Fp(1), PhysReg::Fp(0)),
             };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -1349,7 +1398,11 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let src = ctx.lookup_vreg(*a);
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            let opcode = if class == RegClass::Fp64 { ArmOpcode::FabsD } else { ArmOpcode::FabsS };
+            let opcode = if class == RegClass::Fp64 {
+                ArmOpcode::FabsD
+            } else {
+                ArmOpcode::FabsS
+            };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
                 operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
@@ -1360,7 +1413,11 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let src = ctx.lookup_vreg(*a);
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            let opcode = if class == RegClass::Fp64 { ArmOpcode::FsqrtD } else { ArmOpcode::FsqrtS };
+            let opcode = if class == RegClass::Fp64 {
+                ArmOpcode::FsqrtD
+            } else {
+                ArmOpcode::FsqrtS
+            };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
                 operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
@@ -1618,7 +1675,11 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                     // other case (i32, i64, ptr).
                     let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
                     let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
-                    if is_fp { ArmOpcode::StrFpImm } else { ArmOpcode::StrImm }
+                    if is_fp {
+                        ArmOpcode::StrFpImm
+                    } else {
+                        ArmOpcode::StrImm
+                    }
                 }
             };
 
@@ -1684,10 +1745,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 // No indices — just copy the base.
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(base_vreg),
-                    ],
+                    operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(base_vreg)],
                     def: Some(dest),
                 });
             }
@@ -1715,8 +1773,10 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 _ => 32, // conservative default
             };
             let dest_width = match &inst.ty {
-                IrType::Int(IntWidth::I8) | IrType::Int(IntWidth::I16)
-                | IrType::Int(IntWidth::I32) | IrType::Bool => 32,
+                IrType::Int(IntWidth::I8)
+                | IrType::Int(IntWidth::I16)
+                | IrType::Int(IntWidth::I32)
+                | IrType::Bool => 32,
                 IrType::Int(IntWidth::I64) => 64,
                 _ => 32,
             };
@@ -1724,17 +1784,18 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             // bit-width, with one exception: SXTW requires an
             // X-register destination, so promote to Gp64 when
             // source is 32 AND target is 64.
-            let dest_class = if dest_width == 64 { RegClass::Gp64 } else { RegClass::Gp32 };
+            let dest_class = if dest_width == 64 {
+                RegClass::Gp64
+            } else {
+                RegClass::Gp32
+            };
             let dest = ctx.get_vreg(mf, inst.id, dest_class);
 
             if !*signed {
                 // Zero-extend: MOV (ARM64 implicitly zero-extends W→X).
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(src),
-                    ],
+                    operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                     def: Some(dest),
                 });
             } else if src_width >= dest_width {
@@ -1744,10 +1805,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 // rather than an illegal SXTW Wd, Wn.
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(src),
-                    ],
+                    operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                     def: Some(dest),
                 });
             } else {
@@ -1759,10 +1817,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
                 };
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(src),
-                    ],
+                    operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                     def: Some(dest),
                 });
             }
@@ -1775,10 +1830,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             // Truncate: just MOV — the 32-bit register naturally truncates.
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::MovReg,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::VReg(src),
-                ],
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                 def: Some(dest),
             });
         }
@@ -1790,10 +1842,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let dest = ctx.get_vreg(mf, inst.id, class);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::MovReg,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::VReg(src),
-                ],
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                 def: Some(dest),
             });
         }
@@ -1804,10 +1853,7 @@ fn select_inst(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: 
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode: ArmOpcode::MovReg,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::VReg(src),
-                ],
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                 def: Some(dest),
             });
         }
@@ -1884,7 +1930,13 @@ fn select_terminator(
                 def: None,
             });
         }
-        Terminator::CondBranch { cond, true_dest, true_args, false_dest, false_args } => {
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => {
             let cond_vreg = ctx.lookup_vreg(*cond);
             let true_mb = ctx.lookup_block(*true_dest);
             let false_mb = ctx.lookup_block(*false_dest);
@@ -1963,7 +2015,11 @@ fn select_terminator(
                 def: None,
             });
         }
-        Terminator::Switch { selector, cases, default } => {
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
             let sel_vreg = ctx.lookup_vreg(*selector);
             let default_mb = ctx.lookup_block(*default);
 
@@ -2030,20 +2086,25 @@ fn emit_branch_arg_copies(
     target_block: BlockId,
     args: &[ValueId],
 ) {
-    if args.is_empty() { return; }
+    if args.is_empty() {
+        return;
+    }
 
     // Look up the target block's param vregs in the same order
     // they appear in the IR (which is also the order they were
     // allocated in Phase 4a, so the i-th arg corresponds to the
     // i-th param).
-    let target_params = ctx.block_params.get(&target_block)
+    let target_params = ctx
+        .block_params
+        .get(&target_block)
         .expect("isel: branch target not in block_params snapshot");
     if target_params.len() != args.len() {
         // Verifier should reject this — but if it leaks through
         // we want a clear panic, not silent corruption.
         panic!(
             "isel: branch arg count {} ≠ target block param count {}",
-            args.len(), target_params.len()
+            args.len(),
+            target_params.len()
         );
     }
 
@@ -2070,7 +2131,9 @@ fn emit_branch_arg_copies(
 
     // Helper to look up a vreg's RegClass via mf.vregs.
     fn class_of(mf: &MachineFunction, v: VRegId) -> RegClass {
-        mf.vregs.iter().find(|r| r.id == v)
+        mf.vregs
+            .iter()
+            .find(|r| r.id == v)
             .map(|r| r.class)
             .expect("isel: vreg not registered")
     }
@@ -2088,10 +2151,7 @@ fn emit_branch_arg_copies(
         let opcode = move_opcode_for(class);
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,
-            operands: vec![
-                MachineOperand::VReg(dst),
-                MachineOperand::VReg(src),
-            ],
+            operands: vec![MachineOperand::VReg(dst), MachineOperand::VReg(src)],
             def: Some(dst),
         });
     };
@@ -2102,7 +2162,10 @@ fn emit_branch_arg_copies(
     while !pending.is_empty() {
         let safe_idx = (0..pending.len()).find(|&i| {
             let (d, _) = pending[i];
-            !pending.iter().enumerate().any(|(j, &(_, s))| j != i && s == d)
+            !pending
+                .iter()
+                .enumerate()
+                .any(|(j, &(_, s))| j != i && s == d)
         });
 
         if let Some(idx) = safe_idx {
@@ -2124,7 +2187,10 @@ fn emit_branch_arg_copies(
     while !pending.is_empty() {
         let safe_idx = (0..pending.len()).find(|&i| {
             let (d, _) = pending[i];
-            !pending.iter().enumerate().any(|(j, &(_, s))| j != i && s == d)
+            !pending
+                .iter()
+                .enumerate()
+                .any(|(j, &(_, s))| j != i && s == d)
         });
 
         if let Some(idx) = safe_idx {
@@ -2239,7 +2305,11 @@ fn emit_const_u64_phys(mf: &mut MachineFunction, mb: MBlockId, dest: PhysReg, va
         let shift = i * 16;
         let chunk = ((value >> shift) & 0xFFFF) as u16;
         if chunk != 0 || (first && i == 3) {
-            let opcode = if first { ArmOpcode::Movz } else { ArmOpcode::Movk };
+            let opcode = if first {
+                ArmOpcode::Movz
+            } else {
+                ArmOpcode::Movk
+            };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
                 operands: vec![
@@ -2455,21 +2525,31 @@ fn emit_i128_neg(mf: &mut MachineFunction, mb: MBlockId, lo: PhysReg, hi: PhysRe
 
 /// Emit a constant integer using movz/movk sequence.
 /// Respects width: 32-bit values mask to 32 bits and only emit shifts 0/16.
-fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i128, width: IntWidth) {
-    debug_assert!(width != IntWidth::I128, "backend should reject i128 before isel");
+fn emit_const_int(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    dest: VRegId,
+    val: i128,
+    width: IntWidth,
+) {
+    debug_assert!(
+        width != IntWidth::I128,
+        "backend should reject i128 before isel"
+    );
     let is_32 = matches!(width, IntWidth::I8 | IntWidth::I16 | IntWidth::I32);
     // Mask to the appropriate width to prevent sign-extension artifacts.
-    let uval = if is_32 { (val as u32) as u64 } else { val as u64 };
+    let uval = if is_32 {
+        (val as u32) as u64
+    } else {
+        val as u64
+    };
     let max_shift = if is_32 { 2 } else { 4 }; // 2 chunks for 32-bit, 4 for 64-bit
 
     if uval == 0 {
         let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
         mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::MovReg,
-            operands: vec![
-                MachineOperand::VReg(dest),
-                MachineOperand::PhysReg(zr),
-            ],
+            operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(zr)],
             def: Some(dest),
         });
         return;
@@ -2481,7 +2561,11 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i12
         let shift = i * 16;
         let chunk = ((uval >> shift) & 0xFFFF) as u16;
         if chunk != 0 || (first && i == max_shift - 1) {
-            let opcode = if first { ArmOpcode::Movz } else { ArmOpcode::Movk };
+            let opcode = if first {
+                ArmOpcode::Movz
+            } else {
+                ArmOpcode::Movk
+            };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
                 operands: vec![
@@ -2499,17 +2583,22 @@ fn emit_const_int(mf: &mut MachineFunction, mb: MBlockId, dest: VRegId, val: i12
         let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
         mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::MovReg,
-            operands: vec![
-                MachineOperand::VReg(dest),
-                MachineOperand::PhysReg(zr),
-            ],
+            operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(zr)],
             def: Some(dest),
         });
     }
 }
 
 /// Emit a register-register binary op.
-fn emit_binop(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, opcode: ArmOpcode, a: ValueId, b: ValueId) {
+fn emit_binop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    opcode: ArmOpcode,
+    a: ValueId,
+    b: ValueId,
+) {
     let class = type_to_reg_class(&inst.ty);
     let dest = ctx.get_vreg(mf, inst.id, class);
     let va = ctx.lookup_vreg(a);
@@ -2527,7 +2616,17 @@ fn emit_binop(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &
 
 /// Emit a float binary op, selecting single or double precision.
 #[allow(clippy::too_many_arguments)]
-fn emit_float_binop(mf: &mut MachineFunction, ctx: &mut ISelCtx, mb: MBlockId, inst: &Inst, ty: &IrType, a: ValueId, b: ValueId, op_s: ArmOpcode, op_d: ArmOpcode) {
+fn emit_float_binop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    ty: &IrType,
+    a: ValueId,
+    b: ValueId,
+    op_s: ArmOpcode,
+    op_d: ArmOpcode,
+) {
     let (class, opcode) = match ty {
         IrType::Float(FloatWidth::F32) => (RegClass::Fp32, op_s),
         _ => (RegClass::Fp64, op_d),
@@ -2551,8 +2650,10 @@ fn type_to_reg_class(ty: &IrType) -> RegClass {
     match ty {
         IrType::Float(FloatWidth::F32) => RegClass::Fp32,
         IrType::Float(FloatWidth::F64) => RegClass::Fp64,
-        IrType::Int(IntWidth::I8) | IrType::Int(IntWidth::I16) |
-        IrType::Int(IntWidth::I32) | IrType::Bool => RegClass::Gp32,
+        IrType::Int(IntWidth::I8)
+        | IrType::Int(IntWidth::I16)
+        | IrType::Int(IntWidth::I32)
+        | IrType::Bool => RegClass::Gp32,
         _ => RegClass::Gp64,
     }
 }
@@ -2560,8 +2661,13 @@ fn type_to_reg_class(ty: &IrType) -> RegClass {
 fn needs_wide_icmp_operand(ty: Option<&IrType>, other_ty: Option<&IrType>) -> bool {
     matches!(
         (ty, other_ty),
-        (Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_)), Some(_))
-            | (Some(_), Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_)))
+        (
+            Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_)),
+            Some(_)
+        ) | (
+            Some(_),
+            Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_))
+        )
     )
 }
 
@@ -2585,7 +2691,10 @@ fn icmp_operand_vreg(
         return src;
     }
 
-    if matches!(value_ty, Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_))) {
+    if matches!(
+        value_ty,
+        Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_))
+    ) {
         return src;
     }
 
@@ -2686,7 +2795,8 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
                 }
                 InstKind::Select(cond, _, _) => {
                     if let Some(p) = pending {
-                        if p == *cond && use_count.get(cond) == Some(&1)
+                        if p == *cond
+                            && use_count.get(cond) == Some(&1)
                             && def_block.get(cond) == Some(&block.id)
                         {
                             // Confirmed: fuse this ICmp into the Select.
@@ -2716,7 +2826,8 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
     }
 
     // Remove arm_cond entries for non-fused ICmps.
-    ctx.fused_arm_cond.retain(|vid, _| ctx.select_fused.contains(vid));
+    ctx.fused_arm_cond
+        .retain(|vid, _| ctx.select_fused.contains(vid));
 }
 
 fn cmp_to_arm_cond(op: CmpOp) -> ArmCond {
@@ -2745,8 +2856,8 @@ fn fcmp_to_arm_cond(op: CmpOp) -> ArmCond {
     match op {
         CmpOp::Eq => ArmCond::Eq,
         CmpOp::Ne => ArmCond::Ne,
-        CmpOp::Lt => ArmCond::Mi,  // minus flag for less-than
-        CmpOp::Le => ArmCond::Ls,  // unsigned LE maps to float LE
+        CmpOp::Lt => ArmCond::Mi, // minus flag for less-than
+        CmpOp::Le => ArmCond::Ls, // unsigned LE maps to float LE
         CmpOp::Gt => ArmCond::Gt,
         CmpOp::Ge => ArmCond::Ge,
     }
@@ -2756,7 +2867,7 @@ fn fcmp_to_arm_cond(op: CmpOp) -> ArmCond {
 fn alloca_size(ty: &IrType) -> u32 {
     match ty {
         IrType::Void => 0,
-        IrType::Bool => 4,  // use 4 bytes for alignment
+        IrType::Bool => 4, // use 4 bytes for alignment
         IrType::Int(w) => w.bytes(),
         IrType::Float(w) => w.bytes(),
         IrType::Ptr(_) => 8,
@@ -2837,7 +2948,10 @@ mod tests {
             let _z = b.iadd(x, y);
             b.ret_void();
         });
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::AddReg));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::AddReg));
     }
 
     #[test]
@@ -2849,8 +2963,14 @@ mod tests {
             let _c = b.icmp(CmpOp::Lt, x, y);
             b.ret_void();
         });
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg));
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Cset));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::CmpReg));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::Cset));
     }
 
     #[test]
@@ -2862,7 +2982,13 @@ mod tests {
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
-        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::CmpReg).count() >= 2);
+        assert!(
+            insts
+                .iter()
+                .filter(|i| i.opcode == ArmOpcode::CmpReg)
+                .count()
+                >= 2
+        );
         assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 2);
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
     }
@@ -2876,7 +3002,13 @@ mod tests {
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
-        assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::CmpReg).count() >= 2);
+        assert!(
+            insts
+                .iter()
+                .filter(|i| i.opcode == ArmOpcode::CmpReg)
+                .count()
+                >= 2
+        );
         assert!(insts.iter().filter(|i| i.opcode == ArmOpcode::Cset).count() >= 3);
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::AndReg));
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::OrrReg));
@@ -2894,7 +3026,10 @@ mod tests {
         let insts = &mf.blocks[0].insts;
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CmpImm));
         assert_eq!(
-            insts.iter().filter(|i| i.opcode == ArmOpcode::CselReg).count(),
+            insts
+                .iter()
+                .filter(|i| i.opcode == ArmOpcode::CselReg)
+                .count(),
             2,
             "wide i128 selects should lower with one CSEL per limb"
         );
@@ -2905,43 +3040,53 @@ mod tests {
         // ICmp used solely by a Select → CSET and CMP cond, #0 must NOT appear.
         // Only CmpReg + CselReg should be present.
         let mf = select_simple(|b| {
-            let x  = b.const_i32(5);
-            let y  = b.const_i32(10);
-            let c  = b.icmp(CmpOp::Le, x, y);   // use_count[c] = 1, only in Select
+            let x = b.const_i32(5);
+            let y = b.const_i32(10);
+            let c = b.icmp(CmpOp::Le, x, y); // use_count[c] = 1, only in Select
             let _s = b.select(c, x, y);
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
         // Must have a CMP to set flags.
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg),
-            "expected CmpReg for ICmp");
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::CmpReg),
+            "expected CmpReg for ICmp"
+        );
         // Must have CSEL to select the value.
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::CselReg),
-            "expected CselReg for Select");
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::CselReg),
+            "expected CselReg for Select"
+        );
         // Must NOT have CSET (ICmp boolean materialization is suppressed).
-        assert!(!insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
-            "CSET should be suppressed when ICmp feeds only a Select");
+        assert!(
+            !insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
+            "CSET should be suppressed when ICmp feeds only a Select"
+        );
         // Must NOT have a second CmpImm (CMP cond, #0 is suppressed).
-        assert!(!insts.iter().any(|i| i.opcode == ArmOpcode::CmpImm),
-            "CMP cond,#0 should be suppressed when CSEL uses flags directly");
+        assert!(
+            !insts.iter().any(|i| i.opcode == ArmOpcode::CmpImm),
+            "CMP cond,#0 should be suppressed when CSEL uses flags directly"
+        );
     }
 
     #[test]
     fn csel_no_fusion_when_icmp_has_multiple_uses() {
         // ICmp used by both a Select and another instruction → CSET is kept.
         let mf = select_simple(|b| {
-            let x   = b.const_i32(5);
-            let y   = b.const_i32(10);
-            let c   = b.icmp(CmpOp::Le, x, y);   // use_count[c] = 2
-            let _s  = b.select(c, x, y);
+            let x = b.const_i32(5);
+            let y = b.const_i32(10);
+            let c = b.icmp(CmpOp::Le, x, y); // use_count[c] = 2
+            let _s = b.select(c, x, y);
             // Also use `c` in a logical NOT to force a second use.
-            let _n  = b.not(c);
+            let _n = b.not(c);
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
         // CSET must still be emitted because `c` has multiple uses.
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
-            "CSET should remain when ICmp has multiple uses");
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
+            "CSET should remain when ICmp has multiple uses"
+        );
     }
 
     #[test]
@@ -2952,7 +3097,10 @@ mod tests {
             let _z = b.fadd(x, y);
             b.ret_void();
         });
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::FaddD));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::FaddD));
     }
 
     #[test]
@@ -2964,8 +3112,14 @@ mod tests {
             b.ret_void();
         });
         // Should have SubImm (address materialization from FP) and StrImm.
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::SubImm));
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::StrImm));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::SubImm));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::StrImm));
     }
 
     #[test]
@@ -2982,17 +3136,16 @@ mod tests {
             b.ret_void();
         });
         // Entry block should have CmpImm + BCond + B.
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::BCond));
+        assert!(mf.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.opcode == ArmOpcode::BCond));
     }
 
     #[test]
     fn select_call() {
         let mf = select_simple(|b| {
-            b.runtime_call(
-                crate::ir::inst::RuntimeFunc::PrintInt,
-                vec![],
-                IrType::Void,
-            );
+            b.runtime_call(crate::ir::inst::RuntimeFunc::PrintInt, vec![], IrType::Void);
             b.ret_void();
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
@@ -3028,9 +3181,20 @@ mod tests {
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
-        assert_eq!(insts[0].opcode, ArmOpcode::StpPre, "first inst should be STP (prologue)");
-        assert_eq!(insts[1].opcode, ArmOpcode::AddImm, "second inst should be ADD FP, SP, #offset");
-        assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Ret), "should have RET");
+        assert_eq!(
+            insts[0].opcode,
+            ArmOpcode::StpPre,
+            "first inst should be STP (prologue)"
+        );
+        assert_eq!(
+            insts[1].opcode,
+            ArmOpcode::AddImm,
+            "second inst should be ADD FP, SP, #offset"
+        );
+        assert!(
+            insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            "should have RET"
+        );
     }
 
     #[test]
@@ -3042,11 +3206,14 @@ mod tests {
         // const_i32(0) should use MOV dest, WZR (32-bit zero register).
         let insts = &mf.blocks[0].insts;
         let has_mov_zr = insts.iter().any(|i| {
-            i.opcode == ArmOpcode::MovReg &&
-            i.operands.iter().any(|o| matches!(o,
-                MachineOperand::PhysReg(PhysReg::Xzr) |
-                MachineOperand::PhysReg(PhysReg::Wzr)
-            ))
+            i.opcode == ArmOpcode::MovReg
+                && i.operands.iter().any(|o| {
+                    matches!(
+                        o,
+                        MachineOperand::PhysReg(PhysReg::Xzr)
+                            | MachineOperand::PhysReg(PhysReg::Wzr)
+                    )
+                })
         });
         assert!(has_mov_zr, "const 0 should use MOV from XZR or WZR");
     }
@@ -3064,7 +3231,9 @@ mod tests {
     /// excluding moves that target a physical register (those are
     /// epilogue/return marshaling, not parallel copies).
     fn count_vreg_moves(block: &MachineBlock, opcode: ArmOpcode) -> usize {
-        block.insts.iter()
+        block
+            .insts
+            .iter()
             .filter(|i| i.opcode == opcode)
             .filter(|i| {
                 // True parallel copies are VReg → VReg.
@@ -3075,13 +3244,16 @@ mod tests {
     }
 
     fn find_block<'a>(mf: &'a MachineFunction, contains: &str) -> &'a MachineBlock {
-        mf.blocks.iter()
+        mf.blocks
+            .iter()
             .find(|b| b.label.contains(contains))
-            .unwrap_or_else(|| panic!(
-                "no machine block containing '{}' (have: {:?})",
-                contains,
-                mf.blocks.iter().map(|b| &b.label).collect::<Vec<_>>(),
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no machine block containing '{}' (have: {:?})",
+                    contains,
+                    mf.blocks.iter().map(|b| &b.label).collect::<Vec<_>>(),
+                )
+            })
     }
 
     #[test]

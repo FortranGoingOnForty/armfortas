@@ -2,8 +2,8 @@
 //!
 //! Produces output compatible with both afs-as and Apple's system assembler.
 
-use std::fmt::Write;
 use super::mir::*;
+use std::fmt::Write;
 
 fn split_i128_words(value: i128) -> (u64, u64) {
     let bits = value as u128;
@@ -34,7 +34,7 @@ fn emit_i128_words(out: &mut String, value: i128) {
 /// to prevent cross-TU collisions (audit Maj-1).
 pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
     use crate::ir::inst::GlobalInit;
-    use crate::ir::types::{IrType, IntWidth, FloatWidth};
+    use crate::ir::types::{FloatWidth, IntWidth, IrType};
 
     let mut out = String::new();
     if globals.is_empty() {
@@ -49,8 +49,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             format!("_{}", g.name)
         };
         // Module globals need external linkage for multi-file.
-        let is_module_global = g.name.starts_with("afs_mod_")
-            || g.name.starts_with("afs_common_");
+        let is_module_global = g.name.starts_with("afs_mod_") || g.name.starts_with("afs_common_");
         if is_module_global {
             writeln!(out, ".globl {}", symbol).unwrap();
         } else {
@@ -62,13 +61,13 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         // `.single` / `.double` all work correctly.
         if let IrType::Array(elem_ty, count) = &g.ty {
             let (align, directive, elem_bytes, is_float) = match elem_ty.as_ref() {
-                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte",   1, false),
-                IrType::Int(IntWidth::I16)               => (1, ".short",  2, false),
-                IrType::Int(IntWidth::I32)               => (2, ".long",   4, false),
-                IrType::Int(IntWidth::I64)               => (3, ".quad",   8, false),
-                IrType::Int(IntWidth::I128)              => (4, ".quad",  16, false),
-                IrType::Float(FloatWidth::F32)           => (2, ".single", 4, true),
-                IrType::Float(FloatWidth::F64)           => (3, ".double", 8, true),
+                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte", 1, false),
+                IrType::Int(IntWidth::I16) => (1, ".short", 2, false),
+                IrType::Int(IntWidth::I32) => (2, ".long", 4, false),
+                IrType::Int(IntWidth::I64) => (3, ".quad", 8, false),
+                IrType::Int(IntWidth::I128) => (4, ".quad", 16, false),
+                IrType::Float(FloatWidth::F32) => (2, ".single", 4, true),
+                IrType::Float(FloatWidth::F64) => (3, ".double", 8, true),
                 _ => (3, ".quad", 8, false),
             };
             if align > 0 {
@@ -129,12 +128,12 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             }
         } else {
             match &g.ty {
-                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte",   "0"),
-                IrType::Int(IntWidth::I16)               => (1, ".short",  "0"),
-                IrType::Int(IntWidth::I32)               => (2, ".long",   "0"),
-                IrType::Int(IntWidth::I64)               => (3, ".quad",   "0"),
-                IrType::Float(FloatWidth::F32)           => (2, ".single", "0.0"),
-                IrType::Float(FloatWidth::F64)           => (3, ".double", "0.0"),
+                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte", "0"),
+                IrType::Int(IntWidth::I16) => (1, ".short", "0"),
+                IrType::Int(IntWidth::I32) => (2, ".long", "0"),
+                IrType::Int(IntWidth::I64) => (3, ".quad", "0"),
+                IrType::Float(FloatWidth::F32) => (2, ".single", "0.0"),
+                IrType::Float(FloatWidth::F64) => (3, ".double", "0.0"),
                 _ => (3, ".quad", "0"), // pointers and aggregates: 8-byte slot
             }
         };
@@ -143,8 +142,8 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         }
         writeln!(out, "{}:", symbol).unwrap();
         let value = match &g.initializer {
-            Some(GlobalInit::Int(v))    => v.to_string(),
-            Some(GlobalInit::Float(v))  => {
+            Some(GlobalInit::Int(v)) => v.to_string(),
+            Some(GlobalInit::Float(v)) => {
                 if v.is_finite() {
                     format!("{}", v)
                 } else {
@@ -175,7 +174,11 @@ pub fn emit_function(mf: &MachineFunction) -> String {
     let mut out = String::new();
 
     // Function directive.
-    writeln!(out, ".globl _{}", mf.name).unwrap();
+    if mf.internal_only {
+        writeln!(out, ".private_extern _{}", mf.name).unwrap();
+    } else {
+        writeln!(out, ".globl _{}", mf.name).unwrap();
+    }
     writeln!(out, ".p2align 2").unwrap();
     writeln!(out, "_{}:", mf.name).unwrap();
 
@@ -307,12 +310,24 @@ fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> S
 /// Emit a single machine instruction as assembly text.
 fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
     match inst.opcode {
-        ArmOpcode::AddReg => format!("add {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::AddsReg => format!("adds {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::AdcReg => format!("adc {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::AddReg => format!(
+            "add {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::AddsReg => format!(
+            "adds {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::AdcReg => format!(
+            "adc {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
         ArmOpcode::AddImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
@@ -323,20 +338,31 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                     mf.frame.size.saturating_sub(16) as i64
                 }
                 MachineOperand::Imm(v) => *v,
-                _ => return format!("add {}, {}, {}",
-                    dest, base, op_str(&inst.operands[2])),
+                _ => return format!("add {}, {}, {}", dest, base, op_str(&inst.operands[2])),
             };
             // Both `add x29, sp, #N` (FP setup) and `add Xd, Xn, #N`
             // need the > 4095 fallback. Use the same scratch
             // synthesis since x16 is safe in the prologue.
             fmt_sp_imm("add", &dest, &base, imm)
         }
-        ArmOpcode::SubReg => format!("sub {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::SubsReg => format!("subs {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::SbcReg => format!("sbc {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
+        ArmOpcode::SubReg => format!(
+            "sub {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::SubsReg => format!(
+            "subs {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::SbcReg => format!(
+            "sbc {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
         ArmOpcode::SubImm => {
             let imm: i64 = match &inst.operands[2] {
                 MachineOperand::Imm(-1) => {
@@ -350,115 +376,288 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let base = op_str(&inst.operands[1]);
             fmt_sp_imm("sub", &dest, &base, imm)
         }
-        ArmOpcode::Mul => format!("mul {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::Sdiv => format!("sdiv {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::Msub => format!("msub {}, {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
-            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
-        ArmOpcode::Neg => format!("neg {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-
-        ArmOpcode::AndReg => format!("and {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::OrrReg => format!("orr {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::EorReg => format!("eor {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::OrnReg => format!("orn {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::LslReg => format!("lsl {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::LsrReg => format!("lsr {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::AsrReg => format!("asr {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-
-        ArmOpcode::Mvn => format!("mvn {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::Clz => format!("clz {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::Rbit => format!("rbit {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-
-        ArmOpcode::CmpReg => format!("cmp {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::CmpImm => format!("cmp {}, #{}",
+        ArmOpcode::Mul => format!(
+            "mul {}, {}, {}",
             op_str(&inst.operands[0]),
-            if let MachineOperand::Imm(v) = &inst.operands[1] { *v } else { 0 }),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::Sdiv => format!(
+            "sdiv {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::Msub => format!(
+            "msub {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
+        ArmOpcode::Neg => format!(
+            "neg {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+
+        ArmOpcode::AndReg => format!(
+            "and {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::OrrReg => format!(
+            "orr {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::EorReg => format!(
+            "eor {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::OrnReg => format!(
+            "orn {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::LslReg => format!(
+            "lsl {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::LsrReg => format!(
+            "lsr {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::AsrReg => format!(
+            "asr {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+
+        ArmOpcode::Mvn => format!(
+            "mvn {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::Clz => format!(
+            "clz {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::Rbit => format!(
+            "rbit {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+
+        ArmOpcode::CmpReg => format!(
+            "cmp {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::CmpImm => format!(
+            "cmp {}, #{}",
+            op_str(&inst.operands[0]),
+            if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            }
+        ),
         ArmOpcode::Cset | ArmOpcode::FCset => {
-            let cond = if let MachineOperand::Cond(c) = &inst.operands[1] { cond_str(*c) } else { "eq" };
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[1] {
+                cond_str(*c)
+            } else {
+                "eq"
+            };
             format!("cset {}, {}", op_str(&inst.operands[0]), cond)
         }
         ArmOpcode::CselReg => {
-            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] { cond_str(*c) } else { "eq" };
-            format!("csel {}, {}, {}, {}", op_str(&inst.operands[0]),
-                op_str(&inst.operands[1]), op_str(&inst.operands[2]), cond)
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] {
+                cond_str(*c)
+            } else {
+                "eq"
+            };
+            format!(
+                "csel {}, {}, {}, {}",
+                op_str(&inst.operands[0]),
+                op_str(&inst.operands[1]),
+                op_str(&inst.operands[2]),
+                cond
+            )
         }
-        ArmOpcode::FCmpReg => format!("fcmp {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FCmpReg => format!(
+            "fcmp {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
         ArmOpcode::FcselReg => {
-            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] { cond_str(*c) } else { "eq" };
-            format!("fcsel {}, {}, {}, {}", op_str(&inst.operands[0]),
-                op_str(&inst.operands[1]), op_str(&inst.operands[2]), cond)
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[3] {
+                cond_str(*c)
+            } else {
+                "eq"
+            };
+            format!(
+                "fcsel {}, {}, {}, {}",
+                op_str(&inst.operands[0]),
+                op_str(&inst.operands[1]),
+                op_str(&inst.operands[2]),
+                cond
+            )
         }
 
-        ArmOpcode::FaddS | ArmOpcode::FaddD => format!("fadd {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::FsubS | ArmOpcode::FsubD => format!("fsub {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::FmulS | ArmOpcode::FmulD => format!("fmul {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::FdivS | ArmOpcode::FdivD => format!("fdiv {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]), op_str(&inst.operands[2])),
-        ArmOpcode::FnegS | ArmOpcode::FnegD => format!("fneg {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::FabsS | ArmOpcode::FabsD => format!("fabs {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::FsqrtS | ArmOpcode::FsqrtD => format!("fsqrt {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FaddS | ArmOpcode::FaddD => format!(
+            "fadd {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::FsubS | ArmOpcode::FsubD => format!(
+            "fsub {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::FmulS | ArmOpcode::FmulD => format!(
+            "fmul {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::FdivS | ArmOpcode::FdivD => format!(
+            "fdiv {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2])
+        ),
+        ArmOpcode::FnegS | ArmOpcode::FnegD => format!(
+            "fneg {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::FabsS | ArmOpcode::FabsD => format!(
+            "fabs {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::FsqrtS | ArmOpcode::FsqrtD => format!(
+            "fsqrt {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
         // Fused multiply-add/subtract: 4-operand (dest, Sn, Sm, Sa).
         // FMADD  Sd, Sn, Sm, Sa → Sd = Sa + Sn*Sm
         // FMSUB  Sd, Sn, Sm, Sa → Sd = Sa - Sn*Sm
         // FNMSUB Sd, Sn, Sm, Sa → Sd = Sn*Sm - Sa
-        ArmOpcode::FmaddS | ArmOpcode::FmaddD => format!("fmadd {}, {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
-            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
-        ArmOpcode::FmsubS | ArmOpcode::FmsubD => format!("fmsub {}, {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
-            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
-        ArmOpcode::FnmsubS | ArmOpcode::FnmsubD => format!("fnmsub {}, {}, {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1]),
-            op_str(&inst.operands[2]), op_str(&inst.operands[3])),
+        ArmOpcode::FmaddS | ArmOpcode::FmaddD => format!(
+            "fmadd {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
+        ArmOpcode::FmsubS | ArmOpcode::FmsubD => format!(
+            "fmsub {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
+        ArmOpcode::FnmsubS | ArmOpcode::FnmsubD => format!(
+            "fnmsub {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
 
-        ArmOpcode::ScvtfSW | ArmOpcode::ScvtfDW |
-        ArmOpcode::ScvtfSX | ArmOpcode::ScvtfDX => format!("scvtf {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::FcvtzsWS | ArmOpcode::FcvtzsWD |
-        ArmOpcode::FcvtzsXS | ArmOpcode::FcvtzsXD => format!("fcvtzs {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::FcvtSD | ArmOpcode::FcvtDS => format!("fcvt {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::ScvtfSW | ArmOpcode::ScvtfDW | ArmOpcode::ScvtfSX | ArmOpcode::ScvtfDX => {
+            format!(
+                "scvtf {}, {}",
+                op_str(&inst.operands[0]),
+                op_str(&inst.operands[1])
+            )
+        }
+        ArmOpcode::FcvtzsWS | ArmOpcode::FcvtzsWD | ArmOpcode::FcvtzsXS | ArmOpcode::FcvtzsXD => {
+            format!(
+                "fcvtzs {}, {}",
+                op_str(&inst.operands[0]),
+                op_str(&inst.operands[1])
+            )
+        }
+        ArmOpcode::FcvtSD | ArmOpcode::FcvtDS => format!(
+            "fcvt {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
 
         ArmOpcode::Movz => {
-            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] { *v } else { 0 };
-            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] { *s } else { 0 };
+            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            };
+            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] {
+                *s
+            } else {
+                0
+            };
             if shift == 0 {
                 format!("movz {}, #{}", op_str(&inst.operands[0]), imm)
             } else {
-                format!("movz {}, #{}, lsl #{}", op_str(&inst.operands[0]), imm, shift)
+                format!(
+                    "movz {}, #{}, lsl #{}",
+                    op_str(&inst.operands[0]),
+                    imm,
+                    shift
+                )
             }
         }
         ArmOpcode::Movk => {
-            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] { *v } else { 0 };
-            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] { *s } else { 0 };
-            format!("movk {}, #{}, lsl #{}", op_str(&inst.operands[0]), imm, shift)
+            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            };
+            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] {
+                *s
+            } else {
+                0
+            };
+            format!(
+                "movk {}, #{}, lsl #{}",
+                op_str(&inst.operands[0]),
+                imm,
+                shift
+            )
         }
         ArmOpcode::Movn => {
-            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] { *v } else { 0 };
-            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] { *s } else { 0 };
-            format!("movn {}, #{}, lsl #{}", op_str(&inst.operands[0]), imm, shift)
+            let imm = if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            };
+            let shift = if let MachineOperand::Shift(s) = &inst.operands[2] {
+                *s
+            } else {
+                0
+            };
+            format!(
+                "movn {}, #{}, lsl #{}",
+                op_str(&inst.operands[0]),
+                imm,
+                shift
+            )
         }
         ArmOpcode::MovReg => {
             let dest = op_str(&inst.operands[0]);
@@ -479,11 +678,13 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 format!("mov {}, {}", dest, src)
             }
         }
-        ArmOpcode::FmovReg => format!("fmov {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::FmovReg => format!(
+            "fmov {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
 
-        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm
-        | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
+        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
             let offset_val = match &inst.operands[2] {
@@ -512,8 +713,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 )
             }
         }
-        ArmOpcode::StrImm | ArmOpcode::StrFpImm
-        | ArmOpcode::StrbImm | ArmOpcode::StrhImm => {
+        ArmOpcode::StrImm | ArmOpcode::StrFpImm | ArmOpcode::StrbImm | ArmOpcode::StrhImm => {
             let src = op_str(&inst.operands[0]);
             let base = op_str(&inst.operands[1]);
             let offset_val = match &inst.operands[2] {
@@ -555,15 +755,21 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if stp_offset <= 504 {
                 format!("{}\n    stp x29, x30, [sp, #{}]", sub_sp, stp_offset)
             } else if stp_offset <= 32760 {
-                format!("{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
-                    sub_sp, stp_offset, stp_offset + 8)
+                format!(
+                    "{}\n    str x29, [sp, #{}]\n    str x30, [sp, #{}]",
+                    sub_sp,
+                    stp_offset,
+                    stp_offset + 8
+                )
             } else {
                 // Frame too large for any ldr/str unsigned immediate.
                 // Synthesize the address in x9 (caller-saved scratch)
                 // then use register-offset str.
                 let x9_addr = fmt_sp_imm("add", "x9", "sp", stp_offset);
-                format!("{}\n    {}\n    str x29, [x9]\n    str x30, [x9, #8]",
-                    sub_sp, x9_addr)
+                format!(
+                    "{}\n    {}\n    str x29, [x9]\n    str x30, [x9, #8]",
+                    sub_sp, x9_addr
+                )
             }
         }
         ArmOpcode::LdpPost => {
@@ -573,26 +779,32 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if ldp_offset <= 504 {
                 format!("ldp x29, x30, [sp, #{}]\n    {}", ldp_offset, add_sp)
             } else if ldp_offset <= 32760 {
-                format!("ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    {}",
-                    ldp_offset, ldp_offset + 8, add_sp)
+                format!(
+                    "ldr x29, [sp, #{}]\n    ldr x30, [sp, #{}]\n    {}",
+                    ldp_offset,
+                    ldp_offset + 8,
+                    add_sp
+                )
             } else {
                 // Frame too large for unsigned immediate ldr.
                 // Synthesize address in x9 then restore with register-offset ldr.
                 let x9_addr = fmt_sp_imm("add", "x9", "sp", ldp_offset);
-                format!("{}\n    ldr x29, [x9]\n    ldr x30, [x9, #8]\n    {}",
-                    x9_addr, add_sp)
+                format!(
+                    "{}\n    ldr x29, [x9]\n    ldr x30, [x9, #8]\n    {}",
+                    x9_addr, add_sp
+                )
             }
         }
 
         // Non-preindex STP/LDP for callee-save pairs.
         // Operands: [src1/dst1, src2/dst2, base, imm].
         ArmOpcode::StpOffset => {
-            let r1  = op_str(&inst.operands[0]);
-            let r2  = op_str(&inst.operands[1]);
+            let r1 = op_str(&inst.operands[0]);
+            let r2 = op_str(&inst.operands[1]);
             let base = op_str(&inst.operands[2]);
-            let off  = match &inst.operands[3] {
-                MachineOperand::Imm(v)        => *v,
-                MachineOperand::FrameSlot(v)  => *v as i64,
+            let off = match &inst.operands[3] {
+                MachineOperand::Imm(v) => *v,
+                MachineOperand::FrameSlot(v) => *v as i64,
                 _ => 0,
             };
             // STP signed-offset range: 7-bit signed × 8 → [-512, 504].
@@ -609,12 +821,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             }
         }
         ArmOpcode::LdpOffset => {
-            let r1  = op_str(&inst.operands[0]);
-            let r2  = op_str(&inst.operands[1]);
+            let r1 = op_str(&inst.operands[0]);
+            let r2 = op_str(&inst.operands[1]);
             let base = op_str(&inst.operands[2]);
-            let off  = match &inst.operands[3] {
-                MachineOperand::Imm(v)        => *v,
-                MachineOperand::FrameSlot(v)  => *v as i64,
+            let off = match &inst.operands[3] {
+                MachineOperand::Imm(v) => *v,
+                MachineOperand::FrameSlot(v) => *v as i64,
                 _ => 0,
             };
             // LDP signed-offset range: 7-bit signed × 8 → [-512, 504].
@@ -638,11 +850,15 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 // ADRP requires a GP register. If dest is FP (s/d), use x8 as scratch.
                 let is_fp = dest.starts_with('s') || dest.starts_with('d');
                 if is_fp {
-                    format!("adrp x8, {1}@PAGE\n    ldr {0}, [x8, {1}@PAGEOFF]",
-                        dest, label)
+                    format!(
+                        "adrp x8, {1}@PAGE\n    ldr {0}, [x8, {1}@PAGEOFF]",
+                        dest, label
+                    )
                 } else {
-                    format!("adrp {0}, {1}@PAGE\n    ldr {0}, [{0}, {1}@PAGEOFF]",
-                        dest, label)
+                    format!(
+                        "adrp {0}, {1}@PAGE\n    ldr {0}, [{0}, {1}@PAGEOFF]",
+                        dest, label
+                    )
                 }
             } else {
                 "nop ; bad adrp+ldr".into()
@@ -653,8 +869,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             match &inst.operands[1] {
                 MachineOperand::ConstPool(idx) => {
                     let label = const_pool_label(&mf.name, *idx);
-                    format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
-                        dest, label)
+                    format!(
+                        "adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
+                        dest, label
+                    )
                 }
                 MachineOperand::GlobalLabel(name) => {
                     // Mach-O convention: globals get an underscore prefix.
@@ -663,8 +881,10 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                     } else {
                         format!("_{}", name)
                     };
-                    format!("adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
-                        dest, sym)
+                    format!(
+                        "adrp {0}, {1}@PAGE\n    add {0}, {0}, {1}@PAGEOFF",
+                        dest, sym
+                    )
                 }
                 _ => "nop ; bad adrp+add".into(),
             }
@@ -685,10 +905,16 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             }
         }
         ArmOpcode::BCond => {
-            let cond = if let MachineOperand::Cond(c) = &inst.operands[0] { cond_str(*c) } else { "eq" };
+            let cond = if let MachineOperand::Cond(c) = &inst.operands[0] {
+                cond_str(*c)
+            } else {
+                "eq"
+            };
             let target = if let MachineOperand::BlockRef(id) = &inst.operands[1] {
                 mf.block(*id).label.clone()
-            } else { "???".into() };
+            } else {
+                "???".into()
+            };
             format!("b.{} {}", cond, target)
         }
         ArmOpcode::Bl => {
@@ -699,19 +925,34 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 } else {
                     format!("bl _{}", name) // add Mach-O prefix
                 }
-            } else { "bl ???".into() }
+            } else {
+                "bl ???".into()
+            }
         }
         ArmOpcode::Blr => format!("blr {}", op_str(&inst.operands[0])),
-        ArmOpcode::Sxtw => format!("sxtw {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::Sxth => format!("sxth {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
-        ArmOpcode::Sxtb => format!("sxtb {}, {}",
-            op_str(&inst.operands[0]), op_str(&inst.operands[1])),
+        ArmOpcode::Sxtw => format!(
+            "sxtw {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::Sxth => format!(
+            "sxth {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
+        ArmOpcode::Sxtb => format!(
+            "sxtb {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1])
+        ),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
         ArmOpcode::Brk => {
-            let imm = if let MachineOperand::Imm(v) = &inst.operands[0] { *v } else { 1 };
+            let imm = if let MachineOperand::Imm(v) = &inst.operands[0] {
+                *v
+            } else {
+                1
+            };
             format!("brk #{}", imm)
         }
     }
@@ -734,7 +975,11 @@ fn op_str(op: &MachineOperand) -> String {
         MachineOperand::BlockRef(id) => format!("bb{}", id.0),
         MachineOperand::Extern(name) => name.clone(),
         MachineOperand::GlobalLabel(name) => {
-            if name.starts_with('_') { name.clone() } else { format!("_{}", name) }
+            if name.starts_with('_') {
+                name.clone()
+            } else {
+                format!("_{}", name)
+            }
         }
         MachineOperand::ConstPool(idx) => format!("cp{}", idx),
         MachineOperand::Shift(s) => format!("lsl #{}", s),
@@ -743,12 +988,18 @@ fn op_str(op: &MachineOperand) -> String {
 
 fn cond_str(c: ArmCond) -> &'static str {
     match c {
-        ArmCond::Eq => "eq", ArmCond::Ne => "ne",
-        ArmCond::Hs => "hs", ArmCond::Lo => "lo",
-        ArmCond::Mi => "mi", ArmCond::Pl => "pl",
-        ArmCond::Hi => "hi", ArmCond::Ls => "ls",
-        ArmCond::Ge => "ge", ArmCond::Lt => "lt",
-        ArmCond::Gt => "gt", ArmCond::Le => "le",
+        ArmCond::Eq => "eq",
+        ArmCond::Ne => "ne",
+        ArmCond::Hs => "hs",
+        ArmCond::Lo => "lo",
+        ArmCond::Mi => "mi",
+        ArmCond::Pl => "pl",
+        ArmCond::Hi => "hi",
+        ArmCond::Ls => "ls",
+        ArmCond::Ge => "ge",
+        ArmCond::Lt => "lt",
+        ArmCond::Gt => "gt",
+        ArmCond::Le => "le",
     }
 }
 
@@ -760,10 +1011,10 @@ fn const_pool_label(func: &str, idx: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::*;
-    use crate::ir::inst::*;
-    use crate::ir::builder::FuncBuilder;
     use crate::codegen::isel::select_function;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::inst::*;
+    use crate::ir::types::*;
 
     fn emit_simple(build: impl FnOnce(&mut FuncBuilder)) -> String {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
@@ -778,10 +1029,26 @@ mod tests {
     #[test]
     fn emit_prologue_epilogue() {
         let asm = emit_simple(|b| b.ret_void());
-        assert!(asm.contains("sub sp, sp,"), "missing frame allocation: {}", asm);
-        assert!(asm.contains("stp x29, x30, [sp,"), "missing prologue save: {}", asm);
-        assert!(asm.contains("ldp x29, x30, [sp,"), "missing epilogue restore: {}", asm);
-        assert!(asm.contains("add sp, sp,"), "missing frame deallocation: {}", asm);
+        assert!(
+            asm.contains("sub sp, sp,"),
+            "missing frame allocation: {}",
+            asm
+        );
+        assert!(
+            asm.contains("stp x29, x30, [sp,"),
+            "missing prologue save: {}",
+            asm
+        );
+        assert!(
+            asm.contains("ldp x29, x30, [sp,"),
+            "missing epilogue restore: {}",
+            asm
+        );
+        assert!(
+            asm.contains("add sp, sp,"),
+            "missing frame deallocation: {}",
+            asm
+        );
         assert!(asm.contains("ret"), "missing ret: {}", asm);
     }
 
@@ -817,11 +1084,27 @@ mod tests {
         });
         // The 12-bit immediate max is 4095, so the emitter must
         // synthesize the frame size via x16.
-        assert!(asm.contains("movz x16,"), "large frame should use x16 synthesis: {}", asm);
-        assert!(asm.contains("sub sp, sp, x16"), "large frame sub should use register form: {}", asm);
-        assert!(asm.contains("add sp, sp, x16"), "large frame add should use register form: {}", asm);
+        assert!(
+            asm.contains("movz x16,"),
+            "large frame should use x16 synthesis: {}",
+            asm
+        );
+        assert!(
+            asm.contains("sub sp, sp, x16"),
+            "large frame sub should use register form: {}",
+            asm
+        );
+        assert!(
+            asm.contains("add sp, sp, x16"),
+            "large frame add should use register form: {}",
+            asm
+        );
         // Must NOT contain a raw "sub sp, sp, #5" that exceeds 4095.
-        assert!(!asm.contains("sub sp, sp, #5"), "should not emit out-of-range immediate: {}", asm);
+        assert!(
+            !asm.contains("sub sp, sp, #5"),
+            "should not emit out-of-range immediate: {}",
+            asm
+        );
     }
 
     #[test]
@@ -849,10 +1132,27 @@ mod tests {
             initializer: Some(GlobalInit::Int(18_446_744_073_709_551_616i128)),
         }]);
 
-        assert!(asm.contains(".section __DATA,__data"), "missing data section:\n{}", asm);
-        assert!(asm.contains(".private_extern _big"), "missing global symbol:\n{}", asm);
-        assert!(asm.contains(".p2align 4"), "i128 globals need 16-byte alignment:\n{}", asm);
-        assert_eq!(asm.matches(".quad").count(), 2, "scalar i128 should emit two quads:\n{}", asm);
+        assert!(
+            asm.contains(".section __DATA,__data"),
+            "missing data section:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(".private_extern _big"),
+            "missing global symbol:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(".p2align 4"),
+            "i128 globals need 16-byte alignment:\n{}",
+            asm
+        );
+        assert_eq!(
+            asm.matches(".quad").count(),
+            2,
+            "scalar i128 should emit two quads:\n{}",
+            asm
+        );
         assert!(
             asm.contains(".quad 0x0000000000000000\n    .quad 0x0000000000000001"),
             "scalar i128 should emit low/high 64-bit words in memory order:\n{}",
@@ -868,7 +1168,12 @@ mod tests {
             initializer: Some(GlobalInit::IntArray(vec![1, -1])),
         }]);
 
-        assert_eq!(asm.matches(".quad").count(), 4, "two i128 elements should emit four quads:\n{}", asm);
+        assert_eq!(
+            asm.matches(".quad").count(),
+            4,
+            "two i128 elements should emit four quads:\n{}",
+            asm
+        );
         assert!(
             asm.contains(".quad 0x0000000000000001\n    .quad 0x0000000000000000"),
             "positive i128 array element should preserve low/high word order:\n{}",
@@ -941,6 +1246,25 @@ mod tests {
             !ldp_asm.contains("[x29, #-544]"),
             "ldp should not emit out-of-range raw offset: {}",
             ldp_asm
+        );
+    }
+
+    #[test]
+    fn emit_internal_only_function_as_private_extern() {
+        let mut mf = MachineFunction::new("helper".into());
+        mf.internal_only = true;
+
+        let asm = emit_function(&mf);
+
+        assert!(
+            asm.contains(".private_extern _helper"),
+            "internal-only functions should not be emitted as globals:\n{}",
+            asm
+        );
+        assert!(
+            !asm.contains(".globl _helper"),
+            "internal-only functions should not keep external linkage:\n{}",
+            asm
         );
     }
 }
