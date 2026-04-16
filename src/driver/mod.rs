@@ -1501,6 +1501,10 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     let mut all_inputs = vec![opts.input.clone()];
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
+    if opts.emit_obj && opts.output.is_some() {
+        return Err("-o cannot be used with -c and multiple input files".into());
+    }
+
     // Scan dependencies.
     let file_deps: Vec<dep_scan::FileDeps> = all_inputs
         .iter()
