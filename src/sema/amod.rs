@@ -917,10 +917,29 @@ pub fn extract_module_globals(
     for var in &iface.variables {
         if var.is_parameter { continue; } // PARAMETERs are inlined, no global
         if let Some(ref ir_sym) = var.ir_symbol {
+            let derived_type = match var.type_info.as_ref() {
+                Some(TypeInfo::Derived(name)) => Some(name.clone()),
+                _ => None,
+            };
             let ir_ty = if var.proc_pointer {
                 crate::ir::types::IrType::Ptr(Box::new(
                     crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8),
                 ))
+            } else if let Some(type_name) = &derived_type {
+                if let Some(layout) = iface
+                    .types
+                    .iter()
+                    .find(|layout| layout.name.eq_ignore_ascii_case(type_name))
+                {
+                    crate::ir::types::IrType::Array(
+                        Box::new(crate::ir::types::IrType::Int(
+                            crate::ir::types::IntWidth::I8,
+                        )),
+                        layout.size as u64,
+                    )
+                } else {
+                    type_info_to_ir_type(var.type_info.as_ref())
+                }
             } else {
                 type_info_to_ir_type(var.type_info.as_ref())
             };
@@ -933,6 +952,7 @@ pub fn extract_module_globals(
                     allocatable: var.allocatable,
                     is_pointer: var.pointer,
                     deferred_char: var.deferred_char,
+                    derived_type,
                     char_kind: match var.type_info.as_ref() {
                         Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => {
                             crate::ir::lower::CharKind::Fixed(*n)

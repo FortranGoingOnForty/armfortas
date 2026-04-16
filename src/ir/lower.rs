@@ -241,10 +241,24 @@ pub fn lower_file(
     for unit in units {
         match &unit.node {
             ProgramUnit::Module { name, decls, .. } => {
-                collect_module_globals(&mut module, &mut globals, name, decls, st);
+                collect_module_globals(
+                    &mut module,
+                    &mut globals,
+                    name,
+                    decls,
+                    st,
+                    type_layouts,
+                );
             }
             ProgramUnit::Submodule { parent, decls, .. } => {
-                collect_module_globals(&mut module, &mut globals, parent, decls, st);
+                collect_module_globals(
+                    &mut module,
+                    &mut globals,
+                    parent,
+                    decls,
+                    st,
+                    type_layouts,
+                );
             }
             _ => {}
         }
@@ -962,6 +976,7 @@ pub struct ModuleGlobalInfo {
     pub allocatable: bool,
     pub is_pointer: bool,
     pub deferred_char: bool,
+    pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
     /// External modules (from .amod files) — skip emitting Global
     /// data entries since the storage lives in the other .o file.
@@ -1353,6 +1368,7 @@ fn collect_module_globals(
     mod_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
     st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
@@ -1361,6 +1377,10 @@ fn collect_module_globals(
     for decl in decls {
         if let Decl::TypeDecl { type_spec, attrs, entities } = &decl.node {
             let ir_ty = lower_type_spec_st(type_spec, Some(st));
+            let derived_type_name = match type_spec {
+                TypeSpec::Type(name) => Some(name.clone()),
+                _ => None,
+            };
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a { Some(specs) } else { None }
             });
@@ -1412,6 +1432,7 @@ fn collect_module_globals(
                             allocatable: true,
                             is_pointer,
                             deferred_char: false,
+                            derived_type: None,
                             char_kind: global_char_kind.clone(),
                             external: false,
                         },
@@ -1440,6 +1461,7 @@ fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             deferred_char: true,
+                            derived_type: None,
                             char_kind: CharKind::Deferred,
                             external: false,
                         },
@@ -1457,6 +1479,38 @@ fn collect_module_globals(
                     let total: i64 = dims.iter().map(|(_, e)| *e).product();
                     if total <= 0 {
                         continue; // assumed/deferred shape — skip
+                    }
+                    if let Some(type_name) = &derived_type_name {
+                        if let Some(layout) = type_layouts.get(type_name) {
+                            let elem_ty = IrType::Array(
+                                Box::new(IrType::Int(IntWidth::I8)),
+                                layout.size as u64,
+                            );
+                            let global_ty = IrType::Array(
+                                Box::new(elem_ty.clone()),
+                                total as u64,
+                            );
+                            module.add_global(Global {
+                                name: symbol.clone(),
+                                ty: global_ty,
+                                initializer: Some(GlobalInit::Zero),
+                            });
+                            globals.insert(
+                                (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                                ModuleGlobalInfo {
+                                    symbol,
+                                    ty: elem_ty,
+                                    dims,
+                                    allocatable: false,
+                                    is_pointer,
+                                    deferred_char: false,
+                                    derived_type: Some(type_name.clone()),
+                                    char_kind: CharKind::None,
+                                    external: false,
+                                },
+                            );
+                            continue;
+                        }
                     }
                     let global_ty = IrType::Array(
                         Box::new(ir_ty.clone()),
@@ -1506,12 +1560,41 @@ fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             deferred_char: false,
+                            derived_type: None,
                             char_kind: global_char_kind.clone(),
                             external: false,
                         },
                     );
                 } else {
                     // Scalar module variable.
+                    if let Some(type_name) = &derived_type_name {
+                        if let Some(layout) = type_layouts.get(type_name) {
+                            let scalar_ty = IrType::Array(
+                                Box::new(IrType::Int(IntWidth::I8)),
+                                layout.size as u64,
+                            );
+                            module.add_global(Global {
+                                name: symbol.clone(),
+                                ty: scalar_ty.clone(),
+                                initializer: Some(GlobalInit::Zero),
+                            });
+                            globals.insert(
+                                (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                                ModuleGlobalInfo {
+                                    symbol,
+                                    ty: scalar_ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    is_pointer,
+                                    deferred_char: false,
+                                    derived_type: Some(type_name.clone()),
+                                    char_kind: CharKind::None,
+                                    external: false,
+                                },
+                            );
+                            continue;
+                        }
+                    }
                     let init = entity.init.as_ref()
                         .and_then(|e| eval_const_global_init(e, &param_consts, Some(&ir_ty)));
                     module.add_global(Global {
@@ -1528,6 +1611,7 @@ fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             deferred_char: false,
+                            derived_type: None,
                             char_kind: global_char_kind.clone(),
                             external: false,
                         },
@@ -3129,7 +3213,11 @@ fn install_one_global(
         allocatable: info.allocatable,
         descriptor_arg: false,
         by_ref: false,
-        char_kind: info.char_kind.clone(), derived_type: None, inline_const: None, is_pointer: info.is_pointer, runtime_dim_upper: vec![],
+        char_kind: info.char_kind.clone(),
+        derived_type: info.derived_type.clone(),
+        inline_const: None,
+        is_pointer: info.is_pointer,
+        runtime_dim_upper: vec![],
     });
 }
 
@@ -3626,7 +3714,23 @@ fn alloc_decls(
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts);
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+                    let (array_elem_ty, array_derived_type) =
+                        if let TypeSpec::Type(ref type_name) = type_spec {
+                            if let Some(layout) = type_layouts.get(type_name) {
+                                (
+                                    IrType::Array(
+                                        Box::new(IrType::Int(IntWidth::I8)),
+                                        layout.size as u64,
+                                    ),
+                                    Some(type_name.clone()),
+                                )
+                            } else {
+                                (elem_ty.clone(), None)
+                            }
+                        } else {
+                            (elem_ty.clone(), None)
+                        };
+                    let elem_bytes = ir_scalar_byte_size(&array_elem_ty);
                     let total_bytes = total_size * elem_bytes;
                     const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
 
@@ -3642,12 +3746,12 @@ fn alloc_decls(
                         let n = b.const_i64(total_size);
                         b.call(FuncRef::External("afs_allocate_1d".into()), vec![addr, es, n], IrType::Void);
                         // Mark as allocatable so scope-exit dealloc fires.
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
+                        locals.insert(key, LocalInfo { addr, ty: array_elem_ty.clone(), dims, allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: array_derived_type.clone(), inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                     } else {
                         // Small array: stack allocation.
-                        let arr_ty = IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                        let arr_ty = IrType::Array(Box::new(array_elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
-                        locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
+                        locals.insert(key, LocalInfo { addr, ty: array_elem_ty.clone(), dims, allocatable: false, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: array_derived_type, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
                     // Derived type variable: allocate struct-sized byte array.
@@ -9142,7 +9246,11 @@ fn lower_array_element(
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
     let base = array_base_addr(b, info);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    b.load(elem_ptr)
+    if info.derived_type.is_some() {
+        elem_ptr
+    } else {
+        b.load(elem_ptr)
+    }
 }
 
 fn emit_bounds_check(
@@ -9632,6 +9740,15 @@ fn lower_array_store(
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st);
     let base = array_base_addr(b, info);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
+    if info.derived_type.is_some() {
+        let size = b.const_i64(ir_scalar_byte_size(&info.ty));
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![elem_ptr, value, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
     // Audit5 CRITICAL-1: coerce the RHS to the array element
     // type before the store. Without this, an i32-typed value
     // assigned into an i8 array would emit a 4-byte STR through

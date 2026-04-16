@@ -493,6 +493,87 @@ fn named_len_char_component_substring_and_trim_compile() {
 }
 
 #[test]
+fn imported_derived_array_global_component_access_compiles() {
+    let dir = unique_dir("derived_array_global");
+    let dep = write_program_in(
+        &dir,
+        "dep.f90",
+        "module dep\n  implicit none\n  type :: item_t\n    logical :: active = .false.\n  end type item_t\n  type(item_t), save :: items(2)\ncontains\n  subroutine init_items()\n    items(1)%active = .true.\n  end subroutine init_items\nend module dep\n",
+    );
+    let user = write_program_in(
+        &dir,
+        "user.f90",
+        "module user_mod\n  use dep, only: items\n  implicit none\ncontains\n  logical function item_active(i)\n    integer, intent(in) :: i\n    item_active = items(i)%active\n  end function item_active\nend module user_mod\n",
+    );
+    let dep_obj = dir.join("dep.o");
+    let user_obj = dir.join("user.o");
+
+    let dep_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            dep.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            dep_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("dep module compile failed to spawn");
+    assert!(
+        dep_compile.status.success(),
+        "dep module compile failed: {}",
+        String::from_utf8_lossy(&dep_compile.stderr)
+    );
+
+    let user_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            user.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user module compile failed to spawn");
+    assert!(
+        user_compile.status.success(),
+        "user module compile failed: {}",
+        String::from_utf8_lossy(&user_compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&dep_obj);
+    let _ = std::fs::remove_file(&user_obj);
+    let _ = std::fs::remove_file(dir.join("dep.amod"));
+    let _ = std::fs::remove_file(&dep);
+    let _ = std::fs::remove_file(&user);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn derived_array_element_assignment_with_pointer_component_compiles() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: x = 0\n  end type node_t\n  type :: entry_t\n    character(len=256) :: name\n    type(node_t), pointer :: body => null()\n  end type entry_t\n  type(entry_t), save :: entries(4)\ncontains\n  subroutine shift(i)\n    integer, intent(in) :: i\n    entries(i) = entries(i + 1)\n  end subroutine shift\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_shift_ptr", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array shift compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array shift compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_o_equals_form_sets_output_path() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("oeq", "o");
