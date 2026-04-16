@@ -350,13 +350,21 @@ fn eval_const_int_expr_checked(
                         span: expr.span,
                         msg: "compile-time integer overflow",
                     })?,
-                crate::ast::expr::BinaryOp::Div => left_value
-                    .value
-                    .checked_div(right_value.value)
-                    .ok_or(ConstIntError {
-                        span: expr.span,
-                        msg: "compile-time integer overflow",
-                    })?,
+                crate::ast::expr::BinaryOp::Div => {
+                    if right_value.value == 0 {
+                        return Err(ConstIntError {
+                            span: right.span,
+                            msg: "compile-time integer division by zero",
+                        });
+                    }
+                    left_value
+                        .value
+                        .checked_div(right_value.value)
+                        .ok_or(ConstIntError {
+                            span: expr.span,
+                            msg: "compile-time integer overflow",
+                        })?
+                }
                 crate::ast::expr::BinaryOp::Pow => {
                     let Ok(exp) = u32::try_from(right_value.value) else {
                         return Ok(None);
