@@ -64,6 +64,11 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
             uses
         }
 
+        InstKind::Call(FuncRef::Indirect(target), args) => {
+            let mut uses = vec![*target];
+            uses.extend(args);
+            uses
+        }
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => args.clone(),
 
         InstKind::ExtractField(agg, _) => vec![*agg],
@@ -148,6 +153,10 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
             for i in idxs { r(i); }
         }
 
+        InstKind::Call(FuncRef::Indirect(target), args) => {
+            r(target);
+            for a in args { r(a); }
+        }
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
             for a in args { r(a); }
         }

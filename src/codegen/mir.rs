@@ -117,6 +117,7 @@ pub enum ArmOpcode {
     B,           // B label
     BCond,       // B.cond label
     Bl,          // BL label  (call)
+    Blr,         // BLR reg   (indirect call)
     Ret,         // RET
 
     // ---- Extend ----

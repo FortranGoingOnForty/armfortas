@@ -2600,6 +2600,44 @@ fn procedure_pointer_decl_compiles_through_wrapper_calls() {
 }
 
 #[test]
+fn procedure_pointer_calls_and_assignment_run_indirectly() {
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    integer function pred(x)\n      integer, intent(in) :: x\n    end function pred\n    subroutine act(x)\n      integer, intent(inout) :: x\n    end subroutine act\n  end interface\n  procedure(pred), pointer :: p => null()\n  procedure(act), pointer :: q => null()\ncontains\n  integer function twice(x)\n    integer, intent(in) :: x\n    twice = x * 2\n  end function twice\n\n  subroutine bump(x)\n    integer, intent(inout) :: x\n    x = x + 1\n  end subroutine bump\n\n  subroutine init()\n    p => twice\n    q => bump\n  end subroutine init\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: x\n  call init()\n  x = p(3)\n  call q(x)\n  print *, x\nend program main\n",
+        "f90",
+    );
+    let out = unique_path("procedure_ptr_run", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "procedure-pointer indirect call program should lower to assembly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm = std::fs::read_to_string(&out).expect("cannot read indirect-call assembly");
+    assert!(
+        asm.contains("blr "),
+        "procedure-pointer calls should lower to BLR: {}",
+        asm
+    );
+    assert!(
+        asm.contains("_twice@PAGE") && asm.contains("_bump@PAGE"),
+        "procedure-pointer assignment should materialize callee addresses: {}",
+        asm
+    );
+    assert!(
+        !asm.contains("bl _p") && !asm.contains("bl _q"),
+        "procedure-pointer calls should not lower as direct symbol calls: {}",
+        asm
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_pointer_module_export_survives_amod_import() {
     let dir = unique_dir("procptr_amod");
     let mod_src = write_program_in(

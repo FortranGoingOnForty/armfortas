@@ -5621,6 +5621,43 @@ fn resolved_symbol_call_target(
     (fallback_name.to_string(), key.to_string())
 }
 
+fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
+    let sym = st.find_symbol_any_scope(key)?;
+    if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer {
+        return None;
+    }
+    Some(
+        sym.attrs
+            .procedure_iface
+            .as_deref()
+            .unwrap_or(key)
+            .to_lowercase(),
+    )
+}
+
+fn procedure_pointer_call_target(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    key: &str,
+) -> Option<(ValueId, String)> {
+    let signature_key = procedure_pointer_signature_key(st, key)?;
+    let info = locals.get(key)?;
+    let load_ty = if info.ty.is_ptr() {
+        info.ty.clone()
+    } else {
+        IrType::Ptr(Box::new(info.ty.clone()))
+    };
+    Some((b.load_typed(info.addr, load_ty), signature_key))
+}
+
+fn procedure_pointer_symbol_addr_elem_type(info: &LocalInfo) -> IrType {
+    match &info.ty {
+        IrType::Ptr(inner) => inner.as_ref().clone(),
+        ty => ty.clone(),
+    }
+}
+
 /// Does the actual IR value at `arg_val` satisfy the declared
 /// parameter's `TypeInfo`? Derived types need special handling because
 /// we lower them to `Ptr(Array(i8, N))` and the name of the struct
@@ -7648,6 +7685,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
+                    let procptr_target =
+                        procedure_pointer_call_target(b, &ctx.locals, ctx.st, &key);
+                    let signature_key = procptr_target
+                        .as_ref()
+                        .map(|(_, sig_key)| sig_key.clone())
+                        .unwrap_or_else(|| key.clone());
                     // Not an intrinsic — general subroutine call.
                     // Keyword-argument reordering (F2003 §12.4.1.2).
                     // `call sub(b=10, a=20)` must bind by name, not
@@ -7656,7 +7699,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // param order; the rest of the call-site code
                     // then runs positionally against that reordered
                     // list.
-                    let reordered = reorder_args_by_keyword(args, &key, ctx.st);
+                    let reordered = reorder_args_by_keyword(args, &signature_key, ctx.st);
                     let args: &[crate::ast::expr::Argument] = &reordered;
                     let mut arg_vals: Vec<ValueId> = args.iter().map(|a| {
                         match &a.value {
@@ -7671,10 +7714,17 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // with the specific matched by the actual argument
                     // types. On failure, emit a diagnostic — the same
                     // rule as generic function-call resolution.
-                    let (resolved_name, key) = resolve_subroutine_call_name(
-                        ctx.st, b, name, &key, &arg_vals, callee.span,
-                    );
-                    if let Some(desc_mask) = ctx.descriptor_params.get(&key) {
+                    let (resolved_name, resolved_key) = if procptr_target.is_some() {
+                        (name.clone(), signature_key.clone())
+                    } else {
+                        resolve_subroutine_call_name(ctx.st, b, name, &key, &arg_vals, callee.span)
+                    };
+                    if let Some(desc_mask) = ctx
+                        .descriptor_params
+                        .get(&resolved_key)
+                        .or_else(|| ctx.descriptor_params.get(&signature_key))
+                        .or_else(|| ctx.descriptor_params.get(&key))
+                    {
                         for (i, a) in args.iter().enumerate() {
                             if !desc_mask.get(i).copied().unwrap_or(false) {
                                 continue;
@@ -7689,7 +7739,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
-                    if let Some(opt_flags) = ctx.optional_params.get(&key) {
+                    if let Some(opt_flags) = ctx
+                        .optional_params
+                        .get(&resolved_key)
+                        .or_else(|| ctx.optional_params.get(&signature_key))
+                        .or_else(|| ctx.optional_params.get(&key))
+                    {
                         for flag in opt_flags.iter().skip(arg_vals.len()) {
                             if *flag {
                                 arg_vals.push(b.const_i64(0)); // null → absent
@@ -7699,7 +7754,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // Hidden character-length ABI: for each callee
                     // param that is character(len=*), append the
                     // actual argument's string length as an i64.
-                    if let Some(cls_flags) = ctx.char_len_star_params.get(&key) {
+                    if let Some(cls_flags) = ctx
+                        .char_len_star_params
+                        .get(&resolved_key)
+                        .or_else(|| ctx.char_len_star_params.get(&signature_key))
+                        .or_else(|| ctx.char_len_star_params.get(&key))
+                    {
                         for (i, flag) in cls_flags.iter().enumerate() {
                             if *flag && i < args.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
@@ -7740,13 +7800,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // host-refs analysis that drove the callee
                     // signature, since both caller and callee share
                     // the same enclosing host.
-                    append_host_closure_args(b, ctx, &key, &mut arg_vals);
-                    let func_ref = ctx
-                        .internal_funcs
-                        .get(&key)
-                        .copied()
-                        .map(FuncRef::Internal)
-                        .unwrap_or_else(|| FuncRef::External(resolved_name));
+                    if procptr_target.is_none() {
+                        append_host_closure_args(b, ctx, &resolved_key, &mut arg_vals);
+                    }
+                    let func_ref = if let Some((target, _)) = procptr_target {
+                        FuncRef::Indirect(target)
+                    } else {
+                        ctx.internal_funcs
+                            .get(&resolved_key)
+                            .copied()
+                            .map(FuncRef::Internal)
+                            .unwrap_or_else(|| FuncRef::External(resolved_name))
+                    };
                     b.call(func_ref, arg_vals, IrType::Void);
                 }
             }
@@ -8833,7 +8898,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
             let Expr::Name { name: src_name } = &value.node else { return; };
             let src_key = src_name.to_lowercase();
-            let Some(src_info) = ctx.locals.get(&src_key).cloned() else { return; };
+            let Some(src_info) = ctx.locals.get(&src_key).cloned() else {
+                if let Some(sym) = ctx.st.find_symbol_any_scope(&src_key) {
+                    if matches!(
+                        sym.kind,
+                        crate::sema::symtab::SymbolKind::Function
+                            | crate::sema::symtab::SymbolKind::Subroutine
+                    ) {
+                        let (link_name, _) =
+                            resolved_symbol_call_target(ctx.st, &src_key, src_name);
+                        let addr = b.global_addr(
+                            &link_name,
+                            procedure_pointer_symbol_addr_elem_type(&tgt_info),
+                        );
+                        b.store(addr, tgt_info.addr);
+                    }
+                }
+                return;
+            };
 
             // Array pointer path: materialise a descriptor from the
             // target and memcpy 384 bytes into the pointer's slot.
@@ -14182,6 +14264,11 @@ fn lower_expr_full(
             }
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
+                let procptr_target = procedure_pointer_call_target(b, locals, st, &key);
+                let signature_key = procptr_target
+                    .as_ref()
+                    .map(|(_, sig_key)| sig_key.clone())
+                    .unwrap_or_else(|| key.clone());
 
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
@@ -14321,7 +14408,7 @@ fn lower_expr_full(
                 // Keyword-argument reordering for function calls
                 // (symmetric with the Stmt::Call path). Binds by name
                 // when the callee's arg_order is resolvable.
-                let reordered_fn = reorder_args_by_keyword(args, &key, st);
+                let reordered_fn = reorder_args_by_keyword(args, &signature_key, st);
                 let args: &[crate::ast::expr::Argument] = &reordered_fn;
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
@@ -14339,7 +14426,8 @@ fn lower_expr_full(
                 }
 
                 // Check if the callee has VALUE args (BIND(C) interface).
-                let callee_value_args = callee_value_arg_mask(st, &key);
+                let callee_value_args = callee_value_arg_mask(st, &signature_key)
+                    .or_else(|| callee_value_arg_mask(st, &key));
 
                 // Check which params use the descriptor ABI
                 // (assumed-shape / deferred / assumed-size arrays).
@@ -14351,7 +14439,11 @@ fn lower_expr_full(
                 // would receive a raw element pointer and size(xs)
                 // would read garbage (audit31 Finding 6).
                 let callee_descriptor_args = descriptor_params
-                    .and_then(|m| m.get(&key).cloned());
+                    .and_then(|m| {
+                        m.get(&signature_key)
+                            .cloned()
+                            .or_else(|| m.get(&key).cloned())
+                    });
 
                 // Pass args: by value for VALUE, descriptor for
                 // assumed-shape, by reference otherwise.
@@ -14382,30 +14474,35 @@ fn lower_expr_full(
                 // instead of silently falling back to the generic name,
                 // which would either mismatch the callee ABI or produce
                 // an unresolved link-time symbol.
-                let resolved_name = match resolve_generic_call(st, b, &key, &intrinsic_arg_vals) {
-                    Some(n) => n,
-                    None => {
-                        if let Some(sym) = st.find_symbol_any_scope(&key) {
-                            if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
-                                let specifics = sym.arg_names.join(", ");
-                                eprintln!(
-                                    "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                                    expr.span.start.line,
-                                    expr.span.start.col,
-                                    name,
-                                    specifics,
-                                );
-                                let _ = std::io::stderr().flush();
-                                std::process::exit(1);
+                let (call_name, callee_key) = if procptr_target.is_some() {
+                    (String::new(), signature_key.clone())
+                } else {
+                    let resolved_name =
+                        match resolve_generic_call(st, b, &key, &intrinsic_arg_vals) {
+                            Some(n) => n,
+                            None => {
+                                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                                    if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
+                                        let specifics = sym.arg_names.join(", ");
+                                        eprintln!(
+                                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                                            expr.span.start.line,
+                                            expr.span.start.col,
+                                            name,
+                                            specifics,
+                                        );
+                                        let _ = std::io::stderr().flush();
+                                        std::process::exit(1);
+                                    }
+                                }
+                                name.clone()
                             }
-                        }
-                        name.clone()
-                    }
+                        };
+                    let resolved_key = resolved_name.to_lowercase();
+                    resolved_symbol_call_target(st, &resolved_key, &resolved_name)
                 };
-                let resolved_key = resolved_name.to_lowercase();
-                let (call_name, callee_key) =
-                    resolved_symbol_call_target(st, &resolved_key, &resolved_name);
                 let callee_char_len_star_args = callee_char_len_star_mask(st, &callee_key)
+                    .or_else(|| callee_char_len_star_mask(st, &signature_key))
                     .or_else(|| callee_char_len_star_mask(st, &key));
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
@@ -14444,16 +14541,34 @@ fn lower_expr_full(
                 } else {
                     &key
                 };
-                append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut ref_arg_vals);
+                if procptr_target.is_none() {
+                    append_host_closure_args_raw(
+                        b,
+                        locals,
+                        contained_host_refs,
+                        closure_key,
+                        &mut ref_arg_vals,
+                    );
+                }
 
                 // Look up callee return type from symbol table.
                 let ret_ty = callee_return_ir_type(st, &callee_key)
+                    .or_else(|| callee_return_ir_type(st, &signature_key))
                     .or_else(|| callee_return_ir_type(st, &key))
                     .unwrap_or(IrType::Int(IntWidth::I32));
-                let func_ref = internal_funcs
-                    .and_then(|map| map.get(&callee_key).or_else(|| map.get(&key)).copied())
-                    .map(FuncRef::Internal)
-                    .unwrap_or_else(|| FuncRef::External(call_name));
+                let func_ref = if let Some((target, _)) = procptr_target {
+                    FuncRef::Indirect(target)
+                } else {
+                    internal_funcs
+                        .and_then(|map| {
+                            map.get(&callee_key)
+                                .or_else(|| map.get(&signature_key))
+                                .or_else(|| map.get(&key))
+                                .copied()
+                        })
+                        .map(FuncRef::Internal)
+                        .unwrap_or_else(|| FuncRef::External(call_name))
+                };
                 b.call(func_ref, ref_arg_vals, ret_ty)
             } else if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {

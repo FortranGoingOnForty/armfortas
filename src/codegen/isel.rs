@@ -393,10 +393,17 @@ fn select_call_inst(
     inst: &Inst,
     func: &Function,
 ) {
-    let (label, args, runtime_func) = match &inst.kind {
-        InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice(), None),
-        InstKind::Call(FuncRef::Internal(idx), args) => (format!("_func_{}", idx), args.as_slice(), None),
-        InstKind::RuntimeCall(rf, args) => (String::new(), args.as_slice(), Some(rf)),
+    let (label, args, runtime_func, indirect_target) = match &inst.kind {
+        InstKind::Call(FuncRef::External(name), args) => {
+            (name.clone(), args.as_slice(), None, None)
+        }
+        InstKind::Call(FuncRef::Internal(idx), args) => {
+            (format!("_func_{}", idx), args.as_slice(), None, None)
+        }
+        InstKind::Call(FuncRef::Indirect(target), args) => {
+            (String::new(), args.as_slice(), None, Some(*target))
+        }
+        InstKind::RuntimeCall(rf, args) => (String::new(), args.as_slice(), Some(rf), None),
         _ => unreachable!(),
     };
 
@@ -512,11 +519,19 @@ fn select_call_inst(
         }
     }
 
-    mf.block_mut(mb).insts.push(MachineInst {
-        opcode: ArmOpcode::Bl,
-        operands: vec![MachineOperand::Extern(label)],
-        def: None,
-    });
+    if let Some(target) = indirect_target {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::VReg(ctx.lookup_vreg(target))],
+            def: None,
+        });
+    } else {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::Extern(label)],
+            def: None,
+        });
+    }
 
     if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
         let dest_slot = ctx.lookup_wide_slot(inst.id);

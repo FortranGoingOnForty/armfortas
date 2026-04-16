@@ -181,7 +181,12 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
 
         InstKind::Select(c, t, f) => *c == param_id || *t == param_id || *f == param_id,
         InstKind::GetElementPtr(base, idxs) => *base == param_id || idxs.contains(&param_id),
-        InstKind::RuntimeCall(_, args) | InstKind::Call(FuncRef::External(_), args) => args.contains(&param_id),
+        InstKind::RuntimeCall(_, args) | InstKind::Call(FuncRef::External(_), args) => {
+            args.contains(&param_id)
+        }
+        InstKind::Call(FuncRef::Indirect(target), args) => {
+            *target == param_id || args.contains(&param_id)
+        }
         InstKind::InsertField(agg, _, val) => *agg == param_id || *val == param_id,
         InstKind::Call(FuncRef::Internal(_), _) => false,
     }

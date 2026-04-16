@@ -701,6 +701,7 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 }
             } else { "bl ???".into() }
         }
+        ArmOpcode::Blr => format!("blr {}", op_str(&inst.operands[0])),
         ArmOpcode::Sxtw => format!("sxtw {}, {}",
             op_str(&inst.operands[0]), op_str(&inst.operands[1])),
         ArmOpcode::Sxth => format!("sxth {}, {}",

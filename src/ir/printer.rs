@@ -232,6 +232,7 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
                     .map(|func| format!("@{}", func.name))
                     .unwrap_or_else(|| format!("@func_{}", idx)),
                 FuncRef::External(name) => format!("@{}", name),
+                FuncRef::Indirect(target) => format!("%{}", target.0),
             };
             format!("call {}({})", fname, args_str.join(", "))
         }

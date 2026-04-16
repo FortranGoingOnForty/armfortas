@@ -22,6 +22,8 @@ pub enum FuncRef {
     Internal(u32),
     /// External function by name (runtime calls, etc.).
     External(String),
+    /// Indirect call through a pointer-typed SSA value.
+    Indirect(ValueId),
 }
 
 /// A runtime library function.
