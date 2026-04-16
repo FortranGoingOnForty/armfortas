@@ -3378,7 +3378,7 @@ fn alloc_decls(
                     });
                     continue;
                 } else if let Some(len) = char_len {
-                    if let Some(specs) = array_spec {
+                    if let Some(specs) = array_spec.filter(|_| !is_allocatable) {
                         let dims = extract_array_dims(specs, &param_consts);
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                         let table_ty = IrType::Array(
@@ -3459,7 +3459,11 @@ fn alloc_decls(
                     let zero = b.const_i32(0);
                     let size = b.const_i64(384);
                     b.call(FuncRef::External("memset".into()), vec![addr, zero, size], IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind: CharKind::None, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
+                    let char_kind = match char_len {
+                        Some(len) if array_spec.is_some() => CharKind::Fixed(len),
+                        _ => CharKind::None,
+                    };
+                    locals.insert(key, LocalInfo { addr, ty: elem_ty.clone(), dims: vec![], allocatable: true, descriptor_arg: false, by_ref: false, char_kind, derived_type: None, inline_const: None, is_pointer: false, runtime_dim_upper: vec![] });
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts);
@@ -13616,6 +13620,26 @@ end subroutine
         // Should have implicit deallocation before ret.
         let dealloc_count = ir.matches("call @afs_deallocate_array").count();
         assert!(dealloc_count >= 1, "expected implicit deallocation, got {} in:\n{}", dealloc_count, ir);
+    }
+
+    #[test]
+    fn lower_allocatable_c_char_array_element_assignment() {
+        let (_, ir) = lower_and_verify("\
+subroutine foo(str, n)
+  use iso_c_binding, only: c_char
+  implicit none
+  character(len=*), intent(in) :: str
+  integer, intent(in) :: n
+  character(kind=c_char), target, allocatable :: c_str(:)
+  integer :: i
+  allocate(c_str(n + 1))
+  do i = 1, n
+    c_str(i) = str(i:i)
+  end do
+  c_str(n + 1) = char(10)
+end subroutine
+");
+        assert!(ir.contains("call @afs_allocate_array"), "expected descriptor-backed allocation in:\n{}", ir);
     }
 
     #[test]

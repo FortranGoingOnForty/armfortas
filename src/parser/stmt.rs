@@ -87,7 +87,17 @@ impl<'a> Parser<'a> {
                     Err(self.error("expected 'stop' after 'error'".into()))
                 }
             }
-            "entry" => Err(self.error("ENTRY statements are recognized but not yet implemented".into())),
+            "entry" => {
+                let looks_like_entry_stmt = matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Identifier)
+                );
+                if looks_like_entry_stmt {
+                    Err(self.error("ENTRY statements are recognized but not yet implemented".into()))
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
+            }
             "return" => {
                 self.advance();
                 self.parse_return(start)
@@ -2293,6 +2303,12 @@ end if
         let mut parser = Parser::new(&tokens);
         let err = parser.parse_stmt().expect_err("ENTRY should not parse yet");
         assert!(err.msg.contains("ENTRY statements are recognized but not yet implemented"));
+    }
+
+    #[test]
+    fn entry_name_can_still_start_assignment() {
+        let s = parse_one("entry(i:i) = c_entry(i)\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
     }
 
     #[test]
