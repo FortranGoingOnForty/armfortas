@@ -27,6 +27,7 @@ impl SymbolTable {
             implicit_rules: ImplicitRules::default_fortran(),
             use_associations: Vec::new(),
             default_access: Access::Public,
+            pending_access: HashMap::new(),
             arg_order: Vec::new(),
         };
         Self { scopes: vec![global], current: 0 }
@@ -51,6 +52,7 @@ impl SymbolTable {
             implicit_rules: parent_implicit, // inherit from parent, may be overridden
             use_associations: Vec::new(),
             default_access: Access::Public,
+            pending_access: HashMap::new(),
             arg_order: Vec::new(),
         };
         self.scopes.push(scope);
@@ -98,6 +100,10 @@ impl SymbolTable {
                 msg: format!("symbol '{}' already defined in this scope", symbol.name),
             });
         }
+        let mut symbol = symbol;
+        if let Some(access) = scope.pending_access.get(&key).copied() {
+            symbol.attrs.access = access;
+        }
         scope.symbols.insert(key, symbol);
         Ok(())
     }
@@ -111,6 +117,10 @@ impl SymbolTable {
                 span: symbol.defined_at,
                 msg: format!("symbol '{}' already defined in this scope", symbol.name),
             });
+        }
+        let mut symbol = symbol;
+        if let Some(access) = scope.pending_access.get(&key).copied() {
+            symbol.attrs.access = access;
         }
         scope.symbols.insert(key, symbol);
         Ok(())
@@ -159,7 +169,8 @@ impl SymbolTable {
         // USE associations are intentional restrictions.
         for assoc in &scope.use_associations {
             if assoc.local_name != assoc.original_name { continue; }
-            if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, name, visited) {
+            let mut branch_visited = visited.clone();
+            if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, name, &mut branch_visited) {
                 if sym.attrs.access != Access::Private {
                     return Some(sym);
                 }
@@ -169,7 +180,8 @@ impl SymbolTable {
         // 3. Host association — look in parent scope.
         if let Some(parent) = scope.parent {
             if self.scopes[parent].kind != ScopeKind::Global {
-                return self.lookup_in_guarded(parent, name, visited);
+                let mut branch_visited = visited.clone();
+                return self.lookup_in_guarded(parent, name, &mut branch_visited);
             }
         }
 
@@ -276,12 +288,12 @@ impl SymbolTable {
     /// Used for `PUBLIC :: name` and `PRIVATE :: name` statements.
     pub fn set_symbol_access(&mut self, name: &str, access: Access) {
         let key = name.to_lowercase();
+        self.scopes[self.current]
+            .pending_access
+            .insert(key.clone(), access);
         if let Some(sym) = self.scopes[self.current].symbols.get_mut(&key) {
             sym.attrs.access = access;
         }
-        // If the symbol hasn't been declared yet, we'll apply the access
-        // when it is declared (via the default access mechanism or a
-        // deferred access list). For now, silently skip.
     }
 
     /// Iterate all scopes (for generic interface resolution during lowering).
@@ -320,6 +332,7 @@ pub struct Scope {
     pub implicit_rules: ImplicitRules,
     pub use_associations: Vec<UseAssociation>,
     pub default_access: Access,
+    pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
     pub arg_order: Vec<String>,
 }
@@ -573,6 +586,38 @@ mod tests {
     }
 
     #[test]
+    fn host_association_survives_private_symbol_seen_on_use_branch() {
+        let mut st = SymbolTable::new();
+
+        let host_scope = st.push_scope(ScopeKind::Module("host".into()));
+        let mut host_sym = make_symbol("color_red", SymbolKind::Parameter);
+        host_sym.attrs.access = Access::Private;
+        st.define(host_sym).unwrap();
+        st.pop_scope();
+
+        let imported_scope = st.push_scope(ScopeKind::Module("dep".into()));
+        // Model a pathological search branch where transitive USE walks through a
+        // scope whose parent is the eventual host scope. The private host symbol
+        // must not poison the later host-association search.
+        st.scope_mut(imported_scope).parent = Some(host_scope);
+        st.pop_scope();
+
+        st.push_scope(ScopeKind::Subroutine("inner".into()));
+        st.scope_mut(st.current_scope()).parent = Some(host_scope);
+        st.add_use_association(UseAssociation {
+            local_name: "dep_item".into(),
+            original_name: "dep_item".into(),
+            source_scope: imported_scope,
+            is_submodule_access: false,
+        });
+
+        assert!(
+            st.lookup("color_red").is_some(),
+            "host association should still find private host symbols even after a failed USE branch"
+        );
+    }
+
+    #[test]
     fn local_shadows_host() {
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Subroutine("outer".into()));
@@ -611,6 +656,21 @@ mod tests {
         });
 
         assert!(st.lookup("foo").is_some());
+    }
+
+    #[test]
+    fn pending_access_applies_to_late_defined_symbol() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("m".into()));
+        st.set_default_access(Access::Private);
+        st.set_symbol_access("create_list", Access::Public);
+
+        let mut sym = make_symbol("create_list", SymbolKind::Function);
+        sym.attrs.access = st.default_access(st.current_scope());
+        st.define(sym).unwrap();
+
+        let found = st.lookup("create_list").unwrap();
+        assert_eq!(found.attrs.access, Access::Public);
     }
 
     #[test]
