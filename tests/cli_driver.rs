@@ -543,6 +543,35 @@ fn pointer_dummy_associated_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn pointer_function_result_associated_lowers_without_raw_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  recursive function parse() result(node)\n    type(node_t), pointer :: node, right_node\n    nullify(node)\n    if (.not. associated(node)) return\n    if (.not. associated(right_node)) return\n  end function parse\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("associated_pointer_result", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("pointer result associated compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer result associated compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_associated"),
+        "pointer function-result associated() should not escape as a raw symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn component_array_intrinsics_survive_logical_condition_lowering() {
     let src = write_program(
         "module m\n  implicit none\n  type :: cmd_t\n    character(:), allocatable :: tokens(:)\n    integer, allocatable :: token_lengths(:)\n  end type cmd_t\ncontains\n  integer function f(cmd, i) result(strip_len)\n    type(cmd_t), intent(in) :: cmd\n    integer, intent(in) :: i\n    if (allocated(cmd%token_lengths) .and. i <= size(cmd%token_lengths) .and. cmd%token_lengths(i) > 0) then\n      strip_len = cmd%token_lengths(i)\n    else\n      strip_len = len_trim(cmd%tokens(i))\n    end if\n  end function f\nend module m\n",
@@ -588,6 +617,45 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
 }
 
 #[test]
+fn allocatable_array_element_component_intrinsics_do_not_escape() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: max_token_len = 32\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n    character(len=max_token_len), allocatable :: prefix_assignments(:)\n    character(len=:), allocatable :: heredoc_delimiter\n  end type command_t\ncontains\n  subroutine f()\n    type(command_t), allocatable :: temp_commands(:)\n    integer :: i\n    allocate(temp_commands(2))\n    i = 1\n    if (allocated(temp_commands(i)%prefix_assignments)) print *, 1\n    if (allocated(temp_commands(i)%tokens)) print *, 2\n    if (allocated(temp_commands(i)%heredoc_delimiter)) print *, 3\n  end subroutine f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("allocatable_base_component_intrinsics", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("allocatable base component intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable base component intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        "allocatable component arrays should lower allocated() to afs_array_allocated: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_string_allocated"),
+        "allocatable character components should lower allocated() to afs_string_allocated: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_allocated"),
+        "allocatable array-element component allocated() should not escape as a raw symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_component_array_size_lowers_without_raw_symbol() {
     let src = write_program(
         "module m\n  implicit none\n  type :: shell_t\n    integer :: vars(4)\n  end type shell_t\ncontains\n  integer function f(shell) result(n)\n    type(shell_t), intent(in) :: shell\n    n = size(shell%vars)\n  end function f\nend module m\n",
@@ -609,6 +677,40 @@ fn fixed_component_array_size_lowers_without_raw_symbol() {
     assert!(
         !undefined.iter().any(|sym| sym == "_size"),
         "fixed-size component array SIZE() should not escape as a raw symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    type(string_t), allocatable :: positional_params(:)\n  end type shell_t\ncontains\n  subroutine f(shell)\n    type(shell_t), intent(inout) :: shell\n    type(string_t), allocatable :: saved(:)\n    integer :: i\n    if (allocated(shell%positional_params)) then\n      allocate(saved(size(shell%positional_params)))\n      do i = 1, size(shell%positional_params)\n        saved(i)%str = shell%positional_params(i)%str\n      end do\n    end if\n  end subroutine f\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("allocate_bounds_size", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("allocate-bounds size compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocate-bounds size compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        "allocate bounds should still lower size() to afs_array_size: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_size"),
+        "allocate bounds size() should not escape as a raw symbol: {:?}",
         undefined
     );
 

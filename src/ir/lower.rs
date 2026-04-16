@@ -2924,6 +2924,8 @@ fn lower_unit(
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
 
+                let result_is_pointer = decl_is_pointer(&result_name, decls);
+
                 if is_alloc_return {
                     // The sret param (ValueId 0) IS the descriptor address.
                     // Pre-insert the result variable as an allocatable backed by that
@@ -2946,6 +2948,40 @@ fn lower_unit(
                         },
                     );
                     // result_addr = None; is_alloc_return = true tells Stmt::Return to emit ret void.
+                } else if result_is_pointer {
+                    let result_addr = b.alloca(ir_ret_ty.clone());
+                    let zero_byte = b.const_i32(0);
+                    let eight = b.const_i64(8);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![result_addr, zero_byte, eight],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    ctx.locals.insert(
+                        result_name.clone(),
+                        LocalInfo {
+                            addr: result_addr,
+                            ty: match &ir_ret_ty {
+                                IrType::Ptr(elem) => (**elem).clone(),
+                                other => other.clone(),
+                            },
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: derived_type_name_for_result_var(
+                                return_type,
+                                &result_name,
+                                decls,
+                            ),
+                            inline_const: None,
+                            is_pointer: true,
+                            runtime_dim_upper: vec![],
+                        },
+                    );
+                    ctx.result_addr = Some(result_addr);
+                    ctx.result_type = Some(ir_ret_ty.clone());
                 } else if let Some(dt_name) =
                     derived_type_name_for_result_var(return_type, &result_name, decls)
                 {
@@ -4614,7 +4650,10 @@ fn alloc_decls(
                             descriptor_arg: false,
                             by_ref: false,
                             char_kind,
-                            derived_type: None,
+                            derived_type: match type_spec {
+                                TypeSpec::Type(type_name) => Some(type_name.clone()),
+                                _ => None,
+                            },
                             inline_const: None,
                             is_pointer: false,
                             runtime_dim_upper: vec![],
@@ -10363,8 +10402,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 ));
                                 let one_i64 = b.const_i64(1);
                                 for (i, arg) in args.iter().enumerate() {
-                                    let (lo64, up64) =
-                                        lower_alloc_bounds(b, &ctx.locals, &arg.value, ctx.st);
+                                    let (lo64, up64) = lower_alloc_bounds(b, ctx, &arg.value);
                                     let base = (i * 24) as i64;
                                     let off_lo = b.const_i64(base);
                                     let off_up = b.const_i64(base + 8);
@@ -12271,14 +12309,13 @@ fn widen_idx_to_i64(b: &mut FuncBuilder, idx: ValueId) -> ValueId {
 /// `allocate(m(0:2, 0:3))`.
 fn lower_alloc_bounds(
     b: &mut FuncBuilder,
-    locals: &HashMap<String, LocalInfo>,
+    ctx: &LowerCtx,
     sub: &crate::ast::expr::SectionSubscript,
-    st: &SymbolTable,
 ) -> (ValueId, ValueId) {
     use crate::ast::expr::SectionSubscript;
     match sub {
         SectionSubscript::Element(e) => {
-            let up = lower_expr(b, locals, e, st);
+            let up = lower_expr_ctx(b, ctx, e);
             let up64 = widen_idx_to_i64(b, up);
             let lo64 = b.const_i64(1);
             (lo64, up64)
@@ -12286,14 +12323,14 @@ fn lower_alloc_bounds(
         SectionSubscript::Range { start, end, .. } => {
             let lo64 = match start {
                 Some(e) => {
-                    let v = lower_expr(b, locals, e, st);
+                    let v = lower_expr_ctx(b, ctx, e);
                     widen_idx_to_i64(b, v)
                 }
                 None => b.const_i64(1),
             };
             let up64 = match end {
                 Some(e) => {
-                    let v = lower_expr(b, locals, e, st);
+                    let v = lower_expr_ctx(b, ctx, e);
                     widen_idx_to_i64(b, v)
                 }
                 None => b.const_i64(1),
