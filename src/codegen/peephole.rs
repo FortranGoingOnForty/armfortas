@@ -251,7 +251,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
     }
 
     // Apply plans in reverse order of add_idx to keep indices stable.
-    plans.sort_by(|a, b| b.add_idx.cmp(&a.add_idx));
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan.add_idx));
 
     // Collect mul_idxs to remove.
     let mut remove_idxs: std::collections::HashSet<usize> =
