@@ -268,7 +268,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             // ---- Output path ----
             "-o" => {
                 i += 1;
-                opts.output = Some(PathBuf::from(args.get(i).ok_or("-o requires an argument")?));
+                let value = args.get(i).ok_or("-o requires an argument")?;
+                set_output_path(&mut opts, value)?;
+            }
+            arg if arg.starts_with("-o") => {
+                set_output_path(&mut opts, short_option_value(&arg, "-o", "an argument")?)?;
             }
 
             // ---- Mode ----
@@ -302,7 +306,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.module_search_paths
                     .push(PathBuf::from(args.get(i).ok_or("-I requires a directory")?));
             }
-            arg if arg.starts_with("-I") => opts.module_search_paths.push(PathBuf::from(&arg[2..])),
+            arg if arg.starts_with("-I") => opts
+                .module_search_paths
+                .push(PathBuf::from(short_option_value(&arg, "-I", "a directory")?)),
 
             "-J" => {
                 i += 1;
@@ -310,7 +316,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     Some(PathBuf::from(args.get(i).ok_or("-J requires a directory")?));
             }
             arg if arg.starts_with("-J") => {
-                opts.module_output_dir = Some(PathBuf::from(&arg[2..]));
+                opts.module_output_dir = Some(PathBuf::from(short_option_value(
+                    &arg,
+                    "-J",
+                    "a directory",
+                )?));
             }
 
             // ---- Linker search / libs / rpath ----
@@ -320,7 +330,8 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     .push(PathBuf::from(args.get(i).ok_or("-L requires a directory")?));
             }
             arg if arg.starts_with("-L") => {
-                opts.library_search_paths.push(PathBuf::from(&arg[2..]))
+                opts.library_search_paths
+                    .push(PathBuf::from(short_option_value(&arg, "-L", "a directory")?))
             }
 
             "-l" => {
@@ -328,7 +339,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.link_libs
                     .push(args.get(i).ok_or("-l requires a library name")?.clone());
             }
-            arg if arg.starts_with("-l") => opts.link_libs.push(arg[2..].to_string()),
+            arg if arg.starts_with("-l") => opts.link_libs.push(
+                short_option_value(&arg, "-l", "a library name")?.to_string(),
+            ),
 
             "-rpath" | "--rpath" => {
                 i += 1;
@@ -422,6 +435,10 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     }
 
     collect_cli_warnings(&mut opts, &unknown_warning_flags);
+
+    if matches!(opts.diagnostics_format, DiagnosticsFormat::Json) {
+        return Err("JSON diagnostics are not yet implemented".into());
+    }
 
     if inputs.is_empty() {
         return Err("no input file".into());
@@ -987,15 +1004,24 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
-        let out = opts.output_path();
-        if out.as_os_str() == "-" {
+        if opts.output.is_none() {
             print!("{}", preprocessed);
         } else {
-            fs::write(&out, &preprocessed)
-                .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+            let out = opts.output_path();
+            if out.as_os_str() == "-" {
+                print!("{}", preprocessed);
+            } else {
+                fs::write(&out, &preprocessed)
+                    .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+            }
+            if opts.verbose {
+                eprintln!(" preprocess-only: wrote {}", out.display());
+            }
+            phases.report();
+            return Ok(());
         }
         if opts.verbose {
-            eprintln!(" preprocess-only: wrote {}", out.display());
+            eprintln!(" preprocess-only: wrote stdout");
         }
         phases.report();
         return Ok(());
