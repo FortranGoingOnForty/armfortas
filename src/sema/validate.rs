@@ -871,10 +871,16 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 /// variable's intent/parameter status applies to all parts.
 fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedExpr, span: Span) {
     if let Some(name) = extract_base_name(target) {
-        let (is_intent_in, is_parameter) = ctx.lookup(&name)
-            .map(|sym| (matches!(sym.attrs.intent, Some(Intent::In)), sym.attrs.parameter))
-            .unwrap_or((false, false));
-        if is_intent_in {
+        let (is_intent_in, is_parameter, is_pointer) = ctx.lookup(&name)
+            .map(|sym| (
+                matches!(sym.attrs.intent, Some(Intent::In)),
+                sym.attrs.parameter,
+                sym.attrs.pointer,
+            ))
+            .unwrap_or((false, false, false));
+        let writes_through_pointer_target =
+            is_pointer && !matches!(target.node, Expr::Name { .. });
+        if is_intent_in && !writes_through_pointer_target {
             ctx.error(span, format!("cannot assign to intent(in) variable '{}'", name));
         }
         if is_parameter {
@@ -1945,6 +1951,23 @@ subroutine foo(x)
 end subroutine
 ");
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn assign_through_intent_in_pointer_target_ok() {
+        let errs = errors_from("\
+module m
+  type :: t
+    integer :: x
+  end type
+contains
+  subroutine foo(p)
+    type(t), pointer, intent(in) :: p
+    p%x = 1
+  end subroutine
+end module
+");
+        assert!(!errs.iter().any(|e| e.contains("intent(in)")), "{:?}", errs);
     }
 
     #[test]
