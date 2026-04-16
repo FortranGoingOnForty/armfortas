@@ -85,9 +85,12 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
     if let Some((gutter, line_text, caret_indent, caret_len)) = snippet_for(source, span, span_len)
     {
         let blue = if color { "\x1b[34m" } else { "" };
+        let gutter_width = gutter.to_string().len().max(5);
+        let caret_gutter = " ".repeat(gutter_width);
         eprintln!(
-            "{blue}{gutter:>5} |{reset} {line}",
+            "{blue}{gutter:>width$} |{reset} {line}",
             gutter = gutter,
+            width = gutter_width,
             reset = reset,
             blue = blue,
             line = line_text
@@ -100,8 +103,9 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
             caret.push('^');
         }
         eprintln!(
-            "{blue}      |{reset} {col_start}{caret}{reset}",
+            "{blue}{caret_gutter} |{reset} {col_start}{caret}{reset}",
             blue = blue,
+            caret_gutter = caret_gutter,
             reset = reset,
             col_start = col_start,
             caret = caret
