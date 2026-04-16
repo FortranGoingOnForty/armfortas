@@ -710,7 +710,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_const_int_expr_tree(ctx, &spec.value);
             }
         }
-        Stmt::Allocate { items, opts } | Stmt::Deallocate { items, opts } => {
+        Stmt::Allocate { items, opts, .. } | Stmt::Deallocate { items, opts } => {
             for item in items {
                 validate_const_int_expr_tree(ctx, item);
             }
