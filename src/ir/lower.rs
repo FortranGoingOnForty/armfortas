@@ -19157,7 +19157,7 @@ end program
 ",
         );
         assert!(ir.contains("doconc_check"));
-        assert!(ir.contains("call @shift_scale("));
+        assert!(ir.contains("call @afs_internal___prog_test_1("));
     }
 
     #[test]

@@ -1883,7 +1883,7 @@ mod tests {
         compile(&opts).expect("internal integer(16) call should codegen at O0");
         let asm = fs::read_to_string(&output).expect("missing emitted assembly");
         assert!(
-            asm.contains("bl _add_one"),
+            asm.contains("bl _afs_internal___prog_integer16_internal_call_1"),
             "expected internal helper call in asm:\n{}",
             asm
         );
