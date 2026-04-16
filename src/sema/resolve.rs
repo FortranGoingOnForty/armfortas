@@ -57,6 +57,37 @@ pub fn resolve_file(units: &[SpannedUnit], module_search_paths: &[std::path::Pat
     Ok(ResolveResult { st, type_layouts: layouts, external_modules })
 }
 
+fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
+    let updates: Vec<(String, Option<TypeInfo>, Vec<String>)> = st
+        .scope(scope_id)
+        .symbols
+        .iter()
+        .filter_map(|(key, sym)| {
+            if sym.kind != SymbolKind::ProcedurePointer {
+                return None;
+            }
+            let TypeInfo::Derived(iface_name) = sym.type_info.as_ref()? else {
+                return None;
+            };
+            let iface_sym = st.find_symbol_any_scope(&iface_name.to_lowercase())?;
+            Some((
+                key.clone(),
+                iface_sym.type_info.clone(),
+                iface_sym.arg_names.clone(),
+            ))
+        })
+        .collect();
+
+    for (key, type_info, arg_names) in updates {
+        if let Some(sym) = st.scope_mut(scope_id).symbols.get_mut(&key) {
+            if let Some(type_info) = type_info {
+                sym.type_info = Some(type_info);
+            }
+            sym.arg_names = arg_names;
+        }
+    }
+}
+
 fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
@@ -67,10 +98,12 @@ fn resolve_unit(
         ProgramUnit::Program { name, uses, imports: _, implicit, decls, body: _, contains } => {
             let scope_name = name.clone().unwrap_or_else(|| "<main>".into());
             st.push_scope(ScopeKind::Program(scope_name));
+            let scope_id = st.current_scope();
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
+            backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Module { name, uses, imports: _, implicit, decls, contains } => {
@@ -82,6 +115,7 @@ fn resolve_unit(
                 process_implicit(st, implicit)?;
                 process_decls(st, decls)?;
                 process_contains(st, contains, module_search_paths, layouts)?;
+                backfill_procedure_pointer_interfaces(st, mod_id);
 
                 st.enter_scope(saved);
             }
@@ -111,6 +145,7 @@ fn resolve_unit(
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
+            backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Function { name, args, result, return_type, bind: _, prefix: _, uses, imports: _, implicit, decls, body: _, contains } => {
@@ -148,6 +183,7 @@ fn resolve_unit(
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
+            backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::BlockData { name, uses, decls } => {
@@ -179,6 +215,8 @@ fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
+            let scope_id = st.current_scope();
+            backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::InterfaceBlock { name, is_abstract: _, bodies } => {
@@ -634,21 +672,39 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 pending_access.push((acc, names.clone()));
             }
             Decl::TypeDecl { type_spec, attrs, entities } => {
-                let type_info = type_spec_to_info(type_spec, st);
+                let mut type_info = type_spec_to_info(type_spec, st);
                 let sym_attrs = attrs_to_symbol_attrs(attrs, st.default_access(st.current_scope()));
+                let mut kind = if sym_attrs.parameter {
+                    SymbolKind::Parameter
+                } else {
+                    SymbolKind::Variable
+                };
+                let mut arg_names = Vec::new();
+
+                if sym_attrs.pointer && sym_attrs.external {
+                    kind = SymbolKind::ProcedurePointer;
+                    if let TypeSpec::Type(iface_name) = type_spec {
+                        if let Some(iface_sym) =
+                            st.find_symbol_any_scope(&iface_name.to_lowercase())
+                        {
+                            type_info = iface_sym
+                                .type_info
+                                .clone()
+                                .unwrap_or_else(|| type_info.clone());
+                            arg_names = iface_sym.arg_names.clone();
+                        }
+                    }
+                }
 
                 for entity in entities {
-                    let kind = if sym_attrs.parameter {
-                        SymbolKind::Parameter
-                    } else {
-                        SymbolKind::Variable
-                    };
                     let key = entity.name.to_lowercase();
                     if st.scope(st.current_scope()).symbols.contains_key(&key) {
                         // Symbol already exists (e.g., dummy argument) — update type info.
                         let sym = st.scope_mut(st.current_scope()).symbols.get_mut(&key).unwrap();
+                        sym.kind = kind.clone();
                         sym.type_info = Some(type_info.clone());
                         sym.attrs = sym_attrs.clone();
+                        sym.arg_names = arg_names.clone();
                     } else {
                         // Try to fold PARAMETER initializers to a
                         // compile-time integer so .amod can carry the
@@ -658,12 +714,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         } else { None };
                         st.define(Symbol {
                             name: entity.name.clone(),
-                            kind,
+                            kind: kind.clone(),
                             type_info: Some(type_info.clone()),
                             attrs: sym_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
-                            arg_names: vec![],
+                            arg_names: arg_names.clone(),
                             const_value,
                         })?;
                     }

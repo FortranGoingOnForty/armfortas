@@ -634,13 +634,6 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 );
             }
 
-            if decl_attrs_contain(attrs, Attribute::External) && has_pointer {
-                ctx.error(
-                    decl.span,
-                    "procedure pointer declarations are recognized but not yet implemented",
-                );
-            }
-
             // Pure/elemental: SAVE is forbidden.
             if ctx.in_pure {
                 let has_save = attrs.iter().any(|a| matches!(a, Attribute::Save));

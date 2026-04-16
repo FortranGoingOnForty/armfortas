@@ -1846,9 +1846,9 @@ fn coarray_sync_reports_not_implemented() {
 }
 
 #[test]
-fn procedure_pointer_decl_reports_not_implemented() {
+fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     let src = write_program(
-        "module m\n  implicit none\n  abstract interface\n    logical function pred(x)\n      character(len=*), intent(in) :: x\n    end function pred\n  end interface\n  procedure(pred), pointer :: p => null()\nend module\n",
+        "module m\n  implicit none\n  abstract interface\n    logical function pred(x)\n      integer, intent(in) :: x\n    end function pred\n    subroutine act(x)\n      integer, intent(in) :: x\n    end subroutine act\n  end interface\n  procedure(pred), pointer :: p => null()\n  procedure(act), pointer :: q => null()\ncontains\n  logical function ok(x)\n    integer, intent(in) :: x\n    ok = .false.\n    if (associated(p)) ok = p(x)\n  end function ok\n\n  subroutine run(x)\n    integer, intent(in) :: x\n    if (associated(q)) call q(x)\n  end subroutine run\nend module\n",
         "f90",
     );
     let out = unique_path("procedure_ptr_decl", "o");
@@ -1858,14 +1858,9 @@ fn procedure_pointer_decl_reports_not_implemented() {
         .output()
         .expect("spawn failed");
     assert!(
-        !result.status.success(),
-        "procedure pointers should fail honestly"
-    );
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(
-        stderr.contains("procedure pointer declarations are recognized but not yet implemented"),
-        "expected explicit procedure-pointer diagnostic: {}",
-        stderr
+        result.status.success(),
+        "procedure-pointer declarations should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
