@@ -6401,6 +6401,40 @@ fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool
     Some(mask)
 }
 
+/// Check if a callee has `character(len=*)` dummies via its scope in the
+/// symbol table. Returns a positional bitmap for the visible arguments.
+fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+    use crate::sema::symtab::{ScopeKind, TypeInfo};
+    let callee_scope = st.scopes.iter().find(|s| {
+        match &s.kind {
+            ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.to_lowercase() == callee_name,
+            _ => false,
+        }
+    })?;
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .map(|sym| {
+                    matches!(
+                        sym.type_info,
+                        Some(TypeInfo::Character { len: None, .. })
+                    ) && !sym.attrs.allocatable
+                        && !sym.attrs.pointer
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if mask.iter().any(|flag| *flag) {
+        Some(mask)
+    } else {
+        None
+    }
+}
+
 
 /// Look up the derived-type NAME a callee's result variable carries, if
 /// any.  Used by `Expr::ComponentAccess` when the base is a function
@@ -6533,7 +6567,7 @@ fn lower_string_expr_with_layouts(
         Expr::ComponentAccess { .. } => {
             if let Some(tl) = type_layouts {
                 if let Some((field_ptr, field)) =
-                    resolve_component_field_access(b, locals, expr, tl)
+                    resolve_component_field_access(b, locals, expr, st, tl)
                 {
                     match field_char_kind(&field) {
                         CharKind::Fixed(len) => {
@@ -6584,8 +6618,8 @@ fn lower_string_expr_with_layouts(
         }
         Expr::FunctionCall { callee, args } => {
             if args.len() == 1
-                && expr_is_character_expr(b, locals, callee, type_layouts)
-                && !expr_is_array_designator(b, locals, callee, type_layouts)
+                && expr_is_character_expr(b, locals, callee, st, type_layouts)
+                && !expr_is_array_designator(b, locals, callee, st, type_layouts)
             {
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
@@ -6743,7 +6777,7 @@ fn lower_string_expr_with_layouts(
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Some(info) = component_array_local_info(b, locals, callee, tl) {
+                    if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
                         if args.len() == 1 {
                             if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
                                 if info.char_kind != CharKind::None {
@@ -7313,6 +7347,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             b,
                             &ctx.locals,
                             callee,
+                            ctx.st,
                             ctx.type_layouts,
                         ) {
                             if lower_1d_section_assign(b, ctx, &info, args, value) {
@@ -7347,7 +7382,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         {
                             if let crate::ast::expr::SectionSubscript::Range { ref start, ref end, .. } = args[0].value {
                                 if let Some((field_ptr, field)) =
-                                    resolve_component_field_access(b, &ctx.locals, callee, ctx.type_layouts)
+                                    resolve_component_field_access(
+                                        b,
+                                        &ctx.locals,
+                                        callee,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
                                 {
                                     if is_deferred_char_component_field(&field) {
                                         let (base_ptr, base_len) = load_string_descriptor_view(b, field_ptr);
@@ -7377,7 +7418,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
                 Expr::ComponentAccess { base, component } => {
                     // x%field = val (supports chained: x%a%b = val).
-                    if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                    if let Some((base_addr, type_name)) =
+                        resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
+                    {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
                             if let Some(field) = layout.field(component) {
                                 let offset = b.const_i64(field.offset as i64);
@@ -7522,7 +7565,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             // Handle type-bound procedure calls: call obj%method(args)
             if let Expr::ComponentAccess { base, component } = &callee.node {
-                if let Some((obj_addr, type_name)) = resolve_component_base_for_method(b, &ctx.locals, base, ctx.type_layouts) {
+                if let Some((obj_addr, type_name)) =
+                    resolve_component_base_for_method(
+                        b,
+                        &ctx.locals,
+                        base,
+                        ctx.st,
+                        ctx.type_layouts,
+                    )
+                {
                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                         if let Some(bp) = layout.bound_proc(component) {
                             let target = bp.target_name.clone();
@@ -7607,6 +7658,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         arg_vals.push(len);
                                     } else if let Expr::StringLiteral { value, .. } = &e.node {
                                         arg_vals.push(b.const_i64(value.len() as i64));
+                                    } else if expr_is_character_expr(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                    ) {
+                                        let (_ptr, len) = lower_string_expr_with_layouts(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        );
+                                        arg_vals.push(len);
                                     } else {
                                         arg_vals.push(b.const_i64(0));
                                     }
@@ -8506,7 +8572,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             // In both cases the target must be a simple Name for now;
             // component-access and slice targets are follow-up work.
             if let Some((tgt_field_ptr, tgt_field)) =
-                resolve_component_field_access(b, &ctx.locals, target, ctx.type_layouts)
+                resolve_component_field_access(b, &ctx.locals, target, ctx.st, ctx.type_layouts)
             {
                 if !tgt_field.pointer {
                     return;
@@ -8571,7 +8637,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                     if let Some((src_field_ptr, src_field)) =
-                        resolve_component_field_access(b, &ctx.locals, value, ctx.type_layouts)
+                        resolve_component_field_access(
+                            b,
+                            &ctx.locals,
+                            value,
+                            ctx.st,
+                            ctx.type_layouts,
+                        )
                     {
                         if is_deferred_char_component_field(&src_field) {
                             let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
@@ -8686,7 +8758,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             // Component access target: p => dt%field — resolve the
             // field's address and store into the pointer slot.
             if let Expr::ComponentAccess { base, component } = &value.node {
-                if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                if let Some((base_addr, type_name)) =
+                    resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
+                {
                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                         if let Some(field) = layout.field(component) {
                             let offset = b.const_i64(field.offset as i64);
@@ -9807,7 +9881,9 @@ fn lower_write_items_adv(
             Expr::BinaryOp { op: BinaryOp::Concat, .. } => true,
             Expr::ComponentAccess { base, component } => {
                 // Check if the component is a character field.
-                if let Some((_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                if let Some((_addr, type_name)) =
+                    resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
+                {
                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                         layout.field(component)
                             .map(|f| matches!(f.type_info, crate::sema::symtab::TypeInfo::Character { .. }))
@@ -9909,7 +9985,9 @@ fn lower_write_items_adv(
             // length directly from the type layout since lower_string_expr
             // doesn't have access to type_layouts.
             if let Expr::ComponentAccess { base, component } = &item.node {
-                if let Some((base_addr, type_name)) = resolve_component_base(b, &ctx.locals, base, ctx.type_layouts) {
+                if let Some((base_addr, type_name)) =
+                    resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
+                {
                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                         if let Some(field) = layout.field(component) {
                             if let crate::sema::symtab::TypeInfo::Character { len: Some(flen), .. } = &field.type_info {
@@ -10453,7 +10531,7 @@ fn lower_read_target_addr(
         }
         Expr::ComponentAccess { base, component } => {
             let (base_addr, type_name) =
-                resolve_component_base(b, &ctx.locals, base, ctx.type_layouts)?;
+                resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)?;
             let layout = ctx.type_layouts.get(&type_name)?;
             let field = layout.field(component)?;
             if matches!(&field.type_info, crate::sema::symtab::TypeInfo::Derived(_)) {
@@ -12673,6 +12751,7 @@ fn lower_pointer_intrinsic(
     locals: &HashMap<String, LocalInfo>,
     name: &str,
     args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<ValueId> {
     if name != "associated" {
@@ -12691,7 +12770,7 @@ fn lower_pointer_intrinsic(
         let base_ptr = b.gep(info.addr, vec![zero_off], IrType::Int(IntWidth::I64));
         b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
     } else if let Some(tl) = type_layouts {
-        let (field_ptr, field) = resolve_component_field_access(b, locals, expr, tl)?;
+        let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
         if !field.pointer {
             return None;
         }
@@ -12760,7 +12839,7 @@ fn lower_array_intrinsic(
                         .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
                 }
                 Expr::ComponentAccess { .. } => type_layouts
-                    .and_then(|tl| component_array_local_info(b, locals, e, tl)),
+                    .and_then(|tl| component_array_local_info(b, locals, e, st, tl)),
                 _ => None,
             }
         } else { None }
@@ -13075,6 +13154,7 @@ fn resolve_component_base(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     base: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, String)> {
     match &base.node {
@@ -13096,7 +13176,8 @@ fn resolve_component_base(
         }
         Expr::ComponentAccess { base: inner_base, component } => {
             // Recursive: resolve the inner base first.
-            let (inner_addr, inner_type) = resolve_component_base(b, locals, inner_base, tl)?;
+            let (inner_addr, inner_type) =
+                resolve_component_base(b, locals, inner_base, st, tl)?;
             let layout = tl.get(&inner_type)?;
             let field = layout.field(component)?;
             let offset = b.const_i64(field.offset as i64);
@@ -13108,6 +13189,26 @@ fn resolve_component_base(
                 None // Terminal field — caller should load, not chain further.
             }
         }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let info = locals.get(&name.to_lowercase())?;
+            let type_name = info.derived_type.as_ref()?.clone();
+            if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+                return None;
+            }
+            if args.iter().any(|arg| {
+                !matches!(
+                    arg.value,
+                    crate::ast::expr::SectionSubscript::Element(_)
+                )
+            }) {
+                return None;
+            }
+            let elem_addr = lower_array_element(b, locals, info, args, st);
+            Some((elem_addr, type_name))
+        }
         _ => None,
     }
 }
@@ -13116,12 +13217,13 @@ fn resolve_component_field_access(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, crate::sema::type_layout::FieldLayout)> {
     let Expr::ComponentAccess { base, component } = &expr.node else {
         return None;
     };
-    let (base_addr, type_name) = resolve_component_base(b, locals, base, tl)?;
+    let (base_addr, type_name) = resolve_component_base(b, locals, base, st, tl)?;
     let layout = tl.get(&type_name)?;
     let field = layout.field(component)?.clone();
     let offset = b.const_i64(field.offset as i64);
@@ -13177,9 +13279,10 @@ fn component_array_local_info(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<LocalInfo> {
-    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, tl)?;
+    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
     if field.size != 384 || !(field.allocatable || field.pointer) {
         return None;
     }
@@ -13202,6 +13305,7 @@ fn expr_is_array_designator(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
     match &expr.node {
@@ -13210,7 +13314,7 @@ fn expr_is_array_designator(
             .map(|info| !info.dims.is_empty() || local_uses_array_descriptor(info))
             .unwrap_or(false),
         Expr::ComponentAccess { .. } => type_layouts
-            .and_then(|tl| component_array_local_info(b, locals, expr, tl))
+            .and_then(|tl| component_array_local_info(b, locals, expr, st, tl))
             .is_some(),
         _ => false,
     }
@@ -13220,6 +13324,7 @@ fn expr_is_character_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
     match &expr.node {
@@ -13230,7 +13335,7 @@ fn expr_is_character_expr(
             .map(|info| info.char_kind != CharKind::None)
             .unwrap_or(false),
         Expr::ComponentAccess { .. } => type_layouts
-            .and_then(|tl| resolve_component_field_access(b, locals, expr, tl))
+            .and_then(|tl| resolve_component_field_access(b, locals, expr, st, tl))
             .map(|(_, field)| {
                 matches!(
                     field.type_info,
@@ -13268,8 +13373,8 @@ fn expr_is_character_expr(
             } else if let Expr::ComponentAccess { .. } = &callee.node {
                 type_layouts
                     .and_then(|tl| {
-                        component_array_local_info(b, locals, callee, tl).or_else(|| {
-                            resolve_component_field_access(b, locals, callee, tl).map(
+                        component_array_local_info(b, locals, callee, st, tl).or_else(|| {
+                            resolve_component_field_access(b, locals, callee, st, tl).map(
                                 |(field_ptr, field)| LocalInfo {
                                     addr: field_ptr,
                                     ty: type_info_to_ir_type(&field.type_info),
@@ -13289,7 +13394,7 @@ fn expr_is_character_expr(
                     .map(|info| info.char_kind != CharKind::None)
                     .unwrap_or(false)
             } else {
-                expr_is_character_expr(b, locals, callee, type_layouts)
+                expr_is_character_expr(b, locals, callee, st, type_layouts)
             }
         }
         _ => false,
@@ -13323,6 +13428,7 @@ fn resolve_component_base_for_method(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     base: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, String)> {
     match &base.node {
@@ -13335,7 +13441,8 @@ fn resolve_component_base_for_method(
         }
         Expr::ComponentAccess { base: inner_base, component } => {
             // Resolve the inner base, then GEP to the component field.
-            let (inner_addr, inner_type) = resolve_component_base_for_method(b, locals, inner_base, tl)?;
+            let (inner_addr, inner_type) =
+                resolve_component_base_for_method(b, locals, inner_base, st, tl)?;
             let layout = tl.get(&inner_type)?;
             let field = layout.field(component)?;
             let offset = b.const_i64(field.offset as i64);
@@ -13345,6 +13452,26 @@ fn resolve_component_base_for_method(
             } else {
                 None
             }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let info = locals.get(&name.to_lowercase())?;
+            let type_name = info.derived_type.as_ref()?.clone();
+            if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+                return None;
+            }
+            if args.iter().any(|arg| {
+                !matches!(
+                    arg.value,
+                    crate::ast::expr::SectionSubscript::Element(_)
+                )
+            }) {
+                return None;
+            }
+            let elem_addr = lower_array_element(b, locals, info, args, st);
+            Some((elem_addr, type_name))
         }
         _ => None,
     }
@@ -13405,6 +13532,12 @@ fn lower_char_arg_by_ref(
                 return None;
             };
             let info = locals.get(&name.to_lowercase())?;
+            if info.char_kind != CharKind::None && info.dims.is_empty() {
+                let (ptr, _len) = lower_string_expr_with_layouts(b, locals, expr, st, None);
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(ptr, slot);
+                return Some(slot);
+            }
             if !matches!(info.char_kind, CharKind::Fixed(_)) || info.dims.is_empty() {
                 return None;
             }
@@ -13679,8 +13812,8 @@ fn lower_expr_full(
                     | BinaryOp::Le
                     | BinaryOp::Gt
                     | BinaryOp::Ge
-            ) && (expr_is_character_expr(b, locals, left, type_layouts)
-                || expr_is_character_expr(b, locals, right, type_layouts))
+            ) && (expr_is_character_expr(b, locals, left, st, type_layouts)
+                || expr_is_character_expr(b, locals, right, st, type_layouts))
             {
                 let (lhs_ptr, lhs_len) =
                     lower_string_expr_with_layouts(b, locals, left, st, type_layouts);
@@ -13882,6 +14015,41 @@ fn lower_expr_full(
         Expr::ParenExpr { inner } => lower_expr_full(b, locals, inner, st, type_layouts, internal_funcs, contained_host_refs, descriptor_params),
 
         Expr::FunctionCall { callee, args } => {
+            if args.len() == 1
+                && expr_is_character_expr(b, locals, callee, st, type_layouts)
+                && !expr_is_array_designator(b, locals, callee, st, type_layouts)
+            {
+                match &args[0].value {
+                    crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
+                        let (base_ptr, base_len) =
+                            lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
+                        let (ptr, _len) = lower_substring(
+                            b,
+                            locals,
+                            st,
+                            base_ptr,
+                            base_len,
+                            start.as_ref(),
+                            end.as_ref(),
+                        );
+                        return ptr;
+                    }
+                    crate::ast::expr::SectionSubscript::Element(idx_expr) => {
+                        let (base_ptr, base_len) =
+                            lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
+                        let (ptr, _len) = lower_substring(
+                            b,
+                            locals,
+                            st,
+                            base_ptr,
+                            base_len,
+                            Some(idx_expr),
+                            Some(idx_expr),
+                        );
+                        return ptr;
+                    }
+                }
+            }
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
 
@@ -13899,7 +14067,9 @@ fn lower_expr_full(
                 // Check for pointer intrinsics (ASSOCIATED) first —
                 // these work on every pointer shape and don't care
                 // about the array-intrinsic filter.
-                if let Some(result) = lower_pointer_intrinsic(b, locals, &key, args, type_layouts) {
+                if let Some(result) =
+                    lower_pointer_intrinsic(b, locals, &key, args, st, type_layouts)
+                {
                     return result;
                 }
 
@@ -14103,6 +14273,31 @@ fn lower_expr_full(
                     }
                 };
                 let resolved_key = resolved_name.to_lowercase();
+                let callee_char_len_star_args = callee_char_len_star_mask(st, &resolved_key)
+                    .or_else(|| callee_char_len_star_mask(st, &key));
+
+                if let Some(cls_flags) = &callee_char_len_star_args {
+                    for (i, flag) in cls_flags.iter().enumerate() {
+                        if !*flag || i >= args.len() {
+                            continue;
+                        }
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
+                            if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, locals) {
+                                ref_arg_vals.push(len);
+                            } else if let Expr::StringLiteral { value, .. } = &e.node {
+                                ref_arg_vals.push(b.const_i64(value.len() as i64));
+                            } else if expr_is_character_expr(b, locals, e, st, type_layouts) {
+                                let (_ptr, len) =
+                                    lower_string_expr_with_layouts(b, locals, e, st, type_layouts);
+                                ref_arg_vals.push(len);
+                            } else {
+                                ref_arg_vals.push(b.const_i64(0));
+                            }
+                        } else {
+                            ref_arg_vals.push(b.const_i64(0));
+                        }
+                    }
+                }
 
                 // Host-association closure-passing ABI: append trailing
                 // pointer args for each host-local the callee references.
@@ -14130,7 +14325,7 @@ fn lower_expr_full(
                 b.call(func_ref, ref_arg_vals, ret_ty)
             } else if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Some(info) = component_array_local_info(b, locals, callee, tl) {
+                    if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
                         let has_range = args.iter().any(|a| {
                             matches!(
                                 a.value,
@@ -14152,7 +14347,7 @@ fn lower_expr_full(
         Expr::ComponentAccess { base, component } => {
             if let Some(tl) = type_layouts {
                 // Common case: base is a Name or chained ComponentAccess.
-                let resolved = resolve_component_base(b, locals, base, tl);
+                let resolved = resolve_component_base(b, locals, base, st, tl);
                 // Inline case: base is a call that returns a derived type,
                 // e.g. `add_t(a, b)%x`.  resolve_component_base doesn't
                 // know how to lower a FunctionCall, so handle it here.

@@ -471,6 +471,77 @@ fn scalar_char_component_ops_and_achar_compile() {
 }
 
 #[test]
+fn scalar_char_substring_argument_avoids_raw_local_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  integer function visual_length(s)\n    character(len=*), intent(in) :: s\n    visual_length = len_trim(s)\n  end function visual_length\n\n  integer function run(input) result(n)\n    character(len=*), intent(in) :: input\n    character(len=len(input)) :: working_input\n    working_input = input\n    n = visual_length(working_input(2:3))\n  end function run\nend module m\n",
+        "f90",
+    );
+    let out = unique_path("char_substring_arg", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char substring argument compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "char substring argument compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        "character dummy call should still route len_trim through the runtime: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_working_input"),
+        "character substring argument should not lower as an external local symbol: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_on_derived_array_element_component_uses_descriptor_runtime() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: cmd_t\n    character(:), allocatable :: tokens(:)\n  end type cmd_t\n  type(cmd_t) :: cmds(2)\n  logical :: ok\n  ok = allocated(cmds(1)%tokens)\n  if (ok) print *, size(cmds(1)%tokens)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_component_allocated", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array component allocated compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array component allocated compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let undefined = undefined_symbols(&out);
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        "allocated(cmds(i)%tokens) should lower to afs_array_allocated: {:?}",
+        undefined
+    );
+    assert!(
+        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        "size(cmds(i)%tokens) should lower to afs_array_size: {:?}",
+        undefined
+    );
+    assert!(
+        !undefined.iter().any(|sym| sym == "_allocated" || sym == "_size"),
+        "derived array element component intrinsics should not call raw allocated/size symbols: {:?}",
+        undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn named_len_char_component_substring_and_trim_compile() {
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_token_len = 8\n  type :: token_t\n    character(len=max_token_len) :: value\n  end type token_t\ncontains\n  subroutine f(tok, i, is_bang, trimmed)\n    type(token_t), intent(in) :: tok\n    integer, intent(in) :: i\n    logical, intent(out) :: is_bang\n    character(len=max_token_len), intent(out) :: trimmed\n    is_bang = (tok%value(i:i) == '!')\n    trimmed = trim(tok%value)\n  end subroutine f\nend module m\n",
