@@ -91,6 +91,20 @@ fn run_binary(path: &Path, context: &str) -> Output {
     output
 }
 
+fn compile_with_driver(
+    driver: &Path,
+    source: &Path,
+    output: &Path,
+    extra_envs: &[(&str, &Path)],
+    context: &str,
+) -> Output {
+    let mut cmd = Command::new(driver);
+    for (name, value) in extra_envs {
+        cmd.env(name, value);
+    }
+    run_command(cmd.arg(source).arg("-o").arg(output), context)
+}
+
 #[test]
 fn hello_world_runs_through_afs_as_and_afs_ld() {
     let Some(armfortas) = binary("armfortas") else {
@@ -217,25 +231,26 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
     let default_bin = dir.join("hello-default");
     let standalone_bin = dir.join("hello-driver-standalone");
 
-    let default_compile = run_command(
-        Command::new(&armfortas)
-            .arg(&source)
-            .arg("-o")
-            .arg(&default_bin),
+    let default_compile = compile_with_driver(
+        &armfortas,
+        &source,
+        &default_bin,
+        &[],
         "default armfortas compile",
     );
     assert_success(&default_compile, "default armfortas compile");
     let default_run = run_binary(&default_bin, "default armfortas run");
 
-    let standalone_compile = run_command(
-        Command::new(&armfortas)
-            .env("AFS_AS_PATH", &afs_as)
-            .env("AFS_LD_PATH", &afs_ld)
-            .env("AFS_RUNTIME_PATH", &runtime)
-            .env("AFS_LIBSYSTEM_TBD", &libsystem)
-            .arg(&source)
-            .arg("-o")
-            .arg(&standalone_bin),
+    let standalone_compile = compile_with_driver(
+        &armfortas,
+        &source,
+        &standalone_bin,
+        &[
+            ("AFS_AS_PATH", &afs_as),
+            ("AFS_LD_PATH", &afs_ld),
+            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_LIBSYSTEM_TBD", &libsystem),
+        ],
         "standalone armfortas compile",
     );
     assert_success(&standalone_compile, "standalone armfortas compile");
@@ -255,4 +270,92 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
         "driver override stderr diverged from default driver"
     );
     assert_eq!(standalone_stdout, " Hello, World!\n");
+}
+
+#[test]
+fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(afs_ld) = binary("afs-ld") else {
+        eprintln!("skipping: afs-ld binary not built");
+        return;
+    };
+    let Some(runtime) = runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+    let Some(libsystem) = libsystem_tbd() else {
+        eprintln!("skipping: libSystem.tbd not found");
+        return;
+    };
+
+    let root = workspace_root();
+    let cases = [
+        ("arithmetic.f90", "30"),
+        ("if_else.f90", "positive"),
+        ("real_function.f90", "6.28"),
+    ];
+
+    for (name, needle) in cases {
+        let source = root.join("test_programs").join(name);
+        assert!(source.exists(), "missing source fixture {}", source.display());
+
+        let dir = unique_dir(&format!("standalone_matrix_{name}"));
+        let default_bin = dir.join(format!("{name}.default.out"));
+        let standalone_bin = dir.join(format!("{name}.standalone.out"));
+
+        let default_compile = compile_with_driver(
+            &armfortas,
+            &source,
+            &default_bin,
+            &[],
+            &format!("default armfortas compile for {name}"),
+        );
+        assert_success(&default_compile, &format!("default armfortas compile for {name}"));
+        let default_run = run_binary(&default_bin, &format!("default armfortas run for {name}"));
+
+        let standalone_compile = compile_with_driver(
+            &armfortas,
+            &source,
+            &standalone_bin,
+            &[
+                ("AFS_AS_PATH", &afs_as),
+                ("AFS_LD_PATH", &afs_ld),
+                ("AFS_RUNTIME_PATH", &runtime),
+                ("AFS_LIBSYSTEM_TBD", &libsystem),
+            ],
+            &format!("standalone armfortas compile for {name}"),
+        );
+        assert_success(
+            &standalone_compile,
+            &format!("standalone armfortas compile for {name}"),
+        );
+        let standalone_run =
+            run_binary(&standalone_bin, &format!("standalone armfortas run for {name}"));
+
+        let default_stdout = String::from_utf8_lossy(&default_run.stdout);
+        let standalone_stdout = String::from_utf8_lossy(&standalone_run.stdout);
+        let default_stderr = String::from_utf8_lossy(&default_run.stderr);
+        let standalone_stderr = String::from_utf8_lossy(&standalone_run.stderr);
+
+        assert_eq!(
+            standalone_stdout, default_stdout,
+            "driver override stdout diverged from default driver for {name}"
+        );
+        assert_eq!(
+            standalone_stderr, default_stderr,
+            "driver override stderr diverged from default driver for {name}"
+        );
+        assert!(
+            standalone_stdout.contains(needle),
+            "driver override output for {name} missing '{needle}': {}",
+            standalone_stdout
+        );
+    }
 }
