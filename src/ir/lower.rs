@@ -9322,7 +9322,7 @@ fn callee_character_return_abi(st: &SymbolTable, callee_name: &str) -> Option<Ch
     use crate::sema::symtab::{SymbolKind, TypeInfo};
 
     let key = callee_name.to_ascii_lowercase();
-    let sym = st.scopes.iter().find_map(|scope| scope.symbols.get(&key))?;
+    let sym = st.find_symbol_any_scope(&key)?;
     match sym.kind {
         SymbolKind::Function
         | SymbolKind::ExternalProc
@@ -9887,6 +9887,30 @@ fn lower_string_expr_full(
                             return load_string_descriptor_view(b, desc);
                         }
                     }
+                }
+                if internal_funcs.is_some_and(|funcs| funcs.contains_key(&key)) {
+                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32));
+                    let zero_i32 = b.const_i32(0);
+                    let size32 = b.const_i64(32);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![desc, zero_i32, size32],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    emit_named_function_call(
+                        b,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                        name,
+                        args,
+                        Some(desc),
+                        IrType::Void,
+                    );
+                    return load_string_descriptor_view(b, desc);
                 }
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
@@ -15120,8 +15144,7 @@ fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &crate::ast::ex
     let is_char = expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
 
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-        let (ptr, len) =
-            lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
+        let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
         b.call(
             FuncRef::External("afs_fmt_push_string".into()),
             vec![ptr, len],
