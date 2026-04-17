@@ -1623,6 +1623,80 @@ fn named_len_char_component_substring_and_trim_compile() {
 }
 
 #[test]
+fn fixed_char_component_assigns_into_char_array_element() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: max_token_len = 16\n  type :: token_t\n    character(len=max_token_len) :: value\n    logical :: quoted = .false.\n    logical :: escaped = .false.\n    integer :: quote_type = 0\n    integer :: value_length = 0\n  end type token_t\n  type(token_t) :: tok\n  character(len=max_token_len) :: words(1)\n  tok%value = 'echo'\n  words(1) = tok%value\n  if (trim(words(1)) /= 'echo') error stop 1\n  print *, trim(words(1))\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_component_array_store", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char component array store compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char component array store compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char component array store run failed");
+    assert!(
+        run.status.success(),
+        "fixed char component array store run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo"),
+        "unexpected fixed char component array store output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_component_actual_to_intent_out_dummy_updates_field() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: state_t\n    integer :: num_tokens = 0\n  end type state_t\n  type(state_t) :: state\n  call set_num(state%num_tokens)\n  if (state%num_tokens /= 2) error stop 1\n  print *, state%num_tokens\ncontains\n  subroutine set_num(n)\n    integer, intent(out) :: n\n    n = 2\n  end subroutine set_num\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("component_intent_out", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component intent(out) compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component intent(out) compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("component intent(out) run failed");
+    assert!(
+        run.status.success(),
+        "component intent(out) run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('2'),
+        "unexpected component intent(out) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_derived_array_global_component_access_compiles() {
     let dir = unique_dir("derived_array_global");
     let dep = write_program_in(
@@ -4454,6 +4528,181 @@ fn derived_local_with_allocatable_component_and_trailing_scalar_runs() {
     assert!(
         stdout.contains("ok"),
         "unexpected derived local allocatable component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_array_component_passes_descriptor_to_dummy() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: xs(:)\n  end type\n  type(box_t) :: box\n  allocate(box%xs(3))\n  box%xs = [1, 2, 3]\n  call check(box%xs)\n  print *, 'ok'\ncontains\n  subroutine check(xs)\n    integer, intent(in) :: xs(:)\n    if (size(xs) /= 3) error stop 1\n    if (xs(2) /= 2) error stop 2\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_descriptor_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable component descriptor compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable component descriptor program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable component descriptor program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable component descriptor output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_array_dummy_uses_real_element_stride() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: max_token_len = 16\n  type :: token_t\n    integer :: token_type\n    character(len=max_token_len) :: value\n    integer :: value_length = 0\n    integer :: start_pos = 0\n    integer :: end_pos = 0\n    integer :: line = 1\n    logical :: quoted = .false.\n    logical :: escaped = .false.\n    integer :: quote_type = 0\n  end type token_t\ncontains\n  subroutine add_token(tokens, num_tokens, tok_type, value)\n    type(token_t), intent(inout) :: tokens(:)\n    integer, intent(inout) :: num_tokens\n    integer, intent(in) :: tok_type\n    character(len=*), intent(in) :: value\n    if (num_tokens < size(tokens)) then\n      num_tokens = num_tokens + 1\n      tokens(num_tokens)%token_type = tok_type\n      tokens(num_tokens)%value = value\n      tokens(num_tokens)%value_length = len_trim(value)\n    end if\n  end subroutine add_token\nend module m\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  integer :: num_tokens\n  allocate(tokens(4))\n  num_tokens = 0\n  call add_token(tokens, num_tokens, 1, 'echo')\n  call add_token(tokens, num_tokens, 2, 'ok')\n  if (num_tokens /= 2) error stop 1\n  if (tokens(1)%token_type /= 1) error stop 2\n  if (trim(tokens(1)%value) /= 'echo') error stop 3\n  if (tokens(1)%value_length /= 4) error stop 4\n  if (tokens(2)%token_type /= 2) error stop 5\n  if (trim(tokens(2)%value) /= 'ok') error stop 6\n  if (tokens(2)%value_length /= 2) error stop 7\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_dummy_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array dummy stride compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "derived array dummy stride program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "derived array dummy stride program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived array dummy stride output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_substring_actual_passes_runtime_len_to_len_star_dummy() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: s\n  integer :: n\n  s = 'echo'\n  n = 4\n  call check(s(1:n))\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    character(len=*), intent(in) :: value\n    if (len(value) /= 4) error stop 1\n    if (trim(value) /= 'echo') error stop 2\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("scalar_substring_len_star_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar substring len-star dummy compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "scalar substring len-star dummy program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "scalar substring len-star dummy program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected scalar substring len-star dummy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn parameter_actual_to_by_ref_dummy_materializes_temp_slot() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: eof_token = 6\n  call check(eof_token)\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    integer, intent(in) :: value\n    if (value /= 6) error stop 1\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("parameter_by_ref_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parameter by-ref dummy compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "parameter by-ref dummy program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "parameter by-ref dummy program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected parameter by-ref dummy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_function_result_can_forward_other_pointer_call() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  function make_node(n) result(node)\n    integer, intent(in) :: n\n    type(node_t), pointer :: node\n    allocate(node)\n    node%value = n\n  end function make_node\n\n  function forward_node(n) result(node)\n    integer, intent(in) :: n\n    type(node_t), pointer :: node\n    node => make_node(n)\n  end function forward_node\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  root => forward_node(42)\n  if (.not. associated(root)) error stop 1\n  if (root%value /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_result_forwarding", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer result forwarding compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer result forwarding should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer result forwarding should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer result forwarding output: {}",
         stdout
     );
 
