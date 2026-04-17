@@ -16,6 +16,18 @@ fn emit_i128_words(out: &mut String, value: i128) {
     writeln!(out, "    .quad 0x{:016x}", hi).unwrap();
 }
 
+fn byte_array_align_log2(byte_count: u64) -> u8 {
+    if byte_count >= 8 {
+        3
+    } else if byte_count >= 4 {
+        2
+    } else if byte_count >= 2 {
+        1
+    } else {
+        0
+    }
+}
+
 /// Emit module-level globals as a `.section __DATA,__data` block.
 /// Each global gets a label and a directive matching its type
 /// (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
@@ -61,7 +73,9 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         // `.single` / `.double` all work correctly.
         if let IrType::Array(elem_ty, count) = &g.ty {
             let (align, directive, elem_bytes, is_float) = match elem_ty.as_ref() {
-                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte", 1, false),
+                IrType::Int(IntWidth::I8) | IrType::Bool => {
+                    (byte_array_align_log2(*count), ".byte", 1, false)
+                }
                 IrType::Int(IntWidth::I16) => (1, ".short", 2, false),
                 IrType::Int(IntWidth::I32) => (2, ".long", 4, false),
                 IrType::Int(IntWidth::I64) => (3, ".quad", 8, false),
@@ -1182,6 +1196,21 @@ mod tests {
         assert!(
             asm.contains(".quad 0xffffffffffffffff\n    .quad 0xffffffffffffffff"),
             "negative i128 array element should preserve two's-complement words:\n{}",
+            asm
+        );
+    }
+
+    #[test]
+    fn emit_byte_array_global_uses_natural_alignment() {
+        let asm = emit_globals(&[Global {
+            name: "history".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 400),
+            initializer: Some(GlobalInit::Zero),
+        }]);
+
+        assert!(
+            asm.contains(".p2align 3\n_history:"),
+            "byte-array globals that model descriptors/derived storage need 8-byte alignment:\n{}",
             asm
         );
     }

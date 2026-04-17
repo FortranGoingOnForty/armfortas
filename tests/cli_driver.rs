@@ -4357,6 +4357,111 @@ fn contained_subroutine_forwards_derived_dummy_by_ref() {
 }
 
 #[test]
+fn default_integer_system_clock_runs_without_runtime_abi_crash() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: count, rate, max_count\n  call system_clock(count, rate, max_count)\n  if (rate == 0) error stop 1\n  if (max_count == 0) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("system_clock_default_integer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("default integer system_clock compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "default integer system_clock should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "default integer system_clock should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected default integer system_clock output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
+    let src = write_program(
+        "module m\n  implicit none\n  logical, save :: flag1 = .false.\n  logical, save :: flag2 = .false.\n  logical, save :: flag3 = .false.\n  type :: history_t\n    character(len=16), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(4))\n      history%lines = ''\n      history%count = 1\n      history%initialized = .true.\n    end if\n    print *, history%count, size(history%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  call init_history()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("saved_derived_global_alignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved derived global alignment compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "saved derived global alignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "saved derived global alignment should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1 4") || stdout.contains("1  4"),
+        "unexpected saved derived global alignment output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_local_with_allocatable_component_and_trailing_scalar_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: t\n    integer, allocatable :: a(:)\n    integer :: n\n  end type\n  type(t) :: x\n  allocate(x%a(1))\n  x%n = 7\n  x%a(1) = 17\n  if (.not. allocated(x%a)) stop 1\n  if (size(x%a) /= 1) stop 2\n  if (x%n /= 7) stop 3\n  if (x%a(1) /= 17) stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_local_alloc_comp_scalar_tail", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived local allocatable component compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "derived local allocatable component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "derived local allocatable component should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived local allocatable component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_character_pointer_function_result_compiles_and_runs() {
     let src = write_program(
         "module m\ncontains\n  function maybe_ptr(flag) result(ptr)\n    logical, intent(in) :: flag\n    character(:), pointer :: ptr\n    character(len=4), target, save :: pool = 'okay'\n    if (flag) then\n      ptr => pool(1:4)\n    else\n      ptr => null()\n    end if\n  end function maybe_ptr\nend module m\n\nprogram p\n  use m, only: maybe_ptr\n  implicit none\n  character(len=:), allocatable :: s\n  s = maybe_ptr(.true.)\n  if (s /= 'okay') error stop 1\n  print *, trim(s)\nend program p\n",

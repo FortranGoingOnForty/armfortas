@@ -4932,6 +4932,13 @@ fn alloc_decls(
                         let arr_ty =
                             IrType::Array(Box::new(array_elem_ty.clone()), total_size as u64);
                         let addr = b.alloca(arr_ty);
+                        if let Some(ref type_name) = array_derived_type {
+                            if let Some(layout) = type_layouts.get(type_name) {
+                                if derived_layout_needs_runtime_zero_init(layout) {
+                                    zero_fill_bytes(b, addr, total_bytes);
+                                }
+                            }
+                        }
                         locals.insert(
                             key,
                             LocalInfo {
@@ -4955,6 +4962,13 @@ fn alloc_decls(
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let addr = b.alloca(struct_ty);
+                        if derived_layout_needs_runtime_zero_init(layout) {
+                            // Embedded allocatable/pointer components are runtime
+                            // descriptors or slots and must begin life in the
+                            // null/unallocated state before any ALLOCATE or
+                            // ASSOCIATED query touches them.
+                            zero_fill_bytes(b, addr, layout.size as i64);
+                        }
                         // Store the derived type name in the ty field for component access lookup.
                         // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
                         locals.insert(
@@ -7989,6 +8003,13 @@ fn lower_intrinsic_subroutine(
     name: &str,
     args: &[crate::ast::expr::Argument],
 ) -> bool {
+    #[derive(Clone)]
+    struct RuntimeOutWriteback {
+        dest_ptr: ValueId,
+        dest_ty: IrType,
+        tmp_ptr: ValueId,
+    }
+
     /// Helper: get the nth positional arg as a by-ref pointer, or null if absent.
     fn nth_arg_ref(
         b: &mut FuncBuilder,
@@ -8051,6 +8072,39 @@ fn lower_intrinsic_subroutine(
         }
         let z = b.const_i64(0);
         (z, z)
+    }
+
+    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
+    /// through an i64 slot. Non-i64 destinations get a temporary i64
+    /// alloca followed by an explicit writeback after the runtime call.
+    fn nth_arg_i64_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[crate::ast::expr::Argument],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        if n < args.len() {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+                let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
+                if let Some(IrType::Ptr(inner)) = b.func().value_type(dest_ptr) {
+                    let dest_ty = (*inner).clone();
+                    if dest_ty == IrType::Int(IntWidth::I64) {
+                        return (dest_ptr, None);
+                    }
+                    let tmp_ptr = b.alloca(IrType::Int(IntWidth::I64));
+                    return (
+                        tmp_ptr,
+                        Some(RuntimeOutWriteback {
+                            dest_ptr,
+                            dest_ty,
+                            tmp_ptr,
+                        }),
+                    );
+                }
+                return (dest_ptr, None);
+            }
+        }
+        (b.const_i64(0), None)
     }
 
     fn move_alloc_target(
@@ -8141,14 +8195,22 @@ fn lower_intrinsic_subroutine(
         }
         "system_clock" => {
             // call system_clock(count, count_rate, count_max) — all optional
-            let count = nth_arg_ref(b, ctx, args, 0);
-            let rate = nth_arg_ref(b, ctx, args, 1);
-            let max = nth_arg_ref(b, ctx, args, 2);
+            let (count, count_writeback) = nth_arg_i64_out(b, ctx, args, 0);
+            let (rate, rate_writeback) = nth_arg_i64_out(b, ctx, args, 1);
+            let (max, max_writeback) = nth_arg_i64_out(b, ctx, args, 2);
             b.call(
                 FuncRef::External("afs_system_clock".into()),
                 vec![count, rate, max],
                 IrType::Void,
             );
+            for writeback in [count_writeback, rate_writeback, max_writeback]
+                .into_iter()
+                .flatten()
+            {
+                let raw = b.load(writeback.tmp_ptr);
+                let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+                b.store(coerced, writeback.dest_ptr);
+            }
             true
         }
         "cpu_time" => {
@@ -18137,6 +18199,26 @@ fn type_info_to_storage_ir_type(
         }
     }
     type_info_to_ir_type(ti)
+}
+
+fn derived_layout_needs_runtime_zero_init(layout: &crate::sema::type_layout::TypeLayout) -> bool {
+    layout
+        .fields
+        .iter()
+        .any(|field| field.allocatable || field.pointer)
+}
+
+fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
+    if bytes <= 0 {
+        return;
+    }
+    let zero = b.const_i32(0);
+    let size = b.const_i64(bytes);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![addr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
 }
 
 fn lower_fixed_component_array_element_ptr(
