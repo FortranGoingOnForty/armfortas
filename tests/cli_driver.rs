@@ -4252,6 +4252,41 @@ fn runtime_sized_character_function_result_compiles_and_runs() {
 }
 
 #[test]
+fn formatted_write_of_concat_string_runs() {
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: output_unit\n  implicit none\n  write(output_unit, '(a)') 'fortsh ' // '1.7.0'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_concat_write", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted concat write compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted concat write should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted concat write should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("fortsh 1.7.0"),
+        "unexpected formatted concat write output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_character_pointer_function_result_compiles_and_runs() {
     let src = write_program(
         "module m\ncontains\n  function maybe_ptr(flag) result(ptr)\n    logical, intent(in) :: flag\n    character(:), pointer :: ptr\n    character(len=4), target, save :: pool = 'okay'\n    if (flag) then\n      ptr => pool(1:4)\n    else\n      ptr => null()\n    end if\n  end function maybe_ptr\nend module m\n\nprogram p\n  use m, only: maybe_ptr\n  implicit none\n  character(len=:), allocatable :: s\n  s = maybe_ptr(.true.)\n  if (s /= 'okay') error stop 1\n  print *, trim(s)\nend program p\n",

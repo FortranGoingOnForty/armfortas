@@ -15117,30 +15117,7 @@ fn lower_formatted_read_items(
 
 /// Push a single I/O item value for formatted output via afs_fmt_push_*.
 fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &crate::ast::expr::SpannedExpr) {
-    let is_char = match &item.node {
-        Expr::Name { name } => ctx
-            .locals
-            .get(&name.to_lowercase())
-            .map(|i| i.char_kind != CharKind::None)
-            .unwrap_or(false),
-        Expr::FunctionCall { callee, .. } => {
-            if let Expr::Name { name } = &callee.node {
-                matches!(
-                    name.to_lowercase().as_str(),
-                    "trim"
-                        | "adjustl"
-                        | "adjustr"
-                        | "char"
-                        | "achar"
-                        | "compiler_version"
-                        | "compiler_options"
-                )
-            } else {
-                false
-            }
-        }
-        _ => false,
-    };
+    let is_char = expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
 
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
         let (ptr, len) =
