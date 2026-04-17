@@ -284,6 +284,28 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
 }
 
+fn fmt_stack_alloc(frame_size: i64) -> String {
+    // Apple Silicon uses large guard pages, so jumping the stack pointer
+    // down by a huge frame in one shot can skip the guard and fault on the
+    // first real touch. Probe the stack one chunk at a time for large
+    // frames to keep growth fault-safe.
+    const STACK_PROBE_STRIDE: i64 = 16 * 1024;
+
+    if frame_size <= STACK_PROBE_STRIDE {
+        return fmt_sp_imm("sub", "sp", "sp", frame_size);
+    }
+
+    let mut lines = Vec::new();
+    let mut remaining = frame_size;
+    while remaining > 0 {
+        let step = remaining.min(STACK_PROBE_STRIDE);
+        lines.push(fmt_sp_imm("sub", "sp", "sp", step));
+        lines.push("str xzr, [sp]".to_string());
+        remaining -= step;
+    }
+    lines.join("\n    ")
+}
+
 fn fmt_u64_imm(reg: &str, value: u64) -> String {
     let mut parts = Vec::new();
     for shift in [0u32, 16, 32, 48] {
@@ -757,15 +779,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let frame_size = mf.frame.size as i64;
             let stp_offset = frame_size - 16;
             // The `sub sp, sp, #N` portion handles N > 4095 via
-            // x16 synthesis (audit6 BLOCKING-5 root cause). The
-            // `stp ... [sp, #stp_offset]` form is also bounded
+            // x16 synthesis (audit6 BLOCKING-5 root cause), and
+            // probes very large frames so macOS guard pages aren't
+            // skipped in one jump. The `stp ... [sp, #stp_offset]`
+            // form is also bounded
             // (signed 7-bit immediate * 8 = ±504 byte range), so
             // we fall back to two `str` instructions when over.
             // For very large frames (stp_offset > 32760, the
             // signed 12-bit max for 64-bit ldr/str unsigned imm),
             // we'd need a register-form load/store — not yet
             // exercised in any test, so the panic catches it.
-            let sub_sp = fmt_sp_imm("sub", "sp", "sp", frame_size);
+            let sub_sp = fmt_stack_alloc(frame_size);
             if stp_offset <= 504 {
                 format!("{}\n    stp x29, x30, [sp, #{}]", sub_sp, stp_offset)
             } else if stp_offset <= 32760 {
@@ -1117,6 +1141,21 @@ mod tests {
         assert!(
             !asm.contains("sub sp, sp, #5"),
             "should not emit out-of-range immediate: {}",
+            asm
+        );
+    }
+
+    #[test]
+    fn emit_huge_frame_with_stack_probes() {
+        let asm = emit_simple(|b| {
+            for _ in 0..3000 {
+                let _ = b.alloca(IrType::Int(IntWidth::I64));
+            }
+            b.ret_void();
+        });
+        assert!(
+            asm.contains("str xzr, [sp]"),
+            "huge frame should probe each chunk: {}",
             asm
         );
     }
