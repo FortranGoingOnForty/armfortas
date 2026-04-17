@@ -5828,6 +5828,7 @@ fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(Valu
                 let ptr = b.gep(base, vec![zero], IrType::Int(IntWidth::I8));
                 Some((ptr, b.const_i64(len)))
             } else if info.by_ref
+                && info.derived_type.is_none()
                 && matches!(
                     info.ty,
                     IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
@@ -10967,7 +10968,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
-
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
                     let procptr_target =
@@ -18817,6 +18817,7 @@ fn lower_char_arg_by_ref(
                 return None;
             }
             if info.by_ref
+                && info.derived_type.is_none()
                 && info.char_kind == CharKind::None
                 && matches!(
                     info.ty,
