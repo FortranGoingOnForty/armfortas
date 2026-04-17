@@ -1374,10 +1374,19 @@ _main:
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
     let phase = phases.start("assemble");
-    let as_result = Command::new("as")
-        .args(["-o", obj_path.to_str().unwrap(), asm_path.to_str().unwrap()])
-        .output()
-        .map_err(|e| format!("cannot run assembler: {}", e))?;
+    let as_result = if let Some(assembler) = env_override("AFS_AS_PATH") {
+        Command::new(assembler)
+            .arg(&asm_path)
+            .arg("-o")
+            .arg(&obj_path)
+            .output()
+            .map_err(|e| format!("cannot run assembler: {}", e))?
+    } else {
+        Command::new("as")
+            .args(["-o", obj_path.to_str().unwrap(), asm_path.to_str().unwrap()])
+            .output()
+            .map_err(|e| format!("cannot run assembler: {}", e))?
+    };
     phase.end(&mut phases);
 
     if !as_result.status.success() {
@@ -1455,6 +1464,10 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 /// Link prebuilt objects and archives with the runtime to produce a
 /// binary or shared library, preserving the user-supplied input order.
 fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+    if let Some(linker) = env_override("AFS_LD_PATH") {
+        return link_inputs_with_afs_ld(&linker, inputs, output, opts);
+    }
+
     let rt_path = find_runtime_lib()?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
@@ -1489,6 +1502,59 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
     Ok(())
 }
 
+fn link_inputs_with_afs_ld(
+    linker: &str,
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+) -> Result<(), String> {
+    if opts.shared {
+        return Err("AFS_LD_PATH override does not yet support shared-library links".into());
+    }
+    if !opts.library_search_paths.is_empty() {
+        return Err("AFS_LD_PATH override does not yet support -L search paths".into());
+    }
+    if !opts.link_libs.is_empty() {
+        return Err("AFS_LD_PATH override does not yet support -l linker inputs".into());
+    }
+    if !opts.rpath.is_empty() {
+        return Err("AFS_LD_PATH override does not yet support -rpath".into());
+    }
+    if opts.static_link {
+        return Err("AFS_LD_PATH override does not yet support static-link mode".into());
+    }
+
+    let rt_path = find_runtime_lib()?;
+    let libsystem_tbd = find_libsystem_tbd()?;
+    let mut args: Vec<String> = vec![
+        "-arch".into(),
+        "arm64".into(),
+        "-e".into(),
+        "_main".into(),
+        "-o".into(),
+        output.to_string_lossy().into_owned(),
+    ];
+    for input in inputs {
+        args.push(input.to_string_lossy().into_owned());
+    }
+    args.push(rt_path);
+    args.push(libsystem_tbd);
+
+    let output = Command::new(linker)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot run linker: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "linker failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
 /// Append the user-supplied linker flags from `opts` to `args`.
 /// `-L<dir>` and `-l<name>` map directly; `-rpath` is passed as a
 /// pair; `-shared` switches output type; `-static` discourages
@@ -1513,6 +1579,13 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         // intent visible without breaking link.
         args.push("-search_paths_first".into());
     }
+}
+
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Link multiple object files with the runtime to produce a binary.
@@ -1695,6 +1768,37 @@ fn find_runtime_lib() -> Result<String, String> {
          binary, and /usr/local/lib. Build with \
          'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
         .into())
+}
+
+fn find_libsystem_tbd() -> Result<String, String> {
+    if let Some(path) = env_override("AFS_LIBSYSTEM_TBD") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "AFS_LIBSYSTEM_TBD points to missing path '{}'",
+            p.display()
+        ));
+    }
+
+    let sdk = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    if !sdk.status.success() {
+        return Err(format!(
+            "xcrun failed:\n{}",
+            String::from_utf8_lossy(&sdk.stderr)
+        ));
+    }
+    let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+    let tbd = PathBuf::from(&sysroot).join("usr/lib/libSystem.tbd");
+    if tbd.exists() {
+        Ok(tbd.to_string_lossy().into_owned())
+    } else {
+        Err(format!("cannot find libSystem.tbd at '{}'", tbd.display()))
+    }
 }
 
 fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
