@@ -91,6 +91,12 @@ fn run_binary(path: &Path, context: &str) -> Output {
     output
 }
 
+fn file_description(path: &Path, context: &str) -> String {
+    let output = run_command(Command::new("file").arg(path), context);
+    assert_success(&output, context);
+    String::from_utf8(output.stdout).expect("file output is utf-8")
+}
+
 fn compile_with_driver(
     driver: &Path,
     source: &Path,
@@ -273,6 +279,63 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
 }
 
 #[test]
+fn hello_world_compiles_to_object_with_standalone_assembler_override() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(afs_ld) = binary("afs-ld") else {
+        eprintln!("skipping: afs-ld binary not built");
+        return;
+    };
+
+    let source = workspace_root().join("test_programs/hello.f90");
+    assert!(source.exists(), "hello.f90 missing at {}", source.display());
+
+    let dir = unique_dir("driver_standalone_hello_obj");
+    let default_obj = dir.join("hello-default.o");
+    let standalone_obj = dir.join("hello-standalone.o");
+
+    let default_compile = run_command(
+        Command::new(&armfortas)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&default_obj),
+        "default armfortas -c",
+    );
+    assert_success(&default_compile, "default armfortas -c");
+
+    let standalone_compile = run_command(
+        Command::new(&armfortas)
+            .env("AFS_AS_PATH", &afs_as)
+            .env("AFS_LD_PATH", &afs_ld)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&standalone_obj),
+        "standalone armfortas -c",
+    );
+    assert_success(&standalone_compile, "standalone armfortas -c");
+
+    let default_file = file_description(&default_obj, "file default hello object");
+    let standalone_file = file_description(&standalone_obj, "file standalone hello object");
+
+    assert!(
+        default_file.contains("Mach-O 64-bit object arm64"),
+        "unexpected default object shape: {default_file}"
+    );
+    assert!(
+        standalone_file.contains("Mach-O 64-bit object arm64"),
+        "unexpected standalone object shape: {standalone_file}"
+    );
+}
+
+#[test]
 fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
     let Some(armfortas) = binary("armfortas") else {
         eprintln!("skipping: armfortas binary not built");
@@ -299,6 +362,7 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
     let cases = [
         ("arithmetic.f90", "30"),
         ("if_else.f90", "positive"),
+        ("negative_step.f90", "5"),
         ("real_function.f90", "6.28"),
     ];
 
