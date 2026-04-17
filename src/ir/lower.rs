@@ -1823,6 +1823,14 @@ fn collect_module_globals(
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
     let param_consts = collect_decl_param_consts(decls);
+    let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    for decl in decls {
+        if let Decl::ParameterStmt { pairs } = &decl.node {
+            for (name, expr) in pairs {
+                parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+    }
     for decl in decls {
         if let Decl::TypeDecl {
             type_spec,
@@ -1844,6 +1852,7 @@ fn collect_module_globals(
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let is_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
             let global_char_kind = match type_spec {
                 TypeSpec::Character(Some(sel)) => match &sel.len {
                     Some(crate::ast::decl::LenSpec::Expr(e)) => {
@@ -1859,11 +1868,13 @@ fn collect_module_globals(
                 _ => CharKind::None,
             };
             for entity in entities {
-                let symbol = format!(
-                    "afs_mod_{}_{}",
-                    mod_name.to_lowercase(),
-                    entity.name.to_lowercase()
-                );
+                let key = entity.name.to_lowercase();
+                let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
+                let init_expr = entity
+                    .init
+                    .as_ref()
+                    .or_else(|| parameter_inits.get(&key).copied());
+                let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
@@ -1979,7 +1990,7 @@ fn collect_module_globals(
                     // Per F2018 §7.4.4, the initializer's shape
                     // must conform with the variable's declared
                     // shape; over-long is a hard error.
-                    if let Some(init_e) = &entity.init {
+                    if let Some(init_e) = init_expr {
                         if let Some(scalars) =
                             collect_const_array_scalars(init_e, &ir_ty, &param_consts)
                         {
@@ -2001,9 +2012,7 @@ fn collect_module_globals(
                         }
                     }
 
-                    let init = entity
-                        .init
-                        .as_ref()
+                    let init = init_expr
                         .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts));
                     module.add_global(Global {
                         name: symbol.clone(),
@@ -2077,10 +2086,18 @@ fn collect_module_globals(
                             continue;
                         }
                     }
-                    let init = entity
-                        .init
-                        .as_ref()
-                        .and_then(|e| eval_const_global_init(e, &param_consts, Some(&ir_ty)));
+                    let init = init_expr.and_then(|e| {
+                        if is_parameter {
+                            eval_const_global_init_with_any_scope(
+                                e,
+                                &param_consts,
+                                Some(&ir_ty),
+                                st,
+                            )
+                        } else {
+                            eval_const_global_init(e, &param_consts, Some(&ir_ty))
+                        }
+                    });
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -3391,6 +3408,24 @@ fn eval_const_global_init(
     target: Option<&IrType>,
 ) -> Option<GlobalInit> {
     eval_const_scalar(e, param_consts).map(|raw| {
+        let clamped = match target {
+            Some(t) => clamp_const_to_type(raw, t),
+            None => raw,
+        };
+        match clamped {
+            ConstScalar::Int(i) => GlobalInit::Int(i),
+            ConstScalar::Float(f) => GlobalInit::Float(f),
+        }
+    })
+}
+
+fn eval_const_global_init_with_any_scope(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    target: Option<&IrType>,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    eval_const_scalar_with_any_scope(e, param_consts, st).map(|raw| {
         let clamped = match target {
             Some(t) => clamp_const_to_type(raw, t),
             None => raw,

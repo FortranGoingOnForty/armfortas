@@ -340,6 +340,121 @@ fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
 }
 
 #[test]
+fn module_parameter_alias_from_used_module_initializes_global() {
+    let dir = unique_dir("module_param_alias_init");
+    let cfg_src = write_program_in(
+        &dir,
+        "cfg.f90",
+        "module cfg\n  implicit none\n  integer, parameter :: base = 7\nend module cfg\n",
+    );
+    let m_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  use cfg, only: base\n  implicit none\n  integer, parameter :: alias = base\ncontains\n  function get_alias() result(v)\n    integer :: v\n    v = alias\n  end function get_alias\nend module m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: get_alias\n  implicit none\n  if (get_alias() /= 7) error stop 1\n  print *, get_alias()\nend program p\n",
+    );
+
+    let cfg_obj = dir.join("cfg.o");
+    let compile_cfg = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            cfg_src.to_str().unwrap(),
+            "-o",
+            cfg_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cfg compile failed to spawn");
+    assert!(
+        compile_cfg.status.success(),
+        "cfg module should compile: {}",
+        String::from_utf8_lossy(&compile_cfg.stderr)
+    );
+
+    let m_obj = dir.join("m.o");
+    let compile_m = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            m_src.to_str().unwrap(),
+            "-o",
+            m_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("m compile failed to spawn");
+    assert!(
+        compile_m.status.success(),
+        "module alias should compile: {}",
+        String::from_utf8_lossy(&compile_m.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("module_param_alias_init.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            cfg_obj.to_str().unwrap(),
+            m_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "module alias objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "module alias binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('7'),
+        "module alias parameter should preserve imported constant value: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_param_char_dummy_element_assignment_runs() {
     let dir = unique_dir("imported_param_char_dummy");
     let cfg_src = write_program_in(
