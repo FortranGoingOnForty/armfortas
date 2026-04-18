@@ -17696,9 +17696,12 @@ fn lower_array_expr_descriptor(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<(ValueId, IrType)> {
     match &expr.node {
-        Expr::ParenExpr { inner } => lower_array_expr_descriptor(b, locals, inner, st),
+        Expr::ParenExpr { inner } => {
+            lower_array_expr_descriptor(b, locals, inner, st, type_layouts)
+        }
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             if local_is_array_like(info) {
@@ -17712,18 +17715,37 @@ fn lower_array_expr_descriptor(
                 None
             }
         }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let info = component_array_local_info(b, locals, expr, st, tl)?;
+            if local_is_array_like(&info) {
+                let desc = if local_uses_array_descriptor(&info) {
+                    array_descriptor_addr(b, &info)
+                } else {
+                    materialize_array_descriptor_for_info(b, &info)
+                };
+                Some((desc, info.ty.clone()))
+            } else {
+                None
+            }
+        }
         Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
-                return None;
+            let info = match &callee.node {
+                Expr::Name { name } => locals.get(&name.to_lowercase()).cloned(),
+                Expr::ComponentAccess { .. } => {
+                    let tl = type_layouts?;
+                    component_array_local_info(b, locals, callee, st, tl)
+                }
+                _ => None,
             };
-            let info = locals.get(&name.to_lowercase())?;
-            if local_is_array_like(info)
+            let info = info?;
+            if local_is_array_like(&info)
                 && args.iter().any(|arg| {
                     matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
                 })
             {
                 Some((
-                    lower_array_section(b, locals, info, args, st),
+                    lower_array_section(b, locals, &info, args, st),
                     info.ty.clone(),
                 ))
             } else {
@@ -17757,7 +17779,8 @@ fn lower_1d_section_assign(
         IrType::Int(IntWidth::I64),
     );
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let src_desc = lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st);
+    let src_desc =
+        lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
@@ -18147,7 +18170,8 @@ fn lower_array_assign(
         );
         let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
         let dest_elem_len = descriptor_elem_size(b, dest_desc);
-        let src_desc = lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st);
+        let src_desc =
+            lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
         let src_n = src_desc.as_ref().map(|(desc, _)| {
             b.call(
                 FuncRef::External("afs_array_size".into()),
