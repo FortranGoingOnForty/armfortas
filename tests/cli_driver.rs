@@ -2430,6 +2430,117 @@ fn allocatable_derived_shell_initialization_runs_through_components() {
 }
 
 #[test]
+fn allocatable_scalar_derived_type_preserves_field_defaults_on_allocate() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: shell_t\n    integer :: ifs_len = -1\n    integer :: other = 7\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  if (shell%ifs_len /= -1) error stop 1\n  if (shell%other /= 7) error stop 2\n  print *, shell%ifs_len, shell%other\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_scalar_derived_defaults", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable scalar derived defaults compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable scalar derived defaults compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable scalar derived defaults run failed");
+    assert!(
+        run.status.success(),
+        "allocatable scalar derived defaults run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("-1") && stdout.contains("7"),
+        "allocatable scalar derived defaults should survive allocate(): {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_shell_default_ifs_follows_trim_branch() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: shell_t\n    integer :: ifs_len = -1\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  character(len=32) :: input_line\n  character(len=32) :: var\n  integer :: actual_input_len\n\n  allocate(shell)\n\n  input_line = 'hello\\\\world '\n  actual_input_len = 12\n  if (shell%ifs_len == 0) then\n    var = input_line(:actual_input_len)\n  else\n    var = trim(adjustl(input_line))\n  end if\n  if (trim(var) /= 'hello\\\\world') error stop 1\n\n  input_line = '  x  '\n  actual_input_len = 5\n  if (shell%ifs_len == 0) then\n    var = input_line(:actual_input_len)\n  else\n    var = trim(adjustl(input_line))\n  end if\n  if (trim(var) /= 'x') error stop 2\n\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_shell_default_ifs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable shell default ifs compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable shell default ifs compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable shell default ifs run failed");
+    assert!(
+        run.status.success(),
+        "allocatable shell default ifs run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "allocatable shell default ifs should take trim branch: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_array_section_actual_preserves_bounds_and_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: str\n  end type\n  type :: var_t\n    type(string_t), allocatable :: array_values(:)\n    integer :: array_size = 0\n  end type\n  type :: shell_t\n    type(var_t) :: variables(4)\n    integer :: num_variables = 0\n  end type\n  type(string_t), allocatable :: values(:)\n  type(shell_t) :: shell\n  integer :: count\n\n  allocate(values(20))\n  count = 3\n  values(1)%str = 'a'\n  values(2)%str = 'b'\n  values(3)%str = 'c'\n  call set_array_variable_string_t(shell, values(1:count), count)\n  if (.not. allocated(shell%variables(1)%array_values)) error stop 1\n  if (size(shell%variables(1)%array_values) /= 3) error stop 2\n  if (trim(shell%variables(1)%array_values(1)%str) /= 'a') error stop 3\n  if (trim(shell%variables(1)%array_values(2)%str) /= 'b') error stop 4\n  if (trim(shell%variables(1)%array_values(3)%str) /= 'c') error stop 5\n  print *, trim(shell%variables(1)%array_values(1)%str), trim(shell%variables(1)%array_values(2)%str), trim(shell%variables(1)%array_values(3)%str)\ncontains\n  subroutine set_array_variable_string_t(shell, values, count)\n    type(shell_t), intent(inout) :: shell\n    type(string_t), intent(in) :: values(:)\n    integer, intent(in) :: count\n    integer :: k\n    allocate(shell%variables(1)%array_values(count))\n    do k = 1, count\n      shell%variables(1)%array_values(k)%str = values(k)%str\n    end do\n    shell%variables(1)%array_size = count\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_section_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array section actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array section actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived array section actual run failed");
+    assert!(
+        run.status.success(),
+        "derived array section actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("a") && stdout.contains("b") && stdout.contains("c"),
+        "derived array section actual should preserve section bounds and contents: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_derived_shell_initialization_survives_large_component_offsets() {
     let src = write_program(
         "program p\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    integer :: pad(50000) = 0\n    type(string_t), allocatable :: local_vars(:,:)\n    integer, allocatable :: local_var_counts(:)\n    type(string_t), allocatable :: positional_params(:)\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  call initialize_shell(shell)\n  if (.not. allocated(shell%local_vars)) stop 10\n  if (.not. allocated(shell%local_var_counts)) stop 11\n  if (.not. allocated(shell%positional_params)) stop 12\n  if (shell%local_var_counts(1) /= 1) stop 13\n  print *, trim(shell%positional_params(1)%str)\ncontains\n  subroutine initialize_shell(shell)\n    type(shell_t), intent(out) :: shell\n    allocate(shell%local_vars(1, 1))\n    allocate(shell%local_var_counts(1))\n    allocate(shell%positional_params(1))\n    shell%local_var_counts = [1]\n    shell%positional_params(1)%str = 'ok'\n  end subroutine initialize_shell\nend program\n",

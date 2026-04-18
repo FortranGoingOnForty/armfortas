@@ -12968,6 +12968,27 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 vec![desc, es, rank_val, dim_buf, stat_addr],
                                 IrType::Void,
                             );
+                            if rank == 0 {
+                                if let Some(type_name) = &info.derived_type {
+                                    if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                        let base_ptr = b.load_typed(
+                                            desc,
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                        if derived_layout_needs_runtime_initialization(
+                                            layout,
+                                            ctx.type_layouts,
+                                        ) {
+                                            initialize_derived_storage(
+                                                b,
+                                                base_ptr,
+                                                layout,
+                                                ctx.type_layouts,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
                             let size_val = b.const_i32(elem_size_bytes as i32);
@@ -17802,6 +17823,9 @@ fn lower_arg_descriptor(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
+    if let Some((desc, _)) = lower_array_expr_descriptor(b, locals, expr, st, type_layouts) {
+        return desc;
+    }
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
