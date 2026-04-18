@@ -1297,6 +1297,76 @@ fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
 }
 
 #[test]
+fn bind_c_c_char_buffer_writes_scalar_character_storage() {
+    let dir = unique_dir("bind_c_c_char_buffer");
+    let c_src = write_program_in(
+        &dir,
+        "fill_chars.c",
+        "#include <stddef.h>\n\nsize_t fill_chars(char *buf, size_t n) {\n    static const char msg[] = \"hello world\";\n    size_t len = sizeof(msg) - 1;\n    if (n < len) len = n;\n    for (size_t i = 0; i < len; ++i) buf[i] = msg[i];\n    return len;\n}\n",
+    );
+    let c_obj = dir.join("fill_chars.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_char, c_size_t\n  implicit none\n  interface\n    function fill_chars(buf, n) result(copied) bind(C, name='fill_chars')\n      import :: c_char, c_size_t\n      character(kind=c_char) :: buf(*)\n      integer(c_size_t), value :: n\n      integer(c_size_t) :: copied\n    end function\n  end interface\n  character(len=11) :: fixed\n  character(len=:), allocatable :: dyn\n  integer(c_size_t) :: copied\n\n  fixed = '           '\n  copied = fill_chars(fixed, int(len(fixed), c_size_t))\n  if (fixed /= 'hello world') error stop 1\n\n  allocate(character(len=11) :: dyn)\n  dyn = '           '\n  copied = fill_chars(dyn, int(len(dyn), c_size_t))\n  if (dyn /= 'hello world') error stop 2\n  if (copied /= int(11, c_size_t)) error stop 3\n\n  print *, trim(fixed)\n  print *, trim(dyn)\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char buffer object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) c_char buffer should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_buffer.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char buffer link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) c_char buffer objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) c_char buffer run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) c_char buffer should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.matches("hello world").count() >= 2,
+        "bind(c) c_char buffer should update both scalar character actuals: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_procedure_case_and_bind_label_survive_amod_import() {
     let dir = unique_dir("amod_case_bind");
     let mod_src = write_program_in(
@@ -6888,6 +6958,228 @@ fn empty_allocatable_char_component_copy_stays_allocated() {
     assert!(
         stdout.contains("ok"),
         "unexpected empty alloc-char component copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_global_derived_array_char_default_init_uses_blanks() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: entry_t\n    character(len=8) :: name = ''\n  end type\n  type(entry_t), save :: table(2)\ncontains\n  subroutine check()\n    if (len_trim(table(1)%name) /= 0) error stop 1\n    if (table(1)%name(1:1) /= ' ') error stop 2\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  call check()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_global_derived_array_blank_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module global derived array blank-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module global derived array blank-init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module global derived array blank-init run failed");
+    assert!(
+        run.status.success(),
+        "module global derived array blank-init run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected module global derived array blank-init output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn internal_read_from_char_array_element_uses_internal_file_path() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: words(2)\n  integer :: ios, fd\n  words(1) = '2'\n  ios = -99\n  fd = -1\n  read(words(1), *, iostat=ios) fd\n  if (ios /= 0) error stop 1\n  if (fd /= 2) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_read_array_elem", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal read array-element compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "internal read array-element compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("internal read array-element run failed");
+    assert!(
+        run.status.success(),
+        "internal read array-element run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected internal read array-element output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_internal_read_from_char_component_uses_internal_file_path() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  integer :: ios, fd\n  tok%value(1:1) = '3'\n  ios = -99\n  fd = -1\n  read(tok%value, '(I1)', iostat=ios) fd\n  if (ios /= 0) error stop 1\n  if (fd /= 3) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_internal_read_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted internal read component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "formatted internal read component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("formatted internal read component run failed");
+    assert!(
+        run.status.success(),
+        "formatted internal read component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected formatted internal read component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_char_component_substring_assignment_updates_field() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  tok%value = ''\n  tok%value(1:1) = '3'\n  if (tok%value(1:1) /= '3') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_component_substring", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char component substring compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char component substring compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char component substring run failed");
+    assert!(
+        run.status.success(),
+        "fixed char component substring run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected fixed char component substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn logical_whole_array_copy_preserves_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = src\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_whole_array_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("logical whole-array copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical whole-array copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("logical whole-array copy run failed");
+    assert!(
+        run.status.success(),
+        "logical whole-array copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected logical whole-array copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn logical_section_copy_preserves_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = .false.\n  dest(1:3) = src(1:3)\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_section_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("logical section copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical section copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("logical section copy run failed");
+    assert!(
+        run.status.success(),
+        "logical section copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected logical section copy output: {}",
         stdout
     );
 

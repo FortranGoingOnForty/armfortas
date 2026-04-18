@@ -1999,8 +1999,18 @@ fn collect_module_globals(
                         }
                     }
 
-                    let init = init_expr
-                        .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts));
+                    let init = if let Some(type_name) = &derived_type_name {
+                        if init_expr.is_none() {
+                            type_layouts.get(type_name).and_then(|layout| {
+                                eval_const_derived_global_init(layout, total as usize, type_layouts)
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        init_expr
+                            .and_then(|e| eval_const_array_init(e, &ir_ty, total, &param_consts))
+                    };
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: global_ty,
@@ -2079,10 +2089,15 @@ fn collect_module_globals(
                                 Box::new(IrType::Int(IntWidth::I8)),
                                 layout.size as u64,
                             );
+                            let init = if init_expr.is_none() {
+                                eval_const_derived_global_init(layout, 1, type_layouts)
+                            } else {
+                                None
+                            };
                             module.add_global(Global {
                                 name: symbol.clone(),
                                 ty: scalar_ty.clone(),
-                                initializer: Some(GlobalInit::Zero),
+                                initializer: Some(init.unwrap_or(GlobalInit::Zero)),
                             });
                             globals.insert(
                                 (mod_name.to_lowercase(), entity.name.to_lowercase()),
@@ -3547,6 +3562,127 @@ fn eval_const_char_global_init(
         bytes.resize(target_len, b' ');
     }
     Some(GlobalInit::String(bytes))
+}
+
+fn encode_const_scalar_bytes(value: i128, size: usize) -> Option<Vec<u8>> {
+    let bytes = match size {
+        1 => vec![(value as i8) as u8],
+        2 => (value as i16).to_le_bytes().to_vec(),
+        4 => (value as i32).to_le_bytes().to_vec(),
+        8 => (value as i64).to_le_bytes().to_vec(),
+        16 => value.to_le_bytes().to_vec(),
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+fn apply_derived_const_default_bytes(
+    bytes: &mut [u8],
+    base_offset: usize,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    let mut wrote_defaults = false;
+
+    for field in &layout.fields {
+        let field_offset = base_offset + field.offset;
+
+        if !field.pointer && !field.allocatable {
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = registry.get(&nested_name) {
+                    if derived_layout_has_runtime_field_defaults(nested_layout, registry) {
+                        let elem_count: usize = if field.dims.is_empty() {
+                            1
+                        } else {
+                            field
+                                .dims
+                                .iter()
+                                .map(|(_, extent)| (*extent).max(0) as usize)
+                                .product::<usize>()
+                                .max(1)
+                        };
+                        for idx in 0..elem_count {
+                            let elem_offset = field_offset + idx * nested_layout.size;
+                            wrote_defaults |= apply_derived_const_default_bytes(
+                                bytes,
+                                elem_offset,
+                                nested_layout,
+                                registry,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(default_init) = &field.default_init else {
+            continue;
+        };
+
+        match default_init {
+            crate::sema::type_layout::FieldDefaultInit::Character(value) => {
+                let end = field_offset + field.size;
+                if end > bytes.len() {
+                    return false;
+                }
+                bytes[field_offset..end].fill(b' ');
+                let value_bytes = value.as_bytes();
+                let copy_len = value_bytes.len().min(field.size);
+                bytes[field_offset..field_offset + copy_len]
+                    .copy_from_slice(&value_bytes[..copy_len]);
+                wrote_defaults = true;
+            }
+            crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
+                let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+                let Some(encoded) = encode_const_scalar_bytes(*value, field_size) else {
+                    return false;
+                };
+                let end = field_offset + encoded.len();
+                if end > bytes.len() {
+                    return false;
+                }
+                bytes[field_offset..end].copy_from_slice(&encoded);
+                wrote_defaults = true;
+            }
+            crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
+                let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+                let Some(encoded) =
+                    encode_const_scalar_bytes(if *value { 1 } else { 0 }, field_size)
+                else {
+                    return false;
+                };
+                let end = field_offset + encoded.len();
+                if end > bytes.len() {
+                    return false;
+                }
+                bytes[field_offset..end].copy_from_slice(&encoded);
+                wrote_defaults = true;
+            }
+        }
+    }
+
+    wrote_defaults
+}
+
+fn eval_const_derived_global_init(
+    layout: &crate::sema::type_layout::TypeLayout,
+    elem_count: usize,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<GlobalInit> {
+    if elem_count == 0 || !derived_layout_has_runtime_field_defaults(layout, registry) {
+        return None;
+    }
+    let mut bytes = vec![0u8; layout.size.saturating_mul(elem_count)];
+    let mut wrote_defaults = false;
+    for idx in 0..elem_count {
+        wrote_defaults |=
+            apply_derived_const_default_bytes(&mut bytes, idx * layout.size, layout, registry);
+    }
+    if wrote_defaults {
+        Some(GlobalInit::String(bytes))
+    } else {
+        None
+    }
 }
 
 /// Internal const-folding result for initializer expressions.
@@ -8303,6 +8439,8 @@ fn emit_named_function_call(
         .and_then(|m| m.get(&callee_key).cloned().or_else(|| m.get(&key).cloned()));
     let callee_string_descriptor_args = callee_string_descriptor_arg_mask(st, &callee_key)
         .or_else(|| callee_string_descriptor_arg_mask(st, &key));
+    let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &callee_key)
+        .or_else(|| callee_bind_c_char_arg_mask(st, &key));
 
     let mut call_args = Vec::new();
     if let Some(desc) = hidden_result {
@@ -8318,6 +8456,10 @@ fn emit_named_function_call(
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
         let wants_string_descriptor = callee_string_descriptor_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        let wants_bind_c_char = callee_bind_c_char_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
@@ -8338,6 +8480,17 @@ fn emit_named_function_call(
                     lower_arg_descriptor(b, locals, e, st, type_layouts)
                 } else if wants_string_descriptor {
                     lower_arg_string_descriptor(b, locals, e, st, type_layouts)
+                } else if wants_bind_c_char {
+                    lower_bind_c_char_arg_raw(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )
                 } else {
                     lower_arg_by_ref(b, locals, e, st)
                 }
@@ -8432,6 +8585,8 @@ fn lower_alloc_return_call_into_desc(
         .or_else(|| ctx.descriptor_params.get(&key).cloned());
     let callee_string_descriptor_args = callee_string_descriptor_arg_mask(ctx.st, &callee_key)
         .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key));
+    let callee_bind_c_char_args = callee_bind_c_char_arg_mask(ctx.st, &callee_key)
+        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
 
     let mut call_args = vec![desc_addr];
     call_args.extend(args.iter().enumerate().map(|(i, a)| {
@@ -8447,6 +8602,10 @@ fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let wants_bind_c_char = callee_bind_c_char_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
         match &a.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
                 if is_value {
@@ -8455,6 +8614,17 @@ fn lower_alloc_return_call_into_desc(
                     lower_arg_string_descriptor(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
                 } else if wants_descriptor {
                     lower_arg_descriptor(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
+                } else if wants_bind_c_char {
+                    lower_bind_c_char_arg_raw(
+                        b,
+                        &ctx.locals,
+                        e,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                    )
                 } else {
                     lower_arg_by_ref_ctx(b, ctx, e)
                 }
@@ -9908,6 +10078,17 @@ fn callee_optional_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<b
     Some(mask)
 }
 
+fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
+    use crate::sema::symtab::SymbolKind;
+    let key = callee_name.to_lowercase();
+    st.scopes.iter().any(|scope| {
+        scope.symbols.get(&key).is_some_and(|sym| {
+            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                && sym.attrs.binding_label.is_some()
+        })
+    })
+}
+
 /// Check if a callee has `character(len=*)` dummies via its scope in the
 /// symbol table. Returns a positional bitmap for the visible arguments.
 fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
@@ -9925,6 +10106,7 @@ fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<
                 .get(arg_name)
                 .map(|sym| {
                     matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }))
+                        && !callee_is_bind_c(st, callee_name)
                         && !sym.attrs.allocatable
                         && !sym.attrs.pointer
                 })
@@ -9956,6 +10138,40 @@ fn callee_string_descriptor_arg_mask(st: &SymbolTable, callee_name: &str) -> Opt
                 .map(|sym| {
                     matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }))
                         && (sym.attrs.allocatable || sym.attrs.pointer)
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if mask.iter().any(|flag| *flag) {
+        Some(mask)
+    } else {
+        None
+    }
+}
+
+/// Check if a BIND(C) callee has character(kind=c_char) dummies that should
+/// receive the raw byte pointer directly instead of the Fortran character
+/// by-reference slot used by the default ABI.
+fn callee_bind_c_char_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+    use crate::sema::symtab::{ScopeKind, TypeInfo};
+    let callee_scope = st.scopes.iter().find(|s| match &s.kind {
+        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.to_lowercase() == callee_name,
+        _ => false,
+    })?;
+    if !callee_is_bind_c(st, callee_name) {
+        return None;
+    }
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .map(|sym| {
+                    matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }))
+                        && !sym.attrs.allocatable
+                        && !sym.attrs.pointer
                 })
                 .unwrap_or(false)
         })
@@ -11515,9 +11731,27 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     ctx.st,
                                     ctx.type_layouts,
                                 ) {
-                                    if is_deferred_char_component_field(&field) {
+                                    if is_deferred_char_component_field(&field)
+                                        || matches!(
+                                            field.type_info,
+                                            crate::sema::symtab::TypeInfo::Character {
+                                                len: Some(_),
+                                                ..
+                                            }
+                                        )
+                                    {
                                         let (base_ptr, base_len) =
-                                            load_string_descriptor_view(b, field_ptr);
+                                            if is_deferred_char_component_field(&field) {
+                                                load_string_descriptor_view(b, field_ptr)
+                                            } else if let crate::sema::symtab::TypeInfo::Character {
+                                                len: Some(flen),
+                                                ..
+                                            } = &field.type_info
+                                            {
+                                                (field_ptr, b.const_i64(*flen))
+                                            } else {
+                                                unreachable!()
+                                            };
                                         let (dest_ptr, dest_len) = lower_substring_full(
                                             b,
                                             &ctx.locals,
@@ -11830,6 +12064,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .get(&resolved_key)
                         .or_else(|| ctx.descriptor_params.get(&signature_key))
                         .or_else(|| ctx.descriptor_params.get(&key));
+                    let bind_c_char_mask = callee_bind_c_char_arg_mask(ctx.st, &resolved_key)
+                        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &signature_key))
+                        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
                     if let Some(desc_mask) = desc_mask {
                         for (i, a) in args.iter().enumerate() {
                             if !desc_mask.get(i).copied().unwrap_or(false) {
@@ -11843,6 +12080,34 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         e,
                                         ctx.st,
                                         Some(ctx.type_layouts),
+                                    )
+                                }
+                                _ => b.const_i64(0),
+                            };
+                        }
+                    }
+                    if let Some(bind_c_char_mask) = bind_c_char_mask {
+                        for (i, a) in args.iter().enumerate() {
+                            if desc_mask
+                                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            if !bind_c_char_mask.get(i).copied().unwrap_or(false) {
+                                continue;
+                            }
+                            arg_vals[i] = match &a.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => {
+                                    lower_bind_c_char_arg_raw(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        Some(ctx.internal_funcs),
+                                        Some(ctx.contained_host_refs),
+                                        Some(ctx.descriptor_params),
                                     )
                                 }
                                 _ => b.const_i64(0),
@@ -15554,6 +15819,75 @@ fn internal_io_buffer(
     ctx: &LowerCtx,
     control: &crate::ast::stmt::IoControl,
 ) -> Option<(ValueId, ValueId)> {
+    fn expr_is_internal_io_designator(
+        b: &mut FuncBuilder,
+        locals: &HashMap<String, LocalInfo>,
+        expr: &crate::ast::expr::SpannedExpr,
+        st: &SymbolTable,
+        type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    ) -> bool {
+        use crate::ast::expr::Expr;
+        use crate::sema::symtab::TypeInfo;
+
+        match &expr.node {
+            Expr::Name { name } => locals
+                .get(&name.to_lowercase())
+                .map(|info| {
+                    info.char_kind != CharKind::None
+                        || descriptor_backed_runtime_char_array(info)
+                        || local_fixed_char_allocatable_scalar_len(info).is_some()
+                })
+                .unwrap_or(false),
+            Expr::ComponentAccess { .. } => type_layouts
+                .and_then(|tl| resolve_component_field_access(b, locals, expr, st, tl))
+                .map(|(_, field)| matches!(field.type_info, TypeInfo::Character { .. }))
+                .unwrap_or(false),
+            Expr::FunctionCall { callee, args } => {
+                if !args.iter().all(|arg| {
+                    matches!(
+                        arg.value,
+                        crate::ast::expr::SectionSubscript::Element(_)
+                            | crate::ast::expr::SectionSubscript::Range { .. }
+                    )
+                }) {
+                    return false;
+                }
+                match &callee.node {
+                    Expr::Name { name } => locals
+                        .get(&name.to_lowercase())
+                        .map(|info| {
+                            info.char_kind != CharKind::None
+                                || descriptor_backed_runtime_char_array(info)
+                                || local_fixed_char_allocatable_scalar_len(info).is_some()
+                        })
+                        .unwrap_or(false),
+                    Expr::ComponentAccess { .. } => type_layouts
+                        .map(|tl| {
+                            component_array_local_info(b, locals, callee, st, tl)
+                                .map(|info| {
+                                    info.char_kind != CharKind::None
+                                        || descriptor_backed_runtime_char_array(&info)
+                                })
+                                .or_else(|| {
+                                    resolve_component_field_access(b, locals, callee, st, tl).map(
+                                        |(_, field)| {
+                                            matches!(field.type_info, TypeInfo::Character { .. })
+                                        },
+                                    )
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false),
+                    Expr::FunctionCall { .. } => {
+                        expr_is_internal_io_designator(b, locals, callee, st, type_layouts)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     if control
         .keyword
         .as_deref()
@@ -15563,22 +15897,29 @@ fn internal_io_buffer(
         return None;
     }
 
-    match &control.value.node {
-        Expr::Name { name } => {
-            let info = ctx.locals.get(&name.to_lowercase())?;
-            if info.char_kind == CharKind::None {
-                return None;
-            }
-            Some(lower_string_expr_with_layouts(
-                b,
-                &ctx.locals,
-                &control.value,
-                ctx.st,
-                Some(ctx.type_layouts),
-            ))
-        }
-        _ => None,
+    if !expr_is_internal_io_designator(
+        b,
+        &ctx.locals,
+        &control.value,
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) || !expr_is_character_expr(
+        b,
+        &ctx.locals,
+        &control.value,
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) {
+        return None;
     }
+
+    Some(lower_string_expr_with_layouts(
+        b,
+        &ctx.locals,
+        &control.value,
+        ctx.st,
+        Some(ctx.type_layouts),
+    ))
 }
 
 fn lower_internal_write_items(
@@ -20875,6 +21216,75 @@ fn lower_arg_by_ref_full(
     tmp
 }
 
+fn lower_bind_c_char_arg_raw(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> ValueId {
+    use crate::ast::expr::Expr;
+
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                return array_data_ptr_for_call(b, info);
+            }
+            if let Some((ptr, _len)) = local_char_ptr_and_len(b, info) {
+                return ptr;
+            }
+        }
+    }
+
+    if let Expr::ComponentAccess { .. } = &expr.node {
+        if let Some(tl) = type_layouts {
+            if let Some((field_ptr, field)) =
+                resolve_component_field_access(b, locals, expr, st, tl)
+            {
+                return match field_char_kind(&field) {
+                    CharKind::Fixed(_) => field_ptr,
+                    CharKind::Deferred if field.size == 32 => {
+                        load_string_descriptor_view(b, field_ptr).0
+                    }
+                    _ => field_ptr,
+                };
+            }
+        }
+    }
+
+    if let Some((ptr, _len)) = char_addr_and_runtime_len(b, expr, locals) {
+        return ptr;
+    }
+
+    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+        return lower_string_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )
+        .0;
+    }
+
+    lower_arg_by_ref_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )
+}
+
 fn lower_arg_by_ref(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -21751,6 +22161,8 @@ fn lower_expr_full(
                 let callee_string_descriptor_args =
                     callee_string_descriptor_arg_mask(st, &signature_key)
                         .or_else(|| callee_string_descriptor_arg_mask(st, &key));
+                let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &signature_key)
+                    .or_else(|| callee_bind_c_char_arg_mask(st, &key));
 
                 // Pass args: by value for VALUE, descriptor for
                 // assumed-shape, by reference otherwise.
@@ -21767,6 +22179,10 @@ fn lower_expr_full(
                             .map(|mask| i < mask.len() && mask[i])
                             .unwrap_or(false);
                         let wants_string_descriptor = callee_string_descriptor_args
+                            .as_ref()
+                            .map(|mask| i < mask.len() && mask[i])
+                            .unwrap_or(false);
+                        let wants_bind_c_char = callee_bind_c_char_args
                             .as_ref()
                             .map(|mask| i < mask.len() && mask[i])
                             .unwrap_or(false);
@@ -21787,6 +22203,17 @@ fn lower_expr_full(
                                     lower_arg_string_descriptor(b, locals, e, st, type_layouts)
                                 } else if wants_descriptor {
                                     lower_arg_descriptor(b, locals, e, st, type_layouts)
+                                } else if wants_bind_c_char {
+                                    lower_bind_c_char_arg_raw(
+                                        b,
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    )
                                 } else {
                                     lower_arg_by_ref_full(
                                         b,
