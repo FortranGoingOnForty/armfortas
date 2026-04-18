@@ -948,6 +948,99 @@ fn fixed_char_out_dummy_writes_back_to_caller() {
 }
 
 #[test]
+fn allocatable_component_substring_result_keeps_dynamic_upper_bound() {
+    let src = write_program(
+        "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=32) :: name = ''\n    character(len=:), allocatable :: value\n    integer :: value_len = 0\n  end type\n  type :: shell_t\n    type(var_t) :: variables(4)\n  end type\ncontains\n  function get_var(shell, name) result(v)\n    type(shell_t), intent(in) :: shell\n    character(len=*), intent(in) :: name\n    character(len=:), allocatable :: v\n    v = ''\n    if (trim(shell%variables(1)%name) == trim(name)) then\n      if (shell%variables(1)%value_len > 0) then\n        v = shell%variables(1)%value(1:shell%variables(1)%value_len)\n      end if\n    end if\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  character(len=:), allocatable :: v\n  shell%variables(1)%name = 'a'\n  shell%variables(1)%value = '10'\n  shell%variables(1)%value_len = 2\n  v = get_var(shell, 'a')\n  if (trim(v) /= '10') call c_exit(3_c_int)\n  call c_exit(0_c_int)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_substring_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable component substring result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable component substring result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable component substring result run failed");
+    assert!(
+        run.status.success(),
+        "allocatable component substring result run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_character_component_descriptor_starts_zeroed() {
+    let src = write_program(
+        "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  if (.not. allocated(shell%vars(1)%value)) call c_exit(1_c_int)\n  deallocate(shell%vars(1)%value)\n  call c_exit(0_c_int)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_zero_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable character component zero-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable character component zero-init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable character component zero-init run failed");
+    assert!(
+        run.status.success(),
+        "allocatable character component zero-init run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_character_component_update_through_inout_dummy_runs() {
+    let src = write_program(
+        "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n    integer :: value_len = 0\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\ncontains\n  subroutine safe_assign_alloc_str(dest, src, src_len)\n    character(len=:), allocatable, intent(inout) :: dest\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: src_len\n    integer :: k\n    if (allocated(dest)) deallocate(dest)\n    if (src_len <= 0) then\n      allocate(character(len=0) :: dest)\n      return\n    end if\n    allocate(character(len=src_len) :: dest)\n    do k = 1, src_len\n      dest(k:k) = src(k:k)\n    end do\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  shell%vars(1)%value_len = 2\n  call safe_assign_alloc_str(shell%vars(1)%value, '20', 2)\n  if (trim(shell%vars(1)%value) /= '20') call c_exit(1_c_int)\n  call c_exit(0_c_int)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_update_inout", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable character component update compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable character component update compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable character component update run failed");
+    assert!(
+        run.status.success(),
+        "allocatable character component update run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bind_c_name_call_uses_declared_c_symbol() {
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function getpid_c() bind(c, name='getpid') result(pid)\n      import :: c_int\n      integer(c_int) :: pid\n    end function getpid_c\n  end interface\n  integer(c_int) :: pid\n  pid = getpid_c()\nend program\n",
@@ -2360,6 +2453,80 @@ fn allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips() {
     assert!(
         stdout.contains("true"),
         "unexpected allocatable fixed-char actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens(1) = 'read'\n  tokens(2) = 'line'\n  call check(tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (trim(tokens(2)) /= 'line') error stop 1\n    print *, trim(tokens(2))\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_actual_to_assumed_len_second", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char actual run failed");
+    assert!(
+        run.status.success(),
+        "fixed char actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("line"),
+        "unexpected fixed char actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn whole_fixed_char_array_scalar_fill_preserves_element_slots() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens = ''\n  tokens(2) = 'line'\n  if (trim(tokens(2)) /= 'line') error stop 1\n  print *, trim(tokens(2))\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("whole_fixed_char_array_scalar_fill", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("whole fixed char array scalar fill compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "whole fixed char array scalar fill compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("whole fixed char array scalar fill run failed");
+    assert!(
+        run.status.success(),
+        "whole fixed char array scalar fill run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("line"),
+        "unexpected whole fixed char array scalar fill output: {}",
         stdout
     );
 

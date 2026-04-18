@@ -5194,7 +5194,7 @@ fn alloc_decls(
                         let addr = b.alloca(arr_ty);
                         if let Some(ref type_name) = array_derived_type {
                             if let Some(layout) = type_layouts.get(type_name) {
-                                if derived_layout_needs_runtime_zero_init(layout) {
+                                if derived_layout_needs_runtime_zero_init(layout, type_layouts) {
                                     zero_fill_bytes(b, addr, total_bytes);
                                 }
                             }
@@ -5222,7 +5222,7 @@ fn alloc_decls(
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let addr = b.alloca(struct_ty);
-                        if derived_layout_needs_runtime_zero_init(layout) {
+                        if derived_layout_needs_runtime_zero_init(layout, type_layouts) {
                             // Embedded allocatable/pointer components are runtime
                             // descriptors or slots and must begin life in the
                             // null/unallocated state before any ALLOCATE or
@@ -5907,7 +5907,7 @@ fn eval_const_int_in_scope_or_any_scope(
 /// `start` defaults to 1, `end` defaults to the base string's length.
 /// Negative resulting lengths are clamped to 0 to match the standard's
 /// zero-length substring semantics when `start > end`.
-fn lower_substring(
+fn lower_substring_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
@@ -5915,9 +5915,22 @@ fn lower_substring(
     base_len: ValueId,
     start: Option<&crate::ast::expr::SpannedExpr>,
     end: Option<&crate::ast::expr::SpannedExpr>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> (ValueId, ValueId) {
     let widen = |b: &mut FuncBuilder, e: &crate::ast::expr::SpannedExpr| -> ValueId {
-        let v = lower_expr(b, locals, e, st);
+        let v = lower_expr_full(
+            b,
+            locals,
+            e,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
         match b.func().value_type(v) {
             Some(IrType::Int(IntWidth::I64)) => v,
             _ => b.int_extend(v, IntWidth::I64, true),
@@ -5940,6 +5953,20 @@ fn lower_substring(
     let is_pos = b.icmp(CmpOp::Ge, raw_len, zero);
     let sub_len = b.select(is_pos, raw_len, zero);
     (sub_ptr, sub_len)
+}
+
+fn lower_substring(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    base_ptr: ValueId,
+    base_len: ValueId,
+    start: Option<&crate::ast::expr::SpannedExpr>,
+    end: Option<&crate::ast::expr::SpannedExpr>,
+) -> (ValueId, ValueId) {
+    lower_substring_full(
+        b, locals, st, base_ptr, base_len, start, end, None, None, None, None,
+    )
 }
 
 fn widen_to_i64(b: &mut FuncBuilder, value: ValueId) -> ValueId {
@@ -6047,12 +6074,18 @@ fn char_array_element_ptr_and_len(
             IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
         ) {
             let slot_size = descriptor_elem_size(b, desc);
+            let flags = descriptor_flags(b, desc);
+            let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+            let has_slot_flag_bits = b.bit_and(flags, slot_flag);
+            let zero_flag = b.const_i32(0);
+            let has_slot_flag = b.icmp(CmpOp::Ne, has_slot_flag_bits, zero_flag);
             let table_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             let slot_bb = b.create_block("char_desc_slot_ptr");
             let flat_bb = b.create_block("char_desc_flat_ptr");
             let join_bb = b.create_block("char_desc_ptr_join");
-            let use_slot_table = b.icmp(CmpOp::Ne, slot_size, elem_len);
+            let slot_size_mismatch = b.icmp(CmpOp::Ne, slot_size, elem_len);
+            let use_slot_table = b.or(has_slot_flag, slot_size_mismatch);
             b.cond_branch(use_slot_table, slot_bb, vec![], flat_bb, vec![]);
 
             b.set_block(slot_bb);
@@ -6076,6 +6109,89 @@ fn char_array_element_ptr_and_len(
     } else {
         array_data_ptr_for_call(b, info)
     };
+    let byte_offset = b.imul(idx64, elem_len);
+    let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+    Some((elem_ptr, elem_len))
+}
+
+fn char_array_elem_ptr_and_len_from_flat_index(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    idx64: ValueId,
+) -> Option<(ValueId, ValueId)> {
+    if info.char_kind == CharKind::None && !descriptor_backed_runtime_char_array(info) {
+        return None;
+    }
+    let elem_len = match info.char_kind {
+        CharKind::Fixed(n) => b.const_i64(n),
+        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),
+        CharKind::Deferred if local_uses_array_descriptor(info) => {
+            let desc = array_descriptor_addr(b, info);
+            descriptor_elem_size(b, desc)
+        }
+        CharKind::Deferred => return None,
+        CharKind::None if descriptor_backed_runtime_char_array(info) => {
+            let desc = array_descriptor_addr(b, info);
+            descriptor_elem_size(b, desc)
+        }
+        CharKind::None => return None,
+    };
+    if !local_uses_array_descriptor(info) && !info.by_ref {
+        if matches!(info.ty, IrType::Int(IntWidth::I8)) {
+            let base = array_data_ptr_for_call(b, info);
+            let byte_offset = b.imul(idx64, elem_len);
+            let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+            return Some((elem_ptr, elem_len));
+        }
+        let slot_ptr = b.gep(
+            info.addr,
+            vec![idx64],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let elem_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        return Some((elem_ptr, elem_len));
+    }
+    let desc = array_descriptor_addr(b, info);
+    if matches!(
+        info.char_kind,
+        CharKind::Fixed(_) | CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+    ) && matches!(
+        info.ty,
+        IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+    ) {
+        let slot_size = descriptor_elem_size(b, desc);
+        let flags = descriptor_flags(b, desc);
+        let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+        let has_slot_flag_bits = b.bit_and(flags, slot_flag);
+        let zero_flag = b.const_i32(0);
+        let has_slot_flag = b.icmp(CmpOp::Ne, has_slot_flag_bits, zero_flag);
+        let table_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let slot_bb = b.create_block("char_desc_slot_ptr");
+        let flat_bb = b.create_block("char_desc_flat_ptr");
+        let join_bb = b.create_block("char_desc_ptr_join");
+        let slot_size_mismatch = b.icmp(CmpOp::Ne, slot_size, elem_len);
+        let use_slot_table = b.or(has_slot_flag, slot_size_mismatch);
+        b.cond_branch(use_slot_table, slot_bb, vec![], flat_bb, vec![]);
+
+        b.set_block(slot_bb);
+        let slot_offset = b.imul(idx64, slot_size);
+        let slot_ptr = b.gep(table_base, vec![slot_offset], IrType::Int(IntWidth::I8));
+        let elem_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        b.store(elem_ptr, ptr_slot);
+        b.branch(join_bb, vec![]);
+
+        b.set_block(flat_bb);
+        let byte_offset = b.imul(idx64, elem_len);
+        let elem_ptr = b.gep(table_base, vec![byte_offset], IrType::Int(IntWidth::I8));
+        b.store(elem_ptr, ptr_slot);
+        b.branch(join_bb, vec![]);
+
+        b.set_block(join_bb);
+        let elem_ptr = b.load_typed(ptr_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        return Some((elem_ptr, elem_len));
+    }
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let byte_offset = b.imul(idx64, elem_len);
     let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
     Some((elem_ptr, elem_len))
@@ -10057,7 +10173,7 @@ fn lower_string_expr_full(
                             contained_host_refs,
                             descriptor_params,
                         );
-                        return lower_substring(
+                        return lower_substring_full(
                             b,
                             locals,
                             st,
@@ -10065,6 +10181,10 @@ fn lower_string_expr_full(
                             base_len,
                             start.as_ref(),
                             end.as_ref(),
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
                         );
                     }
                     crate::ast::expr::SectionSubscript::Element(idx_expr) => {
@@ -10078,7 +10198,7 @@ fn lower_string_expr_full(
                             contained_host_refs,
                             descriptor_params,
                         );
-                        return lower_substring(
+                        return lower_substring_full(
                             b,
                             locals,
                             st,
@@ -10086,6 +10206,10 @@ fn lower_string_expr_full(
                             base_len,
                             Some(idx_expr),
                             Some(idx_expr),
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
                         );
                     }
                 }
@@ -10319,7 +10443,7 @@ fn lower_string_expr_full(
                                             type_layouts,
                                         )
                                     {
-                                        return lower_substring(
+                                        return lower_substring_full(
                                             b,
                                             locals,
                                             st,
@@ -10327,6 +10451,10 @@ fn lower_string_expr_full(
                                             elem_len,
                                             start.as_ref(),
                                             end.as_ref(),
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
                                         );
                                     }
                                 }
@@ -10431,7 +10559,7 @@ fn lower_string_expr_full(
                                                 type_layouts,
                                             )
                                         {
-                                            return lower_substring(
+                                            return lower_substring_full(
                                                 b,
                                                 locals,
                                                 st,
@@ -10439,6 +10567,10 @@ fn lower_string_expr_full(
                                                 elem_len,
                                                 start.as_ref(),
                                                 end.as_ref(),
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
                                             );
                                         }
                                     }
@@ -10895,9 +11027,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                     if let Some(info) = ctx.locals.get(&key).cloned() {
                         if local_is_array_like(&info)
-                            && (info.char_kind != CharKind::None
+                            && ((info.char_kind != CharKind::None
                                 || descriptor_backed_runtime_char_array(&info))
-                            && local_uses_array_descriptor(&info)
+                                || local_uses_array_descriptor(&info))
                         {
                             lower_array_assign(b, ctx, name, &info, value);
                             return;
@@ -11125,7 +11257,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     if let Some((base_ptr, base_len)) =
                                         char_addr_and_runtime_len(b, callee, &ctx.locals)
                                     {
-                                        let (dest_ptr, dest_len) = lower_substring(
+                                        let (dest_ptr, dest_len) = lower_substring_full(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -11133,6 +11265,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             base_len,
                                             start.as_ref(),
                                             end.as_ref(),
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                         );
                                         let (src_ptr, src_len) =
                                             lower_string_expr_ctx(b, ctx, value);
@@ -11250,7 +11386,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     if is_deferred_char_component_field(&field) {
                                         let (base_ptr, base_len) =
                                             load_string_descriptor_view(b, field_ptr);
-                                        let (dest_ptr, dest_len) = lower_substring(
+                                        let (dest_ptr, dest_len) = lower_substring_full(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -11258,6 +11394,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             base_len,
                                             start.as_ref(),
                                             end.as_ref(),
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                         );
                                         let (src_ptr, src_len) =
                                             lower_string_expr_ctx(b, ctx, value);
@@ -12264,7 +12404,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             field_ptr,
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                         );
-                                        if derived_layout_needs_runtime_zero_init(layout) {
+                                        if derived_layout_needs_runtime_zero_init(
+                                            layout,
+                                            ctx.type_layouts,
+                                        ) {
                                             zero_fill_bytes(b, base_ptr, layout.size as i64);
                                         }
                                         if derived_layout_has_runtime_field_defaults(layout) {
@@ -12304,7 +12447,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         field_ptr,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
-                                    if derived_layout_needs_runtime_zero_init(layout) {
+                                    if derived_layout_needs_runtime_zero_init(
+                                        layout,
+                                        ctx.type_layouts,
+                                    ) {
                                         zero_fill_bytes(b, base_ptr, layout.size as i64);
                                     }
                                     if derived_layout_has_runtime_field_defaults(layout) {
@@ -12409,7 +12555,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         info.addr,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
-                                    if derived_layout_needs_runtime_zero_init(layout) {
+                                    if derived_layout_needs_runtime_zero_init(
+                                        layout,
+                                        ctx.type_layouts,
+                                    ) {
                                         zero_fill_bytes(b, base_ptr, layout.size as i64);
                                     }
                                     if derived_layout_has_runtime_field_defaults(layout) {
@@ -12455,7 +12604,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let base_name = extract_base_name(item);
                 if let Some(name) = base_name {
                     if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
-                        if info.allocatable || info.descriptor_arg {
+                        if matches!(info.char_kind, CharKind::Deferred) {
+                            let desc = string_descriptor_addr(b, info);
+                            b.call(
+                                FuncRef::External("afs_dealloc_string".into()),
+                                vec![desc],
+                                IrType::Void,
+                            );
+                        } else if info.allocatable || info.descriptor_arg {
                             // Pass descriptor address to runtime with null STAT.
                             // Alloca a dummy STAT to avoid abort on already-deallocated.
                             let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
@@ -13284,7 +13440,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 CharKind::Fixed(n) => b.const_i64(n),
                                                 _ => b.const_i64(0),
                                             };
-                                            let (ptr, len) = lower_substring(
+                                            let (ptr, len) = lower_substring_full(
                                                 b,
                                                 &ctx.locals,
                                                 ctx.st,
@@ -13292,6 +13448,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 elem_len,
                                                 start.as_ref(),
                                                 end.as_ref(),
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
                                             );
                                             store_string_descriptor_view(
                                                 b,
@@ -16864,6 +17024,8 @@ fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
     info.allocatable || info.descriptor_arg
 }
 
+const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
+
 fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.allocatable {
         info.addr
@@ -16930,6 +17092,26 @@ fn derived_scalar_storage_addr_for_call(b: &mut FuncBuilder, info: &LocalInfo) -
     }
 }
 
+fn local_uses_char_slot_table(info: &LocalInfo) -> bool {
+    !local_uses_array_descriptor(info)
+        && !info.by_ref
+        && !info.dims.is_empty()
+        && matches!(
+            info.char_kind,
+            CharKind::Fixed(_) | CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+        )
+        && matches!(
+            info.ty,
+            IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+        )
+}
+
+fn descriptor_flags(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let off = b.const_i64(20);
+    let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
+    b.load_typed(ptr, IrType::Int(IntWidth::I32))
+}
+
 fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
@@ -16946,7 +17128,11 @@ fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &LocalInfo) 
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
     let rank = b.const_i32(info.dims.len() as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
-    let flags = b.const_i32(2);
+    let mut flags = 2;
+    if local_uses_char_slot_table(info) {
+        flags |= DESC_CHAR_SLOT_TABLE;
+    }
+    let flags = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
 
     for (i, (lower, extent)) in info.dims.iter().copied().enumerate() {
@@ -18059,6 +18245,43 @@ fn lower_array_assign(
             }
         }
     } else {
+        if dest_info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(dest_info)
+        {
+            let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+            let n = array_total_elems_value(b, dest_info);
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let zero = b.const_i64(0);
+            b.store(zero, i_addr);
+
+            let bb_check = b.create_block("char_broadcast_check");
+            let bb_body = b.create_block("char_broadcast_body");
+            let bb_exit = b.create_block("char_broadcast_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+            let (dest_ptr, dest_len) =
+                char_array_elem_ptr_and_len_from_flat_index(b, dest_info, i_val)
+                    .expect("whole-array character scalar assign should compute element address");
+            b.call(
+                FuncRef::External("afs_assign_char_fixed".into()),
+                vec![dest_ptr, dest_len, src_ptr, src_len],
+                IrType::Void,
+            );
+            let one = b.const_i64(1);
+            let next_i = b.iadd(i_val, one);
+            b.store(next_i, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
+            return;
+        }
+
         // a = scalar: broadcast scalar to all elements.
         // Generate a loop with stack-allocated counter.
         let scalar = lower_expr_ctx_tl(b, ctx, value);
@@ -18960,11 +19183,26 @@ fn type_info_to_storage_ir_type(
     type_info_to_ir_type(ti)
 }
 
-fn derived_layout_needs_runtime_zero_init(layout: &crate::sema::type_layout::TypeLayout) -> bool {
-    layout
-        .fields
-        .iter()
-        .any(|field| field.allocatable || field.pointer)
+fn derived_layout_needs_runtime_zero_init(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    layout.fields.iter().any(|field| {
+        field.allocatable
+            || field.pointer
+            || (field.size == 32
+                && matches!(
+                    field.type_info,
+                    crate::sema::symtab::TypeInfo::Character { len: None, .. }
+                ))
+            || matches!(
+                &field.type_info,
+                crate::sema::symtab::TypeInfo::Derived(type_name)
+                    if registry
+                        .get(type_name)
+                        .is_some_and(|nested| derived_layout_needs_runtime_zero_init(nested, registry))
+            )
+    })
 }
 
 fn derived_layout_has_runtime_field_defaults(
@@ -20580,7 +20818,7 @@ fn lower_expr_full(
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
                         let (base_ptr, base_len) =
                             lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
-                        let (ptr, _len) = lower_substring(
+                        let (ptr, _len) = lower_substring_full(
                             b,
                             locals,
                             st,
@@ -20588,13 +20826,17 @@ fn lower_expr_full(
                             base_len,
                             start.as_ref(),
                             end.as_ref(),
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
                         );
                         return ptr;
                     }
                     crate::ast::expr::SectionSubscript::Element(idx_expr) => {
                         let (base_ptr, base_len) =
                             lower_string_expr_with_layouts(b, locals, callee, st, type_layouts);
-                        let (ptr, _len) = lower_substring(
+                        let (ptr, _len) = lower_substring_full(
                             b,
                             locals,
                             st,
@@ -20602,6 +20844,10 @@ fn lower_expr_full(
                             base_len,
                             Some(idx_expr),
                             Some(idx_expr),
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
                         );
                         return ptr;
                     }
