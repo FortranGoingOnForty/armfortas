@@ -118,13 +118,11 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                         writeln!(out, "    {} {}", directive, v).unwrap();
                     }
                 }
-                Some(GlobalInit::String(bytes))
-                    if matches!(elem_ty.as_ref(), IrType::Int(IntWidth::I8) | IrType::Bool) =>
-                {
+                Some(GlobalInit::String(bytes)) => {
                     emit_byte_values(&mut out, bytes);
-                    let total = *count as usize;
-                    if bytes.len() < total {
-                        writeln!(out, "    .space {}", total - bytes.len()).unwrap();
+                    let total_bytes = g.ty.size_bytes() as usize;
+                    if bytes.len() < total_bytes {
+                        writeln!(out, "    .space {}", total_bytes - bytes.len()).unwrap();
                     }
                 }
                 _ => {

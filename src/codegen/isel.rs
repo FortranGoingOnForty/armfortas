@@ -1729,8 +1729,14 @@ fn select_inst(
             };
 
             // Determine element size from the GEP result type (Ptr<elem_ty>).
+            // Use the IR semantic size, not alloca_size(): logical arrays are
+            // represented as packed bytes in memory even though scalar bool
+            // allocas reserve 4 bytes for stack alignment.
             let elem_size = match &inst.ty {
-                IrType::Ptr(inner) => alloca_size(inner) as i64,
+                IrType::Ptr(inner) => match inner.as_ref() {
+                    IrType::Struct(_) => alloca_size(inner) as i64,
+                    _ => inner.size_bytes() as i64,
+                },
                 _ => 4, // fallback
             };
 
@@ -2909,7 +2915,13 @@ fn alloca_size(ty: &IrType) -> u32 {
         IrType::Float(w) => w.bytes(),
         IrType::Ptr(_) => 8,
         IrType::Array(elem, count) => {
-            let elem_size = alloca_size(elem);
+            // Arrays must use the IR's semantic element size so packed logical
+            // arrays occupy one byte per element in memory. Scalar logical
+            // allocas still reserve 4 bytes for stack alignment.
+            let elem_size = match elem.as_ref() {
+                IrType::Struct(_) => alloca_size(elem),
+                _ => elem.size_bytes() as u32,
+            };
             elem_size * (*count as u32)
         }
         IrType::FuncPtr(_) => 8,
@@ -3459,6 +3471,15 @@ mod tests {
             fp_moves, 3,
             "FP 2-cycle should emit 3 FmovReg, got {}: {:#?}",
             fp_moves, body_mb.insts,
+        );
+    }
+
+    #[test]
+    fn logical_arrays_use_packed_semantic_size_for_stack_slots() {
+        assert_eq!(alloca_size(&IrType::Array(Box::new(IrType::Bool), 3)), 3);
+        assert_eq!(
+            alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3)),
+            12
         );
     }
 }
