@@ -6,9 +6,11 @@
 use super::symtab::TypeInfo;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldDefaultInit {
     Character(String),
+    Integer(i128),
+    Logical(bool),
 }
 
 /// Layout of a single field in a derived type.
@@ -228,6 +230,19 @@ fn eval_const_int_expr(
     }
 }
 
+fn eval_const_logical_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<bool> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::LogicalLiteral { value, .. } => Some(*value),
+        Expr::ParenExpr { inner } => eval_const_logical_expr(inner),
+        Expr::UnaryOp { op, operand } => match op {
+            crate::ast::expr::UnaryOp::Not => eval_const_logical_expr(operand).map(|v| !v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn eval_explicit_array_dims(
     specs: Option<&Vec<crate::ast::decl::ArraySpec>>,
     const_params: &HashMap<String, i64>,
@@ -400,6 +415,13 @@ pub fn compute_layout(
                             }
                             _ => None,
                         },
+                        (TypeInfo::Integer { .. }, Some(init)) => {
+                            eval_const_int_expr(init, const_params)
+                                .map(|value| FieldDefaultInit::Integer(value as i128))
+                        }
+                        (TypeInfo::Logical { .. }, Some(init)) => {
+                            eval_const_logical_expr(init).map(FieldDefaultInit::Logical)
+                        }
                         _ => None,
                     }
                 } else {
@@ -653,6 +675,35 @@ mod tests {
         )
     }
 
+    fn make_component_with_init(
+        name: &str,
+        ts: crate::ast::decl::TypeSpec,
+        init: crate::ast::expr::Expr,
+    ) -> crate::ast::decl::SpannedDecl {
+        use crate::ast::decl::*;
+        use crate::ast::Spanned;
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+        Spanned::new(
+            Decl::TypeDecl {
+                type_spec: ts,
+                attrs: vec![],
+                entities: vec![EntityDecl {
+                    name: name.to_string(),
+                    array_spec: None,
+                    char_len: None,
+                    init: Some(Spanned::new(init, span)),
+                    ptr_init: None,
+                }],
+            },
+            span,
+        )
+    }
+
     #[test]
     fn compute_layout_simple_struct() {
         // type :: pair; integer :: x; real :: y; end type
@@ -758,6 +809,79 @@ mod tests {
         assert_eq!(field.offset, 0);
         assert!(field.pointer);
         assert_eq!(layout.size, 8);
+    }
+
+    #[test]
+    fn compute_layout_captures_scalar_default_initializers() {
+        let reg = TypeLayoutRegistry::new();
+        let components = vec![
+            make_component_with_init(
+                "depth",
+                crate::ast::decl::TypeSpec::Integer(None),
+                crate::ast::expr::Expr::IntegerLiteral {
+                    text: "7".into(),
+                    kind: None,
+                },
+            ),
+            make_component_with_init(
+                "enabled",
+                crate::ast::decl::TypeSpec::Logical(None),
+                crate::ast::expr::Expr::LogicalLiteral {
+                    value: true,
+                    kind: None,
+                },
+            ),
+            make_component_with_init(
+                "tag",
+                crate::ast::decl::TypeSpec::Character(Some(crate::ast::decl::CharSelector {
+                    len: Some(crate::ast::decl::LenSpec::Expr(crate::ast::Spanned::new(
+                        crate::ast::expr::Expr::IntegerLiteral {
+                            text: "4".into(),
+                            kind: None,
+                        },
+                        crate::lexer::Span {
+                            start: crate::lexer::Position { line: 0, col: 0 },
+                            end: crate::lexer::Position { line: 0, col: 0 },
+                            file_id: 0,
+                        },
+                    ))),
+                    kind: None,
+                })),
+                crate::ast::expr::Expr::StringLiteral {
+                    value: "".into(),
+                    kind: None,
+                },
+            ),
+        ];
+
+        let layout = compute_layout(
+            "state_t",
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
+
+        assert_eq!(
+            layout
+                .field("depth")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Integer(7))
+        );
+        assert_eq!(
+            layout
+                .field("enabled")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Logical(true))
+        );
+        assert_eq!(
+            layout
+                .field("tag")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Character(String::new()))
+        );
     }
 
     #[test]

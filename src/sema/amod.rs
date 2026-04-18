@@ -510,6 +510,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.target {
                 attrs.push_str(" @target");
             }
+            if let Some(default_init) = &field.default_init {
+                attrs.push_str(&render_field_default_init(default_init));
+            }
             writeln!(
                 out,
                 "  @field {} : {} @offset {} @size {}{}{}",
@@ -534,6 +537,24 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                     .unwrap();
                 } else {
                     writeln!(out, "  @binds {} => {}", bp.method_name, bp.target_name).unwrap();
+                }
+            }
+        }
+
+        fn render_field_default_init(init: &crate::sema::type_layout::FieldDefaultInit) -> String {
+            match init {
+                crate::sema::type_layout::FieldDefaultInit::Character(value) => {
+                    let mut hex = String::with_capacity(value.len() * 2);
+                    for byte in value.as_bytes() {
+                        hex.push_str(&format!("{:02x}", byte));
+                    }
+                    format!(" @init=charhex:{}", hex)
+                }
+                crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
+                    format!(" @init=int:{}", value)
+                }
+                crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
+                    format!(" @init=logical:{}", if *value { "true" } else { "false" })
                 }
             }
         }
@@ -1001,6 +1022,36 @@ fn parse_type(
 ) -> crate::sema::type_layout::TypeLayout {
     use crate::sema::type_layout::*;
 
+    fn parse_field_default_init_token(token: &str) -> Option<FieldDefaultInit> {
+        let payload = token.strip_prefix("@init=")?;
+        if let Some(value) = payload.strip_prefix("int:") {
+            return value.parse::<i128>().ok().map(FieldDefaultInit::Integer);
+        }
+        if let Some(value) = payload.strip_prefix("logical:") {
+            return match value {
+                "true" => Some(FieldDefaultInit::Logical(true)),
+                "false" => Some(FieldDefaultInit::Logical(false)),
+                _ => None,
+            };
+        }
+        if let Some(value) = payload.strip_prefix("charhex:") {
+            if value.len() % 2 != 0 {
+                return None;
+            }
+            let mut bytes = Vec::with_capacity(value.len() / 2);
+            let mut idx = 0usize;
+            while idx < value.len() {
+                let next = idx + 2;
+                let byte = u8::from_str_radix(&value[idx..next], 16).ok()?;
+                bytes.push(byte);
+                idx = next;
+            }
+            let decoded = String::from_utf8(bytes).ok()?;
+            return Some(FieldDefaultInit::Character(decoded));
+        }
+        None
+    }
+
     let name = header
         .strip_prefix("@type ")
         .unwrap_or("unknown")
@@ -1068,9 +1119,22 @@ fn parse_type(
                     size_str = &after_offset[..idx];
                     flag_tail = &after_offset[idx..];
                 }
-                let allocatable = flag_tail.contains("@allocatable");
-                let pointer = flag_tail.contains("@pointer");
-                let target = flag_tail.contains("@target");
+                let mut allocatable = false;
+                let mut pointer = false;
+                let mut target = false;
+                let mut default_init = None;
+                for token in flag_tail.split_whitespace() {
+                    match token {
+                        "@allocatable" => allocatable = true,
+                        "@pointer" => pointer = true,
+                        "@target" => target = true,
+                        _ => {
+                            if let Some(init) = parse_field_default_init_token(token) {
+                                default_init = Some(init);
+                            }
+                        }
+                    }
+                }
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
@@ -1081,7 +1145,7 @@ fn parse_type(
                     allocatable,
                     pointer,
                     target,
-                    default_init: None,
+                    default_init,
                 });
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {

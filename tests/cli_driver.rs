@@ -4042,6 +4042,178 @@ fn public_derived_type_in_private_module_is_emitted_and_importable() {
 }
 
 #[test]
+fn nested_derived_defaults_initialize_locally() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: control_block_t\n    logical :: should_execute = .true.\n    character(len=4) :: marker = ''\n  end type control_block_t\n  type :: shell_state_t\n    integer :: control_depth = 0\n    type(control_block_t) :: control_stack(2)\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  if (shell%control_depth /= 0) error stop 1\n  if (.not. shell%control_stack(1)%should_execute) error stop 2\n  if (shell%control_stack(2)%marker /= '    ') error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%should_execute\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_derived_defaults_local", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested derived default-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested derived defaults should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested derived default-init run failed");
+    assert!(
+        run.status.success(),
+        "nested derived defaults should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('0') && stdout.to_lowercase().contains('t'),
+        "unexpected nested derived default-init output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_nested_derived_defaults_round_trip_through_amod_and_run() {
+    let dir = unique_dir("nested_derived_defaults_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "state_mod.f90",
+        "module state_mod\n  implicit none\n  type :: control_block_t\n    logical :: should_execute = .true.\n    character(len=4) :: marker = ''\n  end type control_block_t\n  type, public :: shell_state_t\n    integer :: control_depth = 0\n    type(control_block_t) :: control_stack(2)\n  end type shell_state_t\nend module state_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use state_mod, only: shell_state_t\n  implicit none\n  type(shell_state_t) :: shell\n  if (shell%control_depth /= 0) error stop 1\n  if (.not. shell%control_stack(1)%should_execute) error stop 2\n  if (shell%control_stack(2)%marker /= '    ') error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%should_execute\nend program\n",
+    );
+
+    let mod_obj = dir.join("state_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("state module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "state module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = dir.join("state_mod.amod");
+    let amod_text = std::fs::read_to_string(&amod).expect("missing state_mod.amod");
+    assert!(
+        amod_text.contains("@init=int:0")
+            && amod_text.contains("@init=logical:true")
+            && amod_text.contains("@init=charhex:"),
+        "nested derived field defaults should be exported to .amod: {}",
+        amod_text
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported nested derived defaults should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("nested_defaults.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "nested derived default-init objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "imported nested derived defaults should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('0') && stdout.to_lowercase().contains('t'),
+        "unexpected imported nested derived default-init output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn derived_dummy_component_subscript_uses_updated_component_value() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: control_block_t\n    integer :: block_type = 0\n    logical :: should_execute = .true.\n  end type control_block_t\n  type :: shell_state_t\n    type(control_block_t) :: control_stack(20)\n    integer :: control_depth = 0\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  call push(shell)\n  if (shell%control_depth /= 1) error stop 1\n  if (shell%control_stack(1)%block_type /= 7) error stop 2\n  if (.not. shell%control_stack(1)%should_execute) error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%block_type\ncontains\n  subroutine push(shell)\n    type(shell_state_t), intent(inout) :: shell\n    shell%control_depth = shell%control_depth + 1\n    shell%control_stack(shell%control_depth)%block_type = 7\n  end subroutine push\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_dummy_component_subscript", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived dummy component-subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived dummy component-subscript should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived dummy component-subscript run failed");
+    assert!(
+        run.status.success(),
+        "derived dummy component-subscript should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('1') && stdout.contains('7'),
+        "unexpected derived dummy component-subscript output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn shared_compile_emits_amod_and_links_cleanly() {
     let dir = unique_dir("shared_mod");
     let lib_src = write_program_in(

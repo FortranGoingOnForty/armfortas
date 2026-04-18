@@ -3108,6 +3108,11 @@ fn lower_unit(
                     let size = layout.map(|l| l.size as u64).unwrap_or(8);
                     let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), size);
                     let result_addr = b.alloca(buf_ty);
+                    if let Some(layout) = layout {
+                        if derived_layout_needs_runtime_initialization(layout, type_layouts) {
+                            initialize_derived_storage(&mut b, result_addr, layout, type_layouts);
+                        }
+                    }
                     ctx.locals.insert(
                         result_name.clone(),
                         LocalInfo {
@@ -5170,6 +5175,24 @@ fn alloc_decls(
                             vec![addr, es, n],
                             IrType::Void,
                         );
+                        if let Some(ref type_name) = array_derived_type {
+                            if let Some(layout) = type_layouts.get(type_name) {
+                                if derived_layout_needs_runtime_initialization(layout, type_layouts)
+                                {
+                                    let base_ptr = b.load_typed(
+                                        addr,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    initialize_derived_array_storage(
+                                        b,
+                                        base_ptr,
+                                        layout,
+                                        total_size.max(0),
+                                        type_layouts,
+                                    );
+                                }
+                            }
+                        }
                         // Mark as allocatable so scope-exit dealloc fires.
                         locals.insert(
                             key,
@@ -5194,8 +5217,15 @@ fn alloc_decls(
                         let addr = b.alloca(arr_ty);
                         if let Some(ref type_name) = array_derived_type {
                             if let Some(layout) = type_layouts.get(type_name) {
-                                if derived_layout_needs_runtime_zero_init(layout, type_layouts) {
-                                    zero_fill_bytes(b, addr, total_bytes);
+                                if derived_layout_needs_runtime_initialization(layout, type_layouts)
+                                {
+                                    initialize_derived_array_storage(
+                                        b,
+                                        addr,
+                                        layout,
+                                        total_size.max(0),
+                                        type_layouts,
+                                    );
                                 }
                             }
                         }
@@ -5222,15 +5252,8 @@ fn alloc_decls(
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let addr = b.alloca(struct_ty);
-                        if derived_layout_needs_runtime_zero_init(layout, type_layouts) {
-                            // Embedded allocatable/pointer components are runtime
-                            // descriptors or slots and must begin life in the
-                            // null/unallocated state before any ALLOCATE or
-                            // ASSOCIATED query touches them.
-                            zero_fill_bytes(b, addr, layout.size as i64);
-                        }
-                        if derived_layout_has_runtime_field_defaults(layout) {
-                            apply_derived_field_default_inits(b, addr, layout);
+                        if derived_layout_needs_runtime_initialization(layout, type_layouts) {
+                            initialize_derived_storage(b, addr, layout, type_layouts);
                         }
                         // Store the derived type name in the ty field for component access lookup.
                         // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
@@ -12414,14 +12437,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             field_ptr,
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                         );
-                                        if derived_layout_needs_runtime_zero_init(
+                                        if derived_layout_needs_runtime_initialization(
                                             layout,
                                             ctx.type_layouts,
                                         ) {
-                                            zero_fill_bytes(b, base_ptr, layout.size as i64);
-                                        }
-                                        if derived_layout_has_runtime_field_defaults(layout) {
-                                            apply_derived_field_default_inits(b, base_ptr, layout);
+                                            initialize_derived_storage(
+                                                b,
+                                                base_ptr,
+                                                layout,
+                                                ctx.type_layouts,
+                                            );
                                         }
                                     }
                                 }
@@ -12457,14 +12482,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         field_ptr,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
-                                    if derived_layout_needs_runtime_zero_init(
+                                    if derived_layout_needs_runtime_initialization(
                                         layout,
                                         ctx.type_layouts,
                                     ) {
-                                        zero_fill_bytes(b, base_ptr, layout.size as i64);
-                                    }
-                                    if derived_layout_has_runtime_field_defaults(layout) {
-                                        apply_derived_field_default_inits(b, base_ptr, layout);
+                                        initialize_derived_storage(
+                                            b,
+                                            base_ptr,
+                                            layout,
+                                            ctx.type_layouts,
+                                        );
                                     }
                                 }
                             }
@@ -12565,14 +12592,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         info.addr,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
-                                    if derived_layout_needs_runtime_zero_init(
+                                    if derived_layout_needs_runtime_initialization(
                                         layout,
                                         ctx.type_layouts,
                                     ) {
-                                        zero_fill_bytes(b, base_ptr, layout.size as i64);
-                                    }
-                                    if derived_layout_has_runtime_field_defaults(layout) {
-                                        apply_derived_field_default_inits(b, base_ptr, layout);
+                                        initialize_derived_storage(
+                                            b,
+                                            base_ptr,
+                                            layout,
+                                            ctx.type_layouts,
+                                        );
                                     }
                                 }
                             }
@@ -19379,11 +19408,20 @@ fn derived_layout_needs_runtime_zero_init(
 
 fn derived_layout_has_runtime_field_defaults(
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> bool {
-    layout
-        .fields
-        .iter()
-        .any(|field| field.default_init.is_some())
+    layout.fields.iter().any(|field| {
+        field.default_init.is_some()
+            || (!field.pointer
+                && !field.allocatable
+                && matches!(
+                    &field.type_info,
+                    crate::sema::symtab::TypeInfo::Derived(type_name)
+                        if registry
+                            .get(type_name)
+                            .is_some_and(|nested| derived_layout_has_runtime_field_defaults(nested, registry))
+                ))
+    })
 }
 
 fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
@@ -19399,17 +19437,81 @@ fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
     );
 }
 
+fn derived_layout_needs_runtime_initialization(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    derived_layout_needs_runtime_zero_init(layout, registry)
+        || derived_layout_has_runtime_field_defaults(layout, registry)
+}
+
+fn initialize_derived_storage(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    if derived_layout_needs_runtime_zero_init(layout, registry) {
+        zero_fill_bytes(b, base_addr, layout.size as i64);
+    }
+    if derived_layout_has_runtime_field_defaults(layout, registry) {
+        apply_derived_field_default_inits(b, base_addr, layout, registry);
+    }
+}
+
+fn initialize_derived_array_storage(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    elem_count: i64,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    if elem_count <= 0 {
+        return;
+    }
+    let elem_bytes = layout.size as i64;
+    for idx in 0..elem_count {
+        let byte_off = b.const_i64(idx * elem_bytes);
+        let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
+        initialize_derived_storage(b, elem_ptr, layout, registry);
+    }
+}
+
 fn apply_derived_field_default_inits(
     b: &mut FuncBuilder,
     base_addr: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+
+        if !field.pointer && !field.allocatable {
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = registry.get(&nested_name) {
+                    if derived_layout_needs_runtime_initialization(nested_layout, registry) {
+                        if field.dims.is_empty() {
+                            initialize_derived_storage(b, field_ptr, nested_layout, registry);
+                        } else {
+                            let elem_count: i64 =
+                                field.dims.iter().map(|(_, extent)| *extent).product();
+                            initialize_derived_array_storage(
+                                b,
+                                field_ptr,
+                                nested_layout,
+                                elem_count,
+                                registry,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let Some(default_init) = &field.default_init else {
             continue;
         };
-        let offset = b.const_i64(field.offset as i64);
-        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
         match default_init {
             crate::sema::type_layout::FieldDefaultInit::Character(value) => {
                 let src_ptr = b.const_string(value.as_bytes());
@@ -19421,6 +19523,24 @@ fn apply_derived_field_default_inits(
                     IrType::Void,
                 );
             }
+            crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
+                let field_ty = type_info_to_ir_type(&field.type_info);
+                let raw = materialize_const_scalar(
+                    b,
+                    clamp_const_to_type(ConstScalar::Int(*value), &field_ty),
+                    &field_ty,
+                );
+                b.store(raw, field_ptr);
+            }
+            crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
+                let field_ty = type_info_to_ir_type(&field.type_info);
+                let raw = materialize_const_scalar(
+                    b,
+                    clamp_const_to_type(ConstScalar::Int(if *value { 1 } else { 0 }), &field_ty),
+                    &field_ty,
+                );
+                b.store(raw, field_ptr);
+            }
         }
     }
 }
@@ -19430,6 +19550,7 @@ fn lower_fixed_component_array_element_ptr(
     locals: &HashMap<String, LocalInfo>,
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
     base_ptr: ValueId,
     dims: &[(i64, i64)],
     elem_bytes: i64,
@@ -19443,7 +19564,7 @@ fn lower_fixed_component_array_element_ptr(
         let crate::ast::expr::SectionSubscript::Element(idx_expr) = &arg.value else {
             return None;
         };
-        let idx = lower_expr(b, locals, idx_expr, st);
+        let idx = lower_expr_full(b, locals, idx_expr, st, Some(tl), None, None, None);
         let idx64 = match b.func().value_type(idx) {
             Some(IrType::Int(IntWidth::I64)) => idx,
             _ => b.int_extend(idx, IntWidth::I64, true),
@@ -19560,6 +19681,7 @@ fn resolve_component_base(
                     locals,
                     args,
                     st,
+                    tl,
                     field_ptr,
                     &field.dims,
                     layout.size as i64,
@@ -20291,6 +20413,7 @@ fn resolve_component_base_for_method(
                     locals,
                     args,
                     st,
+                    tl,
                     field_ptr,
                     &field.dims,
                     layout.size as i64,
