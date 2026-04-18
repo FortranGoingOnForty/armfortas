@@ -64,7 +64,8 @@ pub extern "C" fn afs_assign_char_deferred(
     let desc = unsafe { &mut *desc };
 
     if src_len <= 0 {
-        // Empty string assignment.
+        // Empty string assignment still leaves the deferred-length variable
+        // allocated with length zero.
         if desc.is_allocated() && !desc.data.is_null() {
             unsafe {
                 free(desc.data);
@@ -73,7 +74,7 @@ pub extern "C" fn afs_assign_char_deferred(
         desc.data = ptr::null_mut();
         desc.len = 0;
         desc.capacity = 0;
-        desc.flags = STR_DEFERRED;
+        desc.flags = STR_ALLOCATED | STR_DEFERRED;
         return;
     }
 
@@ -535,10 +536,12 @@ mod tests {
         let mut desc = StringDescriptor::zeroed();
         afs_assign_char_deferred(&mut desc, b"hello".as_ptr(), 5);
         afs_assign_char_deferred(&mut desc, ptr::null(), 0);
+        assert!(desc.is_allocated());
+        assert_eq!(afs_string_allocated(&desc), 1);
         assert_eq!(desc.len, 0);
         assert!(desc.data.is_null());
-        // No crash on dealloc of empty.
         afs_dealloc_string(&mut desc);
+        assert_eq!(afs_string_allocated(&desc), 0);
     }
 
     #[test]

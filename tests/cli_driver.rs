@@ -6857,3 +6857,40 @@ fn derived_section_assignment_deep_copies_allocatable_char_component() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn empty_allocatable_char_component_copy_stays_allocated() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: redirect_t\n    character(len=:), allocatable :: filename\n  end type redirect_t\n  type(redirect_t), allocatable :: src_redirs(:)\n  type(redirect_t) :: dst_redirs(1)\n  allocate(src_redirs(1))\n  src_redirs(1)%filename = ''\n  dst_redirs(1:1) = src_redirs(1:1)\n  if (.not. allocated(src_redirs(1)%filename)) error stop 1\n  if (.not. allocated(dst_redirs(1)%filename)) error stop 2\n  if (len(src_redirs(1)%filename) /= 0) error stop 3\n  if (len(dst_redirs(1)%filename) /= 0) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("empty_alloc_char_component_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty alloc-char component copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty alloc-char component copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("empty alloc-char component copy run failed");
+    assert!(
+        run.status.success(),
+        "empty alloc-char component copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected empty alloc-char component copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
