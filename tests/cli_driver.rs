@@ -911,6 +911,43 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 }
 
 #[test]
+fn fixed_char_out_dummy_writes_back_to_caller() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: pos\n  character(len=1) :: op\n  pos = find_op('6*7', op)\n  if (pos /= 2) error stop 1\n  if (op /= '*') error stop 2\n  print *, pos, op\ncontains\n  function find_op(expr, op) result(pos)\n    character(len=*), intent(in) :: expr\n    character(len=1), intent(out) :: op\n    integer :: pos, i\n    pos = 0\n    op = ' '\n    do i = len_trim(expr), 1, -1\n      if (expr(i:i) == '*') then\n        pos = i\n        op = expr(i:i)\n        return\n      end if\n    end do\n  end function find_op\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_out_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char out dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char out dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char out dummy run failed");
+    assert!(
+        run.status.success(),
+        "fixed char out dummy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('2') && stdout.contains('*'),
+        "fixed char out dummy should write back operator: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bind_c_name_call_uses_declared_c_symbol() {
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function getpid_c() bind(c, name='getpid') result(pid)\n      import :: c_int\n      integer(c_int) :: pid\n    end function getpid_c\n  end interface\n  integer(c_int) :: pid\n  pid = getpid_c()\nend program\n",

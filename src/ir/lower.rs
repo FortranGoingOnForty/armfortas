@@ -10907,12 +10907,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 // Fixed-length character assignment: copy with space padding.
                                 // Get source pointer and length from the expression.
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
-                                let dest_len = b.const_i64(*len);
-                                b.call(
-                                    FuncRef::External("afs_assign_char_fixed".into()),
-                                    vec![info.addr, dest_len, src_ptr, src_len],
-                                    IrType::Void,
-                                );
+                                if let Some((dest_ptr, dest_len)) = local_char_ptr_and_len(b, &info)
+                                {
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![dest_ptr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    let dest_len = b.const_i64(*len);
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![info.addr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                }
                             }
                             CharKind::FixedRuntime { len_addr } => {
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
