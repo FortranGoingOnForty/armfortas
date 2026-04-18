@@ -2487,6 +2487,74 @@ fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<String, 
         .ok_or(IOSTAT_END)
 }
 
+fn store_formatted_char_result(
+    field: &str,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+) {
+    crate::string::afs_assign_char_fixed(dest, dest_len, field.as_ptr(), field.len() as i64);
+    if !size_out.is_null() {
+        unsafe {
+            *size_out = field.len().min(i32::MAX as usize) as i32;
+        }
+    }
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+}
+
+fn store_formatted_char_error(dest: *mut u8, dest_len: i64, size_out: *mut i32, code: i32) {
+    crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+    if !size_out.is_null() {
+        unsafe {
+            *size_out = 0;
+        }
+    }
+    if code != 0 {
+        // Caller writes IOSTAT when it passed a non-null pointer.
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_string(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+) {
+    match formatted_read_record_for_unit(unit, data_index)
+        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+    {
+        Ok((FormatDesc::Character { .. }, field)) => {
+            store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+        }
+        Ok(_) => {
+            store_formatted_char_error(dest, dest_len, size_out, 1);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+        }
+        Err(code) => {
+            store_formatted_char_error(dest, dest_len, size_out, code);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn afs_fmt_read_int(
     unit: i32,
@@ -2693,6 +2761,41 @@ pub extern "C" fn afs_fmt_read_real(
             }
         }
         Err(code) => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = code;
+                }
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_string_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
+        Ok((FormatDesc::Character { .. }, field)) => {
+            store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+        }
+        Ok(_) => {
+            store_formatted_char_error(dest, dest_len, size_out, 1);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+        }
+        Err(code) => {
+            store_formatted_char_error(dest, dest_len, size_out, code);
             if !iostat.is_null() {
                 unsafe {
                     *iostat = code;

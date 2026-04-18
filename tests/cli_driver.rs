@@ -249,6 +249,54 @@ fn fixed_form_program_compiles_and_runs() {
 }
 
 #[test]
+fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: input_unit\n  implicit none\n  character(len=16) :: buf\n  integer :: ios, n\n  read(input_unit, '(a)', iostat=ios, advance='no', size=n) buf\n  write(*,'(a,i0)') 'IOS=', ios\n  write(*,'(a,i0)') 'N=', n\n  write(*,'(a,a,a)') 'BUF=<', trim(buf), '>'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_char_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted char read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "formatted char read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let input = unique_path("formatted_char_read_input", "txt");
+    std::fs::write(&input, "line\n").expect("cannot write formatted char read input");
+    let run = Command::new(&out)
+        .stdin(std::fs::File::open(&input).expect("cannot open formatted char read input"))
+        .output()
+        .expect("formatted char read run failed");
+    assert!(
+        run.status.success(),
+        "formatted char read run failed: {:?}\nstderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS=0") || stdout.contains("IOS=-2"),
+        "expected successful or EOR iostat, got: {}",
+        stdout
+    );
+    assert!(stdout.contains("N=4"), "expected SIZE=4, got: {}", stdout);
+    assert!(
+        stdout.contains("BUF=<line>"),
+        "expected buffer contents, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
     let dir = unique_dir("imported_param_char_len");
     let mod_src = write_program_in(
@@ -6437,6 +6485,80 @@ fn deferred_char_component_array_copy_preserves_contents() {
     assert!(
         stdout.contains("read") && stdout.contains("line"),
         "unexpected component char array copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_scalar_assignment_deep_copies_allocatable_char_component() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: redirect_t\n    integer :: kind = 0\n    integer :: fd = -1\n    integer :: target_fd = -1\n    character(len=:), allocatable :: filename\n    logical :: force_clobber = .false.\n  end type redirect_t\n  type(redirect_t) :: src_redir, dst_redir\n  src_redir%kind = 7\n  src_redir%fd = 0\n  src_redir%target_fd = -1\n  allocate(src_redir%filename, source='alpha')\n  src_redir%force_clobber = .true.\n  dst_redir = src_redir\n  src_redir%filename = 'omega'\n  if (.not. allocated(dst_redir%filename)) error stop 1\n  if (trim(dst_redir%filename) /= 'alpha') error stop 2\n  if (dst_redir%kind /= 7) error stop 3\n  if (dst_redir%fd /= 0) error stop 4\n  if (dst_redir%target_fd /= -1) error stop 5\n  if (.not. dst_redir%force_clobber) error stop 6\n  if (trim(src_redir%filename) /= 'omega') error stop 7\n  print *, trim(dst_redir%filename)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_scalar_alloc_char_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived scalar alloc-char copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived scalar alloc-char copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived scalar alloc-char copy run failed");
+    assert!(
+        run.status.success(),
+        "derived scalar alloc-char copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "unexpected derived scalar alloc-char copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_section_assignment_deep_copies_allocatable_char_component() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: redirect_t\n    integer :: kind = 0\n    integer :: fd = -1\n    integer :: target_fd = -1\n    character(len=:), allocatable :: filename\n    logical :: force_clobber = .false.\n  end type redirect_t\n  type(redirect_t), allocatable :: src_redirs(:)\n  type(redirect_t) :: dst_redirs(1)\n  allocate(src_redirs(1))\n  src_redirs(1)%kind = 7\n  src_redirs(1)%fd = 0\n  src_redirs(1)%target_fd = -1\n  allocate(src_redirs(1)%filename, source='alpha')\n  src_redirs(1)%force_clobber = .true.\n  dst_redirs(1:1) = src_redirs(1:1)\n  src_redirs(1)%filename = 'omega'\n  if (.not. allocated(dst_redirs(1)%filename)) error stop 1\n  if (trim(dst_redirs(1)%filename) /= 'alpha') error stop 2\n  if (dst_redirs(1)%kind /= 7) error stop 3\n  if (dst_redirs(1)%fd /= 0) error stop 4\n  if (dst_redirs(1)%target_fd /= -1) error stop 5\n  if (.not. dst_redirs(1)%force_clobber) error stop 6\n  if (trim(src_redirs(1)%filename) /= 'omega') error stop 7\n  print *, trim(dst_redirs(1)%filename)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_section_alloc_char_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived section alloc-char copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived section alloc-char copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived section alloc-char copy run failed");
+    assert!(
+        run.status.success(),
+        "derived section alloc-char copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "unexpected derived section alloc-char copy output: {}",
         stdout
     );
 

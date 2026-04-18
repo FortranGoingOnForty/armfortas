@@ -1710,7 +1710,23 @@ fn select_inst(
         InstKind::GetElementPtr(base, indices) => {
             // GEP: base + index * elem_size
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
-            let base_vreg = ctx.lookup_vreg(*base);
+            let base_src = ctx.lookup_vreg(*base);
+            let base_vreg = if mf.vregs.iter().find(|v| v.id == base_src).map(|v| v.class)
+                != Some(RegClass::Gp64)
+            {
+                let widened = mf.new_vreg(RegClass::Gp64);
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::VReg(widened),
+                        MachineOperand::VReg(base_src),
+                    ],
+                    def: Some(widened),
+                });
+                widened
+            } else {
+                base_src
+            };
 
             // Determine element size from the GEP result type (Ptr<elem_ty>).
             let elem_size = match &inst.ty {
@@ -1719,7 +1735,28 @@ fn select_inst(
             };
 
             if let Some(idx) = indices.first() {
-                let idx_vreg = ctx.lookup_vreg(*idx);
+                let idx_src = ctx.lookup_vreg(*idx);
+                let idx_vreg = if mf.vregs.iter().find(|v| v.id == idx_src).map(|v| v.class)
+                    == Some(RegClass::Gp64)
+                {
+                    idx_src
+                } else {
+                    let widened = mf.new_vreg(RegClass::Gp64);
+                    let opcode = if matches!(func.value_type(*idx), Some(IrType::Bool)) {
+                        ArmOpcode::MovReg
+                    } else {
+                        ArmOpcode::Sxtw
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![
+                            MachineOperand::VReg(widened),
+                            MachineOperand::VReg(idx_src),
+                        ],
+                        def: Some(widened),
+                    });
+                    widened
+                };
                 let tmp = mf.new_vreg(RegClass::Gp64);
                 emit_const_int(mf, mb, tmp, elem_size as i128, IntWidth::I64);
                 let scaled = mf.new_vreg(RegClass::Gp64);

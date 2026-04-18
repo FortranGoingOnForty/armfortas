@@ -11167,17 +11167,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     }
                                 } else if info.derived_type.is_some() {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
-                                    let size = if let Some(ref tn) = info.derived_type {
-                                        ctx.type_layouts.get(tn).map(|l| l.size).unwrap_or(8)
-                                    } else {
-                                        8
-                                    };
-                                    let size_val = b.const_i64(size as i64);
-                                    b.call(
-                                        FuncRef::External("memcpy".into()),
-                                        vec![info.addr, val, size_val],
-                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                    );
+                                    let dest = derived_storage_addr(b, &info);
+                                    if let Some(ref tn) = info.derived_type {
+                                        emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
+                                    }
                                 } else if info.is_pointer {
                                     // Plain `=` on a POINTER dereferences:
                                     // load the target address out of the
@@ -11451,6 +11444,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         vec![field_ptr, src_ptr, src_len],
                                         IrType::Void,
                                     );
+                                } else if matches!(
+                                    field.type_info,
+                                    crate::sema::symtab::TypeInfo::Derived(_)
+                                ) && !field.pointer
+                                    && !field.allocatable
+                                    && field.dims.is_empty()
+                                {
+                                    let src_ptr = lower_expr_ctx_tl(b, ctx, value);
+                                    if let Some(nested_name) = field_derived_type_name(field) {
+                                        emit_derived_value_copy(
+                                            b,
+                                            ctx.type_layouts,
+                                            &nested_name,
+                                            field_ptr,
+                                            src_ptr,
+                                        );
+                                    }
                                 } else {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(
@@ -13160,10 +13170,32 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
             };
 
+            let iostat_addr = controls
+                .iter()
+                .find(|c| {
+                    c.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("iostat"))
+                        .unwrap_or(false)
+                })
+                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
+                .unwrap_or_else(|| b.const_i64(0));
+
+            let size_addr = controls
+                .iter()
+                .find(|c| {
+                    c.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("size"))
+                        .unwrap_or(false)
+                })
+                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
+                .unwrap_or_else(|| b.const_i64(0));
+
             if let Some(ctrl) = controls.first() {
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
-                        lower_internal_read_items(b, ctx, items, buf_ptr, buf_len);
+                        lower_internal_read_items(b, ctx, items, buf_ptr, buf_len, iostat_addr);
                     } else {
                         let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
                             b,
@@ -13173,7 +13205,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             Some(ctx.type_layouts),
                         );
                         lower_formatted_internal_read_items(
-                            b, ctx, items, buf_ptr, buf_len, fmt_ptr, fmt_len,
+                            b,
+                            ctx,
+                            items,
+                            buf_ptr,
+                            buf_len,
+                            fmt_ptr,
+                            fmt_len,
+                            iostat_addr,
+                            size_addr,
                         );
                     }
                     return;
@@ -13187,7 +13227,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 b.const_i32(5) // default stdin
             };
             if is_list_directed {
-                lower_list_read_items(b, ctx, items, unit);
+                lower_list_read_items(b, ctx, items, unit, iostat_addr);
             } else {
                 let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
                     b,
@@ -13196,7 +13236,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     ctx.st,
                     Some(ctx.type_layouts),
                 );
-                lower_formatted_read_items(b, ctx, items, unit, fmt_ptr, fmt_len);
+                lower_formatted_read_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    fmt_ptr,
+                    fmt_len,
+                    iostat_addr,
+                    size_addr,
+                );
             }
         }
 
@@ -15532,8 +15581,8 @@ fn lower_list_read_items(
     ctx: &mut LowerCtx,
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
+    iostat: ValueId,
 ) {
-    let iostat = b.const_i64(0);
     let mode = ReadMode::Unit { unit, iostat };
 
     for item in items {
@@ -15553,11 +15602,11 @@ fn lower_internal_read_items(
     items: &[crate::ast::expr::SpannedExpr],
     buf_ptr: ValueId,
     buf_len: ValueId,
+    iostat: ValueId,
 ) {
     let zero = b.const_i64(0);
     let pos = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero, pos);
-    let iostat = b.alloca(IrType::Int(IntWidth::I32));
     let mode = ReadMode::Internal {
         buf_ptr,
         buf_len,
@@ -16052,9 +16101,10 @@ fn lower_formatted_internal_read_items(
     buf_len: ValueId,
     fmt_ptr: ValueId,
     fmt_len: ValueId,
+    iostat: ValueId,
+    size_out: ValueId,
 ) {
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
-    let iostat = b.alloca(IrType::Int(IntWidth::I32));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
     let mode = ReadMode::FormattedInternal {
@@ -16067,6 +16117,11 @@ fn lower_formatted_internal_read_items(
     };
 
     for item in items {
+        if lower_formatted_char_read_item(
+            b, ctx, item, mode, fmt_ptr, fmt_len, item_idx, iostat, size_out,
+        ) {
+            continue;
+        }
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
@@ -16084,9 +16139,10 @@ fn lower_formatted_read_items(
     unit: ValueId,
     fmt_ptr: ValueId,
     fmt_len: ValueId,
+    iostat: ValueId,
+    size_out: ValueId,
 ) {
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
-    let iostat = b.alloca(IrType::Int(IntWidth::I32));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
     let mode = ReadMode::FormattedUnit {
@@ -16098,6 +16154,11 @@ fn lower_formatted_read_items(
     };
 
     for item in items {
+        if lower_formatted_char_read_item(
+            b, ctx, item, mode, fmt_ptr, fmt_len, item_idx, iostat, size_out,
+        ) {
+            continue;
+        }
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
@@ -16106,6 +16167,72 @@ fn lower_formatted_read_items(
         };
         let _ = lower_read_into_addr(b, mode, &ty, addr);
     }
+}
+
+fn lower_formatted_char_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+    item_idx: ValueId,
+    iostat: ValueId,
+    size_out: ValueId,
+) -> bool {
+    if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
+        return false;
+    }
+
+    let (dest_ptr, dest_len) =
+        if let Some((ptr, len)) = char_addr_and_runtime_len(b, item, &ctx.locals) {
+            (ptr, len)
+        } else {
+            lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+        };
+    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+
+    match mode {
+        ReadMode::FormattedUnit { unit, .. } => {
+            b.call(
+                FuncRef::External("afs_fmt_read_string".into()),
+                vec![
+                    unit,
+                    fmt_ptr,
+                    fmt_len,
+                    current_idx,
+                    dest_ptr,
+                    dest_len,
+                    size_out,
+                    iostat,
+                ],
+                IrType::Void,
+            );
+        }
+        ReadMode::FormattedInternal {
+            buf_ptr, buf_len, ..
+        } => {
+            b.call(
+                FuncRef::External("afs_fmt_read_string_internal".into()),
+                vec![
+                    buf_ptr,
+                    buf_len,
+                    fmt_ptr,
+                    fmt_len,
+                    current_idx,
+                    dest_ptr,
+                    dest_len,
+                    size_out,
+                    iostat,
+                ],
+                IrType::Void,
+            );
+        }
+        _ => return false,
+    }
+
+    bump_formatted_read_index(b, item_idx);
+    true
 }
 
 /// Push a single I/O item value for formatted output via afs_fmt_push_*.
@@ -17789,6 +17916,12 @@ fn lower_1d_section_assign(
         )
     });
 
+    if let Some(type_name) = dest_info.derived_type.as_deref() {
+        let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+        return true;
+    }
+
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
     b.store(zero64, i_addr);
@@ -18227,6 +18360,21 @@ fn lower_array_assign(
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+        return;
+    }
+
+    if let Some(type_name) = dest_info.derived_type.as_deref() {
+        let dest_base_typed = array_base_addr(b, dest_info);
+        let zero = b.const_i64(0);
+        let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
+        let dest_n = array_total_elems_value(b, dest_info);
+        let dest_stride = if local_uses_array_descriptor(dest_info) {
+            let dest_desc = array_descriptor_addr(b, dest_info);
+            load_array_desc_i64_field(b, dest_desc, 24 + 16)
+        } else {
+            b.const_i64(1)
+        };
+        lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
         return;
     }
 
@@ -19683,6 +19831,147 @@ fn store_string_descriptor_view(b: &mut FuncBuilder, desc: ValueId, ptr: ValueId
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), len);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I64), len);
     store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I32), flags);
+}
+
+fn emit_memcpy_bytes(b: &mut FuncBuilder, dest: ValueId, src: ValueId, bytes: i64) {
+    if bytes <= 0 {
+        return;
+    }
+    let size = b.const_i64(bytes);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest, src, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+}
+
+fn derived_storage_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.is_pointer {
+        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    } else if info.allocatable {
+        array_base_addr(b, info)
+    } else if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn emit_derived_value_copy(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    type_name: &str,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
+    let Some(layout) = type_layouts.get(type_name) else {
+        return;
+    };
+
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let dest_field = b.gep(dest_ptr, vec![offset], IrType::Int(IntWidth::I8));
+        let src_field = b.gep(src_ptr, vec![offset], IrType::Int(IntWidth::I8));
+
+        if field.allocatable && is_deferred_char_component_field(field) {
+            let (src_data, src_len) = load_string_descriptor_view(b, src_field);
+            b.call(
+                FuncRef::External("afs_assign_char_deferred".into()),
+                vec![dest_field, src_data, src_len],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        if field.dims.is_empty()
+            && !field.pointer
+            && !field.allocatable
+            && matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_))
+        {
+            let Some(nested_name) = field_derived_type_name(field) else {
+                emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
+                continue;
+            };
+            emit_derived_value_copy(b, type_layouts, &nested_name, dest_field, src_field);
+            continue;
+        }
+
+        emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
+    }
+}
+
+fn lower_derived_array_copy_loop(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    type_name: &str,
+    dest_base: ValueId,
+    dest_n: ValueId,
+    dest_stride: ValueId,
+    value: &crate::ast::expr::SpannedExpr,
+) {
+    let elem_bytes = ctx
+        .type_layouts
+        .get(type_name)
+        .map(|layout| layout.size as i64)
+        .unwrap_or(8);
+    let elem_bytes_val = b.const_i64(elem_bytes);
+    let src_desc =
+        lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
+    let src_n = src_desc.as_ref().map(|(desc, _)| {
+        b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![*desc],
+            IrType::Int(IntWidth::I64),
+        )
+    });
+    let src_stride = src_desc
+        .as_ref()
+        .map(|(desc, _)| load_array_desc_i64_field(b, *desc, 24 + 16));
+    let src_base = src_desc
+        .as_ref()
+        .map(|(desc, _)| b.load_typed(*desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))));
+    let scalar_src = src_desc.is_none().then(|| lower_expr_ctx_tl(b, ctx, value));
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("derived_array_assign_check");
+    let bb_body = b.create_block("derived_array_assign_body");
+    let bb_exit = b.create_block("derived_array_assign_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let mut done = b.icmp(CmpOp::Ge, i, dest_n);
+    if let Some(src_len) = src_n {
+        let src_done = b.icmp(CmpOp::Ge, i, src_len);
+        done = b.or(done, src_done);
+    }
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, elem_bytes_val);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+
+    let src_ptr = if let (Some(src_base), Some(src_stride)) = (src_base, src_stride) {
+        let src_index = b.imul(i_val, src_stride);
+        let src_off = b.imul(src_index, elem_bytes_val);
+        b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8))
+    } else {
+        scalar_src.expect("derived array broadcast should have scalar source")
+    };
+
+    emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, src_ptr);
+
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
 }
 
 fn init_allocated_string_descriptor(b: &mut FuncBuilder, desc: ValueId, len: ValueId) {
