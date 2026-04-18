@@ -1367,6 +1367,76 @@ fn bind_c_c_char_buffer_writes_scalar_character_storage() {
 }
 
 #[test]
+fn bind_c_interface_function_returning_c_ptr_runs() {
+    let dir = unique_dir("bind_c_c_ptr_return");
+    let c_src = write_program_in(
+        &dir,
+        "get_static_buf.c",
+        "#include <stddef.h>\n\nvoid *get_static_buf(void) {\n    static char buf[4] = {'o', 'k', 0, 0};\n    return buf;\n}\n",
+    );
+    let c_obj = dir.join("get_static_buf.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_ptr, c_char, c_f_pointer\n  implicit none\n  interface\n    function get_static_buf() result(raw) bind(C, name='get_static_buf')\n      import :: c_ptr\n      type(c_ptr) :: raw\n    end function\n  end interface\n  type(c_ptr) :: raw\n  character(kind=c_char), pointer :: view(:)\n\n  raw = get_static_buf()\n  call c_f_pointer(raw, view, [4])\n  if (.not. associated(view)) error stop 1\n  if (view(1) /= achar(111, kind=c_char)) error stop 2\n  if (view(2) /= achar(107, kind=c_char)) error stop 3\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_ptr return object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) c_ptr return should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_ptr_return.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_ptr return link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) c_ptr return objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) c_ptr return run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) c_ptr return should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "bind(c) c_ptr return should preserve the full pointer value: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_procedure_case_and_bind_label_survive_amod_import() {
     let dir = unique_dir("amod_case_bind");
     let mod_src = write_program_in(

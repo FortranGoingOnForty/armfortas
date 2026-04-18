@@ -324,6 +324,8 @@ fn resolve_unit(
                         ProgramUnit::Function {
                             name: fn_name,
                             return_type,
+                            result,
+                            decls,
                             args,
                             bind,
                             ..
@@ -338,7 +340,28 @@ fn resolve_unit(
                                     }
                                 })
                                 .collect();
-                            let ti = return_type.as_ref().map(|ts| type_spec_to_info(ts, st));
+                            let ti = return_type
+                                .as_ref()
+                                .map(|ts| type_spec_to_info(ts, st))
+                                .or_else(|| {
+                                    let result_name = result.as_deref().unwrap_or(fn_name.as_str());
+                                    let key = result_name.to_lowercase();
+                                    for d in decls {
+                                        if let decl::Decl::TypeDecl {
+                                            type_spec,
+                                            entities,
+                                            ..
+                                        } = &d.node
+                                        {
+                                            for e in entities {
+                                                if e.name.to_lowercase() == key {
+                                                    return Some(type_spec_to_info(type_spec, st));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None
+                                });
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
