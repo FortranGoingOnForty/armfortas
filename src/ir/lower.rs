@@ -1824,6 +1824,7 @@ fn collect_module_globals(
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
     let param_consts = collect_decl_param_consts(decls);
+    let param_char_consts = collect_decl_param_char_consts(decls);
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for decl in decls {
         if let Decl::ParameterStmt { pairs } = &decl.node {
@@ -1854,20 +1855,6 @@ fn collect_module_globals(
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let is_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
             let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
-            let global_char_kind = match type_spec {
-                TypeSpec::Character(Some(sel)) => match &sel.len {
-                    Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                        eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
-                            .map(CharKind::Fixed)
-                            .unwrap_or(CharKind::None)
-                    }
-                    Some(crate::ast::decl::LenSpec::Colon) => CharKind::Deferred,
-                    Some(crate::ast::decl::LenSpec::Star) => CharKind::None,
-                    None => CharKind::Fixed(1),
-                },
-                TypeSpec::Character(None) => CharKind::Fixed(1),
-                _ => CharKind::None,
-            };
             for entity in entities {
                 let key = entity.name.to_lowercase();
                 let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
@@ -1876,6 +1863,17 @@ fn collect_module_globals(
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
                 let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
+                let char_len =
+                    declared_char_len(type_spec, init_expr, &param_consts, &param_char_consts, st);
+                let global_char_kind = if matches!(
+                    type_spec,
+                    TypeSpec::Character(Some(sel))
+                        if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+                ) {
+                    CharKind::Deferred
+                } else {
+                    char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
+                };
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
@@ -1888,6 +1886,10 @@ fn collect_module_globals(
                 if (is_allocatable || is_pointer) && array_spec.is_some() {
                     let storage_ty = if let Some(type_name) = &derived_type_name {
                         derived_storage_ir_type(type_name, type_layouts)
+                            .unwrap_or_else(|| ir_ty.clone())
+                    } else if matches!(type_spec, TypeSpec::Character(_)) {
+                        char_len
+                            .map(fixed_char_storage_ir_type)
                             .unwrap_or_else(|| ir_ty.clone())
                     } else {
                         ir_ty.clone()
@@ -1955,36 +1957,20 @@ fn collect_module_globals(
                     if total <= 0 {
                         continue; // assumed/deferred shape — skip
                     }
-                    if let Some(type_name) = &derived_type_name {
+                    let elem_storage_ty = if let Some(type_name) = &derived_type_name {
                         if let Some(layout) = type_layouts.get(type_name) {
-                            let elem_ty = IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                layout.size as u64,
-                            );
-                            let global_ty = IrType::Array(Box::new(elem_ty.clone()), total as u64);
-                            module.add_global(Global {
-                                name: symbol.clone(),
-                                ty: global_ty,
-                                initializer: Some(GlobalInit::Zero),
-                            });
-                            globals.insert(
-                                (mod_name.to_lowercase(), entity.name.to_lowercase()),
-                                ModuleGlobalInfo {
-                                    symbol,
-                                    ty: elem_ty,
-                                    dims,
-                                    allocatable: false,
-                                    is_pointer,
-                                    deferred_char: false,
-                                    derived_type: Some(type_name.clone()),
-                                    char_kind: CharKind::None,
-                                    external: false,
-                                },
-                            );
-                            continue;
+                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64)
+                        } else {
+                            ir_ty.clone()
                         }
-                    }
-                    let global_ty = IrType::Array(Box::new(ir_ty.clone()), total as u64);
+                    } else if matches!(type_spec, TypeSpec::Character(_)) {
+                        char_len
+                            .map(fixed_char_storage_ir_type)
+                            .unwrap_or_else(|| ir_ty.clone())
+                    } else {
+                        ir_ty.clone()
+                    };
+                    let global_ty = IrType::Array(Box::new(elem_storage_ty.clone()), total as u64);
 
                     // Audit MAJOR-3: detect over-long initializer
                     // BEFORE eval_const_array_init returns None.
@@ -2024,12 +2010,12 @@ fn collect_module_globals(
                         (mod_name.to_lowercase(), entity.name.to_lowercase()),
                         ModuleGlobalInfo {
                             symbol,
-                            ty: ir_ty.clone(),
+                            ty: elem_storage_ty,
                             dims,
                             allocatable: false,
                             is_pointer,
                             deferred_char: false,
-                            derived_type: None,
+                            derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
                             external: false,
                         },
@@ -2058,6 +2044,34 @@ fn collect_module_globals(
                             },
                         );
                         continue;
+                    }
+                    if matches!(type_spec, TypeSpec::Character(_)) {
+                        if let Some(len) = char_len {
+                            let storage_ty = fixed_char_storage_ir_type(len);
+                            let init = init_expr.and_then(|e| {
+                                eval_const_char_global_init(e, &param_char_consts, len)
+                            });
+                            module.add_global(Global {
+                                name: symbol.clone(),
+                                ty: storage_ty.clone(),
+                                initializer: Some(init.unwrap_or(GlobalInit::Zero)),
+                            });
+                            globals.insert(
+                                (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                                ModuleGlobalInfo {
+                                    symbol,
+                                    ty: storage_ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    is_pointer: false,
+                                    deferred_char: false,
+                                    derived_type: None,
+                                    char_kind: CharKind::Fixed(len),
+                                    external: false,
+                                },
+                            );
+                            continue;
+                        }
                     }
                     if let Some(type_name) = &derived_type_name {
                         if let Some(layout) = type_layouts.get(type_name) {
@@ -3443,6 +3457,98 @@ fn eval_const_global_init_with_any_scope(
     })
 }
 
+fn eval_const_char_bytes(
+    e: &crate::ast::expr::SpannedExpr,
+    param_chars: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    match &e.node {
+        Expr::StringLiteral { value, .. } => Some(value.as_bytes().to_vec()),
+        Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned(),
+        Expr::ParenExpr { inner } => eval_const_char_bytes(inner, param_chars),
+        Expr::BinaryOp {
+            op: BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let mut out = eval_const_char_bytes(left, param_chars)?;
+            out.extend(eval_const_char_bytes(right, param_chars)?);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn collect_decl_param_char_consts(
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> HashMap<String, Vec<u8>> {
+    let mut out = HashMap::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Parameter)) =>
+            {
+                for entity in entities {
+                    if let Some(init) = entity.init.as_ref() {
+                        if let Some(bytes) = eval_const_char_bytes(init, &out) {
+                            out.insert(entity.name.to_lowercase(), bytes);
+                        }
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    if let Some(bytes) = eval_const_char_bytes(expr, &out) {
+                        out.insert(name.to_lowercase(), bytes);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn declared_char_len(
+    type_spec: &TypeSpec,
+    init_expr: Option<&crate::ast::expr::SpannedExpr>,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    match type_spec {
+        TypeSpec::Character(Some(sel)) => match &sel.len {
+            Some(crate::ast::decl::LenSpec::Expr(e)) => {
+                eval_const_int_in_scope_or_any_scope(e, param_consts, st)
+            }
+            Some(crate::ast::decl::LenSpec::Star) => init_expr
+                .and_then(|expr| eval_const_char_bytes(expr, param_char_consts))
+                .map(|bytes| bytes.len() as i64),
+            Some(crate::ast::decl::LenSpec::Colon) => None,
+            None => Some(1),
+        },
+        TypeSpec::Character(None) => Some(1),
+        _ => None,
+    }
+}
+
+fn eval_const_char_global_init(
+    e: &crate::ast::expr::SpannedExpr,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    len: i64,
+) -> Option<GlobalInit> {
+    let mut bytes = eval_const_char_bytes(e, param_char_consts)?;
+    let target_len = usize::try_from(len).ok()?;
+    if bytes.len() > target_len {
+        bytes.truncate(target_len);
+    } else if bytes.len() < target_len {
+        bytes.resize(target_len, b' ');
+    }
+    Some(GlobalInit::String(bytes))
+}
+
 /// Internal const-folding result for initializer expressions.
 /// Int is used for integer kinds AND logical (0/1). Float is
 /// used for real/double precision.
@@ -4499,6 +4605,7 @@ fn alloc_decls(
     // Parameters can reference earlier parameters (`tau = 2 * pi`),
     // so we walk decls in order and build the map incrementally.
     let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
+    let param_char_consts = collect_decl_param_char_consts(decls);
 
     for decl in decls {
         if let Decl::TypeDecl {
@@ -4524,25 +4631,17 @@ fn alloc_decls(
                 if locals.contains_key(&key) {
                     continue;
                 }
+                let init_expr: Option<&crate::ast::expr::SpannedExpr> = entity
+                    .init
+                    .as_ref()
+                    .or_else(|| parameter_inits.get(&key).copied());
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
                 // Check for character type.
-                let char_len = match type_spec {
-                    TypeSpec::Character(Some(sel)) => {
-                        match &sel.len {
-                            Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                                eval_const_int_in_scope_or_any_scope(e, &param_consts, st)
-                            }
-                            Some(crate::ast::decl::LenSpec::Star) => None, // assumed
-                            Some(crate::ast::decl::LenSpec::Colon) => None, // deferred
-                            None => Some(1),                               // default len=1
-                        }
-                    }
-                    TypeSpec::Character(None) => Some(1),
-                    _ => None,
-                };
+                let char_len =
+                    declared_char_len(type_spec, init_expr, &param_consts, &param_char_consts, st);
                 let runtime_char_len_expr = match type_spec {
                     TypeSpec::Character(Some(sel)) => match &sel.len {
                         Some(crate::ast::decl::LenSpec::Expr(e))
@@ -5337,10 +5436,6 @@ fn alloc_decls(
                     //       parameter → SAVE-promote to a module
                     //       global (F2018 §8.5.16 implicit SAVE).
                     //   (c) Plain alloca, no init.
-                    let init_expr: Option<&crate::ast::expr::SpannedExpr> = entity
-                        .init
-                        .as_ref()
-                        .or_else(|| parameter_inits.get(&key).copied());
                     let is_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter))
                         || parameter_inits.contains_key(&key);
 
@@ -5590,6 +5685,27 @@ fn init_decls(
                     let Some(info) = locals.get(&key) else {
                         continue;
                     };
+                    if let CharKind::Fixed(len) = info.char_kind {
+                        let (src_ptr, src_len) = lower_string_expr(b, locals, expr, st);
+                        let dest_len = b.const_i64(len);
+                        b.call(
+                            FuncRef::External("afs_assign_char_fixed".into()),
+                            vec![info.addr, dest_len, src_ptr, src_len],
+                            IrType::Void,
+                        );
+                        continue;
+                    }
+                    if let CharKind::FixedRuntime { len_addr } = info.char_kind {
+                        let (src_ptr, src_len) = lower_string_expr(b, locals, expr, st);
+                        let (dest_ptr, dest_len) =
+                            fixed_runtime_char_ptr_and_len(b, info, len_addr);
+                        b.call(
+                            FuncRef::External("afs_assign_char_fixed".into()),
+                            vec![dest_ptr, dest_len, src_ptr, src_len],
+                            IrType::Void,
+                        );
+                        continue;
+                    }
                     if !info.dims.is_empty()
                         || info.allocatable
                         || info.by_ref

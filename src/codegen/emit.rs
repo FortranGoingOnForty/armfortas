@@ -16,6 +16,18 @@ fn emit_i128_words(out: &mut String, value: i128) {
     writeln!(out, "    .quad 0x{:016x}", hi).unwrap();
 }
 
+fn emit_byte_values(out: &mut String, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let joined = bytes
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "    .byte {}", joined).unwrap();
+}
+
 fn byte_array_align_log2(byte_count: u64) -> u8 {
     if byte_count >= 8 {
         3
@@ -106,6 +118,15 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                         writeln!(out, "    {} {}", directive, v).unwrap();
                     }
                 }
+                Some(GlobalInit::String(bytes))
+                    if matches!(elem_ty.as_ref(), IrType::Int(IntWidth::I8) | IrType::Bool) =>
+                {
+                    emit_byte_values(&mut out, bytes);
+                    let total = *count as usize;
+                    if bytes.len() < total {
+                        writeln!(out, "    .space {}", total - bytes.len()).unwrap();
+                    }
+                }
                 _ => {
                     // Nested arrays (for example arrays of byte-packed derived
                     // values) don't have a scalar element directive. Emit their
@@ -175,7 +196,12 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                 }
             }
             Some(GlobalInit::Zero) | None => default_zero.into(),
-            Some(GlobalInit::String(_)) => default_zero.into(), // strings TBD
+            Some(GlobalInit::String(bytes))
+                if matches!(g.ty, IrType::Int(IntWidth::I8) | IrType::Bool) =>
+            {
+                bytes.first().copied().unwrap_or(0).to_string()
+            }
+            Some(GlobalInit::String(_)) => default_zero.into(),
             Some(GlobalInit::IntArray(_)) | Some(GlobalInit::FloatArray(_)) => {
                 // Array initializer on a scalar-typed global —
                 // shouldn't happen, but emit zero as a safe fallback.

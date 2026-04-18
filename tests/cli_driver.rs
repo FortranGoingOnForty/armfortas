@@ -5249,6 +5249,126 @@ fn char_concat_actual_to_assumed_len_dummy_runs() {
 }
 
 #[test]
+fn char_parameter_constants_preserve_bytes_and_concat() {
+    let src = write_program(
+        "module version_matrix\n  implicit none\n  character(len=*), parameter :: mod_star = '1.7.0'\ncontains\n  subroutine print_mod_star()\n    print '(a)', mod_star\n  end subroutine\n  subroutine print_mod_star_concat()\n    print '(a)', 'fortsh ' // mod_star\n  end subroutine\nend module\n\nprogram main\n  use version_matrix\n  implicit none\n  character(len=*), parameter :: local_star = '2.3.4'\n  print '(a)', local_star\n  call print_mod_star()\n  call print_mod_star_concat()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_param_matrix", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char parameter matrix compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char parameter matrix compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char parameter matrix runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let lines: Vec<_> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["2.3.4", "1.7.0", "fortsh 1.7.0"],
+        "unexpected char parameter runtime output"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn char_parameter_round_trips_through_amod_import() {
+    let dir = unique_dir("char_param_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "version_mod.f90",
+        "module version_mod\n  implicit none\n  character(len=*), parameter :: fortsh_version = '1.7.0'\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use version_mod, only: fortsh_version\n  implicit none\n  print '(a)', fortsh_version\nend program\n",
+    );
+    let mod_obj = dir.join("version_mod.o");
+    let user_obj = dir.join("user.o");
+    let out = dir.join("user_bin");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("char parameter module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "char parameter module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("char parameter user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "char parameter user compile failed: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("char parameter link spawn failed");
+    assert!(
+        link.status.success(),
+        "char parameter link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char parameter user runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "1.7.0",
+        "unexpected imported char parameter output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_funptr, c_intptr_t\ncontains\n  subroutine s(buf, mask, ok)\n    character(len=:), allocatable, intent(inout) :: buf\n    logical, intent(in) :: mask\n    logical, intent(out) :: ok\n    type(c_funptr) :: sig_ign\n    if (allocated(buf)) then\n      ok = lgt(trim(buf), 'a')\n    else\n      ok = .false.\n    end if\n    ok = ok .or. any(buf(1:1) == ['!', '?'])\n    buf = merge(buf // new_line('a'), '?', mask)\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine s\nend module m\n",

@@ -165,12 +165,23 @@ fn emit_variable(
     sym: &Symbol,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
 ) {
+    let global_key = (mod_key.to_string(), name.to_lowercase());
+    let global_info = globals.get(&global_key);
     let type_str = if matches!(sym.kind, SymbolKind::ProcedurePointer) {
         sym.attrs
             .procedure_iface
             .as_ref()
             .map(|iface| format!("type({})", iface))
             .unwrap_or_else(|| "unknown".to_string())
+    } else if let (
+        Some(TypeInfo::Character { len: None, .. }),
+        Some(ModuleGlobalInfo {
+            char_kind: crate::ir::lower::CharKind::Fixed(n),
+            ..
+        }),
+    ) = (sym.type_info.as_ref(), global_info)
+    {
+        format!("character(len={})", n)
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
@@ -196,8 +207,7 @@ fn emit_variable(
         write!(out, ", {}", attrs.join(", ")).unwrap();
     }
 
-    let global_key = (mod_key.to_string(), name.to_lowercase());
-    if let Some(info) = globals.get(&global_key) {
+    if let Some(info) = global_info {
         write!(out, " @ir {}", info.symbol).unwrap();
         if info.deferred_char {
             write!(out, " @deferred_char").unwrap();
@@ -219,14 +229,26 @@ fn emit_parameter(
     sym: &Symbol,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
 ) {
-    let type_str = type_info_to_string(sym.type_info.as_ref());
+    let global_key = (mod_key.to_string(), name.to_lowercase());
+    let global_info = globals.get(&global_key);
+    let type_str = if let (
+        Some(TypeInfo::Character { len: None, .. }),
+        Some(ModuleGlobalInfo {
+            char_kind: crate::ir::lower::CharKind::Fixed(n),
+            ..
+        }),
+    ) = (sym.type_info.as_ref(), global_info)
+    {
+        format!("character(len={})", n)
+    } else {
+        type_info_to_string(sym.type_info.as_ref())
+    };
     if let Some(cv) = sym.const_value {
         writeln!(out, "@param {} : {} = {}", name, type_str, cv).unwrap();
     } else {
         // Parameter without a folded const_value — emit with @ir
         // so the reader can at least reference the global.
-        let global_key = (mod_key.to_string(), name.to_lowercase());
-        if let Some(info) = globals.get(&global_key) {
+        if let Some(info) = global_info {
             writeln!(out, "@param {} : {} @ir {}", name, type_str, info.symbol).unwrap();
         } else {
             writeln!(out, "@param {} : {}", name, type_str).unwrap();
@@ -1263,9 +1285,9 @@ pub fn extract_module_globals(
     let mod_key = iface.module_name.to_lowercase();
     let mut out = HashMap::new();
     for var in &iface.variables {
-        if var.is_parameter {
+        if var.is_parameter && var.ir_symbol.is_none() {
             continue;
-        } // PARAMETERs are inlined, no global
+        } // PARAMETERs with folded values inline; others still need storage
         if let Some(ref ir_sym) = var.ir_symbol {
             let derived_type = match var.type_info.as_ref() {
                 Some(TypeInfo::Derived(name)) => Some(name.clone()),
@@ -1299,6 +1321,17 @@ pub fn extract_module_globals(
                     )
                 } else {
                     type_info_to_ir_type(var.type_info.as_ref())
+                }
+            } else if let Some(TypeInfo::Character { len: Some(n), .. }) = var.type_info.as_ref() {
+                if *n <= 1 {
+                    crate::ir::types::IrType::Int(crate::ir::types::IntWidth::I8)
+                } else {
+                    crate::ir::types::IrType::Array(
+                        Box::new(crate::ir::types::IrType::Int(
+                            crate::ir::types::IntWidth::I8,
+                        )),
+                        *n as u64,
+                    )
                 }
             } else {
                 type_info_to_ir_type(var.type_info.as_ref())
