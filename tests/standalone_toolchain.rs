@@ -368,7 +368,11 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
 
     for (name, needle) in cases {
         let source = root.join("test_programs").join(name);
-        assert!(source.exists(), "missing source fixture {}", source.display());
+        assert!(
+            source.exists(),
+            "missing source fixture {}",
+            source.display()
+        );
 
         let dir = unique_dir(&format!("standalone_matrix_{name}"));
         let default_bin = dir.join(format!("{name}.default.out"));
@@ -381,7 +385,10 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
             &[],
             &format!("default armfortas compile for {name}"),
         );
-        assert_success(&default_compile, &format!("default armfortas compile for {name}"));
+        assert_success(
+            &default_compile,
+            &format!("default armfortas compile for {name}"),
+        );
         let default_run = run_binary(&default_bin, &format!("default armfortas run for {name}"));
 
         let standalone_compile = compile_with_driver(
@@ -400,8 +407,10 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
             &standalone_compile,
             &format!("standalone armfortas compile for {name}"),
         );
-        let standalone_run =
-            run_binary(&standalone_bin, &format!("standalone armfortas run for {name}"));
+        let standalone_run = run_binary(
+            &standalone_bin,
+            &format!("standalone armfortas run for {name}"),
+        );
 
         let default_stdout = String::from_utf8_lossy(&default_run.stdout);
         let standalone_stdout = String::from_utf8_lossy(&standalone_run.stdout);

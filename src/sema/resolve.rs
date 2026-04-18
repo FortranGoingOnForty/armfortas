@@ -926,6 +926,21 @@ fn collect_derived_type_layouts(
     }
 }
 
+fn parse_boz_i64(text: &str, base: crate::ast::expr::BozBase) -> Option<i64> {
+    let radix = match base {
+        crate::ast::expr::BozBase::Binary => 2,
+        crate::ast::expr::BozBase::Octal => 8,
+        crate::ast::expr::BozBase::Hex => 16,
+    };
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !matches!(c, '\'' | '"'))
+        .skip(1)
+        .take_while(|c| !matches!(c, '\'' | '"'))
+        .collect();
+    i64::from_str_radix(&digits, radix).ok()
+}
+
 fn eval_const_int_expr_with_params(
     expr: &crate::ast::expr::SpannedExpr,
     const_params: &HashMap<String, i64>,
@@ -936,6 +951,7 @@ fn eval_const_int_expr_with_params(
             let clean = text.split('_').next().unwrap_or(text);
             clean.parse::<i64>().ok()
         }
+        Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
         Expr::Name { name } => const_params.get(&name.to_lowercase()).copied(),
         Expr::UnaryOp { op, operand } => {
             let v = eval_const_int_expr_with_params(operand, const_params)?;
@@ -1010,6 +1026,24 @@ fn eval_const_int_expr_with_params(
                         }
                         Expr::IntegerLiteral { .. } => Some(4),
                         _ => None,
+                    }
+                }
+                "int" => {
+                    let arg = args.first()?;
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    match &e.node {
+                        Expr::RealLiteral { text, .. } => text
+                            .replace('d', "e")
+                            .replace('D', "E")
+                            .split('_')
+                            .next()
+                            .unwrap_or(text)
+                            .parse::<f64>()
+                            .ok()
+                            .map(|v| v.trunc() as i64),
+                        _ => eval_const_int_expr_with_params(e, const_params),
                     }
                 }
                 _ => None,
@@ -1338,6 +1372,7 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
             let clean = text.split('_').next().unwrap_or(text);
             clean.parse::<i64>().ok()
         }
+        Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
         Expr::Name { name } => {
             // Look up the name in the current scope chain.
             let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
@@ -1423,6 +1458,24 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                             }
                         } else {
                             None
+                        }
+                    }
+                    "int" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        match &e.node {
+                            Expr::RealLiteral { text, .. } => text
+                                .replace('d', "e")
+                                .replace('D', "E")
+                                .split('_')
+                                .next()
+                                .unwrap_or(text)
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| v.trunc() as i64),
+                            _ => eval_const_int_expr(e, st),
                         }
                     }
                     _ => None,

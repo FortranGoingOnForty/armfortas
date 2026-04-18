@@ -6,6 +6,11 @@
 use super::symtab::TypeInfo;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+pub enum FieldDefaultInit {
+    Character(String),
+}
+
 /// Layout of a single field in a derived type.
 #[derive(Debug, Clone)]
 pub struct FieldLayout {
@@ -21,6 +26,7 @@ pub struct FieldLayout {
     pub allocatable: bool,
     pub pointer: bool,
     pub target: bool,
+    pub default_init: Option<FieldDefaultInit>,
 }
 
 /// A type-bound procedure mapping.
@@ -362,8 +368,10 @@ pub fn compute_layout(
                         && entity.array_spec.is_none()
                     {
                         (32, 8) // StringDescriptor for deferred-length scalar char components
+                    } else if is_pointer && entity.array_spec.is_none() {
+                        (8, 8) // Scalar POINTER components are pointer slots, not descriptors
                     } else if is_allocatable || is_pointer {
-                        (384, 8) // ArrayDescriptor size for allocatable/pointer components
+                        (384, 8) // ArrayDescriptor size for allocatable/pointer array components
                     } else if let TypeInfo::Derived(ref dname) = ti {
                         registry
                             .get(dname)
@@ -384,6 +392,19 @@ pub fn compute_layout(
                         .product::<usize>()
                 };
                 let field_size = elem_size.saturating_mul(elem_count.max(1));
+                let default_init = if dims.is_empty() && !is_allocatable && !is_pointer {
+                    match (&ti, entity.init.as_ref()) {
+                        (TypeInfo::Character { .. }, Some(init)) => match &init.node {
+                            crate::ast::expr::Expr::StringLiteral { value, .. } => {
+                                Some(FieldDefaultInit::Character(value.clone()))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
 
                 fields.push(FieldLayout {
                     name: entity.name.clone(),
@@ -394,6 +415,7 @@ pub fn compute_layout(
                     allocatable: is_allocatable,
                     pointer: is_pointer,
                     target: is_target,
+                    default_init,
                 });
                 offset += field_size;
             }
@@ -470,6 +492,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    default_init: None,
                 },
                 FieldLayout {
                     name: "y".into(),
@@ -480,6 +503,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    default_init: None,
                 },
             ],
             bound_procs: vec![],
@@ -514,6 +538,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    default_init: None,
                 },
                 FieldLayout {
                     name: "b".into(),
@@ -524,6 +549,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    default_init: None,
                 },
                 FieldLayout {
                     name: "c".into(),
@@ -534,6 +560,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    default_init: None,
                 },
             ],
             bound_procs: vec![],
@@ -595,6 +622,35 @@ mod tests {
 
     fn empty_params() -> std::collections::HashMap<String, i64> {
         std::collections::HashMap::new()
+    }
+
+    fn make_component_with_attrs(
+        name: &str,
+        ts: crate::ast::decl::TypeSpec,
+        attrs: Vec<crate::ast::decl::Attribute>,
+    ) -> crate::ast::decl::SpannedDecl {
+        use crate::ast::decl::*;
+        use crate::ast::Spanned;
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+        Spanned::new(
+            Decl::TypeDecl {
+                type_spec: ts,
+                attrs,
+                entities: vec![EntityDecl {
+                    name: name.to_string(),
+                    array_spec: None,
+                    char_len: None,
+                    init: None,
+                    ptr_init: None,
+                }],
+            },
+            span,
+        )
     }
 
     #[test]
@@ -674,6 +730,34 @@ mod tests {
         assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
         assert_eq!(child_layout.field("y").unwrap().offset, 4); // appended
         assert_eq!(child_layout.size, 8);
+    }
+
+    #[test]
+    fn compute_layout_scalar_derived_pointer_component_uses_pointer_slot() {
+        let mut reg = TypeLayoutRegistry::new();
+        reg.insert(TypeLayout {
+            name: "node_t".into(),
+            size: 16,
+            align: 8,
+            fields: vec![],
+            bound_procs: vec![],
+            final_procs: vec![],
+            type_tag: 0,
+            parent: None,
+        });
+        let components = vec![make_component_with_attrs(
+            "left",
+            crate::ast::decl::TypeSpec::Type("node_t".into()),
+            vec![crate::ast::decl::Attribute::Pointer],
+        )];
+
+        let layout = compute_layout("list_t", &[], &[], &components, None, &reg, &empty_params());
+        let field = layout.field("left").expect("missing left field");
+
+        assert_eq!(field.size, 8);
+        assert_eq!(field.offset, 0);
+        assert!(field.pointer);
+        assert_eq!(layout.size, 8);
     }
 
     #[test]

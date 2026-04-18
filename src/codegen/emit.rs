@@ -72,7 +72,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         // directive from the element type so `.long` / `.quad` /
         // `.single` / `.double` all work correctly.
         if let IrType::Array(elem_ty, count) = &g.ty {
-            let (align, directive, elem_bytes, is_float) = match elem_ty.as_ref() {
+            let (align, directive, _elem_bytes, is_float) = match elem_ty.as_ref() {
                 IrType::Int(IntWidth::I8) | IrType::Bool => {
                     (byte_array_align_log2(*count), ".byte", 1, false)
                 }
@@ -107,7 +107,11 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                     }
                 }
                 _ => {
-                    let byte_size = count * (elem_bytes as u64);
+                    // Nested arrays (for example arrays of byte-packed derived
+                    // values) don't have a scalar element directive. Emit their
+                    // zero-initialized storage using the full IR type size
+                    // instead of falling back to a bogus ".quad * count" size.
+                    let byte_size = g.ty.size_bytes();
                     writeln!(out, "    .space {}", byte_size).unwrap();
                 }
             }
@@ -1250,6 +1254,24 @@ mod tests {
         assert!(
             asm.contains(".p2align 3\n_history:"),
             "byte-array globals that model descriptors/derived storage need 8-byte alignment:\n{}",
+            asm
+        );
+    }
+
+    #[test]
+    fn emit_nested_byte_array_global_uses_full_storage_size() {
+        let asm = emit_globals(&[Global {
+            name: "command_cache".into(),
+            ty: IrType::Array(
+                Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 264)),
+                4,
+            ),
+            initializer: Some(GlobalInit::Zero),
+        }]);
+
+        assert!(
+            asm.contains("_command_cache:\n    .space 1056"),
+            "nested byte-array globals should reserve their full storage size:\n{}",
             asm
         );
     }

@@ -630,6 +630,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         )
         .0
     }

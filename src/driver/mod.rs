@@ -1166,6 +1166,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     // 6. Lower to IR.
+    let mut external_optional_params = std::collections::HashMap::new();
+    for ext_mod in &resolve_result.external_modules {
+        external_optional_params.extend(crate::sema::amod::extract_optional_params(ext_mod));
+    }
+
     let mut external_descriptor_params = std::collections::HashMap::new();
     for ext_mod in &resolve_result.external_modules {
         external_descriptor_params.extend(crate::sema::amod::extract_descriptor_params(ext_mod));
@@ -1182,6 +1187,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         &st,
         &type_layouts,
         external_globals,
+        external_optional_params,
         external_descriptor_params,
         external_char_len_star,
     );
@@ -1258,17 +1264,23 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
 
-    // 8. Register allocation (linear scan).
+    let use_naive_regalloc = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
+
+    // 8. Register allocation.
     for mf in &mut allocated {
-        let liveness = crate::codegen::liveness::compute_liveness(mf);
-        let result = linearscan::linear_scan(mf);
-        linearscan::apply_allocation(mf, &result, &liveness);
-        linearscan::insert_callee_saves(mf, &result.callee_saved_used);
-        linearscan::coalesce_moves(mf);
-        // 8.5. Tail call optimization (O1+): BL + epilogue → epilogue + B.
-        // Runs after regalloc so we can inspect physical register assignments.
-        if opts.opt_level >= OptLevel::O1 {
-            crate::codegen::tailcall::tail_call_opt(mf);
+        if use_naive_regalloc {
+            crate::codegen::regalloc::regalloc_naive(mf);
+        } else {
+            let liveness = crate::codegen::liveness::compute_liveness(mf);
+            let result = linearscan::linear_scan(mf);
+            linearscan::apply_allocation(mf, &result, &liveness);
+            linearscan::insert_callee_saves(mf, &result.callee_saved_used);
+            linearscan::coalesce_moves(mf);
+            // 8.5. Tail call optimization (O1+): BL + epilogue → epilogue + B.
+            // Runs after regalloc so we can inspect physical register assignments.
+            if opts.opt_level >= OptLevel::O1 {
+                crate::codegen::tailcall::tail_call_opt(mf);
+            }
         }
     }
 

@@ -455,6 +455,94 @@ fn module_parameter_alias_from_used_module_initializes_global() {
 }
 
 #[test]
+fn module_boz_int_parameter_initializes_global_and_exports_value() {
+    let dir = unique_dir("module_boz_int_param");
+    let m_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  use iso_c_binding\n  implicit none\n  integer(c_int), parameter :: s_ifdir = int(o'040000', c_int)\n  integer(c_int), parameter :: s_ifmt = int(o'170000', c_int)\ncontains\n  function sum_constants() result(v)\n    integer(c_int) :: v\n    v = s_ifdir + s_ifmt\n  end function sum_constants\nend module m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int\n  use m, only: s_ifdir, s_ifmt, sum_constants\n  implicit none\n  if (s_ifdir /= 16384_c_int) error stop 1\n  if (s_ifmt /= 61440_c_int) error stop 2\n  if (sum_constants() /= 77824_c_int) error stop 3\n  print *, s_ifdir, s_ifmt, sum_constants()\nend program p\n",
+    );
+
+    let m_obj = dir.join("m.o");
+    let compile_m = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            m_src.to_str().unwrap(),
+            "-o",
+            m_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile failed to spawn");
+    assert!(
+        compile_m.status.success(),
+        "module BOZ parameter compile should succeed: {}",
+        String::from_utf8_lossy(&compile_m.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile against BOZ parameter module: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("module_boz_int_param.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            m_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "BOZ parameter objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "BOZ parameter binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("16384") && stdout.contains("61440") && stdout.contains("77824"),
+        "module BOZ parameter values should survive globals and use-association: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_param_char_dummy_element_assignment_runs() {
     let dir = unique_dir("imported_param_char_dummy");
     let cfg_src = write_program_in(
@@ -1178,6 +1266,43 @@ fn pointer_dummy_associated_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn local_derived_pointer_actual_passes_target_to_pointer_dummy() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\n  type(node_t), target :: target_node\n  type(node_t), pointer :: root\n  target_node%value = 42\n  root => target_node\n  call check(root)\ncontains\n  subroutine check(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node)) error stop 1\n    if (node%value /= 42) error stop 2\n    print *, 'ok'\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_pointer_actual_to_pointer_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived pointer actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived pointer actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived pointer actual run failed");
+    assert!(
+        run.status.success(),
+        "derived pointer actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived pointer actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_function_result_associated_lowers_without_raw_symbol() {
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  recursive function parse() result(node)\n    type(node_t), pointer :: node, right_node\n    nullify(node)\n    if (.not. associated(node)) return\n    if (.not. associated(right_node)) return\n  end function parse\nend module m\n",
@@ -1406,6 +1531,363 @@ fn scalar_char_component_ops_and_achar_compile() {
         !undefined.iter().any(|sym| sym == "_achar" || sym == "_ifs"),
         "scalar char component lowering should not introduce raw achar/ifs symbols: {:?}",
         undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_derived_pointer_preserves_blank_char_component_default() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=8) :: heredoc_delimiter = ''\n  end type simple_command_data_t\n  type(simple_command_data_t), pointer :: cmd\n  allocate(cmd)\n  if (len_trim(cmd%heredoc_delimiter) /= 0) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_pointer_blank_char_default", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived pointer blank-char default compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived pointer blank-char default compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived pointer blank-char default run failed");
+    assert!(
+        run.status.success(),
+        "derived pointer blank-char default run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_pointer_component_preserves_blank_char_component_default() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer, allocatable :: word_lengths(:)\n    integer :: num_words = 0\n    character(len=256) :: heredoc_delimiter = ''\n    logical :: heredoc_quoted = .false.\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t), pointer :: simple_cmd => null()\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  node => create_simple_command()\n  if (.not. associated(node%simple_cmd)) error stop 2\n  if (len_trim(node%simple_cmd%heredoc_delimiter) /= 0) error stop 1\n  print *, 'ok'\ncontains\n  function create_simple_command() result(node)\n    type(command_node_t), pointer :: node\n    allocate(node)\n    allocate(node%simple_cmd)\n    allocate(character(len=32) :: node%simple_cmd%words(1))\n    node%simple_cmd%words(1) = 'false'\n  end function create_simple_command\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_component_blank_char_default", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer component blank-char default compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer component blank-char default compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer component blank-char default run failed");
+    assert!(
+        run.status.success(),
+        "pointer component blank-char default run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_pointer_component_assignment_and_read_round_trip() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: p => null()\n  end type\n  type(box_t) :: box\n  integer, target :: value\n  value = 11\n  box%p => value\n  print *, box%p\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("scalar_pointer_component_round_trip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar pointer component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar pointer component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar pointer component run failed");
+    assert!(
+        run.status.success(),
+        "scalar pointer component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("11"),
+        "unexpected scalar pointer component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_pointer_component_array_element_access_round_trips() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: cmd_t\n    integer :: x = 0\n  end type\n  type :: pipeline_t\n    type(cmd_t), pointer :: commands(:) => null()\n  end type\n  type :: node_t\n    type(pipeline_t), pointer :: pipeline => null()\n  end type\n  type(node_t) :: node\n  type(cmd_t), target :: backing(2)\n  backing(1)%x = 11\n  backing(2)%x = 22\n  allocate(node%pipeline)\n  node%pipeline%commands => backing\n  print *, node%pipeline%commands(1)%x, node%pipeline%commands(2)%x\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("nested_pointer_component_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested pointer component array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested pointer component array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested pointer component array run failed");
+    assert!(
+        run.status.success(),
+        "nested pointer component array run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("11") && stdout.contains("22"),
+        "unexpected nested pointer component array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_scalar_derived_pointer_component_access_and_call_round_trip() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: list_t\n    type(node_t), pointer :: left => null()\n    type(node_t), pointer :: right => null()\n    integer :: sep = 0\n  end type\n  type :: node_t\n    integer :: kind = 0\n    type(list_t), pointer :: list => null()\n  end type\ncontains\n  function make_simple(v) result(node)\n    integer, intent(in) :: v\n    type(node_t), pointer :: node\n    allocate(node)\n    node%kind = v\n  end function\n\n  function make_list(left, right, sep) result(node)\n    type(node_t), pointer, intent(in) :: left, right\n    integer, intent(in) :: sep\n    type(node_t), pointer :: node\n    allocate(node)\n    node%kind = 99\n    allocate(node%list)\n    node%list%left => left\n    node%list%right => right\n    node%list%sep = sep\n  end function\n\n  function read_kind(node) result(v)\n    type(node_t), pointer, intent(in) :: node\n    integer :: v\n    if (associated(node)) then\n      v = node%kind\n    else\n      v = -1\n    end if\n  end function\nend module\n\nprogram main\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  root => make_list(make_simple(11), make_simple(22), 7)\n  print *, root%list%left%kind\n  print *, read_kind(root%list%left)\n  print *, read_kind(root%list%right)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_scalar_derived_pointer_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested scalar derived pointer component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested scalar derived pointer component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested scalar derived pointer component run failed");
+    assert!(
+        run.status.success(),
+        "nested scalar derived pointer component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("11") && stdout.contains("22"),
+        "unexpected nested scalar derived pointer component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_result_self_argument_survives_module_boundary() {
+    let dir = unique_dir("pointer_result_self_argument");
+    let tree_src = write_program_in(
+        &dir,
+        "tree.f90",
+        "module tree\n  implicit none\n  integer, parameter :: NODE_SIMPLE = 1, NODE_LIST = 2\n  type :: list_t\n    type(node_t), pointer :: left => null()\n    type(node_t), pointer :: right => null()\n    integer :: sep = 0\n  end type\n  type :: node_t\n    integer :: node_type = 0\n    integer :: line = 0\n    integer :: column = 0\n    type(list_t), pointer :: list => null()\n    integer, allocatable :: redirects(:)\n    integer :: num_redirects = 0\n  end type\ncontains\n  function create_simple(kind) result(node)\n    integer, intent(in) :: kind\n    type(node_t), pointer :: node\n    allocate(node)\n    node%node_type = kind\n  end function\n  function create_list(left, right, sep) result(node)\n    type(node_t), pointer, intent(in) :: left, right\n    integer, intent(in) :: sep\n    type(node_t), pointer :: node\n    allocate(node)\n    node%node_type = NODE_LIST\n    allocate(node%list)\n    node%list%left => left\n    node%list%right => right\n    node%list%sep = sep\n  end function\nend module\n",
+    );
+    let builder_src = write_program_in(
+        &dir,
+        "builder.f90",
+        "module builder\n  use tree\n  implicit none\ncontains\n  function make_root() result(node)\n    type(node_t), pointer :: node\n    type(node_t), pointer :: right\n    node => create_simple(11)\n    right => create_simple(22)\n    node => create_list(node, right, 1)\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use builder\n  use tree\n  implicit none\n  type(node_t), pointer :: root\n  root => make_root()\n  print *, root%node_type\n  print *, root%list%sep\n  print *, root%list%left%node_type\n  print *, root%list%right%node_type\nend program\n",
+    );
+    let mod_dir = dir.join("mod");
+    std::fs::create_dir_all(&mod_dir).expect("cannot create module directory");
+    let tree_obj = dir.join("tree.o");
+    let builder_obj = dir.join("builder.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("main.bin");
+
+    let compile_tree = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            tree_src.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            tree_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("tree module compile failed to spawn");
+    assert!(
+        compile_tree.status.success(),
+        "tree module compile failed: {}",
+        String::from_utf8_lossy(&compile_tree.stderr)
+    );
+
+    let compile_builder = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            builder_src.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-I",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            builder_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("builder module compile failed to spawn");
+    assert!(
+        compile_builder.status.success(),
+        "builder module compile failed: {}",
+        String::from_utf8_lossy(&compile_builder.stderr)
+    );
+
+    let compile_main = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-I",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            main_obj.to_str().unwrap(),
+            builder_obj.to_str().unwrap(),
+            tree_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("self-argument module boundary run failed");
+    assert!(
+        run.status.success(),
+        "self-argument module boundary run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("2")
+            && stdout.contains("1")
+            && stdout.contains("11")
+            && stdout.contains("22"),
+        "unexpected self-argument module boundary output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn pointer_component_null_assignment_and_default_do_not_escape_null_symbol() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: cmd_t\n    integer :: x = 0\n  end type\n  type :: entry_t\n    type(cmd_t), pointer :: body => null()\n  end type\n  type(entry_t) :: entry\n  if (associated(entry%body)) error stop 1\n  entry%body => null()\n  if (associated(entry%body)) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_component_null_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer component null compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer component null compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer component null run failed");
+    assert!(
+        run.status.success(),
+        "pointer component null run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer component null output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_char_component_allocate_source_copies_runtime_string_value() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: redirect_t\n    character(:), allocatable :: filename\n  end type redirect_t\n  type(redirect_t) :: redirects(1)\n  character(len=8) :: tok\n  tok = 'abc   '\n  allocate(redirects(1)%filename, source=trim(tok))\n  if (len(redirects(1)%filename) /= 3) error stop 1\n  if (redirects(1)%filename /= 'abc') error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_component_source", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char component SOURCE= compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char component SOURCE= compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred char component SOURCE= run failed");
+    assert!(
+        run.status.success(),
+        "deferred char component SOURCE= run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -1775,6 +2257,228 @@ fn fixed_char_component_assigns_into_char_array_element() {
 }
 
 #[test]
+fn deferred_char_component_array_element_assignment_round_trips() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32) :: words(1)\n  words(1) = 'true'\n  node => create_simple_command(words, 1)\n  if (trim(node%simple_cmd%words(1)) /= 'true') error stop 1\n  print *, trim(node%simple_cmd%words(1))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_component_array_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char component array assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char component array assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred char component array assign run failed");
+    assert!(
+        run.status.success(),
+        "deferred char component array assign run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("true"),
+        "unexpected deferred char component array assign output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=32), allocatable :: words(:)\n  allocate(words(1))\n  words(1) = 'true'\n  call check(words)\ncontains\n  subroutine check(words)\n    character(len=*), intent(in) :: words(:)\n    if (trim(words(1)) /= 'true') error stop 1\n    print *, trim(words(1))\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_fixed_char_actual_to_assumed_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable fixed-char actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable fixed-char actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable fixed-char actual run failed");
+    assert!(
+        run.status.success(),
+        "allocatable fixed-char actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("true"),
+        "unexpected allocatable fixed-char actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_array_element_fixed_char_component_survives_nested_dummy_call() {
+    let src = write_program(
+        "program p\n  implicit none\n\n  type :: command_t\n    integer :: num_tokens = 0\n    character(len=32), allocatable :: tokens(:)\n  end type command_t\n\n  type :: pipeline_t\n    type(command_t), allocatable :: commands(:)\n    integer :: num_commands = 0\n  end type pipeline_t\n\n  type(pipeline_t) :: pipeline\n\n  allocate(pipeline%commands(1))\n  pipeline%num_commands = 1\n  pipeline%commands(1)%num_tokens = 1\n  allocate(character(len=32) :: pipeline%commands(1)%tokens(1))\n  pipeline%commands(1)%tokens(1) = 'true'\n\n  call exec(pipeline)\n\ncontains\n\n  subroutine exec(p)\n    type(pipeline_t), intent(inout) :: p\n    call run_single(p%commands(1))\n  end subroutine exec\n\n  subroutine run_single(cmd)\n    type(command_t), intent(inout) :: cmd\n    if (trim(cmd%tokens(1)) /= 'true') error stop 1\n    print *, 'ok'\n  end subroutine run_single\n\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_element_fixed_char_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array element fixed char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array element fixed char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived array element fixed char component run failed");
+    assert!(
+        run.status.success(),
+        "derived array element fixed char component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived array element fixed char component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_global_derived_array_fixed_char_component_clears_cleanly() {
+    let src = write_program(
+        "module cache_mod\n  implicit none\n  integer, parameter :: max_entries = 4\n  type :: entry_t\n    logical :: valid = .false.\n    character(len=256) :: command = ''\n  end type entry_t\n  type(entry_t) :: command_cache(max_entries)\ncontains\n  subroutine clear_command_cache()\n    integer :: i\n    do i = 1, max_entries\n      command_cache(i)%valid = .false.\n      command_cache(i)%command = ''\n    end do\n  end subroutine clear_command_cache\nend module cache_mod\n\nprogram p\n  use cache_mod, only: clear_command_cache, command_cache\n  implicit none\n  call clear_command_cache()\n  if (len_trim(command_cache(1)%command) /= 0) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("module_global_derived_array_fixed_char_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module global derived array fixed char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module global derived array fixed char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module global derived array fixed char component run failed");
+    assert!(
+        run.status.success(),
+        "module global derived array fixed char component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected module global derived array fixed char component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_char_component_array_element_actual_to_assumed_len_dummy_survives() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  allocate(character(len=32) :: cmd%tokens(1))\n  cmd%tokens(1) = 'true'\n  if (is_keyword(cmd%tokens(1))) error stop 1\n  print *, trim(cmd%tokens(1))\ncontains\n  function is_keyword(word) result(ok)\n    character(len=*), intent(in) :: word\n    logical :: ok\n    ok = trim(word) == 'if'\n  end function is_keyword\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_component_actual_to_assumed_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char component actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred char component actual run failed");
+    assert!(
+        run.status.success(),
+        "deferred char component actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("true"),
+        "unexpected deferred char component actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn select_case_on_trimmed_deferred_char_component_dispatches_correctly() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  integer :: code\n  allocate(character(len=8) :: cmd%tokens(1))\n  cmd%tokens(1) = 'echo'\n  code = dispatch(cmd)\n  if (code /= 42) error stop 1\n  print *, 'ok'\ncontains\n  integer function dispatch(cmd) result(code)\n    type(command_t), intent(in) :: cmd\n    select case (trim(cmd%tokens(1)))\n    case ('echo')\n      code = 42\n    case default\n      code = 0\n    end select\n  end function dispatch\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_case_trimmed_deferred_char_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("select-case deferred char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "select-case deferred char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("select-case deferred char component run failed");
+    assert!(
+        run.status.success(),
+        "select-case deferred char component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected select-case deferred char component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_component_actual_to_intent_out_dummy_updates_field() {
     let src = write_program(
         "program p\n  implicit none\n  type :: state_t\n    integer :: num_tokens = 0\n  end type state_t\n  type(state_t) :: state\n  call set_num(state%num_tokens)\n  if (state%num_tokens /= 2) error stop 1\n  print *, state%num_tokens\ncontains\n  subroutine set_num(n)\n    integer, intent(out) :: n\n    n = 2\n  end subroutine set_num\nend program p\n",
@@ -1804,6 +2508,43 @@ fn scalar_component_actual_to_intent_out_dummy_updates_field() {
     assert!(
         stdout.contains('2'),
         "unexpected component intent(out) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_two_dimensional_element_actuals_update_storage() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: grid(:,:)\n  allocate(grid(2, 1))\n  grid = 0\n  call set_pair(grid(1, 1), grid(2, 1))\n  if (grid(1, 1) /= 11) error stop 1\n  if (grid(2, 1) /= 22) error stop 2\n  print *, grid(1, 1), grid(2, 1)\ncontains\n  subroutine set_pair(x, y)\n    integer, intent(out) :: x, y\n    x = 11\n    y = 22\n  end subroutine set_pair\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_2d_element_actuals", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable 2d element-actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable 2d element-actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable 2d element-actual run failed");
+    assert!(
+        run.status.success(),
+        "allocatable 2d element-actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("11 22") || stdout.contains("11  22"),
+        "unexpected allocatable 2d element-actual output: {}",
         stdout
     );
 
@@ -3921,6 +4662,169 @@ fn procedure_pointer_module_export_survives_amod_import() {
 }
 
 #[test]
+fn external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths() {
+    let dir = unique_dir("optional_hidden_char_len");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  subroutine foo(name, value, value_length)\n    character(len=*), intent(in) :: name, value\n    integer, intent(in), optional :: value_length\n    integer :: n\n    if (present(value_length)) then\n      n = value_length\n    else\n      n = len_trim(value)\n    end if\n    print *, trim(name), n\n  end subroutine foo\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m\n  implicit none\n  character(len=8) :: s\n  s = 'false'\n  call inner()\ncontains\n  subroutine inner()\n    call foo('COLUMNS', trim(s))\n  end subroutine inner\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "optional module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "optional caller compile failed: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let out = dir.join("p.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            user_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "optional caller link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("optional caller run failed");
+    assert!(
+        run.status.success(),
+        "optional caller run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("COLUMNS") && stdout.contains('5'),
+        "optional caller should fall back to len_trim(value): {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inquire_file_with_sparse_optional_string_outputs_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical :: exists\n  character(len=16) :: access, action\n  inquire(file='fortsh_missing_config_marker', exist=exists, access=access, action=action)\n  print *, trim(access), trim(action)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("inquire_sparse_optional", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "sparse INQUIRE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "sparse INQUIRE runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.matches("UNDEFINED").count() >= 2,
+        "sparse INQUIRE should populate ACCESS/ACTION without crashing: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn char_concat_actual_to_assumed_len_dummy_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: home\n  home = 'abc'\n  call show(trim(home)//'/.fortshrc')\ncontains\n  subroutine show(path)\n    character(len=*), intent(in) :: path\n    print *, trim(path)\n  end subroutine show\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_concat_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "character concat actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "character concat actual runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("abc/.fortshrc"),
+        "character concat actual should preserve both sides of the string: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_funptr, c_intptr_t\ncontains\n  subroutine s(buf, mask, ok)\n    character(len=:), allocatable, intent(inout) :: buf\n    logical, intent(in) :: mask\n    logical, intent(out) :: ok\n    type(c_funptr) :: sig_ign\n    if (allocated(buf)) then\n      ok = lgt(trim(buf), 'a')\n    else\n      ok = .false.\n    end if\n    ok = ok .or. any(buf(1:1) == ['!', '?'])\n    buf = merge(buf // new_line('a'), '?', mask)\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine s\nend module m\n",
@@ -5015,6 +5919,41 @@ fn fixed_allocatable_character_substring_compiles_and_runs() {
 }
 
 #[test]
+fn allocatable_scalar_substring_actual_preserves_hidden_len() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: buf\n  allocate(character(len=3) :: buf)\n  buf = 'ok '\n  call check(buf(1:2))\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    character(len=*), intent(in) :: value\n    if (len(value) /= 2) error stop 1\n    if (value /= 'ok') error stop 2\n  end subroutine check\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_scalar_substring_len_star", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable scalar substring compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable scalar substring should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable scalar substring should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable scalar substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn local_array_element_does_not_fall_back_to_unrelated_char_symbol() {
     let src = write_program(
         "module helper_mod\ncontains\n  function values(i) result(out)\n    integer, intent(in) :: i\n    character(len=1) :: out\n    if (i > 0) then\n      out = 'x'\n    else\n      out = 'y'\n    end if\n  end function values\nend module helper_mod\n\nprogram p\n  implicit none\n  integer :: values(8)\n  values = 0\n  values(2) = 5\n  if (values(2) >= 1 .and. values(2) <= 12) print *, values(2)\nend program\n",
@@ -5186,6 +6125,80 @@ fn allocated_eqv_on_allocatables_compiles() {
         "allocated() logical combinations should compile: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn runtime_bound_local_c_ptr_array_accepts_final_null_slot() {
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_ptr, c_null_ptr, c_associated\n  implicit none\n  call run(1)\ncontains\n  subroutine run(n)\n    integer, intent(in) :: n\n    type(c_ptr), target :: argv(n + 1)\n    argv(n + 1) = c_null_ptr\n    if (c_associated(argv(n + 1))) error stop 1\n    print *, 'ok'\n  end subroutine run\nend program\n",
+        "f90",
+    );
+    let out = unique_path("runtime_bound_c_ptr_auto_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime-bound c_ptr array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime-bound c_ptr array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime-bound c_ptr array run failed");
+    assert!(
+        run.status.success(),
+        "runtime-bound c_ptr array run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected runtime-bound c_ptr array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn whole_component_char_array_actual_preserves_hidden_len() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  allocate(character(len=8) :: cmd%tokens(1))\n  cmd%tokens(1) = 'true'\n  call check(cmd%tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (len(tokens(1)) /= 8) error stop 1\n    if (trim(tokens(1)) /= 'true') error stop 2\n    print *, trim(tokens(1))\n  end subroutine check\nend program\n",
+        "f90",
+    );
+    let out = unique_path("component_char_array_actual_hidden_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component char array actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component char array actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("component char array actual run failed");
+    assert!(
+        run.status.success(),
+        "component char array actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("true"),
+        "unexpected component char array actual output: {}",
+        stdout
+    );
+
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }

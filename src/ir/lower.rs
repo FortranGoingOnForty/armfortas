@@ -7,7 +7,7 @@ use super::builder::FuncBuilder;
 use super::inst::*;
 use super::types::*;
 use crate::ast::decl::{Decl, TypeSpec};
-use crate::ast::expr::{BinaryOp, Expr, UnaryOp};
+use crate::ast::expr::{BinaryOp, Expr, SpannedExpr, UnaryOp};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
 use crate::sema::symtab::SymbolTable;
@@ -272,6 +272,7 @@ pub fn lower_file(
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     external_globals: HashMap<(String, String), ModuleGlobalInfo>,
+    external_optional_params: HashMap<String, Vec<bool>>,
     external_descriptor_params: HashMap<String, Vec<bool>>,
     external_char_len_star: HashMap<String, Vec<bool>>,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
@@ -357,7 +358,7 @@ pub fn lower_file(
     // Maps lowercase callee name → Vec<bool> (per-position, true = OPTIONAL).
     // Used at call sites to pass null pointers for absent optional arguments
     // so PRESENT() works correctly inside the callee.
-    let mut optional_params: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut optional_params: HashMap<String, Vec<bool>> = external_optional_params;
     for unit in units {
         collect_optional_params(&unit.node, &mut optional_params);
     }
@@ -3455,20 +3456,47 @@ impl ConstScalar {
     }
 }
 
+fn parse_boz_const_scalar(text: &str, base: crate::ast::expr::BozBase) -> Option<ConstScalar> {
+    let radix = match base {
+        crate::ast::expr::BozBase::Binary => 2,
+        crate::ast::expr::BozBase::Octal => 8,
+        crate::ast::expr::BozBase::Hex => 16,
+    };
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !matches!(c, '\'' | '"'))
+        .skip(1)
+        .take_while(|c| !matches!(c, '\'' | '"'))
+        .collect();
+    i128::from_str_radix(&digits, radix)
+        .ok()
+        .map(ConstScalar::Int)
+}
+
 fn eval_const_scalar(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
 ) -> Option<ConstScalar> {
     use crate::ast::expr::{BinaryOp, UnaryOp};
     match &e.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<i128>().ok().map(ConstScalar::Int),
+        Expr::IntegerLiteral { text, .. } => text
+            .split('_')
+            .next()
+            .unwrap_or(text)
+            .parse::<i128>()
+            .ok()
+            .map(ConstScalar::Int),
         Expr::RealLiteral { text, .. } => text
             .replace('d', "e")
             .replace('D', "E")
+            .split('_')
+            .next()
+            .unwrap_or(text)
             .parse::<f64>()
             .ok()
             .map(ConstScalar::Float),
         Expr::LogicalLiteral { value, .. } => Some(ConstScalar::Int(if *value { 1 } else { 0 })),
+        Expr::BozLiteral { text, base } => parse_boz_const_scalar(text, *base),
         // Audit CRITICAL-1: a name reference resolves only if it's
         // a compile-time parameter declared earlier in the same
         // scope. Anything else (regular local, dummy arg, module
@@ -3609,6 +3637,16 @@ fn eval_const_scalar(
                             }
                         } else {
                             None
+                        }
+                    }
+                    "int" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        match eval_const_scalar(e, param_consts)? {
+                            ConstScalar::Int(i) => Some(ConstScalar::Int(i)),
+                            ConstScalar::Float(f) => Some(ConstScalar::Int(f.trunc() as i128)),
                         }
                     }
                     _ => None,
@@ -4654,7 +4692,162 @@ fn alloc_decls(
                         },
                     );
                     continue;
-                } else if let Some(len) = char_len {
+                }
+
+                if let Some(specs) = array_spec.filter(|_| !is_allocatable) {
+                    if (!matches!(type_spec, TypeSpec::Character(_)) || char_len.is_some())
+                        && array_spec_has_runtime_bounds(specs, &param_consts, Some(st))
+                    {
+                        let dims = extract_array_dims(specs, &param_consts, Some(st));
+                        let (array_elem_ty, array_derived_type, array_char_kind) = if matches!(
+                            type_spec,
+                            TypeSpec::Character(_)
+                        ) {
+                            let len = char_len.expect(
+                                    "runtime-bound explicit-shape character array should have a fixed element length",
+                                );
+                            (fixed_char_storage_ir_type(len), None, CharKind::Fixed(len))
+                        } else if let TypeSpec::Type(ref type_name) = type_spec {
+                            if let Some(layout) = type_layouts.get(type_name) {
+                                (
+                                    IrType::Array(
+                                        Box::new(IrType::Int(IntWidth::I8)),
+                                        layout.size as u64,
+                                    ),
+                                    Some(type_name.clone()),
+                                    CharKind::None,
+                                )
+                            } else {
+                                (elem_ty.clone(), None, CharKind::None)
+                            }
+                        } else {
+                            (elem_ty.clone(), None, CharKind::None)
+                        };
+
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let addr = b.alloca(desc_ty);
+                        let zero = b.const_i32(0);
+                        let size384 = b.const_i64(384);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![addr, zero, size384],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+
+                        let rank = specs.len();
+                        let one_i64 = b.const_i64(1);
+                        let dim_buf = if rank == 0 {
+                            b.const_i64(0)
+                        } else {
+                            let dim_buf_bytes = (rank * 24) as u64;
+                            let dim_buf = b.alloca(IrType::Array(
+                                Box::new(IrType::Int(IntWidth::I8)),
+                                dim_buf_bytes,
+                            ));
+                            for (i, spec) in specs.iter().enumerate() {
+                                let (lo64, up64) = match spec {
+                                    ArraySpec::Explicit { lower, upper } => {
+                                        let lo64 = lower
+                                            .as_ref()
+                                            .and_then(|expr| {
+                                                eval_const_array_bound(
+                                                    expr,
+                                                    &param_consts,
+                                                    Some(st),
+                                                )
+                                            })
+                                            .map(|value| b.const_i64(value))
+                                            .unwrap_or_else(|| {
+                                                if let Some(expr) = lower.as_ref() {
+                                                    let raw = lower_expr(b, locals, expr, st);
+                                                    widen_to_i64(b, raw)
+                                                } else {
+                                                    b.const_i64(1)
+                                                }
+                                            });
+                                        let up64 =
+                                            eval_const_array_bound(upper, &param_consts, Some(st))
+                                                .map(|value| b.const_i64(value))
+                                                .unwrap_or_else(|| {
+                                                    let raw = lower_expr(b, locals, upper, st);
+                                                    widen_to_i64(b, raw)
+                                                });
+                                        (lo64, up64)
+                                    }
+                                    _ => (b.const_i64(1), b.const_i64(1)),
+                                };
+                                let base = (i * 24) as i64;
+                                let off_lo = b.const_i64(base);
+                                let off_up = b.const_i64(base + 8);
+                                let off_st = b.const_i64(base + 16);
+                                let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+                                let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+                                let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+                                b.store(lo64, p_lo);
+                                b.store(up64, p_up);
+                                b.store(one_i64, p_st);
+                            }
+                            dim_buf
+                        };
+
+                        let elem_size = b.const_i64(ir_scalar_byte_size(&array_elem_ty));
+                        let rank_val = b.const_i32(rank as i32);
+                        let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
+                        b.call(
+                            FuncRef::External("afs_allocate_array".into()),
+                            vec![addr, elem_size, rank_val, dim_buf, stat_slot],
+                            IrType::Void,
+                        );
+
+                        if let Some(len) = char_len {
+                            let total = b.call(
+                                FuncRef::External("afs_array_size".into()),
+                                vec![addr],
+                                IrType::Int(IntWidth::I64),
+                            );
+                            let byte_count = if len == 1 {
+                                total
+                            } else {
+                                let elem_len = b.const_i64(len);
+                                b.imul(total, elem_len)
+                            };
+                            let byte_base = if matches!(array_elem_ty, IrType::Int(IntWidth::I8)) {
+                                b.load_typed(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                            } else {
+                                let base = b
+                                    .load_typed(addr, IrType::Ptr(Box::new(array_elem_ty.clone())));
+                                let zero = b.const_i64(0);
+                                b.gep(base, vec![zero], IrType::Int(IntWidth::I8))
+                            };
+                            let space = b.const_i32(b' ' as i32);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![byte_base, space, byte_count],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                        }
+
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: array_elem_ty,
+                                dims,
+                                allocatable: true,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: array_char_kind,
+                                derived_type: array_derived_type,
+                                inline_const: None,
+                                is_pointer: false,
+                                runtime_dim_upper: vec![],
+                            },
+                        );
+                        continue;
+                    }
+                }
+
+                if let Some(len) = char_len {
                     if let Some(specs) = array_spec.filter(|_| !is_allocatable) {
                         let dims = extract_array_dims(specs, &param_consts, Some(st));
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
@@ -5035,6 +5228,9 @@ fn alloc_decls(
                             // null/unallocated state before any ALLOCATE or
                             // ASSOCIATED query touches them.
                             zero_fill_bytes(b, addr, layout.size as i64);
+                        }
+                        if derived_layout_has_runtime_field_defaults(layout) {
+                            apply_derived_field_default_inits(b, addr, layout);
                         }
                         // Store the derived type name in the ty field for component access lookup.
                         // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
@@ -5538,6 +5734,31 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
 
 /// Extract compile-time array dimensions from array spec.
 /// Returns (lower_bound, extent) pairs. Runtime expressions default to (1, 1).
+fn eval_const_array_bound(
+    expr: &SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
+) -> Option<i64> {
+    st.and_then(|st| eval_const_int_in_scope_or_any_scope(expr, param_consts, st))
+        .or_else(|| eval_const_int_in_scope(expr, param_consts))
+}
+
+fn array_spec_has_runtime_bounds(
+    specs: &[ArraySpec],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
+) -> bool {
+    specs.iter().any(|spec| match spec {
+        ArraySpec::Explicit { lower, upper } => {
+            lower
+                .as_ref()
+                .is_some_and(|expr| eval_const_array_bound(expr, param_consts, st).is_none())
+                || eval_const_array_bound(upper, param_consts, st).is_none()
+        }
+        _ => false,
+    })
+}
+
 fn extract_array_dims(
     specs: &[ArraySpec],
     param_consts: &HashMap<String, ConstScalar>,
@@ -5550,19 +5771,9 @@ fn extract_array_dims(
                 ArraySpec::Explicit { lower, upper } => {
                     let lo = lower
                         .as_ref()
-                        .and_then(|e| {
-                            st.and_then(|st| {
-                                eval_const_int_in_scope_or_any_scope(e, param_consts, st)
-                            })
-                            .or_else(|| eval_const_int_in_scope(e, param_consts))
-                        })
+                        .and_then(|e| eval_const_array_bound(e, param_consts, st))
                         .unwrap_or(1);
-                    let hi = st
-                        .and_then(|st| {
-                            eval_const_int_in_scope_or_any_scope(upper, param_consts, st)
-                        })
-                        .or_else(|| eval_const_int_in_scope(upper, param_consts))
-                        .unwrap_or(1);
+                    let hi = eval_const_array_bound(upper, param_consts, st).unwrap_or(1);
                     (lo, hi - lo + 1)
                 }
                 ArraySpec::AssumedShape { .. } => (1, 0), // size unknown at compile time
@@ -5828,6 +6039,39 @@ fn char_array_element_ptr_and_len(
     }
     let base = if local_uses_array_descriptor(info) {
         let desc = array_descriptor_addr(b, info);
+        if matches!(
+            info.char_kind,
+            CharKind::Fixed(_) | CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+        ) && matches!(
+            info.ty,
+            IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+        ) {
+            let slot_size = descriptor_elem_size(b, desc);
+            let table_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let slot_bb = b.create_block("char_desc_slot_ptr");
+            let flat_bb = b.create_block("char_desc_flat_ptr");
+            let join_bb = b.create_block("char_desc_ptr_join");
+            let use_slot_table = b.icmp(CmpOp::Ne, slot_size, elem_len);
+            b.cond_branch(use_slot_table, slot_bb, vec![], flat_bb, vec![]);
+
+            b.set_block(slot_bb);
+            let slot_offset = b.imul(idx64, slot_size);
+            let slot_ptr = b.gep(table_base, vec![slot_offset], IrType::Int(IntWidth::I8));
+            let elem_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(elem_ptr, ptr_slot);
+            b.branch(join_bb, vec![]);
+
+            b.set_block(flat_bb);
+            let byte_offset = b.imul(idx64, elem_len);
+            let elem_ptr = b.gep(table_base, vec![byte_offset], IrType::Int(IntWidth::I8));
+            b.store(elem_ptr, ptr_slot);
+            b.branch(join_bb, vec![]);
+
+            b.set_block(join_bb);
+            let elem_ptr = b.load_typed(ptr_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            return Some((elem_ptr, elem_len));
+        }
         b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
     } else {
         array_data_ptr_for_call(b, info)
@@ -5967,6 +6211,10 @@ fn local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<Value
             let len_ptr = b.gep(desc, vec![eight], IrType::Int(IntWidth::I8));
             Some(b.load_typed(len_ptr, IrType::Int(IntWidth::I64)))
         }
+        CharKind::None if descriptor_backed_runtime_char_array(info) => {
+            let desc = array_descriptor_addr(b, info);
+            Some(descriptor_elem_size(b, desc))
+        }
         CharKind::None => None,
     }
 }
@@ -5986,6 +6234,30 @@ fn actual_char_arg_runtime_len(
         Expr::Name { name } => locals
             .get(&name.to_lowercase())
             .and_then(|info| local_char_runtime_len(b, info)),
+        Expr::FunctionCall { callee, args }
+            if args.len() == 1
+                && expr_is_character_expr(b, locals, callee, st, type_layouts)
+                && !expr_is_array_designator(b, locals, callee, st, type_layouts) =>
+        {
+            Some(lower_string_expr_with_layouts(b, locals, expr, st, type_layouts).1)
+        }
+        Expr::ComponentAccess { .. } => {
+            if let Some(tl) = type_layouts {
+                if let Some(info) = component_array_local_info(b, locals, expr, st, tl) {
+                    if info.char_kind != CharKind::None
+                        || descriptor_backed_runtime_char_array(&info)
+                    {
+                        if let Some(len) = local_char_runtime_len(b, &info) {
+                            return Some(len);
+                        }
+                    }
+                }
+            }
+            expr_is_character_expr(b, locals, expr, st, type_layouts).then(|| {
+                let (_ptr, len) = lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
+                len
+            })
+        }
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 if let Some(info) = locals.get(&name.to_lowercase()) {
@@ -9268,6 +9540,25 @@ fn append_host_closure_args_raw(
         // id IS the address.
         let addr = if info.by_ref {
             b.load(info.addr)
+        } else if info.dims.is_empty()
+            && !info.descriptor_arg
+            && !matches!(info.char_kind, CharKind::Deferred)
+            && matches!(
+                info.char_kind,
+                CharKind::Fixed(_) | CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+            )
+        {
+            // Ordinary character dummies pass a pointer slot so the
+            // callee can uniformly recover the raw character buffer via
+            // one extra load. Contained-proc closure args for host-owned
+            // fixed/assumed/runtime-length character scalars need the
+            // same shape; passing the raw data pointer here makes the
+            // callee treat the first bytes of the string as a pointer.
+            let (ptr, _) = local_char_ptr_and_len(b, &info)
+                .expect("host-owned scalar character closure local should lower");
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(ptr, slot);
+            slot
         } else {
             info.addr
         };
@@ -9333,6 +9624,29 @@ fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool
                 .symbols
                 .get(arg_name)
                 .map(|sym| sym.attrs.value)
+                .unwrap_or(false)
+        })
+        .collect();
+    Some(mask)
+}
+
+fn callee_optional_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+    use crate::sema::symtab::ScopeKind;
+    let callee_scope = st.scopes.iter().find(|s| match &s.kind {
+        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n.to_lowercase() == callee_name,
+        _ => false,
+    })?;
+    if !callee_scope.symbols.values().any(|sym| sym.attrs.optional) {
+        return None;
+    }
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .map(|sym| sym.attrs.optional)
                 .unwrap_or(false)
         })
         .collect();
@@ -11268,12 +11582,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     }
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
-                    if let Some(opt_flags) = ctx
+                    let opt_flags = ctx
                         .optional_params
                         .get(&resolved_key)
-                        .or_else(|| ctx.optional_params.get(&signature_key))
-                        .or_else(|| ctx.optional_params.get(&key))
-                    {
+                        .cloned()
+                        .or_else(|| ctx.optional_params.get(&signature_key).cloned())
+                        .or_else(|| ctx.optional_params.get(&key).cloned())
+                        .or_else(|| callee_optional_arg_mask(ctx.st, &resolved_key))
+                        .or_else(|| callee_optional_arg_mask(ctx.st, &signature_key))
+                        .or_else(|| callee_optional_arg_mask(ctx.st, &key));
+                    if let Some(opt_flags) = opt_flags {
                         for flag in opt_flags.iter().skip(arg_vals.len()) {
                             if *flag {
                                 arg_vals.push(b.const_i64(0)); // null → absent
@@ -11832,91 +12150,160 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 typed_allocate_char_len(b, &ctx.locals, type_spec.as_ref(), ctx.st);
 
             for item in items {
-                if let Expr::FunctionCall { callee, args } = &item.node {
-                    if let Expr::ComponentAccess { .. } = &callee.node {
-                        if let Some((field_ptr, field)) = resolve_component_field_access(
-                            b,
-                            &ctx.locals,
-                            callee,
-                            ctx.st,
-                            ctx.type_layouts,
-                        ) {
-                            if matches!(field_char_kind(&field), CharKind::Deferred)
-                                && field.size == 32
-                            {
-                                let Some(len_val) = typed_char_len else {
-                                    eprintln!(
+                let source_char = allocate_char_source_value(b, ctx, opts);
+                let char_alloc_len = typed_char_len
+                    .or_else(|| source_char.as_ref().map(|(_, len)| *len))
+                    .or_else(|| allocate_char_mold_len(b, ctx, opts));
+                let component_alloc = match &item.node {
+                    Expr::ComponentAccess { .. } => Some((item, &[][..])),
+                    Expr::FunctionCall { callee, args }
+                        if matches!(callee.node, Expr::ComponentAccess { .. }) =>
+                    {
+                        Some((callee.as_ref(), args.as_slice()))
+                    }
+                    _ => None,
+                };
+                if let Some((component_expr, args)) = component_alloc {
+                    if let Some((field_ptr, field)) = resolve_component_field_access(
+                        b,
+                        &ctx.locals,
+                        component_expr,
+                        ctx.st,
+                        ctx.type_layouts,
+                    ) {
+                        if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32
+                        {
+                            let Some(len_val) = char_alloc_len else {
+                                eprintln!(
                                         "armfortas: error: {}:{}: deferred-length character ALLOCATE requires a typed length or SOURCE/MOLD support",
                                         stmt.span.start.line, stmt.span.start.col
                                     );
-                                    let _ = std::io::stderr().flush();
-                                    std::process::exit(1);
-                                };
-                                init_allocated_string_descriptor(b, field_ptr, len_val);
-                                continue;
-                            }
-                            if field.size == 384 && (field.allocatable || field.pointer) {
-                                let elem_ty = type_info_to_storage_ir_type(
-                                    &field.type_info,
-                                    ctx.type_layouts,
-                                );
-                                let elem_size_bytes = descriptor_element_size_bytes(&LocalInfo {
-                                    addr: field_ptr,
-                                    ty: elem_ty.clone(),
-                                    dims: vec![],
-                                    allocatable: true,
-                                    descriptor_arg: false,
-                                    by_ref: false,
-                                    char_kind: field_char_kind(&field),
-                                    derived_type: field_derived_type_name(&field),
-                                    inline_const: None,
-                                    is_pointer: field.pointer,
-                                    runtime_dim_upper: vec![],
-                                });
-                                let es = if matches!(
-                                    field.type_info,
-                                    crate::sema::symtab::TypeInfo::Character { len: None, .. }
-                                ) {
-                                    typed_char_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
-                                } else {
-                                    b.const_i64(elem_size_bytes)
-                                };
-                                let rank = args.len();
-                                let one_i64 = b.const_i64(1);
-                                let dim_buf = if rank == 0 {
-                                    b.const_i64(0)
-                                } else {
-                                    let dim_buf_bytes = (rank * 24) as u64;
-                                    let dim_buf = b.alloca(IrType::Array(
-                                        Box::new(IrType::Int(IntWidth::I8)),
-                                        dim_buf_bytes,
-                                    ));
-                                    for (i, arg) in args.iter().enumerate() {
-                                        let (lo64, up64) = lower_alloc_bounds(b, ctx, &arg.value);
-                                        let base = (i * 24) as i64;
-                                        let off_lo = b.const_i64(base);
-                                        let off_up = b.const_i64(base + 8);
-                                        let off_st = b.const_i64(base + 16);
-                                        let p_lo =
-                                            b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
-                                        let p_up =
-                                            b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
-                                        let p_st =
-                                            b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
-                                        b.store(lo64, p_lo);
-                                        b.store(up64, p_up);
-                                        b.store(one_i64, p_st);
-                                    }
-                                    dim_buf
-                                };
-                                let rank_val = b.const_i32(rank as i32);
+                                let _ = std::io::stderr().flush();
+                                std::process::exit(1);
+                            };
+                            init_allocated_string_descriptor(b, field_ptr, len_val);
+                            if let Some((src_ptr, src_len)) = source_char {
                                 b.call(
-                                    FuncRef::External("afs_allocate_array".into()),
-                                    vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                    FuncRef::External("afs_assign_char_deferred".into()),
+                                    vec![field_ptr, src_ptr, src_len],
                                     IrType::Void,
                                 );
-                                continue;
                             }
+                            continue;
+                        }
+                        if field.size == 384 && (field.allocatable || field.pointer) {
+                            let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
+                            let elem_size_bytes = descriptor_element_size_bytes(&LocalInfo {
+                                addr: field_ptr,
+                                ty: elem_ty.clone(),
+                                dims: vec![],
+                                allocatable: true,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: field_char_kind(&field),
+                                derived_type: field_derived_type_name(&field),
+                                inline_const: None,
+                                is_pointer: field.pointer,
+                                runtime_dim_upper: vec![],
+                            });
+                            let es = if matches!(
+                                field.type_info,
+                                crate::sema::symtab::TypeInfo::Character { len: None, .. }
+                            ) {
+                                char_alloc_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
+                            } else {
+                                b.const_i64(elem_size_bytes)
+                            };
+                            let rank = args.len();
+                            let one_i64 = b.const_i64(1);
+                            let dim_buf = if rank == 0 {
+                                b.const_i64(0)
+                            } else {
+                                let dim_buf_bytes = (rank * 24) as u64;
+                                let dim_buf = b.alloca(IrType::Array(
+                                    Box::new(IrType::Int(IntWidth::I8)),
+                                    dim_buf_bytes,
+                                ));
+                                for (i, arg) in args.iter().enumerate() {
+                                    let (lo64, up64) = lower_alloc_bounds(b, ctx, &arg.value);
+                                    let base = (i * 24) as i64;
+                                    let off_lo = b.const_i64(base);
+                                    let off_up = b.const_i64(base + 8);
+                                    let off_st = b.const_i64(base + 16);
+                                    let p_lo =
+                                        b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+                                    let p_up =
+                                        b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+                                    let p_st =
+                                        b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+                                    b.store(lo64, p_lo);
+                                    b.store(up64, p_up);
+                                    b.store(one_i64, p_st);
+                                }
+                                dim_buf
+                            };
+                            let rank_val = b.const_i32(rank as i32);
+                            b.call(
+                                FuncRef::External("afs_allocate_array".into()),
+                                vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                IrType::Void,
+                            );
+                            if rank == 0 {
+                                if let Some(type_name) = field_derived_type_name(&field) {
+                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                        let base_ptr = b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                        if derived_layout_needs_runtime_zero_init(layout) {
+                                            zero_fill_bytes(b, base_ptr, layout.size as i64);
+                                        }
+                                        if derived_layout_has_runtime_field_defaults(layout) {
+                                            apply_derived_field_default_inits(b, base_ptr, layout);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if (field.allocatable || field.pointer) && args.is_empty() {
+                            let field_info = LocalInfo {
+                                addr: field_ptr,
+                                ty: field_storage_ir_type(&field, ctx.type_layouts),
+                                dims: vec![],
+                                allocatable: false,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: field_char_kind(&field),
+                                derived_type: field_derived_type_name(&field),
+                                inline_const: None,
+                                is_pointer: field.pointer,
+                                runtime_dim_upper: vec![],
+                            };
+                            let elem_size_bytes =
+                                local_storage_size_bytes(&field_info, ctx.type_layouts);
+                            let size_val = b.const_i32(elem_size_bytes as i32);
+                            let ptr = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![size_val],
+                                IrType::Ptr(Box::new(field_info.ty.clone())),
+                            );
+                            b.store(ptr, field_ptr);
+                            if let Some(type_name) = &field_info.derived_type {
+                                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    let base_ptr = b.load_typed(
+                                        field_ptr,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    if derived_layout_needs_runtime_zero_init(layout) {
+                                        zero_fill_bytes(b, base_ptr, layout.size as i64);
+                                    }
+                                    if derived_layout_has_runtime_field_defaults(layout) {
+                                        apply_derived_field_default_inits(b, base_ptr, layout);
+                                    }
+                                }
+                            }
+                            continue;
                         }
                     }
                 }
@@ -11929,7 +12316,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if let Some(name) = base_name {
                     if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
                         if matches!(info.char_kind, CharKind::Deferred) {
-                            let Some(len_val) = typed_char_len else {
+                            let Some(len_val) = char_alloc_len else {
                                 eprintln!(
                                     "armfortas: error: {}:{}: deferred-length character ALLOCATE requires a typed length or SOURCE/MOLD support",
                                     stmt.span.start.line, stmt.span.start.col
@@ -11939,6 +12326,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             };
                             let desc = string_descriptor_addr(b, &info);
                             init_allocated_string_descriptor(b, desc, len_val);
+                            if let Some((src_ptr, src_len)) = source_char {
+                                b.call(
+                                    FuncRef::External("afs_assign_char_deferred".into()),
+                                    vec![desc, src_ptr, src_len],
+                                    IrType::Void,
+                                );
+                            }
                             continue;
                         }
                         let elem_size_bytes = local_storage_size_bytes(&info, ctx.type_layouts);
@@ -11952,7 +12346,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             // address. Scalar allocatables lower as a rank-0
                             // descriptor allocation.
                             let es = if descriptor_backed_runtime_char_array(&info) {
-                                typed_char_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
+                                char_alloc_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
                             } else {
                                 b.const_i64(elem_size_bytes)
                             };
@@ -12000,6 +12394,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 IrType::Ptr(Box::new(info.ty.clone())),
                             );
                             b.store(ptr, info.addr);
+                            if let Some(type_name) = &info.derived_type {
+                                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    let base_ptr = b.load_typed(
+                                        info.addr,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    if derived_layout_needs_runtime_zero_init(layout) {
+                                        zero_fill_bytes(b, base_ptr, layout.size as i64);
+                                    }
+                                    if derived_layout_has_runtime_field_defaults(layout) {
+                                        apply_derived_field_default_inits(b, base_ptr, layout);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -12628,20 +13036,57 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Inquire { specs, .. } => {
-            // Simplified INQUIRE: extract UNIT or FILE, and EXIST.
             let null = b.const_i64(0);
+            let zero_len = b.const_i64(0);
+            let spec_by_keyword = |needle: &str| {
+                specs.iter().find(|s| {
+                    s.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case(needle))
+                        .unwrap_or(false)
+                })
+            };
             let file_spec = specs.iter().find(|s| {
                 s.keyword
                     .as_deref()
                     .map(|k| k.eq_ignore_ascii_case("file"))
                     .unwrap_or(false)
             });
-            let exist_spec = specs.iter().find(|s| {
+            let unit_spec = specs.iter().find(|s| {
                 s.keyword
                     .as_deref()
-                    .map(|k| k.eq_ignore_ascii_case("exist"))
+                    .map(|k| k.eq_ignore_ascii_case("unit"))
                     .unwrap_or(false)
             });
+
+            let lower_ref_spec = |b: &mut FuncBuilder, needle: &str| -> ValueId {
+                spec_by_keyword(needle)
+                    .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
+                    .unwrap_or(null)
+            };
+            let lower_string_spec = |b: &mut FuncBuilder, needle: &str| -> (ValueId, ValueId) {
+                if let Some(spec) = spec_by_keyword(needle) {
+                    lower_string_expr_with_layouts(
+                        b,
+                        &ctx.locals,
+                        &spec.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    )
+                } else {
+                    (null, zero_len)
+                }
+            };
+
+            let exist_addr = lower_ref_spec(b, "exist");
+            let opened_addr = lower_ref_spec(b, "opened");
+            let iostat_addr = lower_ref_spec(b, "iostat");
+            let (name_ptr, name_len) = lower_string_spec(b, "name");
+            let (access_ptr, access_len) = lower_string_spec(b, "access");
+            let (form_ptr, form_len) = lower_string_spec(b, "form");
+            let (action_ptr, action_len) = lower_string_spec(b, "action");
+            let recl_addr = lower_ref_spec(b, "recl");
+            let size_addr = lower_ref_spec(b, "size");
 
             if let Some(fs) = file_spec {
                 let (fptr, flen) = lower_string_expr_with_layouts(
@@ -12651,21 +13096,48 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     ctx.st,
                     Some(ctx.type_layouts),
                 );
-                let exist_addr = if let Some(es) = exist_spec {
-                    if let Expr::Name { name } = &es.value.node {
-                        ctx.locals
-                            .get(&name.to_lowercase())
-                            .map(|i| i.addr)
-                            .unwrap_or(null)
-                    } else {
-                        null
-                    }
-                } else {
-                    null
-                };
                 b.call(
                     FuncRef::External("afs_inquire_file".into()),
-                    vec![fptr, flen, exist_addr, null, null],
+                    vec![
+                        fptr,
+                        flen,
+                        exist_addr,
+                        opened_addr,
+                        iostat_addr,
+                        name_ptr,
+                        name_len,
+                        access_ptr,
+                        access_len,
+                        form_ptr,
+                        form_len,
+                        action_ptr,
+                        action_len,
+                        recl_addr,
+                        size_addr,
+                    ],
+                    IrType::Void,
+                );
+            } else if let Some(us) = unit_spec {
+                let unit_raw = lower_expr_ctx(b, ctx, &us.value);
+                let unit = coerce_to_type(b, unit_raw, &IrType::Int(IntWidth::I32));
+                b.call(
+                    FuncRef::External("afs_inquire_unit".into()),
+                    vec![
+                        unit,
+                        exist_addr,
+                        opened_addr,
+                        iostat_addr,
+                        name_ptr,
+                        name_len,
+                        access_ptr,
+                        access_len,
+                        form_ptr,
+                        form_len,
+                        action_ptr,
+                        action_len,
+                        recl_addr,
+                        size_addr,
+                    ],
                     IrType::Void,
                 );
             }
@@ -12736,9 +13208,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             //
             // In both cases the target must be a simple Name for now;
             // component-access and slice targets are follow-up work.
-            if let Some((tgt_field_ptr, tgt_field)) =
+            let component_target =
                 resolve_component_field_access(b, &ctx.locals, target, ctx.st, ctx.type_layouts)
-            {
+                    .filter(|(_, field)| field.pointer);
+
+            if let Some((tgt_field_ptr, tgt_field)) = component_target.as_ref() {
                 if !tgt_field.pointer {
                     return;
                 }
@@ -12748,7 +13222,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             if name.eq_ignore_ascii_case("null") {
                                 let zero = b.const_i64(0);
                                 let null = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
-                                store_string_descriptor_view(b, tgt_field_ptr, null, zero);
+                                store_string_descriptor_view(b, *tgt_field_ptr, null, zero);
                                 return;
                             }
                         }
@@ -12812,7 +13286,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             );
                                             store_string_descriptor_view(
                                                 b,
-                                                tgt_field_ptr,
+                                                *tgt_field_ptr,
                                                 ptr,
                                                 len,
                                             );
@@ -12832,7 +13306,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     ) {
                         if is_deferred_char_component_field(&src_field) {
                             let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
-                            store_string_descriptor_view(b, tgt_field_ptr, ptr, len);
+                            store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
                             return;
                         }
                     }
@@ -12843,21 +13317,73 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         ctx.st,
                         Some(ctx.type_layouts),
                     );
-                    store_string_descriptor_view(b, tgt_field_ptr, ptr, len);
+                    store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
                     return;
                 }
             }
 
-            let Expr::Name { name: tgt_name } = &target.node else {
-                return;
-            };
-            let tgt_key = tgt_name.to_lowercase();
-            let Some(tgt_info) = ctx.locals.get(&tgt_key).cloned() else {
+            let Some(tgt_info) = component_target
+                .map(|(tgt_field_ptr, tgt_field)| LocalInfo {
+                    addr: tgt_field_ptr,
+                    ty: if tgt_field.pointer
+                        && matches!(
+                            tgt_field.type_info,
+                            crate::sema::symtab::TypeInfo::Derived(_)
+                        )
+                        && tgt_field.size != 384
+                    {
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+                    } else {
+                        field_storage_ir_type(&tgt_field, ctx.type_layouts)
+                    },
+                    dims: vec![],
+                    allocatable: tgt_field.size == 384
+                        && (tgt_field.allocatable || tgt_field.pointer),
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: field_char_kind(&tgt_field),
+                    derived_type: field_derived_type_name(&tgt_field),
+                    inline_const: None,
+                    is_pointer: tgt_field.pointer,
+                    runtime_dim_upper: vec![],
+                })
+                .or_else(|| {
+                    if let Expr::Name { name: tgt_name } = &target.node {
+                        ctx.locals.get(&tgt_name.to_lowercase()).cloned()
+                    } else {
+                        None
+                    }
+                })
+            else {
                 return;
             };
             if !tgt_info.is_pointer {
                 return;
             }
+
+            if let Expr::FunctionCall { callee, .. } = &value.node {
+                if let Expr::Name { name } = &callee.node {
+                    if name.eq_ignore_ascii_case("null") {
+                        if matches!(tgt_info.char_kind, CharKind::Deferred) {
+                            let tgt_desc = string_descriptor_addr(b, &tgt_info);
+                            let zero = b.const_i64(0);
+                            let null = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
+                            store_string_descriptor_view(b, tgt_desc, null, zero);
+                            return;
+                        }
+                        let zero_byte = b.const_i32(0);
+                        let size = if tgt_info.allocatable { 384i64 } else { 8i64 };
+                        let size_val = b.const_i64(size);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![tgt_info.addr, zero_byte, size_val],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        return;
+                    }
+                }
+            }
+
             if matches!(tgt_info.char_kind, CharKind::Deferred) {
                 let tgt_desc = string_descriptor_addr(b, &tgt_info);
                 if let Expr::FunctionCall { callee, .. } = &value.node {
@@ -13616,7 +14142,10 @@ fn lower_select_case(
     selector: &crate::ast::expr::SpannedExpr,
     cases: &[CaseBlock],
 ) {
-    let sel_val = lower_expr_ctx(b, ctx, selector);
+    let selector_is_char =
+        expr_is_character_expr(b, &ctx.locals, selector, ctx.st, Some(ctx.type_layouts));
+    let sel_char = selector_is_char.then(|| lower_string_expr_ctx(b, ctx, selector));
+    let sel_val = (!selector_is_char).then(|| lower_expr_ctx(b, ctx, selector));
     let bb_end = b.create_block("select_end");
 
     // For simplicity, lower as a chain of if-else comparisons.
@@ -13656,19 +14185,60 @@ fn lower_select_case(
         for sel in &case.selectors {
             let cond = match sel {
                 CaseSelector::Value(expr) => {
-                    let val = lower_expr_ctx(b, ctx, expr);
-                    b.icmp(CmpOp::Eq, sel_val, val)
+                    if let Some((sel_ptr, sel_len)) = sel_char {
+                        let (case_ptr, case_len) = lower_string_expr_ctx(b, ctx, expr);
+                        let cmp = b.call(
+                            FuncRef::External("afs_compare_char".into()),
+                            vec![sel_ptr, sel_len, case_ptr, case_len],
+                            IrType::Int(IntWidth::I32),
+                        );
+                        let zero = b.const_i32(0);
+                        b.icmp(CmpOp::Eq, cmp, zero)
+                    } else {
+                        let val = lower_expr_ctx(b, ctx, expr);
+                        b.icmp(CmpOp::Eq, sel_val.expect("non-character selector"), val)
+                    }
                 }
                 CaseSelector::Range { low, high } => {
                     let low_ok = if let Some(lo) = low {
-                        let lo_val = lower_expr_ctx(b, ctx, lo);
-                        Some(b.icmp(CmpOp::Ge, sel_val, lo_val))
+                        if let Some((sel_ptr, sel_len)) = sel_char {
+                            let (lo_ptr, lo_len) = lower_string_expr_ctx(b, ctx, lo);
+                            let cmp = b.call(
+                                FuncRef::External("afs_compare_char".into()),
+                                vec![sel_ptr, sel_len, lo_ptr, lo_len],
+                                IrType::Int(IntWidth::I32),
+                            );
+                            let zero = b.const_i32(0);
+                            Some(b.icmp(CmpOp::Ge, cmp, zero))
+                        } else {
+                            let lo_val = lower_expr_ctx(b, ctx, lo);
+                            Some(b.icmp(
+                                CmpOp::Ge,
+                                sel_val.expect("non-character selector"),
+                                lo_val,
+                            ))
+                        }
                     } else {
                         None
                     };
                     let high_ok = if let Some(hi) = high {
-                        let hi_val = lower_expr_ctx(b, ctx, hi);
-                        Some(b.icmp(CmpOp::Le, sel_val, hi_val))
+                        if let Some((sel_ptr, sel_len)) = sel_char {
+                            let (hi_ptr, hi_len) = lower_string_expr_ctx(b, ctx, hi);
+                            let cmp = b.call(
+                                FuncRef::External("afs_compare_char".into()),
+                                vec![sel_ptr, sel_len, hi_ptr, hi_len],
+                                IrType::Int(IntWidth::I32),
+                            );
+                            let zero = b.const_i32(0);
+                            Some(b.icmp(CmpOp::Le, cmp, zero))
+                        } else {
+                            let hi_val = lower_expr_ctx(b, ctx, hi);
+                            Some(b.icmp(
+                                CmpOp::Le,
+                                sel_val.expect("non-character selector"),
+                                hi_val,
+                            ))
+                        }
                     } else {
                         None
                     };
@@ -13788,13 +14358,17 @@ fn compute_flat_elem_offset(
             };
             let sub = widen_idx_to_i64(b, sub_raw);
 
-            let dim_base = 24 + (dim_idx as i64) * 24;
-            let off_lo = b.const_i64(dim_base);
-            let off_up = b.const_i64(dim_base + 8);
-            let p_lo = b.gep(desc, vec![off_lo], IrType::Int(IntWidth::I8));
-            let p_up = b.gep(desc, vec![off_up], IrType::Int(IntWidth::I8));
-            let lo = b.load_typed(p_lo, IrType::Int(IntWidth::I64));
-            let up = b.load_typed(p_up, IrType::Int(IntWidth::I64));
+            let dim = b.const_i32((dim_idx + 1) as i32);
+            let lo = b.call(
+                FuncRef::External("afs_array_lbound".into()),
+                vec![desc, dim],
+                IrType::Int(IntWidth::I64),
+            );
+            let up = b.call(
+                FuncRef::External("afs_array_ubound".into()),
+                vec![desc, dim],
+                IrType::Int(IntWidth::I64),
+            );
             emit_bounds_check(b, sub, lo, up);
 
             let adjusted = b.isub(sub, lo);
@@ -17910,7 +18484,7 @@ fn component_intrinsic_local_info(
     if field.size == 384 && (field.allocatable || field.pointer) {
         return Some(LocalInfo {
             addr: field_ptr,
-            ty: type_info_to_storage_ir_type(&field.type_info, tl),
+            ty: field_storage_ir_type(&field, tl),
             dims: vec![],
             allocatable: true,
             descriptor_arg: false,
@@ -17927,7 +18501,7 @@ fn component_intrinsic_local_info(
     }
     Some(LocalInfo {
         addr: field_ptr,
-        ty: type_info_to_storage_ir_type(&field.type_info, tl),
+        ty: field_storage_ir_type(&field, tl),
         dims: field.dims.clone(),
         allocatable: false,
         descriptor_arg: false,
@@ -18384,6 +18958,15 @@ fn derived_layout_needs_runtime_zero_init(layout: &crate::sema::type_layout::Typ
         .any(|field| field.allocatable || field.pointer)
 }
 
+fn derived_layout_has_runtime_field_defaults(
+    layout: &crate::sema::type_layout::TypeLayout,
+) -> bool {
+    layout
+        .fields
+        .iter()
+        .any(|field| field.default_init.is_some())
+}
+
 fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
     if bytes <= 0 {
         return;
@@ -18395,6 +18978,32 @@ fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
         vec![addr, zero, size],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
+}
+
+fn apply_derived_field_default_inits(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    for field in &layout.fields {
+        let Some(default_init) = &field.default_init else {
+            continue;
+        };
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+        match default_init {
+            crate::sema::type_layout::FieldDefaultInit::Character(value) => {
+                let src_ptr = b.const_string(value.as_bytes());
+                let dest_len = b.const_i64(field.size as i64);
+                let src_len = b.const_i64(value.len() as i64);
+                b.call(
+                    FuncRef::External("afs_assign_char_fixed".into()),
+                    vec![field_ptr, dest_len, src_ptr, src_len],
+                    IrType::Void,
+                );
+            }
+        }
+    }
 }
 
 fn lower_fixed_component_array_element_ptr(
@@ -18481,7 +19090,21 @@ fn resolve_component_base(
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             // The field must be a derived type for chaining to continue.
             if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
-                Some((field_ptr, nested_type.clone()))
+                let addr = if field.pointer {
+                    // Scalar derived POINTER components store an address slot,
+                    // while descriptor-backed POINTER components store the
+                    // pointee base in the descriptor's base_addr field.
+                    // Chained accesses must walk through that indirection.
+                    b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else if field.size == 384 && field.allocatable {
+                    // Scalar allocatable derived components are stored in an
+                    // ArrayDescriptor slot. Chained accesses must walk the
+                    // pointee base, not the descriptor header itself.
+                    b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else {
+                    field_ptr
+                };
+                Some((addr, nested_type.clone()))
             } else {
                 None // Terminal field — caller should load, not chain further.
             }
@@ -18550,6 +19173,7 @@ fn resolve_component_field_access(
 
 fn is_deferred_char_component_field(field: &crate::sema::type_layout::FieldLayout) -> bool {
     (field.pointer || field.allocatable)
+        && field.size == 32
         && matches!(
             field.type_info,
             crate::sema::symtab::TypeInfo::Character { len: None, .. }
@@ -18568,8 +19192,10 @@ fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> CharKind {
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => CharKind::Fixed(*n),
         crate::sema::symtab::TypeInfo::Character { len: None, .. } => {
-            if field.pointer || field.allocatable {
+            if (field.pointer || field.allocatable) && field.size == 32 {
                 CharKind::Deferred
+            } else if field.pointer || field.allocatable {
+                CharKind::None
             } else {
                 CharKind::Fixed(field.size as i64)
             }
@@ -18582,6 +19208,25 @@ fn field_derived_type_name(field: &crate::sema::type_layout::FieldLayout) -> Opt
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Derived(name) => Some(name.clone()),
         _ => None,
+    }
+}
+
+fn field_storage_ir_type(
+    field: &crate::sema::type_layout::FieldLayout,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> IrType {
+    match &field.type_info {
+        crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }
+            if field.pointer || field.allocatable =>
+        {
+            fixed_char_storage_ir_type(*n)
+        }
+        crate::sema::symtab::TypeInfo::Character { len: None, .. }
+            if field.pointer || field.allocatable =>
+        {
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+        }
+        _ => type_info_to_storage_ir_type(&field.type_info, tl),
     }
 }
 
@@ -18598,7 +19243,7 @@ fn component_array_local_info(
     }
     Some(LocalInfo {
         addr: field_ptr,
-        ty: type_info_to_storage_ir_type(&field.type_info, tl),
+        ty: field_storage_ir_type(&field, tl),
         dims: vec![],
         allocatable: true,
         descriptor_arg: false,
@@ -18728,7 +19373,7 @@ fn expr_is_character_expr(
                             resolve_component_field_access(b, locals, callee, st, tl).map(
                                 |(field_ptr, field)| LocalInfo {
                                     addr: field_ptr,
-                                    ty: type_info_to_storage_ir_type(&field.type_info, tl),
+                                    ty: field_storage_ir_type(&field, tl),
                                     dims: vec![],
                                     allocatable: field.allocatable,
                                     descriptor_arg: false,
@@ -18975,6 +19620,41 @@ fn typed_allocate_char_len(
     }
 }
 
+fn allocate_keyword_expr<'a>(opts: &'a [IoControl], keyword: &str) -> Option<&'a SpannedExpr> {
+    opts.iter()
+        .find(|opt| {
+            opt.keyword
+                .as_deref()
+                .map(|kw| kw.eq_ignore_ascii_case(keyword))
+                .unwrap_or(false)
+        })
+        .map(|opt| &opt.value)
+}
+
+fn allocate_char_source_value(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    opts: &[IoControl],
+) -> Option<(ValueId, ValueId)> {
+    let expr = allocate_keyword_expr(opts, "source")?;
+    if !expr_is_character_expr(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts)) {
+        return None;
+    }
+    Some(lower_string_expr_ctx(b, ctx, expr))
+}
+
+fn allocate_char_mold_len(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    opts: &[IoControl],
+) -> Option<ValueId> {
+    let expr = allocate_keyword_expr(opts, "mold")?;
+    if !expr_is_character_expr(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts)) {
+        return None;
+    }
+    Some(lower_string_expr_ctx(b, ctx, expr).1)
+}
+
 /// Resolve a base expression for a type-bound procedure call.
 /// Returns (object_address, type_name) — the address of the base object.
 /// For simple `obj%method()`, base is `obj` → returns (obj.addr, obj.type).
@@ -18991,7 +19671,9 @@ fn resolve_component_base_for_method(
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
             let type_name = info.derived_type.as_ref()?.clone();
-            let addr = if info.allocatable {
+            let addr = if info.is_pointer {
+                b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else if info.allocatable {
                 array_base_addr(b, info)
             } else if info.by_ref {
                 b.load(info.addr)
@@ -19012,7 +19694,12 @@ fn resolve_component_base_for_method(
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
-                Some((field_ptr, nested_type.clone()))
+                let addr = if field.size == 384 && (field.allocatable || field.pointer) {
+                    b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                } else {
+                    field_ptr
+                };
+                Some((addr, nested_type.clone()))
             } else {
                 None
             }
@@ -19134,6 +19821,25 @@ fn lower_char_arg_by_ref(
         }
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
+                if let Expr::ComponentAccess { .. } = &callee.node {
+                    let tl = type_layouts?;
+                    let info = component_intrinsic_local_info(b, locals, callee, st, tl)?;
+                    if info.char_kind == CharKind::None
+                        && !descriptor_backed_runtime_char_array(&info)
+                    {
+                        return None;
+                    }
+                    let ptr = if local_uses_array_descriptor(&info)
+                        || matches!(info.ty, IrType::Int(IntWidth::I8))
+                    {
+                        char_array_element_ptr_and_len(b, locals, &info, args, st, type_layouts)?.0
+                    } else {
+                        lower_array_element(b, locals, &info, args, st, type_layouts)
+                    };
+                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    b.store(ptr, slot);
+                    return Some(slot);
+                }
                 return None;
             };
             let info = locals.get(&name.to_lowercase())?;
@@ -19152,7 +19858,9 @@ fn lower_char_arg_by_ref(
                 b.store(ptr, slot);
                 return Some(slot);
             }
-            if !matches!(info.char_kind, CharKind::Fixed(_)) || info.dims.is_empty() {
+            if (info.char_kind == CharKind::None && !descriptor_backed_runtime_char_array(info))
+                || (info.dims.is_empty() && !local_uses_array_descriptor(info))
+            {
                 return None;
             }
             let ptr = if local_uses_array_descriptor(info)
@@ -19228,6 +19936,21 @@ fn lower_arg_by_ref_full(
     ) {
         return ptr_slot;
     }
+    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+        let (ptr, _len) = lower_string_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        b.store(ptr, slot);
+        return slot;
+    }
     // If it's a simple name, pass its address.
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
@@ -19237,6 +19960,14 @@ fn lower_arg_by_ref_full(
                 let tmp = b.alloca(info.ty.clone());
                 b.store(val, tmp);
                 return tmp;
+            }
+            if info.is_pointer && !info.by_ref && info.dims.is_empty() {
+                let load_ty = if info.ty.is_ptr() {
+                    info.ty.clone()
+                } else {
+                    IrType::Ptr(Box::new(info.ty.clone()))
+                };
+                return b.load_typed(info.addr, load_ty);
             }
             if info.derived_type.is_some() && info.dims.is_empty() && !info.is_pointer {
                 return derived_scalar_storage_addr_for_call(b, info);
@@ -19259,6 +19990,23 @@ fn lower_arg_by_ref_full(
             if let Some((field_ptr, field)) =
                 resolve_component_field_access(b, locals, expr, st, tl)
             {
+                if field.pointer {
+                    if is_deferred_char_component_field(&field) {
+                        return field_ptr;
+                    }
+                    if field.size == 384 && (field.allocatable || field.pointer) {
+                        return field_ptr;
+                    }
+                    if matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_)) {
+                        return b.load_typed(
+                            field_ptr,
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                    }
+                    let pointee_ty = type_info_to_ir_type(&field.type_info);
+                    let slot_ty = IrType::Ptr(Box::new(pointee_ty));
+                    return b.load_typed(field_ptr, slot_ty);
+                }
                 let _ = field;
                 // Component actuals like `state%num_tokens` are lvalues:
                 // pass the field storage itself so intent(out/inout)
@@ -19276,27 +20024,30 @@ fn lower_arg_by_ref_full(
         if let Expr::Name { name } = &callee.node {
             let key = name.to_lowercase();
             if let Some(info) = locals.get(&key) {
-                if !info.dims.is_empty() || local_uses_array_descriptor(info) {
-                    // Compute the element address via GEP.
-                    if args.len() == 1 {
-                        if let crate::ast::expr::SectionSubscript::Element(idx_expr) =
-                            &args[0].value
-                        {
-                            let base = array_data_ptr_for_call(b, info);
-                            let idx = lower_expr(b, locals, idx_expr, st);
-                            let idx64 = match b.func().value_type(idx) {
-                                Some(IrType::Int(IntWidth::I64)) => idx,
-                                _ => b.int_extend(idx, IntWidth::I64, true),
-                            };
-                            let one = b.const_i64(1);
-                            let idx0 = b.isub(idx64, one); // Fortran 1-indexed → 0-indexed
-                            let elem = b.gep(base, vec![idx0], info.ty.clone());
-                            if info.derived_type.is_some() {
-                                let zero = b.const_i64(0);
-                                return b.gep(elem, vec![zero], IrType::Int(IntWidth::I8));
-                            }
-                            return elem;
+                if (!info.dims.is_empty() || local_uses_array_descriptor(info))
+                    && args.iter().all(|arg| {
+                        matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_))
+                    })
+                {
+                    let elem = lower_array_element_addr(b, locals, info, args, st, type_layouts);
+                    if info.derived_type.is_some() {
+                        let zero = b.const_i64(0);
+                        return b.gep(elem, vec![zero], IrType::Int(IntWidth::I8));
+                    }
+                    return elem;
+                }
+            }
+        }
+        if let Expr::ComponentAccess { .. } = &callee.node {
+            if let Some(tl) = type_layouts {
+                if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
+                    if !info.dims.is_empty() || local_uses_array_descriptor(&info) {
+                        let elem = lower_array_element_addr(b, locals, &info, args, st, Some(tl));
+                        if info.derived_type.is_some() {
+                            let zero = b.const_i64(0);
+                            return b.gep(elem, vec![zero], IrType::Int(IntWidth::I8));
                         }
+                        return elem;
                     }
                 }
             }
@@ -19317,6 +20068,9 @@ fn lower_arg_by_ref_full(
         .func()
         .value_type(val)
         .unwrap_or(IrType::Int(IntWidth::I32));
+    if ty.is_ptr() {
+        return val;
+    }
     let tmp = b.alloca(ty);
     b.store(val, tmp);
     tmp
@@ -20301,6 +21055,16 @@ fn lower_expr_full(
                         };
                     }
                 }
+                if let Some(opt_flags) = callee_optional_arg_mask(st, &callee_key)
+                    .or_else(|| callee_optional_arg_mask(st, &signature_key))
+                    .or_else(|| callee_optional_arg_mask(st, &key))
+                {
+                    for flag in opt_flags.iter().skip(ref_arg_vals.len()) {
+                        if *flag {
+                            ref_arg_vals.push(b.const_i64(0));
+                        }
+                    }
+                }
                 let callee_char_len_star_args = callee_char_len_star_mask(st, &callee_key)
                     .or_else(|| callee_char_len_star_mask(st, &signature_key))
                     .or_else(|| callee_char_len_star_mask(st, &key));
@@ -20419,15 +21183,30 @@ fn lower_expr_full(
                             let field_ptr =
                                 b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
-                            // If the field is a derived type, DON'T load — return the pointer
-                            // (for chained access like x%inner%field).
-                            if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
-                                return field_ptr;
-                            }
-
                             if is_deferred_char_component_field(field) {
                                 let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
                                 return ptr;
+                            }
+
+                            if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {
+                                if field.pointer {
+                                    return b.load_typed(
+                                        field_ptr,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                }
+                                // Non-pointer derived fields stay address-valued
+                                // so chained access like x%inner%field can walk
+                                // the inline storage directly.
+                                return field_ptr;
+                            }
+
+                            if field.pointer {
+                                let slot_ty =
+                                    IrType::Ptr(Box::new(type_info_to_ir_type(&field.type_info)));
+                                let pointee = b.load_typed(field_ptr, slot_ty);
+                                return b
+                                    .load_typed(pointee, type_info_to_ir_type(&field.type_info));
                             }
 
                             // Character fields: return the pointer to the inline
@@ -20590,6 +21369,7 @@ mod tests {
             &units,
             &st,
             &layouts,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -21323,6 +22103,30 @@ end subroutine
         assert!(
             ir.contains("call @afs_allocate_array"),
             "expected descriptor-backed allocation in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_runtime_bound_explicit_shape_local_uses_descriptor_storage() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine foo(n)
+  implicit none
+  integer, intent(in) :: n
+  integer :: argv(n + 1)
+  argv(n + 1) = 22
+end subroutine
+",
+        );
+        assert!(
+            ir.contains("call @afs_allocate_array"),
+            "expected runtime-bound local array allocation in:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("call @afs_deallocate_array"),
+            "expected runtime-bound local array cleanup in:\n{}",
             ir
         );
     }

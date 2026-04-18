@@ -1081,6 +1081,7 @@ fn parse_type(
                     allocatable,
                     pointer,
                     target,
+                    default_init: None,
                 });
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
@@ -1258,6 +1259,21 @@ pub fn extract_module_globals(
                     external: true,
                 },
             );
+        }
+    }
+    out
+}
+
+/// Extract char_len_star_params from a loaded ModuleInterface.
+/// For each procedure with character(len=*) args, produces a
+/// Vec<bool> (per-position, true = assumed-length character).
+pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for proc in &iface.procedures {
+        let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
+        let flags: Vec<bool> = visible_args.iter().map(|a| a.optional).collect();
+        if flags.iter().any(|f| *f) {
+            out.insert(proc.name.to_lowercase(), flags);
         }
     }
     out
