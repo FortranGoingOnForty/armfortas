@@ -1367,6 +1367,116 @@ fn bind_c_c_char_buffer_writes_scalar_character_storage() {
 }
 
 #[test]
+fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
+    let dir = unique_dir("bind_c_c_char_buffer_amod");
+    let c_src = write_program_in(
+        &dir,
+        "fill_chars.c",
+        "#include <stddef.h>\n\nsize_t fill_chars(char *buf, size_t n) {\n    static const char msg[] = \"hello world\";\n    size_t len = sizeof(msg) - 1;\n    if (n < len) len = n;\n    for (size_t i = 0; i < len; ++i) buf[i] = msg[i];\n    return len;\n}\n",
+    );
+    let c_obj = dir.join("fill_chars.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let mod_src = write_program_in(
+        &dir,
+        "c_strings.f90",
+        "module c_strings\n  use iso_c_binding, only: c_char, c_size_t\n  implicit none\n  interface\n    function fill_chars(buf, n) result(copied) bind(C, name='fill_chars')\n      import :: c_char, c_size_t\n      character(kind=c_char) :: buf(*)\n      integer(c_size_t), value :: n\n      integer(c_size_t) :: copied\n    end function\n  end interface\nend module c_strings\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_size_t\n  use c_strings, only: fill_chars\n  implicit none\n  character(len=11) :: fixed\n  integer(c_size_t) :: copied\n\n  fixed = '           '\n  copied = fill_chars(fixed, int(len(fixed), c_size_t))\n  if (fixed /= 'hello world') error stop 1\n  if (copied /= int(11, c_size_t)) error stop 2\n  print *, trim(fixed)\nend program\n",
+    );
+
+    let mod_obj = dir.join("c_strings.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "bind(c) c_char interface module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("c_strings.amod")).expect("missing c_strings.amod");
+    assert!(
+        amod.contains("@abi cc=aapcs64 hidden_char_lens=0"),
+        "bind(c) c_char buffer interface should not advertise hidden lengths: {}",
+        amod
+    );
+    assert!(
+        !amod.contains("@arg buf@len"),
+        "bind(c) c_char buffer interface should not serialize hidden len args: {}",
+        amod
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char interface user compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "bind(c) c_char interface user should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_buffer_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char interface user link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) c_char interface user objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) c_char interface user run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) c_char interface user binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("hello world"),
+        "bind(c) c_char buffer should survive .amod import and still write the caller storage: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(
@@ -4182,6 +4292,132 @@ fn public_derived_type_in_private_module_is_emitted_and_importable() {
 }
 
 #[test]
+fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
+    let dir = unique_dir("named_char_component_amod");
+    let cfg_src = write_program_in(
+        &dir,
+        "cfg.f90",
+        "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 16\nend module cfg\n",
+    );
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  use cfg, only: max_token_len\n  implicit none\n  type, public :: simple_command_t\n    character(len=max_token_len), allocatable :: assignments(:)\n    character(len=max_token_len) :: heredoc_delimiter = ''\n  end type\nend module m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: simple_command_t\n  implicit none\n  type(simple_command_t) :: cmd\n  allocate(cmd%assignments(1))\n  cmd%assignments(1) = 'hello.world.txt'\n  cmd%heredoc_delimiter = 'done'\n  if (trim(cmd%assignments(1)) /= 'hello.world.txt') error stop 1\n  if (trim(cmd%heredoc_delimiter) /= 'done') error stop 2\n  print *, trim(cmd%assignments(1)), trim(cmd%heredoc_delimiter)\nend program\n",
+    );
+
+    let cfg_obj = dir.join("cfg.o");
+    let compile_cfg = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            cfg_src.to_str().unwrap(),
+            "-o",
+            cfg_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cfg compile spawn failed");
+    assert!(
+        compile_cfg.status.success(),
+        "cfg module should compile: {}",
+        String::from_utf8_lossy(&compile_cfg.stderr)
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module with imported named character lengths should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = dir.join("m.amod");
+    let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
+    assert!(
+        amod_text.contains("@field assignments : character(len=16)")
+            && amod_text.contains("@field heredoc_delimiter : character(len=16)"),
+        "fixed imported character component lengths should survive into .amod: {}",
+        amod_text
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported fixed-length character components should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("named_char_component_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            cfg_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("named char component link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported fixed-length character component objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("named char component run failed");
+    assert!(
+        run.status.success(),
+        "imported fixed-length character components should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("hello.world.txt") && stdout.contains("done"),
+        "imported fixed-length character components should preserve their bytes: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn nested_derived_defaults_initialize_locally() {
     let src = write_program(
         "program p\n  implicit none\n  type :: control_block_t\n    logical :: should_execute = .true.\n    character(len=4) :: marker = ''\n  end type control_block_t\n  type :: shell_state_t\n    integer :: control_depth = 0\n    type(control_block_t) :: control_stack(2)\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  if (shell%control_depth /= 0) error stop 1\n  if (.not. shell%control_stack(1)%should_execute) error stop 2\n  if (shell%control_stack(2)%marker /= '    ') error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%should_execute\nend program\n",
@@ -6630,6 +6866,46 @@ fn allocatable_scalar_substring_actual_preserves_hidden_len() {
     assert!(
         stdout.contains("ok"),
         "unexpected allocatable scalar substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn zero_length_allocatable_substring_in_and_chain_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: assign_value\n  integer :: value_len\n  allocate(character(len=0) :: assign_value)\n  value_len = 0\n  if (value_len >= 2 .and. assign_value(1:1) == '(' .and. &\n      assign_value(value_len:value_len) == ')') then\n    print *, 'array'\n  end if\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("zero_len_alloc_substring_and", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero-length allocatable substring program compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "zero-length allocatable substring program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "zero-length allocatable substring program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected zero-length allocatable substring output: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("array"),
+        "zero-length allocatable substring should not satisfy guarded compare: {}",
         stdout
     );
 

@@ -8,7 +8,7 @@ use crate::ast::decl;
 use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
@@ -56,7 +56,7 @@ pub fn resolve_file(
     });
 
     // Third pass: compute layouts for all derived types.
-    compute_all_layouts(units, &mut layouts);
+    compute_all_layouts(units, &st, &mut layouts);
 
     Ok(ResolveResult {
         st,
@@ -879,16 +879,75 @@ fn load_external_module(
 /// Walk all program units and compute layouts for derived types.
 fn compute_all_layouts(
     units: &[SpannedUnit],
+    st: &SymbolTable,
     layouts: &mut super::type_layout::TypeLayoutRegistry,
 ) {
     let inherited_params = HashMap::new();
     for unit in units {
-        collect_derived_type_layouts(&unit.node, layouts, &inherited_params);
+        let scope_id = find_unit_scope(st, 0, &unit.node).unwrap_or(0);
+        collect_derived_type_layouts(&unit.node, scope_id, st, layouts, &inherited_params);
     }
+}
+
+fn scope_matches_unit(kind: &ScopeKind, unit: &ProgramUnit) -> bool {
+    match (kind, unit) {
+        (ScopeKind::Program(lhs), ProgramUnit::Program { name, .. }) => name
+            .as_deref()
+            .map(|rhs| lhs.eq_ignore_ascii_case(rhs))
+            .unwrap_or(false),
+        (ScopeKind::Module(lhs), ProgramUnit::Module { name, .. })
+        | (ScopeKind::Submodule(lhs), ProgramUnit::Submodule { name, .. })
+        | (ScopeKind::Subroutine(lhs), ProgramUnit::Subroutine { name, .. })
+        | (ScopeKind::Function(lhs), ProgramUnit::Function { name, .. }) => {
+            lhs.eq_ignore_ascii_case(name)
+        }
+        _ => false,
+    }
+}
+
+fn find_unit_scope(st: &SymbolTable, parent_scope: ScopeId, unit: &ProgramUnit) -> Option<ScopeId> {
+    st.all_scopes().iter().find_map(|scope| {
+        if scope.parent != Some(parent_scope) {
+            return None;
+        }
+        if scope_matches_unit(&scope.kind, unit) {
+            Some(scope.id)
+        } else {
+            None
+        }
+    })
+}
+
+fn visible_const_int_params(st: &SymbolTable, scope_id: ScopeId) -> HashMap<String, i64> {
+    let mut visible_names = BTreeSet::new();
+    for scope in st.all_scopes() {
+        for (name, sym) in &scope.symbols {
+            if sym.attrs.parameter {
+                visible_names.insert(name.clone());
+            }
+        }
+        for assoc in &scope.use_associations {
+            visible_names.insert(assoc.local_name.clone());
+        }
+    }
+
+    let mut out = HashMap::new();
+    for name in visible_names {
+        if let Some(sym) = st.lookup_in(scope_id, &name) {
+            if sym.attrs.parameter {
+                if let Some(value) = sym.const_value {
+                    out.insert(name, value);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn collect_derived_type_layouts(
     unit: &ProgramUnit,
+    scope_id: ScopeId,
+    st: &SymbolTable,
     layouts: &mut super::type_layout::TypeLayoutRegistry,
     inherited_params: &HashMap<String, i64>,
 ) {
@@ -907,7 +966,9 @@ fn collect_derived_type_layouts(
         } => (decls, contains),
         _ => return,
     };
-    let const_params = collect_const_int_params(decls, inherited_params);
+    let mut seed_params = inherited_params.clone();
+    seed_params.extend(visible_const_int_params(st, scope_id));
+    let const_params = collect_const_int_params(decls, &seed_params);
     for decl in decls {
         if let Decl::DerivedTypeDef {
             name,
@@ -945,7 +1006,8 @@ fn collect_derived_type_layouts(
         }
     }
     for sub in contains {
-        collect_derived_type_layouts(&sub.node, layouts, &const_params);
+        let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
+        collect_derived_type_layouts(&sub.node, sub_scope_id, st, layouts, &const_params);
     }
 }
 
@@ -1640,6 +1702,13 @@ mod tests {
         resolve_file(&units, &[]).unwrap().st
     }
 
+    fn resolve_source_with_layouts(src: &str) -> ResolveResult {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        resolve_file(&units, &[]).unwrap()
+    }
+
     // ---- Integration tests ----
 
     #[test]
@@ -1771,5 +1840,33 @@ end program
             .unwrap();
         assert!(mod_scope.symbols.contains_key("mytype"));
         assert_eq!(mod_scope.symbols["mytype"].kind, SymbolKind::DerivedType);
+    }
+
+    #[test]
+    fn imported_named_character_params_feed_type_layouts() {
+        let resolved = resolve_source_with_layouts(
+            "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 16\nend module\n\nmodule m\n  use cfg, only: max_token_len\n  implicit none\n  type :: token_t\n    character(len=max_token_len), allocatable :: value(:)\n    character(len=max_token_len) :: tag = ''\n  end type\nend module\n",
+        );
+        let layout = resolved
+            .type_layouts
+            .get("token_t")
+            .expect("missing token_t layout");
+        let value = layout.field("value").expect("missing value field");
+        let tag = layout.field("tag").expect("missing tag field");
+
+        assert!(matches!(
+            value.type_info,
+            TypeInfo::Character {
+                len: Some(16),
+                kind: None
+            }
+        ));
+        assert!(matches!(
+            tag.type_info,
+            TypeInfo::Character {
+                len: Some(16),
+                kind: None
+            }
+        ));
     }
 }

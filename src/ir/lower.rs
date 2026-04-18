@@ -6220,13 +6220,23 @@ fn lower_substring_full(
         None => base_len,
     };
     let one = b.const_i64(1);
-    let off = b.isub(start_val, one);
-    let sub_ptr = b.gep(base_ptr, vec![off], IrType::Int(IntWidth::I8));
-    let span = b.isub(end_val, start_val);
-    let raw_len = b.iadd(span, one);
     let zero = b.const_i64(0);
+    let max_start = b.iadd(base_len, one);
+    let start_ge_one = b.icmp(CmpOp::Ge, start_val, one);
+    let clamped_start_low = b.select(start_ge_one, start_val, one);
+    let start_le_max = b.icmp(CmpOp::Le, clamped_start_low, max_start);
+    let safe_start = b.select(start_le_max, clamped_start_low, max_start);
+    let end_ge_zero = b.icmp(CmpOp::Ge, end_val, zero);
+    let clamped_end_low = b.select(end_ge_zero, end_val, zero);
+    let end_le_len = b.icmp(CmpOp::Le, clamped_end_low, base_len);
+    let safe_end = b.select(end_le_len, clamped_end_low, base_len);
+    let off = b.isub(safe_start, one);
+    let sub_ptr_raw = b.gep(base_ptr, vec![off], IrType::Int(IntWidth::I8));
+    let span = b.isub(safe_end, safe_start);
+    let raw_len = b.iadd(span, one);
     let is_pos = b.icmp(CmpOp::Ge, raw_len, zero);
     let sub_len = b.select(is_pos, raw_len, zero);
+    let sub_ptr = b.select(is_pos, sub_ptr_raw, base_ptr);
     (sub_ptr, sub_len)
 }
 

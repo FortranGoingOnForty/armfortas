@@ -332,6 +332,8 @@ fn emit_procedure(
             })
         });
 
+    let is_bind_c = sym.attrs.binding_label.is_some();
+
     // Compute hidden char-length count from the scope's arg types.
     let mut hidden_count = 0usize;
     if let Some(pscope) = proc_scope {
@@ -341,6 +343,7 @@ fn emit_procedure(
                     arg_sym.type_info,
                     Some(TypeInfo::Character { len: None, .. })
                 ) && !arg_sym.attrs.allocatable
+                    && !is_bind_c
                 {
                     hidden_count += 1;
                 }
@@ -441,7 +444,8 @@ fn emit_procedure(
                 let is_assumed_len = matches!(
                     arg_sym.type_info,
                     Some(TypeInfo::Character { len: None, .. })
-                ) && !arg_sym.attrs.allocatable;
+                ) && !arg_sym.attrs.allocatable
+                    && !is_bind_c;
                 if is_assumed_len {
                     let reg = if reg_idx < 8 {
                         format!("x{}", reg_idx)
@@ -1382,11 +1386,14 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
 pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
+        let is_bind_c = proc.binding_label.is_some();
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args
             .iter()
             .map(|a| {
-                matches!(a.type_info, Some(TypeInfo::Character { len: None, .. })) && !a.allocatable
+                matches!(a.type_info, Some(TypeInfo::Character { len: None, .. }))
+                    && !a.allocatable
+                    && !is_bind_c
             })
             .collect();
         if flags.iter().any(|f| *f) {
