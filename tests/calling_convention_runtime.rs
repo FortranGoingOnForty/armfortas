@@ -436,3 +436,165 @@ fn non_bindc_keyword_reordering_preserves_mixed_gp_fp_spills() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cross_tu_character_result_with_spills_survives_amod_import() {
+    let dir = unique_dir("cross_tu_char_result_spills");
+    let mod_src = write_program_in(
+        &dir,
+        "abi_mod.f90",
+        "module abi_mod\ncontains\n  function accumulate(tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2, d3, d4, d5, d6, d7, d8, d9) result(out)\n    character(len=*), intent(in) :: tag\n    integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n    real(8), intent(in) :: d1, d2, d3, d4, d5, d6, d7, d8, d9\n    character(len=32) :: out\n    write(out, '(A,I0)') trim(tag) // '=', a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2) + int(d3) + int(d4) + int(d5) + int(d6) + int(d7) + int(d8) + int(d9)\n  end function accumulate\nend module abi_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use abi_mod, only: accumulate\n  implicit none\n  character(len=32) :: out\n  out = accumulate(a9=99, d8=8.5d0, a4=44, d2=2.5d0, tag='xy', a1=11, d5=5.25d0, a7=77, d1=1.25d0, &\n                   a2=22, d9=9.25d0, a5=55, d4=4.5d0, a8=88, a3=33, d6=6.5d0, a6=66, d3=3.75d0, d7=7.75d0)\n  if (trim(out) /= 'xy=540') error stop 1\n  print *, trim(out)\nend program\n",
+    );
+
+    let mod_obj = dir.join("abi_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-TU char-result module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "cross-TU char-result module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-TU char-result main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "cross-TU char-result main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("cross_tu_char_result_spills.bin");
+    link_program(&[&main_obj, &mod_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-TU char-result runtime failed");
+    assert!(
+        run.status.success(),
+        "cross-TU char-result runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("xy=540"),
+        "unexpected cross-TU char-result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_bindc_keyword_spills_survive_amod_import() {
+    let dir = unique_dir("cross_tu_bindc_keyword_spills");
+    let c_src = write_program_in(
+        &dir,
+        "check_keyword_spill.c",
+        "#include <stdint.h>\n\nint check_keyword_spill(int32_t *out0, int32_t a1, int32_t *io1, double d1, int32_t a2, int32_t *io2, double d2, int32_t a3, int32_t *io3, double d3, int32_t a4, int32_t *io4, int32_t a5) {\n    if (!out0 || !io1 || !io2 || !io3 || !io4) return 100;\n    if (a1 != 11) return 1;\n    if (*io1 != 101) return 2;\n    if (d1 != 1.25) return 3;\n    if (a2 != 22) return 4;\n    if (*io2 != 202) return 5;\n    if (d2 != 2.5) return 6;\n    if (a3 != 33) return 7;\n    if (*io3 != 303) return 8;\n    if (d3 != 3.75) return 9;\n    if (a4 != 44) return 10;\n    if (*io4 != 404) return 11;\n    if (a5 != 55) return 12;\n    *out0 = a1 + a2 + a3 + a4 + a5;\n    *io4 += 1;\n    return 0;\n}\n",
+    );
+    let c_obj = dir.join("check_keyword_spill.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let mod_src = write_program_in(
+        &dir,
+        "c_mix.f90",
+        "module c_mix\n  use iso_c_binding, only: c_int, c_double\n  implicit none\n  interface\n    function check_keyword_spill(out0, a1, io1, d1, a2, io2, d2, a3, io3, d3, a4, io4, a5) result(rc) bind(C, name='check_keyword_spill')\n      import :: c_int, c_double\n      integer(c_int), intent(out) :: out0\n      integer(c_int), value :: a1, a2, a3, a4, a5\n      integer(c_int), intent(inout) :: io1, io2, io3, io4\n      real(c_double), value :: d1, d2, d3\n      integer(c_int) :: rc\n    end function check_keyword_spill\n  end interface\nend module c_mix\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_double\n  use c_mix, only: check_keyword_spill\n  implicit none\n  integer(c_int) :: rc, out0, io1, io2, io3, io4\n  io1 = 101_c_int\n  io2 = 202_c_int\n  io3 = 303_c_int\n  io4 = 404_c_int\n  rc = check_keyword_spill(a5=55_c_int, io2=io2, d2=2.5_c_double, out0=out0, a1=11_c_int, io1=io1, d1=1.25_c_double, a2=22_c_int, io3=io3, d3=3.75_c_double, a3=33_c_int, io4=io4, a4=44_c_int)\n  if (rc /= 0_c_int) error stop rc\n  if (out0 /= 165_c_int) error stop 21\n  if (io4 /= 405_c_int) error stop 22\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("c_mix.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-TU bind(c) module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "cross-TU bind(c) module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-TU bind(c) main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "cross-TU bind(c) main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("cross_tu_bindc_keyword_spills.bin");
+    link_program(&[&main_obj, &mod_obj, &c_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-TU bind(c) runtime failed");
+    assert!(
+        run.status.success(),
+        "cross-TU bind(c) runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected cross-TU bind(c) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
