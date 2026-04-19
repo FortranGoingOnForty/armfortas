@@ -8424,6 +8424,79 @@ fn deferred_char_pointer_component_compiles_string_pool_style_ops() {
 }
 
 #[test]
+fn deferred_char_pointer_component_can_bind_allocatable_char_array_element() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: string_ref\n    character(:), pointer :: data => null()\n  end type string_ref\n  type(string_ref) :: ref\n  character(len=32), target, allocatable :: pool(:)\n\n  allocate(pool(1))\n  pool = ''\n  ref%data => pool(1)(1:32)\n  if (.not. associated(ref%data)) error stop 1\n  ref%data = '/tmp'\n  if (trim(ref%data) /= '/tmp') error stop 2\n  print *, trim(ref%data)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_ptr_alloc_char_elem", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char element pointer bind compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable char element pointer bind should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable char element pointer bind should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("/tmp"),
+        "unexpected allocatable char element pointer bind output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn get_environment_variable_literal_name_populates_value_and_status() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: home_buf\n  integer :: len_out, stat_out\n  home_buf = ''\n  len_out = -1\n  stat_out = -1\n  call get_environment_variable('HOME', home_buf, len_out, stat_out)\n  if (stat_out /= 0) error stop 1\n  if (len_out /= 4) error stop 2\n  if (trim(home_buf) /= '/tmp') error stop 3\n  print *, trim(home_buf)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("get_environment_variable_literal_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("literal-name get_environment_variable compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "literal-name get_environment_variable should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .env("HOME", "/tmp")
+        .output()
+        .expect("run failed");
+    assert!(
+        run.status.success(),
+        "literal-name get_environment_variable should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("/tmp"),
+        "unexpected literal-name get_environment_variable output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_allocatable_slice_assignment_compiles() {
     let src = write_program(
         "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  integer :: n\n  n = 4\n  allocate(a(n), b(n))\n  a = .false.\n  b = .true.\n  a(1:n) = b(1:n)\n  b(2:n-1) = .false.\nend program\n",

@@ -9079,19 +9079,14 @@ fn lower_intrinsic_subroutine(
     ) -> (ValueId, ValueId) {
         if n < args.len() {
             if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
-                // Check if it's a character variable — pass ptr+len.
-                if let Expr::Name { name } = &e.node {
-                    if let Some(info) = ctx.locals.get(&name.to_lowercase()) {
-                        if info.char_kind != CharKind::None {
-                            return lower_string_expr_with_layouts(
-                                b,
-                                &ctx.locals,
-                                e,
-                                ctx.st,
-                                Some(ctx.type_layouts),
-                            );
-                        }
-                    }
+                if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts)) {
+                    return lower_string_expr_with_layouts(
+                        b,
+                        &ctx.locals,
+                        e,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    );
                 }
                 // Otherwise pass as ref + zero length.
                 let ptr = lower_arg_by_ref_ctx(b, ctx, e);
@@ -14360,30 +14355,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             ..
                                         } = args[0].value
                                         {
-                                            let idx64 = if inner_args.len() == 1 {
-                                                if let crate::ast::expr::SectionSubscript::Element(
-                                                    idx_expr,
-                                                ) = &inner_args[0].value
-                                                {
-                                                    let idx = lower_expr_ctx(b, ctx, idx_expr);
-                                                    let idx_wide = match b.func().value_type(idx) {
-                                                        Some(IrType::Int(IntWidth::I64)) => idx,
-                                                        _ => b.int_extend(idx, IntWidth::I64, true),
-                                                    };
-                                                    let one = b.const_i64(1);
-                                                    b.isub(idx_wide, one)
-                                                } else {
-                                                    b.const_i64(0)
-                                                }
-                                            } else {
-                                                b.const_i64(0)
-                                            };
-                                            let base = array_base_addr(b, info);
-                                            let elem_slot =
-                                                b.gep(base, vec![idx64], info.ty.clone());
-                                            let elem_ptr = b.load_typed(
+                                            let elem_slot = lower_array_element_addr(
+                                                b,
+                                                &ctx.locals,
+                                                info,
+                                                inner_args,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
+                                            let zero = b.const_i64(0);
+                                            let elem_ptr = b.gep(
                                                 elem_slot,
-                                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                vec![zero],
+                                                IrType::Int(IntWidth::I8),
                                             );
                                             let elem_len = match info.char_kind {
                                                 CharKind::Fixed(n) => b.const_i64(n),
