@@ -2988,6 +2988,43 @@ fn fixed_char_array_component_element_assignment_round_trips() {
 }
 
 #[test]
+fn fixed_char_array_component_element_actual_to_char_function_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: max_path_len = 256, max_dir_stack = 32\n  type :: dir_stack_t\n    character(len=max_path_len) :: directories(max_dir_stack)\n    integer :: top\n  end type\ncontains\n  function echo_path(path) result(out)\n    character(len=*), intent(in) :: path\n    character(len=max_path_len) :: out\n    out = path\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(dir_stack_t) :: s\n  character(len=max_path_len) :: fixed\n  s%directories = ''\n  s%directories(2) = '/tmp'\n  fixed = echo_path(s%directories(2))\n  if (trim(fixed) /= '/tmp') error stop 1\n  print *, trim(fixed)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_component_actual_char_function", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char component actual char function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char component actual char function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char component actual char function run failed");
+    assert!(
+        run.status.success(),
+        "fixed char component actual char function run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("/tmp"),
+        "unexpected fixed char component actual char function output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_char_component_array_element_assignment_round_trips() {
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32) :: words(1)\n  words(1) = 'true'\n  node => create_simple_command(words, 1)\n  if (trim(node%simple_cmd%words(1)) /= 'true') error stop 1\n  print *, trim(node%simple_cmd%words(1))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",

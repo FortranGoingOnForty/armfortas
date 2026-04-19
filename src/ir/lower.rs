@@ -11129,7 +11129,7 @@ fn lower_string_expr_full(
                                 name,
                                 args,
                                 Some(desc),
-                                false,
+                                true,
                                 IrType::Void,
                             );
                             return load_string_descriptor_view(b, desc);
@@ -11156,7 +11156,7 @@ fn lower_string_expr_full(
                         name,
                         args,
                         Some(desc),
-                        false,
+                        true,
                         IrType::Void,
                     );
                     return load_string_descriptor_view(b, desc);
