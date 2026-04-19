@@ -2951,6 +2951,43 @@ fn fixed_char_component_assigns_into_char_array_element() {
 }
 
 #[test]
+fn fixed_char_array_component_element_assignment_round_trips() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: t\n    character(len=16) :: arr(4)\n  end type\n  type(t), save :: g\ncontains\n  subroutine fill_direct()\n    g%arr = ''\n    g%arr(1) = 'alpha'\n    g%arr(2) = 'beta'\n  end subroutine\n\n  subroutine fill_via_local_copy()\n    type(t) :: x\n    x%arr = ''\n    x%arr(1) = 'one'\n    x%arr(2) = 'two'\n    g = x\n  end subroutine\nend module\n\nprogram p\n  use m\n  call fill_direct()\n  if (trim(g%arr(1)) /= 'alpha') error stop 1\n  if (trim(g%arr(2)) /= 'beta') error stop 2\n  call fill_via_local_copy()\n  if (trim(g%arr(1)) /= 'one') error stop 3\n  if (trim(g%arr(2)) /= 'two') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_array_component_element", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char array component element compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char array component element compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char array component element run failed");
+    assert!(
+        run.status.success(),
+        "fixed char array component element run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected fixed char array component element output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_char_component_array_element_assignment_round_trips() {
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32) :: words(1)\n  words(1) = 'true'\n  node => create_simple_command(words, 1)\n  if (trim(node%simple_cmd%words(1)) /= 'true') error stop 1\n  print *, trim(node%simple_cmd%words(1))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",

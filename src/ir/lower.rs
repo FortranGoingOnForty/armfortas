@@ -6626,7 +6626,7 @@ fn actual_char_arg_runtime_len(
         }
         Expr::ComponentAccess { .. } => {
             if let Some(tl) = type_layouts {
-                if let Some(info) = component_array_local_info(b, locals, expr, st, tl) {
+                if let Some(info) = component_intrinsic_local_info(b, locals, expr, st, tl) {
                     if info.char_kind != CharKind::None
                         || descriptor_backed_runtime_char_array(&info)
                     {
@@ -6658,7 +6658,12 @@ fn actual_char_arg_runtime_len(
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
+                    if let Some((_ptr, len)) =
+                        fixed_component_char_array_elem_ptr_and_len(b, locals, callee, args, st, tl)
+                    {
+                        return Some(len);
+                    }
+                    if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
                         if info.char_kind != CharKind::None
                             || descriptor_backed_runtime_char_array(&info)
                         {
@@ -11159,7 +11164,51 @@ fn lower_string_expr_full(
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
+                    if args.len() == 1 {
+                        if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
+                            if let Some(result) = fixed_component_char_array_elem_ptr_and_len(
+                                b, locals, callee, args, st, tl,
+                            ) {
+                                return result;
+                            }
+                        }
+                    }
+                    if args.len() == 2 {
+                        if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
+                            if let crate::ast::expr::SectionSubscript::Range {
+                                ref start,
+                                ref end,
+                                ..
+                            } = args[1].value
+                            {
+                                if let Some((elem_ptr, elem_len)) =
+                                    fixed_component_char_array_elem_ptr_and_len(
+                                        b,
+                                        locals,
+                                        callee,
+                                        &args[..1],
+                                        st,
+                                        tl,
+                                    )
+                                {
+                                    return lower_substring_full(
+                                        b,
+                                        locals,
+                                        st,
+                                        elem_ptr,
+                                        elem_len,
+                                        start.as_ref(),
+                                        end.as_ref(),
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
                         if args.len() == 1 {
                             if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
                                 if info.char_kind != CharKind::None
@@ -11956,7 +12005,25 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             }
                         }
                     } else if let Expr::ComponentAccess { .. } = &callee.node {
-                        if let Some(info) = component_array_local_info(
+                        if let Some((dest_ptr, dest_len)) =
+                            fixed_component_char_array_elem_ptr_and_len(
+                                b,
+                                &ctx.locals,
+                                callee,
+                                args,
+                                ctx.st,
+                                ctx.type_layouts,
+                            )
+                        {
+                            let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+                            b.call(
+                                FuncRef::External("afs_assign_char_fixed".into()),
+                                vec![dest_ptr, dest_len, src_ptr, src_len],
+                                IrType::Void,
+                            );
+                            return;
+                        }
+                        if let Some(info) = component_intrinsic_local_info(
                             b,
                             &ctx.locals,
                             callee,
@@ -20553,6 +20620,44 @@ fn lower_fixed_component_array_element_ptr(
     Some(b.gep(base_ptr, vec![byte_off], IrType::Int(IntWidth::I8)))
 }
 
+fn fixed_component_char_array_elem_ptr_and_len(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    callee: &crate::ast::expr::SpannedExpr,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, ValueId)> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+    let (field_ptr, field) = resolve_component_field_access(b, locals, callee, st, tl)?;
+    let crate::sema::symtab::TypeInfo::Character {
+        len: Some(flen), ..
+    } = &field.type_info
+    else {
+        return None;
+    };
+    if field.dims.is_empty() {
+        return None;
+    }
+    let elem_ptr = lower_fixed_component_array_element_ptr(
+        b,
+        locals,
+        args,
+        st,
+        tl,
+        field_ptr,
+        &field.dims,
+        *flen,
+    )?;
+    Some((elem_ptr, b.const_i64(*flen)))
+}
+
 /// Resolve a component access base expression to (struct_address, type_name).
 /// Handles both direct names (x%field) and chained access (x%inner%field).
 fn resolve_component_base(
@@ -20731,9 +20836,7 @@ fn field_storage_ir_type(
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> IrType {
     match &field.type_info {
-        crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }
-            if field.pointer || field.allocatable =>
-        {
+        crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => {
             fixed_char_storage_ir_type(*n)
         }
         crate::sema::symtab::TypeInfo::Character { len: None, .. }
@@ -20793,7 +20896,7 @@ fn expr_is_array_designator(
             })
             .unwrap_or(false),
         Expr::ComponentAccess { .. } => type_layouts
-            .and_then(|tl| component_array_local_info(b, locals, expr, st, tl))
+            .and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
             .is_some(),
         _ => false,
     }
@@ -21480,6 +21583,13 @@ fn lower_char_arg_by_ref(
             let Expr::Name { name } = &callee.node else {
                 if let Expr::ComponentAccess { .. } = &callee.node {
                     let tl = type_layouts?;
+                    if let Some((ptr, _len)) =
+                        fixed_component_char_array_elem_ptr_and_len(b, locals, callee, args, st, tl)
+                    {
+                        let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        b.store(ptr, slot);
+                        return Some(slot);
+                    }
                     let info = component_intrinsic_local_info(b, locals, callee, st, tl)?;
                     if info.char_kind == CharKind::None
                         && !descriptor_backed_runtime_char_array(&info)
@@ -23137,7 +23247,7 @@ fn lower_expr_full(
                 b.call(func_ref, ref_arg_vals, ret_ty)
             } else if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
+                    if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
                         let has_range = args.iter().any(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
