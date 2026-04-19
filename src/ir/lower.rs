@@ -21970,6 +21970,125 @@ fn lower_expr_ctx_tl(
     )
 }
 
+fn lower_short_circuit_logical_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> ValueId {
+    match &expr.node {
+        Expr::ParenExpr { inner } => lower_short_circuit_logical_expr(
+            b,
+            locals,
+            inner,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let lhs = lower_short_circuit_logical_expr(
+                b,
+                locals,
+                left,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let bb_rhs = b.create_block("and_rhs_expr");
+            let bb_false = b.create_block("and_false_expr");
+            let bb_merge = b.create_block("and_merge_expr");
+            let result = b.add_block_param(bb_merge, IrType::Bool);
+            b.cond_branch(lhs, bb_rhs, vec![], bb_false, vec![]);
+
+            b.set_block(bb_rhs);
+            let rhs = lower_short_circuit_logical_expr(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            b.branch(bb_merge, vec![rhs]);
+
+            b.set_block(bb_false);
+            let false_val = b.const_bool(false);
+            b.branch(bb_merge, vec![false_val]);
+
+            b.set_block(bb_merge);
+            result
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let lhs = lower_short_circuit_logical_expr(
+                b,
+                locals,
+                left,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let bb_true = b.create_block("or_true_expr");
+            let bb_rhs = b.create_block("or_rhs_expr");
+            let bb_merge = b.create_block("or_merge_expr");
+            let result = b.add_block_param(bb_merge, IrType::Bool);
+            b.cond_branch(lhs, bb_true, vec![], bb_rhs, vec![]);
+
+            b.set_block(bb_true);
+            let true_val = b.const_bool(true);
+            b.branch(bb_merge, vec![true_val]);
+
+            b.set_block(bb_rhs);
+            let rhs = lower_short_circuit_logical_expr(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            b.branch(bb_merge, vec![rhs]);
+
+            b.set_block(bb_merge);
+            result
+        }
+        _ => {
+            let raw = lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_to_type(b, raw, &IrType::Bool)
+        }
+    }
+}
+
 fn lower_expr_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -22142,6 +22261,18 @@ fn lower_expr_full(
                     BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp, zero),
                     _ => unreachable!(),
                 };
+            }
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                return lower_short_circuit_logical_expr(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
             }
             let mut lhs = lower_expr_full(
                 b,

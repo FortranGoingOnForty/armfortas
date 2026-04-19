@@ -110,3 +110,41 @@ fn character_select_case_matches_expected_arm() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn logical_and_or_short_circuit_in_expression_values() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical :: x, y\n  x = .false. .and. boom()\n  y = .true. .or. boom()\n  if (x) error stop 1\n  if (.not. y) error stop 2\n  print *, 77\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
+        "f90",
+    );
+    let out = unique_path("short_circuit_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("expression short-circuit compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "expression short-circuit compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("expression short-circuit run failed");
+    assert!(
+        run.status.success(),
+        "expression short-circuit run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("77"),
+        "unexpected expression short-circuit output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
