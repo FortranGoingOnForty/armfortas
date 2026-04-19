@@ -8560,6 +8560,43 @@ fn resolved_symbol_call_target(
     (fallback_name.to_string(), key.to_string())
 }
 
+fn canonical_procedure_abi_key(st: &SymbolTable, key: &str) -> String {
+    find_linkable_symbol_any_scope(st, key)
+        .map(|sym| sym.name.to_lowercase())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn procedure_abi_lookup_keys(st: &SymbolTable, keys: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for key in keys {
+        if key.is_empty() {
+            continue;
+        }
+        let canonical = canonical_procedure_abi_key(st, key);
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+        let direct = (*key).to_string();
+        if seen.insert(direct.clone()) {
+            out.push(direct);
+        }
+    }
+    out
+}
+
+fn first_procedure_lookup<T, F>(lookup_keys: &[String], mut lookup: F) -> Option<T>
+where
+    F: FnMut(&str) -> Option<T>,
+{
+    for key in lookup_keys {
+        if let Some(value) = lookup(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn emit_named_function_call(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -8603,20 +8640,25 @@ fn emit_named_function_call(
     };
     let resolved_key = resolved_name.to_lowercase();
     let (call_name, callee_key) = resolved_symbol_call_target(st, &resolved_key, &resolved_name);
+    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[&callee_key, &key]);
+    let abi_primary_key = abi_lookup_keys
+        .first()
+        .map(String::as_str)
+        .unwrap_or(callee_key.as_str());
 
     let callee_value_args =
-        callee_value_arg_mask(st, &callee_key).or_else(|| callee_value_arg_mask(st, &key));
-    let callee_descriptor_args = descriptor_params
-        .and_then(|m| m.get(&callee_key).cloned().or_else(|| m.get(&key).cloned()));
-    let callee_string_descriptor_args = callee_string_descriptor_arg_mask(st, &callee_key)
-        .or_else(|| callee_string_descriptor_arg_mask(st, &key));
-    let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &callee_key)
-        .or_else(|| callee_bind_c_char_arg_mask(st, &key));
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
+    let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        descriptor_params.and_then(|m| m.get(k).cloned())
+    });
+    let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_string_descriptor_arg_mask(st, k)
+    });
+    let callee_bind_c_char_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
     let callee_pointer_args =
-        callee_pointer_arg_mask(st, &callee_key).or_else(|| callee_pointer_arg_mask(st, &key));
-
-    let opt_flags =
-        callee_optional_arg_mask(st, &callee_key).or_else(|| callee_optional_arg_mask(st, &key));
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
 
     let mut call_args = Vec::new();
     if let Some(desc) = hidden_result {
@@ -8651,10 +8693,22 @@ fn emit_named_function_call(
                     .map(|mask| mask.get(i).copied().unwrap_or(false))
                     .unwrap_or(false)
                 {
-                    call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+                    call_args.push(missing_optional_call_arg(
+                        b,
+                        st,
+                        abi_primary_key,
+                        i,
+                        is_value,
+                    ));
                     continue;
                 }
-                call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+                call_args.push(missing_optional_call_arg(
+                    b,
+                    st,
+                    abi_primary_key,
+                    i,
+                    is_value,
+                ));
                 continue;
             }
         };
@@ -8743,13 +8797,19 @@ fn emit_named_function_call(
                     .as_ref()
                     .map(|mask| i < mask.len() && mask[i])
                     .unwrap_or(false);
-                call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+                call_args.push(missing_optional_call_arg(
+                    b,
+                    st,
+                    abi_primary_key,
+                    i,
+                    is_value,
+                ));
             }
         }
     }
 
     if let Some(cls_flags) =
-        callee_char_len_star_mask(st, &callee_key).or_else(|| callee_char_len_star_mask(st, &key))
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k))
     {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
@@ -8839,23 +8899,25 @@ fn lower_alloc_return_call_into_desc(
     let resolved_key = resolved_name.to_lowercase();
     let (call_name, callee_key) =
         resolved_symbol_call_target(ctx.st, &resolved_key, &resolved_name);
+    let abi_lookup_keys = procedure_abi_lookup_keys(ctx.st, &[&callee_key, &key]);
+    let abi_primary_key = abi_lookup_keys
+        .first()
+        .map(String::as_str)
+        .unwrap_or(callee_key.as_str());
 
     let callee_value_args =
-        callee_value_arg_mask(ctx.st, &callee_key).or_else(|| callee_value_arg_mask(ctx.st, &key));
-    let callee_descriptor_args = ctx
-        .descriptor_params
-        .get(&callee_key)
-        .cloned()
-        .or_else(|| ctx.descriptor_params.get(&key).cloned());
-    let callee_string_descriptor_args = callee_string_descriptor_arg_mask(ctx.st, &callee_key)
-        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key));
-    let callee_bind_c_char_args = callee_bind_c_char_arg_mask(ctx.st, &callee_key)
-        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
-    let callee_pointer_args = callee_pointer_arg_mask(ctx.st, &callee_key)
-        .or_else(|| callee_pointer_arg_mask(ctx.st, &key));
-
-    let opt_flags = callee_optional_arg_mask(ctx.st, &callee_key)
-        .or_else(|| callee_optional_arg_mask(ctx.st, &key));
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(ctx.st, k));
+    let callee_descriptor_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| ctx.descriptor_params.get(k).cloned());
+    let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_string_descriptor_arg_mask(ctx.st, k)
+    });
+    let callee_bind_c_char_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(ctx.st, k));
+    let callee_pointer_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(ctx.st, k));
+    let opt_flags =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(ctx.st, k));
 
     let mut call_args = vec![desc_addr];
     for (i, slot) in arg_slots.iter().enumerate() {
@@ -8890,7 +8952,7 @@ fn lower_alloc_return_call_into_desc(
                     call_args.push(missing_optional_call_arg(
                         b,
                         ctx.st,
-                        &callee_key,
+                        abi_primary_key,
                         i,
                         is_value,
                     ));
@@ -8899,7 +8961,7 @@ fn lower_alloc_return_call_into_desc(
                 call_args.push(missing_optional_call_arg(
                     b,
                     ctx.st,
-                    &callee_key,
+                    abi_primary_key,
                     i,
                     is_value,
                 ));
@@ -8948,11 +9010,9 @@ fn lower_alloc_return_call_into_desc(
         call_args.push(value);
     }
 
-    if let Some(cls_flags) = ctx
-        .char_len_star_params
-        .get(&callee_key)
-        .or_else(|| ctx.char_len_star_params.get(&key))
-    {
+    if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
+        ctx.char_len_star_params.get(k).cloned()
+    }) {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
                 continue;
@@ -12322,7 +12382,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
-                                ) && !field.pointer
+                                ) && !is_opaque_c_handle_type(&field.type_info)
+                                    && !field.pointer
                                     && !field.allocatable
                                     && field.dims.is_empty()
                                 {
@@ -12547,34 +12608,35 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             callee.span,
                         )
                     };
-                    let value_mask = callee_value_arg_mask(ctx.st, &resolved_key)
-                        .or_else(|| callee_value_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_value_arg_mask(ctx.st, &key));
-                    let desc_mask = ctx
-                        .descriptor_params
-                        .get(&resolved_key)
-                        .or_else(|| ctx.descriptor_params.get(&signature_key))
-                        .or_else(|| ctx.descriptor_params.get(&key));
-                    let bind_c_char_mask = callee_bind_c_char_arg_mask(ctx.st, &resolved_key)
-                        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
-                    let pointer_mask = callee_pointer_arg_mask(ctx.st, &resolved_key)
-                        .or_else(|| callee_pointer_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_pointer_arg_mask(ctx.st, &key));
-                    let string_desc_mask = callee_string_descriptor_arg_mask(ctx.st, &resolved_key)
-                        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key));
+                    let abi_lookup_keys =
+                        procedure_abi_lookup_keys(ctx.st, &[&resolved_key, &signature_key, &key]);
+                    let abi_primary_key = abi_lookup_keys
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(resolved_key.as_str());
+                    let value_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_value_arg_mask(ctx.st, k)
+                    });
+                    let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.descriptor_params.get(k).cloned()
+                    });
+                    let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_bind_c_char_arg_mask(ctx.st, k)
+                    });
+                    let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_pointer_arg_mask(ctx.st, k)
+                    });
+                    let string_desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_string_descriptor_arg_mask(ctx.st, k)
+                    });
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
-                    let opt_flags = ctx
-                        .optional_params
-                        .get(&resolved_key)
-                        .cloned()
-                        .or_else(|| ctx.optional_params.get(&signature_key).cloned())
-                        .or_else(|| ctx.optional_params.get(&key).cloned())
-                        .or_else(|| callee_optional_arg_mask(ctx.st, &resolved_key))
-                        .or_else(|| callee_optional_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_optional_arg_mask(ctx.st, &key));
+                    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.optional_params
+                            .get(k)
+                            .cloned()
+                            .or_else(|| callee_optional_arg_mask(ctx.st, k))
+                    });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
@@ -12582,6 +12644,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_descriptor = desc_mask
+                            .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_bind_c_char = bind_c_char_mask
@@ -12664,7 +12727,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 _ => b.const_i32(0),
                             },
                             None => {
-                                missing_optional_call_arg(b, ctx.st, &resolved_key, i, is_value)
+                                missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
                             }
                         };
                         arg_vals.push(value);
@@ -12679,16 +12742,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // Hidden character-length ABI: for each callee
                     // param that is character(len=*), append the
                     // actual argument's string length as an i64.
-                    if let Some(cls_flags) = ctx
-                        .char_len_star_params
-                        .get(&resolved_key)
-                        .or_else(|| ctx.char_len_star_params.get(&signature_key))
-                        .or_else(|| ctx.char_len_star_params.get(&key))
-                        .cloned()
-                        .or_else(|| callee_char_len_star_mask(ctx.st, &resolved_key))
-                        .or_else(|| callee_char_len_star_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_char_len_star_mask(ctx.st, &key))
-                    {
+                    if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.char_len_star_params
+                            .get(k)
+                            .cloned()
+                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                    }) {
                         for (i, flag) in cls_flags.iter().enumerate() {
                             if !*flag || i >= arg_slots.len() {
                                 continue;
@@ -15639,7 +15698,12 @@ fn lower_array_element(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
     let elem_ptr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
-    if info.derived_type.is_some() {
+    if info
+        .derived_type
+        .as_deref()
+        .filter(|name| !is_opaque_c_handle_name(name))
+        .is_some()
+    {
         elem_ptr
     } else {
         b.load(elem_ptr)
@@ -16249,7 +16313,12 @@ fn lower_array_store(
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st, type_layouts);
     let base = array_base_addr(b, info);
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-    if info.derived_type.is_some() {
+    if info
+        .derived_type
+        .as_deref()
+        .filter(|name| !is_opaque_c_handle_name(name))
+        .is_some()
+    {
         let size = b.const_i64(ir_scalar_byte_size(&info.ty));
         b.call(
             FuncRef::External("memcpy".into()),
@@ -17248,7 +17317,9 @@ fn lower_read_target_addr(
                 resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)?;
             let layout = ctx.type_layouts.get(&type_name)?;
             let field = layout.field(component)?;
-            if matches!(&field.type_info, crate::sema::symtab::TypeInfo::Derived(_)) {
+            if matches!(&field.type_info, crate::sema::symtab::TypeInfo::Derived(_))
+                && !is_opaque_c_handle_type(&field.type_info)
+            {
                 return None;
             }
             let offset = b.const_i64(field.offset as i64);
@@ -20869,6 +20940,9 @@ fn resolve_component_base(
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             // The field must be a derived type for chaining to continue.
             if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
+                if is_opaque_c_handle_type(&field.type_info) {
+                    return None;
+                }
                 let addr = if field.pointer {
                     // Scalar derived POINTER components store an address slot,
                     // while descriptor-backed POINTER components store the
@@ -20960,6 +21034,18 @@ fn is_deferred_char_component_field(field: &crate::sema::type_layout::FieldLayou
         )
 }
 
+fn is_opaque_c_handle_type(ti: &crate::sema::symtab::TypeInfo) -> bool {
+    matches!(
+        ti,
+        crate::sema::symtab::TypeInfo::Derived(name)
+            if is_opaque_c_handle_name(name)
+    )
+}
+
+fn is_opaque_c_handle_name(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "c_ptr" | "c_funptr")
+}
+
 fn load_string_descriptor_view(b: &mut FuncBuilder, desc: ValueId) -> (ValueId, ValueId) {
     let ptr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let eight = b.const_i64(8);
@@ -20986,7 +21072,11 @@ fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> CharKind {
 
 fn field_derived_type_name(field: &crate::sema::type_layout::FieldLayout) -> Option<String> {
     match &field.type_info {
-        crate::sema::symtab::TypeInfo::Derived(name) => Some(name.clone()),
+        crate::sema::symtab::TypeInfo::Derived(name)
+            if !is_opaque_c_handle_type(&field.type_info) =>
+        {
+            Some(name.clone())
+        }
         _ => None,
     }
 }
@@ -21613,6 +21703,9 @@ fn resolve_component_base_for_method(
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
+                if is_opaque_c_handle_type(&field.type_info) {
+                    return None;
+                }
                 let addr = if field.size == 384 && (field.allocatable || field.pointer) {
                     b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                 } else {
@@ -23131,7 +23224,7 @@ fn lower_expr_full(
                 let intrinsic_arg_vals: Vec<ValueId> = args
                     .iter()
                     .map(|a| match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) =>
+                        crate::ast::expr::SectionSubscript::Element(e) => {
                             generic_dispatch_probe_value(
                                 b,
                                 locals,
@@ -23141,7 +23234,8 @@ fn lower_expr_full(
                                 internal_funcs,
                                 contained_host_refs,
                                 descriptor_params,
-                            ),
+                            )
+                        }
                         _ => b.const_i32(0),
                     })
                     .collect();
@@ -23184,11 +23278,17 @@ fn lower_expr_full(
                     let resolved_key = resolved_name.to_lowercase();
                     resolved_symbol_call_target(st, &resolved_key, &resolved_name)
                 };
+                let abi_lookup_keys =
+                    procedure_abi_lookup_keys(st, &[&callee_key, &signature_key, &key]);
+                let abi_primary_key = abi_lookup_keys
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(callee_key.as_str());
                 if procptr_target.is_none()
                     && matches!(
-                        callee_hidden_result_abi(st, &callee_key)
-                            .or_else(|| callee_hidden_result_abi(st, &signature_key))
-                            .or_else(|| callee_hidden_result_abi(st, &key)),
+                        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(
+                            st, k
+                        )),
                         Some(HiddenResultAbi::ArrayDescriptor)
                     )
                 {
@@ -23216,28 +23316,21 @@ fn lower_expr_full(
                     );
                     return desc;
                 }
-                let callee_value_args = callee_value_arg_mask(st, &callee_key)
-                    .or_else(|| callee_value_arg_mask(st, &signature_key))
-                    .or_else(|| callee_value_arg_mask(st, &key));
-                let callee_descriptor_args = descriptor_params.and_then(|m| {
-                    m.get(&callee_key)
-                        .cloned()
-                        .or_else(|| m.get(&signature_key).cloned())
-                        .or_else(|| m.get(&key).cloned())
+                let callee_value_args =
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
+                let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    descriptor_params.and_then(|m| m.get(k).cloned())
                 });
-                let callee_string_descriptor_args =
-                    callee_string_descriptor_arg_mask(st, &callee_key)
-                        .or_else(|| callee_string_descriptor_arg_mask(st, &signature_key))
-                        .or_else(|| callee_string_descriptor_arg_mask(st, &key));
-                let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &callee_key)
-                    .or_else(|| callee_bind_c_char_arg_mask(st, &signature_key))
-                    .or_else(|| callee_bind_c_char_arg_mask(st, &key));
-                let callee_pointer_args = callee_pointer_arg_mask(st, &callee_key)
-                    .or_else(|| callee_pointer_arg_mask(st, &signature_key))
-                    .or_else(|| callee_pointer_arg_mask(st, &key));
-                let opt_flags = callee_optional_arg_mask(st, &callee_key)
-                    .or_else(|| callee_optional_arg_mask(st, &signature_key))
-                    .or_else(|| callee_optional_arg_mask(st, &key));
+                let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    callee_string_descriptor_arg_mask(st, k)
+                });
+                let callee_bind_c_char_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    callee_bind_c_char_arg_mask(st, k)
+                });
+                let callee_pointer_args =
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+                let opt_flags =
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
                 let mut ref_arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                 for (i, slot) in arg_slots.iter().enumerate() {
                     let is_value = callee_value_args
@@ -23329,7 +23422,7 @@ fn lower_expr_full(
                             }
                             _ => b.const_i32(0),
                         },
-                        None => missing_optional_call_arg(b, st, &callee_key, i, is_value),
+                        None => missing_optional_call_arg(b, st, abi_primary_key, i, is_value),
                     };
                     ref_arg_vals.push(value);
                 }
@@ -23340,9 +23433,8 @@ fn lower_expr_full(
                         }
                     }
                 }
-                let callee_char_len_star_args = callee_char_len_star_mask(st, &callee_key)
-                    .or_else(|| callee_char_len_star_mask(st, &signature_key))
-                    .or_else(|| callee_char_len_star_mask(st, &key));
+                let callee_char_len_star_args =
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
                     for (i, flag) in cls_flags.iter().enumerate() {
@@ -23397,10 +23489,9 @@ fn lower_expr_full(
                 }
 
                 // Look up callee return type from symbol table.
-                let ret_ty = callee_return_ir_type(st, &callee_key)
-                    .or_else(|| callee_return_ir_type(st, &signature_key))
-                    .or_else(|| callee_return_ir_type(st, &key))
-                    .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty =
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
+                        .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = if let Some((target, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
@@ -23474,6 +23565,11 @@ fn lower_expr_full(
                             if is_deferred_char_component_field(field) {
                                 let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
                                 return ptr;
+                            }
+
+                            if is_opaque_c_handle_type(&field.type_info) {
+                                let ir_ty = type_info_to_ir_type(&field.type_info);
+                                return b.load_typed(field_ptr, ir_ty);
                             }
 
                             if let crate::sema::symtab::TypeInfo::Derived(_) = &field.type_info {

@@ -6047,6 +6047,134 @@ fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
 }
 
 #[test]
+fn c_funptr_component_assignment_round_trips_through_c_associated() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  type :: sigaction_t\n    type(c_funptr) :: sa_handler\n    integer(c_long) :: sa_mask(16)\n    integer(c_int) :: sa_flags\n    type(c_funptr) :: sa_restorer\n  end type\n  type(sigaction_t) :: sa\n  logical :: same\n  sa%sa_handler = c_funloc(handler)\n  same = c_associated(sa%sa_handler, c_funloc(handler))\n  print '(A,L1)', 'SAME=', same\ncontains\n  subroutine handler(signum) bind(C)\n    integer(c_int), value :: signum\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_funptr_component_roundtrip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_funptr component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_funptr component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_funptr component run failed");
+    assert!(
+        run.status.success(),
+        "c_funptr component runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let normalized: String = stdout.split_whitespace().collect();
+    assert!(
+        normalized.contains("SAME=T"),
+        "c_funptr component should preserve the stored function pointer: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_ptr_array_element_assignment_round_trips_through_c_associated() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(len=16), target, allocatable :: args(:)\n  type(c_ptr), allocatable, target :: argv(:)\n  allocate(args(2))\n  allocate(argv(3))\n  args(1) = 'echo' // c_null_char\n  args(2) = 'done' // c_null_char\n  argv(1) = c_loc(args(1))\n  argv(2) = c_loc(args(2))\n  argv(3) = c_null_ptr\n  if (.not. c_associated(argv(1), c_loc(args(1)))) error stop 1\n  if (.not. c_associated(argv(2), c_loc(args(2)))) error stop 2\n  if (c_associated(argv(3))) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_ptr_array_element_roundtrip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_ptr array element compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_ptr array element compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_ptr array element run failed");
+    assert!(
+        run.status.success(),
+        "c_ptr array element runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected c_ptr array element output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn sigaction_module_bind_c_struct_preserves_handler_component_for_self_signal() {
+    let src = write_program(
+        "module m\n  use iso_c_binding\n  implicit none\n  integer(c_int), parameter :: SIGUSR1 = 10\n  logical, save :: pending(32) = .false.\n  type, bind(C) :: sigaction_t\n    type(c_funptr) :: sa_handler\n    integer(c_long) :: sa_mask(16)\n    integer(c_int) :: sa_flags\n    type(c_funptr) :: sa_restorer\n  end type\n  interface\n    function c_sigaction(signum, act, oldact) bind(C, name='sigaction')\n      import :: c_int, sigaction_t\n      integer(c_int), value :: signum\n      type(sigaction_t), intent(in) :: act\n      type(sigaction_t), intent(out) :: oldact\n      integer(c_int) :: c_sigaction\n    end function\n    function c_raise(sig) bind(C, name='raise')\n      import :: c_int\n      integer(c_int), value :: sig\n      integer(c_int) :: c_raise\n    end function\n  end interface\ncontains\n  subroutine handler(signum) bind(C)\n    integer(c_int), value :: signum\n    if (signum > 0 .and. signum <= 32) pending(signum) = .true.\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(sigaction_t) :: sa, old_sa\n  integer(c_int) :: rc\n  sa%sa_handler = c_funloc(handler)\n  sa%sa_mask = 0\n  sa%sa_flags = 0\n  sa%sa_restorer = c_null_funptr\n  rc = c_sigaction(SIGUSR1, sa, old_sa)\n  print '(A,I0)', 'SIGACTION=', rc\n  rc = c_raise(SIGUSR1)\n  print '(A,I0)', 'RAISE=', rc\n  print '(A,L1)', 'PENDING=', pending(SIGUSR1)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sigaction_self_signal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sigaction self-signal compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sigaction self-signal compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sigaction self-signal run failed");
+    assert!(
+        run.status.success(),
+        "sigaction self-signal runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let normalized: String = stdout.split_whitespace().collect();
+    assert!(
+        normalized.contains("SIGACTION=0"),
+        "sigaction setup should succeed: {}",
+        stdout
+    );
+    assert!(
+        normalized.contains("RAISE=0"),
+        "self-signal should return normally through the registered handler: {}",
+        stdout
+    );
+    assert!(
+        normalized.contains("PENDING=T"),
+        "signal handler should mark the pending flag through the BIND(C) struct: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_pointer_module_export_survives_amod_import() {
     let dir = unique_dir("procptr_amod");
     let mod_src = write_program_in(
@@ -6418,6 +6546,60 @@ fn keyword_actual_preserves_skipped_optional_slot() {
     assert!(
         stdout.contains("ok"),
         "unexpected keyword optional gap output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn use_renamed_subroutine_call_preserves_optional_slot_and_hidden_char_lengths() {
+    let src = write_program(
+        "module m\ncontains\n  subroutine sink(name, value, value_length)\n    character(len=*), intent(in) :: name, value\n    integer, intent(in), optional :: value_length\n    write(*,'(A,L1)') 'PRESENT=', present(value_length)\n    write(*,'(A,I0)') 'NLEN=', len(name)\n    write(*,'(A,I0)') 'VLEN=', len(value)\n    write(*,'(A)') 'PAIR=' // trim(name) // ':' // trim(value)\n  end subroutine sink\nend module m\nprogram p\n  use m, only: alias_sink => sink\n  implicit none\n  character(len=8) :: a, b\n  a = 'X'\n  b = 'YZ'\n  call alias_sink(trim(a), trim(b))\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("use_rename_hidden_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("use-rename hidden-len compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "use-rename hidden-len compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("use-rename hidden-len run failed");
+    assert!(
+        run.status.success(),
+        "use-rename hidden-len run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("PRESENT=F"),
+        "renamed call should keep the optional argument absent: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("NLEN=1"),
+        "renamed call should preserve the first hidden character length: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("VLEN=2"),
+        "renamed call should preserve the second hidden character length: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("PAIR=X:YZ"),
+        "renamed call should preserve the trimmed character payloads: {}",
         stdout
     );
 
@@ -8885,6 +9067,44 @@ fn formatted_internal_read_from_char_component_uses_internal_file_path() {
     assert!(
         stdout.contains("ok"),
         "unexpected formatted internal read component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_octal_internal_io_round_trips_min_digits_and_values() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  integer(c_int) :: current_mask, new_mask\n  integer :: ios\n  character(len=16) :: mask_str\n  current_mask = int(o'0022', c_int)\n  write(mask_str, '(o4.4)') current_mask\n  if (trim(adjustl(mask_str)) /= '0022') error stop 1\n  mask_str = '077'\n  read(mask_str, '(o10)', iostat=ios) new_mask\n  if (ios /= 0 .or. new_mask /= 63_c_int) error stop 2\n  mask_str = '22'\n  read(mask_str, '(o10)', iostat=ios) new_mask\n  if (ios /= 0 .or. new_mask /= 18_c_int) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_octal_internal_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted octal internal io compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "formatted octal internal io compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("formatted octal internal io run failed");
+    assert!(
+        run.status.success(),
+        "formatted octal internal io run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected formatted octal internal io output: {}",
         stdout
     );
 

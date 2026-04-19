@@ -690,14 +690,17 @@ impl FormatEngine {
                 };
                 format!("{:>width$}", s, width = *width)
             }
-            (FormatDesc::IntegerB { width, .. }, IoValue::Integer(v)) => {
-                format!("{:>width$}", format!("{:b}", v), width = *width)
+            (FormatDesc::IntegerB { width, min_digits }, IoValue::Integer(v)) => {
+                let s = format_radix_integer(*v, *min_digits, 2);
+                format!("{:>width$}", s, width = *width)
             }
-            (FormatDesc::IntegerO { width, .. }, IoValue::Integer(v)) => {
-                format!("{:>width$}", format!("{:o}", v), width = *width)
+            (FormatDesc::IntegerO { width, min_digits }, IoValue::Integer(v)) => {
+                let s = format_radix_integer(*v, *min_digits, 8);
+                format!("{:>width$}", s, width = *width)
             }
-            (FormatDesc::IntegerZ { width, .. }, IoValue::Integer(v)) => {
-                format!("{:>width$}", format!("{:X}", v), width = *width)
+            (FormatDesc::IntegerZ { width, min_digits }, IoValue::Integer(v)) => {
+                let s = format_radix_integer(*v, *min_digits, 16);
+                format!("{:>width$}", s, width = *width)
             }
 
             // ---- Real ----
@@ -943,6 +946,25 @@ impl FormatEngine {
     }
 }
 
+fn format_radix_integer(value: i128, min_digits: Option<usize>, radix: u32) -> String {
+    let digits = match radix {
+        2 => format!("{:b}", value.unsigned_abs()),
+        8 => format!("{:o}", value.unsigned_abs()),
+        16 => format!("{:X}", value.unsigned_abs()),
+        _ => unreachable!("unsupported radix"),
+    };
+    let padded = if let Some(min_digits) = min_digits {
+        format!("{:0>width$}", digits, width = min_digits)
+    } else {
+        digits
+    };
+    if value < 0 {
+        format!("-{}", padded)
+    } else {
+        padded
+    }
+}
+
 // ---- Helpers ----
 
 fn to_engineering(v: f64) -> (f64, i32) {
@@ -1176,6 +1198,14 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(255)]);
         assert_eq!(out, "   377");
+    }
+
+    #[test]
+    fn format_octal_integer_with_min_digits() {
+        let descs = parse_format("(O4.4)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Integer(18)]);
+        assert_eq!(out, "0022");
     }
 
     #[test]

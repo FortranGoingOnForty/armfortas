@@ -2519,6 +2519,29 @@ fn store_formatted_char_error(dest: *mut u8, dest_len: i64, size_out: *mut i32, 
     }
 }
 
+fn parse_formatted_integer_field(desc: &FormatDesc, field: &str) -> Option<i128> {
+    let trimmed = field.trim().replace(',', "");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (negative, digits) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed.as_str())
+    };
+    let radix = match desc {
+        FormatDesc::IntegerI { .. } => 10,
+        FormatDesc::IntegerB { .. } => 2,
+        FormatDesc::IntegerO { .. } => 8,
+        FormatDesc::IntegerZ { .. } => 16,
+        _ => return None,
+    };
+    let parsed = i128::from_str_radix(digits, radix).ok()?;
+    Some(if negative { -parsed } else { parsed })
+}
+
 #[no_mangle]
 pub extern "C" fn afs_fmt_read_string(
     unit: i32,
@@ -2567,9 +2590,12 @@ pub extern "C" fn afs_fmt_read_int(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i32>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
+                Some(v) => {
                     if !val.is_null() {
                         unsafe {
                             *val = v;
@@ -2581,7 +2607,7 @@ pub extern "C" fn afs_fmt_read_int(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -2619,9 +2645,12 @@ pub extern "C" fn afs_fmt_read_int64(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i64>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
+                Some(v) => {
                     if !val.is_null() {
                         unsafe {
                             *val = v;
@@ -2633,7 +2662,7 @@ pub extern "C" fn afs_fmt_read_int64(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -2671,9 +2700,12 @@ pub extern "C" fn afs_fmt_read_int128(
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i128>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field) {
+                Some(v) => {
                     write_i128_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
@@ -2681,7 +2713,7 @@ pub extern "C" fn afs_fmt_read_int128(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -2816,9 +2848,12 @@ pub extern "C" fn afs_fmt_read_int_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i32>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
+                Some(v) => {
                     if !val.is_null() {
                         unsafe {
                             *val = v;
@@ -2830,7 +2865,7 @@ pub extern "C" fn afs_fmt_read_int_internal(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -2867,9 +2902,12 @@ pub extern "C" fn afs_fmt_read_int64_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i64>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
+                Some(v) => {
                     if !val.is_null() {
                         unsafe {
                             *val = v;
@@ -2881,7 +2919,7 @@ pub extern "C" fn afs_fmt_read_int64_internal(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -2918,9 +2956,12 @@ pub extern "C" fn afs_fmt_read_int128_internal(
     iostat: *mut i32,
 ) {
     match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::IntegerI { .. }, field)) => {
-            match field.trim().replace(',', "").parse::<i128>() {
-                Ok(v) => {
+        Ok((desc @ FormatDesc::IntegerI { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerB { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerO { .. }, field))
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+            match parse_formatted_integer_field(&desc, &field) {
+                Some(v) => {
                     write_i128_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
@@ -2928,7 +2969,7 @@ pub extern "C" fn afs_fmt_read_int128_internal(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 1;
@@ -3330,6 +3371,38 @@ mod tests {
         assert_eq!(iostat, 0);
         assert_eq!(first, 42);
         assert_eq!(second, 7);
+    }
+
+    #[test]
+    fn formatted_internal_read_supports_octal_descriptor() {
+        let buf = b"077 22";
+        let mut first = 0i32;
+        let mut second = 0i32;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_int_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(O3,1X,O2)".as_ptr(),
+            10,
+            0,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+
+        afs_fmt_read_int_internal(
+            buf.as_ptr(),
+            buf.len() as i64,
+            "(O3,1X,O2)".as_ptr(),
+            10,
+            1,
+            &mut second,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        assert_eq!(first, 63);
+        assert_eq!(second, 18);
     }
 
     #[test]
