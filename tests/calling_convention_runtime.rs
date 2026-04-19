@@ -292,3 +292,85 @@ fn recursive_contained_helper_preserves_host_closure_and_hidden_lengths() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn bind_c_keyword_reordering_preserves_mixed_value_and_byref_slots() {
+    let dir = unique_dir("keyword_mix");
+    let c_src = write_program_in(
+        &dir,
+        "check_keyword_mix.c",
+        "#include <stdint.h>\n\nint check_keyword_mix(int32_t *out_sum, int32_t a, double d, int32_t *inout, float s, int64_t big) {\n    if (!out_sum || !inout) return 100;\n    if (a != 7) return 1;\n    if (d != 1.5) return 2;\n    if (*inout != 10) return 3;\n    if (s != 2.25f) return 4;\n    if (big != 99) return 5;\n    *out_sum = a + *inout + (int32_t)big + (int32_t)d + (int32_t)s;\n    *inout += 5;\n    return 0;\n}\n",
+    );
+    let c_obj = dir.join("check_keyword_mix.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_long_long, c_float, c_double\n  implicit none\n  interface\n    function check_keyword_mix(out_sum, a, d, inout, s, big) result(rc) bind(C, name='check_keyword_mix')\n      import :: c_int, c_long_long, c_float, c_double\n      integer(c_int), intent(out) :: out_sum\n      integer(c_int), value :: a\n      real(c_double), value :: d\n      integer(c_int), intent(inout) :: inout\n      real(c_float), value :: s\n      integer(c_long_long), value :: big\n      integer(c_int) :: rc\n    end function check_keyword_mix\n  end interface\n  integer(c_int) :: rc, out_sum, inout\n\n  inout = 10_c_int\n  rc = check_keyword_mix(big=99_c_long_long, s=2.25_c_float, inout=inout, d=1.5_c_double, out_sum=out_sum, a=7_c_int)\n  if (rc /= 0_c_int) error stop rc\n  if (out_sum /= 119_c_int) error stop 11\n  if (inout /= 15_c_int) error stop 12\n  print *, 'ok'\nend program\n",
+    );
+    let f_obj = dir.join("main.o");
+    compile_fortran_object(&f_src, &f_obj);
+
+    let exe = dir.join("keyword_mix.bin");
+    link_program(&[&f_obj, &c_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("keyword mixed-slot runtime failed");
+    assert!(
+        run.status.success(),
+        "keyword mixed-slot runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected keyword mixed-slot output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_keyword_reordering_preserves_gp_spill_with_pointer_args() {
+    let dir = unique_dir("keyword_gp_spill");
+    let c_src = write_program_in(
+        &dir,
+        "check_keyword_spill.c",
+        "#include <stdint.h>\n\nint check_keyword_spill(int32_t *out0, int32_t a1, int32_t *io1, double d1, int32_t a2, int32_t *io2, double d2, int32_t a3, int32_t *io3, double d3, int32_t a4, int32_t *io4, int32_t a5) {\n    if (!out0 || !io1 || !io2 || !io3 || !io4) return 100;\n    if (a1 != 11) return 1;\n    if (*io1 != 101) return 2;\n    if (d1 != 1.25) return 3;\n    if (a2 != 22) return 4;\n    if (*io2 != 202) return 5;\n    if (d2 != 2.5) return 6;\n    if (a3 != 33) return 7;\n    if (*io3 != 303) return 8;\n    if (d3 != 3.75) return 9;\n    if (a4 != 44) return 10;\n    if (*io4 != 404) return 11;\n    if (a5 != 55) return 12;\n    *out0 = a1 + a2 + a3 + a4 + a5;\n    *io4 += 1;\n    return 0;\n}\n",
+    );
+    let c_obj = dir.join("check_keyword_spill.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_double\n  implicit none\n  interface\n    function check_keyword_spill(out0, a1, io1, d1, a2, io2, d2, a3, io3, d3, a4, io4, a5) result(rc) bind(C, name='check_keyword_spill')\n      import :: c_int, c_double\n      integer(c_int), intent(out) :: out0\n      integer(c_int), value :: a1, a2, a3, a4, a5\n      integer(c_int), intent(inout) :: io1, io2, io3, io4\n      real(c_double), value :: d1, d2, d3\n      integer(c_int) :: rc\n    end function check_keyword_spill\n  end interface\n  integer(c_int) :: rc, out0, io1, io2, io3, io4\n\n  io1 = 101_c_int\n  io2 = 202_c_int\n  io3 = 303_c_int\n  io4 = 404_c_int\n  rc = check_keyword_spill(a5=55_c_int, io2=io2, d2=2.5_c_double, out0=out0, a1=11_c_int, io1=io1, d1=1.25_c_double, a2=22_c_int, io3=io3, d3=3.75_c_double, a3=33_c_int, io4=io4, a4=44_c_int)\n  if (rc /= 0_c_int) error stop rc\n  if (out0 /= 165_c_int) error stop 21\n  if (io4 /= 405_c_int) error stop 22\n  print *, 'ok'\nend program\n",
+    );
+    let f_obj = dir.join("main.o");
+    compile_fortran_object(&f_src, &f_obj);
+
+    let exe = dir.join("keyword_gp_spill.bin");
+    link_program(&[&f_obj, &c_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("keyword GP spill runtime failed");
+    assert!(
+        run.status.success(),
+        "keyword GP spill runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected keyword GP spill output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
