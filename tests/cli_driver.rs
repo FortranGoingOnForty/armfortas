@@ -7848,6 +7848,43 @@ fn fixed_char_component_substring_assignment_updates_field() {
 }
 
 #[test]
+fn fixed_char_component_substring_prints_contents() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  tok%value = 'echo'\n  print *, tok%value(1:4)\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("fixed_char_component_print", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed char component print compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed char component print compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed char component print run failed");
+    assert!(
+        run.status.success(),
+        "fixed char component print run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo"),
+        "unexpected fixed char component print output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_whole_array_copy_preserves_elements() {
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = src\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",

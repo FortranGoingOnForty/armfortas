@@ -15747,87 +15747,9 @@ fn lower_write_items_adv(
     advance: bool,
 ) {
     for item in items {
-        let is_char = match &item.node {
-            Expr::Name { name } => ctx
-                .locals
-                .get(&name.to_lowercase())
-                .map(|i| i.char_kind != CharKind::None)
-                .unwrap_or(false),
-            Expr::FunctionCall { callee, args } => {
-                if let Expr::Name { name } = &callee.node {
-                    let key = name.to_lowercase();
-                    matches!(
-                        key.as_str(),
-                        "trim"
-                            | "adjustl"
-                            | "adjustr"
-                            | "char"
-                            | "achar"
-                            | "compiler_version"
-                            | "compiler_options"
-                    ) || ctx
-                        .locals
-                        .get(&key)
-                        .map(|i| {
-                            i.char_kind != CharKind::None
-                                && (i.dims.is_empty()
-                                    || args.iter().all(|a| {
-                                        matches!(
-                                            a.value,
-                                            crate::ast::expr::SectionSubscript::Element(_)
-                                        )
-                                    }))
-                        })
-                        .unwrap_or(false)
-                } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
-                    // Nested: arr(i)(lo:hi) — substring of char array element.
-                    if let Expr::Name { name } = &inner.node {
-                        let key = name.to_lowercase();
-                        ctx.locals
-                            .get(&key)
-                            .map(|i| {
-                                i.char_kind != CharKind::None
-                                    && (!i.dims.is_empty() || i.allocatable)
-                            })
-                            .unwrap_or(false)
-                            && args.iter().any(|a| {
-                                matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
-                            })
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            Expr::BinaryOp {
-                op: BinaryOp::Concat,
-                ..
-            } => true,
-            Expr::ComponentAccess { base, component } => {
-                // Check if the component is a character field.
-                if let Some((_addr, type_name)) =
-                    resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
-                {
-                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
-                        layout
-                            .field(component)
-                            .map(|f| {
-                                matches!(
-                                    f.type_info,
-                                    crate::sema::symtab::TypeInfo::Character { .. }
-                                )
-                            })
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+        let is_char = matches!(item.node, Expr::StringLiteral { .. })
+            || (expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+                && !expr_is_array_designator(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)));
 
         // Whole-array print: a plain Name reference whose local
         // has array dims. Iterate elements and call the per-element
