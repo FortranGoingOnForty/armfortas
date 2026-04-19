@@ -74,6 +74,9 @@ fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
         IrType::Int(IntWidth::I128) => (16, 16),
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => (8, 8),
         IrType::Float(FloatWidth::F64) => (8, 8),
+        // TODO: integer(c_short), value actuals still appear widened before
+        // reaching call lowering, so end-to-end 16-bit VALUE ABI parity needs
+        // a follow-up beyond this stack-packing fix.
         IrType::Float(FloatWidth::F32) => (4, 4),
         IrType::Int(IntWidth::I32) => (4, 4),
         IrType::Int(IntWidth::I16) => (2, 2),
