@@ -74,11 +74,10 @@ fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
         IrType::Int(IntWidth::I128) => (16, 16),
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => (8, 8),
         IrType::Float(FloatWidth::F64) => (8, 8),
-        IrType::Float(FloatWidth::F32) => (4, 8),
-        IrType::Int(IntWidth::I8)
-        | IrType::Int(IntWidth::I16)
-        | IrType::Int(IntWidth::I32)
-        | IrType::Bool => (4, 8),
+        IrType::Float(FloatWidth::F32) => (4, 4),
+        IrType::Int(IntWidth::I32) => (4, 4),
+        IrType::Int(IntWidth::I16) => (2, 2),
+        IrType::Int(IntWidth::I8) | IrType::Bool => (1, 1),
         _ => (8, 8),
     }
 }
@@ -188,7 +187,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
     }
 
     enum IncomingParam {
-        Narrow(VRegId, RegClass, AbiArgLoc),
+        Narrow(VRegId, RegClass, AbiArgLoc, IrType),
         Wide(i32, AbiArgLoc),
     }
 
@@ -208,7 +207,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
         let class = type_to_reg_class(&param.ty);
         let vreg = mf.new_vreg(class);
         ctx.value_map.insert(param.id, vreg);
-        param_info.push(IncomingParam::Narrow(vreg, class, loc));
+        param_info.push(IncomingParam::Narrow(vreg, class, loc, param.ty.clone()));
     }
 
     // Phase 3: emit prologue in entry block.
@@ -246,7 +245,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     PhysReg::Gp(17),
                 );
             }
-            IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg)) => {
+            IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg), _) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -256,7 +255,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     def: Some(*vreg),
                 });
             }
-            IncomingParam::Narrow(vreg, RegClass::Fp32, AbiArgLoc::Fp32(reg)) => {
+            IncomingParam::Narrow(vreg, RegClass::Fp32, AbiArgLoc::Fp32(reg), _) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -266,7 +265,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     def: Some(*vreg),
                 });
             }
-            IncomingParam::Narrow(vreg, RegClass::Gp32, AbiArgLoc::Gp32(reg)) => {
+            IncomingParam::Narrow(vreg, RegClass::Gp32, AbiArgLoc::Gp32(reg), _) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -276,7 +275,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     def: Some(*vreg),
                 });
             }
-            IncomingParam::Narrow(vreg, _, AbiArgLoc::Gp(reg)) => {
+            IncomingParam::Narrow(vreg, _, AbiArgLoc::Gp(reg), _) => {
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -286,12 +285,13 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     def: Some(*vreg),
                 });
             }
-            IncomingParam::Narrow(vreg, class, AbiArgLoc::Stack(stack_offset)) => {
+            IncomingParam::Narrow(vreg, class, AbiArgLoc::Stack(stack_offset), ty) => {
                 emit_load_stack_arg_into_vreg(
                     &mut mf,
                     MBlockId(0),
                     *vreg,
                     *class,
+                    ty,
                     16 + *stack_offset,
                 );
             }
@@ -301,7 +301,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                     other
                 );
             }
-            IncomingParam::Narrow(_, class, other) => {
+            IncomingParam::Narrow(_, class, other, _) => {
                 panic!(
                     "isel: unexpected ABI loc {:?} for incoming {:?} param",
                     other, class
@@ -515,7 +515,7 @@ fn select_call_inst(
                 });
             }
             (Some(class), AbiArgLoc::Stack(stack_offset)) => {
-                emit_store_stack_arg_from_vreg(mf, mb, arg_vreg, class, stack_offset);
+                emit_store_stack_arg_from_vreg(mf, mb, arg_vreg, class, &arg_ty, stack_offset);
             }
             (Some(class), other) => {
                 panic!(
@@ -2442,14 +2442,19 @@ fn emit_load_stack_arg_into_vreg(
     mb: MBlockId,
     dest: VRegId,
     class: RegClass,
+    ty: &IrType,
     offset: i64,
 ) {
-    let (opcode, reg_base) = match class {
-        RegClass::Fp64 => (ArmOpcode::LdrFpImm, MachineOperand::PhysReg(PhysReg::FP)),
-        RegClass::Fp32 => (ArmOpcode::LdrFpImm, MachineOperand::PhysReg(PhysReg::FP)),
-        RegClass::Gp32 => (ArmOpcode::LdrImm, MachineOperand::PhysReg(PhysReg::FP)),
-        RegClass::Gp64 => (ArmOpcode::LdrImm, MachineOperand::PhysReg(PhysReg::FP)),
+    let opcode = match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
+        IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
+        IrType::Float(_) => ArmOpcode::LdrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
+        },
     };
+    let reg_base = MachineOperand::PhysReg(PhysReg::FP);
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![
@@ -2466,11 +2471,17 @@ fn emit_store_stack_arg_from_vreg(
     mb: MBlockId,
     src: VRegId,
     class: RegClass,
+    ty: &IrType,
     offset: i64,
 ) {
-    let opcode = match class {
-        RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
-        RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
+    let opcode = match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::StrbImm,
+        IrType::Int(IntWidth::I16) => ArmOpcode::StrhImm,
+        IrType::Float(_) => ArmOpcode::StrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
+        },
     };
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
