@@ -651,6 +651,11 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             }
             if let Some(step) = step {
                 validate_const_int_expr_tree(ctx, step);
+                if let Ok(Some(value)) = eval_const_int_expr_checked(ctx, step) {
+                    if value.value == 0 {
+                        ctx.error(step.span, "DO step must not be zero");
+                    }
+                }
             }
         }
         Stmt::DoConcurrent { controls, mask, .. } => {
@@ -3359,6 +3364,21 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn do_loop_zero_step_is_rejected() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i
+  do i = 1, 10, 0
+  end do
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("DO step must not be zero")));
     }
 
     #[test]

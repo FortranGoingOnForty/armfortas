@@ -3773,6 +3773,37 @@ fn emit_tokens_without_o_uses_tokens_suffix() {
 }
 
 #[test]
+fn do_loop_zero_step_is_rejected_before_codegen() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i\n  do i = 1, 10, 0\n    print *, i\n  end do\nend program\n",
+        "f90",
+    );
+    let out = unique_path("zero_step", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "zero-step DO loop should be rejected"
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "zero-step DO loop should stay a compile-time error"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("DO step must not be zero"),
+        "expected zero-step loop diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn dash_capital_d_defines_preprocessor_macro() {
     let src = write_program(
         "#ifdef USE_C_STRINGS\n#define X 1\n#else\n#define X 0\n#endif\nprogram p\n  print *, X\nend program\n",
