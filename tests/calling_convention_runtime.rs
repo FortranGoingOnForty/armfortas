@@ -63,9 +63,27 @@ fn compile_c_object(source: &std::path::Path, output: &std::path::Path) {
 
 fn compile_fortran_object(source: &std::path::Path, output: &std::path::Path) {
     let result = Command::new(compiler("armfortas"))
-        .args(["-c", source.to_str().unwrap(), "-o", output.to_str().unwrap()])
+        .args([
+            "-c",
+            source.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to spawn armfortas object compile");
+    assert!(
+        result.status.success(),
+        "armfortas failed for {}: {}",
+        source.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn compile_fortran_program(source: &std::path::Path, output: &std::path::Path) {
+    let result = Command::new(compiler("armfortas"))
+        .args([source.to_str().unwrap(), "-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn armfortas program compile");
     assert!(
         result.status.success(),
         "armfortas failed for {}: {}",
@@ -153,7 +171,9 @@ fn bind_c_ninth_integer_arg_spills_with_fp_args_still_in_registers() {
     let exe = dir.join("gp_spill.bin");
     link_program(&[&f_obj, &c_obj], &exe);
 
-    let run = Command::new(&exe).output().expect("GP spill runtime failed");
+    let run = Command::new(&exe)
+        .output()
+        .expect("GP spill runtime failed");
     assert!(
         run.status.success(),
         "GP spill runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
@@ -192,7 +212,9 @@ fn bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers() {
     let exe = dir.join("fp_spill.bin");
     link_program(&[&f_obj, &c_obj], &exe);
 
-    let run = Command::new(&exe).output().expect("FP spill runtime failed");
+    let run = Command::new(&exe)
+        .output()
+        .expect("FP spill runtime failed");
     assert!(
         run.status.success(),
         "FP spill runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
@@ -204,6 +226,68 @@ fn bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers() {
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected FP spill output: {}",
         String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contained_hidden_result_optional_gap_preserves_host_and_char_ordering() {
+    let dir = unique_dir("contained_hidden_result_gap");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  character(len=32) :: out\n  out = outer('cmd', 'abc')\n  if (trim(out) /= 'cmd=5') error stop 1\n  print *, trim(out)\ncontains\n  function outer(name, value) result(line)\n    character(len=*), intent(in) :: name, value\n    character(len=32) :: line\n    integer :: bias\n    bias = 2\n    line = render(name, value)\n  contains\n    function render(name, value, manual_len) result(out)\n      character(len=*), intent(in) :: name, value\n      integer, intent(in), optional :: manual_len\n      character(len=32) :: out\n      integer :: n\n      if (present(manual_len)) then\n        n = manual_len + bias\n      else\n        n = len_trim(value) + bias\n      end if\n      write(out, '(A,I0)') trim(name) // '=', n\n    end function render\n  end function outer\nend program\n",
+    );
+    let exe = dir.join("contained_hidden_result_gap.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("contained hidden-result runtime failed");
+    assert!(
+        run.status.success(),
+        "contained hidden-result runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("cmd=5"),
+        "unexpected contained hidden-result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recursive_contained_helper_preserves_host_closure_and_hidden_lengths() {
+    let dir = unique_dir("recursive_hidden_lengths");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer :: total\n  total = walk(3, 2.0d0, 'abc')\n  if (total /= 9) error stop 1\n  print *, total\ncontains\n  recursive integer function walk(n, scale, label) result(total)\n    integer, intent(in) :: n\n    real(8), intent(in) :: scale\n    character(len=*), intent(in) :: label\n    integer :: bias\n    bias = int(scale)\n    if (n <= 0) then\n      total = len_trim(label)\n    else\n      total = helper(n, label)\n    end if\n  contains\n    integer function helper(n, label) result(step)\n      integer, intent(in) :: n\n      character(len=*), intent(in) :: label\n      step = bias + walk(n - 1, scale, label)\n    end function helper\n  end function walk\nend program\n",
+    );
+    let exe = dir.join("recursive_hidden_lengths.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("recursive contained helper runtime failed");
+    assert!(
+        run.status.success(),
+        "recursive contained helper runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("9"),
+        "unexpected recursive contained helper output: {}",
+        stdout
     );
 
     let _ = std::fs::remove_dir_all(&dir);

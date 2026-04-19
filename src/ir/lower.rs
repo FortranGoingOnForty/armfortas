@@ -8659,6 +8659,18 @@ fn emit_named_function_call(
         call_args.push(value);
     }
 
+    if let Some(opt_flags) = &opt_flags {
+        for (i, flag) in opt_flags.iter().enumerate().skip(arg_slots.len()) {
+            if *flag {
+                let is_value = callee_value_args
+                    .as_ref()
+                    .map(|mask| i < mask.len() && mask[i])
+                    .unwrap_or(false);
+                call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+            }
+        }
+    }
+
     if let Some(cls_flags) =
         callee_char_len_star_mask(st, &callee_key).or_else(|| callee_char_len_star_mask(st, &key))
     {
