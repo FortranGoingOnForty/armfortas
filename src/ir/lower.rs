@@ -21332,6 +21332,19 @@ fn emit_derived_value_copy(
             continue;
         }
 
+        if field.allocatable && field.size == 384 {
+            // Intrinsic assignment of derived values must deep-copy
+            // allocatable components instead of aliasing their
+            // descriptors. A raw memcpy here makes sibling copies of
+            // a derived object share the same array storage.
+            b.call(
+                FuncRef::External("afs_assign_allocatable".into()),
+                vec![dest_field, src_field],
+                IrType::Void,
+            );
+            continue;
+        }
+
         if field.dims.is_empty()
             && !field.pointer
             && !field.allocatable

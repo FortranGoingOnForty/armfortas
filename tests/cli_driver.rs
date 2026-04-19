@@ -9113,6 +9113,44 @@ fn formatted_octal_internal_io_round_trips_min_digits_and_values() {
 }
 
 #[test]
+fn derived_assignment_deep_copies_allocatable_command_tokens() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: shell_state_t\n    integer :: last_exit_status = -99\n  end type\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n    integer :: num_tokens = 0\n    integer, allocatable :: token_lengths(:)\n    logical, allocatable :: token_quoted(:)\n    logical, allocatable :: token_escaped(:)\n    integer, allocatable :: token_quote_type(:)\n  end type\ncontains\n  recursive subroutine execute_test_command(cmd, shell)\n    type(command_t), intent(in) :: cmd\n    type(shell_state_t), intent(inout) :: shell\n    logical :: test_result\n    logical :: left_result, right_result\n    type(command_t) :: sub_cmd, left_cmd, right_cmd\n    integer :: i, j, logical_op_pos\n    integer :: paren_depth, check_pos\n    logical :: outer_parens_wrap_all\n    integer :: effective_num_tokens\n    logical :: is_bracket_cmd\n    character(len=16) :: op\n\n    if (cmd%num_tokens < 2) then\n      shell%last_exit_status = 1\n      return\n    end if\n\n    is_bracket_cmd = (trim(cmd%tokens(1)) == '[')\n    if (is_bracket_cmd) then\n      effective_num_tokens = cmd%num_tokens - 1\n    else\n      effective_num_tokens = cmd%num_tokens\n    end if\n\n    if (effective_num_tokens == 4) then\n      op = cmd%tokens(3)\n      select case (trim(op))\n      case ('-gt')\n        test_result = string_to_int(cmd%tokens(2)) > string_to_int(cmd%tokens(4))\n      case default\n        test_result = .false.\n      end select\n    else if (effective_num_tokens >= 5) then\n      if (trim(cmd%tokens(2)) == '(') then\n        paren_depth = 1\n        outer_parens_wrap_all = .false.\n        do check_pos = 3, effective_num_tokens\n          if (trim(cmd%tokens(check_pos)) == '(') then\n            paren_depth = paren_depth + 1\n          else if (trim(cmd%tokens(check_pos)) == ')') then\n            paren_depth = paren_depth - 1\n            if (paren_depth == 0) then\n              outer_parens_wrap_all = (check_pos == effective_num_tokens)\n              exit\n            end if\n          end if\n        end do\n        if (outer_parens_wrap_all) then\n          sub_cmd = cmd\n          sub_cmd%tokens(1) = cmd%tokens(1)\n          if (is_bracket_cmd) then\n            sub_cmd%num_tokens = cmd%num_tokens - 2\n            do i = 2, sub_cmd%num_tokens - 1\n              sub_cmd%tokens(i) = cmd%tokens(i + 1)\n            end do\n            sub_cmd%tokens(sub_cmd%num_tokens) = ']'\n          else\n            sub_cmd%num_tokens = cmd%num_tokens - 2\n            do i = 2, sub_cmd%num_tokens\n              sub_cmd%tokens(i) = cmd%tokens(i + 1)\n            end do\n          end if\n          call execute_test_command(sub_cmd, shell)\n          return\n        end if\n      end if\n\n      logical_op_pos = 0\n      paren_depth = 0\n      do i = 2, effective_num_tokens\n        if (trim(cmd%tokens(i)) == '(') then\n          paren_depth = paren_depth + 1\n        else if (trim(cmd%tokens(i)) == ')') then\n          paren_depth = paren_depth - 1\n        else if (paren_depth == 0) then\n          if (trim(cmd%tokens(i)) == '-o') then\n            logical_op_pos = i\n            exit\n          else if (trim(cmd%tokens(i)) == '-a') then\n            if (logical_op_pos == 0) logical_op_pos = i\n          end if\n        end if\n      end do\n\n      if (logical_op_pos > 0) then\n        left_cmd = cmd\n        left_cmd%tokens(1) = 'test'\n        left_cmd%num_tokens = logical_op_pos - 1\n        do j = 2, left_cmd%num_tokens\n          left_cmd%tokens(j) = cmd%tokens(j)\n        end do\n\n        right_cmd = cmd\n        right_cmd%tokens(1) = 'test'\n        right_cmd%num_tokens = effective_num_tokens + 1 - logical_op_pos\n        do j = 2, right_cmd%num_tokens\n          right_cmd%tokens(j) = cmd%tokens(j + logical_op_pos - 1)\n        end do\n\n        call execute_test_command(left_cmd, shell)\n        left_result = (shell%last_exit_status == 0)\n        call execute_test_command(right_cmd, shell)\n        right_result = (shell%last_exit_status == 0)\n\n        if (trim(cmd%tokens(logical_op_pos)) == '-a') then\n          test_result = left_result .and. right_result\n        else\n          test_result = left_result .or. right_result\n        end if\n      else\n        test_result = .false.\n      end if\n    else\n      test_result = .false.\n    end if\n\n    if (test_result) then\n      shell%last_exit_status = 0\n    else\n      shell%last_exit_status = 1\n    end if\n  end subroutine\n\n  integer function string_to_int(str) result(v)\n    character(len=*), intent(in) :: str\n    integer :: ios\n    read(str, *, iostat=ios) v\n    if (ios /= 0) v = 0\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  type(shell_state_t) :: shell\n\n  allocate(character(len=16) :: cmd%tokens(12))\n  allocate(cmd%token_lengths(12), cmd%token_quoted(12), cmd%token_escaped(12), cmd%token_quote_type(12))\n  cmd%num_tokens = 12\n  cmd%tokens = ''\n  cmd%token_lengths = 0\n  cmd%token_quoted = .false.\n  cmd%token_escaped = .false.\n  cmd%token_quote_type = 0\n  cmd%tokens(1) = 'test'\n  cmd%tokens(2) = '('\n  cmd%tokens(3) = '5'\n  cmd%tokens(4) = '-gt'\n  cmd%tokens(5) = '3'\n  cmd%tokens(6) = ')'\n  cmd%tokens(7) = '-a'\n  cmd%tokens(8) = '('\n  cmd%tokens(9) = '10'\n  cmd%tokens(10) = '-gt'\n  cmd%tokens(11) = '8'\n  cmd%tokens(12) = ')'\n\n  call execute_test_command(cmd, shell)\n  if (shell%last_exit_status /= 0) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_assign_alloc_char_tokens", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived alloc-char token compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived alloc-char token compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived alloc-char token run failed");
+    assert!(
+        run.status.success(),
+        "derived alloc-char token run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived alloc-char token output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_char_component_substring_assignment_updates_field() {
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  tok%value = ''\n  tok%value(1:1) = '3'\n  if (tok%value(1:1) /= '3') error stop 1\n  print *, 'ok'\nend program\n",
