@@ -5552,6 +5552,47 @@ fn procedure_dummy_actual_argument_round_trips_through_pointer_assignment() {
 }
 
 #[test]
+fn procedure_pointer_callback_with_derived_and_assumed_len_char_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: shell_state_t\n    integer :: marker = 0\n  end type\n  type :: parser_state_t\n    character(len=:), allocatable :: raw_input\n  end type\n  abstract interface\n    subroutine cb(shell, command, out_len)\n      import :: shell_state_t\n      type(shell_state_t), intent(inout) :: shell\n      character(len=*), intent(in) :: command\n      integer, intent(out) :: out_len\n    end subroutine cb\n  end interface\n  procedure(cb), pointer :: p => null()\ncontains\n  subroutine set_cb(x)\n    procedure(cb) :: x\n    p => x\n  end subroutine\n\n  subroutine invoke(shell, command, out_len)\n    type(shell_state_t), intent(inout) :: shell\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: out_len\n    call p(shell, command, out_len)\n  end subroutine\n\n  subroutine impl(shell, command, out_len)\n    type(shell_state_t), intent(inout) :: shell\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: out_len\n    type(parser_state_t) :: state\n    state%raw_input = command\n    shell%marker = len(state%raw_input)\n    out_len = len(state%raw_input)\n    print '(A)', state%raw_input\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  type(shell_state_t) :: shell\n  integer :: n\n  call set_cb(impl)\n  call invoke(shell, 'echo a b c', n)\n  print *, shell%marker, n\nend program\n",
+        "f90",
+    );
+    let out = unique_path("procptr_shell_char_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "procedure-pointer callback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "procedure-pointer callback runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo a b c"),
+        "procedure-pointer callback should preserve the assumed-length character payload: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("10"),
+        "procedure-pointer callback should preserve the hidden character length: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
     let src = write_program(
         "module m\n  use iso_c_binding\n  implicit none\n  interface\n    function c_signal(sig, handler) bind(C, name='signal') result(old)\n      import :: c_int, c_funptr\n      integer(c_int), value :: sig\n      type(c_funptr), value :: handler\n      type(c_funptr) :: old\n    end function\n  end interface\ncontains\n  subroutine setup()\n    type(c_funptr) :: old_handler\n    old_handler = c_signal(2, c_funloc(sig_handler))\n  end subroutine\n\n  subroutine sig_handler() bind(C)\n  end subroutine\nend module\n",

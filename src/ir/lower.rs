@@ -12227,6 +12227,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .get(&resolved_key)
                         .or_else(|| ctx.char_len_star_params.get(&signature_key))
                         .or_else(|| ctx.char_len_star_params.get(&key))
+                        .cloned()
+                        .or_else(|| callee_char_len_star_mask(ctx.st, &resolved_key))
+                        .or_else(|| callee_char_len_star_mask(ctx.st, &signature_key))
+                        .or_else(|| callee_char_len_star_mask(ctx.st, &key))
                     {
                         for (i, flag) in cls_flags.iter().enumerate() {
                             if *flag && i < args.len() {
