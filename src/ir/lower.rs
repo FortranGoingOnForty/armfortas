@@ -15262,6 +15262,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let bb_body = b.create_block(body_name);
         let bb_incr = b.create_block(incr_name);
         let bb_exit = b.create_block(exit_name);
+        let bb_zero_step = b.create_block("do_zero_step");
 
         b.branch(bb_check, vec![]);
 
@@ -15272,16 +15273,25 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
         let const_step = step.as_ref().and_then(eval_const_int);
         if let Some(sv) = const_step {
             // Compile-time known step direction.
-            let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
-            let cond = b.icmp(cmp_op, cur, end_val);
-            b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
+            if sv == 0 {
+                b.branch(bb_zero_step, vec![]);
+            } else {
+                let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+                let cond = b.icmp(cmp_op, cur, end_val);
+                b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
+            }
         } else {
             // Runtime step: check sign and use appropriate comparison.
             let zero_const = b.const_i32(0);
             let zero = coerce_to_type(b, zero_const, &var_ty);
+            let step_zero = b.icmp(CmpOp::Eq, step_val, zero);
             let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+            let bb_sign_check = b.create_block("do_sign_check");
             let bb_neg_check = b.create_block(neg_check_name);
             let bb_pos_check = b.create_block(pos_check_name);
+            b.cond_branch(step_zero, bb_zero_step, vec![], bb_sign_check, vec![]);
+
+            b.set_block(bb_sign_check);
             b.cond_branch(step_neg, bb_neg_check, vec![], bb_pos_check, vec![]);
 
             b.set_block(bb_neg_check);
@@ -15292,6 +15302,10 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
             let cond_pos = b.icmp(CmpOp::Le, cur, end_val);
             b.cond_branch(cond_pos, bb_body, vec![], bb_exit, vec![]);
         }
+
+        b.set_block(bb_zero_step);
+        b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+        b.branch(bb_exit, vec![]);
 
         // Body.
         ctx.push_loop(name.clone(), bb_incr, bb_exit);
@@ -15345,6 +15359,12 @@ fn lower_select_case(
     // (Switch terminator would be ideal for integer constants, but the
     // general case needs range checks and DEFAULT handling.)
     let mut bb_current = b.current_block();
+    let default_body = cases.iter().find_map(|case| {
+        case.selectors
+            .iter()
+            .any(|s| matches!(s, CaseSelector::Default))
+            .then_some(&case.body)
+    });
 
     for (i, case) in cases.iter().enumerate() {
         let is_default = case
@@ -15353,19 +15373,7 @@ fn lower_select_case(
             .any(|s| matches!(s, CaseSelector::Default));
 
         if is_default {
-            // Default case — always taken.
-            b.set_block(bb_current);
-            let bb_body = b.create_block(&format!("case_{}_body", i));
-            b.branch(bb_body, vec![]);
-
-            b.set_block(bb_body);
-            lower_stmts(b, ctx, &case.body);
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_end, vec![]);
-            }
-            // After default, no more cases matter.
-            b.set_block(bb_end);
-            return;
+            continue;
         }
 
         let bb_body = b.create_block(&format!("case_{}_body", i));
@@ -15461,9 +15469,18 @@ fn lower_select_case(
         bb_current = bb_next;
     }
 
-    // If no case matched and no default, fall through.
     b.set_block(bb_current);
-    b.branch(bb_end, vec![]);
+    if let Some(body) = default_body {
+        let bb_body = b.create_block("case_default_body");
+        b.branch(bb_body, vec![]);
+        b.set_block(bb_body);
+        lower_stmts(b, ctx, body);
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(bb_end, vec![]);
+        }
+    } else {
+        b.branch(bb_end, vec![]);
+    }
 
     b.set_block(bb_end);
 }

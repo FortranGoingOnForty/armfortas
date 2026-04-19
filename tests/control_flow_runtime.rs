@@ -1,6 +1,8 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -33,6 +35,28 @@ fn write_program(text: &str, suffix: &str) -> PathBuf {
     let path = unique_path("src", suffix);
     std::fs::write(&path, text).expect("cannot write control-flow test source");
     path
+}
+
+fn run_with_timeout(path: &std::path::Path) -> Output {
+    let mut child = Command::new(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn control-flow test binary");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(_status) = child.try_wait().expect("failed to poll child status") {
+            return child
+                .wait_with_output()
+                .expect("failed to collect child output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("control-flow test binary hung");
+        }
+        sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -142,6 +166,82 @@ fn logical_and_or_short_circuit_in_expression_values() {
     assert!(
         stdout.contains("77"),
         "unexpected expression short-circuit output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn runtime_zero_step_do_fails_loudly_instead_of_hanging() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i, step\n  step = 0\n  do i = 1, 10, step\n    print *, i\n  end do\n  print *, 88\nend program\n",
+        "f90",
+    );
+    let out = unique_path("runtime_zero_step", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime zero-step compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime zero-step compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = run_with_timeout(&out);
+    assert!(
+        !run.status.success(),
+        "runtime zero-step DO should fail instead of succeeding"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ERROR STOP"),
+        "expected runtime zero-step diagnostic, got stderr: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn case_default_runs_only_after_other_cases_fail() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  x = 2\n  select case (x)\n  case default\n    print *, 0\n  case (2)\n    print *, 2\n  end select\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_default_fallback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("select default fallback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "select default fallback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("select default fallback run failed");
+    assert!(
+        run.status.success(),
+        "select default fallback run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("2"),
+        "default arm should not swallow later matching case: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("0"),
+        "default arm should only run as fallback: {}",
         stdout
     );
 
