@@ -5089,142 +5089,88 @@ fn alloc_decls(
 
                 if let Some(len) = char_len {
                     if let Some(specs) = array_spec.filter(|_| !is_allocatable) {
+                        // Fixed-length character arrays use contiguous inline
+                        // element storage, not a pointer-slot table. The slot
+                        // table was a legacy lowering artifact that let reads
+                        // load the element bytes as if they were an address,
+                        // which is exactly how local `character(len=N),
+                        // parameter :: builtins(...)` ended up crashing fortsh
+                        // `type`/`command` with `0x202020...` memmove faults.
                         let dims = extract_array_dims(specs, &param_consts, Some(st));
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                        if len == 1 {
-                            // `character(len=1)` arrays are byte arrays, not
-                            // pointer tables. Keeping them contiguous matches
-                            // descriptor-backed `character(kind=c_char)` locals
-                            // and lets element stores land in `ptr<i8>` slots.
-                            const STACK_THRESHOLD: i64 = 64 * 1024;
-                            if total_size >= STACK_THRESHOLD {
-                                let desc_ty =
-                                    IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
-                                let addr = b.alloca(desc_ty);
-                                let zero = b.const_i32(0);
-                                let size384 = b.const_i64(384);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![addr, zero, size384],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                let es = b.const_i64(1);
-                                let n = b.const_i64(total_size);
-                                b.call(
-                                    FuncRef::External("afs_allocate_1d".into()),
-                                    vec![addr, es, n],
-                                    IrType::Void,
-                                );
-                                let space = b.const_i32(b' ' as i32);
-                                let base = b.load_typed(
-                                    addr,
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                let bytes = b.const_i64(total_size);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![base, space, bytes],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                locals.insert(
-                                    key,
-                                    LocalInfo {
-                                        addr,
-                                        ty: IrType::Int(IntWidth::I8),
-                                        dims,
-                                        allocatable: true,
-                                        descriptor_arg: false,
-                                        by_ref: false,
-                                        char_kind: CharKind::Fixed(1),
-                                        derived_type: None,
-                                        inline_const: None,
-                                        is_pointer: false,
-                                        runtime_dim_upper: vec![],
-                                    },
-                                );
-                            } else {
-                                let arr_ty = IrType::Array(
-                                    Box::new(IrType::Int(IntWidth::I8)),
-                                    total_size as u64,
-                                );
-                                let addr = b.alloca(arr_ty);
-                                let space = b.const_i32(b' ' as i32);
-                                let bytes = b.const_i64(total_size);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![addr, space, bytes],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                locals.insert(
-                                    key,
-                                    LocalInfo {
-                                        addr,
-                                        ty: IrType::Int(IntWidth::I8),
-                                        dims,
-                                        allocatable: false,
-                                        descriptor_arg: false,
-                                        by_ref: false,
-                                        char_kind: CharKind::Fixed(1),
-                                        derived_type: None,
-                                        inline_const: None,
-                                        is_pointer: false,
-                                        runtime_dim_upper: vec![],
-                                    },
-                                );
-                            }
-                            continue;
-                        }
-                        let table_ty = IrType::Array(
-                            Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
-                            total_size as u64,
-                        );
-                        let addr = b.alloca(table_ty);
-                        let buf_ty = IrType::Array(
-                            Box::new(IrType::Int(IntWidth::I8)),
-                            (total_size * (len + 1)) as u64,
-                        );
-                        let buf = b.alloca(buf_ty);
-                        let zero = b.const_i32(0);
-                        let total_bytes = b.const_i64(total_size * (len + 1));
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![buf, zero, total_bytes],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
+                        let elem_ty = fixed_char_storage_ir_type(len);
+                        let elem_bytes = ir_scalar_byte_size(&elem_ty);
+                        let total_bytes = total_size * elem_bytes;
                         let space = b.const_i32(b' ' as i32);
-                        let char_bytes = b.const_i64(len);
-                        for idx in 0..total_size {
-                            let slot_idx = b.const_i64(idx);
-                            let slot_ptr = b.gep(
-                                addr,
-                                vec![slot_idx],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
-                            let byte_off = b.const_i64(idx * (len + 1));
-                            let elem_ptr = b.gep(buf, vec![byte_off], IrType::Int(IntWidth::I8));
+                        let total_bytes_val = b.const_i64(total_bytes);
+                        const STACK_THRESHOLD: i64 = 64 * 1024;
+
+                        if total_bytes >= STACK_THRESHOLD {
+                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                            let addr = b.alloca(desc_ty);
+                            let zero = b.const_i32(0);
+                            let size384 = b.const_i64(384);
                             b.call(
                                 FuncRef::External("memset".into()),
-                                vec![elem_ptr, space, char_bytes],
+                                vec![addr, zero, size384],
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
-                            b.store(elem_ptr, slot_ptr);
+                            let es = b.const_i64(elem_bytes);
+                            let n = b.const_i64(total_size);
+                            b.call(
+                                FuncRef::External("afs_allocate_1d".into()),
+                                vec![addr, es, n],
+                                IrType::Void,
+                            );
+                            let base = b
+                                .load_typed(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![base, space, total_bytes_val],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: elem_ty,
+                                    dims,
+                                    allocatable: true,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(len),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                },
+                            );
+                        } else {
+                            let arr_ty =
+                                IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                            let addr = b.alloca(arr_ty);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![addr, space, total_bytes_val],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: elem_ty,
+                                    dims,
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(len),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                },
+                            );
                         }
-                        locals.insert(
-                            key,
-                            LocalInfo {
-                                addr,
-                                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                dims,
-                                allocatable: false,
-                                descriptor_arg: false,
-                                by_ref: false,
-                                char_kind: CharKind::Fixed(len),
-                                derived_type: None,
-                                inline_const: None,
-                                is_pointer: false,
-                                runtime_dim_upper: vec![],
-                            },
-                        );
                         continue;
                     }
                     if !is_allocatable {
@@ -5371,8 +5317,14 @@ fn alloc_decls(
                     // Fixed-size array variable.
                     let dims = extract_array_dims(specs, &param_consts, Some(st));
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
-                    let (array_elem_ty, array_derived_type) =
-                        if let TypeSpec::Type(ref type_name) = type_spec {
+                    let (array_elem_ty, array_derived_type, array_char_kind) =
+                        if matches!(type_spec, TypeSpec::Character(_)) {
+                            if let Some(len) = char_len {
+                                (fixed_char_storage_ir_type(len), None, CharKind::Fixed(len))
+                            } else {
+                                (elem_ty.clone(), None, CharKind::None)
+                            }
+                        } else if let TypeSpec::Type(ref type_name) = type_spec {
                             if let Some(layout) = type_layouts.get(type_name) {
                                 (
                                     IrType::Array(
@@ -5380,12 +5332,13 @@ fn alloc_decls(
                                         layout.size as u64,
                                     ),
                                     Some(type_name.clone()),
+                                    CharKind::None,
                                 )
                             } else {
-                                (elem_ty.clone(), None)
+                                (elem_ty.clone(), None, CharKind::None)
                             }
                         } else {
-                            (elem_ty.clone(), None)
+                            (elem_ty.clone(), None, CharKind::None)
                         };
                     let elem_bytes = ir_scalar_byte_size(&array_elem_ty);
                     let total_bytes = total_size * elem_bytes;
@@ -5438,7 +5391,7 @@ fn alloc_decls(
                                 allocatable: true,
                                 descriptor_arg: false,
                                 by_ref: false,
-                                char_kind: CharKind::None,
+                                char_kind: array_char_kind.clone(),
                                 derived_type: array_derived_type.clone(),
                                 inline_const: None,
                                 is_pointer: false,
@@ -5473,7 +5426,7 @@ fn alloc_decls(
                                 allocatable: false,
                                 descriptor_arg: false,
                                 by_ref: false,
-                                char_kind: CharKind::None,
+                                char_kind: array_char_kind,
                                 derived_type: array_derived_type,
                                 inline_const: None,
                                 is_pointer: false,
@@ -5732,6 +5685,18 @@ fn init_decls(
                     {
                         if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
                             store_ac_values_into(b, locals, info.addr, &info.ty, values, st);
+                        }
+                        continue;
+                    }
+                    if !info.dims.is_empty()
+                        && !info.allocatable
+                        && info.derived_type.is_none()
+                        && matches!(info.char_kind, CharKind::Fixed(_))
+                    {
+                        if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
+                            if let CharKind::Fixed(len) = info.char_kind {
+                                store_char_ac_values_into(b, locals, info.addr, len, values, st);
+                            }
                         }
                         continue;
                     }
@@ -6302,6 +6267,14 @@ fn descriptor_backed_runtime_char_array(info: &LocalInfo) -> bool {
                 && local_fixed_char_allocatable_scalar_len(info).is_none()))
 }
 
+fn inline_char_array_storage(info: &LocalInfo) -> bool {
+    matches!(info.ty, IrType::Int(IntWidth::I8))
+        || matches!(
+            info.ty,
+            IrType::Array(ref inner, _) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+        )
+}
+
 fn char_array_element_ptr_and_len(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -6332,10 +6305,11 @@ fn char_array_element_ptr_and_len(
         CharKind::None => return None,
     };
     if !local_uses_array_descriptor(info) && !info.by_ref {
-        if matches!(info.ty, IrType::Int(IntWidth::I8)) {
+        if inline_char_array_storage(info) {
             // `character(len=1)` / `character(kind=c_char)` locals use
-            // contiguous byte storage, not the pointer-table layout used by
-            // fixed-length character(N>1) arrays.
+            // contiguous byte storage. Fixed-length character arrays now
+            // lower their element storage inline as `[i8 x len]` as well,
+            // so they share the same flat byte-addressing path here.
             let base = array_data_ptr_for_call(b, info);
             let byte_offset = b.imul(idx64, elem_len);
             let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
@@ -6422,7 +6396,7 @@ fn char_array_elem_ptr_and_len_from_flat_index(
         CharKind::None => return None,
     };
     if !local_uses_array_descriptor(info) && !info.by_ref {
-        if matches!(info.ty, IrType::Int(IntWidth::I8)) {
+        if inline_char_array_storage(info) {
             let base = array_data_ptr_for_call(b, info);
             let byte_offset = b.imul(idx64, elem_len);
             let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
@@ -8494,7 +8468,12 @@ fn resolved_symbol_call_target(
 ) -> (String, String) {
     if let Some(sym) = find_linkable_symbol_any_scope(st, key) {
         let call_name = symbol_link_name(st, sym);
-        return (call_name, sym.name.to_lowercase());
+        // Preserve the caller's resolved lookup key for later internal
+        // procedure binding. USE-renamed imports can legitimately point at
+        // a symbol whose defining name differs from the local alias, and
+        // replacing the key with `sym.name` can accidentally rebind a call
+        // to an unrelated same-named local procedure in the current unit.
+        return (call_name, key.to_string());
     }
     (fallback_name.to_string(), key.to_string())
 }
@@ -15801,6 +15780,39 @@ fn store_ac_values_into(
     }
 }
 
+fn store_char_ac_values_into(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_len: i64,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+) {
+    let off_slot = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, off_slot);
+    let step_bytes = b.const_i64(elem_len);
+    let dest_len = b.const_i64(elem_len);
+
+    for v in values {
+        match v {
+            crate::ast::expr::AcValue::Expr(e) => {
+                let cur_off = b.load(off_slot);
+                let elem_ptr = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                let (src_ptr, src_len) = lower_string_expr(b, locals, e, st);
+                b.call(
+                    FuncRef::External("afs_assign_char_fixed".into()),
+                    vec![elem_ptr, dest_len, src_ptr, src_len],
+                    IrType::Void,
+                );
+                let next_off = b.iadd(cur_off, step_bytes);
+                b.store(next_off, off_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo(_) => {}
+        }
+    }
+}
+
 /// Lower an implied-do array constructor iterator:
 ///   `( inner_values, var = start, end [, step] )`
 /// produces the sequence `inner_values[var=start], inner_values[var=start+step], …`.
@@ -21439,7 +21451,7 @@ fn lower_char_arg_by_ref(
                         return None;
                     }
                     let ptr = if local_uses_array_descriptor(&info)
-                        || matches!(info.ty, IrType::Int(IntWidth::I8))
+                        || inline_char_array_storage(&info)
                     {
                         char_array_element_ptr_and_len(b, locals, &info, args, st, type_layouts)?.0
                     } else {
@@ -21472,9 +21484,7 @@ fn lower_char_arg_by_ref(
             {
                 return None;
             }
-            let ptr = if local_uses_array_descriptor(info)
-                || matches!(info.ty, IrType::Int(IntWidth::I8))
-            {
+            let ptr = if local_uses_array_descriptor(info) || inline_char_array_storage(info) {
                 char_array_element_ptr_and_len(b, locals, info, args, st, type_layouts)?.0
             } else {
                 lower_array_element(b, locals, info, args, st, type_layouts)
@@ -21545,7 +21555,9 @@ fn lower_arg_by_ref_full(
     ) {
         return ptr_slot;
     }
-    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+    if expr_is_character_expr(b, locals, expr, st, type_layouts)
+        && !expr_is_array_designator(b, locals, expr, st, type_layouts)
+    {
         let (ptr, _len) = lower_string_expr_full(
             b,
             locals,
@@ -22563,7 +22575,7 @@ fn lower_expr_full(
                                     if let Some(info) = locals.get(&name.to_lowercase()) {
                                         if info.char_kind != CharKind::None {
                                             let addr = if local_uses_array_descriptor(info)
-                                                || matches!(info.ty, IrType::Int(IntWidth::I8))
+                                                || inline_char_array_storage(info)
                                             {
                                                 char_array_element_ptr_and_len(
                                                     b,

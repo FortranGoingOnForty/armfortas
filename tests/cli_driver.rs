@@ -5910,6 +5910,199 @@ fn procedure_pointer_module_export_survives_amod_import() {
 }
 
 #[test]
+fn use_renamed_procedure_call_keeps_imported_target_even_with_local_name_collision() {
+    let dir = unique_dir("use_rename_call_target");
+    let imported_src = write_program_in(
+        &dir,
+        "imported.f90",
+        "module imported_m\ncontains\n  subroutine builtin_type()\n    print *, 'IMPORTED'\n  end subroutine\nend module\n",
+    );
+    let wrapper_src = write_program_in(
+        &dir,
+        "wrapper.f90",
+        "module wrapper_m\n  use imported_m, only: cmd_builtin_type => builtin_type\n  implicit none\ncontains\n  subroutine dispatch()\n    call cmd_builtin_type()\n  end subroutine\n\n  subroutine builtin_type()\n    print *, 'LOCAL'\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use wrapper_m\n  implicit none\n  call dispatch()\nend program\n",
+    );
+
+    let imported_obj = dir.join("imported.o");
+    let compile_imported = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            imported_src.to_str().unwrap(),
+            "-o",
+            imported_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported module compile spawn failed");
+    assert!(
+        compile_imported.status.success(),
+        "imported module should compile: {}",
+        String::from_utf8_lossy(&compile_imported.stderr)
+    );
+
+    let wrapper_obj = dir.join("wrapper.o");
+    let compile_wrapper = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            wrapper_src.to_str().unwrap(),
+            "-o",
+            wrapper_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("wrapper module compile spawn failed");
+    assert!(
+        compile_wrapper.status.success(),
+        "wrapper module should preserve the USE-renamed import: {}",
+        String::from_utf8_lossy(&compile_wrapper.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main should compile against the wrapper module: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("use_rename_call_target.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            wrapper_obj.to_str().unwrap(),
+            imported_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "linked binary should be produced: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "USE-renamed call target binary failed: {:?}\nstderr:{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IMPORTED"),
+        "USE-renamed call should target the imported procedure, not the local collision: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("LOCAL"),
+        "USE-renamed call should not dispatch to the local same-named procedure: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_char_parameter_array_elements_preserve_runtime_bytes() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine identify(command_name, type_flag)\n    character(len=*), intent(in) :: command_name\n    logical, intent(in) :: type_flag\n    if (is_builtin_command(command_name)) then\n      if (type_flag) then\n        print *, 'builtin'\n      else\n        print *, trim(command_name)\n      end if\n    else\n      print *, 'missing'\n    end if\n  end subroutine\n\n  function is_builtin_command(command_name) result(is_builtin)\n    character(len=*), intent(in) :: command_name\n    logical :: is_builtin\n    character(len=16), parameter :: builtins(4) = [ &\n      'cd              ', 'pwd             ', 'echo            ', 'printf          ' ]\n    integer :: i\n    is_builtin = .false.\n    do i = 1, size(builtins)\n      if (trim(command_name) == trim(builtins(i))) then\n        is_builtin = .true.\n        return\n      end if\n    end do\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  character(len=256) :: command_name\n  command_name = 'echo'\n  call identify(command_name, .true.)\n  call identify(command_name, .false.)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_param_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char parameter array compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char parameter array runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let lines: Vec<_> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["builtin", "echo"],
+        "unexpected local char parameter array runtime output"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_char_array_element_actual_to_char_dummy_runs() {
+    let src = write_program(
+        "subroutine install_single_trap(signal_name, command)\n  implicit none\n  character(len=*), intent(in) :: signal_name, command\n  print *, trim(signal_name), trim(command)\nend subroutine\n\nsubroutine parse_signal_list(signals, signal_names, count)\n  implicit none\n  character(len=*), intent(in) :: signals\n  character(len=32), intent(out) :: signal_names(20)\n  integer, intent(out) :: count\n  count = 1\n  signal_names(1) = signals\nend subroutine\n\nsubroutine install_trap(signals, command)\n  implicit none\n  character(len=*), intent(in) :: signals, command\n  character(len=32) :: signal_names(20)\n  integer :: signal_count, i\n  call parse_signal_list(signals, signal_names, signal_count)\n  do i = 1, signal_count\n    call install_single_trap(signal_names(i), command)\n  end do\nend subroutine\n\nprogram p\n  implicit none\n  call install_trap('INT', 'echo')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_array_element_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char array element actual compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char array element actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char array element actual runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("INT") && stdout.contains("echo"),
+        "unexpected fixed char array element actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths() {
     let dir = unique_dir("optional_hidden_char_len");
     let mod_src = write_program_in(
