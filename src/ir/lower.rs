@@ -6632,6 +6632,14 @@ fn actual_char_arg_runtime_len(
     }
 
     match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            if values.len() == 1 {
+                if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
+                    return actual_char_arg_runtime_len(b, locals, first, st, type_layouts);
+                }
+            }
+            None
+        }
         Expr::Name { name } => locals
             .get(&name.to_lowercase())
             .and_then(|info| local_char_runtime_len(b, info)),
@@ -14423,6 +14431,29 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 b.store(ptr, tgt_info.addr);
                                 return;
                             }
+                            if field.pointer && field.size == 384 {
+                                let size = b.const_i64(384);
+                                b.call(
+                                    FuncRef::External("memcpy".into()),
+                                    vec![tgt_info.addr, field_ptr, size],
+                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                );
+                                return;
+                            }
+                            if field.pointer {
+                                let slot_value_ty = match &field.type_info {
+                                    crate::sema::symtab::TypeInfo::Derived(_) => {
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+                                    }
+                                    _ => IrType::Ptr(Box::new(field_storage_ir_type(
+                                        field,
+                                        ctx.type_layouts,
+                                    ))),
+                                };
+                                let associated = b.load_typed(field_ptr, slot_value_ty);
+                                b.store(associated, tgt_info.addr);
+                                return;
+                            }
                             // Cast ptr<i8> → ptr<tgt_ty> via zero-offset GEP
                             // so the store type matches the pointer slot.
                             let zero = b.const_i64(0);
@@ -18507,6 +18538,47 @@ fn lower_array_expr_descriptor(
             } else {
                 None
             }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            if values.len() == 1 {
+                if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
+                    if expr_is_character_expr(b, locals, first, st, type_layouts) {
+                        let (ptr, len) =
+                            lower_string_expr_with_layouts(b, locals, first, st, type_layouts);
+                        let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        b.store(ptr, slot);
+                        let zero = b.const_i64(0);
+                        let table_base = b.gep(slot, vec![zero], IrType::Int(IntWidth::I8));
+                        let desc =
+                            b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                        let zero32 = b.const_i32(0);
+                        let sz384 = b.const_i64(384);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![desc, zero32, sz384],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        store_byte_aggregate_field(
+                            b,
+                            desc,
+                            0,
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            table_base,
+                        );
+                        store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), len);
+                        let rank = b.const_i32(1);
+                        store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+                        let flags = b.const_i32(2 | DESC_CHAR_SLOT_TABLE);
+                        store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+                        let one = b.const_i64(1);
+                        store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
+                        store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), one);
+                        store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+                        return Some((desc, IrType::Int(IntWidth::I8)));
+                    }
+                }
+            }
+            None
         }
         _ => None,
     }

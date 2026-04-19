@@ -7337,6 +7337,76 @@ fn local_array_element_does_not_fall_back_to_unrelated_char_symbol() {
 }
 
 #[test]
+fn pointer_component_rhs_pointer_component_association_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(node_t), pointer :: body => null()\n  end type\n  type :: entry_t\n    type(node_t), pointer :: body => null()\n  end type\n  type(entry_t) :: cache\n  type(node_t), target :: root, leaf\n\n  leaf%node_type = 42\n  root%body => leaf\n  cache%body => root%body\n  if (.not. associated(cache%body)) error stop 1\n  if (cache%body%node_type /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_component_rhs_pointer_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer component rhs pointer component compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer component rhs pointer component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer component rhs pointer component should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer component rhs pointer component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'echo hello'\n  call show([s], 1)\ncontains\n  subroutine show(body_lines, body_count)\n    character(len=*), intent(in) :: body_lines(:)\n    integer, intent(in) :: body_count\n    if (size(body_lines) /= 1) error stop 1\n    if (body_count /= 1) error stop 2\n    if (trim(body_lines(1)) /= 'echo hello') error stop 3\n    print *, 'ok'\n  end subroutine show\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("char_array_constructor_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char array constructor actual compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char array constructor actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char array constructor actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected char array constructor actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_pointer_module_global_survives_amod_import() {
     let dir = unique_dir("derived_ptr_amod");
     let mod_src = write_program_in(
