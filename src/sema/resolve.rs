@@ -96,9 +96,18 @@ fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId
     }
 }
 
-fn normalized_bind_name(bind: Option<&crate::ast::unit::BindInfo>) -> Option<String> {
-    bind.and_then(|info| info.name.as_ref())
-        .map(|name| name.trim_matches('\'').trim_matches('"').to_string())
+fn normalized_bind_name(
+    bind: Option<&crate::ast::unit::BindInfo>,
+    default_name: &str,
+) -> Option<String> {
+    bind.map(|info| {
+        info.name
+            .as_deref()
+            .unwrap_or(default_name)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string()
+    })
 }
 
 type InterfaceOuterRef = (
@@ -367,7 +376,7 @@ fn resolve_unit(
                                 SymbolKind::Function,
                                 ti,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref()),
+                                normalized_bind_name(bind.as_ref(), fn_name),
                             ));
                         }
                         ProgramUnit::Subroutine {
@@ -391,7 +400,7 @@ fn resolve_unit(
                                 SymbolKind::Subroutine,
                                 None,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref()),
+                                normalized_bind_name(bind.as_ref(), fn_name),
                             ));
                         }
                         _ => {}
@@ -1363,7 +1372,7 @@ fn process_contains(
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
-                    binding_label: normalized_bind_name(bind.as_ref()),
+                    binding_label: normalized_bind_name(bind.as_ref(), name),
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -1422,7 +1431,7 @@ fn process_contains(
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
-                    binding_label: normalized_bind_name(bind.as_ref()),
+                    binding_label: normalized_bind_name(bind.as_ref(), name),
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {

@@ -8390,12 +8390,41 @@ fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> Stri
     sym.name.clone()
 }
 
+fn find_linkable_symbol_any_scope<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    use crate::sema::symtab::SymbolKind;
+
+    let mut callable_fallback: Option<&crate::sema::symtab::Symbol> = None;
+    for scope in st.all_scopes() {
+        if let Some(sym) = scope.symbols.get(key) {
+            if sym.attrs.binding_label.is_some() {
+                return Some(sym);
+            }
+            if callable_fallback.is_none()
+                && matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                )
+            {
+                callable_fallback = Some(sym);
+            }
+        }
+    }
+    callable_fallback.or_else(|| st.find_symbol_any_scope(key))
+}
+
 fn resolved_symbol_call_target(
     st: &SymbolTable,
     key: &str,
     fallback_name: &str,
 ) -> (String, String) {
-    if let Some(sym) = st.find_symbol_any_scope(key) {
+    if let Some(sym) = find_linkable_symbol_any_scope(st, key) {
         let call_name = symbol_link_name(st, sym);
         return (call_name, sym.name.to_lowercase());
     }
@@ -14350,6 +14379,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     IrType::Ptr(Box::new(src_info.ty.clone()))
                 };
                 b.load_typed(src_info.addr, load_ty)
+            } else if src_info.by_ref {
+                // Dummy TARGETs and procedure dummies are stored as
+                // caller-provided addresses inside the local slot.
+                // Pointer association must load through that slot so
+                // `p => x` binds to the caller's storage/symbol rather
+                // than this callee's alloca.
+                let load_ty = if src_info.ty.is_ptr() {
+                    src_info.ty.clone()
+                } else {
+                    IrType::Ptr(Box::new(src_info.ty.clone()))
+                };
+                b.load_typed(src_info.addr, load_ty)
             } else if src_info.derived_type.is_some() {
                 // Derived-type TARGET.  src_info.addr is a
                 // ptr<[i8 x size]>; the pointer slot expects ptr<i8>.
@@ -14359,8 +14400,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 let zero = b.const_i64(0);
                 b.gep(src_info.addr, vec![zero], IrType::Int(IntWidth::I8))
             } else {
-                // Plain TARGET or ordinary scalar local: the alloca
-                // address IS the associated target.
+                // Plain TARGET or ordinary scalar local: the local
+                // alloca address IS the associated target.
                 src_info.addr
             };
             b.store(addr, tgt_info.addr);
@@ -14456,8 +14497,11 @@ fn try_lower_select(
         return false;
     }
 
-    // The variable must be a simple scalar local (not character, not array,
-    // not allocatable). These constraints ensure a plain store suffices.
+    // The variable must be a plain scalar stack local (not character, not
+    // array, not allocatable, and not any flavor of indirect storage).
+    // By-ref dummies and POINTER targets keep a slot that stores the target
+    // address, so `store selected, info.addr` would scribble the scalar value
+    // into the pointer slot instead of the pointee.
     let info = match ctx.locals.get(&then_name) {
         Some(info) => info.clone(),
         None => return false,
@@ -14466,6 +14510,9 @@ fn try_lower_select(
         return false;
     }
     if !matches!(info.char_kind, CharKind::None) {
+        return false;
+    }
+    if info.by_ref || info.is_pointer || info.descriptor_arg || info.derived_type.is_some() {
         return false;
     }
 
@@ -21177,6 +21224,17 @@ fn lower_arg_by_ref_full(
             }
             return info.addr;
         }
+        if let Some(sym) = find_linkable_symbol_any_scope(st, &key) {
+            if matches!(
+                sym.kind,
+                crate::sema::symtab::SymbolKind::Function
+                    | crate::sema::symtab::SymbolKind::Subroutine
+                    | crate::sema::symtab::SymbolKind::ExternalProc
+            ) {
+                let (link_name, _) = resolved_symbol_call_target(st, &key, name);
+                return b.global_addr(&link_name, IrType::Int(IntWidth::I8));
+            }
+        }
     }
     if let Expr::ComponentAccess { .. } = &expr.node {
         if let Some(tl) = type_layouts {
@@ -22962,6 +23020,35 @@ end program
         assert!(ir.contains("if_then"));
         assert!(ir.contains("if_else"));
         assert!(ir.contains("if_end"));
+    }
+
+    #[test]
+    fn lower_if_then_else_by_ref_dummy_uses_branches() {
+        let (_, ir) = lower_and_verify(
+            "\
+module m
+contains
+  subroutine set_flag(flag)
+    integer, intent(out) :: flag
+    if (.true.) then
+      flag = 7
+    else
+      flag = -1
+    end if
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !ir.contains("select"),
+            "by-ref dummy assignments must not use the select fast path: {}",
+            ir
+        );
+        assert!(
+            ir.contains("cond_br"),
+            "by-ref dummy assignments should lower through ordinary control flow: {}",
+            ir
+        );
     }
 
     #[test]

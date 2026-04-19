@@ -5516,6 +5516,75 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
 }
 
 #[test]
+fn procedure_dummy_actual_argument_round_trips_through_pointer_assignment() {
+    let src = write_program(
+        "module modproc_m\n  implicit none\n  abstract interface\n    subroutine cb(command, exit_status)\n      character(len=*), intent(in) :: command\n      integer, intent(out) :: exit_status\n    end subroutine cb\n  end interface\n  procedure(cb), pointer :: p => null()\ncontains\n  subroutine set_cb(x)\n    procedure(cb) :: x\n    p => x\n  end subroutine\n\n  subroutine run(command, exit_status)\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: exit_status\n    call p(command, exit_status)\n  end subroutine\n\n  subroutine cb_impl(command, exit_status)\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: exit_status\n    exit_status = len_trim(command)\n  end subroutine\nend module\n\nprogram main\n  use modproc_m\n  implicit none\n  integer :: status\n  call set_cb(cb_impl)\n  call run('abc', status)\n  print *, status\nend program\n",
+        "f90",
+    );
+    let out = unique_path("procedure_dummy_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "procedure dummy actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "procedure dummy actual runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('3'),
+        "procedure dummy actual should call the rebound module procedure: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
+    let src = write_program(
+        "module m\n  use iso_c_binding\n  implicit none\n  interface\n    function c_signal(sig, handler) bind(C, name='signal') result(old)\n      import :: c_int, c_funptr\n      integer(c_int), value :: sig\n      type(c_funptr), value :: handler\n      type(c_funptr) :: old\n    end function\n  end interface\ncontains\n  subroutine setup()\n    type(c_funptr) :: old_handler\n    old_handler = c_signal(2, c_funloc(sig_handler))\n  end subroutine\n\n  subroutine sig_handler() bind(C)\n  end subroutine\nend module\n",
+        "f90",
+    );
+    let out = unique_path("c_funloc_bindc", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "c_funloc bind(C) compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let asm = std::fs::read_to_string(&out).expect("cannot read c_funloc assembly");
+    assert!(
+        asm.contains("_sig_handler@PAGE"),
+        "c_funloc should materialize the bind(C) label, not the module symbol: {}",
+        asm
+    );
+    assert!(
+        !asm.contains("_afs_modproc_m_sig_handler@PAGE"),
+        "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
+        asm
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_pointer_module_export_survives_amod_import() {
     let dir = unique_dir("procptr_amod");
     let mod_src = write_program_in(
@@ -5728,6 +5797,42 @@ fn char_concat_actual_to_assumed_len_dummy_runs() {
     assert!(
         stdout.contains("abc/.fortshrc"),
         "character concat actual should preserve both sides of the string: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn if_else_assignment_to_dummy_argument_runs() {
+    let src = write_program(
+        "module m\ncontains\n  subroutine set_flag(flag)\n    integer, intent(out) :: flag\n    if (.true.) then\n      flag = 7\n    else\n      flag = -1\n    end if\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: flag\n  call set_flag(flag)\n  print *, flag\nend program\n",
+        "f90",
+    );
+    let out = unique_path("if_else_dummy_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "if/else dummy assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "if/else dummy assignment runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('7'),
+        "if/else dummy assignment should write through the caller's storage: {}",
         stdout
     );
 

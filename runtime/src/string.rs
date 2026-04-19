@@ -89,10 +89,14 @@ pub extern "C" fn afs_assign_char_deferred(
             std::process::exit(1);
         }
 
-        // Copy source to new buffer (safe even if src points into old buffer).
+        // Copy source to new buffer. Use `ptr::copy` rather than
+        // `copy_nonoverlapping`: the runtime intentionally accepts
+        // self-referential/alias-heavy deferred-length assignment
+        // shapes, and some compiler paths can still route an
+        // overlapping slice through the reallocating branch.
         if !src.is_null() {
             unsafe {
-                ptr::copy_nonoverlapping(src, new_data, src_len as usize);
+                ptr::copy(src, new_data, src_len as usize);
             }
         }
 
@@ -557,6 +561,23 @@ mod tests {
         assert_eq!(desc.len, 4);
         let data = unsafe { std::slice::from_raw_parts(desc.data, 4) };
         assert_eq!(data, b"ello");
+        afs_dealloc_string(&mut desc);
+    }
+
+    #[test]
+    fn deferred_self_referential_realloc_safe() {
+        // Force the aliasing path through the "needs_realloc" branch by
+        // shrinking capacity metadata while keeping the backing buffer valid.
+        let mut desc = StringDescriptor::zeroed();
+        afs_assign_char_deferred(&mut desc, b"abcdef".as_ptr(), 6);
+        desc.capacity = 1;
+
+        let src_ptr = unsafe { desc.data.add(1) };
+        afs_assign_char_deferred(&mut desc, src_ptr, 4);
+
+        assert_eq!(desc.len, 4);
+        let data = unsafe { std::slice::from_raw_parts(desc.data, 4) };
+        assert_eq!(data, b"bcde");
         afs_dealloc_string(&mut desc);
     }
 
