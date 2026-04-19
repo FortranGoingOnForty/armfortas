@@ -3878,6 +3878,68 @@ fn do_loop_zero_step_is_rejected_before_codegen() {
 }
 
 #[test]
+fn overlapping_select_case_ranges_are_rejected_before_codegen() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  x = 7\n  select case (x)\n  case (1:10)\n    print *, 1\n  case (5:8)\n    print *, 2\n  end select\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_case_overlap", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "overlapping SELECT CASE ranges should be rejected"
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "overlapping SELECT CASE ranges should stay a compile-time error"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("SELECT CASE selectors must be mutually exclusive"),
+        "expected overlapping SELECT CASE diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn multiple_select_case_defaults_are_rejected_before_codegen() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  x = 7\n  select case (x)\n  case default\n    print *, 0\n  case default\n    print *, 9\n  end select\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_case_default", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "multiple CASE DEFAULT arms should be rejected"
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "multiple CASE DEFAULT arms should stay a compile-time error"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("SELECT CASE cannot contain multiple CASE DEFAULT arms"),
+        "expected duplicate CASE DEFAULT diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn logical_and_or_short_circuit_in_conditions() {
     let src = write_program(
         "program p\n  implicit none\n  if (.false. .and. boom()) stop 1\n  if (.true. .or. boom()) stop 2\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",

@@ -622,10 +622,6 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         }
         Stmt::IfStmt { condition, .. }
         | Stmt::DoWhile { condition, .. }
-        | Stmt::SelectCase {
-            selector: condition,
-            ..
-        }
         | Stmt::SelectType {
             selector: condition,
             ..
@@ -640,6 +636,25 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         | Stmt::WhereStmt {
             mask: condition, ..
         } => validate_const_int_expr_tree(ctx, condition),
+        Stmt::SelectCase { selector, cases, .. } => {
+            validate_const_int_expr_tree(ctx, selector);
+            for case in cases {
+                for selector in &case.selectors {
+                    match selector {
+                        CaseSelector::Value(expr) => validate_const_int_expr_tree(ctx, expr),
+                        CaseSelector::Range { low, high } => {
+                            if let Some(low) = low {
+                                validate_const_int_expr_tree(ctx, low);
+                            }
+                            if let Some(high) = high {
+                                validate_const_int_expr_tree(ctx, high);
+                            }
+                        }
+                        CaseSelector::Default => {}
+                    }
+                }
+            }
+        }
         Stmt::DoLoop {
             start, end, step, ..
         } => {
@@ -1345,6 +1360,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_stmts(ctx, body);
         }
         Stmt::SelectCase { cases, .. } => {
+            validate_select_case_arms(ctx, stmt.span, cases);
             for case in cases {
                 validate_stmts(ctx, &case.body);
             }
@@ -1422,6 +1438,117 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConstCaseInterval {
+    low: i128,
+    high: i128,
+}
+
+fn case_selector_span(selector: &CaseSelector, fallback: Span) -> Span {
+    match selector {
+        CaseSelector::Value(expr) => expr.span,
+        CaseSelector::Range { low, high } => low
+            .as_ref()
+            .map(|expr| expr.span)
+            .or_else(|| high.as_ref().map(|expr| expr.span))
+            .unwrap_or(fallback),
+        CaseSelector::Default => fallback,
+    }
+}
+
+fn eval_const_case_bound(
+    ctx: &mut Ctx<'_>,
+    expr: Option<&crate::ast::expr::SpannedExpr>,
+) -> Option<i128> {
+    let expr = expr?;
+    match eval_const_int_expr_checked(ctx, expr) {
+        Ok(Some(value)) => Some(value.value),
+        Ok(None) => None,
+        Err(diag) => {
+            ctx.error(diag.span, diag.msg);
+            None
+        }
+    }
+}
+
+fn const_case_interval(
+    ctx: &mut Ctx<'_>,
+    selector: &CaseSelector,
+    stmt_span: Span,
+) -> Option<ConstCaseInterval> {
+    match selector {
+        CaseSelector::Value(expr) => match eval_const_int_expr_checked(ctx, expr) {
+            Ok(Some(value)) => Some(ConstCaseInterval {
+                low: value.value,
+                high: value.value,
+            }),
+            Ok(None) => None,
+            Err(diag) => {
+                ctx.error(diag.span, diag.msg);
+                None
+            }
+        },
+        CaseSelector::Range { low, high } => {
+            let low_value = match low {
+                Some(_) => eval_const_case_bound(ctx, low.as_ref())?,
+                None => i128::MIN,
+            };
+            let high_value = match high {
+                Some(_) => eval_const_case_bound(ctx, high.as_ref())?,
+                None => i128::MAX,
+            };
+            if low_value > high_value {
+                ctx.error(
+                    case_selector_span(selector, stmt_span),
+                    "SELECT CASE range lower bound exceeds upper bound",
+                );
+                return None;
+            }
+            Some(ConstCaseInterval {
+                low: low_value,
+                high: high_value,
+            })
+        }
+        CaseSelector::Default => None,
+    }
+}
+
+fn validate_select_case_arms(ctx: &mut Ctx<'_>, stmt_span: Span, cases: &[CaseBlock]) {
+    let mut default_seen = false;
+    let mut seen_intervals: Vec<ConstCaseInterval> = Vec::new();
+
+    for case in cases {
+        for selector in &case.selectors {
+            if matches!(selector, CaseSelector::Default) {
+                if default_seen {
+                    ctx.error(
+                        case_selector_span(selector, stmt_span),
+                        "SELECT CASE cannot contain multiple CASE DEFAULT arms",
+                    );
+                } else {
+                    default_seen = true;
+                }
+                continue;
+            }
+
+            let Some(interval) = const_case_interval(ctx, selector, stmt_span) else {
+                continue;
+            };
+            if seen_intervals
+                .iter()
+                .any(|previous| interval.low <= previous.high && previous.low <= interval.high)
+            {
+                ctx.error(
+                    case_selector_span(selector, stmt_span),
+                    "SELECT CASE selectors must be mutually exclusive",
+                );
+                continue;
+            }
+            seen_intervals.push(interval);
+        }
     }
 }
 
@@ -3379,6 +3506,48 @@ end program
 ",
         );
         assert!(errs.iter().any(|e| e.contains("DO step must not be zero")));
+    }
+
+    #[test]
+    fn select_case_rejects_multiple_default_arms() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: x
+  x = 7
+  select case (x)
+  case default
+    print *, 0
+  case default
+    print *, 9
+  end select
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("multiple CASE DEFAULT")));
+    }
+
+    #[test]
+    fn select_case_rejects_overlapping_integer_ranges() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: x
+  x = 7
+  select case (x)
+  case (1:10)
+    print *, 1
+  case (5:8)
+    print *, 2
+  end select
+end program
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("SELECT CASE selectors must be mutually exclusive")));
     }
 
     #[test]
