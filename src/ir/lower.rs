@@ -8223,14 +8223,14 @@ fn resolve_operator_overload(
 /// must reference a param past the last positional. When the
 /// callee's signature isn't resolvable (e.g. external BIND(C)),
 /// the original list passes through unchanged.
-fn reorder_args_by_keyword(
+fn reorder_args_by_keyword_slots(
     args: &[crate::ast::expr::Argument],
     callee_key: &str,
     st: &SymbolTable,
-) -> Vec<crate::ast::expr::Argument> {
+) -> Vec<Option<crate::ast::expr::Argument>> {
     // Fast path: no keyword args anywhere → pass through.
     if args.iter().all(|a| a.keyword.is_none()) {
-        return args.to_vec();
+        return args.iter().cloned().map(Some).collect();
     }
     // Look up the callee's declared param order. NamedInterface
     // symbols live in scope.symbols keyed by lowercase name and
@@ -8249,7 +8249,7 @@ fn reorder_args_by_keyword(
         }
         match found {
             Some(v) if !v.is_empty() => v,
-            _ => return args.to_vec(), // no signature info → no reorder
+            _ => return args.iter().cloned().map(Some).collect(), // no signature info → no reorder
         }
     };
     // Build slot list the size of the callee's declared params.
@@ -8279,7 +8279,67 @@ fn reorder_args_by_keyword(
             slots.push(Some(a.clone()));
         }
     }
-    slots.into_iter().flatten().collect()
+    slots
+}
+
+fn reorder_args_by_keyword(
+    args: &[crate::ast::expr::Argument],
+    callee_key: &str,
+    st: &SymbolTable,
+) -> Vec<crate::ast::expr::Argument> {
+    reorder_args_by_keyword_slots(args, callee_key, st)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn callee_arg_symbol<'a>(
+    st: &'a SymbolTable,
+    callee_name: &str,
+    idx: usize,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    use crate::sema::symtab::ScopeKind;
+
+    let scope = st.all_scopes().iter().find(|scope| match &scope.kind {
+        ScopeKind::Function(name) | ScopeKind::Subroutine(name) => {
+            name.eq_ignore_ascii_case(callee_name)
+        }
+        _ => false,
+    })?;
+    let arg_name = scope.arg_order.get(idx)?;
+    scope.symbols.get(arg_name)
+}
+
+fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueId {
+    match ty {
+        IrType::Int(IntWidth::I64) => b.const_i64(0),
+        IrType::Int(IntWidth::I128) => b.const_i64(0),
+        IrType::Int(_) => b.const_i32(0),
+        IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+        IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
+        IrType::Bool => b.const_bool(false),
+        IrType::Ptr(_) => b.const_i64(0),
+        IrType::FuncPtr(_) => b.const_i64(0),
+        IrType::Array(_, _) | IrType::Struct(_) => b.const_i64(0),
+        IrType::Void => b.const_i32(0),
+    }
+}
+
+fn missing_optional_call_arg(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    callee_name: &str,
+    idx: usize,
+    is_value: bool,
+) -> ValueId {
+    if !is_value {
+        return b.const_i64(0);
+    }
+    callee_arg_symbol(st, callee_name, idx)
+        .and_then(|sym| sym.type_info.as_ref())
+        .map(type_info_to_ir_type)
+        .map(|ty| zero_value_for_ir_type(b, &ty))
+        .unwrap_or_else(|| b.const_i32(0))
 }
 
 /// Generic SUBROUTINE call-site resolver. Mirror of the generic
@@ -8445,8 +8505,10 @@ fn emit_named_function_call(
     ret_ty: IrType,
 ) -> ValueId {
     let key = callee_name.to_lowercase();
-    let reordered = reorder_args_by_keyword(args, &key, st);
-    let args: &[crate::ast::expr::Argument] = &reordered;
+    let arg_slots = reorder_args_by_keyword_slots(args, &key, st);
+    let present_args: Vec<crate::ast::expr::Argument> =
+        arg_slots.iter().flatten().cloned().collect();
+    let args: &[crate::ast::expr::Argument] = &present_args;
 
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
@@ -8481,11 +8543,14 @@ fn emit_named_function_call(
     let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &callee_key)
         .or_else(|| callee_bind_c_char_arg_mask(st, &key));
 
+    let opt_flags =
+        callee_optional_arg_mask(st, &callee_key).or_else(|| callee_optional_arg_mask(st, &key));
+
     let mut call_args = Vec::new();
     if let Some(desc) = hidden_result {
         call_args.push(desc);
     }
-    call_args.extend(args.iter().enumerate().map(|(i, a)| {
+    for (i, slot) in arg_slots.iter().enumerate() {
         let is_value = callee_value_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
@@ -8502,7 +8567,22 @@ fn emit_named_function_call(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
-        match &a.value {
+        let arg = match slot {
+            Some(arg) => arg,
+            None => {
+                if opt_flags
+                    .as_ref()
+                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+                    continue;
+                }
+                call_args.push(missing_optional_call_arg(b, st, &callee_key, i, is_value));
+                continue;
+            }
+        };
+        let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
                 if is_value {
                     lower_expr_full(
@@ -8535,33 +8615,38 @@ fn emit_named_function_call(
                 }
             }
             _ => b.const_i32(0),
-        }
-    }));
+        };
+        call_args.push(value);
+    }
 
     if let Some(cls_flags) =
         callee_char_len_star_mask(st, &callee_key).or_else(|| callee_char_len_star_mask(st, &key))
     {
         for (i, flag) in cls_flags.iter().enumerate() {
-            if !*flag || i >= args.len() {
+            if !*flag || i >= arg_slots.len() {
                 continue;
             }
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
-                if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, locals) {
-                    call_args.push(len);
-                } else if let Expr::StringLiteral { value, .. } = &e.node {
-                    call_args.push(b.const_i64(value.len() as i64));
-                } else if expr_is_character_expr(b, locals, e, st, type_layouts) {
-                    let (_ptr, len) = lower_string_expr_full(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    );
-                    call_args.push(len);
+            if let Some(arg) = &arg_slots[i] {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, locals) {
+                        call_args.push(len);
+                    } else if let Expr::StringLiteral { value, .. } = &e.node {
+                        call_args.push(b.const_i64(value.len() as i64));
+                    } else if expr_is_character_expr(b, locals, e, st, type_layouts) {
+                        let (_ptr, len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        call_args.push(len);
+                    } else {
+                        call_args.push(b.const_i64(0));
+                    }
                 } else {
                     call_args.push(b.const_i64(0));
                 }
@@ -8596,8 +8681,10 @@ fn lower_alloc_return_call_into_desc(
     args: &[crate::ast::expr::Argument],
 ) {
     let key = callee_name.to_lowercase();
-    let reordered = reorder_args_by_keyword(args, &key, ctx.st);
-    let args: &[crate::ast::expr::Argument] = &reordered;
+    let arg_slots = reorder_args_by_keyword_slots(args, &key, ctx.st);
+    let present_args: Vec<crate::ast::expr::Argument> =
+        arg_slots.iter().flatten().cloned().collect();
+    let args: &[crate::ast::expr::Argument] = &present_args;
 
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
@@ -8627,8 +8714,11 @@ fn lower_alloc_return_call_into_desc(
     let callee_bind_c_char_args = callee_bind_c_char_arg_mask(ctx.st, &callee_key)
         .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
 
+    let opt_flags = callee_optional_arg_mask(ctx.st, &callee_key)
+        .or_else(|| callee_optional_arg_mask(ctx.st, &key));
+
     let mut call_args = vec![desc_addr];
-    call_args.extend(args.iter().enumerate().map(|(i, a)| {
+    for (i, slot) in arg_slots.iter().enumerate() {
         let is_value = callee_value_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
@@ -8645,7 +8735,34 @@ fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
-        match &a.value {
+        let arg = match slot {
+            Some(arg) => arg,
+            None => {
+                if opt_flags
+                    .as_ref()
+                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    call_args.push(missing_optional_call_arg(
+                        b,
+                        ctx.st,
+                        &callee_key,
+                        i,
+                        is_value,
+                    ));
+                    continue;
+                }
+                call_args.push(missing_optional_call_arg(
+                    b,
+                    ctx.st,
+                    &callee_key,
+                    i,
+                    is_value,
+                ));
+                continue;
+            }
+        };
+        let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
                 if is_value {
                     lower_expr_ctx(b, ctx, e)
@@ -8669,8 +8786,9 @@ fn lower_alloc_return_call_into_desc(
                 }
             }
             _ => b.const_i32(0),
-        }
-    }));
+        };
+        call_args.push(value);
+    }
 
     if let Some(cls_flags) = ctx
         .char_len_star_params
@@ -8678,14 +8796,24 @@ fn lower_alloc_return_call_into_desc(
         .or_else(|| ctx.char_len_star_params.get(&key))
     {
         for (i, flag) in cls_flags.iter().enumerate() {
-            if !*flag || i >= args.len() {
+            if !*flag || i >= arg_slots.len() {
                 continue;
             }
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
-                call_args.push(
-                    actual_char_arg_runtime_len(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
+            if let Some(arg) = &arg_slots[i] {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    call_args.push(
+                        actual_char_arg_runtime_len(
+                            b,
+                            &ctx.locals,
+                            e,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        )
                         .unwrap_or_else(|| b.const_i64(0)),
-                );
+                    );
+                } else {
+                    call_args.push(b.const_i64(0));
+                }
             } else {
                 call_args.push(b.const_i64(0));
             }
@@ -12073,9 +12201,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // param order; the rest of the call-site code
                     // then runs positionally against that reordered
                     // list.
-                    let reordered = reorder_args_by_keyword(args, &signature_key, ctx.st);
-                    let args: &[crate::ast::expr::Argument] = &reordered;
-                    let mut arg_vals: Vec<ValueId> = args
+                    let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
+                    let present_args: Vec<crate::ast::expr::Argument> =
+                        arg_slots.iter().flatten().cloned().collect();
+                    let args: &[crate::ast::expr::Argument] = &present_args;
+                    let resolution_arg_vals: Vec<ValueId> = args
                         .iter()
                         .map(|a| match &a.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
@@ -12092,31 +12222,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     let (resolved_name, resolved_key) = if procptr_target.is_some() {
                         (name.clone(), signature_key.clone())
                     } else {
-                        resolve_subroutine_call_name(ctx.st, b, name, &key, &arg_vals, callee.span)
+                        resolve_subroutine_call_name(
+                            ctx.st,
+                            b,
+                            name,
+                            &key,
+                            &resolution_arg_vals,
+                            callee.span,
+                        )
                     };
-                    if let Some(value_mask) = callee_value_arg_mask(ctx.st, &resolved_key)
+                    let value_mask = callee_value_arg_mask(ctx.st, &resolved_key)
                         .or_else(|| callee_value_arg_mask(ctx.st, &signature_key))
-                        .or_else(|| callee_value_arg_mask(ctx.st, &key))
-                    {
-                        for (i, a) in args.iter().enumerate() {
-                            if !value_mask.get(i).copied().unwrap_or(false) {
-                                continue;
-                            }
-                            arg_vals[i] = match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
-                                    b,
-                                    &ctx.locals,
-                                    e,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                    Some(ctx.internal_funcs),
-                                    Some(ctx.contained_host_refs),
-                                    Some(ctx.descriptor_params),
-                                ),
-                                _ => b.const_i32(0),
-                            };
-                        }
-                    }
+                        .or_else(|| callee_value_arg_mask(ctx.st, &key));
                     let desc_mask = ctx
                         .descriptor_params
                         .get(&resolved_key)
@@ -12125,82 +12242,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     let bind_c_char_mask = callee_bind_c_char_arg_mask(ctx.st, &resolved_key)
                         .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &signature_key))
                         .or_else(|| callee_bind_c_char_arg_mask(ctx.st, &key));
-                    if let Some(desc_mask) = desc_mask {
-                        for (i, a) in args.iter().enumerate() {
-                            if !desc_mask.get(i).copied().unwrap_or(false) {
-                                continue;
-                            }
-                            arg_vals[i] = match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => {
-                                    lower_arg_descriptor(
-                                        b,
-                                        &ctx.locals,
-                                        e,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    )
-                                }
-                                _ => b.const_i64(0),
-                            };
-                        }
-                    }
-                    if let Some(bind_c_char_mask) = bind_c_char_mask {
-                        for (i, a) in args.iter().enumerate() {
-                            if desc_mask
-                                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if !bind_c_char_mask.get(i).copied().unwrap_or(false) {
-                                continue;
-                            }
-                            arg_vals[i] = match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => {
-                                    lower_bind_c_char_arg_raw(
-                                        b,
-                                        &ctx.locals,
-                                        e,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                        Some(ctx.internal_funcs),
-                                        Some(ctx.contained_host_refs),
-                                        Some(ctx.descriptor_params),
-                                    )
-                                }
-                                _ => b.const_i64(0),
-                            };
-                        }
-                    }
-                    if let Some(string_desc_mask) =
-                        callee_string_descriptor_arg_mask(ctx.st, &resolved_key)
-                            .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &signature_key))
-                            .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key))
-                    {
-                        for (i, a) in args.iter().enumerate() {
-                            if desc_mask
-                                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if !string_desc_mask.get(i).copied().unwrap_or(false) {
-                                continue;
-                            }
-                            arg_vals[i] = match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => {
-                                    lower_arg_string_descriptor(
-                                        b,
-                                        &ctx.locals,
-                                        e,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    )
-                                }
-                                _ => b.const_i64(0),
-                            };
-                        }
-                    }
+                    let string_desc_mask = callee_string_descriptor_arg_mask(ctx.st, &resolved_key)
+                        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &signature_key))
+                        .or_else(|| callee_string_descriptor_arg_mask(ctx.st, &key));
                     // If the callee has more parameters than provided args, and the
                     // trailing ones are OPTIONAL, pass null pointers so PRESENT() works.
                     let opt_flags = ctx
@@ -12212,6 +12256,76 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .or_else(|| callee_optional_arg_mask(ctx.st, &resolved_key))
                         .or_else(|| callee_optional_arg_mask(ctx.st, &signature_key))
                         .or_else(|| callee_optional_arg_mask(ctx.st, &key));
+                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    for (i, slot) in arg_slots.iter().enumerate() {
+                        let is_value = value_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_descriptor = desc_mask
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_bind_c_char = bind_c_char_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_string_descriptor = string_desc_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let value = match slot {
+                            Some(arg) => match &arg.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => {
+                                    if is_value {
+                                        lower_expr_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                    } else if wants_string_descriptor {
+                                        lower_arg_string_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                    } else if wants_descriptor {
+                                        lower_arg_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                    } else if wants_bind_c_char {
+                                        lower_bind_c_char_arg_raw(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                    } else {
+                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                    }
+                                }
+                                _ => b.const_i32(0),
+                            },
+                            None => {
+                                missing_optional_call_arg(b, ctx.st, &resolved_key, i, is_value)
+                            }
+                        };
+                        arg_vals.push(value);
+                    }
                     if let Some(opt_flags) = opt_flags {
                         for flag in opt_flags.iter().skip(arg_vals.len()) {
                             if *flag {
@@ -12233,10 +12347,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .or_else(|| callee_char_len_star_mask(ctx.st, &key))
                     {
                         for (i, flag) in cls_flags.iter().enumerate() {
-                            if *flag && i < args.len() {
-                                if let crate::ast::expr::SectionSubscript::Element(e) =
-                                    &args[i].value
-                                {
+                            if !*flag || i >= arg_slots.len() {
+                                continue;
+                            }
+                            if let Some(arg) = &arg_slots[i] {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                     arg_vals.push(
                                         actual_char_arg_runtime_len(
                                             b,
@@ -12250,6 +12365,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } else {
                                     arg_vals.push(b.const_i64(0));
                                 }
+                            } else {
+                                arg_vals.push(b.const_i64(0));
                             }
                         }
                     }
@@ -22230,8 +22347,10 @@ fn lower_expr_full(
                 // Keyword-argument reordering for function calls
                 // (symmetric with the Stmt::Call path). Binds by name
                 // when the callee's arg_order is resolvable.
-                let reordered_fn = reorder_args_by_keyword(args, &signature_key, st);
-                let args: &[crate::ast::expr::Argument] = &reordered_fn;
+                let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, st);
+                let present_args: Vec<crate::ast::expr::Argument> =
+                    arg_slots.iter().flatten().cloned().collect();
+                let args: &[crate::ast::expr::Argument] = &present_args;
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
                 let intrinsic_arg_vals: Vec<ValueId> = args
@@ -22255,53 +22374,79 @@ fn lower_expr_full(
                     return result;
                 }
 
-                // Check if the callee has VALUE args (BIND(C) interface).
-                let callee_value_args = callee_value_arg_mask(st, &signature_key)
+                // Resolve generic interface names to specific procedures.
+                // For a NamedInterface callee, failing to resolve means
+                // the call is ill-typed (wrong arity, wrong kind, or no
+                // matching specific). Emit a compile-time diagnostic
+                // instead of silently falling back to the generic name,
+                // which would either mismatch the callee ABI or produce
+                // an unresolved link-time symbol.
+                let (call_name, callee_key) = if procptr_target.is_some() {
+                    (String::new(), signature_key.clone())
+                } else {
+                    let resolved_name = match resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
+                    {
+                        Some(n) => n,
+                        None => {
+                            if let Some(sym) = st.find_symbol_any_scope(&key) {
+                                if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
+                                    let specifics = sym.arg_names.join(", ");
+                                    eprintln!(
+                                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                                            expr.span.start.line,
+                                            expr.span.start.col,
+                                            name,
+                                            specifics,
+                                        );
+                                    let _ = std::io::stderr().flush();
+                                    std::process::exit(1);
+                                }
+                            }
+                            name.clone()
+                        }
+                    };
+                    let resolved_key = resolved_name.to_lowercase();
+                    resolved_symbol_call_target(st, &resolved_key, &resolved_name)
+                };
+                let callee_value_args = callee_value_arg_mask(st, &callee_key)
+                    .or_else(|| callee_value_arg_mask(st, &signature_key))
                     .or_else(|| callee_value_arg_mask(st, &key));
-
-                // Check which params use the descriptor ABI
-                // (assumed-shape / deferred / assumed-size arrays).
-                // The Stmt::Call path consults ctx.descriptor_params
-                // directly; here we reach into it through the
-                // descriptor_params plumbed as an optional arg so
-                // the function-call path doesn't need full ctx.
-                // Without this, a function with `integer :: xs(:)`
-                // would receive a raw element pointer and size(xs)
-                // would read garbage (audit31 Finding 6).
                 let callee_descriptor_args = descriptor_params.and_then(|m| {
-                    m.get(&signature_key)
+                    m.get(&callee_key)
                         .cloned()
+                        .or_else(|| m.get(&signature_key).cloned())
                         .or_else(|| m.get(&key).cloned())
                 });
                 let callee_string_descriptor_args =
-                    callee_string_descriptor_arg_mask(st, &signature_key)
+                    callee_string_descriptor_arg_mask(st, &callee_key)
+                        .or_else(|| callee_string_descriptor_arg_mask(st, &signature_key))
                         .or_else(|| callee_string_descriptor_arg_mask(st, &key));
-                let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &signature_key)
+                let callee_bind_c_char_args = callee_bind_c_char_arg_mask(st, &callee_key)
+                    .or_else(|| callee_bind_c_char_arg_mask(st, &signature_key))
                     .or_else(|| callee_bind_c_char_arg_mask(st, &key));
-
-                // Pass args: by value for VALUE, descriptor for
-                // assumed-shape, by reference otherwise.
-                let mut ref_arg_vals: Vec<ValueId> = args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let is_value = callee_value_args
-                            .as_ref()
-                            .map(|mask| i < mask.len() && mask[i])
-                            .unwrap_or(false);
-                        let wants_descriptor = callee_descriptor_args
-                            .as_ref()
-                            .map(|mask| i < mask.len() && mask[i])
-                            .unwrap_or(false);
-                        let wants_string_descriptor = callee_string_descriptor_args
-                            .as_ref()
-                            .map(|mask| i < mask.len() && mask[i])
-                            .unwrap_or(false);
-                        let wants_bind_c_char = callee_bind_c_char_args
-                            .as_ref()
-                            .map(|mask| i < mask.len() && mask[i])
-                            .unwrap_or(false);
-                        match &a.value {
+                let opt_flags = callee_optional_arg_mask(st, &callee_key)
+                    .or_else(|| callee_optional_arg_mask(st, &signature_key))
+                    .or_else(|| callee_optional_arg_mask(st, &key));
+                let mut ref_arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                for (i, slot) in arg_slots.iter().enumerate() {
+                    let is_value = callee_value_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let wants_descriptor = callee_descriptor_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let wants_string_descriptor = callee_string_descriptor_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let wants_bind_c_char = callee_bind_c_char_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let value = match slot {
+                        Some(arg) => match &arg.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
                                 if is_value {
                                     lower_expr_full(
@@ -22343,71 +22488,12 @@ fn lower_expr_full(
                                 }
                             }
                             _ => b.const_i32(0),
-                        }
-                    })
-                    .collect();
-
-                // Resolve generic interface names to specific procedures.
-                // For a NamedInterface callee, failing to resolve means
-                // the call is ill-typed (wrong arity, wrong kind, or no
-                // matching specific). Emit a compile-time diagnostic
-                // instead of silently falling back to the generic name,
-                // which would either mismatch the callee ABI or produce
-                // an unresolved link-time symbol.
-                let (call_name, callee_key) = if procptr_target.is_some() {
-                    (String::new(), signature_key.clone())
-                } else {
-                    let resolved_name = match resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
-                    {
-                        Some(n) => n,
-                        None => {
-                            if let Some(sym) = st.find_symbol_any_scope(&key) {
-                                if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
-                                    let specifics = sym.arg_names.join(", ");
-                                    eprintln!(
-                                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                                            expr.span.start.line,
-                                            expr.span.start.col,
-                                            name,
-                                            specifics,
-                                        );
-                                    let _ = std::io::stderr().flush();
-                                    std::process::exit(1);
-                                }
-                            }
-                            name.clone()
-                        }
+                        },
+                        None => missing_optional_call_arg(b, st, &callee_key, i, is_value),
                     };
-                    let resolved_key = resolved_name.to_lowercase();
-                    resolved_symbol_call_target(st, &resolved_key, &resolved_name)
-                };
-                if let Some(string_desc_flags) = callee_string_descriptor_arg_mask(st, &callee_key)
-                    .or_else(|| callee_string_descriptor_arg_mask(st, &signature_key))
-                    .or_else(|| callee_string_descriptor_arg_mask(st, &key))
-                {
-                    for (i, flag) in string_desc_flags.iter().enumerate() {
-                        if callee_descriptor_args
-                            .as_ref()
-                            .map(|mask| mask.get(i).copied().unwrap_or(false))
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        if !*flag || i >= args.len() {
-                            continue;
-                        }
-                        ref_arg_vals[i] = match &args[i].value {
-                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                lower_arg_string_descriptor(b, locals, e, st, type_layouts)
-                            }
-                            _ => b.const_i64(0),
-                        };
-                    }
+                    ref_arg_vals.push(value);
                 }
-                if let Some(opt_flags) = callee_optional_arg_mask(st, &callee_key)
-                    .or_else(|| callee_optional_arg_mask(st, &signature_key))
-                    .or_else(|| callee_optional_arg_mask(st, &key))
-                {
+                if let Some(opt_flags) = opt_flags {
                     for flag in opt_flags.iter().skip(ref_arg_vals.len()) {
                         if *flag {
                             ref_arg_vals.push(b.const_i64(0));
@@ -22420,14 +22506,18 @@ fn lower_expr_full(
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
                     for (i, flag) in cls_flags.iter().enumerate() {
-                        if !*flag || i >= args.len() {
+                        if !*flag || i >= arg_slots.len() {
                             continue;
                         }
-                        if let crate::ast::expr::SectionSubscript::Element(e) = &args[i].value {
-                            ref_arg_vals.push(
-                                actual_char_arg_runtime_len(b, locals, e, st, type_layouts)
-                                    .unwrap_or_else(|| b.const_i64(0)),
-                            );
+                        if let Some(arg) = &arg_slots[i] {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                ref_arg_vals.push(
+                                    actual_char_arg_runtime_len(b, locals, e, st, type_layouts)
+                                        .unwrap_or_else(|| b.const_i64(0)),
+                                );
+                            } else {
+                                ref_arg_vals.push(b.const_i64(0));
+                            }
                         } else {
                             ref_arg_vals.push(b.const_i64(0));
                         }

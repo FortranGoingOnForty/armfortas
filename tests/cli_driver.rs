@@ -5774,6 +5774,44 @@ fn external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths
 }
 
 #[test]
+fn keyword_actual_preserves_skipped_optional_slot() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: t\n    integer :: a = 0\n    logical :: b = .false.\n    integer :: c = 0\n  end type\ncontains\n  subroutine foo(x, a, b, c)\n    type(t), intent(inout) :: x\n    integer, intent(in) :: a\n    logical, intent(in), optional :: b\n    integer, intent(in), optional :: c\n    x%a = a\n    if (present(b)) then\n      x%b = b\n    else\n      x%b = .false.\n    end if\n    if (present(c)) then\n      x%c = c\n    else\n      x%c = -1\n    end if\n  end subroutine foo\nend module m\nprogram p\n  use m\n  implicit none\n  type(t) :: x\n  call foo(x, 11, c=77)\n  if (x%a /= 11) error stop 1\n  if (x%b) error stop 2\n  if (x%c /= 77) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("keyword_optional_gap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("keyword optional gap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "keyword optional gap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("keyword optional gap run failed");
+    assert!(
+        run.status.success(),
+        "keyword optional gap run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected keyword optional gap output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn inquire_file_with_sparse_optional_string_outputs_runs() {
     let src = write_program(
         "program p\n  implicit none\n  logical :: exists\n  character(len=16) :: access, action\n  inquire(file='fortsh_missing_config_marker', exist=exists, access=access, action=action)\n  print *, trim(access), trim(action)\nend program\n",
