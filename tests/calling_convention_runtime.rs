@@ -232,6 +232,88 @@ fn bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers() {
 }
 
 #[test]
+fn bind_c_signed_char_value_args_keep_narrow_stack_widths() {
+    let dir = unique_dir("i8_stack");
+    let c_src = write_program_in(
+        &dir,
+        "check_i8_stack.c",
+        "#include <stdint.h>\n\nint check_i8_stack(int8_t a1, int8_t a2, int8_t a3, int8_t a4, int8_t a5, int8_t a6, int8_t a7, int8_t a8, int8_t a9, int8_t a10) {\n    if (a1 != 1) return 1;\n    if (a2 != 2) return 2;\n    if (a3 != 3) return 3;\n    if (a4 != 4) return 4;\n    if (a5 != 5) return 5;\n    if (a6 != 6) return 6;\n    if (a7 != 7) return 7;\n    if (a8 != 8) return 8;\n    if (a9 != 9) return 9;\n    if (a10 != 10) return 10;\n    return 19;\n}\n",
+    );
+    let c_obj = dir.join("check_i8_stack.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_signed_char\n  implicit none\n  interface\n    function check_i8_stack(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) result(rc) bind(C, name='check_i8_stack')\n      import :: c_int, c_signed_char\n      integer(c_signed_char), value :: a1, a2, a3, a4, a5, a6, a7, a8, a9, a10\n      integer(c_int) :: rc\n    end function check_i8_stack\n  end interface\n  integer(c_int) :: rc\n\n  rc = check_i8_stack(1_c_signed_char, 2_c_signed_char, 3_c_signed_char, 4_c_signed_char, 5_c_signed_char, 6_c_signed_char, 7_c_signed_char, 8_c_signed_char, 9_c_signed_char, 10_c_signed_char)\n  if (rc /= 19_c_int) error stop rc\n  print *, 'ok'\nend program\n",
+    );
+    let f_obj = dir.join("main.o");
+    compile_fortran_object(&f_src, &f_obj);
+
+    let exe = dir.join("i8_stack.bin");
+    link_program(&[&f_obj, &c_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("c_signed_char stack runtime failed");
+    assert!(
+        run.status.success(),
+        "c_signed_char stack runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected c_signed_char stack output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_short_value_args_keep_narrow_stack_widths() {
+    let dir = unique_dir("i16_stack");
+    let c_src = write_program_in(
+        &dir,
+        "check_i16_stack.c",
+        "#include <stdint.h>\n\nint check_i16_stack(int16_t a1, int16_t a2, int16_t a3, int16_t a4, int16_t a5, int16_t a6, int16_t a7, int16_t a8, int16_t a9, int16_t a10) {\n    if (a1 != 1) return 1;\n    if (a2 != 2) return 2;\n    if (a3 != 3) return 3;\n    if (a4 != 4) return 4;\n    if (a5 != 5) return 5;\n    if (a6 != 6) return 6;\n    if (a7 != 7) return 7;\n    if (a8 != 8) return 8;\n    if (a9 != 9) return 9;\n    if (a10 != 10) return 10;\n    return 19;\n}\n",
+    );
+    let c_obj = dir.join("check_i16_stack.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_short\n  implicit none\n  interface\n    function check_i16_stack(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) result(rc) bind(C, name='check_i16_stack')\n      import :: c_int, c_short\n      integer(c_short), value :: a1, a2, a3, a4, a5, a6, a7, a8, a9, a10\n      integer(c_int) :: rc\n    end function check_i16_stack\n  end interface\n  integer(c_int) :: rc\n\n  rc = check_i16_stack(1_c_short, 2_c_short, 3_c_short, 4_c_short, 5_c_short, 6_c_short, 7_c_short, 8_c_short, 9_c_short, 10_c_short)\n  if (rc /= 19_c_int) error stop rc\n  print *, 'ok'\nend program\n",
+    );
+    let f_obj = dir.join("main.o");
+    compile_fortran_object(&f_src, &f_obj);
+
+    let exe = dir.join("i16_stack.bin");
+    link_program(&[&f_obj, &c_obj], &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("c_short stack runtime failed");
+    assert!(
+        run.status.success(),
+        "c_short stack runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected c_short stack output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn contained_hidden_result_optional_gap_preserves_host_and_char_ordering() {
     let dir = unique_dir("contained_hidden_result_gap");
     let src = write_program_in(

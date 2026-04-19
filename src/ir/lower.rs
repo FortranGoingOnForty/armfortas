@@ -8374,6 +8374,24 @@ fn callee_arg_symbol<'a>(
     scope.symbols.get(arg_name)
 }
 
+fn callee_arg_ir_type(st: &SymbolTable, callee_name: &str, idx: usize) -> Option<IrType> {
+    callee_arg_symbol(st, callee_name, idx)
+        .and_then(|sym| sym.type_info.as_ref())
+        .map(type_info_to_ir_type)
+}
+
+fn coerce_value_call_arg(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    callee_name: &str,
+    idx: usize,
+    raw: ValueId,
+) -> ValueId {
+    callee_arg_ir_type(st, callee_name, idx)
+        .map(|ty| coerce_to_type(b, raw, &ty))
+        .unwrap_or(raw)
+}
+
 fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueId {
     match ty {
         IrType::Int(IntWidth::I64) => b.const_i64(0),
@@ -8399,9 +8417,7 @@ fn missing_optional_call_arg(
     if !is_value {
         return b.const_i64(0);
     }
-    callee_arg_symbol(st, callee_name, idx)
-        .and_then(|sym| sym.type_info.as_ref())
-        .map(type_info_to_ir_type)
+    callee_arg_ir_type(st, callee_name, idx)
         .map(|ty| zero_value_for_ir_type(b, &ty))
         .unwrap_or_else(|| b.const_i32(0))
 }
@@ -8726,7 +8742,7 @@ fn emit_named_function_call(
                         descriptor_params,
                     )
                 } else if is_value {
-                    lower_expr_full(
+                    let raw = lower_expr_full(
                         b,
                         locals,
                         e,
@@ -8735,7 +8751,8 @@ fn emit_named_function_call(
                         internal_funcs,
                         contained_host_refs,
                         descriptor_params,
-                    )
+                    );
+                    coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                 } else if wants_descriptor {
                     lower_arg_descriptor(b, locals, e, st, type_layouts)
                 } else if wants_string_descriptor {
@@ -8982,7 +8999,8 @@ fn lower_alloc_return_call_into_desc(
                         Some(ctx.descriptor_params),
                     )
                 } else if is_value {
-                    lower_expr_ctx(b, ctx, e)
+                    let raw = lower_expr_ctx(b, ctx, e);
+                    coerce_value_call_arg(b, ctx.st, abi_primary_key, i, raw)
                 } else if wants_string_descriptor {
                     lower_arg_string_descriptor(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
                 } else if wants_descriptor {
@@ -12674,7 +12692,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             Some(ctx.descriptor_params),
                                         )
                                     } else if is_value {
-                                        lower_expr_full(
+                                        let raw = lower_expr_full(
                                             b,
                                             &ctx.locals,
                                             e,
@@ -12683,6 +12701,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             Some(ctx.internal_funcs),
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
+                                        );
+                                        coerce_value_call_arg(
+                                            b,
+                                            ctx.st,
+                                            abi_primary_key,
+                                            i,
+                                            raw,
                                         )
                                     } else if wants_descriptor {
                                         lower_arg_descriptor(
@@ -23381,7 +23406,7 @@ fn lower_expr_full(
                                         descriptor_params,
                                     )
                                 } else if is_value {
-                                    lower_expr_full(
+                                    let raw = lower_expr_full(
                                         b,
                                         locals,
                                         e,
@@ -23390,7 +23415,8 @@ fn lower_expr_full(
                                         internal_funcs,
                                         contained_host_refs,
                                         descriptor_params,
-                                    )
+                                    );
+                                    coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                                 } else if wants_descriptor {
                                     lower_arg_descriptor(b, locals, e, st, type_layouts)
                                 } else if wants_string_descriptor {
