@@ -8114,6 +8114,32 @@ fn resolve_generic_call(
     None
 }
 
+fn generic_dispatch_probe_value(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> ValueId {
+    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+        b.const_int(0, IntWidth::I8)
+    } else {
+        lower_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )
+    }
+}
+
 /// Try to lower an assignment through a user-defined `INTERFACE
 /// ASSIGNMENT(=)`. Returns true when a specific subroutine matches
 /// the (LHS info, RHS expression) type pair and the call was emitted.
@@ -8557,22 +8583,16 @@ fn emit_named_function_call(
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
-            crate::ast::expr::SectionSubscript::Element(e) => {
-                if expr_is_character_expr(b, locals, e, st, type_layouts) {
-                    b.const_i32(0)
-                } else {
-                    lower_expr_full(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
-                }
-            }
+            crate::ast::expr::SectionSubscript::Element(e) => generic_dispatch_probe_value(
+                b,
+                locals,
+                e,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ),
             _ => b.const_i32(0),
         })
         .collect();
@@ -8798,13 +8818,16 @@ fn lower_alloc_return_call_into_desc(
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
-            crate::ast::expr::SectionSubscript::Element(e) => {
-                if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts)) {
-                    b.const_i32(0)
-                } else {
-                    lower_expr_ctx(b, ctx, e)
-                }
-            }
+            crate::ast::expr::SectionSubscript::Element(e) => generic_dispatch_probe_value(
+                b,
+                &ctx.locals,
+                e,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ),
             _ => b.const_i32(0),
         })
         .collect();
@@ -10684,6 +10707,47 @@ fn named_expr_callable_character_return_abi(
     callee_character_return_abi(st, &key)
 }
 
+fn resolved_character_return_abi_for_call(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    callee_name: &str,
+    args: &[crate::ast::expr::Argument],
+) -> Option<CharacterReturnAbi> {
+    if let Some(ret_abi) = named_expr_callable_character_return_abi(st, locals, callee_name) {
+        return Some(ret_abi);
+    }
+
+    let key = callee_name.to_ascii_lowercase();
+    let sym = st.find_symbol_any_scope(&key)?;
+    if sym.kind != crate::sema::symtab::SymbolKind::NamedInterface {
+        return None;
+    }
+
+    let probe_vals: Vec<ValueId> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => generic_dispatch_probe_value(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ),
+            _ => b.const_i32(0),
+        })
+        .collect();
+    let resolved = resolve_generic_call(st, b, &key, &probe_vals)?;
+    callee_character_return_abi(st, &resolved)
+}
+
 /// Check if a dummy argument has the VALUE attribute in its declaration.
 fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     let key = arg_name.to_lowercase();
@@ -11183,7 +11247,17 @@ fn lower_string_expr_full(
                     }
                 }
 
-                if let Some(ret_abi) = named_expr_callable_character_return_abi(st, locals, &key) {
+                if let Some(ret_abi) = resolved_character_return_abi_for_call(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    &key,
+                    args,
+                ) {
                     match ret_abi {
                         CharacterReturnAbi::HiddenDescriptor => {
                             let desc =
@@ -23057,22 +23131,17 @@ fn lower_expr_full(
                 let intrinsic_arg_vals: Vec<ValueId> = args
                     .iter()
                     .map(|a| match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => {
-                            if expr_is_character_expr(b, locals, e, st, type_layouts) {
-                                b.const_i32(0)
-                            } else {
-                                lower_expr_full(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                            }
-                        }
+                        crate::ast::expr::SectionSubscript::Element(e) =>
+                            generic_dispatch_probe_value(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ),
                         _ => b.const_i32(0),
                     })
                     .collect();
