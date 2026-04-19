@@ -21839,6 +21839,32 @@ fn lower_pointer_dummy_actual(
             return Some(field_ptr);
         }
     }
+    if let Expr::FunctionCall { callee, args } = &expr.node {
+        if args
+            .iter()
+            .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+        {
+            return None;
+        }
+        if let Expr::Name { name } = &callee.node {
+            let info = locals.get(&name.to_lowercase())?;
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                let elem_addr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(elem_addr, slot);
+                return Some(slot);
+            }
+        }
+        if let Expr::ComponentAccess { .. } = &callee.node {
+            let tl = type_layouts?;
+            if let Some(info) = component_array_local_info(b, locals, callee, st, tl) {
+                let elem_addr = lower_array_element_addr(b, locals, &info, args, st, type_layouts);
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(elem_addr, slot);
+                return Some(slot);
+            }
+        }
+    }
     None
 }
 

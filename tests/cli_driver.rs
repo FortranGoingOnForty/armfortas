@@ -7817,6 +7817,41 @@ fn pointer_dummy_rhs_name_component_assignment_preserves_pointee() {
 }
 
 #[test]
+fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(node_t), pointer :: child => null()\n  end type\n  type :: pipeline_t\n    type(node_t), pointer :: commands(:) => null()\n  end type\n  type :: wrapper_t\n    type(pipeline_t), pointer :: pipe => null()\n  end type\n  type(node_t), target :: storage(2)\n  type(node_t), pointer :: cmds(:)\n  type(wrapper_t) :: w\n\n  storage(1)%node_type = 11\n  storage(2)%node_type = 22\n  cmds => storage\n\n  allocate(w%pipe)\n  w%pipe%commands => cmds\n\n  call show_node(w%pipe%commands(1))\n  call show_node(w%pipe%commands(2))\ncontains\n  subroutine show_node(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node)) error stop 1\n    print '(A,I0)', 'NODE=', node%node_type\n  end subroutine show_node\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_array_component_element_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer array component element actual compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer array component element actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer array component element actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("11") && stdout.contains("22"),
+        "unexpected pointer array component element actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'echo hello'\n  call show([s], 1)\ncontains\n  subroutine show(body_lines, body_count)\n    character(len=*), intent(in) :: body_lines(:)\n    integer, intent(in) :: body_count\n    if (size(body_lines) /= 1) error stop 1\n    if (body_count /= 1) error stop 2\n    if (trim(body_lines(1)) /= 'echo hello') error stop 3\n    print *, 'ok'\n  end subroutine show\nend program p\n",
