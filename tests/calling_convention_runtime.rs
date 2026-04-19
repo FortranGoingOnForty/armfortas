@@ -374,3 +374,65 @@ fn bind_c_keyword_reordering_preserves_gp_spill_with_pointer_args() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn recursive_non_bindc_calls_preserve_hidden_lengths_host_closure_and_gp_spills() {
+    let dir = unique_dir("recursive_non_bindc_gp_spill");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer :: total\n  total = outer()\n  if (total /= 1512) error stop 1\n  print *, total\ncontains\n  integer function outer() result(total)\n    integer :: bias\n    bias = 3\n    total = walk(2, 'abc', 11, 22, 33, 44, 55, 66, 77, 88, 99, 1.25d0, 2.5d0)\n  contains\n    recursive integer function walk(n, tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2) result(v)\n      integer, intent(in) :: n\n      character(len=*), intent(in) :: tag\n      integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n      real(8), intent(in) :: d1, d2\n      if (n <= 0) then\n        v = leaf(a8=a8, d2=d2, a3=a3, a5=a5, a1=a1, tag=tag, a9=a9, d1=d1, a7=a7, a2=a2, a4=a4, a6=a6)\n      else\n        v = leaf(a8=a8, d2=d2, a3=a3, a5=a5, a1=a1, tag=tag, a9=a9, d1=d1, a7=a7, a2=a2, a4=a4, a6=a6) + &\n            walk(n - 1, tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2)\n      end if\n    contains\n      integer function leaf(tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2) result(sumv)\n        character(len=*), intent(in) :: tag\n        integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n        real(8), intent(in) :: d1, d2\n        sumv = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2) + len_trim(tag) + bias\n      end function leaf\n    end function walk\n  end function outer\nend program\n",
+    );
+    let exe = dir.join("recursive_non_bindc_gp_spill.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("recursive non-bind(c) GP spill runtime failed");
+    assert!(
+        run.status.success(),
+        "recursive non-bind(c) GP spill runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1512"),
+        "unexpected recursive non-bind(c) GP spill output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_bindc_keyword_reordering_preserves_mixed_gp_fp_spills() {
+    let dir = unique_dir("non_bindc_keyword_spills");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer :: total\n  total = driver()\n  if (total /= 542) error stop 1\n  print *, total\ncontains\n  integer function driver() result(total)\n    total = accumulate(a9=99, d8=8.5d0, a4=44, d2=2.5d0, tag='xy', a1=11, d5=5.25d0, a7=77, d1=1.25d0, &\n                       a2=22, d9=9.25d0, a5=55, d4=4.5d0, a8=88, a3=33, d6=6.5d0, a6=66, d3=3.75d0, d7=7.75d0)\n  contains\n    integer function accumulate(tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2, d3, d4, d5, d6, d7, d8, d9) result(v)\n      character(len=*), intent(in) :: tag\n      integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n      real(8), intent(in) :: d1, d2, d3, d4, d5, d6, d7, d8, d9\n      v = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2) + int(d3) + int(d4) + int(d5) + int(d6) + int(d7) + int(d8) + int(d9) + len_trim(tag)\n    end function accumulate\n  end function driver\nend program\n",
+    );
+    let exe = dir.join("non_bindc_keyword_spills.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("non-bind(c) keyword spill runtime failed");
+    assert!(
+        run.status.success(),
+        "non-bind(c) keyword spill runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("542"),
+        "unexpected non-bind(c) keyword spill output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
