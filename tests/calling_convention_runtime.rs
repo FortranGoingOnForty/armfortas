@@ -598,3 +598,65 @@ fn cross_tu_bindc_keyword_spills_survive_amod_import() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn character_result_actual_preserves_scalar_spills_in_nested_calls() {
+    let dir = unique_dir("char_result_nested_actual");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer :: total\n  total = consume(label=render(a9=9, d2=2.5d0, a3=3, a5=5, a1=1, tag='ab', d1=1.25d0, a7=7, a2=2, a4=4, a6=6, a8=8), &\n                  a9=9, d2=2.5d0, a3=3, a5=5, a1=1, d1=1.25d0, a7=7, a2=2, a4=4, a6=6, a8=8)\n  if (total /= 53) error stop 1\n  print *, total\ncontains\n  function render(tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2) result(out)\n    character(len=*), intent(in) :: tag\n    integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n    real(8), intent(in) :: d1, d2\n    character(len=16) :: out\n    write(out, '(A,I0)') trim(tag) // '=', a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2)\n  end function render\n\n  integer function consume(label, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2) result(v)\n    character(len=*), intent(in) :: label\n    integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n    real(8), intent(in) :: d1, d2\n    v = len_trim(label) + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2)\n  end function consume\nend program\n",
+    );
+    let exe = dir.join("char_result_nested_actual.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("character-result nested-actual runtime failed");
+    assert!(
+        run.status.success(),
+        "character-result nested-actual runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("53"),
+        "unexpected character-result nested-actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hidden_result_builder_preserves_scalar_helper_spills() {
+    let dir = unique_dir("hidden_result_builder_spills");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  character(len=32) :: out\n  out = render(a9=99, d8=8.5d0, a4=44, d2=2.5d0, tag='xy', a1=11, d5=5.25d0, a7=77, d1=1.25d0, &\n               a2=22, d9=9.25d0, a5=55, d4=4.5d0, a8=88, a3=33, d6=6.5d0, a6=66, d3=3.75d0, d7=7.75d0)\n  if (trim(out) /= 'xy=542') error stop 1\n  print *, trim(out)\ncontains\n  function render(tag, a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2, d3, d4, d5, d6, d7, d8, d9) result(out)\n    character(len=*), intent(in) :: tag\n    integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n    real(8), intent(in) :: d1, d2, d3, d4, d5, d6, d7, d8, d9\n    character(len=32) :: out\n    write(out, '(A,I0)') trim(tag) // '=', weight(a9=a9, d8=d8, a4=a4, d2=d2, a1=a1, d5=d5, a7=a7, d1=d1, a2=a2, d9=d9, a5=a5, d4=d4, a8=a8, a3=a3, d6=d6, a6=a6, d3=d3, d7=d7)\n  end function render\n\n  integer function weight(a1, a2, a3, a4, a5, a6, a7, a8, a9, d1, d2, d3, d4, d5, d6, d7, d8, d9) result(v)\n    integer, intent(in) :: a1, a2, a3, a4, a5, a6, a7, a8, a9\n    real(8), intent(in) :: d1, d2, d3, d4, d5, d6, d7, d8, d9\n    v = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + int(d1) + int(d2) + int(d3) + int(d4) + int(d5) + int(d6) + int(d7) + int(d8) + int(d9) + 2\n  end function weight\nend program\n",
+    );
+    let exe = dir.join("hidden_result_builder_spills.bin");
+    compile_fortran_program(&src, &exe);
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("hidden-result builder runtime failed");
+    assert!(
+        run.status.success(),
+        "hidden-result builder runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("xy=542"),
+        "unexpected hidden-result builder output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

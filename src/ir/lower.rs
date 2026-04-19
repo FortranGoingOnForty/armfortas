@@ -6600,6 +6600,9 @@ fn actual_char_arg_runtime_len(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
     if let Some((_ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
         return Some(len);
@@ -6609,7 +6612,16 @@ fn actual_char_arg_runtime_len(
         Expr::ArrayConstructor { values, .. } => {
             if values.len() == 1 {
                 if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
-                    return actual_char_arg_runtime_len(b, locals, first, st, type_layouts);
+                    return actual_char_arg_runtime_len(
+                        b,
+                        locals,
+                        first,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
                 }
             }
             None
@@ -6622,7 +6634,19 @@ fn actual_char_arg_runtime_len(
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts) =>
         {
-            Some(lower_string_expr_with_layouts(b, locals, expr, st, type_layouts).1)
+            Some(
+                lower_string_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .1,
+            )
         }
         Expr::ComponentAccess { .. } => {
             if let Some(tl) = type_layouts {
@@ -6637,7 +6661,16 @@ fn actual_char_arg_runtime_len(
                 }
             }
             expr_is_character_expr(b, locals, expr, st, type_layouts).then(|| {
-                let (_ptr, len) = lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
+                let (_ptr, len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 len
             })
         }
@@ -6682,12 +6715,30 @@ fn actual_char_arg_runtime_len(
                 }
             }
             expr_is_character_expr(b, locals, expr, st, type_layouts).then(|| {
-                let (_ptr, len) = lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
+                let (_ptr, len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 len
             })
         }
         _ => expr_is_character_expr(b, locals, expr, st, type_layouts).then(|| {
-            let (_ptr, len) = lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
+            let (_ptr, len) = lower_string_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             len
         }),
     }
@@ -8506,16 +8557,22 @@ fn emit_named_function_call(
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
-            crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
-                b,
-                locals,
-                e,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            ),
+            crate::ast::expr::SectionSubscript::Element(e) => {
+                if expr_is_character_expr(b, locals, e, st, type_layouts) {
+                    b.const_i32(0)
+                } else {
+                    lower_expr_full(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )
+                }
+            }
             _ => b.const_i32(0),
         })
         .collect();
@@ -8741,7 +8798,13 @@ fn lower_alloc_return_call_into_desc(
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
-            crate::ast::expr::SectionSubscript::Element(e) => lower_expr_ctx(b, ctx, e),
+            crate::ast::expr::SectionSubscript::Element(e) => {
+                if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts)) {
+                    b.const_i32(0)
+                } else {
+                    lower_expr_ctx(b, ctx, e)
+                }
+            }
             _ => b.const_i32(0),
         })
         .collect();
@@ -8880,6 +8943,9 @@ fn lower_alloc_return_call_into_desc(
                             e,
                             ctx.st,
                             Some(ctx.type_layouts),
+                            Some(ctx.internal_funcs),
+                            Some(ctx.contained_host_refs),
+                            Some(ctx.descriptor_params),
                         )
                         .unwrap_or_else(|| b.const_i64(0)),
                     );
@@ -10607,8 +10673,12 @@ fn named_expr_callable_character_return_abi(
     let key = callee_name.to_ascii_lowercase();
     if locals.contains_key(&key) {
         let sym = st.scopes.iter().find_map(|scope| scope.symbols.get(&key))?;
-        if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer {
-            return None;
+        match sym.kind {
+            crate::sema::symtab::SymbolKind::ProcedurePointer
+            | crate::sema::symtab::SymbolKind::Function
+            | crate::sema::symtab::SymbolKind::ExternalProc
+            | crate::sema::symtab::SymbolKind::IntrinsicProc => {}
+            _ => return None,
         }
     }
     callee_character_return_abi(st, &key)
@@ -12558,6 +12628,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             e,
                                             ctx.st,
                                             Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                         )
                                         .unwrap_or_else(|| b.const_i64(0)),
                                     );
@@ -22984,16 +23057,22 @@ fn lower_expr_full(
                 let intrinsic_arg_vals: Vec<ValueId> = args
                     .iter()
                     .map(|a| match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
-                            b,
-                            locals,
-                            e,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        ),
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            if expr_is_character_expr(b, locals, e, st, type_layouts) {
+                                b.const_i32(0)
+                            } else {
+                                lower_expr_full(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                )
+                            }
+                        }
                         _ => b.const_i32(0),
                     })
                     .collect();
@@ -23204,8 +23283,17 @@ fn lower_expr_full(
                         if let Some(arg) = &arg_slots[i] {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 ref_arg_vals.push(
-                                    actual_char_arg_runtime_len(b, locals, e, st, type_layouts)
-                                        .unwrap_or_else(|| b.const_i64(0)),
+                                    actual_char_arg_runtime_len(
+                                        b,
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    )
+                                    .unwrap_or_else(|| b.const_i64(0)),
                                 );
                             } else {
                                 ref_arg_vals.push(b.const_i64(0));
