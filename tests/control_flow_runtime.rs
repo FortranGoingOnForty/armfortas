@@ -72,3 +72,41 @@ fn named_exit_and_cycle_target_nested_constructs() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn character_select_case_matches_expected_arm() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: code\n  character(len=8) :: cmd\n  cmd = 'help'\n  code = dispatch(cmd)\n  if (code /= 2) error stop 1\n  cmd = 'exit'\n  code = dispatch(cmd)\n  if (code /= 1) error stop 2\n  cmd = 'other'\n  code = dispatch(cmd)\n  if (code /= 3) error stop 3\n  print *, 99\ncontains\n  integer function dispatch(cmd) result(code)\n    character(len=*), intent(in) :: cmd\n    select case (trim(cmd))\n    case ('quit', 'exit')\n      code = 1\n    case ('help')\n      code = 2\n    case default\n      code = 3\n    end select\n  end function dispatch\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_select_case", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character SELECT CASE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character SELECT CASE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("character SELECT CASE run failed");
+    assert!(
+        run.status.success(),
+        "character SELECT CASE run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("99"),
+        "unexpected character SELECT CASE output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
