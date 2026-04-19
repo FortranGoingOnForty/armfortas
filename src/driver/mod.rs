@@ -238,6 +238,10 @@ impl Options {
             PathBuf::from(format!("{}.o", stem))
         } else if self.emit_ir {
             PathBuf::from(format!("{}.ir", stem))
+        } else if self.emit_ast {
+            PathBuf::from(format!("{}.ast", stem))
+        } else if self.emit_tokens {
+            PathBuf::from(format!("{}.tokens", stem))
         } else {
             PathBuf::from(stem)
         }

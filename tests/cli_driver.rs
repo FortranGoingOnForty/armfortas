@@ -3701,6 +3701,78 @@ fn dash_capital_e_without_o_writes_to_stdout() {
 }
 
 #[test]
+fn emit_ast_without_o_uses_ast_suffix() {
+    let dir = unique_dir("emit_ast_default");
+    write_program_in(
+        &dir,
+        "hello.f90",
+        "program p\n  implicit none\n  print *, 1\nend program\n",
+    );
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["--emit-ast", "hello.f90"])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "--emit-ast failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ast_path = dir.join("hello.ast");
+    assert!(
+        ast_path.exists(),
+        "default --emit-ast should create hello.ast"
+    );
+    let ast = std::fs::read_to_string(&ast_path).expect("missing AST output");
+    assert!(
+        ast.contains("Program"),
+        "AST dump should contain Program node: {}",
+        ast
+    );
+    assert!(
+        !dir.join("hello").exists(),
+        "default --emit-ast output should not create a bare-stem file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn emit_tokens_without_o_uses_tokens_suffix() {
+    let dir = unique_dir("emit_tokens_default");
+    write_program_in(
+        &dir,
+        "hello.f90",
+        "program p\n  implicit none\n  print *, 1\nend program\n",
+    );
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["--emit-tokens", "hello.f90"])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "--emit-tokens failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let tokens_path = dir.join("hello.tokens");
+    assert!(
+        tokens_path.exists(),
+        "default --emit-tokens should create hello.tokens"
+    );
+    let tokens = std::fs::read_to_string(&tokens_path).expect("missing token output");
+    assert!(
+        tokens.contains("Token { kind:") && tokens.contains("IntegerLiteral"),
+        "token dump should contain token debug output: {}",
+        tokens
+    );
+    assert!(
+        !dir.join("hello").exists(),
+        "default --emit-tokens output should not create a bare-stem file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dash_capital_d_defines_preprocessor_macro() {
     let src = write_program(
         "#ifdef USE_C_STRINGS\n#define X 1\n#else\n#define X 0\n#endif\nprogram p\n  print *, X\nend program\n",
