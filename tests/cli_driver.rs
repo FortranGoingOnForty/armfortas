@@ -6,6 +6,7 @@
 //! stderr-routing, and missing-symbol-from-bin issues that an
 //! in-process API call wouldn't see.
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1477,6 +1478,76 @@ fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
 }
 
 #[test]
+fn bind_c_c_char_value_arg_passes_actual_byte_after_value_handle() {
+    let dir = unique_dir("bind_c_c_char_value_arg");
+    let c_src = write_program_in(
+        &dir,
+        "check_char.c",
+        "#include <stddef.h>\n\nint check_char(void *handle, char ch) {\n    (void)handle;\n    return (unsigned char)ch;\n}\n",
+    );
+    let c_obj = dir.join("check_char.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_ptr, c_null_ptr, c_char, c_int\n  implicit none\n  interface\n    function check_char(handle, ch) result(rc) bind(C, name='check_char')\n      import :: c_ptr, c_char, c_int\n      type(c_ptr), value :: handle\n      character(kind=c_char), value :: ch\n      integer(c_int) :: rc\n    end function\n  end interface\n  character(len=3) :: s\n  integer(c_int) :: rc\n\n  s = ' +0'\n\n  rc = check_char(c_null_ptr, ' ')\n  if (rc /= 32) error stop 1\n  rc = check_char(c_null_ptr, '+')\n  if (rc /= 43) error stop 2\n  rc = check_char(c_null_ptr, s(1:1))\n  if (rc /= 32) error stop 3\n  rc = check_char(c_null_ptr, s(2:2))\n  if (rc /= 43) error stop 4\n  rc = check_char(c_null_ptr, s(3:3))\n  if (rc /= 48) error stop 5\n\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char value object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) c_char value object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_value_arg.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char value link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) c_char value objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) c_char value run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) c_char value should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "bind(c) c_char value should pass the actual byte for literals and substrings: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(
@@ -2284,6 +2355,90 @@ fn pointer_component_null_assignment_and_default_do_not_escape_null_symbol() {
     assert!(
         stdout.contains("ok"),
         "unexpected pointer component null output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nullified_pointer_component_actual_passes_slot_to_pointer_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: child_t\n    integer :: tag = 0\n  end type\n  type :: holder_t\n    type(child_t), pointer :: body => null()\n  end type\n  type :: node_t\n    type(holder_t), pointer :: fn => null()\n  end type\ncontains\n  subroutine check_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (associated(n)) then\n      print *, 'ASSOC', n%tag\n    else\n      print *, 'NULL'\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: leaf\n  type(node_t), pointer :: parent\n  allocate(parent)\n  allocate(parent%fn)\n  allocate(leaf)\n  leaf%tag = 42\n  parent%fn%body => leaf\n  nullify(parent%fn%body)\n  call check_child(parent%fn%body)\n  print *, 'DONE'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nullified_pointer_component_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nullified pointer component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nullified pointer component actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nullified pointer component actual run failed");
+    assert!(
+        run.status.success(),
+        "nullified pointer component actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("NULL"),
+        "pointer dummy should observe a nullified component actual as disassociated: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("DONE"),
+        "program should continue after the pointer-dummy check: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: count = 0\n  type :: child_t\n    integer :: tag = 0\n  end type\ncontains\n  subroutine destroy_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (.not. associated(n)) return\n    count = count + 1\n    deallocate(n)\n    nullify(n)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: cached\n  allocate(cached)\n  cached%tag = 42\n  call destroy_child(cached)\n  print *, 'COUNT', count\n  if (associated(cached)) then\n    print *, 'CACHED', cached%tag\n  else\n    print *, 'CACHED', -1\n  end if\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pointer_dummy_dealloc_writeback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer dummy deallocate compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer dummy deallocate compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer dummy deallocate run failed");
+    assert!(
+        run.status.success(),
+        "pointer dummy deallocate run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("COUNT 1"),
+        "pointer dummy deallocate should run exactly once: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("CACHED -1"),
+        "pointer dummy deallocate/nullify should disassociate the caller slot: {}",
         stdout
     );
 
@@ -5848,6 +6003,49 @@ fn inquire_file_with_sparse_optional_string_outputs_runs() {
 }
 
 #[test]
+fn open_with_newunit_and_iostat_uses_keyword_specs() {
+    let dir = unique_dir("open_newunit_iostat");
+    let input = dir.join("input.txt");
+    fs::write(&input, "hello\n").expect("write input");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  integer :: u, ios\n  character(len=16) :: line\n  u = -77\n  ios = -88\n  open(newunit=u, file='{}', status='old', action='read', iostat=ios)\n  if (ios /= 0) error stop 1\n  if (u == -77) error stop 2\n  read(u, '(a)', iostat=ios) line\n  if (ios /= 0) error stop 3\n  if (trim(line) /= 'hello') error stop 4\n  close(u)\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+    );
+    let out = dir.join("open_newunit_iostat.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OPEN with NEWUNIT/IOSTAT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "OPEN with NEWUNIT/IOSTAT runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "OPEN with NEWUNIT/IOSTAT should assign the new unit and read the file: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_concat_actual_to_assumed_len_dummy_runs() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: home\n  home = 'abc'\n  call show(trim(home)//'/.fortshrc')\ncontains\n  subroutine show(path)\n    character(len=*), intent(in) :: path\n    print *, trim(path)\n  end subroutine show\nend program\n",
@@ -6898,6 +7096,41 @@ fn allocatable_array_component_passes_descriptor_to_dummy() {
 }
 
 #[test]
+fn allocatable_char_array_component_passes_descriptor_to_dummy() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: tokens(:)\n    integer :: num_tokens = 0\n  end type\n  type(box_t) :: box\n  call fill_tokens(box%tokens, box%num_tokens)\n  if (.not. allocated(box%tokens)) error stop 1\n  if (box%num_tokens /= 2) error stop 2\n  if (size(box%tokens) /= 2) error stop 3\n  if (trim(box%tokens(1)) /= 'echo') error stop 4\n  if (trim(box%tokens(2)) /= 'hello') error stop 5\n  print *, 'ok'\ncontains\n  subroutine fill_tokens(tokens, num_tokens)\n    character(len=:), allocatable, intent(out) :: tokens(:)\n    integer, intent(out) :: num_tokens\n    character(len=16), allocatable :: temp_tokens(:)\n    integer :: i\n    num_tokens = 2\n    allocate(temp_tokens(num_tokens))\n    temp_tokens(1) = 'echo'\n    temp_tokens(2) = 'hello'\n    allocate(character(len=16) :: tokens(num_tokens))\n    do i = 1, num_tokens\n      tokens(i) = temp_tokens(i)\n    end do\n    deallocate(temp_tokens)\n  end subroutine fill_tokens\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_char_descriptor_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char component descriptor compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable char component descriptor program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable char component descriptor program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable char component descriptor output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_array_dummy_uses_real_element_stride() {
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_token_len = 16\n  type :: token_t\n    integer :: token_type\n    character(len=max_token_len) :: value\n    integer :: value_length = 0\n    integer :: start_pos = 0\n    integer :: end_pos = 0\n    integer :: line = 1\n    logical :: quoted = .false.\n    logical :: escaped = .false.\n    integer :: quote_type = 0\n  end type token_t\ncontains\n  subroutine add_token(tokens, num_tokens, tok_type, value)\n    type(token_t), intent(inout) :: tokens(:)\n    integer, intent(inout) :: num_tokens\n    integer, intent(in) :: tok_type\n    character(len=*), intent(in) :: value\n    if (num_tokens < size(tokens)) then\n      num_tokens = num_tokens + 1\n      tokens(num_tokens)%token_type = tok_type\n      tokens(num_tokens)%value = value\n      tokens(num_tokens)%value_length = len_trim(value)\n    end if\n  end subroutine add_token\nend module m\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  integer :: num_tokens\n  allocate(tokens(4))\n  num_tokens = 0\n  call add_token(tokens, num_tokens, 1, 'echo')\n  call add_token(tokens, num_tokens, 2, 'ok')\n  if (num_tokens /= 2) error stop 1\n  if (tokens(1)%token_type /= 1) error stop 2\n  if (trim(tokens(1)%value) /= 'echo') error stop 3\n  if (tokens(1)%value_length /= 4) error stop 4\n  if (tokens(2)%token_type /= 2) error stop 5\n  if (trim(tokens(2)%value) /= 'ok') error stop 6\n  if (tokens(2)%value_length /= 2) error stop 7\n  print *, 'ok'\nend program p\n",
@@ -7098,6 +7331,183 @@ fn allocatable_result_helper_assignment_uses_resolved_symbol() {
         !undefined.iter().any(|sym| sym == "_helper"),
         "same-file allocatable-result helper should not lower to a raw external symbol: {:?}",
         undefined
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocatable_derived_array_function_result_assignment_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: str\n  end type\ncontains\n  function clone(src, count) result(body)\n    type(string_t), intent(in) :: src(:)\n    integer, intent(in) :: count\n    type(string_t), allocatable :: body(:)\n    integer :: j\n    allocate(body(count))\n    do j = 1, count\n      body(j)%str = src(j)%str\n    end do\n  end function clone\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(string_t), allocatable :: src(:), dst(:)\n  allocate(src(1))\n  src(1)%str = 'echo hello'\n  dst = clone(src, 1)\n  if (.not. allocated(dst)) error stop 1\n  if (size(dst) /= 1) error stop 2\n  if (trim(dst(1)%str) /= 'echo hello') error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("allocatable_derived_array_result_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable derived array result compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable derived array result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable derived array result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable derived array result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn hidden_result_call_accepts_component_char_array_element_actual() {
+    let dir = unique_dir("hidden_result_component_char_actual");
+    let types_src = write_program_in(
+        &dir,
+        "types.f90",
+        "module types_mod\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: str\n  end type\n  type :: shell_function_t\n    character(len=256) :: name = ''\n    type(string_t), allocatable :: body(:)\n    integer :: body_lines = 0\n  end type\n  type :: shell_state_t\n    type(shell_function_t) :: functions(8)\n    integer :: num_functions = 0\n  end type\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n    integer :: num_tokens = 0\n  end type\nend module types_mod\n",
+    );
+    let vars_src = write_program_in(
+        &dir,
+        "vars.f90",
+        "module vars_mod\n  use types_mod\n  implicit none\ncontains\n  subroutine initialize_shell(shell)\n    type(shell_state_t), intent(out) :: shell\n    integer :: i\n    do i = 1, size(shell%functions)\n      shell%functions(i)%name = ''\n      shell%functions(i)%body_lines = 0\n    end do\n  end subroutine initialize_shell\n\n  subroutine add_function(shell, name, body_lines, body_count)\n    type(shell_state_t), intent(inout) :: shell\n    character(len=*), intent(in) :: name\n    character(len=*), intent(in) :: body_lines(:)\n    integer, intent(in) :: body_count\n    integer :: i, j\n    do i = 1, size(shell%functions)\n      if (trim(shell%functions(i)%name) == trim(name) .or. len_trim(shell%functions(i)%name) == 0) then\n        shell%functions(i)%name = name\n        shell%functions(i)%body_lines = body_count\n        if (allocated(shell%functions(i)%body)) deallocate(shell%functions(i)%body)\n        allocate(shell%functions(i)%body(body_count))\n        do j = 1, body_count\n          shell%functions(i)%body(j)%str = trim(body_lines(j))\n        end do\n        shell%num_functions = max(shell%num_functions, i)\n        return\n      end if\n    end do\n  end subroutine add_function\n\n  function get_function_body(shell, name) result(body)\n    type(shell_state_t), intent(in) :: shell\n    character(len=*), intent(in) :: name\n    type(string_t), allocatable :: body(:)\n    integer :: i, j\n    do i = 1, shell%num_functions\n      if (trim(shell%functions(i)%name) == trim(name)) then\n        if (allocated(shell%functions(i)%body)) then\n          allocate(body(shell%functions(i)%body_lines))\n          do j = 1, shell%functions(i)%body_lines\n            body(j)%str = shell%functions(i)%body(j)%str\n          end do\n        end if\n        return\n      end if\n    end do\n  end function get_function_body\nend module vars_mod\n",
+    );
+    let exec_src = write_program_in(
+        &dir,
+        "exec.f90",
+        "module exec_mod\n  use types_mod\n  use vars_mod, only: get_function_body\n  implicit none\ncontains\n  subroutine run(shell, cmd)\n    type(shell_state_t), intent(in) :: shell\n    type(command_t), intent(in) :: cmd\n    type(string_t), allocatable :: body(:)\n    body = get_function_body(shell, cmd%tokens(1))\n    if (.not. allocated(body)) error stop 1\n    if (size(body) /= 1) error stop 2\n    if (.not. allocated(body(1)%str)) error stop 3\n    if (trim(body(1)%str) /= 'echo hello') error stop 4\n    print *, 'ok'\n  end subroutine run\nend module exec_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use types_mod\n  use vars_mod, only: initialize_shell, add_function\n  use exec_mod, only: run\n  implicit none\n  type(shell_state_t) :: shell\n  type(command_t) :: cmd\n  call initialize_shell(shell)\n  call add_function(shell, 'myfunc', ['echo hello'], 1)\n  allocate(character(len=16) :: cmd%tokens(1))\n  cmd%tokens(1) = 'myfunc'\n  cmd%num_tokens = 1\n  call run(shell, cmd)\nend program p\n",
+    );
+
+    let types_obj = dir.join("types.o");
+    let compile_types = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            types_src.to_str().unwrap(),
+            "-o",
+            types_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("types module compile spawn failed");
+    assert!(
+        compile_types.status.success(),
+        "types module should compile: {}",
+        String::from_utf8_lossy(&compile_types.stderr)
+    );
+
+    let vars_obj = dir.join("vars.o");
+    let compile_vars = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            vars_src.to_str().unwrap(),
+            "-o",
+            vars_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("vars module compile spawn failed");
+    assert!(
+        compile_vars.status.success(),
+        "vars module should compile: {}",
+        String::from_utf8_lossy(&compile_vars.stderr)
+    );
+
+    let exec_obj = dir.join("exec.o");
+    let compile_exec = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            exec_src.to_str().unwrap(),
+            "-o",
+            exec_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("exec module compile spawn failed");
+    assert!(
+        compile_exec.status.success(),
+        "exec module should compile: {}",
+        String::from_utf8_lossy(&compile_exec.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main program should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("hidden_result_component_char_actual.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            types_obj.to_str().unwrap(),
+            vars_obj.to_str().unwrap(),
+            exec_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "hidden-result component-char actual objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "hidden-result component-char actual binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected hidden-result component-char actual output: {}",
+        stdout
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -7364,6 +7774,41 @@ fn pointer_component_rhs_pointer_component_association_runs() {
     assert!(
         stdout.contains("ok"),
         "unexpected pointer component rhs pointer component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_dummy_rhs_name_component_assignment_preserves_pointee() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(list_t), pointer :: list => null()\n  end type\n  type :: list_t\n    type(node_t), pointer :: left => null()\n    type(node_t), pointer :: right => null()\n  end type\n  type(node_t), pointer :: a, b, root\n\n  allocate(a)\n  a%node_type = 11\n  allocate(b)\n  b%node_type = 22\n\n  root => create_list(a, b)\n\n  if (.not. associated(root%list%left)) error stop 1\n  if (.not. associated(root%list%right)) error stop 2\n  if (root%list%left%node_type /= 11) error stop 3\n  if (root%list%right%node_type /= 22) error stop 4\n  print *, 'ok'\ncontains\n  function create_list(left, right) result(node)\n    type(node_t), pointer, intent(in) :: left, right\n    type(node_t), pointer :: node\n    allocate(node)\n    node%node_type = 33\n    allocate(node%list)\n    node%list%left => left\n    node%list%right => right\n  end function create_list\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_dummy_rhs_name_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer dummy rhs name component compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer dummy rhs name component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer dummy rhs name component should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer dummy rhs name component output: {}",
         stdout
     );
 
