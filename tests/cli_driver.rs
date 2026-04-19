@@ -3804,6 +3804,33 @@ fn do_loop_zero_step_is_rejected_before_codegen() {
 }
 
 #[test]
+fn logical_and_or_short_circuit_in_conditions() {
+    let src = write_program(
+        "program p\n  implicit none\n  if (.false. .and. boom()) stop 1\n  if (.true. .or. boom()) stop 2\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
+        "f90",
+    );
+    let out = unique_path("short_circuit", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "short-circuit repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "short-circuit repro should not evaluate boom():\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn dash_capital_d_defines_preprocessor_macro() {
     let src = write_program(
         "#ifdef USE_C_STRINGS\n#define X 1\n#else\n#define X 0\n#endif\nprogram p\n  print *, X\nend program\n",

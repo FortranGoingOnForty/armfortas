@@ -12532,10 +12532,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::IfStmt { condition, action } => {
-            let cond = lower_expr_ctx(b, ctx, condition);
             let bb_then = b.create_block("if_then");
             let bb_end = b.create_block("if_end");
-            b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
+            lower_condition_branch(b, ctx, condition, bb_then, bb_end);
 
             b.set_block(bb_then);
             lower_stmt(b, ctx, action);
@@ -12593,8 +12592,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             ctx.push_loop(name.clone(), bb_header, bb_exit);
 
             b.set_block(bb_header);
-            let cond = lower_expr_ctx(b, ctx, condition);
-            b.cond_branch(cond, bb_body, vec![], bb_exit, vec![]);
+            lower_condition_branch(b, ctx, condition, bb_body, bb_exit);
 
             b.set_block(bb_body);
             lower_stmts(b, ctx, body);
@@ -14919,14 +14917,13 @@ fn lower_if(
 
     let bb_end = b.create_block("if_end");
 
-    let cond = lower_expr_ctx(b, ctx, condition);
     let bb_then = b.create_block("if_then");
     let bb_next = if !else_ifs.is_empty() || else_body.is_some() {
         b.create_block("if_else")
     } else {
         bb_end
     };
-    b.cond_branch(cond, bb_then, vec![], bb_next, vec![]);
+    lower_condition_branch(b, ctx, condition, bb_then, bb_next);
 
     // Then block.
     b.set_block(bb_then);
@@ -14939,14 +14936,13 @@ fn lower_if(
     let mut current_else = bb_next;
     for (i, (ei_cond, ei_body)) in else_ifs.iter().enumerate() {
         b.set_block(current_else);
-        let ei_cond_val = lower_expr_ctx(b, ctx, ei_cond);
         let bb_ei_then = b.create_block(&format!("elseif_{}_then", i));
         let bb_ei_next = if i + 1 < else_ifs.len() || else_body.is_some() {
             b.create_block(&format!("elseif_{}_else", i))
         } else {
             bb_end
         };
-        b.cond_branch(ei_cond_val, bb_ei_then, vec![], bb_ei_next, vec![]);
+        lower_condition_branch(b, ctx, ei_cond, bb_ei_then, bb_ei_next);
 
         b.set_block(bb_ei_then);
         lower_stmts(b, ctx, ei_body);
@@ -14967,6 +14963,46 @@ fn lower_if(
     }
 
     b.set_block(bb_end);
+}
+
+fn lower_condition_branch(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    condition: &crate::ast::expr::SpannedExpr,
+    bb_true: BlockId,
+    bb_false: BlockId,
+) {
+    match &condition.node {
+        Expr::ParenExpr { inner } => lower_condition_branch(b, ctx, inner, bb_true, bb_false),
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => lower_condition_branch(b, ctx, operand, bb_false, bb_true),
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let bb_rhs = b.create_block("and_rhs");
+            lower_condition_branch(b, ctx, left, bb_rhs, bb_false);
+            b.set_block(bb_rhs);
+            lower_condition_branch(b, ctx, right, bb_true, bb_false);
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let bb_rhs = b.create_block("or_rhs");
+            lower_condition_branch(b, ctx, left, bb_true, bb_rhs);
+            b.set_block(bb_rhs);
+            lower_condition_branch(b, ctx, right, bb_true, bb_false);
+        }
+        _ => {
+            let cond = lower_expr_ctx(b, ctx, condition);
+            b.cond_branch(cond, bb_true, vec![], bb_false, vec![]);
+        }
+    }
 }
 
 /// DO loop fields bundled for passing without too many args.
