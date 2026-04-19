@@ -10305,6 +10305,25 @@ fn local_fixed_char_allocatable_scalar_len(info: &LocalInfo) -> Option<i64> {
     }
 }
 
+fn allocated_array_elem_size(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    fallback_bytes: i64,
+    typed_char_len: Option<ValueId>,
+) -> ValueId {
+    match info.char_kind {
+        CharKind::Fixed(len) => b.const_i64(len),
+        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),
+        CharKind::Deferred if descriptor_backed_runtime_char_array(info) => {
+            typed_char_len.unwrap_or_else(|| b.const_i64(fallback_bytes))
+        }
+        CharKind::None if descriptor_backed_runtime_char_array(info) => {
+            typed_char_len.unwrap_or_else(|| b.const_i64(fallback_bytes))
+        }
+        _ => b.const_i64(fallback_bytes),
+    }
+}
+
 fn local_is_string_scalar(info: &LocalInfo) -> bool {
     (info.allocatable && info.dims.is_empty() && matches!(info.char_kind, CharKind::Deferred))
         || local_fixed_char_allocatable_scalar_len(info).is_some()
@@ -12766,7 +12785,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
-                            let elem_size_bytes = descriptor_element_size_bytes(&LocalInfo {
+                            let field_info = LocalInfo {
                                 addr: field_ptr,
                                 ty: elem_ty.clone(),
                                 dims: vec![],
@@ -12778,15 +12797,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 inline_const: None,
                                 is_pointer: field.pointer,
                                 runtime_dim_upper: vec![],
-                            });
-                            let es = if matches!(
-                                field.type_info,
-                                crate::sema::symtab::TypeInfo::Character { len: None, .. }
-                            ) {
-                                char_alloc_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
-                            } else {
-                                b.const_i64(elem_size_bytes)
                             };
+                            let elem_size_bytes = descriptor_element_size_bytes(&field_info);
+                            let es = allocated_array_elem_size(
+                                b,
+                                &field_info,
+                                elem_size_bytes,
+                                char_alloc_len,
+                            );
                             let rank = args.len();
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
@@ -12928,11 +12946,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             // rather than the local spill slot that holds its
                             // address. Scalar allocatables lower as a rank-0
                             // descriptor allocation.
-                            let es = if descriptor_backed_runtime_char_array(&info) {
-                                char_alloc_len.unwrap_or_else(|| b.const_i64(elem_size_bytes))
-                            } else {
-                                b.const_i64(elem_size_bytes)
-                            };
+                            let es = allocated_array_elem_size(
+                                b,
+                                &info,
+                                elem_size_bytes,
+                                char_alloc_len,
+                            );
                             let desc = array_descriptor_addr(b, &info);
                             let rank = args.len();
                             let one_i64 = b.const_i64(1);

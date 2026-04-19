@@ -5973,6 +5973,99 @@ fn deferred_char_allocatable_array_dummy_whole_and_element_assignment_runs() {
 }
 
 #[test]
+fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_runs() {
+    let dir = unique_dir("fixed_len_char_array_dummy_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  subroutine fill(tokens, num_tokens, expanded_tokens, expanded_count)\n    character(len=*), intent(in) :: tokens(:)\n    integer, intent(in) :: num_tokens\n    character(len=32), allocatable, intent(out) :: expanded_tokens(:)\n    integer, intent(out) :: expanded_count\n    integer :: i\n    expanded_count = num_tokens\n    allocate(expanded_tokens(expanded_count))\n    do i = 1, expanded_count\n      expanded_tokens(i) = tokens(i)\n    end do\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: fill\n  implicit none\n  character(len=32) :: tokens(2)\n  character(len=32), allocatable :: expanded_tokens(:)\n  integer :: expanded_count\n  tokens(1) = 'echo'\n  tokens(2) = 'foo[1]'\n  call fill(tokens, 2, expanded_tokens, expanded_count)\n  print *, 'COUNT=', expanded_count\n  print *, 'TOK1=<' // trim(expanded_tokens(1)) // '>'\n  print *, 'TOK2=<' // trim(expanded_tokens(2)) // '>'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "fixed-length allocatable char array module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "fixed-length allocatable char array consumer should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("fixed_len_char_array_dummy_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "fixed-length allocatable char array .amod link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "fixed-length allocatable char array .amod binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("COUNT= 2") || stdout.contains("COUNT=2"),
+        "expected element count to survive round-trip: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("TOK1=<echo>") && stdout.contains("TOK2=<foo[1]>"),
+        "fixed-length allocatable char array dummy should preserve element text across .amod import: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn use_renamed_procedure_call_uses_remote_symbol() {
     let dir = unique_dir("use_rename_proc");
     let mod_src = write_program_in(
