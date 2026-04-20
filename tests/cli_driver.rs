@@ -198,6 +198,62 @@ fn no_input_after_flags_prints_help_and_mentions_missing_input() {
 }
 
 #[test]
+fn ambiguous_use_warning_is_deduped_across_contained_procedures() {
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  print *, x
+contains
+  subroutine s1()
+    print *, x
+  end subroutine
+
+  subroutine s2()
+    print *, x
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let count = stderr
+        .matches(
+            "warning: ambiguous USE import 'x' from both 'mod_a' and 'mod_b'; keeping the first",
+        )
+        .count();
+    assert_eq!(
+        count, 1,
+        "expected one deduped ambiguous-USE warning, got {}:\n{}",
+        count, stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_c_produces_object_file_only() {
     let src = write_program("module foo\n  integer :: x = 1\nend module\n", "f90");
     let out = unique_path("obj", "o");

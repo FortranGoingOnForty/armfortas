@@ -13,8 +13,10 @@ use crate::ast::unit::*;
 use crate::sema::symtab::SymbolTable;
 
 use crate::ast::decl::ArraySpec;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::rc::Rc;
 
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
@@ -158,6 +160,11 @@ struct LowerCtx<'a> {
     /// begins at that label. Pre-populated by `collect_label_blocks` before
     /// lowering so that GOTO can branch forward as well as backward.
     label_blocks: HashMap<u64, BlockId>,
+    /// Cross-function dedupe for ambiguous USE-import warnings emitted by
+    /// install_globals_as_locals. Large fortsh units can otherwise print the
+    /// exact same ambiguity hundreds or thousands of times while lowering each
+    /// contained procedure separately.
+    ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -172,6 +179,7 @@ impl<'a> LowerCtx<'a> {
         elemental_funcs: &'a HashSet<String>,
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
         contained_host_refs: &'a HashMap<String, Vec<String>>,
+        ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>>,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -192,6 +200,7 @@ impl<'a> LowerCtx<'a> {
             char_len_star_params,
             contained_host_refs,
             label_blocks: HashMap::new(),
+            ambiguous_use_warnings,
         }
     }
 
@@ -278,6 +287,8 @@ pub fn lower_file(
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
+    let ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>> =
+        Rc::new(RefCell::new(HashSet::new()));
 
     // Pass 1: collect module-level variables.  Submodule decls are
     // installed under their parent module's name so the submodule's
@@ -420,6 +431,7 @@ pub fn lower_file(
             &elemental_funcs,
             &char_len_star_params,
             &contained_host_refs,
+            &ambiguous_use_warnings,
             false,
         );
     }
@@ -2341,6 +2353,7 @@ fn lower_unit(
     // names it reads or writes. Drives both callee signature
     // (hidden trailing pointer params) and call-site arg list.
     contained_host_refs: &HashMap<String, Vec<String>>,
+    ambiguous_use_warnings: &Rc<RefCell<HashSet<(String, String, String)>>>,
     internal_only: bool,
 ) {
     match &unit.node {
@@ -2368,6 +2381,7 @@ fn lower_unit(
                 elemental_funcs,
                 char_len_star_params,
                 contained_host_refs,
+                ambiguous_use_warnings.clone(),
             );
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
@@ -2396,6 +2410,7 @@ fn lower_unit(
                     &combined_uses,
                     host_module,
                     ctx.st,
+                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -2449,6 +2464,7 @@ fn lower_unit(
                     elemental_funcs,
                     char_len_star_params,
                     contained_host_refs,
+                    ambiguous_use_warnings,
                     true,
                 );
             }
@@ -2563,6 +2579,7 @@ fn lower_unit(
                 elemental_funcs,
                 char_len_star_params,
                 contained_host_refs,
+                ambiguous_use_warnings.clone(),
             );
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -2699,6 +2716,7 @@ fn lower_unit(
                     &combined_uses,
                     host_module,
                     ctx.st,
+                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -2755,6 +2773,7 @@ fn lower_unit(
                     elemental_funcs,
                     char_len_star_params,
                     contained_host_refs,
+                    ambiguous_use_warnings,
                     true,
                 );
             }
@@ -2944,6 +2963,7 @@ fn lower_unit(
                 elemental_funcs,
                 char_len_star_params,
                 contained_host_refs,
+                ambiguous_use_warnings.clone(),
             );
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -3198,6 +3218,7 @@ fn lower_unit(
                     &combined_uses,
                     host_module,
                     ctx.st,
+                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
@@ -3283,6 +3304,7 @@ fn lower_unit(
                     elemental_funcs,
                     char_len_star_params,
                     contained_host_refs,
+                    ambiguous_use_warnings,
                     true,
                 );
             }
@@ -3328,6 +3350,7 @@ fn lower_unit(
                     elemental_funcs,
                     char_len_star_params,
                     contained_host_refs,
+                    ambiguous_use_warnings,
                     false,
                 );
             }
@@ -3372,6 +3395,7 @@ fn lower_unit(
                     elemental_funcs,
                     char_len_star_params,
                     contained_host_refs,
+                    ambiguous_use_warnings,
                     false,
                 );
             }
@@ -4518,6 +4542,7 @@ fn install_globals_as_locals(
     uses: &[crate::ast::decl::SpannedDecl],
     host_module: Option<&str>,
     st: &SymbolTable,
+    ambiguous_use_warnings: &Rc<RefCell<HashSet<(String, String, String)>>>,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -4624,11 +4649,14 @@ fn install_globals_as_locals(
             // Collision check: two modules exporting the same local key.
             if let Some(prev_mod) = installed_from.get(&local_key) {
                 if *prev_mod != mod_key {
-                    eprintln!(
-                        "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
-                         keeping the first",
-                        local_key, prev_mod, mod_key,
-                    );
+                    let warning_key = (local_key.clone(), prev_mod.clone(), mod_key.clone());
+                    if ambiguous_use_warnings.borrow_mut().insert(warning_key) {
+                        eprintln!(
+                            "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
+                             keeping the first",
+                            local_key, prev_mod, mod_key,
+                        );
+                    }
                     continue;
                 }
             }
@@ -14070,7 +14098,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 init_decls(b, &ctx.locals, &effective_decls, ctx.st);
             }
             if !uses.is_empty() {
-                install_globals_as_locals(b, &mut ctx.locals, ctx.globals, uses, None, ctx.st);
+                install_globals_as_locals(
+                    b,
+                    &mut ctx.locals,
+                    ctx.globals,
+                    uses,
+                    None,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
             }
             lower_stmts(b, ctx, body);
             // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
