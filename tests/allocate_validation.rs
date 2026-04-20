@@ -48,6 +48,13 @@ fn compile_program(source: &Path, output: &Path) -> std::process::Output {
         .expect("failed to spawn armfortas compile")
 }
 
+fn compile_with_args(args: &[&str]) -> std::process::Output {
+    Command::new(compiler("armfortas"))
+        .args(args)
+        .output()
+        .expect("failed to spawn armfortas compile")
+}
+
 #[test]
 fn bare_allocate_array_requires_shape_or_source_or_mold() {
     let dir = unique_dir("bare_array");
@@ -130,6 +137,123 @@ fn bare_allocate_scalar_allocatable_still_works() {
     assert!(
         stdout.contains("T") && stdout.contains("7"),
         "expected allocated scalar output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_allocatable_component_array_requires_shape_or_source_or_mold() {
+    let dir = unique_dir("imported_component_array");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type :: box_t\n    integer, allocatable :: vals(:)\n  end type box_t\nend module\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let compile_mod = compile_with_args(&[
+        "-c",
+        mod_src.to_str().unwrap(),
+        "-J",
+        dir.to_str().unwrap(),
+        "-o",
+        mod_obj.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_mod.stdout),
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: box_t\n  implicit none\n  type(box_t) :: box\n  allocate(box%vals)\nend program\n",
+    );
+    let exe = dir.join("imported_component_array.bin");
+    let compile_main = compile_with_args(&[
+        main_src.to_str().unwrap(),
+        "-I",
+        dir.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    assert!(
+        !compile_main.status.success(),
+        "compile unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_main.stdout),
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&compile_main.stderr);
+    assert!(
+        stderr.contains("array ALLOCATE requires bounds or SOURCE=/MOLD="),
+        "unexpected compile failure for imported component array allocate: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_allocatable_component_scalar_still_works() {
+    let dir = unique_dir("imported_component_scalar");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type :: box_t\n    integer, allocatable :: val\n  end type box_t\nend module\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let compile_mod = compile_with_args(&[
+        "-c",
+        mod_src.to_str().unwrap(),
+        "-J",
+        dir.to_str().unwrap(),
+        "-o",
+        mod_obj.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_mod.stdout),
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: box_t\n  implicit none\n  type(box_t) :: box\n  allocate(box%val)\n  box%val = 9\n  print *, box%val\nend program\n",
+    );
+    let exe = dir.join("imported_component_scalar.bin");
+    let compile_main = compile_with_args(&[
+        main_src.to_str().unwrap(),
+        "-I",
+        dir.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_main.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_main.stdout),
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("imported scalar allocate runtime failed");
+    assert!(
+        run.status.success(),
+        "imported scalar allocate runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("9"),
+        "expected imported scalar allocate output: {}",
         stdout
     );
 

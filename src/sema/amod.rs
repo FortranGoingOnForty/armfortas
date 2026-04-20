@@ -536,6 +536,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.target {
                 attrs.push_str(" @target");
             }
+            if field.declared_array && field.dims.is_empty() {
+                attrs.push_str(" @declared_array");
+            }
             if let Some(default_init) = &field.default_init {
                 attrs.push_str(&render_field_default_init(default_init));
             }
@@ -1148,12 +1151,14 @@ fn parse_type(
                 let mut allocatable = false;
                 let mut pointer = false;
                 let mut target = false;
+                let mut declared_array = false;
                 let mut default_init = None;
                 for token in flag_tail.split_whitespace() {
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
                         "@target" => target = true,
+                        "@declared_array" => declared_array = true,
                         _ => {
                             if let Some(init) = parse_field_default_init_token(token) {
                                 default_init = Some(init);
@@ -1161,7 +1166,7 @@ fn parse_type(
                         }
                     }
                 }
-                let declared_array = !dims.is_empty();
+                declared_array |= !dims.is_empty();
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
