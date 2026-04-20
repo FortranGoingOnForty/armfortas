@@ -7777,6 +7777,41 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
 }
 
 #[test]
+fn allocatable_char_component_store_accepts_component_subscript_expr() {
+    let src = write_program(
+        "module hist_mod\n  implicit none\n  integer, parameter :: max_line_len = 1024\n  integer, parameter :: max_history = 100\n  type :: history_t\n    character(len=max_line_len), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(max_history))\n      history%lines = ''\n      history%count = 0\n      history%current = 0\n      history%initialized = .true.\n    end if\n  end subroutine\n\n  subroutine fill()\n    character(len=max_line_len) :: line\n    call init_history()\n    line = 'abc'\n    history%count = 0\n    history%current = 0\n    history%count = history%count + 1\n    history%lines(history%count) = line\n    print *, history%count\n    print *, trim(history%lines(1))\n  end subroutine\nend module\nprogram p\n  use hist_mod\n  call fill()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_char_component_subscript_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char component subscript compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable char component subscript should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable char component subscript should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1") && stdout.contains("abc"),
+        "unexpected allocatable char component subscript output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_local_with_allocatable_component_and_trailing_scalar_runs() {
     let src = write_program(
         "program p\n  implicit none\n  type :: t\n    integer, allocatable :: a(:)\n    integer :: n\n  end type\n  type(t) :: x\n  allocate(x%a(1))\n  x%n = 7\n  x%a(1) = 17\n  if (.not. allocated(x%a)) stop 1\n  if (size(x%a) /= 1) stop 2\n  if (x%n /= 7) stop 3\n  if (x%a(1) /= 17) stop 4\n  print *, 'ok'\nend program p\n",

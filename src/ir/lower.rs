@@ -16567,7 +16567,7 @@ fn lower_char_array_store(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) {
     let Some((dest_ptr, dest_len)) =
-        char_array_element_ptr_and_len(b, locals, info, args, st, None)
+        char_array_element_ptr_and_len(b, locals, info, args, st, type_layouts)
     else {
         return;
     };
