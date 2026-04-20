@@ -19438,6 +19438,13 @@ fn lower_array_expr_descriptor(
             None
         }
         Expr::ArrayConstructor { values, .. } => {
+            if values
+                .iter()
+                .any(|v| matches!(v, crate::ast::expr::AcValue::ImpliedDo(_)))
+            {
+                return None;
+            }
+
             if values.len() == 1 {
                 if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
                     if expr_is_character_expr(b, locals, first, st, type_layouts) {
@@ -19476,7 +19483,56 @@ fn lower_array_expr_descriptor(
                     }
                 }
             }
-            None
+
+            let expr_values: Vec<&crate::ast::expr::SpannedExpr> = values
+                .iter()
+                .filter_map(|v| match v {
+                    crate::ast::expr::AcValue::Expr(expr) => Some(expr),
+                    crate::ast::expr::AcValue::ImpliedDo(_) => None,
+                })
+                .collect();
+            let first = expr_values.first()?;
+            if expr_is_character_expr(b, locals, first, st, type_layouts) {
+                return None;
+            }
+
+            let first_ft = crate::sema::types::expr_type(first, st);
+            let elem_ty = fortran_type_to_ir_scalar_type(&first_ft)
+                .unwrap_or_else(|| infer_const_expr_ty(&first.node));
+            let n = expr_values.len() as i64;
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1) as u64);
+            let buf = b.alloca(arr_ty);
+            let zero = b.const_i64(0);
+            let base = b.gep(buf, vec![zero], elem_ty.clone());
+            store_ac_values_into(b, locals, base, &elem_ty, values, st);
+
+            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero32 = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![desc, zero32, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            store_byte_aggregate_field(
+                b,
+                desc,
+                0,
+                IrType::Ptr(Box::new(elem_ty.clone())),
+                base,
+            );
+            let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+            store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
+            let rank = b.const_i32(1);
+            store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+            let flags = b.const_i32(2);
+            store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+            let one = b.const_i64(1);
+            let upper = b.const_i64(n);
+            store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
+            store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
+            store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+            Some((desc, elem_ty))
         }
         _ => None,
     }
@@ -24284,6 +24340,34 @@ fn infer_const_expr_ty(e: &Expr) -> IrType {
         Expr::UnaryOp { operand, .. } => infer_const_expr_ty(&operand.node),
         Expr::ParenExpr { inner } => infer_const_expr_ty(&inner.node),
         _ => IrType::Int(IntWidth::I32),
+    }
+}
+
+fn fortran_type_to_ir_scalar_type(ft: &crate::sema::types::FortranType) -> Option<IrType> {
+    use crate::sema::types::FortranType;
+    match ft {
+        FortranType::Integer { kind } => match kind {
+            1 => Some(IrType::Int(IntWidth::I8)),
+            2 => Some(IrType::Int(IntWidth::I16)),
+            4 => Some(IrType::Int(IntWidth::I32)),
+            8 => Some(IrType::Int(IntWidth::I64)),
+            16 => Some(IrType::Int(IntWidth::I128)),
+            _ => None,
+        },
+        FortranType::Real { kind } => match kind {
+            4 => Some(IrType::Float(FloatWidth::F32)),
+            8 => Some(IrType::Float(FloatWidth::F64)),
+            _ => None,
+        },
+        FortranType::Logical { kind } => match kind {
+            1 => Some(IrType::Int(IntWidth::I8)),
+            2 => Some(IrType::Int(IntWidth::I16)),
+            4 => Some(IrType::Bool),
+            8 => Some(IrType::Int(IntWidth::I64)),
+            _ => None,
+        },
+        FortranType::Derived { .. } => Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+        _ => None,
     }
 }
 
