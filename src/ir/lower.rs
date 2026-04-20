@@ -6550,6 +6550,20 @@ fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(Valu
     }
 }
 
+fn load_string_descriptor_substring_view(b: &mut FuncBuilder, desc: ValueId) -> (ValueId, ValueId) {
+    let ptr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let eight = b.const_i64(8);
+    let len_ptr = b.gep(desc, vec![eight], IrType::Int(IntWidth::I8));
+    let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
+    let sixteen = b.const_i64(16);
+    let cap_ptr = b.gep(desc, vec![sixteen], IrType::Int(IntWidth::I8));
+    let cap = b.load_typed(cap_ptr, IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    let len_is_zero = b.icmp(CmpOp::Eq, len, zero);
+    let bound_len = b.select(len_is_zero, cap, len);
+    (ptr, bound_len)
+}
+
 fn char_addr_and_runtime_len(
     b: &mut FuncBuilder,
     arg_spanned: &crate::ast::expr::SpannedExpr,
@@ -6560,6 +6574,32 @@ fn char_addr_and_runtime_len(
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             local_char_ptr_and_len(b, info)
+        }
+        Expr::StringLiteral { value, .. } => {
+            let ptr = b.const_string(value.as_bytes());
+            let len = b.const_i64(value.len() as i64);
+            Some((ptr, len))
+        }
+        _ => None,
+    }
+}
+
+fn char_addr_and_substring_bound_len(
+    b: &mut FuncBuilder,
+    arg_spanned: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<(ValueId, ValueId)> {
+    use crate::ast::expr::Expr;
+    match &arg_spanned.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            match info.char_kind {
+                CharKind::Deferred => {
+                    let desc = string_descriptor_addr(b, info);
+                    Some(load_string_descriptor_substring_view(b, desc))
+                }
+                _ => local_char_ptr_and_len(b, info),
+            }
         }
         Expr::StringLiteral { value, .. } => {
             let ptr = b.const_string(value.as_bytes());
@@ -11025,16 +11065,22 @@ fn lower_string_expr_full(
             {
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
-                        let (base_ptr, base_len) = lower_string_expr_full(
-                            b,
-                            locals,
-                            callee,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        );
+                        let (base_ptr, base_len) = if let Some((ptr, len)) =
+                            char_addr_and_substring_bound_len(b, callee, locals)
+                        {
+                            (ptr, len)
+                        } else {
+                            lower_string_expr_full(
+                                b,
+                                locals,
+                                callee,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        };
                         return lower_substring_full(
                             b,
                             locals,
@@ -11050,16 +11096,22 @@ fn lower_string_expr_full(
                         );
                     }
                     crate::ast::expr::SectionSubscript::Element(idx_expr) => {
-                        let (base_ptr, base_len) = lower_string_expr_full(
-                            b,
-                            locals,
-                            callee,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        );
+                        let (base_ptr, base_len) = if let Some((ptr, len)) =
+                            char_addr_and_substring_bound_len(b, callee, locals)
+                        {
+                            (ptr, len)
+                        } else {
+                            lower_string_expr_full(
+                                b,
+                                locals,
+                                callee,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        };
                         return lower_substring_full(
                             b,
                             locals,
@@ -12165,7 +12217,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } = args[0].value
                                 {
                                     if let Some((base_ptr, base_len)) =
-                                        char_addr_and_runtime_len(b, callee, &ctx.locals)
+                                        char_addr_and_substring_bound_len(b, callee, &ctx.locals)
                                     {
                                         let (dest_ptr, dest_len) = lower_substring_full(
                                             b,
@@ -12322,7 +12374,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     {
                                         let (base_ptr, base_len) =
                                             if is_deferred_char_component_field(&field) {
-                                                load_string_descriptor_view(b, field_ptr)
+                                                load_string_descriptor_substring_view(b, field_ptr)
                                             } else if let crate::sema::symtab::TypeInfo::Character {
                                                 len: Some(flen),
                                                 ..
@@ -12702,13 +12754,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         );
-                                        coerce_value_call_arg(
-                                            b,
-                                            ctx.st,
-                                            abi_primary_key,
-                                            i,
-                                            raw,
-                                        )
+                                        coerce_value_call_arg(b, ctx.st, abi_primary_key, i, raw)
                                     } else if wants_descriptor {
                                         lower_arg_descriptor(
                                             b,
@@ -21690,11 +21736,7 @@ fn lower_stmt_error(span: crate::lexer::Span, message: &str) -> ! {
     std::process::exit(1);
 }
 
-fn allocate_status_target_addr(
-    b: &mut FuncBuilder,
-    ctx: &LowerCtx,
-    opts: &[IoControl],
-) -> ValueId {
+fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoControl]) -> ValueId {
     let Some(stat_expr) = allocate_keyword_expr(opts, "stat") else {
         return b.alloca(IrType::Int(IntWidth::I32));
     };
@@ -21719,13 +21761,9 @@ fn allocate_status_target_addr(
             }
         }
         Expr::ComponentAccess { .. } => {
-            let Some((field_ptr, field)) = resolve_component_field_access(
-                b,
-                &ctx.locals,
-                stat_expr,
-                ctx.st,
-                ctx.type_layouts,
-            ) else {
+            let Some((field_ptr, field)) =
+                resolve_component_field_access(b, &ctx.locals, stat_expr, ctx.st, ctx.type_layouts)
+            else {
                 lower_stmt_error(
                     stat_expr.span,
                     "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
@@ -21767,10 +21805,8 @@ fn resolve_errmsg_target_expr(
                     desc: string_descriptor_addr(b, info),
                 })
             } else {
-                local_char_ptr_and_len(b, info).map(|(ptr, len)| RuntimeErrmsgTarget::Fixed {
-                    ptr,
-                    len,
-                })
+                local_char_ptr_and_len(b, info)
+                    .map(|(ptr, len)| RuntimeErrmsgTarget::Fixed { ptr, len })
             }
         }
         Expr::ComponentAccess { .. } => {

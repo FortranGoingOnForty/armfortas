@@ -1028,6 +1028,44 @@ fn allocatable_component_substring_result_keeps_dynamic_upper_bound() {
 }
 
 #[test]
+fn deferred_local_zero_len_buffer_substring_preserves_written_bytes() {
+    let src = write_program(
+        "module m\ncontains\n  function build(prompt) result(expanded)\n    character(len=*), intent(in) :: prompt\n    character(len=:), allocatable :: expanded\n    character(len=:), allocatable :: result\n    integer :: i, j\n    allocate(character(len=len(prompt) * 2 + 8) :: result)\n    result = ''\n    i = 1\n    j = 1\n    do while (i <= len(prompt))\n      result(j:j) = prompt(i:i)\n      i = i + 1\n      j = j + 1\n    end do\n    expanded = result(1:j-1)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = build('+ ')\n  if (len(s) /= 2) error stop 1\n  if (s /= '+ ') error stop 2\n  print *, s\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_local_zero_len_substring", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred local zero-len substring compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred local zero-len substring compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred local zero-len substring run failed");
+    assert!(
+        run.status.success(),
+        "deferred local zero-len substring run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("+"),
+        "unexpected deferred local zero-len substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_character_component_descriptor_starts_zeroed() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  if (.not. allocated(shell%vars(1)%value)) call c_exit(1_c_int)\n  deallocate(shell%vars(1)%value)\n  call c_exit(0_c_int)\nend program\n",
