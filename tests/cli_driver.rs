@@ -7042,6 +7042,97 @@ fn char_parameter_round_trips_through_amod_import() {
 }
 
 #[test]
+fn reexported_c_null_char_round_trips_through_amod_import() {
+    let dir = unique_dir("reexported_c_null_char_amod");
+    let wrapper_src = write_program_in(
+        &dir,
+        "wrapper.f90",
+        "module wrapper\n  use iso_c_binding\n  implicit none\ncontains\n  subroutine touch(buf)\n    character(kind=c_char), intent(out) :: buf\n    buf = c_null_char\n  end subroutine\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use wrapper, only: c_null_char\n  implicit none\n  character(len=:), allocatable :: path\n  path = 'abc' // c_null_char\n  if (len(path) /= 4) error stop 1\n  if (iachar(path(4:4)) /= 0) error stop 2\n  print '(a,i0,a,i0)', 'LEN=', len(path), ' LAST=', iachar(path(4:4))\nend program\n",
+    );
+    let wrapper_obj = dir.join("wrapper.o");
+    let user_obj = dir.join("user.o");
+    let out = dir.join("user_bin");
+
+    let compile_wrapper = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            wrapper_src.to_str().unwrap(),
+            "-o",
+            wrapper_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reexported c_null_char wrapper compile spawn failed");
+    assert!(
+        compile_wrapper.status.success(),
+        "reexported c_null_char wrapper compile failed: {}",
+        String::from_utf8_lossy(&compile_wrapper.stderr)
+    );
+
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reexported c_null_char user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "reexported c_null_char user compile failed: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            wrapper_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reexported c_null_char link spawn failed");
+    assert!(
+        link.status.success(),
+        "reexported c_null_char link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "reexported c_null_char runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("LEN=")
+            && stdout.contains('4')
+            && stdout.contains("LAST=")
+            && stdout.contains('0'),
+        "unexpected reexported c_null_char runtime output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_funptr, c_intptr_t\ncontains\n  subroutine s(buf, mask, ok)\n    character(len=:), allocatable, intent(inout) :: buf\n    logical, intent(in) :: mask\n    logical, intent(out) :: ok\n    type(c_funptr) :: sig_ign\n    if (allocated(buf)) then\n      ok = lgt(trim(buf), 'a')\n    else\n      ok = .false.\n    end if\n    ok = ok .or. any(buf(1:1) == ['!', '?'])\n    buf = merge(buf // new_line('a'), '?', mask)\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine s\nend module m\n",

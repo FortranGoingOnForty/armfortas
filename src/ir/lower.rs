@@ -11044,6 +11044,21 @@ fn lower_string_expr_full(
                     }
                 }
             } else {
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if sym.attrs.parameter {
+                        if let Some(cv) = sym.const_value {
+                            if matches!(
+                                sym.type_info,
+                                Some(crate::sema::symtab::TypeInfo::Character { .. })
+                            ) {
+                                let byte = [cv as u8];
+                                let ptr = b.const_string(&byte);
+                                let len = b.const_i64(1);
+                                return (ptr, len);
+                            }
+                        }
+                    }
+                }
                 let val = lower_expr_full(
                     b,
                     locals,
@@ -19528,13 +19543,7 @@ fn lower_array_expr_descriptor(
                 vec![desc, zero32, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            store_byte_aggregate_field(
-                b,
-                desc,
-                0,
-                IrType::Ptr(Box::new(elem_ty.clone())),
-                base,
-            );
+            store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(elem_ty.clone())), base);
             let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
             store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
             let rank = b.const_i32(1);

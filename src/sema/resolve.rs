@@ -704,7 +704,10 @@ fn load_external_module(
     // the dep's symbols. Without this, `USE amod_middle` where
     // middle does `use amod_base` never sees amod_base's symbols.
     for dep in &iface.dependencies {
-        if let Some(dep_scope) = load_external_module(st, dep, search_paths, type_layouts) {
+        let dep_scope = st
+            .find_module_scope(dep)
+            .or_else(|| load_external_module(st, dep, search_paths, type_layouts));
+        if let Some(dep_scope) = dep_scope {
             st.enter_scope(scope_id);
             // Re-export every public symbol of the dep by name, like
             // a bare `use <dep>` in source. The transitive lookup in
