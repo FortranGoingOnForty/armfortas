@@ -4,7 +4,7 @@
 //! dataflow. Used by the linear scan register allocator.
 
 use super::mir::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 /// A live interval: the range of instruction positions where a vreg is live.
 #[derive(Debug, Clone)]
@@ -26,166 +26,253 @@ pub struct LivenessResult {
     pub num_positions: u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct LiveSet {
+    words: Vec<u64>,
+}
+
+impl LiveSet {
+    fn new(num_vregs: usize) -> Self {
+        let num_words = num_vregs.div_ceil(64);
+        Self {
+            words: vec![0; num_words],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
+    fn copy_from(&mut self, other: &Self) {
+        self.words.copy_from_slice(&other.words);
+    }
+
+    fn insert(&mut self, vreg: VRegId) {
+        let idx = vreg.0 as usize;
+        let word = idx / 64;
+        let bit = idx % 64;
+        if let Some(slot) = self.words.get_mut(word) {
+            *slot |= 1u64 << bit;
+        }
+    }
+
+    fn remove(&mut self, vreg: &VRegId) {
+        let idx = vreg.0 as usize;
+        let word = idx / 64;
+        let bit = idx % 64;
+        if let Some(slot) = self.words.get_mut(word) {
+            *slot &= !(1u64 << bit);
+        }
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (dst, src) in self.words.iter_mut().zip(&other.words) {
+            *dst |= *src;
+        }
+    }
+
+    fn iter(&self) -> LiveSetIter<'_> {
+        LiveSetIter {
+            words: &self.words,
+            word_idx: 0,
+            active_word: self.words.first().copied().unwrap_or(0),
+        }
+    }
+}
+
+struct LiveSetIter<'a> {
+    words: &'a [u64],
+    word_idx: usize,
+    active_word: u64,
+}
+
+impl Iterator for LiveSetIter<'_> {
+    type Item = VRegId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.active_word != 0 {
+                let bit = self.active_word.trailing_zeros() as usize;
+                self.active_word &= self.active_word - 1;
+                let idx = self.word_idx * 64 + bit;
+                return Some(VRegId(idx as u32));
+            }
+
+            self.word_idx += 1;
+            if self.word_idx >= self.words.len() {
+                return None;
+            }
+            self.active_word = self.words[self.word_idx];
+        }
+    }
+}
+
+fn machine_vreg_capacity(mf: &MachineFunction) -> usize {
+    let mut max_idx = 0usize;
+    for vreg in &mf.vregs {
+        max_idx = max_idx.max(vreg.id.0 as usize + 1);
+    }
+    for block in &mf.blocks {
+        for inst in &block.insts {
+            if let Some(def) = inst.def {
+                max_idx = max_idx.max(def.0 as usize + 1);
+            }
+            for op in &inst.operands {
+                if let MachineOperand::VReg(vreg) = op {
+                    max_idx = max_idx.max(vreg.0 as usize + 1);
+                }
+            }
+        }
+    }
+    max_idx
+}
+
 /// Compute live intervals for all vregs in a machine function.
 pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
+    let num_vregs = machine_vreg_capacity(mf);
+    let block_indices: HashMap<MBlockId, usize> = mf
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, block)| (block.id, idx))
+        .collect();
+
     // Phase 1: assign a linear position to each instruction.
     // Positions increase by 2 (leave gaps for inserted moves).
-    let mut inst_positions: Vec<(MBlockId, usize, u32)> = Vec::new(); // (block, inst_idx, position)
-    let mut block_start: HashMap<MBlockId, u32> = HashMap::new();
-    let mut block_end: HashMap<MBlockId, u32> = HashMap::new();
+    let mut inst_positions: Vec<Vec<u32>> = Vec::with_capacity(mf.blocks.len());
+    let mut block_start: Vec<u32> = Vec::with_capacity(mf.blocks.len());
+    let mut block_end: Vec<u32> = Vec::with_capacity(mf.blocks.len());
     let mut pos: u32 = 0;
 
     for block in &mf.blocks {
-        block_start.insert(block.id, pos);
-        for (i, _inst) in block.insts.iter().enumerate() {
-            inst_positions.push((block.id, i, pos));
+        block_start.push(pos);
+        let mut block_positions = Vec::with_capacity(block.insts.len());
+        for _inst in &block.insts {
+            block_positions.push(pos);
             pos += 2;
         }
-        block_end.insert(block.id, pos);
+        inst_positions.push(block_positions);
+        block_end.push(pos);
     }
     let num_positions = pos;
 
-    // Phase 2: compute uses and defs per block.
-    // Also build a map from (block, inst_idx) → position.
-    let mut position_map: HashMap<(MBlockId, usize), u32> = HashMap::new();
-    for &(bid, idx, p) in &inst_positions {
-        position_map.insert((bid, idx), p);
-    }
-
     // Phase 3: backward dataflow to compute live-in and live-out per block.
-    let mut live_in: HashMap<MBlockId, BTreeSet<VRegId>> = HashMap::new();
-    let mut live_out: HashMap<MBlockId, BTreeSet<VRegId>> = HashMap::new();
-    for block in &mf.blocks {
-        live_in.insert(block.id, BTreeSet::new());
-        live_out.insert(block.id, BTreeSet::new());
-    }
+    let mut live_in: Vec<LiveSet> = (0..mf.blocks.len())
+        .map(|_| LiveSet::new(num_vregs))
+        .collect();
+    let mut live_out: Vec<LiveSet> = (0..mf.blocks.len())
+        .map(|_| LiveSet::new(num_vregs))
+        .collect();
 
     // Build successor map from branch targets.
     // Our codegen emits conditional branches as: CmpImm, BCond, B (unconditional fallback).
     // So a block can have both BCond and B targets.
-    let mut successors: HashMap<MBlockId, Vec<MBlockId>> = HashMap::new();
-    for block in &mf.blocks {
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); mf.blocks.len()];
+    for (block_idx, block) in mf.blocks.iter().enumerate() {
         let mut succs = Vec::new();
         // Scan ALL instructions in the block for branch targets (not just the last).
         for inst in &block.insts {
             match inst.opcode {
                 ArmOpcode::B => {
                     if let Some(MachineOperand::BlockRef(target)) = inst.operands.first() {
-                        if !succs.contains(target) {
-                            succs.push(*target);
+                        if let Some(&succ_idx) = block_indices.get(target) {
+                            if !succs.contains(&succ_idx) {
+                                succs.push(succ_idx);
+                            }
                         }
                     }
                 }
                 ArmOpcode::BCond => {
                     if let Some(MachineOperand::BlockRef(target)) = inst.operands.get(1) {
-                        if !succs.contains(target) {
-                            succs.push(*target);
+                        if let Some(&succ_idx) = block_indices.get(target) {
+                            if !succs.contains(&succ_idx) {
+                                succs.push(succ_idx);
+                            }
                         }
                     }
                 }
                 _ => {}
             }
         }
-        successors.insert(block.id, succs);
+        successors[block_idx] = succs;
     }
 
     // Iterate until fixed point.
     let mut changed = true;
+    let mut scratch_out = LiveSet::new(num_vregs);
+    let mut scratch_in = LiveSet::new(num_vregs);
     while changed {
         changed = false;
-        for block in mf.blocks.iter().rev() {
+        for block_idx in (0..mf.blocks.len()).rev() {
+            let block = &mf.blocks[block_idx];
             // live_out = union of live_in of all successors.
-            let mut new_out = BTreeSet::new();
-            if let Some(succs) = successors.get(&block.id) {
-                for succ in succs {
-                    if let Some(succ_in) = live_in.get(succ) {
-                        new_out.extend(succ_in);
-                    }
-                }
+            scratch_out.clear();
+            for &succ_idx in &successors[block_idx] {
+                scratch_out.union_with(&live_in[succ_idx]);
             }
 
             // live_in = (live_out - defs) ∪ uses
-            let mut new_in = new_out.clone();
+            scratch_in.copy_from(&scratch_out);
             // Walk instructions backward.
             for inst in block.insts.iter().rev() {
                 // Remove defs.
                 if let Some(def) = &inst.def {
-                    new_in.remove(def);
+                    scratch_in.remove(def);
                 }
                 // Add uses.
                 for op in &inst.operands {
                     if let MachineOperand::VReg(vid) = op {
-                        new_in.insert(*vid);
+                        scratch_in.insert(*vid);
                     }
                 }
             }
 
-            if live_in.get(&block.id) != Some(&new_in) {
-                live_in.insert(block.id, new_in);
+            if live_in[block_idx] != scratch_in {
+                live_in[block_idx].copy_from(&scratch_in);
                 changed = true;
             }
-            if live_out.get(&block.id) != Some(&new_out) {
-                live_out.insert(block.id, new_out);
+            if live_out[block_idx] != scratch_out {
+                live_out[block_idx].copy_from(&scratch_out);
                 changed = true;
             }
         }
     }
 
     // Phase 4: build live intervals from def/use positions.
-    let mut starts: HashMap<VRegId, u32> = HashMap::new();
-    let mut ends: HashMap<VRegId, u32> = HashMap::new();
+    let mut starts: Vec<Option<u32>> = vec![None; num_vregs];
+    let mut ends: Vec<Option<u32>> = vec![None; num_vregs];
 
-    for block in &mf.blocks {
-        let b_start = block_start[&block.id];
-        let b_end = block_end[&block.id];
+    for (block_idx, block) in mf.blocks.iter().enumerate() {
+        let b_start = block_start[block_idx];
+        let b_end = block_end[block_idx];
 
         // Vregs live-in to this block: extend their interval to block start.
-        if let Some(lin) = live_in.get(&block.id) {
-            for &vreg in lin {
-                ends.entry(vreg)
-                    .and_modify(|e| *e = (*e).max(b_end))
-                    .or_insert(b_end);
-                starts
-                    .entry(vreg)
-                    .and_modify(|s| *s = (*s).min(b_start))
-                    .or_insert(b_start);
-            }
+        for vreg in live_in[block_idx].iter() {
+            let idx = vreg.0 as usize;
+            ends[idx] = Some(ends[idx].map_or(b_end, |end| end.max(b_end)));
+            starts[idx] = Some(starts[idx].map_or(b_start, |start| start.min(b_start)));
         }
 
         // Vregs live-out of this block: extend their interval to block end.
-        if let Some(lout) = live_out.get(&block.id) {
-            for &vreg in lout {
-                ends.entry(vreg)
-                    .and_modify(|e| *e = (*e).max(b_end))
-                    .or_insert(b_end);
-                starts
-                    .entry(vreg)
-                    .and_modify(|s| *s = (*s).min(b_start))
-                    .or_insert(b_start);
-            }
+        for vreg in live_out[block_idx].iter() {
+            let idx = vreg.0 as usize;
+            ends[idx] = Some(ends[idx].map_or(b_end, |end| end.max(b_end)));
+            starts[idx] = Some(starts[idx].map_or(b_start, |start| start.min(b_start)));
         }
 
         // Walk instructions for precise def/use positions.
         for (i, inst) in block.insts.iter().enumerate() {
-            let p = position_map[&(block.id, i)];
+            let p = inst_positions[block_idx][i];
             if let Some(def) = &inst.def {
-                starts
-                    .entry(*def)
-                    .and_modify(|s| *s = (*s).min(p))
-                    .or_insert(p);
-                ends.entry(*def)
-                    .and_modify(|e| *e = (*e).max(p))
-                    .or_insert(p);
+                let idx = def.0 as usize;
+                starts[idx] = Some(starts[idx].map_or(p, |start| start.min(p)));
+                ends[idx] = Some(ends[idx].map_or(p, |end| end.max(p)));
             }
             for op in &inst.operands {
                 if let MachineOperand::VReg(vid) = op {
-                    ends.entry(*vid)
-                        .and_modify(|e| *e = (*e).max(p))
-                        .or_insert(p);
-                    starts
-                        .entry(*vid)
-                        .and_modify(|s| *s = (*s).min(p))
-                        .or_insert(p);
+                    let idx = vid.0 as usize;
+                    ends[idx] = Some(ends[idx].map_or(p, |end| end.max(p)));
+                    starts[idx] = Some(starts[idx].map_or(p, |start| start.min(p)));
                 }
             }
         }
@@ -193,26 +280,29 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
 
     // Collect positions of all call instructions.
     let mut call_positions: Vec<u32> = Vec::new();
-    for block in &mf.blocks {
+    for (block_idx, block) in mf.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             if inst.opcode == ArmOpcode::Bl {
-                if let Some(&p) = position_map.get(&(block.id, i)) {
-                    call_positions.push(p);
-                }
+                call_positions.push(inst_positions[block_idx][i]);
             }
         }
     }
     call_positions.sort();
 
     // Build intervals.
-    let vreg_classes: HashMap<VRegId, RegClass> =
-        mf.vregs.iter().map(|v| (v.id, v.class)).collect();
+    let mut vreg_classes = vec![RegClass::Gp64; num_vregs];
+    for vreg in &mf.vregs {
+        vreg_classes[vreg.id.0 as usize] = vreg.class;
+    }
 
     let mut intervals: Vec<LiveInterval> = starts
         .iter()
-        .filter_map(|(&vreg, &start)| {
-            let end = ends.get(&vreg).copied()?;
-            let class = vreg_classes.get(&vreg).copied().unwrap_or(RegClass::Gp64);
+        .enumerate()
+        .filter_map(|(idx, start)| {
+            let start = (*start)?;
+            let end = ends[idx]?;
+            let vreg = VRegId(idx as u32);
+            let class = vreg_classes[idx];
             // Check if any call falls within [start, end].
             let crosses_call = call_positions.iter().any(|&cp| cp > start && cp < end);
             Some(LiveInterval {
