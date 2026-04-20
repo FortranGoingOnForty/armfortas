@@ -300,7 +300,7 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
 #[test]
 fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
     let src = write_program(
-        "program p\n  implicit none\n  character(:), pointer :: line\n  integer :: ios\n  allocate(character(len=32) :: line)\n  line = 'seed'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS1=', ios, ' LINE1=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS2=', ios, ' LINE2=<', trim(line), '>'\nend program\n",
+        "program p\n  implicit none\n  character(:), pointer :: line\n  integer :: ios\n  allocate(character(len=32) :: line)\n  line = 'seed'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS1=', ios, ' LINE1=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS2=', ios, ' LINE2=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0)') 'IOS3=', ios\nend program\n",
         "f90",
     );
     let out = unique_path("formatted_char_pointer_blank_record", "bin");
@@ -337,6 +337,11 @@ fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
     assert!(
         stdout.contains("IOS2=0 LINE2=<hello>"),
         "expected second record to stay readable after blank line, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("IOS3=-1"),
+        "expected EOF after the second record, got: {}",
         stdout
     );
 

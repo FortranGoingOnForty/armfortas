@@ -2469,9 +2469,10 @@ fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<String, 
 
     if data_index <= 0 || u.formatted_read_record.is_none() {
         match u.read_line() {
-            Ok(line) => {
+            Ok(line) if !line.is_empty() => {
                 u.formatted_read_record = Some(line);
             }
+            Ok(_) => return Err(IOSTAT_END),
             Err(_) => return Err(1),
         }
     }
