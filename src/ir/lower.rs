@@ -13290,32 +13290,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             items,
             opts,
         } => {
-            // Resolve STAT= option: find the user's stat variable address.
-            // The runtime writes 0 on success or a nonzero error code to this slot.
-            // If absent, use a private scratch slot (allocation failure aborts).
-            let stat_addr: ValueId = {
-                let stat_expr = opts.iter().find(|o| {
-                    o.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("stat"))
-                        .unwrap_or(false)
-                });
-                if let Some(stat_io) = stat_expr {
-                    if let Expr::Name { name } = &stat_io.value.node {
-                        if let Some(stat_info) = ctx.locals.get(&name.to_lowercase()) {
-                            // Pass the user's variable address directly: runtime writes
-                            // 0 (success) or error code into it, so the variable is set.
-                            stat_info.addr
-                        } else {
-                            b.alloca(IrType::Int(IntWidth::I32))
-                        }
-                    } else {
-                        b.alloca(IrType::Int(IntWidth::I32))
-                    }
-                } else {
-                    b.alloca(IrType::Int(IntWidth::I32))
-                }
-            };
+            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             let typed_char_len =
                 typed_allocate_char_len(b, &ctx.locals, type_spec.as_ref(), ctx.st);
 
@@ -13416,6 +13392,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 FuncRef::External("afs_allocate_array".into()),
                                 vec![field_ptr, es, rank_val, dim_buf, stat_addr],
                                 IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
                             );
                             if rank == 0 {
                                 if let Some(type_name) = field_derived_type_name(&field) {
@@ -13565,6 +13547,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 vec![desc, es, rank_val, dim_buf, stat_addr],
                                 IrType::Void,
                             );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             if rank == 0 {
                                 if let Some(type_name) = &info.derived_type {
                                     if let Some(layout) = ctx.type_layouts.get(type_name) {
@@ -13620,7 +13608,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
-        Stmt::Deallocate { items, .. } => {
+        Stmt::Deallocate { items, opts } => {
+            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
                     if let Some((field_ptr, field)) = resolve_component_field_access(
@@ -13639,11 +13629,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             continue;
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
-                            let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
-                                vec![field_ptr, stat_slot],
+                                vec![field_ptr, stat_addr],
                                 IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
                             );
                             continue;
                         }
@@ -13668,14 +13663,17 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 IrType::Void,
                             );
                         } else if info.allocatable || info.descriptor_arg {
-                            // Pass descriptor address to runtime with null STAT.
-                            // Alloca a dummy STAT to avoid abort on already-deallocated.
-                            let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                             let desc = array_descriptor_addr(b, info);
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
-                                vec![desc, stat_slot],
+                                vec![desc, stat_addr],
                                 IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
                             );
                         } else if info.is_pointer {
                             let slot = if info.by_ref {
@@ -21676,6 +21674,174 @@ fn allocate_keyword_expr<'a>(opts: &'a [IoControl], keyword: &str) -> Option<&'a
                 .unwrap_or(false)
         })
         .map(|opt| &opt.value)
+}
+
+enum RuntimeErrmsgTarget {
+    Fixed { ptr: ValueId, len: ValueId },
+    Deferred { desc: ValueId },
+}
+
+fn lower_stmt_error(span: crate::lexer::Span, message: &str) -> ! {
+    eprintln!(
+        "armfortas: error: {}:{}: {}",
+        span.start.line, span.start.col, message
+    );
+    let _ = std::io::stderr().flush();
+    std::process::exit(1);
+}
+
+fn allocate_status_target_addr(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    opts: &[IoControl],
+) -> ValueId {
+    let Some(stat_expr) = allocate_keyword_expr(opts, "stat") else {
+        return b.alloca(IrType::Int(IntWidth::I32));
+    };
+    match &stat_expr.node {
+        Expr::Name { name } => {
+            let Some(info) = ctx.locals.get(&name.to_lowercase()) else {
+                lower_stmt_error(
+                    stat_expr.span,
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                );
+            };
+            if !info.dims.is_empty() || info.ty != IrType::Int(IntWidth::I32) {
+                lower_stmt_error(
+                    stat_expr.span,
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                );
+            }
+            if info.by_ref {
+                b.load(info.addr)
+            } else {
+                info.addr
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let Some((field_ptr, field)) = resolve_component_field_access(
+                b,
+                &ctx.locals,
+                stat_expr,
+                ctx.st,
+                ctx.type_layouts,
+            ) else {
+                lower_stmt_error(
+                    stat_expr.span,
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                );
+            };
+            match &field.type_info {
+                crate::sema::symtab::TypeInfo::Integer { kind }
+                    if *kind == Some(4) && field.dims.is_empty() =>
+                {
+                    field_ptr
+                }
+                _ => lower_stmt_error(
+                    stat_expr.span,
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                ),
+            }
+        }
+        _ => lower_stmt_error(
+            stat_expr.span,
+            "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+        ),
+    }
+}
+
+fn resolve_errmsg_target_expr(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &SpannedExpr,
+) -> Option<RuntimeErrmsgTarget> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => resolve_errmsg_target_expr(b, ctx, inner),
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            if !info.dims.is_empty() || descriptor_backed_runtime_char_array(info) {
+                return None;
+            }
+            if matches!(info.char_kind, CharKind::Deferred) {
+                Some(RuntimeErrmsgTarget::Deferred {
+                    desc: string_descriptor_addr(b, info),
+                })
+            } else {
+                local_char_ptr_and_len(b, info).map(|(ptr, len)| RuntimeErrmsgTarget::Fixed {
+                    ptr,
+                    len,
+                })
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let (field_ptr, field) =
+                resolve_component_field_access(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)?;
+            match field_char_kind(&field) {
+                CharKind::Deferred if field.size == 32 => {
+                    Some(RuntimeErrmsgTarget::Deferred { desc: field_ptr })
+                }
+                CharKind::Fixed(n) => Some(RuntimeErrmsgTarget::Fixed {
+                    ptr: field_ptr,
+                    len: b.const_i64(n),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn allocate_errmsg_target(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    opts: &[IoControl],
+) -> Option<RuntimeErrmsgTarget> {
+    let expr = allocate_keyword_expr(opts, "errmsg")?;
+    resolve_errmsg_target_expr(b, ctx, expr).or_else(|| {
+        lower_stmt_error(
+            expr.span,
+            "ALLOCATE/DEALLOCATE ERRMSG= must name a scalar CHARACTER variable",
+        )
+    })
+}
+
+fn emit_runtime_errmsg_on_failure(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    errmsg_target: Option<&RuntimeErrmsgTarget>,
+    message: &str,
+) {
+    let Some(target) = errmsg_target else {
+        return;
+    };
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let has_error = b.icmp(CmpOp::Ne, stat, zero);
+    let set_bb = b.create_block("alloc_errmsg_set");
+    let done_bb = b.create_block("alloc_errmsg_done");
+    b.cond_branch(has_error, set_bb, vec![], done_bb, vec![]);
+
+    b.set_block(set_bb);
+    let msg_ptr = b.const_string(message.as_bytes());
+    let msg_len = b.const_i64(message.len() as i64);
+    match target {
+        RuntimeErrmsgTarget::Fixed { ptr, len } => {
+            b.call(
+                FuncRef::External("afs_assign_char_fixed".into()),
+                vec![*ptr, *len, msg_ptr, msg_len],
+                IrType::Void,
+            );
+        }
+        RuntimeErrmsgTarget::Deferred { desc } => {
+            b.call(
+                FuncRef::External("afs_assign_char_deferred".into()),
+                vec![*desc, msg_ptr, msg_len],
+                IrType::Void,
+            );
+        }
+    }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
 }
 
 fn allocate_char_source_value(
