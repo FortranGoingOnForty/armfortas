@@ -6234,6 +6234,107 @@ fn c_funptr_component_assignment_round_trips_through_c_associated() {
 }
 
 #[test]
+fn imported_module_c_funptr_global_passes_value_not_storage_address() {
+    let dir = unique_dir("amod_imported_c_funptr_global");
+    let c_src = write_program_in(
+        &dir,
+        "handler_matches.c",
+        "#include <stdint.h>\n\nint handler_matches(int sig, void *handler, intptr_t expected) {\n    (void)sig;\n    return (intptr_t)handler == expected;\n}\n",
+    );
+    let c_obj = dir.join("handler_matches.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let mod_src = write_program_in(
+        &dir,
+        "sysint.f90",
+        "module sysint\n  use iso_c_binding\n  implicit none\n  type(c_funptr) :: sig_dfl, sig_ign\ncontains\n  subroutine init_consts()\n    sig_dfl = c_null_funptr\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_int, c_funptr, c_intptr_t\n  use sysint, only: init_consts, sig_dfl, sig_ign\n  implicit none\n  interface\n    function handler_matches(sig, handler, expected) bind(C, name='handler_matches') result(rc)\n      import :: c_int, c_funptr, c_intptr_t\n      integer(c_int), value :: sig\n      type(c_funptr), value :: handler\n      integer(c_intptr_t), value :: expected\n      integer(c_int) :: rc\n    end function\n  end interface\n  integer(c_int) :: rc\n\n  call init_consts()\n  rc = handler_matches(2_c_int, sig_dfl, 0_c_intptr_t)\n  if (rc /= 1_c_int) error stop 1\n  rc = handler_matches(3_c_int, sig_ign, 1_c_intptr_t)\n  if (rc /= 1_c_int) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("sysint.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("c_funptr module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "c_funptr module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("c_funptr user compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "c_funptr user should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("amod_imported_c_funptr_global.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("c_funptr user link failed to spawn");
+    assert!(
+        link.status.success(),
+        "c_funptr user objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("c_funptr user run failed");
+    assert!(
+        run.status.success(),
+        "imported module c_funptr globals should pass raw function-pointer values: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "imported module c_funptr globals should preserve the stored scalar values across .amod import: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn c_ptr_array_element_assignment_round_trips_through_c_associated() {
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(len=16), target, allocatable :: args(:)\n  type(c_ptr), allocatable, target :: argv(:)\n  allocate(args(2))\n  allocate(argv(3))\n  args(1) = 'echo' // c_null_char\n  args(2) = 'done' // c_null_char\n  argv(1) = c_loc(args(1))\n  argv(2) = c_loc(args(2))\n  argv(3) = c_null_ptr\n  if (.not. c_associated(argv(1), c_loc(args(1)))) error stop 1\n  if (.not. c_associated(argv(2), c_loc(args(2)))) error stop 2\n  if (c_associated(argv(3))) error stop 3\n  print *, 'ok'\nend program\n",

@@ -1301,7 +1301,11 @@ pub fn extract_module_globals(
         } // PARAMETERs with folded values inline; others still need storage
         if let Some(ref ir_sym) = var.ir_symbol {
             let derived_type = match var.type_info.as_ref() {
-                Some(TypeInfo::Derived(name)) => Some(name.clone()),
+                Some(TypeInfo::Derived(name))
+                    if !matches!(name.to_lowercase().as_str(), "c_ptr" | "c_funptr") =>
+                {
+                    Some(name.clone())
+                }
                 _ => None,
             };
             let ir_ty = if var.proc_pointer {
