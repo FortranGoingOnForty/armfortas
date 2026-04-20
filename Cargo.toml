@@ -2,6 +2,11 @@
 members = [".", "afs-as", "afs-ld", "runtime", "bencch/bench-core", "bencch/bench"]
 resolver = "2"
 
+[profile.dev]
+# Keep the default debug-friendly profile, but avoid the pathological
+# opt-level=0 slowdown when using armfortas itself as the compiler.
+opt-level = 1
+
 [package]
 name = "armfortas"
 version = "0.1.0"
