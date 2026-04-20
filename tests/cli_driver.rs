@@ -6480,6 +6480,48 @@ fn local_char_parameter_array_elements_preserve_runtime_bytes() {
 }
 
 #[test]
+fn fixed_char_array_constructor_assignment_preserves_runtime_bytes() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=20) :: builtins(3)\n  builtins = [ 'cd                  ', 'echo                ', 'printf              ' ]\n  print '(a)', trim(builtins(1))\n  print '(a)', trim(builtins(2))\n  print '(a)', trim(builtins(3))\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_array_ctor_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char array constructor assignment compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char array constructor assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&compile.stderr).contains("unhandled coercion"),
+        "char array constructor assignment should not hit generic coercion fallback: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "char array constructor assignment runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let lines: Vec<_> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["cd", "echo", "printf"],
+        "unexpected fixed char array constructor assignment output"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_char_array_element_actual_to_char_dummy_runs() {
     let src = write_program(
         "subroutine install_single_trap(signal_name, command)\n  implicit none\n  character(len=*), intent(in) :: signal_name, command\n  print *, trim(signal_name), trim(command)\nend subroutine\n\nsubroutine parse_signal_list(signals, signal_names, count)\n  implicit none\n  character(len=*), intent(in) :: signals\n  character(len=32), intent(out) :: signal_names(20)\n  integer, intent(out) :: count\n  count = 1\n  signal_names(1) = signals\nend subroutine\n\nsubroutine install_trap(signals, command)\n  implicit none\n  character(len=*), intent(in) :: signals, command\n  character(len=32) :: signal_names(20)\n  integer :: signal_count, i\n  call parse_signal_list(signals, signal_names, signal_count)\n  do i = 1, signal_count\n    call install_single_trap(signal_names(i), command)\n  end do\nend subroutine\n\nprogram p\n  implicit none\n  call install_trap('INT', 'echo')\nend program\n",

@@ -19965,7 +19965,11 @@ fn lower_array_assign(
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
         let dest_base = array_base_addr(b, dest_info);
-        store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        if let CharKind::Fixed(len) = dest_info.char_kind {
+            store_char_ac_values_into(b, &ctx.locals, dest_base, len, values, ctx.st);
+        } else {
+            store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+        }
         return;
     }
 
