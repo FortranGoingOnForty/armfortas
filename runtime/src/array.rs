@@ -1051,6 +1051,43 @@ pub extern "C" fn afs_allocate_1d(desc: *mut ArrayDescriptor, elem_size: i64, n:
     );
 }
 
+/// Allocate `dest` with the same shape and element size as `source`.
+///
+/// The resulting destination is always contiguous, even when `source`
+/// is a section descriptor with non-unit strides.
+#[no_mangle]
+pub extern "C" fn afs_allocate_like(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    stat: *mut i32,
+) {
+    if dest.is_null() || source.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+        }
+        return;
+    }
+
+    let source = unsafe { &*source };
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: source.dims[i].lower_bound,
+            upper_bound: source.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+
+    let dims_ptr = if source.rank > 0 {
+        dims.as_ptr()
+    } else {
+        ptr::null()
+    };
+    afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
+}
+
 // ---- DEALLOCATE ----
 
 /// Deallocate an array, freeing its memory and clearing the descriptor.
@@ -1355,6 +1392,40 @@ mod tests {
         afs_allocate_array(&mut desc, 4, 1, &dim, &mut stat);
         assert_eq!(stat, 2); // already allocated
         afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn allocate_like_preserves_shape_and_forces_contiguous_stride() {
+        let mut source = ArrayDescriptor::zeroed();
+        source.elem_size = 8;
+        source.rank = 2;
+        source.flags = DESC_ALLOCATED;
+        source.dims[0] = DimDescriptor {
+            lower_bound: -2,
+            upper_bound: 1,
+            stride: 3,
+        };
+        source.dims[1] = DimDescriptor {
+            lower_bound: 4,
+            upper_bound: 6,
+            stride: 5,
+        };
+
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+        afs_allocate_like(&mut dest, &source, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(dest.is_allocated());
+        assert_eq!(dest.elem_size, 8);
+        assert_eq!(dest.rank, 2);
+        assert_eq!(dest.dims[0].lower_bound, -2);
+        assert_eq!(dest.dims[0].upper_bound, 1);
+        assert_eq!(dest.dims[0].stride, 1);
+        assert_eq!(dest.dims[1].lower_bound, 4);
+        assert_eq!(dest.dims[1].upper_bound, 6);
+        assert_eq!(dest.dims[1].stride, 1);
+
+        afs_deallocate_array(&mut dest, ptr::null_mut());
     }
 
     #[test]

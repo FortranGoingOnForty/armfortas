@@ -196,3 +196,141 @@ fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn allocate_source_array_infers_shape_and_copies_values() {
+    let dir = unique_dir("alloc_source_array");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:), b(:)\n  allocate(b(3))\n  b = [10, 20, 30]\n  allocate(a, source=b)\n  if (.not. allocated(a)) error stop 1\n  if (size(a) /= 3) error stop 2\n  if (a(1) /= b(1) .or. a(2) /= b(2) .or. a(3) /= b(3)) error stop 3\n  b(1) = 99\n  if (a(1) /= 10) error stop 4\n  print *, size(a)\n  print *, a(1), a(2), a(3)\nend program\n",
+    );
+    let exe = dir.join("alloc_source_array.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("source array runtime failed");
+    assert!(
+        run.status.success(),
+        "source array runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("3"), "expected inferred size in output: {}", stdout);
+    assert!(
+        stdout.contains("10") && stdout.contains("20") && stdout.contains("30"),
+        "expected copied values in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_mold_array_infers_shape_without_source_copy() {
+    let dir = unique_dir("alloc_mold_array");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:), b(:)\n  allocate(b(4))\n  b = [1, 2, 3, 4]\n  allocate(a, mold=b)\n  if (.not. allocated(a)) error stop 1\n  if (size(a) /= 4) error stop 2\n  print *, size(a)\nend program\n",
+    );
+    let exe = dir.join("alloc_mold_array.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("mold array runtime failed");
+    assert!(
+        run.status.success(),
+        "mold array runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("4"), "expected inferred mold size in output: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_source_scalar_initializes_allocatable_scalar() {
+    let dir = unique_dir("alloc_source_scalar");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: x\n  allocate(x, source=7)\n  print *, allocated(x)\n  print *, x\nend program\n",
+    );
+    let exe = dir.join("alloc_source_scalar.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("source scalar runtime failed");
+    assert!(
+        run.status.success(),
+        "source scalar runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("7"), "expected initialized scalar in output: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_component_source_array_infers_shape_and_copies_values() {
+    let dir = unique_dir("alloc_component_source_array");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: vals(:)\n  end type box_t\n  type(box_t) :: box\n  integer, allocatable :: src(:)\n  allocate(src(2))\n  src = [4, 5]\n  allocate(box%vals, source=src)\n  if (.not. allocated(box%vals)) error stop 1\n  if (size(box%vals) /= 2) error stop 2\n  if (box%vals(1) /= src(1) .or. box%vals(2) /= src(2)) error stop 3\n  src(1) = 99\n  if (box%vals(1) /= 4) error stop 4\n  print *, size(box%vals)\n  print *, box%vals(1), box%vals(2)\nend program\n",
+    );
+    let exe = dir.join("alloc_component_source_array.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("component source array runtime failed");
+    assert!(
+        run.status.success(),
+        "component source array runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("2"), "expected inferred component size in output: {}", stdout);
+    assert!(
+        stdout.contains("4") && stdout.contains("5"),
+        "expected copied component values in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

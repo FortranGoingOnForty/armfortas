@@ -11168,6 +11168,52 @@ fn lower_string_expr_full(
                             return (buf, trimmed_len);
                         }
                     }
+                    "repeat" => {
+                        let second_int_arg = args.get(1).and_then(|a| {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        });
+                        if let (Some(src_expr), Some(copies_expr)) =
+                            (first_char_arg, second_int_arg)
+                        {
+                            let (src_ptr, src_len) = lower_string_expr_full(
+                                b,
+                                locals,
+                                src_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let raw_copies = lower_expr(b, locals, copies_expr, st);
+                            let copies = widen_to_i64(b, raw_copies);
+                            let copies = clamp_nonnegative_i64(b, copies);
+                            let total_len = b.imul(src_len, copies);
+                            let one = b.const_i64(1);
+                            let alloc_len = b.iadd(total_len, one);
+                            let buf = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![alloc_len],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let zero = b.const_i32(0);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![buf, zero, alloc_len],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            b.call(
+                                FuncRef::External("afs_repeat".into()),
+                                vec![src_ptr, src_len, copies, buf],
+                                IrType::Void,
+                            );
+                            return (buf, total_len);
+                        }
+                    }
                     "adjustl" => {
                         if let Some(arg) = first_char_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
@@ -13340,6 +13386,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             let typed_char_len =
                 typed_allocate_char_len(b, &ctx.locals, type_spec.as_ref(), ctx.st);
+            let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
+            let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
+            let shape_desc = source_desc.or(mold_desc);
+            let source_expr = allocate_keyword_expr(opts, "source");
 
             for item in items {
                 let source_char = allocate_char_source_value(b, ctx, opts);
@@ -13433,18 +13483,67 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                                 dim_buf
                             };
-                            let rank_val = b.const_i32(rank as i32);
-                            b.call(
-                                FuncRef::External("afs_allocate_array".into()),
-                                vec![field_ptr, es, rank_val, dim_buf, stat_addr],
-                                IrType::Void,
-                            );
+                            if rank == 0 {
+                                if let Some(shape_desc) = shape_desc {
+                                    b.call(
+                                        FuncRef::External("afs_allocate_like".into()),
+                                        vec![field_ptr, shape_desc, stat_addr],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    let rank_val = b.const_i32(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                        IrType::Void,
+                                    );
+                                }
+                            } else {
+                                let rank_val = b.const_i32(rank as i32);
+                                b.call(
+                                    FuncRef::External("afs_allocate_array".into()),
+                                    vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                    IrType::Void,
+                                );
+                            }
                             emit_runtime_errmsg_on_failure(
                                 b,
                                 stat_addr,
                                 errmsg_target.as_ref(),
                                 "ALLOCATE failed",
                             );
+                            if let Some(source_desc) = source_desc {
+                                emit_allocatable_source_copy_on_success(
+                                    b,
+                                    stat_addr,
+                                    field_ptr,
+                                    source_desc,
+                                );
+                            } else if rank == 0 {
+                                if let Some(source_expr) = source_expr {
+                                    if !expr_is_character_expr(
+                                        b,
+                                        &ctx.locals,
+                                        source_expr,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                    ) {
+                                        let dest_base = b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(elem_ty.clone())),
+                                        );
+                                        emit_scalar_allocate_source_init_on_success(
+                                            b,
+                                            ctx,
+                                            stat_addr,
+                                            dest_base,
+                                            &elem_ty,
+                                            field_derived_type_name(&field).as_deref(),
+                                            source_expr,
+                                        );
+                                    }
+                                }
+                            }
                             if rank == 0 {
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
@@ -13587,18 +13686,67 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                                 dim_buf
                             };
-                            let rank_val = b.const_i32(rank as i32);
-                            b.call(
-                                FuncRef::External("afs_allocate_array".into()),
-                                vec![desc, es, rank_val, dim_buf, stat_addr],
-                                IrType::Void,
-                            );
+                            if rank == 0 {
+                                if let Some(shape_desc) = shape_desc {
+                                    b.call(
+                                        FuncRef::External("afs_allocate_like".into()),
+                                        vec![desc, shape_desc, stat_addr],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    let rank_val = b.const_i32(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![desc, es, rank_val, dim_buf, stat_addr],
+                                        IrType::Void,
+                                    );
+                                }
+                            } else {
+                                let rank_val = b.const_i32(rank as i32);
+                                b.call(
+                                    FuncRef::External("afs_allocate_array".into()),
+                                    vec![desc, es, rank_val, dim_buf, stat_addr],
+                                    IrType::Void,
+                                );
+                            }
                             emit_runtime_errmsg_on_failure(
                                 b,
                                 stat_addr,
                                 errmsg_target.as_ref(),
                                 "ALLOCATE failed",
                             );
+                            if let Some(source_desc) = source_desc {
+                                emit_allocatable_source_copy_on_success(
+                                    b,
+                                    stat_addr,
+                                    desc,
+                                    source_desc,
+                                );
+                            } else if rank == 0 {
+                                if let Some(source_expr) = source_expr {
+                                    if !expr_is_character_expr(
+                                        b,
+                                        &ctx.locals,
+                                        source_expr,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                    ) {
+                                        let dest_base = b.load_typed(
+                                            desc,
+                                            IrType::Ptr(Box::new(info.ty.clone())),
+                                        );
+                                        emit_scalar_allocate_source_init_on_success(
+                                            b,
+                                            ctx,
+                                            stat_addr,
+                                            dest_base,
+                                            &info.ty,
+                                            info.derived_type.as_deref(),
+                                            source_expr,
+                                        );
+                                    }
+                                }
+                            }
                             if rank == 0 {
                                 if let Some(type_name) = &info.derived_type {
                                     if let Some(layout) = ctx.type_layouts.get(type_name) {
@@ -17978,6 +18126,12 @@ fn load_array_desc_i64_field(b: &mut FuncBuilder, desc: ValueId, offset: i64) ->
     b.load_typed(ptr, IrType::Int(IntWidth::I64))
 }
 
+fn load_array_desc_i32_field(b: &mut FuncBuilder, desc: ValueId, offset: i64) -> ValueId {
+    let off = b.const_i64(offset);
+    let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
+    b.load_typed(ptr, IrType::Int(IntWidth::I32))
+}
+
 fn lower_alloc_section_read(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -21902,6 +22056,69 @@ fn allocate_char_mold_len(
         return None;
     }
     Some(lower_string_expr_ctx(b, ctx, expr).1)
+}
+
+fn allocate_descriptor_keyword_expr(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    opts: &[IoControl],
+    keyword: &str,
+) -> Option<ValueId> {
+    let expr = allocate_keyword_expr(opts, keyword)?;
+    lower_array_expr_descriptor(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
+        .map(|(desc, _)| desc)
+}
+
+fn emit_allocatable_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_source_copy");
+    let done_bb = b.create_block("alloc_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    b.call(
+        FuncRef::External("afs_assign_allocatable".into()),
+        vec![dest_desc, source_desc],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn emit_scalar_allocate_source_init_on_success(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    stat_addr: ValueId,
+    dest_base: ValueId,
+    dest_ty: &IrType,
+    derived_type: Option<&str>,
+    source_expr: &SpannedExpr,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let init_bb = b.create_block("alloc_source_init");
+    let done_bb = b.create_block("alloc_source_init_done");
+    b.cond_branch(ok, init_bb, vec![], done_bb, vec![]);
+
+    b.set_block(init_bb);
+    if let Some(type_name) = derived_type {
+        let src = lower_expr_ctx_tl(b, ctx, source_expr);
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
+    } else {
+        let raw = lower_expr_ctx_tl(b, ctx, source_expr);
+        let coerced = coerce_to_type(b, raw, dest_ty);
+        b.store(coerced, dest_base);
+    }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
 }
 
 /// Resolve a base expression for a type-bound procedure call.
