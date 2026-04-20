@@ -11,6 +11,7 @@ use crate::ast::stmt::*;
 use crate::ast::unit::*;
 use crate::lexer::Span;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// Fortran standard level for --std= conformance checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +89,8 @@ struct Ctx<'a> {
     /// sensitive targets on a component access (`obj%field`), where
     /// the base variable's attributes aren't the right thing to check.
     type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
+    /// Array names declared in each scope with allocatable/pointer storage.
+    allocatable_array_targets: HashSet<(ScopeId, String)>,
     lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
     warn_pedantic: bool,
     warn_deprecated: bool,
@@ -110,6 +113,7 @@ impl<'a> Ctx<'a> {
             labels_defined: Vec::new(),
             labels_referenced: Vec::new(),
             type_layouts: None,
+            allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
             warn_pedantic,
             warn_deprecated,
@@ -1125,6 +1129,16 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
             let is_scalar_decl = entities.iter().all(|entity| entity.array_spec.is_none());
+            let has_dimension_attr = attrs.iter().any(|a| matches!(a, Attribute::Dimension(_)));
+
+            if has_alloc || has_pointer {
+                for entity in entities {
+                    if entity.array_spec.is_some() || has_dimension_attr {
+                        ctx.allocatable_array_targets
+                            .insert((ctx.scope_id, entity.name.to_lowercase()));
+                    }
+                }
+            }
 
             // Deferred-length character must be allocatable or pointer.
             if let crate::ast::decl::TypeSpec::Character(Some(sel)) = type_spec {
@@ -1289,6 +1303,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
+                if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
+                    ctx.error(
+                        item.span,
+                        "array ALLOCATE requires bounds or SOURCE=/MOLD=",
+                    );
+                }
             }
         }
         Stmt::Deallocate { items, .. } => {
@@ -1726,6 +1746,19 @@ fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr
                 ),
             );
         }
+    }
+}
+
+fn allocate_item_needs_explicit_shape(ctx: &Ctx<'_>, item: &crate::ast::expr::SpannedExpr) -> bool {
+    match &item.node {
+        Expr::Name { name } => ctx
+            .allocatable_array_targets
+            .contains(&(ctx.scope_id, name.to_lowercase())),
+        Expr::ParenExpr { inner } => allocate_item_needs_explicit_shape(ctx, inner),
+        Expr::ComponentAccess { .. } => leaf_field_layout(ctx, item)
+            .map(|leaf| leaf.field.declared_array)
+            .unwrap_or(false),
+        _ => false,
     }
 }
 

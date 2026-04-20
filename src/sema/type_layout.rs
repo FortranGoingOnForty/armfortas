@@ -20,6 +20,7 @@ pub struct FieldLayout {
     pub offset: usize,
     pub size: usize,
     pub dims: Vec<(i64, i64)>,
+    pub declared_array: bool,
     pub type_info: TypeInfo,
     /// F2018 §7.5.4.5 / §7.5.4.6 attributes on the component, carried
     /// per-field because validation of `obj%comp` as an ALLOCATE
@@ -369,6 +370,9 @@ pub fn compute_layout(
             let is_target = attrs
                 .iter()
                 .any(|a| matches!(a, crate::ast::decl::Attribute::Target));
+            let has_dimension_attr = attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Dimension(_)));
 
             let ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
@@ -433,6 +437,7 @@ pub fn compute_layout(
                     offset,
                     size: field_size,
                     dims,
+                    declared_array: entity.array_spec.is_some() || has_dimension_attr,
                     type_info: ti.clone(),
                     allocatable: is_allocatable,
                     pointer: is_pointer,
@@ -510,6 +515,7 @@ mod tests {
                     offset: 0,
                     size: 4,
                     dims: vec![],
+                    declared_array: false,
                     type_info: TypeInfo::Real { kind: Some(4) },
                     allocatable: false,
                     pointer: false,
@@ -521,6 +527,7 @@ mod tests {
                     offset: 4,
                     size: 4,
                     dims: vec![],
+                    declared_array: false,
                     type_info: TypeInfo::Real { kind: Some(4) },
                     allocatable: false,
                     pointer: false,
@@ -556,6 +563,7 @@ mod tests {
                     offset: 0,
                     size: 1,
                     dims: vec![],
+                    declared_array: false,
                     type_info: TypeInfo::Integer { kind: Some(1) },
                     allocatable: false,
                     pointer: false,
@@ -567,6 +575,7 @@ mod tests {
                     offset: 8,
                     size: 8,
                     dims: vec![],
+                    declared_array: false,
                     type_info: TypeInfo::Real { kind: Some(8) },
                     allocatable: false,
                     pointer: false,
@@ -578,6 +587,7 @@ mod tests {
                     offset: 16,
                     size: 4,
                     dims: vec![],
+                    declared_array: false,
                     type_info: TypeInfo::Integer { kind: Some(4) },
                     allocatable: false,
                     pointer: false,

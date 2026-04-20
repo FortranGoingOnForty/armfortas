@@ -1161,12 +1161,14 @@ fn parse_type(
                         }
                     }
                 }
+                let declared_array = !dims.is_empty();
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
                     offset: offset_str.trim().parse().unwrap_or(0),
                     size: size_str.trim().parse().unwrap_or(0),
                     dims,
+                    declared_array,
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
                     allocatable,
                     pointer,
