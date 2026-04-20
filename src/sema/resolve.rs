@@ -8,7 +8,7 @@ use crate::ast::decl;
 use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
@@ -895,9 +895,19 @@ fn compute_all_layouts(
     layouts: &mut super::type_layout::TypeLayoutRegistry,
 ) {
     let inherited_params = HashMap::new();
+    let mut visible_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
+    let mut exported_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
     for unit in units {
         let scope_id = find_unit_scope(st, 0, &unit.node).unwrap_or(0);
-        collect_derived_type_layouts(&unit.node, scope_id, st, layouts, &inherited_params);
+        collect_derived_type_layouts(
+            &unit.node,
+            scope_id,
+            st,
+            layouts,
+            &inherited_params,
+            &mut visible_param_cache,
+            &mut exported_param_cache,
+        );
     }
 }
 
@@ -930,29 +940,127 @@ fn find_unit_scope(st: &SymbolTable, parent_scope: ScopeId, unit: &ProgramUnit) 
     })
 }
 
-fn visible_const_int_params(st: &SymbolTable, scope_id: ScopeId) -> HashMap<String, i64> {
-    let mut visible_names = BTreeSet::new();
-    for scope in st.all_scopes() {
-        for (name, sym) in &scope.symbols {
-            if sym.attrs.parameter {
-                visible_names.insert(name.clone());
+fn exported_const_int_params(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    visible_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+    exported_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+) -> HashMap<String, i64> {
+    if let Some(cached) = exported_cache.get(&scope_id) {
+        return cached.clone();
+    }
+
+    let scope = st.scope(scope_id);
+    let mut out = HashMap::new();
+
+    for (name, sym) in &scope.symbols {
+        if sym.attrs.parameter && sym.attrs.access != Access::Private {
+            if let Some(value) = sym.const_value {
+                out.entry(name.clone()).or_insert(value);
             }
-        }
-        for assoc in &scope.use_associations {
-            visible_names.insert(assoc.local_name.clone());
         }
     }
 
-    let mut out = HashMap::new();
-    for name in visible_names {
-        if let Some(sym) = st.lookup_in(scope_id, &name) {
-            if sym.attrs.parameter {
+    for assoc in &scope.use_associations {
+        if let Some(sym) = st
+            .scope(assoc.source_scope)
+            .symbols
+            .get(&assoc.original_name)
+        {
+            if sym.attrs.parameter
+                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+            {
                 if let Some(value) = sym.const_value {
-                    out.insert(name, value);
+                    out.entry(assoc.local_name.clone()).or_insert(value);
                 }
             }
         }
     }
+
+    let mut seen_use_scopes = HashSet::new();
+    for assoc in &scope.use_associations {
+        if assoc.local_name != assoc.original_name {
+            continue;
+        }
+        if !seen_use_scopes.insert(assoc.source_scope) {
+            continue;
+        }
+        for (name, value) in
+            exported_const_int_params(st, assoc.source_scope, visible_cache, exported_cache)
+        {
+            out.entry(name).or_insert(value);
+        }
+    }
+
+    exported_cache.insert(scope_id, out.clone());
+    out
+}
+
+fn visible_const_int_params(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    visible_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+    exported_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+) -> HashMap<String, i64> {
+    if let Some(cached) = visible_cache.get(&scope_id) {
+        return cached.clone();
+    }
+
+    let scope = st.scope(scope_id);
+    let mut out = HashMap::new();
+
+    for (name, sym) in &scope.symbols {
+        if sym.attrs.parameter {
+            if let Some(value) = sym.const_value {
+                out.entry(name.clone()).or_insert(value);
+            }
+        }
+    }
+
+    for assoc in &scope.use_associations {
+        if out.contains_key(&assoc.local_name) {
+            continue;
+        }
+        if let Some(sym) = st
+            .scope(assoc.source_scope)
+            .symbols
+            .get(&assoc.original_name)
+        {
+            if sym.attrs.parameter
+                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+            {
+                if let Some(value) = sym.const_value {
+                    out.insert(assoc.local_name.clone(), value);
+                }
+            }
+        }
+    }
+
+    let mut seen_use_scopes = HashSet::new();
+    for assoc in &scope.use_associations {
+        if assoc.local_name != assoc.original_name {
+            continue;
+        }
+        if !seen_use_scopes.insert(assoc.source_scope) {
+            continue;
+        }
+        for (name, value) in
+            exported_const_int_params(st, assoc.source_scope, visible_cache, exported_cache)
+        {
+            out.entry(name).or_insert(value);
+        }
+    }
+
+    if let Some(parent) = scope.parent {
+        if st.scope(parent).kind != ScopeKind::Global {
+            for (name, value) in visible_const_int_params(st, parent, visible_cache, exported_cache)
+            {
+                out.entry(name).or_insert(value);
+            }
+        }
+    }
+
+    visible_cache.insert(scope_id, out.clone());
     out
 }
 
@@ -962,6 +1070,8 @@ fn collect_derived_type_layouts(
     st: &SymbolTable,
     layouts: &mut super::type_layout::TypeLayoutRegistry,
     inherited_params: &HashMap<String, i64>,
+    visible_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+    exported_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
 ) {
     let (decls, contains) = match unit {
         ProgramUnit::Program {
@@ -979,7 +1089,12 @@ fn collect_derived_type_layouts(
         _ => return,
     };
     let mut seed_params = inherited_params.clone();
-    seed_params.extend(visible_const_int_params(st, scope_id));
+    seed_params.extend(visible_const_int_params(
+        st,
+        scope_id,
+        visible_param_cache,
+        exported_param_cache,
+    ));
     let const_params = collect_const_int_params(decls, &seed_params);
     for decl in decls {
         if let Decl::DerivedTypeDef {
@@ -1019,7 +1134,15 @@ fn collect_derived_type_layouts(
     }
     for sub in contains {
         let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
-        collect_derived_type_layouts(&sub.node, sub_scope_id, st, layouts, &const_params);
+        collect_derived_type_layouts(
+            &sub.node,
+            sub_scope_id,
+            st,
+            layouts,
+            &const_params,
+            visible_param_cache,
+            exported_param_cache,
+        );
     }
 }
 
