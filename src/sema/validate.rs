@@ -1268,12 +1268,24 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 
         // ---- Allocate / Deallocate ----
         Stmt::Allocate { items, opts, .. } => {
-            if opts.iter().any(|opt| {
+            let has_source = opts.iter().any(|opt| {
                 opt.keyword
                     .as_deref()
                     .is_some_and(|kw| kw.eq_ignore_ascii_case("source"))
-            }) {
+            });
+            let has_mold = opts.iter().any(|opt| {
+                opt.keyword
+                    .as_deref()
+                    .is_some_and(|kw| kw.eq_ignore_ascii_case("mold"))
+            });
+            if has_source {
                 ctx.require_std(stmt.span, FortranStandard::F2003, "ALLOCATE with SOURCE=");
+            }
+            if has_mold {
+                ctx.require_std(stmt.span, FortranStandard::F2003, "ALLOCATE with MOLD=");
+            }
+            if has_source && has_mold {
+                ctx.error(stmt.span, "ALLOCATE cannot specify both SOURCE= and MOLD=");
             }
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");

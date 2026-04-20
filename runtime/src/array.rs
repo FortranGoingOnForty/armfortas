@@ -1088,6 +1088,71 @@ pub extern "C" fn afs_allocate_like(
     afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
 }
 
+/// Copy array payload from `source` into an already-allocated `dest` without
+/// reshaping or reallocating `dest`.
+///
+/// Used by `ALLOCATE(..., SOURCE=...)` after the destination shape has already
+/// been fixed by explicit bounds. On mismatch, the fresh destination allocation
+/// is rolled back so the overall statement still fails loudly instead of
+/// silently changing shape.
+#[no_mangle]
+pub extern "C" fn afs_copy_array_data(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    stat: *mut i32,
+) {
+    if dest.is_null() || source.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE SOURCE=: null descriptor");
+        std::process::exit(1);
+    }
+
+    let dest = unsafe { &mut *dest };
+    let source = unsafe { &*source };
+
+    let ok = dest.is_allocated()
+        && source.is_allocated()
+        && dest.elem_size == source.elem_size
+        && dest.rank == source.rank
+        && (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent());
+
+    if !ok {
+        if dest.is_allocated() && !dest.base_addr.is_null() {
+            unsafe {
+                libc_free(dest.base_addr);
+            }
+        }
+        dest.base_addr = ptr::null_mut();
+        dest.flags &= !DESC_ALLOCATED;
+        if !stat.is_null() {
+            unsafe {
+                *stat = 4;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE SOURCE=: destination shape does not conform to source");
+        std::process::exit(1);
+    }
+
+    let bytes = source.total_bytes();
+    if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
+        unsafe {
+            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        }
+    }
+
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
+
 // ---- DEALLOCATE ----
 
 /// Deallocate an array, freeing its memory and clearing the descriptor.
@@ -1426,6 +1491,49 @@ mod tests {
         assert_eq!(dest.dims[1].stride, 1);
 
         afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn copy_array_data_preserves_explicit_destination_shape() {
+        let mut source = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+
+        afs_allocate_1d(&mut source, 4, 2);
+        afs_allocate_1d(&mut dest, 4, 2);
+        unsafe {
+            let src = source.base_addr as *mut i32;
+            *src.add(0) = 4;
+            *src.add(1) = 5;
+        }
+
+        afs_copy_array_data(&mut dest, &source, &mut stat);
+        assert_eq!(stat, 0);
+        assert_eq!(dest.total_elements(), 2);
+        unsafe {
+            let data = dest.base_addr as *const i32;
+            assert_eq!(*data.add(0), 4);
+            assert_eq!(*data.add(1), 5);
+        }
+
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn copy_array_data_rolls_back_on_shape_mismatch() {
+        let mut source = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+
+        afs_allocate_1d(&mut source, 4, 3);
+        afs_allocate_1d(&mut dest, 4, 2);
+        afs_copy_array_data(&mut dest, &source, &mut stat);
+        assert_eq!(stat, 4);
+        assert!(!dest.is_allocated());
+        assert!(dest.base_addr.is_null());
+
+        afs_deallocate_array(&mut source, ptr::null_mut());
     }
 
     #[test]

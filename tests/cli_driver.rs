@@ -6761,6 +6761,42 @@ fn char_concat_actual_to_assumed_len_dummy_runs() {
 }
 
 #[test]
+fn repeat_left_concat_assignment_preserves_leading_bytes() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: s\n  s = repeat(' ', 8) // 'hi'\n  print '(a)', '<' // s(1:10) // '>'\n  s = repeat('0', 3) // '42'\n  print '(a)', '<' // s(1:5) // '>'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("repeat_left_concat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "repeat-left concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "repeat-left concat runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("<        hi>") && stdout.contains("<00042>"),
+        "repeat-left concat should preserve leading spaces and zeros: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn if_else_assignment_to_dummy_argument_runs() {
     let src = write_program(
         "module m\ncontains\n  subroutine set_flag(flag)\n    integer, intent(out) :: flag\n    if (.true.) then\n      flag = 7\n    else\n      flag = -1\n    end if\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: flag\n  call set_flag(flag)\n  print *, flag\nend program\n",

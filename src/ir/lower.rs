@@ -13518,6 +13518,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     stat_addr,
                                     field_ptr,
                                     source_desc,
+                                    rank > 0,
+                                    errmsg_target.as_ref(),
                                 );
                             } else if rank == 0 {
                                 if let Some(source_expr) = source_expr {
@@ -13721,6 +13723,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     stat_addr,
                                     desc,
                                     source_desc,
+                                    rank > 0,
+                                    errmsg_target.as_ref(),
                                 );
                             } else if rank == 0 {
                                 if let Some(source_expr) = source_expr {
@@ -22074,6 +22078,8 @@ fn emit_allocatable_source_copy_on_success(
     stat_addr: ValueId,
     dest_desc: ValueId,
     source_desc: ValueId,
+    preserve_shape: bool,
+    errmsg_target: Option<&RuntimeErrmsgTarget>,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
@@ -22083,11 +22089,20 @@ fn emit_allocatable_source_copy_on_success(
     b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
 
     b.set_block(copy_bb);
-    b.call(
-        FuncRef::External("afs_assign_allocatable".into()),
-        vec![dest_desc, source_desc],
-        IrType::Void,
-    );
+    if preserve_shape {
+        b.call(
+            FuncRef::External("afs_copy_array_data".into()),
+            vec![dest_desc, source_desc, stat_addr],
+            IrType::Void,
+        );
+        emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
+    } else {
+        b.call(
+            FuncRef::External("afs_assign_allocatable".into()),
+            vec![dest_desc, source_desc],
+            IrType::Void,
+        );
+    }
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
 }

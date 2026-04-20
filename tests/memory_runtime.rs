@@ -334,3 +334,65 @@ fn allocate_component_source_array_infers_shape_and_copies_values() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn allocate_source_with_explicit_bounds_preserves_destination_shape() {
+    let dir = unique_dir("alloc_source_explicit_shape");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:), b(:)\n  allocate(b(2))\n  b = [4, 5]\n  allocate(a(2), source=b)\n  if (.not. allocated(a)) error stop 1\n  if (size(a) /= 2) error stop 2\n  if (a(1) /= 4 .or. a(2) /= 5) error stop 3\n  print *, size(a)\n  print *, a(1), a(2)\nend program\n",
+    );
+    let exe = dir.join("alloc_source_explicit_shape.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("explicit-shape source runtime failed");
+    assert!(
+        run.status.success(),
+        "explicit-shape source runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("2") && stdout.contains("4") && stdout.contains("5"),
+        "expected explicit-shape copied values in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_source_and_mold_are_rejected_together() {
+    let dir = unique_dir("alloc_source_mold_conflict");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:), b(:), c(:)\n  allocate(b(2), c(2))\n  allocate(a, source=b, mold=c)\nend program\n",
+    );
+    let exe = dir.join("alloc_source_mold_conflict.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        !compile.status.success(),
+        "compile unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("SOURCE=") && stderr.contains("MOLD="),
+        "unexpected compile failure for SOURCE=/MOLD= conflict: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
