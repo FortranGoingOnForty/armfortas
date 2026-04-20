@@ -2438,10 +2438,6 @@ fn parse_nth_formatted_record(
     fmt_len: i64,
     data_index: i64,
 ) -> Result<(FormatDesc, String), i32> {
-    if input.is_empty() {
-        return Err(-1);
-    }
-
     let fmt = unsafe_str(fmt_str, fmt_len);
     let descs = parse_format(&fmt);
     let mut cursor = 0usize;
@@ -2473,10 +2469,9 @@ fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<String, 
 
     if data_index <= 0 || u.formatted_read_record.is_none() {
         match u.read_line() {
-            Ok(line) if !line.is_empty() => {
+            Ok(line) => {
                 u.formatted_read_record = Some(line);
             }
-            Ok(_) => return Err(IOSTAT_END),
             Err(_) => return Err(1),
         }
     }

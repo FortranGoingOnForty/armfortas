@@ -12113,14 +12113,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 );
                             }
                             CharKind::Deferred => {
-                                // Deferred-length: call afs_assign_char_deferred.
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                 let desc = string_descriptor_addr(b, &info);
-                                b.call(
-                                    FuncRef::External("afs_assign_char_deferred".into()),
-                                    vec![desc, src_ptr, src_len],
-                                    IrType::Void,
-                                );
+                                if info.is_pointer {
+                                    let (dest_ptr, dest_len) =
+                                        load_string_descriptor_substring_view(b, desc);
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_fixed".into()),
+                                        vec![dest_ptr, dest_len, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                } else {
+                                    // Deferred-length allocatables keep reallocation semantics.
+                                    b.call(
+                                        FuncRef::External("afs_assign_char_deferred".into()),
+                                        vec![desc, src_ptr, src_len],
+                                        IrType::Void,
+                                    );
+                                }
                             }
                             CharKind::AssumedLen { len_addr } => {
                                 // Assumed-length dummy assignment: use
@@ -14570,9 +14580,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             }
 
-            // READ(unit, *) items — simplified: first control is unit.
+            // Extract unit (first control). * means stdin (unit 5).
             let unit = if let Some(ctrl) = controls.first() {
-                lower_expr_ctx(b, ctx, &ctrl.value)
+                if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") {
+                    b.const_i32(5)
+                } else {
+                    lower_expr_ctx(b, ctx, &ctrl.value)
+                }
             } else {
                 b.const_i32(5) // default stdin
             };
@@ -17725,7 +17739,7 @@ fn lower_formatted_char_read_item(
     }
 
     let (dest_ptr, dest_len) =
-        if let Some((ptr, len)) = char_addr_and_runtime_len(b, item, &ctx.locals) {
+        if let Some((ptr, len)) = char_addr_and_substring_bound_len(b, item, &ctx.locals) {
             (ptr, len)
         } else {
             lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))

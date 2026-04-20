@@ -298,6 +298,54 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
 }
 
 #[test]
+fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(:), pointer :: line\n  integer :: ios\n  allocate(character(len=32) :: line)\n  line = 'seed'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS1=', ios, ' LINE1=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS2=', ios, ' LINE2=<', trim(line), '>'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_char_pointer_blank_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted char pointer blank-record compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "formatted char pointer blank-record compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let input = unique_path("formatted_char_pointer_blank_record_input", "txt");
+    std::fs::write(&input, "\nhello\n")
+        .expect("cannot write formatted char pointer blank-record input");
+    let run = Command::new(&out)
+        .stdin(std::fs::File::open(&input).expect("cannot open formatted char pointer input"))
+        .output()
+        .expect("formatted char pointer blank-record run failed");
+    assert!(
+        run.status.success(),
+        "formatted char pointer blank-record run failed: {:?}\nstderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS1=0 LINE1=<>"),
+        "expected blank first record to succeed as empty string, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("IOS2=0 LINE2=<hello>"),
+        "expected second record to stay readable after blank line, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
     let dir = unique_dir("imported_param_char_len");
     let mod_src = write_program_in(
