@@ -8381,7 +8381,10 @@ fn reorder_args_by_keyword_slots(
         }
         match found {
             Some(v) if !v.is_empty() => v,
-            _ => return args.iter().cloned().map(Some).collect(), // no signature info → no reorder
+            _ => match intrinsic_subroutine_arg_order(callee_key) {
+                Some(names) => names.iter().map(|name| (*name).to_string()).collect(),
+                None => return args.iter().cloned().map(Some).collect(), // no signature info → no reorder
+            },
         }
     };
     // Build slot list the size of the callee's declared params.
@@ -8412,6 +8415,22 @@ fn reorder_args_by_keyword_slots(
         }
     }
     slots
+}
+
+fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'static [&'static str]> {
+    match callee_key {
+        "move_alloc" => Some(&["from", "to"]),
+        "system_clock" => Some(&["count", "count_rate", "count_max"]),
+        "cpu_time" => Some(&["time"]),
+        "date_and_time" => Some(&["date", "time", "zone", "values"]),
+        "get_command_argument" => Some(&["number", "value", "length", "status"]),
+        "get_command" => Some(&["command", "length", "status"]),
+        "get_environment_variable" => Some(&["name", "value", "length", "status"]),
+        "random_number" => Some(&["harvest"]),
+        "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
+        "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
+        _ => None,
+    }
 }
 
 fn reorder_args_by_keyword(
@@ -9278,11 +9297,11 @@ fn lower_intrinsic_subroutine(
     fn nth_arg_ref(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
-        args: &[crate::ast::expr::Argument],
+        args: &[Option<crate::ast::expr::Argument>],
         n: usize,
     ) -> ValueId {
-        if n < args.len() {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 return lower_arg_by_ref_ctx(b, ctx, e);
             }
         }
@@ -9293,12 +9312,12 @@ fn lower_intrinsic_subroutine(
     fn nth_arg_val(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
-        args: &[crate::ast::expr::Argument],
+        args: &[Option<crate::ast::expr::Argument>],
         n: usize,
         default: i32,
     ) -> ValueId {
-        if n < args.len() {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 return lower_expr_ctx(b, ctx, e);
             }
         }
@@ -9309,11 +9328,11 @@ fn lower_intrinsic_subroutine(
     fn nth_arg_str(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
-        args: &[crate::ast::expr::Argument],
+        args: &[Option<crate::ast::expr::Argument>],
         n: usize,
     ) -> (ValueId, ValueId) {
-        if n < args.len() {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts)) {
                     return lower_string_expr_with_layouts(
                         b,
@@ -9339,11 +9358,11 @@ fn lower_intrinsic_subroutine(
     fn nth_arg_i64_out(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
-        args: &[crate::ast::expr::Argument],
+        args: &[Option<crate::ast::expr::Argument>],
         n: usize,
     ) -> (ValueId, Option<RuntimeOutWriteback>) {
-        if n < args.len() {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &args[n].value {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
                 if let Some(IrType::Ptr(inner)) = b.func().value_type(dest_ptr) {
                     let dest_ty = (*inner).clone();
@@ -9365,6 +9384,9 @@ fn lower_intrinsic_subroutine(
         }
         (b.const_i64(0), None)
     }
+
+    let arg_slots = reorder_args_by_keyword_slots(args, name, ctx.st);
+    let args = arg_slots.as_slice();
 
     fn move_alloc_target(
         b: &mut FuncBuilder,
@@ -9406,6 +9428,7 @@ fn lower_intrinsic_subroutine(
     match name {
         "move_alloc" => {
             let from_expr = args.first().and_then(|arg| {
+                let arg = arg.as_ref()?;
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                     Some(e)
                 } else {
@@ -9413,6 +9436,7 @@ fn lower_intrinsic_subroutine(
                 }
             });
             let to_expr = args.get(1).and_then(|arg| {
+                let arg = arg.as_ref()?;
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                     Some(e)
                 } else {
@@ -9589,6 +9613,7 @@ fn lower_intrinsic_subroutine(
             };
 
             let target_expr = args.get(1).and_then(|arg| {
+                let arg = arg.as_ref()?;
                 if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
                     Some(expr)
                 } else {
@@ -9757,9 +9782,9 @@ fn c_f_pointer_target(
 }
 
 fn c_f_pointer_shape_values(
-    args: &[crate::ast::expr::Argument],
+    args: &[Option<crate::ast::expr::Argument>],
 ) -> Option<&[crate::ast::expr::AcValue]> {
-    let arg = args.get(2)?;
+    let arg = args.get(2)?.as_ref()?;
     let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
         return None;
     };

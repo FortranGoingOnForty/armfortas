@@ -9066,6 +9066,82 @@ fn get_environment_variable_literal_name_populates_value_and_status() {
 }
 
 #[test]
+fn get_environment_variable_status_keyword_preserves_length_hole() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: test_mode\n  integer :: stat_out\n  test_mode = ''\n  stat_out = -1\n  call get_environment_variable('FORTSH_TEST_MODE', test_mode, status=stat_out)\n  if (stat_out /= 0) error stop 1\n  if (trim(test_mode) /= '1') error stop 2\n  print *, trim(test_mode)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("get_environment_variable_status_keyword_gap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("status-keyword get_environment_variable compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "status-keyword get_environment_variable should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .env("FORTSH_TEST_MODE", "1")
+        .output()
+        .expect("run failed");
+    assert!(
+        run.status.success(),
+        "status-keyword get_environment_variable should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('1'),
+        "unexpected status-keyword get_environment_variable output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn get_environment_variable_status_only_keyword_uses_correct_slot() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: stat_out\n  stat_out = -1\n  call get_environment_variable('FORTSH_TEST_MODE', status=stat_out)\n  if (stat_out /= 0) error stop 1\n  print *, stat_out\nend program\n",
+        "f90",
+    );
+    let out = unique_path("get_environment_variable_status_only_keyword", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("status-only get_environment_variable compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "status-only get_environment_variable should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .env("FORTSH_TEST_MODE", "1")
+        .output()
+        .expect("run failed");
+    assert!(
+        run.status.success(),
+        "status-only get_environment_variable should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('0'),
+        "unexpected status-only get_environment_variable output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_allocatable_slice_assignment_compiles() {
     let src = write_program(
         "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  integer :: n\n  n = 4\n  allocate(a(n), b(n))\n  a = .false.\n  b = .true.\n  a(1:n) = b(1:n)\n  b(2:n-1) = .false.\nend program\n",
