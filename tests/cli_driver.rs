@@ -1695,6 +1695,106 @@ fn bind_c_c_char_value_arg_passes_actual_byte_after_value_handle() {
 }
 
 #[test]
+fn bind_c_c_char_function_result_round_trips_through_wrapper_module() {
+    let dir = unique_dir("bind_c_c_char_result");
+    let c_src = write_program_in(
+        &dir,
+        "check.c",
+        "#include <stddef.h>\n\nvoid *get_static_buf(void) {\n    static char buf[] = \"echo hi\";\n    return buf;\n}\n\nchar buffer_get_char(void *buf, size_t pos) {\n    return ((char *)buf)[pos];\n}\n",
+    );
+    let c_obj = dir.join("check.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let mod_src = write_program_in(
+        &dir,
+        "c_strings.f90",
+        "module c_strings\n  use iso_c_binding, only: c_ptr, c_null_ptr, c_size_t, c_char, c_associated\n  implicit none\n  type :: c_string_buffer\n    type(c_ptr) :: handle = c_null_ptr\n  end type\n  interface\n    function get_static_buf_c() result(buf) bind(C, name='get_static_buf')\n      import :: c_ptr\n      type(c_ptr) :: buf\n    end function\n    function buffer_get_char_c(buf, pos) result(ch) bind(C, name='buffer_get_char')\n      import :: c_ptr, c_size_t, c_char\n      type(c_ptr), value :: buf\n      integer(c_size_t), value :: pos\n      character(kind=c_char) :: ch\n    end function\n  end interface\ncontains\n  function c_string_create() result(buf)\n    type(c_string_buffer) :: buf\n    buf%handle = get_static_buf_c()\n  end function\n\n  function c_string_get_char(buf, pos) result(ch)\n    type(c_string_buffer), intent(in) :: buf\n    integer, intent(in) :: pos\n    character(len=1) :: ch\n    if (.not. c_associated(buf%handle)) then\n      ch = ' '\n      return\n    end if\n    ch = buffer_get_char_c(buf%handle, int(pos - 1, c_size_t))\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use c_strings\n  implicit none\n  type(c_string_buffer) :: buf\n  character(len=1) :: ch\n  buf = c_string_create()\n  ch = c_string_get_char(buf, 1)\n  if (ch /= 'e') error stop 1\n  ch = c_string_get_char(buf, 5)\n  if (ch /= ' ') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("c_strings.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char result module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "bind(c) c_char result wrapper module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char result user compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "bind(c) c_char result user should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_result.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) c_char result link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) c_char result objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) c_char result run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) c_char result should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "bind(c) c_char function result should round-trip through the wrapper module: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(

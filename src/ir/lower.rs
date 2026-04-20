@@ -609,6 +609,7 @@ fn function_hidden_result_abi(
     result: &Option<String>,
     return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
+    bind: Option<&crate::ast::unit::BindInfo>,
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
     let result_key = result
@@ -638,7 +639,11 @@ fn function_hidden_result_abi(
             }
             let has_dims = entity.array_spec.as_ref().or(attr_dims).is_some();
             if matches!(type_spec, TypeSpec::Character(_)) && !has_dims {
-                return HiddenResultAbi::StringDescriptor;
+                return if bind.is_some() {
+                    HiddenResultAbi::None
+                } else {
+                    HiddenResultAbi::StringDescriptor
+                };
             }
             if attrs.iter().any(|a| matches!(a, Attribute::Allocatable)) {
                 return HiddenResultAbi::ArrayDescriptor;
@@ -647,7 +652,11 @@ fn function_hidden_result_abi(
         }
     }
     if matches!(return_type, Some(TypeSpec::Character(_))) {
-        return HiddenResultAbi::StringDescriptor;
+        return if bind.is_some() {
+            HiddenResultAbi::None
+        } else {
+            HiddenResultAbi::StringDescriptor
+        };
     }
     HiddenResultAbi::None
 }
@@ -673,9 +682,10 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
             contains,
             result,
             return_type,
+            bind,
             ..
         } => {
-            if function_hidden_result_abi(name, result, return_type.as_ref(), decls)
+            if function_hidden_result_abi(name, result, return_type.as_ref(), decls, bind.as_ref())
                 == HiddenResultAbi::ArrayDescriptor
             {
                 out.insert(name.to_lowercase());
@@ -2806,8 +2816,13 @@ fn lower_unit(
             // descriptor, while scalar character results use a 32-byte
             // string descriptor. In both cases the caller provides the
             // descriptor storage as param 0 and the callee returns void.
-            let hidden_result_abi =
-                function_hidden_result_abi(name, result, return_type.as_ref(), decls);
+            let hidden_result_abi = function_hidden_result_abi(
+                name,
+                result,
+                return_type.as_ref(),
+                decls,
+                bind.as_ref(),
+            );
             let uses_hidden_result = hidden_result_abi != HiddenResultAbi::None;
 
             let (func_params, ir_ret_ty) = if uses_hidden_result {
@@ -2867,13 +2882,19 @@ fn lower_unit(
                 params.extend(real);
                 (params, IrType::Void)
             } else {
-                let ret_ty = return_type
-                    .as_ref()
-                    .map(|ts| lower_type_spec_st(ts, Some(st)))
-                    .unwrap_or_else(|| {
-                        let result_name = result.as_deref().unwrap_or(name.as_str());
-                        arg_type_from_decls(result_name, decls, Some(st))
-                    });
+                let ret_ty = if bind.is_some()
+                    && matches!(return_type.as_ref(), Some(TypeSpec::Character(_)))
+                {
+                    IrType::Int(IntWidth::I8)
+                } else {
+                    return_type
+                        .as_ref()
+                        .map(|ts| lower_type_spec_st(ts, Some(st)))
+                        .unwrap_or_else(|| {
+                            let result_name = result.as_deref().unwrap_or(name.as_str());
+                            arg_type_from_decls(result_name, decls, Some(st))
+                        })
+                };
                 let params: Vec<Param> = args
                     .iter()
                     .enumerate()
@@ -10774,6 +10795,7 @@ fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharacterReturnAbi {
     HiddenDescriptor,
+    BindCScalarByte,
 }
 
 fn callee_character_return_abi(st: &SymbolTable, callee_name: &str) -> Option<CharacterReturnAbi> {
@@ -10791,7 +10813,11 @@ fn callee_character_return_abi(st: &SymbolTable, callee_name: &str) -> Option<Ch
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
-    Some(CharacterReturnAbi::HiddenDescriptor)
+    if sym.attrs.binding_label.is_some() {
+        Some(CharacterReturnAbi::BindCScalarByte)
+    } else {
+        Some(CharacterReturnAbi::HiddenDescriptor)
+    }
 }
 
 fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<HiddenResultAbi> {
@@ -10807,7 +10833,13 @@ fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<Hidde
         _ => return None,
     }
     match sym.type_info.as_ref()? {
-        TypeInfo::Character { .. } => Some(HiddenResultAbi::StringDescriptor),
+        TypeInfo::Character { .. } => {
+            if sym.attrs.binding_label.is_some() {
+                None
+            } else {
+                Some(HiddenResultAbi::StringDescriptor)
+            }
+        }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
         _ => None,
     }
@@ -11528,6 +11560,25 @@ fn lower_string_expr_full(
                                 IrType::Void,
                             );
                             return load_string_descriptor_view(b, desc);
+                        }
+                        CharacterReturnAbi::BindCScalarByte => {
+                            let byte = emit_named_function_call(
+                                b,
+                                locals,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                name,
+                                args,
+                                None,
+                                true,
+                                IrType::Int(IntWidth::I8),
+                            );
+                            let slot = b.alloca(IrType::Int(IntWidth::I8));
+                            b.store(byte, slot);
+                            return (slot, b.const_i64(1));
                         }
                     }
                 }
