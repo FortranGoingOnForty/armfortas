@@ -554,9 +554,22 @@ fn find_promotable_allocas(func: &Function) -> Vec<Promotable> {
                     if candidates.contains_key(val) {
                         candidates.remove(val);
                     }
-                    // `addr` being an alloca is the promotable
-                    // case. Nothing to do.
-                    let _ = addr;
+                    if let Some(slot_ty) = candidates.get(addr).cloned() {
+                        // Mem2Reg's block params need one exact SSA
+                        // type. The verifier intentionally permits a
+                        // few low-level store mismatches (notably
+                        // pointer-subtype stores into ptr<i8> slots),
+                        // but promoting those allocas would thread
+                        // mismatched branch args into a single phi
+                        // param type. Keep the optimization honest by
+                        // refusing such slots.
+                        match func.value_type(*val) {
+                            Some(val_ty) if val_ty == slot_ty => {}
+                            _ => {
+                                candidates.remove(addr);
+                            }
+                        }
+                    }
                 }
                 _ => {
                     // Any other instruction: every operand that is
@@ -731,6 +744,56 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn skips_promotion_when_store_type_differs_from_slot_pointee() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let entry = f.entry;
+
+        let slot = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+            IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))),
+        );
+        let buf = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1)),
+            IrType::Ptr(Box::new(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I8)),
+                1,
+            ))),
+        );
+        push_inst(&mut f, entry, InstKind::Store(buf, slot), IrType::Void);
+        push_inst(
+            &mut f,
+            entry,
+            InstKind::Load(slot),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(
+            verify_module(&m).is_empty(),
+            "test setup invalid before mem2reg"
+        );
+        assert!(
+            !Mem2Reg.run(&mut m),
+            "mem2reg should refuse slots whose stored value type differs from the slot pointee"
+        );
+
+        let block = &m.functions[0].blocks[0];
+        assert!(
+            block
+                .insts
+                .iter()
+                .any(|i| matches!(i.kind, InstKind::Alloca(_))),
+            "the mismatched pointer slot should remain stack-backed"
+        );
     }
 
     // =============================================================
