@@ -6797,6 +6797,42 @@ fn repeat_left_concat_assignment_preserves_leading_bytes() {
 }
 
 #[test]
+fn internal_read_err_label_success_path_preserves_substring_store() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: pos, format_len, output_pos, octal_val, i\n  character(len=8) :: format_str\n  character(len=8) :: output\n  character :: escape_char\n  character(len=3) :: octal_str\n\n  format_str = '\\101'\n  output = ''\n  pos = 1\n  output_pos = 1\n  format_len = len_trim(format_str)\n\n  pos = pos + 1\n  escape_char = format_str(pos:pos)\n  select case (escape_char)\n  case ('0', '1', '2', '3', '4', '5', '6', '7')\n    octal_str = escape_char\n    do i = 2, 3\n      if (pos + i - 1 <= format_len) then\n        escape_char = format_str(pos + i - 1:pos + i - 1)\n        if (escape_char >= '0' .and. escape_char <= '7') then\n          octal_str(i:i) = escape_char\n        else\n          exit\n        end if\n      else\n        exit\n      end if\n    end do\n    read(octal_str, '(O3)', err=50) octal_val\n    output(output_pos:output_pos) = char(mod(octal_val, 256))\n    pos = pos + len_trim(octal_str) - 1\n    goto 60\n50  output(output_pos:output_pos) = format_str(pos:pos)\n60  continue\n  end select\n\n  if (output(1:1) /= 'A') error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("internal_read_err_label_success", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "internal READ ERR= success-path compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "internal READ ERR= success-path runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "internal READ ERR= success-path should preserve the success result: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn if_else_assignment_to_dummy_argument_runs() {
     let src = write_program(
         "module m\ncontains\n  subroutine set_flag(flag)\n    integer, intent(out) :: flag\n    if (.true.) then\n      flag = 7\n    else\n      flag = -1\n    end if\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: flag\n  call set_flag(flag)\n  print *, flag\nend program\n",

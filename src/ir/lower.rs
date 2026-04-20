@@ -11999,6 +11999,38 @@ fn collect_label_blocks(
             Stmt::IfStmt { action, .. } => {
                 collect_label_blocks(b, std::slice::from_ref(action.as_ref()), out);
             }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_label_blocks(b, &case.body, out);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            collect_label_blocks(b, body, out);
+                        }
+                    }
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_label_blocks(b, body, out);
+                for (_, else_body) in elsewhere {
+                    collect_label_blocks(b, else_body, out);
+                }
+            }
+            Stmt::WhereStmt { stmt, .. } | Stmt::ForallStmt { stmt, .. } => {
+                collect_label_blocks(b, std::slice::from_ref(stmt.as_ref()), out);
+            }
+            Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. } => {
+                collect_label_blocks(b, body, out);
+            }
             Stmt::DoLoop { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::DoConcurrent { body, .. } => {
@@ -14445,6 +14477,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Read { controls, items } => {
+            let err_label = controls.iter().find_map(|c| {
+                if c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("err"))
+                    .unwrap_or(false)
+                {
+                    match &c.value.node {
+                        Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
             let fmt_control = controls
                 .iter()
                 .skip(1)
@@ -14463,7 +14509,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
             };
 
-            let iostat_addr = controls
+            let explicit_iostat_addr = controls
                 .iter()
                 .find(|c| {
                     c.keyword
@@ -14471,8 +14517,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         .map(|k| k.eq_ignore_ascii_case("iostat"))
                         .unwrap_or(false)
                 })
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
-                .unwrap_or_else(|| b.const_i64(0));
+                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
+
+            let iostat_addr = match (err_label, explicit_iostat_addr) {
+                (_, Some(addr)) => addr,
+                (Some(_), None) => {
+                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    b.store(zero, tmp);
+                    tmp
+                }
+                (None, None) => b.const_i64(0),
+            };
 
             let size_addr = controls
                 .iter()
@@ -14509,6 +14565,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             size_addr,
                         );
                     }
+                    lower_read_err_branch(b, ctx, err_label, iostat_addr);
                     return;
                 }
             }
@@ -14540,6 +14597,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     size_addr,
                 );
             }
+            lower_read_err_branch(b, ctx, err_label, iostat_addr);
         }
 
         Stmt::Inquire { specs, .. } => {
@@ -17108,6 +17166,30 @@ enum ReadMode {
         item_idx: ValueId,
         iostat: ValueId,
     },
+}
+
+fn lower_read_err_branch(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    err_label: Option<u64>,
+    iostat_addr: ValueId,
+) {
+    let Some(label) = err_label else {
+        return;
+    };
+    let Some(&target_bb) = ctx.label_blocks.get(&label) else {
+        return;
+    };
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+        return;
+    };
+
+    let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let is_err = b.icmp(CmpOp::Ne, status, zero);
+    let ok_bb = b.create_block(&format!("read_ok_{}", label));
+    b.cond_branch(is_err, target_bb, vec![], ok_bb, vec![]);
+    b.set_block(ok_bb);
 }
 
 fn lower_read_into_addr(b: &mut FuncBuilder, mode: ReadMode, ty: &IrType, addr: ValueId) -> bool {
