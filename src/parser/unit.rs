@@ -695,6 +695,10 @@ impl<'a> Parser<'a> {
                 decls.push(self.parse_equivalence_stmt()?);
                 continue;
             }
+            if text == "enum" && next_tok.as_ref() == Some(&TokenKind::Comma) {
+                decls.push(self.parse_enum_def()?);
+                continue;
+            }
 
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
@@ -728,8 +732,8 @@ impl<'a> Parser<'a> {
                     } // consume ::
                     let mut names = Vec::new();
                     loop {
-                        if self.peek() == &TokenKind::Identifier {
-                            names.push(self.advance().clone().text);
+                        if let Some(name) = self.parse_access_list_item()? {
+                            names.push(name);
                         } else {
                             break;
                         }
@@ -756,6 +760,27 @@ impl<'a> Parser<'a> {
         }
 
         Ok((uses, imports, implicit, decls, body, interfaces))
+    }
+
+    fn parse_access_list_item(&mut self) -> Result<Option<String>, ParseError> {
+        if self.peek() != &TokenKind::Identifier {
+            return Ok(None);
+        }
+
+        let is_generic_spec = (self.peek_text().eq_ignore_ascii_case("operator")
+            || self.peek_text().eq_ignore_ascii_case("assignment"))
+            && self.pos + 1 < self.tokens.len()
+            && self.tokens[self.pos + 1].kind == TokenKind::LParen;
+
+        if !is_generic_spec {
+            return Ok(Some(self.advance().clone().text));
+        }
+
+        let generic_kw = self.advance().clone().text;
+        self.expect(&TokenKind::LParen)?;
+        let op = self.advance().clone().text;
+        self.expect(&TokenKind::RParen)?;
+        Ok(Some(format!("{}({})", generic_kw, op)))
     }
 
     fn parse_contains_section(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -1055,6 +1080,32 @@ mod tests {
             assert_eq!(bodies.len(), 2);
         } else {
             panic!("not InterfaceBlock");
+        }
+    }
+
+    #[test]
+    fn module_access_list_accepts_generic_specs() {
+        let u = parse_unit(
+            "module m\n  implicit none\n  private\n  public :: assignment(=), operator(+), box_t\n  type :: box_t\n    integer :: value\n  end type\nend module\n",
+        );
+        if let ProgramUnit::Module { decls, .. } = &u.node {
+            let access = decls
+                .iter()
+                .find_map(|decl| match &decl.node {
+                    crate::ast::decl::Decl::AccessList { names, .. } => Some(names.clone()),
+                    _ => None,
+                })
+                .expect("expected access list");
+            assert_eq!(
+                access,
+                vec![
+                    "assignment(=)".to_string(),
+                    "operator(+)".to_string(),
+                    "box_t".to_string()
+                ]
+            );
+        } else {
+            panic!("not Module");
         }
     }
 

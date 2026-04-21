@@ -5033,6 +5033,63 @@ fn dash_j_nonexistent_dir_is_hard_error() {
 }
 
 #[test]
+fn dash_j_also_searches_for_modules_on_dependent_compile() {
+    let dir = unique_dir("dashj_search");
+    let mod_dir = dir.join("modules");
+    std::fs::create_dir_all(&mod_dir).unwrap();
+    let mod_src = write_program_in(
+        &dir,
+        "producer.f90",
+        "module producer_mod\n  implicit none\n  integer :: x = 42\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use producer_mod\n  implicit none\n  if (x /= 42) error stop 1\nend program\n",
+    );
+    let mod_obj = dir.join("producer.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-J",
+            mod_dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+    assert!(
+        mod_dir.join("producer_mod.amod").exists(),
+        "producer compile should emit .amod to -J dir"
+    );
+
+    let user_obj = dir.join("consumer.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-J",
+            mod_dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "-J should also search that directory for modules: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dash_i_equals_form_finds_modules() {
     let dir = unique_dir("ieq_mod");
     let mod_src = write_program_in(
@@ -7914,6 +7971,131 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs() {
+    let dir = unique_dir("public_defined_assignment_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "box_mod.f90",
+        "module box_mod\n  implicit none\n  private\n  public :: box_t, assignment(=)\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    module procedure assign_box_from_int\n  end interface\ncontains\n  subroutine assign_box_from_int(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs * 2\n  end subroutine\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use box_mod\n  implicit none\n  type(box_t) :: box\n  box = 21\n  print *, box%value\nend program\n",
+    );
+
+    let mod_obj = dir.join("box_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("defined assignment module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "defined assignment module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("defined assignment user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "defined assignment consumer should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let exe = dir.join("public_defined_assignment_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("defined assignment link spawn failed");
+    assert!(
+        link.status.success(),
+        "defined assignment .amod link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "defined assignment runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "42",
+        "public defined assignment should stay callable across .amod import"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enum_bind_c_enumerators_compile_and_run() {
+    let src = write_program(
+        "module colors\n  implicit none\n  enum, bind(c)\n    enumerator :: red = 1, blue = 2, green = 3\n  end enum\nend module\nprogram main\n  use colors\n  implicit none\n  integer, parameter :: color_kind = kind(red)\n  print *, red, blue, green, color_kind\nend program\n",
+        "f90",
+    );
+    let out = unique_path("enum_bind_c", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("enum bind(c) compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "enum bind(c) program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "enum bind(c) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains('1')
+            && stdout.contains('2')
+            && stdout.contains('3')
+            && (stdout.contains(" 4") || stdout.contains("\n4") || stdout.contains(" 8")),
+        "enum bind(c) enumerators should behave like integer parameters: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

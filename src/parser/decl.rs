@@ -1007,6 +1007,60 @@ impl<'a> Parser<'a> {
         let span = crate::parser::expr::span_from_to(start, self.prev_span());
         Ok(Spanned::new(Decl::EquivalenceStmt { groups }, span))
     }
+
+    pub fn parse_enum_def(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        self.advance(); // consume ENUM
+
+        if self.eat(&TokenKind::Comma) {
+            if !self.eat_ident("bind") {
+                return Err(self.error("expected BIND(C) after ENUM,".into()));
+            }
+            self.expect(&TokenKind::LParen)?;
+            if !self.eat_ident("c") {
+                return Err(self.error("expected BIND(C) after ENUM,".into()));
+            }
+            self.expect(&TokenKind::RParen)?;
+        }
+
+        self.skip_newlines();
+        let mut enumerators = Vec::new();
+        loop {
+            self.skip_newlines();
+            let text = self.peek_text().to_lowercase();
+            if text == "end" || text == "endenum" {
+                break;
+            }
+            if text != "enumerator" {
+                return Err(self.error(format!(
+                    "expected ENUMERATOR or end enum, got '{}'",
+                    self.peek_text()
+                )));
+            }
+            self.advance(); // consume ENUMERATOR
+            self.eat(&TokenKind::ColonColon);
+            loop {
+                if self.peek() != &TokenKind::Identifier {
+                    return Err(self.error("expected enumerator name".into()));
+                }
+                let name = self.advance().clone().text;
+                let value = if self.eat(&TokenKind::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                enumerators.push((name, value));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.skip_newlines();
+        }
+
+        self.consume_end("enum")?;
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Decl::EnumDef { enumerators }, span))
+    }
 }
 
 #[cfg(test)]
@@ -1058,6 +1112,11 @@ mod tests {
         if parser.peek_text().eq_ignore_ascii_case("equivalence") {
             parser.advance();
             return parser.parse_equivalence_stmt().unwrap();
+        }
+
+        // Try ENUM.
+        if parser.peek_text().eq_ignore_ascii_case("enum") {
+            return parser.parse_enum_def().unwrap();
         }
 
         panic!("could not parse as declaration: {}", src);
@@ -1254,6 +1313,18 @@ mod tests {
             assert!(attrs.iter().any(|a| matches!(a, Attribute::Bind(None))));
         } else {
             panic!("not TypeDecl");
+        }
+    }
+
+    #[test]
+    fn enum_bind_c() {
+        let d = parse_decl("enum, bind(c)\n  enumerator :: red = 1, blue = 2\nend enum\n");
+        if let Decl::EnumDef { enumerators } = &d.node {
+            assert_eq!(enumerators.len(), 2);
+            assert_eq!(enumerators[0].0, "red");
+            assert_eq!(enumerators[1].0, "blue");
+        } else {
+            panic!("not EnumDef");
         }
     }
 

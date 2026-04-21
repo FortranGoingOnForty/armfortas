@@ -24,8 +24,8 @@ pub enum Decl {
     /// default access for all subsequent declarations.
     AccessDefault { access: Attribute },
 
-    /// `PUBLIC :: name1, name2` or `PRIVATE :: name1, name2` — sets
-    /// access on specific names.
+    /// `PUBLIC :: name1, name2` or `PRIVATE :: assignment(=)` — sets
+    /// access on specific names or generic specs.
     AccessList {
         access: Attribute,
         names: Vec<String>,

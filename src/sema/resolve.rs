@@ -779,7 +779,7 @@ fn load_external_module(
     // candidates and fails.
     for proc in &iface.procedures {
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: proc.access,
             allocatable: proc.result_allocatable,
             pointer: proc.result_pointer,
             pure: proc.pure,
@@ -1463,6 +1463,31 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     arg_names: vec![],
                     const_value: None,
                 })?;
+            }
+            Decl::EnumDef { enumerators } => {
+                let mut next_value = 0i64;
+                for (name, value_expr) in enumerators {
+                    let const_value = if let Some(expr) = value_expr {
+                        eval_const_int_expr(expr, st).unwrap_or(next_value)
+                    } else {
+                        next_value
+                    };
+                    next_value = const_value + 1;
+                    st.define(Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Parameter,
+                        type_info: Some(TypeInfo::Integer { kind: None }),
+                        attrs: SymbolAttrs {
+                            access: st.default_access(st.current_scope()),
+                            parameter: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: st.current_scope(),
+                        arg_names: vec![],
+                        const_value: Some(const_value),
+                    })?;
+                }
             }
             _ => {}
         }

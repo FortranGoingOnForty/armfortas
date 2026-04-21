@@ -14,7 +14,7 @@
 //!   - Polymorphic type tags (@tag)
 //!   - Human-editable for hand-written FFI descriptions
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -113,10 +113,20 @@ pub fn write_amod(
     }
 
     // ---- Procedures ----
-    let procs: Vec<_> = syms
+    let interface_specifics: BTreeSet<String> = syms
         .iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine))
+        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::NamedInterface))
+        .flat_map(|(_, sym)| sym.arg_names.iter().cloned())
         .collect();
+    let mut procs: Vec<_> = scope
+        .symbols
+        .iter()
+        .filter(|(name, sym)| {
+            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                && (is_public(sym, scope) || interface_specifics.contains(&name.to_lowercase()))
+        })
+        .collect();
+    procs.sort_by_key(|(k, _)| k.to_lowercase());
     for (name, sym) in &procs {
         emit_procedure(
             &mut out,
@@ -285,6 +295,9 @@ fn emit_procedure(
     }
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
+    }
+    if sym.attrs.access == Access::Private {
+        write!(out, ", private").unwrap();
     }
     if let Some(binding_label) = &sym.attrs.binding_label {
         write!(out, ", bind={}", binding_label).unwrap();
@@ -687,6 +700,7 @@ pub struct AmodProc {
     pub result_pointer: bool,
     pub pure: bool,
     pub elemental: bool,
+    pub access: Access,
     pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
 }
@@ -958,6 +972,11 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let elemental = attrs_str.contains("elemental");
     let result_allocatable = attrs_str.contains("result_allocatable");
     let result_pointer = attrs_str.contains("result_pointer");
+    let access = if attrs_str.split(", ").any(|attr| attr == "private") {
+        Access::Private
+    } else {
+        Access::Public
+    };
     let binding_label = attrs_str
         .split(", ")
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
@@ -991,6 +1010,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_pointer,
         pure,
         elemental,
+        access,
         binding_label,
         args,
     }

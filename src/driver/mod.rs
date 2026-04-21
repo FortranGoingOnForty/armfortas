@@ -316,12 +316,18 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
 
             "-J" => {
                 i += 1;
-                opts.module_output_dir =
-                    Some(PathBuf::from(args.get(i).ok_or("-J requires a directory")?));
+                let dir = PathBuf::from(args.get(i).ok_or("-J requires a directory")?);
+                if !opts.module_search_paths.iter().any(|path| path == &dir) {
+                    opts.module_search_paths.push(dir.clone());
+                }
+                opts.module_output_dir = Some(dir);
             }
             arg if arg.starts_with("-J") => {
-                opts.module_output_dir =
-                    Some(PathBuf::from(short_option_value(arg, "-J", "a directory")?));
+                let dir = PathBuf::from(short_option_value(arg, "-J", "a directory")?);
+                if !opts.module_search_paths.iter().any(|path| path == &dir) {
+                    opts.module_search_paths.push(dir.clone());
+                }
+                opts.module_output_dir = Some(dir);
             }
 
             // ---- Linker search / libs / rpath ----
