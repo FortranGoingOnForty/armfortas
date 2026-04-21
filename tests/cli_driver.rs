@@ -4815,6 +4815,62 @@ fn multi_input_dash_c_produces_one_object_per_source() {
 }
 
 #[test]
+fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
+    let dir = unique_dir("module_cwd_amod");
+    std::fs::create_dir_all(dir.join("src/utils")).expect("mkdir utils");
+    std::fs::create_dir_all(dir.join("src/buffer")).expect("mkdir buffer");
+    let mod_src = write_program_in(
+        &dir.join("src/utils"),
+        "utf8_module.f90",
+        "module utf8_module\n  implicit none\n  integer, parameter :: UTF8_OK = 7\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir.join("src/buffer"),
+        "text_buffer_module.f90",
+        "module text_buffer_module\n  use utf8_module, only: UTF8_OK\n  implicit none\n  integer, parameter :: VALUE = UTF8_OK\nend module\n",
+    );
+    let mod_obj = dir.join("src/utils/utf8_module.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            mod_src.strip_prefix(&dir).unwrap().to_str().unwrap(),
+            "-o",
+            mod_obj.strip_prefix(&dir).unwrap().to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+    assert!(
+        dir.join("utf8_module.amod").exists(),
+        "compile-only build should emit module file in current dir when -J is absent"
+    );
+
+    let user_obj = dir.join("src/buffer/text_buffer_module.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            user_src.strip_prefix(&dir).unwrap().to_str().unwrap(),
+            "-o",
+            user_obj.strip_prefix(&dir).unwrap().to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "consumer compile should find cwd module file: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn multi_input_dash_c_with_o_is_rejected() {
     let dir = unique_dir("multi_c_err");
     write_program_in(&dir, "a.f90", "program a\n  print *, 1\nend program\n");

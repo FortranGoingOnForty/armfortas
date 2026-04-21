@@ -1464,8 +1464,11 @@ _main:
     }
 
     // Emit .amod files for each MODULE in the compilation unit.
-    // -J <dir> overrides where they go; otherwise they follow the
-    // primary output path, even for shared-library builds.
+    // -J <dir> overrides where they go. For compile-only (-c) builds
+    // without -J, keep the traditional compiler behavior of writing
+    // module files into the current working directory even if the
+    // object output path points into a source subdirectory. For full
+    // link/shared outputs, keep following the primary output path.
     for unit in &units {
         if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
             let mod_key = name.to_lowercase();
@@ -1483,10 +1486,15 @@ _main:
                 );
                 let amod_dir: std::path::PathBuf =
                     opts.module_output_dir.clone().unwrap_or_else(|| {
-                        opts.output_path()
-                            .parent()
-                            .unwrap_or_else(|| std::path::Path::new("."))
-                            .to_path_buf()
+                        if opts.emit_obj {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        } else {
+                            opts.output_path()
+                                .parent()
+                                .unwrap_or_else(|| std::path::Path::new("."))
+                                .to_path_buf()
+                        }
                     });
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
                 fs::write(&amod_path, &amod_text)
