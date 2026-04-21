@@ -35,6 +35,21 @@ Current staged order:
 6. `facsimile`
 7. `fortty` later
 
+Secondary targets worth keeping warm:
+
+- `fuss`
+  - smaller git-oriented TUI with UTF-8 tree rendering and shell/workflow hooks
+  - good backup interactive target when we want less dependency noise than the editor/TUI stack
+- `fgof-fs`
+  - filesystem/path library with dense native tests
+  - good for `.amod`, packaging, and runtime I/O truthfulness
+- `fgof-process`
+  - subprocess/process library with capture, timeout, and shell behavior tests
+  - good system-interop target without full application complexity
+- `fgof-pty`
+  - PTY/session library with interactive subprocess and resize coverage
+  - good terminal-truthfulness target before the heavier TUI/editor programs
+
 Current de-prioritized projects:
 
 - `convolution`
