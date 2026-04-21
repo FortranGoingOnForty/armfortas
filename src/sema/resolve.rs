@@ -1095,6 +1095,11 @@ fn collect_derived_type_layouts(
         visible_param_cache,
         exported_param_cache,
     ));
+    let host_module = match &st.scope(scope_id).kind {
+        crate::sema::symtab::ScopeKind::Module(module_name)
+        | crate::sema::symtab::ScopeKind::Submodule(module_name) => Some(module_name.as_str()),
+        _ => None,
+    };
     let const_params = collect_const_int_params(decls, &seed_params);
     for decl in decls {
         if let Decl::DerivedTypeDef {
@@ -1109,6 +1114,7 @@ fn collect_derived_type_layouts(
             let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
             let layout = super::type_layout::compute_layout(
                 name,
+                host_module,
                 type_bound_procs,
                 final_procs,
                 components,

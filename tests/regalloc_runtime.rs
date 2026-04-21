@@ -146,7 +146,14 @@ fn gp_values_live_across_call_pressure_survive() {
     let src = "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function check_gp_live(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) result(v) bind(C, name='check_gp_live')\n      import :: c_int\n      integer(c_int), value :: a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16\n      integer(c_int) :: v\n    end function check_gp_live\n  end interface\n  integer(c_int) :: total\n  integer(c_int) :: a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16\n  a1 = 1\n  a2 = 2\n  a3 = 3\n  a4 = 4\n  a5 = 5\n  a6 = 6\n  a7 = 7\n  a8 = 8\n  a9 = 9\n  a10 = 10\n  a11 = 11\n  a12 = 12\n  a13 = 13\n  a14 = 14\n  a15 = 15\n  a16 = 16\n  total = check_gp_live(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16)\n  total = total + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16\n  if (total /= 272_c_int) error stop 1\n  print *, total\nend program\n";
 
     for opt in ["-O0", "-O2"] {
-        compile_and_run_with_c("gp_live_across_call", "check_gp_live.c", c_text, src, opt, "272");
+        compile_and_run_with_c(
+            "gp_live_across_call",
+            "check_gp_live.c",
+            c_text,
+            src,
+            opt,
+            "272",
+        );
     }
 }
 
@@ -156,7 +163,14 @@ fn fp_values_live_across_call_pressure_survive() {
     let src = "program p\n  use iso_c_binding, only: c_int, c_double\n  implicit none\n  interface\n    function check_fp_live(d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12) result(v) bind(C, name='check_fp_live')\n      import :: c_int, c_double\n      real(c_double), value :: d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12\n      integer(c_int) :: v\n    end function check_fp_live\n  end interface\n  integer(c_int) :: total\n  real(c_double) :: d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12\n  d1 = 1.0d0\n  d2 = 2.0d0\n  d3 = 3.0d0\n  d4 = 4.0d0\n  d5 = 5.0d0\n  d6 = 6.0d0\n  d7 = 7.0d0\n  d8 = 8.0d0\n  d9 = 9.0d0\n  d10 = 10.0d0\n  d11 = 11.0d0\n  d12 = 12.0d0\n  total = check_fp_live(d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12)\n  total = total + int(d1) + int(d2) + int(d3) + int(d4) + int(d5) + int(d6) + int(d7) + int(d8) + int(d9) + int(d10) + int(d11) + int(d12)\n  if (total /= 156_c_int) error stop 1\n  print *, total\nend program\n";
 
     for opt in ["-O0", "-O2"] {
-        compile_and_run_with_c("fp_live_across_call", "check_fp_live.c", c_text, src, opt, "156");
+        compile_and_run_with_c(
+            "fp_live_across_call",
+            "check_fp_live.c",
+            c_text,
+            src,
+            opt,
+            "156",
+        );
     }
 }
 

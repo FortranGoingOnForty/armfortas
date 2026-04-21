@@ -22,3 +22,5 @@ AGENTS.md
 # IR / object dumps from --emit-ir and -c runs.
 /*.ir
 /*.o
+/*.mod
+/scratch/

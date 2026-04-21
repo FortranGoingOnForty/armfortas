@@ -77,7 +77,10 @@ fn allocate_source_array_constructor_infers_shape_and_copies_values() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("3") && stdout.contains("1") && stdout.contains("2") && stdout.contains("3"),
+        stdout.contains("3")
+            && stdout.contains("1")
+            && stdout.contains("2")
+            && stdout.contains("3"),
         "unexpected source array constructor output: {}",
         stdout
     );

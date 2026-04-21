@@ -26,7 +26,10 @@ fn compiler(name: &str) -> PathBuf {
 fn unique_path(stem: &str, ext: &str) -> PathBuf {
     let pid = std::process::id();
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("afs_alloc_validate_{}_{}_{}.{}", stem, pid, id, ext))
+    std::env::temp_dir().join(format!(
+        "afs_alloc_validate_{}_{}_{}.{}",
+        stem, pid, id, ext
+    ))
 }
 
 fn unique_dir(stem: &str) -> PathBuf {

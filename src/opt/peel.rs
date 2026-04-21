@@ -16,7 +16,7 @@ use super::loop_utils::{clone_loop, find_preheader, loop_defined_values, resolve
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
-use crate::ir::walk::{find_natural_loops, predecessors};
+use crate::ir::walk::{find_natural_loops, inst_uses, predecessors, terminator_uses};
 use std::collections::HashSet;
 
 pub struct LoopPeel;
@@ -102,6 +102,9 @@ fn peel_in_function(func: &mut Function) -> bool {
         // Check if body has a FIRST-ITERATION conditional:
         // ICmp(Eq, iv, init_val) feeding a CondBranch.
         let loop_defs = loop_defined_values(func, lp);
+        if has_external_ssa_uses(func, lp, &loop_defs) {
+            continue;
+        }
         if !has_first_iter_conditional(func, lp, iv, init_const, &loop_defs) {
             continue;
         }
@@ -176,6 +179,39 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
         }
     }
     None
+}
+
+/// Peeling adds a new peeled-exit path into the original exit block.
+/// If downstream blocks still read loop-defined SSA values directly, the
+/// transform would need extra SSA repair across the new predecessor. Until
+/// that exists, skip those loops.
+fn has_external_ssa_uses(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    loop_defs: &HashSet<ValueId>,
+) -> bool {
+    for block in &func.blocks {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for inst in &block.insts {
+            if inst_uses(&inst.kind)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+            {
+                return true;
+            }
+        }
+        if let Some(term) = &block.terminator {
+            if terminator_uses(term)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Get the args passed to the exit block from the cmp's false-branch.
@@ -298,6 +334,7 @@ mod tests {
     use super::*;
     use crate::ir::inst::*;
     use crate::ir::types::{IntWidth, IrType};
+    use crate::ir::verify::verify_module;
     use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
 
@@ -368,6 +405,14 @@ mod tests {
             span: span(),
             kind: InstKind::ICmp(CmpOp::Le, iv, c10),
         });
+        let exit_seed = f.next_value_id();
+        f.register_type(exit_seed, IrType::Int(IntWidth::I32));
+        f.block_mut(cmp).insts.push(Inst {
+            id: exit_seed,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
         f.block_mut(cmp).terminator = Some(Terminator::CondBranch {
             cond: cmp_v,
             true_dest: body,
@@ -411,5 +456,133 @@ mod tests {
         let pass = LoopPeel;
         let changed = pass.run(&mut m);
         assert!(!changed, "loop without i==init check should not be peeled");
+    }
+
+    #[test]
+    fn peel_skips_loops_with_direct_exit_uses_of_loop_values() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+
+        let preheader = f.create_block("preheader");
+        let header = f.create_block("header");
+        let cmp = f.create_block("cmp");
+        let body = f.create_block("body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let entry = f.entry;
+
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let c10 = f.next_value_id();
+        f.register_type(c10, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(10, IntWidth::I32),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::Branch(preheader, vec![]));
+        f.block_mut(preheader).terminator = Some(Terminator::Branch(header, vec![c1]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(header).terminator = Some(Terminator::Branch(cmp, vec![]));
+
+        let cmp_v = f.next_value_id();
+        f.register_type(cmp_v, IrType::Bool);
+        f.block_mut(cmp).insts.push(Inst {
+            id: cmp_v,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv, c10),
+        });
+        let exit_seed = f.next_value_id();
+        f.register_type(exit_seed, IrType::Int(IntWidth::I32));
+        f.block_mut(cmp).insts.push(Inst {
+            id: exit_seed,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
+        f.block_mut(cmp).terminator = Some(Terminator::CondBranch {
+            cond: cmp_v,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let first_iter = f.next_value_id();
+        f.register_type(first_iter, IrType::Bool);
+        f.block_mut(body).insts.push(Inst {
+            id: first_iter,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Eq, iv, c1),
+        });
+        let alloca = f.next_value_id();
+        f.register_type(alloca, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(body).insts.push(Inst {
+            id: alloca,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+        });
+        let store_id = f.next_value_id();
+        f.register_type(store_id, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: store_id,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(iv, alloca),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(latch, vec![]));
+
+        let nxt = f.next_value_id();
+        f.register_type(nxt, IrType::Int(IntWidth::I32));
+        f.block_mut(latch).insts.push(Inst {
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![nxt]));
+
+        let escaped = f.next_value_id();
+        f.register_type(escaped, IrType::Int(IntWidth::I32));
+        f.block_mut(exit).insts.push(Inst {
+            id: escaped,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(exit_seed, c1),
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+        assert!(
+            verify_module(&m).is_empty(),
+            "test setup must start valid before peeling"
+        );
+
+        let pass = LoopPeel;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "peeling should skip loops whose exit reads loop-defined SSA values directly"
+        );
+        assert!(
+            verify_module(&m).is_empty(),
+            "skipping the peel should keep the IR valid"
+        );
     }
 }

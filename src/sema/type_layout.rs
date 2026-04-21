@@ -37,6 +37,7 @@ pub struct FieldLayout {
 pub struct BoundProc {
     pub method_name: String,
     pub target_name: String,
+    pub abi_name: String,
     pub nopass: bool,
 }
 
@@ -333,6 +334,7 @@ fn type_spec_to_type_info(
 /// Compute the layout of a derived type from its component declarations.
 pub fn compute_layout(
     type_name: &str,
+    host_module: Option<&str>,
     type_bound_procs: &[crate::ast::decl::TypeBoundProc],
     final_proc_names: &[String],
     components: &[crate::ast::decl::SpannedDecl],
@@ -461,9 +463,19 @@ pub fn compute_layout(
         .map(|tbp| {
             let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
             let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
+            let target_name = if let Some(module_name) = host_module {
+                format!(
+                    "afs_modproc_{}_{}",
+                    module_name.to_lowercase(),
+                    target.to_lowercase()
+                )
+            } else {
+                target.to_string()
+            };
             BoundProc {
                 method_name: tbp.name.clone(),
-                target_name: target.to_string(),
+                target_name,
+                abi_name: target.to_lowercase(),
                 nopass,
             }
         })
@@ -722,7 +734,16 @@ mod tests {
             make_component("x", crate::ast::decl::TypeSpec::Integer(None)),
             make_component("y", crate::ast::decl::TypeSpec::Real(None)),
         ];
-        let layout = compute_layout("pair", &[], &[], &components, None, &reg, &empty_params());
+        let layout = compute_layout(
+            "pair",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
         assert_eq!(layout.name, "pair");
         assert_eq!(layout.size, 8); // 4 + 4, no padding needed
         assert_eq!(layout.align, 4);
@@ -755,7 +776,16 @@ mod tests {
             ),
             make_component("b", crate::ast::decl::TypeSpec::DoublePrecision),
         ];
-        let layout = compute_layout("padded", &[], &[], &components, None, &reg, &empty_params());
+        let layout = compute_layout(
+            "padded",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
         assert_eq!(layout.field("a").unwrap().offset, 0);
         assert_eq!(layout.field("a").unwrap().size, 1);
         assert_eq!(layout.field("b").unwrap().offset, 8); // padded to 8-byte alignment
@@ -773,13 +803,22 @@ mod tests {
             "x",
             crate::ast::decl::TypeSpec::Integer(None),
         )];
-        let base_layout =
-            compute_layout("base", &[], &[], &base_comps, None, &reg, &empty_params());
+        let base_layout = compute_layout(
+            "base",
+            None,
+            &[],
+            &[],
+            &base_comps,
+            None,
+            &reg,
+            &empty_params(),
+        );
         assert_eq!(base_layout.size, 4);
 
         let child_comps = vec![make_component("y", crate::ast::decl::TypeSpec::Real(None))];
         let child_layout = compute_layout(
             "child",
+            None,
             &[],
             &[],
             &child_comps,
@@ -812,7 +851,16 @@ mod tests {
             vec![crate::ast::decl::Attribute::Pointer],
         )];
 
-        let layout = compute_layout("list_t", &[], &[], &components, None, &reg, &empty_params());
+        let layout = compute_layout(
+            "list_t",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
         let field = layout.field("left").expect("missing left field");
 
         assert_eq!(field.size, 8);
@@ -866,6 +914,7 @@ mod tests {
 
         let layout = compute_layout(
             "state_t",
+            None,
             &[],
             &[],
             &components,
@@ -922,7 +971,7 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("max_token_len".into(), 8);
 
-        let layout = compute_layout("token_t", &[], &[], &components, None, &reg, &params);
+        let layout = compute_layout("token_t", None, &[], &[], &components, None, &reg, &params);
         let field = layout.field("value").expect("missing value field");
 
         assert_eq!(field.size, 8);

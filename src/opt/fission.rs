@@ -141,9 +141,15 @@ fn fission_in_function(func: &mut Function) -> bool {
         // Redirect original cmp's exit → bridge.
         for &bid in &lp.body {
             let block = func.block_mut(bid);
-            if let Some(Terminator::CondBranch { false_dest, .. }) = &mut block.terminator {
+            if let Some(Terminator::CondBranch {
+                false_dest,
+                false_args,
+                ..
+            }) = &mut block.terminator
+            {
                 if *false_dest == exit_id {
                     *false_dest = bridge;
+                    false_args.clear();
                     break;
                 }
             }
@@ -244,8 +250,19 @@ fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::IrType;
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::ir::verify::verify_module;
+    use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
+
+    fn span() -> Span {
+        let pos = Position { line: 0, col: 0 };
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
+    }
 
     #[test]
     fn fission_no_op_on_empty() {
@@ -256,5 +273,165 @@ mod tests {
         let pass = LoopFission;
         let changed = pass.run(&mut m);
         assert!(!changed, "no loops → no fission");
+    }
+
+    #[test]
+    fn fission_clears_exit_args_when_rerouting_to_bridge() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+
+        let preheader = f.create_block("preheader");
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let entry = f.entry;
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 16);
+        let arr_a = f.next_value_id();
+        f.register_type(arr_a, IrType::Ptr(Box::new(arr_ty.clone())));
+        f.block_mut(entry).insts.push(Inst {
+            id: arr_a,
+            ty: IrType::Ptr(Box::new(arr_ty.clone())),
+            span: span(),
+            kind: InstKind::Alloca(arr_ty.clone()),
+        });
+        let arr_b = f.next_value_id();
+        f.register_type(arr_b, IrType::Ptr(Box::new(arr_ty.clone())));
+        f.block_mut(entry).insts.push(Inst {
+            id: arr_b,
+            ty: IrType::Ptr(Box::new(arr_ty)),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 16)),
+        });
+        let c0 = f.next_value_id();
+        f.register_type(c0, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c0,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(0, IntWidth::I32),
+        });
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let c2 = f.next_value_id();
+        f.register_type(c2, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c2,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        let c4 = f.next_value_id();
+        f.register_type(c4, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c4,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(4, IntWidth::I32),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::Branch(preheader, vec![]));
+
+        f.block_mut(preheader).terminator = Some(Terminator::Branch(header, vec![c0]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(header).terminator = Some(Terminator::Branch(body, vec![]));
+
+        let gep_a = f.next_value_id();
+        f.register_type(gep_a, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(body).insts.push(Inst {
+            id: gep_a,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::GetElementPtr(arr_a, vec![iv]),
+        });
+        let store_a = f.next_value_id();
+        f.register_type(store_a, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: store_a,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(c1, gep_a),
+        });
+
+        let gep_b = f.next_value_id();
+        f.register_type(gep_b, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(body).insts.push(Inst {
+            id: gep_b,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::GetElementPtr(arr_b, vec![iv]),
+        });
+        let store_b = f.next_value_id();
+        f.register_type(store_b, IrType::Void);
+        f.block_mut(body).insts.push(Inst {
+            id: store_b,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(c2, gep_b),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(latch, vec![]));
+
+        let nxt = f.next_value_id();
+        f.register_type(nxt, IrType::Int(IntWidth::I32));
+        f.block_mut(latch).insts.push(Inst {
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
+        let cmp = f.next_value_id();
+        f.register_type(cmp, IrType::Bool);
+        f.block_mut(latch).insts.push(Inst {
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, nxt, c4),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::CondBranch {
+            cond: cmp,
+            true_dest: header,
+            true_args: vec![nxt],
+            false_dest: exit,
+            false_args: vec![nxt],
+        });
+
+        let exit_param = f.next_value_id();
+        f.register_type(exit_param, IrType::Int(IntWidth::I32));
+        f.block_mut(exit).params.push(BlockParam {
+            id: exit_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        let _use_exit = f.next_value_id();
+        f.register_type(_use_exit, IrType::Int(IntWidth::I32));
+        f.block_mut(exit).insts.push(Inst {
+            id: _use_exit,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(exit_param, c1),
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+        assert!(verify_module(&m).is_empty(), "test setup must start valid");
+
+        let pass = LoopFission;
+        let changed = pass.run(&mut m);
+        assert!(changed, "the loop should fission");
+        assert!(
+            verify_module(&m).is_empty(),
+            "fission should keep bridge exit edges verifier-clean"
+        );
     }
 }
