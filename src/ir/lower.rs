@@ -6823,6 +6823,8 @@ fn char_addr_and_substring_bound_len(
     b: &mut FuncBuilder,
     arg_spanned: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<(ValueId, ValueId)> {
     use crate::ast::expr::Expr;
     match &arg_spanned.node {
@@ -6840,6 +6842,18 @@ fn char_addr_and_substring_bound_len(
             let ptr = b.const_string(value.as_bytes());
             let len = b.const_i64(value.len() as i64);
             Some((ptr, len))
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) =
+                resolve_component_field_access(b, locals, arg_spanned, st, tl)?;
+            match field_char_kind(&field) {
+                CharKind::Fixed(len) => Some((field_ptr, b.const_i64(len))),
+                CharKind::Deferred if field.size == 32 => {
+                    Some(load_string_descriptor_substring_view(b, field_ptr))
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -11352,7 +11366,7 @@ fn lower_string_expr_full(
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
                         let (base_ptr, base_len) = if let Some((ptr, len)) =
-                            char_addr_and_substring_bound_len(b, callee, locals)
+                            char_addr_and_substring_bound_len(b, callee, locals, st, type_layouts)
                         {
                             (ptr, len)
                         } else {
@@ -11383,7 +11397,7 @@ fn lower_string_expr_full(
                     }
                     crate::ast::expr::SectionSubscript::Element(idx_expr) => {
                         let (base_ptr, base_len) = if let Some((ptr, len)) =
-                            char_addr_and_substring_bound_len(b, callee, locals)
+                            char_addr_and_substring_bound_len(b, callee, locals, st, type_layouts)
                         {
                             (ptr, len)
                         } else {
@@ -12610,7 +12624,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } = args[0].value
                                 {
                                     if let Some((base_ptr, base_len)) =
-                                        char_addr_and_substring_bound_len(b, callee, &ctx.locals)
+                                        char_addr_and_substring_bound_len(
+                                            b,
+                                            callee,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
                                     {
                                         let (dest_ptr, dest_len) = lower_substring_full(
                                             b,
@@ -18078,12 +18098,13 @@ fn lower_formatted_char_read_item(
         return false;
     }
 
-    let (dest_ptr, dest_len) =
-        if let Some((ptr, len)) = char_addr_and_substring_bound_len(b, item, &ctx.locals) {
-            (ptr, len)
-        } else {
-            lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
-        };
+    let (dest_ptr, dest_len) = if let Some((ptr, len)) =
+        char_addr_and_substring_bound_len(b, item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+    {
+        (ptr, len)
+    } else {
+        lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+    };
     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
 
     match mode {

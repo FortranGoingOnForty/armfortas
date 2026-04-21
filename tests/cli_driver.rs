@@ -1175,6 +1175,43 @@ fn deferred_local_zero_len_buffer_substring_preserves_written_bytes() {
 }
 
 #[test]
+fn deferred_char_component_substring_reads_back_written_chars() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: state_t\n    character(len=:), allocatable :: search_string\n    integer :: search_length = 0\n  end type\ncontains\n  subroutine init_state(state)\n    type(state_t), intent(inout) :: state\n    allocate(character(len=64) :: state%search_string)\n    state%search_string = ''\n    state%search_length = 0\n  end subroutine\n\n  subroutine set_search_char(state, pos, ch)\n    type(state_t), intent(inout) :: state\n    integer, intent(in) :: pos\n    character, intent(in) :: ch\n    state%search_string(pos:pos) = ch\n  end subroutine\n\n  subroutine get_search_string(state, str, slen)\n    type(state_t), intent(in) :: state\n    character(len=*), intent(out) :: str\n    integer, intent(in) :: slen\n    integer :: j\n    str = ''\n    if (slen <= 0) return\n    do j = 1, min(slen, len(str))\n      str(j:j) = state%search_string(j:j)\n    end do\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(state_t) :: state\n  character(len=64) :: buf\n  call init_state(state)\n  state%search_length = 4\n  call set_search_char(state, 1, 'f')\n  call set_search_char(state, 2, 'i')\n  call set_search_char(state, 3, 'n')\n  call set_search_char(state, 4, 'd')\n  call get_search_string(state, buf, state%search_length)\n  if (buf(:state%search_length) /= 'find') error stop 1\n  print *, buf(:state%search_length)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_component_substring_reads", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char component substring read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char component substring read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred char component substring read run failed");
+    assert!(
+        run.status.success(),
+        "deferred char component substring read run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("find"),
+        "unexpected deferred char component substring read output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_character_component_descriptor_starts_zeroed() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  if (.not. allocated(shell%vars(1)%value)) call c_exit(1_c_int)\n  deallocate(shell%vars(1)%value)\n  call c_exit(0_c_int)\nend program\n",
