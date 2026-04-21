@@ -11807,6 +11807,43 @@ fn logical_component_array_copy_preserves_elements() {
 }
 
 #[test]
+fn component_array_section_bound_expr_preserves_derived_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: token_t\n    integer :: t = 0\n    integer :: pos = 0\n    logical :: bits(0:255) = .false.\n  end type\n  type :: list_t\n    type(token_t), allocatable :: tokens(:)\n    integer :: count = 0\n    integer :: capacity = 0\n  end type\n  type(list_t) :: list\n  type(token_t), allocatable :: temp(:)\n  type(token_t) :: tok\n  integer :: i, idx\n  list%capacity = 32\n  allocate(list%tokens(list%capacity))\n  do i = 1, 32\n    tok = token_t()\n    tok%t = i\n    tok%pos = i\n    idx = mod(i, 256)\n    tok%bits(idx) = .true.\n    list%count = list%count + 1\n    list%tokens(list%count) = tok\n  end do\n  allocate(temp(list%count))\n  temp = list%tokens(1:list%count)\n  do i = 1, 32\n    idx = mod(i, 256)\n    if (temp(i)%t /= i) error stop 100 + i\n    if (temp(i)%pos /= i) error stop 200 + i\n    if (.not. temp(i)%bits(idx)) error stop 300 + i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("component_array_section_bound_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component array section bound expr compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component array section bound expr compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("component array section bound expr run failed");
+    assert!(
+        run.status.success(),
+        "component array section bound expr run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected component array section bound expr output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_section_copy_preserves_elements() {
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = .false.\n  dest(1:3) = src(1:3)\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",

@@ -20809,7 +20809,7 @@ fn lower_array_expr_descriptor(
                 .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }))
             {
                 return Some((
-                    lower_array_section(b, locals, &info, args, st),
+                    lower_array_section(b, locals, &info, args, st, type_layouts),
                     info.ty.clone(),
                 ));
             }
@@ -20926,7 +20926,14 @@ fn lower_1d_section_assign(
         return false;
     }
 
-    let dest_desc = lower_array_section(b, &ctx.locals, dest_info, dest_args, ctx.st);
+    let dest_desc = lower_array_section(
+        b,
+        &ctx.locals,
+        dest_info,
+        dest_args,
+        ctx.st,
+        Some(ctx.type_layouts),
+    );
     let dest_n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![dest_desc],
@@ -21639,6 +21646,7 @@ fn lower_array_section(
     info: &LocalInfo,
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
     let n_dims = args.len();
 
@@ -21657,7 +21665,13 @@ fn lower_array_section(
                 let start_val = start
                     .as_ref()
                     .map(|e| {
-                        let raw = lower_expr(b, locals, e, st);
+                        let raw = lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                        );
                         widen_idx_to_i64(b, raw)
                     })
                     .unwrap_or_else(|| {
@@ -21677,7 +21691,13 @@ fn lower_array_section(
                 let end_val = end
                     .as_ref()
                     .map(|e| {
-                        let raw = lower_expr(b, locals, e, st);
+                        let raw = lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                        );
                         widen_idx_to_i64(b, raw)
                     })
                     .unwrap_or_else(|| {
@@ -21697,7 +21717,13 @@ fn lower_array_section(
                 let stride_val = stride
                     .as_ref()
                     .map(|e| {
-                        let raw = lower_expr(b, locals, e, st);
+                        let raw = lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                        );
                         widen_idx_to_i64(b, raw)
                     })
                     .unwrap_or_else(|| b.const_i64(1)); // default stride = 1
@@ -21715,7 +21741,7 @@ fn lower_array_section(
             }
             crate::ast::expr::SectionSubscript::Element(e) => {
                 // Single element subscript in a section context — treat as start=end=val, stride=1.
-                let raw = lower_expr(b, locals, e, st);
+                let raw = lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
                 let val = widen_idx_to_i64(b, raw);
                 let off0 = b.const_i64(base_offset);
                 let off8 = b.const_i64(base_offset + 8);
@@ -24978,7 +25004,14 @@ fn lower_expr_full(
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
                         if has_range {
-                            return lower_array_section(b, locals, info, args, st);
+                            return lower_array_section(
+                                b,
+                                locals,
+                                info,
+                                args,
+                                st,
+                                type_layouts,
+                            );
                         }
                         return lower_array_element(b, locals, info, args, st, type_layouts);
                     }
@@ -25570,7 +25603,14 @@ fn lower_expr_full(
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
                         if has_range {
-                            return lower_array_section(b, locals, &info, args, st);
+                            return lower_array_section(
+                                b,
+                                locals,
+                                &info,
+                                args,
+                                st,
+                                type_layouts,
+                            );
                         }
                         return lower_array_element(b, locals, &info, args, st, type_layouts);
                     }
