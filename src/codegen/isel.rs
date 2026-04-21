@@ -342,11 +342,14 @@ pub fn select_function(func: &Function) -> MachineFunction {
             ctx.value_map.insert(bp.id, vreg);
         }
         for inst in &block.insts {
-            // Allocas are special: they're handled by Phase 1
-            // (stack-slot allocation). They don't get vregs.
-            if matches!(inst.kind, InstKind::Alloca(_)) {
-                continue;
-            }
+            // Allocas already have their backing stack slots from
+            // Phase 1, but the SSA value they produce is still a real
+            // pointer that later blocks may pass to calls or branch
+            // params before the defining block is selected.
+            //
+            // Reserve the vreg here so forward-dominating alloca uses
+            // are safe even when block vec order puts the use before
+            // the definition.
             // Void-typed insts (Store, RuntimeCall returning void,
             // etc.) don't produce a usable value.
             if matches!(inst.ty, IrType::Void) {
@@ -3214,6 +3217,52 @@ mod tests {
             b.ret_void();
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
+    }
+
+    #[test]
+    fn select_call_arg_from_later_block_alloca_has_preallocated_vreg() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let use_block = b.create_block("use");
+            let def_block = b.create_block("def");
+
+            b.branch(def_block, vec![]);
+
+            b.set_block(use_block);
+            let dummy = b.const_i64(7);
+            b.call(
+                FuncRef::External("_callee".into()),
+                vec![dummy],
+                IrType::Void,
+            );
+            b.ret_void();
+
+            b.set_block(def_block);
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.call(FuncRef::External("_callee".into()), vec![slot], IrType::Void);
+            b.branch(use_block, vec![]);
+        }
+
+        let mf = select_function(&func);
+        assert!(
+            mf.blocks.iter().any(|block| {
+                block.insts.iter().any(|inst| {
+                    inst.opcode == ArmOpcode::SubImm
+                        && matches!(inst.operands.first(), Some(MachineOperand::VReg(_)))
+                })
+            }),
+            "alloca address should materialize into a preallocated vreg",
+        );
+        assert!(
+            mf.blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .filter(|inst| inst.opcode == ArmOpcode::Bl)
+                .count()
+                >= 2,
+            "both calls should lower successfully without an unmapped alloca arg vreg",
+        );
     }
 
     #[test]
