@@ -8163,6 +8163,53 @@ end program
 }
 
 #[test]
+fn mixed_scalar_complex_division_compiles_and_runs() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  complex(real64) :: z, got
+
+  z = cmplx(1.0_real64, -1.0_real64, kind=real64)
+  got = 6.0_real64 / z
+
+  if (abs(real(got) - 3.0_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(got) - 3.0_real64) > 1.0e-12_real64) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("mixed_scalar_complex_div", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed scalar/complex division compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "mixed scalar/complex division should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "mixed scalar/complex division runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected mixed scalar/complex division smoke output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn extended_math_intrinsics_compile_and_run() {
     let src = write_program(
         r#"

@@ -12117,6 +12117,57 @@ fn complex_byte_size(ty: &IrType) -> i64 {
     }
 }
 
+fn materialize_complex_operand(
+    b: &mut FuncBuilder,
+    value: ValueId,
+    target_fw: FloatWidth,
+) -> ValueId {
+    let elem_ty = IrType::Float(target_fw);
+    let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);
+    let elem_bytes = b.const_i64(if target_fw == FloatWidth::F64 { 8 } else { 4 });
+    let zero = b.const_i64(0);
+    let buf = b.alloca(arr_ty);
+    let src_ty = b
+        .func()
+        .value_type(value)
+        .unwrap_or(IrType::Int(IntWidth::I32));
+
+    let (real_val, imag_val) = if is_complex_ty(&src_ty) {
+        let src_ptr = match src_ty {
+            IrType::Ptr(_) => value,
+            IrType::Array(_, 2) => {
+                let tmp = b.alloca(src_ty.clone());
+                b.store(value, tmp);
+                tmp
+            }
+            _ => value,
+        };
+        let src_fw = complex_float_width(&src_ty);
+        let src_elem_ty = IrType::Float(src_fw);
+        let src_elem_bytes = b.const_i64(if src_fw == FloatWidth::F64 { 8 } else { 4 });
+        let real_ptr = b.gep(src_ptr, vec![zero], IrType::Int(IntWidth::I8));
+        let imag_ptr = b.gep(src_ptr, vec![src_elem_bytes], IrType::Int(IntWidth::I8));
+        let real = b.load_typed(real_ptr, src_elem_ty.clone());
+        let imag = b.load_typed(imag_ptr, src_elem_ty.clone());
+        (
+            coerce_to_type(b, real, &elem_ty),
+            coerce_to_type(b, imag, &elem_ty),
+        )
+    } else {
+        let imag_zero = match target_fw {
+            FloatWidth::F64 => b.const_f64(0.0),
+            FloatWidth::F32 => b.const_f32(0.0),
+        };
+        (coerce_to_type(b, value, &elem_ty), imag_zero)
+    };
+
+    let real_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+    let imag_ptr = b.gep(buf, vec![elem_bytes], IrType::Int(IntWidth::I8));
+    b.store(real_val, real_ptr);
+    b.store(imag_val, imag_ptr);
+    buf
+}
+
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 ///
@@ -23799,8 +23850,10 @@ fn lower_expr_full(
             // Complex arithmetic: both operands are ptr<[f32/f64 x 2]>.
             // Add/Sub operate component-wise; Mul uses (ac-bd, ad+bc).
             if is_complex_ty(&lty) || is_complex_ty(&rty) {
-                let fw = if complex_float_width(&lty) == FloatWidth::F64
-                    || complex_float_width(&rty) == FloatWidth::F64
+                let fw = if matches!(lty, IrType::Float(FloatWidth::F64))
+                    || matches!(rty, IrType::Float(FloatWidth::F64))
+                    || (is_complex_ty(&lty) && complex_float_width(&lty) == FloatWidth::F64)
+                    || (is_complex_ty(&rty) && complex_float_width(&rty) == FloatWidth::F64)
                 {
                     FloatWidth::F64
                 } else {
@@ -23809,14 +23862,16 @@ fn lower_expr_full(
                 let elem = IrType::Float(fw);
                 let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
                 let zero = b.const_i64(0);
+                let lhs_buf = materialize_complex_operand(b, lhs, fw);
+                let rhs_buf = materialize_complex_operand(b, rhs, fw);
                 // Load components from lhs (re_l, im_l).
-                let re_l_ptr = b.gep(lhs, vec![zero], IrType::Int(IntWidth::I8));
-                let im_l_ptr = b.gep(lhs, vec![esz], IrType::Int(IntWidth::I8));
+                let re_l_ptr = b.gep(lhs_buf, vec![zero], IrType::Int(IntWidth::I8));
+                let im_l_ptr = b.gep(lhs_buf, vec![esz], IrType::Int(IntWidth::I8));
                 let re_l = b.load_typed(re_l_ptr, elem.clone());
                 let im_l = b.load_typed(im_l_ptr, elem.clone());
                 // Load components from rhs (re_r, im_r).
-                let re_r_ptr = b.gep(rhs, vec![zero], IrType::Int(IntWidth::I8));
-                let im_r_ptr = b.gep(rhs, vec![esz], IrType::Int(IntWidth::I8));
+                let re_r_ptr = b.gep(rhs_buf, vec![zero], IrType::Int(IntWidth::I8));
+                let im_r_ptr = b.gep(rhs_buf, vec![esz], IrType::Int(IntWidth::I8));
                 let re_r = b.load_typed(re_r_ptr, elem.clone());
                 let im_r = b.load_typed(im_r_ptr, elem.clone());
                 let arr_ty = IrType::Array(Box::new(elem.clone()), 2);
@@ -23831,6 +23886,19 @@ fn lower_expr_full(
                         let ad = b.fmul(re_l, im_r);
                         let bc = b.fmul(im_l, re_r);
                         (b.fsub(ac, bd), b.fadd(ad, bc))
+                    }
+                    BinaryOp::Div => {
+                        // (a+bi)/(c+di) = ((ac+bd)/(c^2+d^2), (bc-ad)/(c^2+d^2))
+                        let rr = b.fmul(re_r, re_r);
+                        let ii = b.fmul(im_r, im_r);
+                        let denom = b.fadd(rr, ii);
+                        let ac = b.fmul(re_l, re_r);
+                        let bd = b.fmul(im_l, im_r);
+                        let bc = b.fmul(im_l, re_r);
+                        let ad = b.fmul(re_l, im_r);
+                        let real_num = b.fadd(ac, bd);
+                        let imag_num = b.fsub(bc, ad);
+                        (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
                     }
                     _ => (re_l, im_l), // unsupported: return lhs unchanged
                 };
