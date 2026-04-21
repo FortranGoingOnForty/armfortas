@@ -24971,10 +24971,26 @@ fn lower_expr_full(
             ) && (expr_is_character_expr(b, locals, left, st, type_layouts)
                 || expr_is_character_expr(b, locals, right, st, type_layouts))
             {
-                let (lhs_ptr, lhs_len) =
-                    lower_string_expr_with_layouts(b, locals, left, st, type_layouts);
-                let (rhs_ptr, rhs_len) =
-                    lower_string_expr_with_layouts(b, locals, right, st, type_layouts);
+                let (lhs_ptr, lhs_len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    left,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let (rhs_ptr, rhs_len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 let cmp = b.call(
                     FuncRef::External("afs_compare_char".into()),
                     vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],

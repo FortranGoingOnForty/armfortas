@@ -2304,6 +2304,48 @@ fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
 }
 
 #[test]
+fn contained_char_function_in_comparison_uses_internal_call_target() {
+    let dir = unique_dir("contained_char_fn_compare");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  call write_text_file('x', 'hello')\n  if (read_text_file('x') /= 'hello') error stop 1\n  print *, 'ok'\ncontains\n  subroutine write_text_file(path, text)\n    character(len=*), intent(in) :: path\n    character(len=*), intent(in) :: text\n    integer :: unit\n    open(newunit=unit, file=path, status='replace', action='write')\n    write(unit, '(A)') text\n    close(unit)\n  end subroutine write_text_file\n\n  function read_text_file(path) result(text)\n    character(len=*), intent(in) :: path\n    character(len=:), allocatable :: text\n    character(len=256) :: buffer\n    integer :: unit\n    open(newunit=unit, file=path, status='old', action='read')\n    read(unit, '(A)') buffer\n    close(unit)\n    text = trim(buffer)\n  end function read_text_file\nend program p\n",
+    );
+
+    let exe = dir.join("contained_char_fn_compare.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("contained char fn compare compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained char fn compare should compile and link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .current_dir(&dir)
+        .output()
+        .expect("contained char fn compare run failed");
+    assert!(
+        run.status.success(),
+        "contained char fn compare should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected contained char fn compare output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(dir.join("x"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(
