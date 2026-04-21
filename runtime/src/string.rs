@@ -435,6 +435,15 @@ pub extern "C" fn afs_ichar(c: u8) -> i32 {
     c as i32
 }
 
+/// ICHAR from an addressable character byte.
+#[no_mangle]
+pub extern "C" fn afs_ichar_ptr(c: *const u8) -> i32 {
+    if c.is_null() {
+        return 0;
+    }
+    unsafe { *c as i32 }
+}
+
 /// LGE: lexicographic greater-than-or-equal (ASCII collating sequence).
 #[no_mangle]
 pub extern "C" fn afs_lge(a: *const u8, a_len: i64, b: *const u8, b_len: i64) -> i32 {
@@ -724,6 +733,8 @@ mod tests {
     fn char_ichar() {
         assert_eq!(afs_char(65), b'A');
         assert_eq!(afs_ichar(b'A'), 65);
+        let byte = 0xFFu8;
+        assert_eq!(afs_ichar_ptr(&byte), 255);
     }
 
     #[test]

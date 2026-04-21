@@ -407,6 +407,102 @@ fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
 }
 
 #[test]
+fn stream_unformatted_scalar_char_read_preserves_each_byte() {
+    let input = unique_path("stream_unformatted_char_read", "bin");
+    std::fs::write(&input, b"A\0B").expect("cannot write stream char read input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  character(len=1) :: ch\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  do\n    read(unit_num, iostat=ios) ch\n    if (ios /= 0) exit\n    print '(i0)', iachar(ch)\n  end do\n  print '(a,i0)', 'IOS=', ios\n  close(unit_num)\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_char_read.f90",
+    );
+    let out = unique_path("stream_unformatted_char_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted char read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted char read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted char read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted char read run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>())
+            .collect::<Vec<_>>(),
+        vec!["65", "0", "66", "IOS=-1"],
+        "unexpected stream unformatted char read output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
+    let input = unique_path("nonadvancing_a1_char_read", "bin");
+    std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
+
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios\n  character(len=1) :: ch\n  do\n    read(*, '(A1)', advance='no', iostat=ios) ch\n    if (ios /= 0) exit\n    print '(i0)', iachar(ch)\n  end do\n  print '(a,i0)', 'IOS=', ios\nend program\n",
+        "nonadvancing_a1_char_read.f90",
+    );
+    let out = unique_path("nonadvancing_a1_char_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nonadvancing A1 char read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nonadvancing A1 char read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .stdin(std::fs::File::open(&input).expect("cannot open nonadvancing A1 input"))
+        .output()
+        .expect("nonadvancing A1 char read run failed");
+    assert!(
+        run.status.success(),
+        "nonadvancing A1 char read run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>())
+            .collect::<Vec<_>>(),
+        vec!["65", "0", "66", "IOS=-2"],
+        "unexpected nonadvancing A1 char read output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
     let dir = unique_dir("imported_param_char_len");
     let mod_src = write_program_in(
@@ -1130,6 +1226,42 @@ fn allocatable_component_substring_result_keeps_dynamic_upper_bound() {
         "allocatable component substring result run failed: status={:?} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn bind_c_exit_flushes_pending_nonadvancing_stdout_output() {
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  write(*, '(A,A)', advance='no') 'hello', char(0)\n  call c_exit(0_c_int)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("bind_c_exit_flushes_pending_stdout", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("bind(c) exit flush compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "bind(c) exit flush compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("bind(c) exit flush run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) exit flush run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"hello\0",
+        "bind(c) exit should flush pending non-advancing stdout writes"
     );
 
     let _ = std::fs::remove_file(&out);
@@ -3294,6 +3426,36 @@ fn c_f_pointer_array_target_builds_descriptor_backing() {
     assert!(
         run.status.success(),
         "c_f_pointer array run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_f_pointer_scalar_fixed_c_char_pointer_reads_back_bytes() {
+    let src = write_program(
+        "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  type(c_ptr) :: raw\n  character(kind=c_char, len=4), pointer :: view\n  buf = [achar(97, kind=c_char), achar(98, kind=c_char), achar(99, kind=c_char), c_null_char]\n  raw = c_loc(buf(1))\n  call c_f_pointer(raw, view)\n  if (view(1:1) /= achar(97, kind=c_char)) error stop 1\n  if (view(2:2) /= achar(98, kind=c_char)) error stop 2\n  if (view(3:3) /= achar(99, kind=c_char)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_f_pointer_scalar_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_f_pointer scalar fixed c_char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_f_pointer scalar fixed c_char compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_f_pointer scalar fixed c_char run failed");
+    assert!(
+        run.status.success(),
+        "c_f_pointer scalar fixed c_char run failed: {}",
         String::from_utf8_lossy(&run.stderr)
     );
 
@@ -8297,6 +8459,42 @@ fn char_parameter_round_trips_through_amod_import() {
 }
 
 #[test]
+fn char_parameter_concat_with_intrinsic_char_emits_runtime_bytes() {
+    let src = write_program(
+        "module colors\n  implicit none\n  character(len=*), parameter :: color_match = char(27) // '[01;31m'\n  character(len=*), parameter :: color_reset = char(27) // '[0m'\ncontains\n  subroutine check()\n    if (len(color_match) /= 8) error stop 1\n    if (iachar(color_match(1:1)) /= 27) error stop 2\n    if (color_match(2:8) /= '[01;31m') error stop 3\n    if (len(color_reset) /= 4) error stop 4\n    if (iachar(color_reset(1:1)) /= 27) error stop 5\n    if (color_reset(2:4) /= '[0m') error stop 6\n    write(*, '(a)') color_match // 'module' // color_reset\n  end subroutine\nend module\nprogram p\n  use colors\n  implicit none\n  call check()\nend program\n",
+        "char_param_intrinsic_concat.f90",
+    );
+    let out = unique_path("char_param_intrinsic_concat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char intrinsic concat compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "char intrinsic concat program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("char intrinsic concat run failed");
+    assert!(
+        run.status.success(),
+        "char intrinsic concat program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "\u{1b}[01;31mmodule\u{1b}[0m\n",
+        "unexpected char intrinsic concat runtime output"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reexported_c_null_char_round_trips_through_amod_import() {
     let dir = unique_dir("reexported_c_null_char_amod");
     let wrapper_src = write_program_in(
@@ -8682,6 +8880,128 @@ fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_fixed_logical_component_array_whole_assignment_clears_all_elements() {
+    let dir = unique_dir("imported_fixed_logical_component_clear");
+    let mod_src = write_program_in(
+        &dir,
+        "types_mod.f90",
+        "module types_mod\n  implicit none\n  type :: token_t\n    logical :: char_class(0:255) = .true.\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use types_mod\n  implicit none\n  type(token_t) :: tok\n  tok%char_class = .false.\n  tok%char_class(iachar('a')) = .true.\n  tok%char_class(iachar('b')) = .true.\n  tok%char_class(iachar('c')) = .true.\n  if (.not. tok%char_class(iachar('a'))) error stop 1\n  if (tok%char_class(iachar('z'))) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("types_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("logical component module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "logical component module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("logical component consumer compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "logical component consumer should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("logical_component_clear.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("logical component link spawn failed");
+    assert!(
+        link.status.success(),
+        "logical component .amod link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("logical component run failed");
+    assert!(
+        run.status.success(),
+        "logical component runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "logical component whole-array assignment should clear the imported component storage: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ichar_and_iachar_treat_high_bit_bytes_as_unsigned() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=1) :: c\n  c = achar(255)\n  if (ichar(c) /= 255) error stop 1\n  if (iachar(c) /= 255) error stop 2\n  print *, ichar(c), iachar(c)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ichar_unsigned_high_bit", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("ichar unsigned compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "ichar unsigned compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("ichar unsigned run failed");
+    assert!(
+        run.status.success(),
+        "ichar unsigned runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("255"),
+        "ichar/iachar should preserve unsigned byte values: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -10967,6 +11287,43 @@ fn whole_component_char_array_actual_preserves_hidden_len() {
 }
 
 #[test]
+fn fixed_char_component_array_actual_preserves_bounds_in_assumed_shape_dummy() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: max_path_len = 32\n  type :: opts_t\n    character(len=max_path_len) :: globs(4) = ''\n    integer :: n = 0\n  end type opts_t\n  type(opts_t) :: opts\n  opts%globs(1) = 'foo'\n  opts%n = 1\n  call check(opts%globs, opts%n)\ncontains\n  subroutine check(globs, n)\n    character(len=max_path_len), intent(in) :: globs(:)\n    integer, intent(in) :: n\n    if (lbound(globs, 1) /= 1) error stop 1\n    if (ubound(globs, 1) /= 4) error stop 2\n    if (n > 0 .and. trim(globs(1)) /= 'foo') error stop 3\n    print *, trim(globs(1))\n  end subroutine check\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_component_char_array_actual_bounds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed component char array actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed component char array actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed component char array actual run failed");
+    assert!(
+        run.status.success(),
+        "fixed component char array actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("foo"),
+        "unexpected fixed component char array actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_char_component_array_copy_preserves_contents() {
     let src = write_program(
         "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: src_cmd, dst_cmd\n  allocate(character(len=4) :: src_cmd%tokens(2), dst_cmd%tokens(2))\n  src_cmd%tokens(1) = 'read'\n  src_cmd%tokens(2) = 'line'\n  dst_cmd%tokens = src_cmd%tokens\n  if (trim(dst_cmd%tokens(1)) /= 'read') error stop 1\n  if (trim(dst_cmd%tokens(2)) /= 'line') error stop 2\n  print *, trim(dst_cmd%tokens(1)), trim(dst_cmd%tokens(2))\nend program\n",
@@ -11413,6 +11770,43 @@ fn logical_whole_array_copy_preserves_elements() {
 }
 
 #[test]
+fn logical_component_array_copy_preserves_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: token_t\n    logical :: bits(0:255)\n  end type\n  type :: node_t\n    logical :: bits(0:255)\n  end type\n  type(token_t) :: tok\n  type(node_t) :: node\n  tok%bits = .false.\n  tok%bits(iachar('a')) = .true.\n  node%bits = tok%bits\n  if (.not. node%bits(iachar('a'))) error stop 1\n  if (node%bits(iachar('z'))) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_component_array_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("logical component array copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical component array copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("logical component array copy run failed");
+    assert!(
+        run.status.success(),
+        "logical component array copy run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected logical component array copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_section_copy_preserves_elements() {
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = .false.\n  dest(1:3) = src(1:3)\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
@@ -11442,6 +11836,43 @@ fn logical_section_copy_preserves_elements() {
     assert!(
         stdout.contains("ok"),
         "unexpected logical section copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn local_logical_array_broadcast_does_not_clobber_prior_stack_local() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: payload_t\n    character(len=16) :: text = ''\n  end type\n  call wrapper()\n  print *, 'ok'\ncontains\n  subroutine fill(payload, flags, line)\n    type(payload_t), intent(in) :: payload\n    logical, intent(out) :: flags(256)\n    character(len=:), allocatable, intent(out) :: line\n    flags = .false.\n    line = payload%text\n  end subroutine\n\n  subroutine wrapper()\n    type(payload_t) :: payload\n    logical :: flags(256)\n    character(len=:), allocatable :: line\n    payload%text = 'hello'\n    call fill(payload, flags, line)\n    if (trim(line) /= 'hello') error stop 1\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_array_stack_overlap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("logical array stack overlap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical array stack overlap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("logical array stack overlap run failed");
+    assert!(
+        run.status.success(),
+        "logical array stack overlap run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected logical array stack overlap output: {}",
         stdout
     );
 

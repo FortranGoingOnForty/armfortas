@@ -1732,12 +1732,13 @@ fn select_inst(
             };
 
             // Determine element size from the GEP result type (Ptr<elem_ty>).
-            // Use the IR semantic size, not alloca_size(): logical arrays are
-            // represented as packed bytes in memory even though scalar bool
-            // allocas reserve 4 bytes for stack alignment.
+            // Scalar IR bool values are lowered as byte-sized SSA values, but
+            // Fortran LOGICAL storage still uses the default 4-byte kind in
+            // stack slots and arrays.
             let elem_size = match &inst.ty {
                 IrType::Ptr(inner) => match inner.as_ref() {
                     IrType::Struct(_) => alloca_size(inner) as i64,
+                    IrType::Bool => 4,
                     _ => inner.size_bytes() as i64,
                 },
                 _ => 4, // fallback
@@ -2929,10 +2930,11 @@ fn alloca_size(ty: &IrType) -> u32 {
         IrType::Float(w) => w.bytes(),
         IrType::Ptr(_) => 8,
         IrType::Array(elem, count) => {
-            // Arrays must use the IR's semantic element size so packed logical
-            // arrays occupy one byte per element in memory. Scalar logical
-            // allocas still reserve 4 bytes for stack alignment.
+            // Stack storage uses ABI-sized elements. Fortran LOGICAL arrays are
+            // stored as default-kind 4-byte elements, even though Bool SSA
+            // values themselves remain byte-sized.
             let elem_size = match elem.as_ref() {
+                IrType::Bool => 4,
                 IrType::Struct(_) => alloca_size(elem),
                 _ => elem.size_bytes() as u32,
             };
@@ -3489,8 +3491,8 @@ mod tests {
     }
 
     #[test]
-    fn logical_arrays_use_packed_semantic_size_for_stack_slots() {
-        assert_eq!(alloca_size(&IrType::Array(Box::new(IrType::Bool), 3)), 3);
+    fn logical_arrays_use_default_kind_storage_for_stack_slots() {
+        assert_eq!(alloca_size(&IrType::Array(Box::new(IrType::Bool), 3)), 12);
         assert_eq!(
             alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3)),
             12

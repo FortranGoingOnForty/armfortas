@@ -3713,6 +3713,29 @@ fn eval_const_char_bytes(
         Expr::StringLiteral { value, .. } => Some(value.as_bytes().to_vec()),
         Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned(),
         Expr::ParenExpr { inner } => eval_const_char_bytes(inner, param_chars),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let intrinsic = name.to_lowercase();
+            if intrinsic != "char" && intrinsic != "achar" {
+                return None;
+            }
+            if args.len() != 1 || args[0].keyword.is_some() {
+                return None;
+            }
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
+                return None;
+            };
+            let empty_consts = HashMap::new();
+            let ConstScalar::Int(code) = eval_const_scalar(arg_expr, &empty_consts)? else {
+                return None;
+            };
+            if !(0..=255).contains(&code) {
+                return None;
+            }
+            Some(vec![code as u8])
+        }
         Expr::BinaryOp {
             op: BinaryOp::Concat,
             left,
@@ -5428,6 +5451,38 @@ fn alloc_decls(
                         }
                         continue;
                     }
+                    if is_pointer_attr && array_spec.is_none() {
+                        // Fixed-length scalar character POINTERs use a pointer
+                        // slot, not inline character storage. Intrinsics like
+                        // c_f_pointer populate this slot with the associated
+                        // byte buffer address, and later substring/character
+                        // reads must dereference it.
+                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        let zero = b.const_i32(0);
+                        let eight = b.const_i64(8);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![addr, zero, eight],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: IrType::Int(IntWidth::I8),
+                                dims: vec![],
+                                allocatable: false,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: CharKind::Fixed(len),
+                                derived_type: None,
+                                inline_const: None,
+                                is_pointer: true,
+                                runtime_dim_upper: vec![],
+                            },
+                        );
+                        continue;
+                    }
                     if !is_allocatable {
                         // Fixed-length character(N): alloca N+1 bytes so call-boundary
                         // lowering can rely on a stable trailing NUL while the Fortran
@@ -6768,7 +6823,14 @@ fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(Valu
             if !info.dims.is_empty() {
                 return None;
             }
-            let ptr = if info.by_ref {
+            let ptr = if info.is_pointer {
+                let slot = if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                };
+                b.load_typed(slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else if info.by_ref {
                 let outer = b.load(info.addr);
                 b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
             } else {
@@ -7110,10 +7172,9 @@ fn lower_char_intrinsic(
         "ichar" | "iachar" => {
             let (ptr, _) =
                 lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
-            let byte = b.load_typed(ptr, IrType::Int(IntWidth::I8));
             Some(b.call(
-                FuncRef::External("afs_ichar".into()),
-                vec![byte],
+                FuncRef::External("afs_ichar_ptr".into()),
+                vec![ptr],
                 IrType::Int(IntWidth::I32),
             ))
         }
@@ -13478,8 +13539,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
                 Expr::ComponentAccess { base, component } => {
                     // x%field = val (supports chained: x%a%b = val).
-                    if let Some(info) =
-                        component_array_local_info(b, &ctx.locals, target, ctx.st, ctx.type_layouts)
+                    if let Some(info) = component_intrinsic_local_info(
+                        b,
+                        &ctx.locals,
+                        target,
+                        ctx.st,
+                        ctx.type_layouts,
+                    )
                     {
                         if local_is_array_like(&info) {
                             lower_array_assign(b, ctx, "", &info, value);
@@ -15662,6 +15728,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Read { controls, items } => {
+            let nonadvancing = controls
+                .iter()
+                .find(|c| {
+                    c.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("advance"))
+                        .unwrap_or(false)
+                })
+                .and_then(|c| match &c.value.node {
+                    Expr::StringLiteral { value, .. } => Some(value.eq_ignore_ascii_case("no")),
+                    Expr::Name { name } => Some(name.eq_ignore_ascii_case("no")),
+                    _ => None,
+                })
+                .unwrap_or(false);
             let err_label = controls.iter().find_map(|c| {
                 if c.keyword
                     .as_deref()
@@ -15782,6 +15862,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     unit,
                     fmt_ptr,
                     fmt_len,
+                    nonadvancing,
                     iostat_addr,
                     size_addr,
                 );
@@ -17499,11 +17580,14 @@ fn lower_alloc_bounds(
 fn ir_scalar_byte_size(ty: &IrType) -> i64 {
     match ty {
         IrType::Array(elem, count) => (elem.size_bytes() * count) as i64,
-        IrType::Int(IntWidth::I8) | IrType::Bool => 1,
+        IrType::Int(IntWidth::I8) => 1,
         IrType::Int(IntWidth::I16) => 2,
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
         IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
         IrType::Int(IntWidth::I128) => 16,
+        // Fortran default LOGICAL arrays/components occupy 4-byte storage
+        // slots even though Bool values stay compact in SSA form.
+        IrType::Bool => 4,
         _ => 8,
     }
 }
@@ -18325,6 +18409,9 @@ fn lower_list_read_items(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
+        if lower_list_char_read_item(b, ctx, item, unit, iostat) {
+            continue;
+        }
         let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
@@ -18855,6 +18942,33 @@ fn lower_read_target_addr(
     }
 }
 
+fn lower_list_char_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    unit: ValueId,
+    iostat: ValueId,
+) -> bool {
+    if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
+        return false;
+    }
+
+    let (dest_ptr, dest_len) = if let Some((ptr, len)) =
+        char_addr_and_substring_bound_len(b, item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+    {
+        (ptr, len)
+    } else {
+        lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+    };
+
+    b.call(
+        FuncRef::External("afs_read_string".into()),
+        vec![unit, dest_ptr, dest_len, iostat],
+        IrType::Void,
+    );
+    true
+}
+
 fn lower_formatted_internal_read_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -18880,7 +18994,7 @@ fn lower_formatted_internal_read_items(
 
     for item in items {
         if lower_formatted_char_read_item(
-            b, ctx, item, mode, fmt_ptr, fmt_len, item_idx, iostat, size_out,
+            b, ctx, item, mode, fmt_ptr, fmt_len, item_idx, false, iostat, size_out,
         ) {
             continue;
         }
@@ -18901,6 +19015,7 @@ fn lower_formatted_read_items(
     unit: ValueId,
     fmt_ptr: ValueId,
     fmt_len: ValueId,
+    nonadvancing: bool,
     iostat: ValueId,
     size_out: ValueId,
 ) {
@@ -18917,7 +19032,16 @@ fn lower_formatted_read_items(
 
     for item in items {
         if lower_formatted_char_read_item(
-            b, ctx, item, mode, fmt_ptr, fmt_len, item_idx, iostat, size_out,
+            b,
+            ctx,
+            item,
+            mode,
+            fmt_ptr,
+            fmt_len,
+            item_idx,
+            nonadvancing,
+            iostat,
+            size_out,
         ) {
             continue;
         }
@@ -18939,6 +19063,7 @@ fn lower_formatted_char_read_item(
     fmt_ptr: ValueId,
     fmt_len: ValueId,
     item_idx: ValueId,
+    nonadvancing: bool,
     iostat: ValueId,
     size_out: ValueId,
 ) -> bool {
@@ -18957,20 +19082,28 @@ fn lower_formatted_char_read_item(
 
     match mode {
         ReadMode::FormattedUnit { unit, .. } => {
-            b.call(
-                FuncRef::External("afs_fmt_read_string".into()),
-                vec![
-                    unit,
-                    fmt_ptr,
-                    fmt_len,
-                    current_idx,
-                    dest_ptr,
-                    dest_len,
-                    size_out,
-                    iostat,
-                ],
-                IrType::Void,
-            );
+            if nonadvancing {
+                b.call(
+                    FuncRef::External("afs_fmt_read_string_noadvance".into()),
+                    vec![unit, fmt_ptr, fmt_len, dest_ptr, dest_len, size_out, iostat],
+                    IrType::Void,
+                );
+            } else {
+                b.call(
+                    FuncRef::External("afs_fmt_read_string".into()),
+                    vec![
+                        unit,
+                        fmt_ptr,
+                        fmt_len,
+                        current_idx,
+                        dest_ptr,
+                        dest_len,
+                        size_out,
+                        iostat,
+                    ],
+                    IrType::Void,
+                );
+            }
         }
         ReadMode::FormattedInternal {
             buf_ptr, buf_len, ..
@@ -20137,6 +20270,28 @@ fn whole_array_expr_info(
         .cloned()
 }
 
+fn whole_array_expr_local_info(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<LocalInfo> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => whole_array_expr_local_info(b, locals, inner, st, type_layouts),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            locals
+                .get(&key)
+                .filter(|info| local_is_array_like(info))
+                .cloned()
+        }
+        Expr::ComponentAccess { .. } => component_intrinsic_local_info(b, locals, expr, st, type_layouts)
+            .filter(|info| local_is_array_like(info)),
+        _ => None,
+    }
+}
+
 fn whole_array_named_info(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -20616,7 +20771,7 @@ fn lower_array_expr_descriptor(
         }
         Expr::ComponentAccess { .. } => {
             let tl = type_layouts?;
-            let info = component_array_local_info(b, locals, expr, st, tl)?;
+            let info = component_intrinsic_local_info(b, locals, expr, st, tl)?;
             if local_is_array_like(&info) {
                 let desc = if local_uses_array_descriptor(&info) {
                     array_descriptor_addr(b, &info)
@@ -20633,7 +20788,7 @@ fn lower_array_expr_descriptor(
                 Expr::Name { name } => locals.get(&name.to_lowercase()).cloned(),
                 Expr::ComponentAccess { .. } => {
                     let tl = type_layouts?;
-                    component_array_local_info(b, locals, callee, st, tl)
+                    component_intrinsic_local_info(b, locals, callee, st, tl)
                 }
                 _ => None,
             };
@@ -21262,36 +21417,22 @@ fn lower_array_assign(
         return;
     }
 
-    // Check if RHS is also an array variable → element-wise copy via memcpy.
-    let rhs_is_array = if let Expr::Name { name } = &value.node {
-        ctx.locals
-            .get(&name.to_lowercase())
-            .map(|i| !i.dims.is_empty() || i.allocatable)
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    if rhs_is_array {
-        // a = b: memcpy from b's data to a's data.
+    if let Some(src_info) =
+        whole_array_expr_local_info(b, &ctx.locals, value, ctx.st, ctx.type_layouts)
+    {
+        // a = b: memcpy from the RHS array's data into the destination.
         let dest_base = array_base_addr(b, dest_info);
+        let src_base = array_base_addr(b, &src_info);
 
-        if let Expr::Name { name } = &value.node {
-            let key = name.to_lowercase();
-            if let Some(src_info) = ctx.locals.get(&key) {
-                let src_base = array_base_addr(b, src_info);
-
-                // Compute byte count: size(a) * elem_size.
-                let n = array_total_elems_value(b, dest_info);
-                let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-                let byte_count = b.imul(n, elem_bytes);
-                b.call(
-                    FuncRef::External("memcpy".into()),
-                    vec![dest_base, src_base, byte_count],
-                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                );
-            }
-        }
+        // Compute byte count: size(a) * storage size of each element.
+        let n = array_total_elems_value(b, dest_info);
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        let byte_count = b.imul(n, elem_bytes);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_base, src_base, byte_count],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
     } else {
         if dest_info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(dest_info)
         {

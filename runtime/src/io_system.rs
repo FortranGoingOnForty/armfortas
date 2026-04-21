@@ -92,6 +92,8 @@ struct Unit {
     read_tokens: Vec<String>,
     /// Cached formatted input record for the current READ statement.
     formatted_read_record: Option<String>,
+    /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
+    formatted_read_cursor: usize,
 }
 
 impl Unit {
@@ -219,6 +221,7 @@ impl IoState {
                 recl: None,
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
+                formatted_read_cursor: 0,
             },
         );
         units.insert(
@@ -234,6 +237,7 @@ impl IoState {
                 recl: None,
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
+                formatted_read_cursor: 0,
             },
         );
         units.insert(
@@ -249,6 +253,7 @@ impl IoState {
                 recl: None,
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
+                formatted_read_cursor: 0,
             },
         );
 
@@ -450,6 +455,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     recl: if recl > 0 { Some(recl) } else { None },
                     read_tokens: Vec::new(),
                     formatted_read_record: None,
+                    formatted_read_cursor: 0,
                 },
             );
 
@@ -872,6 +878,91 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                     unsafe {
                         *iostat = 1;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Read a character value from an external unit.
+///
+/// For formatted/list-directed units this consumes the next token. For
+/// stream-unformatted units it performs a raw byte read into the caller's
+/// fixed-length character storage.
+#[no_mangle]
+pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+
+    if dest_len < 0 {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    }
+
+    if u.form == Form::Unformatted && u.access == Access::Stream {
+        let mut bytes = vec![b' '; dest_len as usize];
+        match u.read_raw(&mut bytes) {
+            Ok(0) => {
+                crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                }
+            }
+            Ok(n) => {
+                crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), n as i64);
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 0;
+                    }
+                }
+            }
+            Err(_) => {
+                crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    match u.next_read_token() {
+        Ok(Some(token)) => {
+            crate::string::afs_assign_char_fixed(dest, dest_len, token.as_ptr(), token.len() as i64);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+        }
+        Ok(None) => {
+            crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = IOSTAT_END;
+                }
+            }
+        }
+        Err(_) => {
+            crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
                 }
             }
         }
@@ -2570,6 +2661,102 @@ pub extern "C" fn afs_fmt_read_string(
                     *iostat = code;
                 }
             }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_string_noadvance(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    let descs = parse_format(&fmt);
+
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        store_formatted_char_error(dest, dest_len, size_out, 1);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+
+    if u.formatted_read_record.is_none() {
+        match u.read_line() {
+            Ok(line) if !line.is_empty() => {
+                u.formatted_read_record = Some(line.trim_end_matches(['\r', '\n']).to_string());
+                u.formatted_read_cursor = 0;
+            }
+            Ok(_) => {
+                store_formatted_char_error(dest, dest_len, size_out, IOSTAT_END);
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                }
+                return;
+            }
+            Err(_) => {
+                store_formatted_char_error(dest, dest_len, size_out, 1);
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    let input = u
+        .formatted_read_record
+        .as_ref()
+        .map(|line| line.as_bytes().to_vec())
+        .unwrap_or_default();
+    if u.formatted_read_cursor >= input.len() {
+        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = IOSTAT_EOR;
+            }
+        }
+        u.formatted_read_record = None;
+        u.formatted_read_cursor = 0;
+        return;
+    }
+    let mut cursor = u.formatted_read_cursor;
+    let mut remaining = 0usize;
+
+    match extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining) {
+        Some((FormatDesc::Character { .. }, field)) => {
+            store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+            u.formatted_read_cursor = cursor;
+        }
+        Some(_) => {
+            store_formatted_char_error(dest, dest_len, size_out, 1);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+        }
+        None => {
+            store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = IOSTAT_EOR;
+                }
+            }
+            u.formatted_read_record = None;
+            u.formatted_read_cursor = 0;
         }
     }
 }
