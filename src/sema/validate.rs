@@ -1669,6 +1669,7 @@ fn validate_pointer_assignment(
         // ancestor on the path carries one of those attributes.
         if let Some(leaf) = leaf_field_layout(ctx, value) {
             let ok = leaf.field.pointer
+                || leaf.field.allocatable
                 || leaf.field.target
                 || leaf.ancestor_is_target
                 || leaf.ancestor_is_allocatable;
@@ -3018,6 +3019,25 @@ end program
 ",
         );
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn pointer_assignment_from_allocatable_component_element_ok() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  type :: node
+    type(node), allocatable :: children(:)
+  end type
+  type(node), target :: root
+  type(node), pointer :: p
+  allocate(root%children(1))
+  p => root%children(1)
+end program
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
     // ---- Pure constraints ----
