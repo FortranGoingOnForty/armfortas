@@ -237,10 +237,10 @@ fn eval_const_logical_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<bool>
     match &expr.node {
         Expr::LogicalLiteral { value, .. } => Some(*value),
         Expr::ParenExpr { inner } => eval_const_logical_expr(inner),
-        Expr::UnaryOp { op, operand } => match op {
-            crate::ast::expr::UnaryOp::Not => eval_const_logical_expr(operand).map(|v| !v),
-            _ => None,
-        },
+        Expr::UnaryOp {
+            op: crate::ast::expr::UnaryOp::Not,
+            operand,
+        } => eval_const_logical_expr(operand).map(|v| !v),
         _ => None,
     }
 }

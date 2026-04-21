@@ -96,6 +96,39 @@ fn block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
     &func_section[start..end]
 }
 
+fn last_block_section<'a>(func_section: &'a str, prefix: &str) -> &'a str {
+    let mut starts = Vec::new();
+
+    for (idx, _line) in func_section.match_indices('\n') {
+        let line_start = idx + 1;
+        let tail = &func_section[line_start..];
+        let line_text = tail.split_once('\n').map(|(line, _)| line).unwrap_or(tail);
+        if line_text.starts_with("    ")
+            && !line_text.starts_with("      ")
+            && line_text[4..].starts_with(prefix)
+        {
+            starts.push(line_start);
+        }
+    }
+
+    let start = *starts
+        .last()
+        .unwrap_or_else(|| panic!("missing block with prefix {}", prefix));
+    let tail = &func_section[start..];
+    let end = tail
+        .match_indices('\n')
+        .find_map(|(idx, _)| {
+            let line_start = idx + 1;
+            let rest = &tail[line_start..];
+            let line_text = rest.split_once('\n').map(|(line, _)| line).unwrap_or(rest);
+            ((line_text.starts_with("    ") && !line_text.starts_with("      "))
+                || line_text == "  }")
+                .then_some(idx)
+        })
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
 fn tail_after<'a>(text: &'a str, needle: &str) -> &'a str {
     let start = text
         .find(needle)
@@ -233,8 +266,8 @@ fn o2_forwards_branch_join_reuse_across_noalias_side_call() {
 
     let raw_branchy = function_section(&raw_ir, helper_names[2]);
     let opt_branchy = function_section(&opt_ir, helper_names[2]);
-    let raw_join = block_section(raw_branchy, "if_end_9");
-    let opt_join = block_section(opt_branchy, "if_end_9");
+    let raw_join = last_block_section(raw_branchy, "if_end_");
+    let opt_join = last_block_section(opt_branchy, "if_end_");
 
     assert!(
         raw_join.contains("gep") && raw_join.contains("load"),

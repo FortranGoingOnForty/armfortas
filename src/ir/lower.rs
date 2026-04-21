@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::rc::Rc;
 
+type AmbiguousUseWarnings = Rc<RefCell<HashSet<(String, String, String)>>>;
+
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
 
@@ -164,7 +166,7 @@ struct LowerCtx<'a> {
     /// install_globals_as_locals. Large fortsh units can otherwise print the
     /// exact same ambiguity hundreds or thousands of times while lowering each
     /// contained procedure separately.
-    ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>>,
+    ambiguous_use_warnings: AmbiguousUseWarnings,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -179,7 +181,7 @@ impl<'a> LowerCtx<'a> {
         elemental_funcs: &'a HashSet<String>,
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
         contained_host_refs: &'a HashMap<String, Vec<String>>,
-        ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>>,
+        ambiguous_use_warnings: AmbiguousUseWarnings,
     ) -> Self {
         Self {
             locals: HashMap::new(),
@@ -287,8 +289,7 @@ pub fn lower_file(
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into());
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
-    let ambiguous_use_warnings: Rc<RefCell<HashSet<(String, String, String)>>> =
-        Rc::new(RefCell::new(HashSet::new()));
+    let ambiguous_use_warnings: AmbiguousUseWarnings = Rc::new(RefCell::new(HashSet::new()));
 
     // Pass 1: collect module-level variables.  Submodule decls are
     // installed under their parent module's name so the submodule's
@@ -2554,7 +2555,7 @@ fn lower_unit(
     // names it reads or writes. Drives both callee signature
     // (hidden trailing pointer params) and call-site arg list.
     contained_host_refs: &HashMap<String, Vec<String>>,
-    ambiguous_use_warnings: &Rc<RefCell<HashSet<(String, String, String)>>>,
+    ambiguous_use_warnings: &AmbiguousUseWarnings,
     internal_only: bool,
 ) {
     match &unit.node {
@@ -4796,7 +4797,7 @@ fn install_globals_as_locals(
     required_names: Option<&HashSet<String>>,
     host_module: Option<&str>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &Rc<RefCell<HashSet<(String, String, String)>>>,
+    ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -13368,7 +13369,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                                     IrType::Void,
                                                 );
-                                                return;
                                             }
                                         }
                                     }
@@ -13448,7 +13448,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                                     IrType::Void,
                                                 );
-                                                return;
                                             }
                                         }
                                     }
@@ -16129,7 +16128,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 if !tgt_field.pointer {
                     return;
                 }
-                if is_deferred_char_component_field(&tgt_field) {
+                if is_deferred_char_component_field(tgt_field) {
                     if let Expr::FunctionCall { callee, .. } = &value.node {
                         if let Expr::Name { name } = &callee.node {
                             if name.eq_ignore_ascii_case("null") {
@@ -20335,8 +20334,14 @@ fn whole_array_expr_local_info(
                 .filter(|info| local_is_array_like(info))
                 .cloned()
         }
-        Expr::ComponentAccess { .. } => component_intrinsic_local_info(b, locals, expr, st, type_layouts)
-            .filter(|info| local_is_array_like(info)),
+        Expr::ComponentAccess { .. } => component_intrinsic_local_info(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+        )
+        .filter(local_is_array_like),
         _ => None,
     }
 }
@@ -21977,7 +21982,7 @@ fn component_intrinsic_local_info(
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<LocalInfo> {
     let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
-    if field.size == 384 && (field.allocatable || field.pointer) {
+    if field_uses_array_descriptor(&field) {
         return Some(LocalInfo {
             addr: field_ptr,
             ty: field_storage_ir_type(&field, tl),
@@ -22908,6 +22913,12 @@ fn field_storage_ir_type(
     }
 }
 
+fn field_uses_array_descriptor(field: &crate::sema::type_layout::FieldLayout) -> bool {
+    field.size == 384
+        && (field.allocatable || field.pointer)
+        && (field.declared_array || !field.dims.is_empty())
+}
+
 fn component_array_local_info(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -22916,7 +22927,7 @@ fn component_array_local_info(
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<LocalInfo> {
     let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
-    if field.size != 384 || !(field.allocatable || field.pointer) {
+    if !field_uses_array_descriptor(&field) {
         return None;
     }
     Some(LocalInfo {

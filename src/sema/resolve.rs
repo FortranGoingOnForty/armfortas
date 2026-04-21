@@ -943,7 +943,7 @@ fn find_unit_scope(st: &SymbolTable, parent_scope: ScopeId, unit: &ProgramUnit) 
 fn exported_const_int_params(
     st: &SymbolTable,
     scope_id: ScopeId,
-    visible_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+    _visible_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
     exported_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
 ) -> HashMap<String, i64> {
     if let Some(cached) = exported_cache.get(&scope_id) {
@@ -986,7 +986,7 @@ fn exported_const_int_params(
             continue;
         }
         for (name, value) in
-            exported_const_int_params(st, assoc.source_scope, visible_cache, exported_cache)
+            exported_const_int_params(st, assoc.source_scope, _visible_cache, exported_cache)
         {
             out.entry(name).or_insert(value);
         }

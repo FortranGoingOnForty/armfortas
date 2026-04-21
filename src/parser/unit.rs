@@ -731,12 +731,8 @@ impl<'a> Parser<'a> {
                         self.advance();
                     } // consume ::
                     let mut names = Vec::new();
-                    loop {
-                        if let Some(name) = self.parse_access_list_item()? {
-                            names.push(name);
-                        } else {
-                            break;
-                        }
+                    while let Some(name) = self.parse_access_list_item()? {
+                        names.push(name);
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }
