@@ -85,12 +85,14 @@ impl<'a> Parser<'a> {
                 self.parse_stop(start, false)
             }
             "error" => {
-                self.advance();
-                if self.peek_text().eq_ignore_ascii_case("stop") {
+                if self.tokens.get(self.pos + 1).is_some_and(|tok| {
+                    tok.kind == TokenKind::Identifier && tok.text.eq_ignore_ascii_case("stop")
+                }) {
+                    self.advance();
                     self.advance();
                     self.parse_stop(start, true)
                 } else {
-                    Err(self.error("expected 'stop' after 'error'".into()))
+                    self.parse_assignment_or_call(start)
                 }
             }
             "entry" => {
@@ -1760,6 +1762,18 @@ mod tests {
     fn error_stop() {
         let s = parse_one("error stop\n");
         assert!(matches!(s.node, Stmt::ErrorStop { .. }));
+    }
+
+    #[test]
+    fn error_name_can_start_assignment() {
+        let s = parse_one("error = 1\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
+    }
+
+    #[test]
+    fn error_name_can_start_component_assignment() {
+        let s = parse_one("error%has_error = parser%has_error\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
     }
 
     #[test]
