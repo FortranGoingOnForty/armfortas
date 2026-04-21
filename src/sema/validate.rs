@@ -1451,7 +1451,19 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // Nullify: items must be pointers.
         Stmt::Nullify { items } => {
             for item in items {
-                if let Some(ref name) = extract_base_name(item) {
+                if expr_selects_component(item) {
+                    if let Some(leaf) = leaf_field_layout(ctx, item) {
+                        if !leaf.field.pointer {
+                            ctx.error(
+                                item.span,
+                                format!(
+                                    "NULLIFY target component '{}' must have pointer attribute",
+                                    leaf.field.name
+                                ),
+                            );
+                        }
+                    }
+                } else if let Some(ref name) = extract_base_name(item) {
                     let is_pointer = ctx.lookup(name).map(|s| s.attrs.pointer).unwrap_or(true);
                     if !is_pointer {
                         ctx.error(
