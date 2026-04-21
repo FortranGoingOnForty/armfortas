@@ -49,7 +49,12 @@ fn global_lsf_function(func: &mut Function) -> bool {
                 if let Some(forwarded_val) =
                     find_reaching_store(func, &idoms, &preds, block.id, inst.id, *ptr)
                 {
-                    replacements.insert(inst.id, forwarded_val);
+                    if func
+                        .value_type(forwarded_val)
+                        .is_some_and(|ty| ty == inst.ty)
+                    {
+                        replacements.insert(inst.id, forwarded_val);
+                    }
                 }
             }
         }
@@ -797,5 +802,101 @@ mod tests {
         } else {
             panic!("unexpected terminator after GlobalLsf: {:?}", term);
         }
+    }
+
+    #[test]
+    fn does_not_forward_scalar_store_into_aggregate_load() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let load_block = f.create_block("load");
+        let arr_ty = IrType::Array(
+            Box::new(IrType::Float(crate::ir::types::FloatWidth::F64)),
+            2,
+        );
+
+        let alloca = f.next_value_id();
+        f.register_type(alloca, IrType::Ptr(Box::new(arr_ty.clone())));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: alloca,
+            ty: IrType::Ptr(Box::new(arr_ty.clone())),
+            span,
+            kind: InstKind::Alloca(arr_ty.clone()),
+        });
+
+        let zero = f.next_value_id();
+        f.register_type(zero, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: zero,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(0, IntWidth::I64),
+        });
+
+        let elem_ptr = f.next_value_id();
+        f.register_type(
+            elem_ptr,
+            IrType::Ptr(Box::new(IrType::Float(crate::ir::types::FloatWidth::F64))),
+        );
+        f.block_mut(f.entry).insts.push(Inst {
+            id: elem_ptr,
+            ty: IrType::Ptr(Box::new(IrType::Float(crate::ir::types::FloatWidth::F64))),
+            span,
+            kind: InstKind::GetElementPtr(alloca, vec![zero]),
+        });
+
+        let scalar = f.next_value_id();
+        f.register_type(scalar, IrType::Float(crate::ir::types::FloatWidth::F64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: scalar,
+            ty: IrType::Float(crate::ir::types::FloatWidth::F64),
+            span,
+            kind: InstKind::ConstFloat(1.5, crate::ir::types::FloatWidth::F64),
+        });
+
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(scalar, elem_ptr),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(load_block, vec![]));
+
+        let load = f.next_value_id();
+        f.register_type(load, arr_ty.clone());
+        f.block_mut(load_block).insts.push(Inst {
+            id: load,
+            ty: arr_ty,
+            span,
+            kind: InstKind::Load(alloca),
+        });
+        f.block_mut(load_block).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let pass = GlobalLsf;
+        assert!(
+            !pass.run(&mut m),
+            "global-lsf must not forward a scalar store into an aggregate load"
+        );
+
+        let func = &m.functions[0];
+        let load_inst = func
+            .block(load_block)
+            .insts
+            .iter()
+            .find(|inst| inst.id == load)
+            .expect("load should still exist");
+        assert!(
+            matches!(load_inst.kind, InstKind::Load(ptr) if ptr == alloca),
+            "aggregate load should remain untouched, got {:?}",
+            load_inst.kind
+        );
     }
 }
