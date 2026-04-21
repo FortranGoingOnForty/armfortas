@@ -378,6 +378,7 @@ pub fn compute_layout(
 
             let ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
+                let declared_array = entity.array_spec.is_some() || has_dimension_attr;
                 let dims = if is_allocatable || is_pointer {
                     Vec::new()
                 } else {
@@ -386,10 +387,10 @@ pub fn compute_layout(
                 let (elem_size, elem_align) =
                     if matches!(&ti, TypeInfo::Character { len: None, .. })
                         && (is_allocatable || is_pointer)
-                        && entity.array_spec.is_none()
+                        && !declared_array
                     {
                         (32, 8) // StringDescriptor for deferred-length scalar char components
-                    } else if is_pointer && entity.array_spec.is_none() {
+                    } else if is_pointer && !declared_array {
                         (8, 8) // Scalar POINTER components are pointer slots, not descriptors
                     } else if is_allocatable || is_pointer {
                         (384, 8) // ArrayDescriptor size for allocatable/pointer array components
@@ -439,7 +440,7 @@ pub fn compute_layout(
                     offset,
                     size: field_size,
                     dims,
-                    declared_array: entity.array_spec.is_some() || has_dimension_attr,
+                    declared_array,
                     type_info: ti.clone(),
                     allocatable: is_allocatable,
                     pointer: is_pointer,
@@ -867,6 +868,47 @@ mod tests {
         assert_eq!(field.offset, 0);
         assert!(field.pointer);
         assert_eq!(layout.size, 8);
+    }
+
+    #[test]
+    fn compute_layout_deferred_char_array_component_with_dimension_attr_uses_array_descriptor() {
+        use crate::ast::decl::{ArraySpec, Attribute, CharSelector, LenSpec, TypeSpec};
+
+        let components = vec![make_component_with_attrs(
+            "lines",
+            TypeSpec::Character(Some(CharSelector {
+                len: Some(LenSpec::Colon),
+                kind: None,
+            })),
+            vec![
+                Attribute::Allocatable,
+                Attribute::Dimension(vec![ArraySpec::Deferred]),
+            ],
+        )];
+
+        let reg = TypeLayoutRegistry::new();
+        let layout = compute_layout(
+            "item_t",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
+        let field = layout.field("lines").expect("missing lines field");
+
+        assert_eq!(field.size, 384);
+        assert!(field.allocatable);
+        assert!(field.declared_array);
+        assert!(matches!(
+            field.type_info,
+            TypeInfo::Character {
+                len: None,
+                kind: None
+            }
+        ));
     }
 
     #[test]

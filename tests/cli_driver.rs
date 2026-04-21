@@ -13230,6 +13230,73 @@ fn o2_keeps_address_taken_contained_callback_symbols() {
 }
 
 #[test]
+fn contained_program_char_function_inside_adjustl_and_trim_links_and_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  call sleep_ms(25)\ncontains\n  subroutine sleep_ms(ms)\n    integer, intent(in) :: ms\n    real :: seconds\n\n    seconds = real(ms) / 1000.0\n    print '(A)', trim(adjustl(real_to_str(seconds)))\n  end subroutine sleep_ms\n\n  function real_to_str(r) result(str)\n    real, intent(in) :: r\n    character(len=32) :: str\n\n    write(str, '(F0.3)') r\n  end function real_to_str\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("contained_program_char_adjustl_trim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained program char helper compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained program char helper compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained program char helper run failed");
+    assert!(
+        run.status.success(),
+        "contained program char helper run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("0.025"),
+        "unexpected contained program char helper output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_program_char_function_inside_execute_command_line_arg_links_and_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  call sleep_ms(25)\ncontains\n  subroutine sleep_ms(ms)\n    integer, intent(in) :: ms\n    real :: seconds\n\n    seconds = real(ms) / 1000.0\n    call execute_command_line('sleep ' // trim(adjustl(real_to_str(seconds))))\n  end subroutine sleep_ms\n\n  function real_to_str(r) result(str)\n    real, intent(in) :: r\n    character(len=32) :: str\n\n    write(str, '(F0.3)') r\n  end function real_to_str\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("contained_program_char_exec_cmd", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained execute_command_line compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained execute_command_line compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained execute_command_line run failed");
+    assert!(
+        run.status.success(),
+        "contained execute_command_line run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
     let src = write_program(
         "module m\n  implicit none\n  type :: cursor_t\n    integer :: line = 0\n  end type\n  type :: pane_t\n    type(cursor_t), allocatable :: cursors(:)\n    character(len=:), allocatable :: filename\n  end type\ncontains\n  subroutine check(panes)\n    type(pane_t), intent(inout) :: panes(:)\n    associate (pane => panes(1))\n      if (.not. allocated(pane%cursors)) error stop 1\n      if (size(pane%cursors) /= 2) error stop 2\n      if (.not. allocated(pane%filename)) error stop 3\n      if (trim(pane%filename) /= 'abc') error stop 4\n    end associate\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(pane_t), allocatable :: panes(:)\n  allocate(panes(1))\n  allocate(panes(1)%cursors(2))\n  allocate(character(len=3) :: panes(1)%filename)\n  panes(1)%filename = 'abc'\n  call check(panes)\nend program\n",
@@ -13258,6 +13325,42 @@ fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected associate alias output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_char_array_component_size_with_dimension_attr_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: item_t\n    character(len=:), allocatable, dimension(:) :: lines\n  end type\ncontains\n  subroutine show(total)\n    integer, intent(out) :: total\n    type(item_t) :: one\n    type(item_t) :: many(1)\n    allocate(character(len=8) :: one%lines(2))\n    allocate(character(len=8) :: many(1)%lines(3))\n    one%lines(1) = 'a'\n    one%lines(2) = 'b'\n    many(1)%lines(1) = 'x'\n    many(1)%lines(2) = 'y'\n    many(1)%lines(3) = 'z'\n    total = size(one%lines) + size(many(1)%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: total\n  call show(total)\n  if (total /= 5) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_component_size_dimension_attr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char array component size compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char array component size compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred char array component size run failed");
+    assert!(
+        run.status.success(),
+        "deferred char array component size run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected deferred char array component size output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

@@ -7373,6 +7373,9 @@ fn lower_char_intrinsic(
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
     use crate::ast::expr::SectionSubscript;
 
@@ -7386,16 +7389,27 @@ fn lower_char_intrinsic(
             }
         })
     };
+    let lower_string_arg =
+        |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| -> (ValueId, ValueId) {
+            lower_string_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+        };
 
     match name {
         "len" => {
-            let (_, len) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (_, len) = lower_string_arg(b, arg_spanned(0)?);
             Some(len)
         }
         "len_trim" => {
-            let (ptr, len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
             Some(b.call(
                 FuncRef::External("afs_len_trim".into()),
                 vec![ptr, len_val],
@@ -7403,8 +7417,7 @@ fn lower_char_intrinsic(
             ))
         }
         "ichar" | "iachar" => {
-            let (ptr, _) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (ptr, _) = lower_string_arg(b, arg_spanned(0)?);
             Some(b.call(
                 FuncRef::External("afs_ichar_ptr".into()),
                 vec![ptr],
@@ -7437,10 +7450,8 @@ fn lower_char_intrinsic(
             Some(buf)
         }
         "index" => {
-            let (hay_ptr, hay_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
-            let (needle_ptr, needle_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(1)?, st, type_layouts);
+            let (hay_ptr, hay_len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let (needle_ptr, needle_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -7451,10 +7462,8 @@ fn lower_char_intrinsic(
             ))
         }
         "scan" => {
-            let (src_ptr, src_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
-            let (set_ptr, set_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(1)?, st, type_layouts);
+            let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -7465,10 +7474,8 @@ fn lower_char_intrinsic(
             ))
         }
         "verify" => {
-            let (src_ptr, src_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
-            let (set_ptr, set_len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(1)?, st, type_layouts);
+            let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -7479,10 +7486,8 @@ fn lower_char_intrinsic(
             ))
         }
         "lge" | "lgt" | "lle" | "llt" => {
-            let (lhs_ptr, lhs_len) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
-            let (rhs_ptr, rhs_len) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(1)?, st, type_layouts);
+            let (lhs_ptr, lhs_len) = lower_string_arg(b, arg_spanned(0)?);
+            let (rhs_ptr, rhs_len) = lower_string_arg(b, arg_spanned(1)?);
             let raw = b.call(
                 FuncRef::External(format!("afs_{}", name)),
                 vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
@@ -7492,8 +7497,7 @@ fn lower_char_intrinsic(
             Some(b.icmp(CmpOp::Ne, raw, zero))
         }
         "adjustl" => {
-            let (src_ptr, len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -7515,8 +7519,7 @@ fn lower_char_intrinsic(
             Some(buf)
         }
         "adjustr" => {
-            let (src_ptr, len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -7541,8 +7544,7 @@ fn lower_char_intrinsic(
             // TRIM(s): returns character with trailing blanks removed.
             // Allocate buffer of declared length, memcpy source, return buffer pointer.
             // The actual printed length is discovered by len_trim at the call site.
-            let (src_ptr, len_val) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -7564,8 +7566,7 @@ fn lower_char_intrinsic(
             Some(buf)
         }
         "repeat" => {
-            let (src_ptr, src_len) =
-                lower_string_expr_with_layouts(b, locals, arg_spanned(0)?, st, type_layouts);
+            let (src_ptr, src_len) = lower_string_arg(b, arg_spanned(0)?);
             let raw_copies = lower_expr(b, locals, arg_spanned(1)?, st);
             let copies = widen_to_i64(b, raw_copies);
             let copies = clamp_nonnegative_i64(b, copies);
@@ -10444,13 +10445,7 @@ fn lower_intrinsic_subroutine(
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 if expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts)) {
-                    return lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        e,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    return lower_string_expr_ctx(b, ctx, e);
                 }
                 // Otherwise pass as ref + zero length.
                 let ptr = lower_arg_by_ref_ctx(b, ctx, e);
@@ -16694,13 +16689,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             return;
                         }
                     }
-                    let (ptr, len) = lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                     store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
                     return;
                 }
@@ -18611,13 +18600,7 @@ fn lower_write_items_adv(
                     }
                 }
             }
-            let (ptr, len) = lower_string_expr_with_layouts(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-            );
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
             b.call(
                 FuncRef::External("afs_write_string".into()),
                 vec![unit, ptr, len],
@@ -18780,13 +18763,7 @@ fn internal_io_buffer(
         return None;
     }
 
-    Some(lower_string_expr_with_layouts(
-        b,
-        &ctx.locals,
-        &control.value,
-        ctx.st,
-        Some(ctx.type_layouts),
-    ))
+    Some(lower_string_expr_ctx(b, ctx, &control.value))
 }
 
 fn lower_internal_write_items(
@@ -18862,13 +18839,7 @@ fn lower_internal_write_items(
         };
 
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-            let (ptr, len) = lower_string_expr_with_layouts(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-            );
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
             b.call(
                 FuncRef::External("afs_write_internal_string".into()),
                 vec![buf_ptr, buf_len, ptr, len, pos],
@@ -19491,7 +19462,7 @@ fn lower_list_char_read_item(
     {
         (ptr, len)
     } else {
-        lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+        lower_string_expr_ctx(b, ctx, item)
     };
 
     b.call(
@@ -19609,7 +19580,7 @@ fn lower_formatted_char_read_item(
     {
         (ptr, len)
     } else {
-        lower_string_expr_with_layouts(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+        lower_string_expr_ctx(b, ctx, item)
     };
     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
 
@@ -26110,8 +26081,17 @@ fn lower_expr_full(
                 }
 
                 // Try character intrinsics (need access to locals for CharKind).
-                if let Some(result) = lower_char_intrinsic(b, &key, args, locals, st, type_layouts)
-                {
+                if let Some(result) = lower_char_intrinsic(
+                    b,
+                    &key,
+                    args,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
                     return result;
                 }
 
