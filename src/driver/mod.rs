@@ -112,6 +112,7 @@ pub struct Options {
     pub emit_tokens: bool,     // --emit-tokens
     pub preprocess_only: bool, // -E
     pub preprocessor_defines: Vec<(String, String)>,
+    pub cpp_compat: bool, // -cpp (accepted; preprocessing already runs)
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
@@ -142,6 +143,7 @@ pub struct Options {
     pub diagnostics_format: DiagnosticsFormat, // --diagnostics-format=
     pub check_bounds: bool,                    // -fcheck=bounds
     pub check_all: bool,                       // -fcheck=all
+    pub backtrace_requested: bool,             // -fbacktrace (accepted; runtime wiring TODO)
 
     // ---- Search paths / linking ----
     /// Directories to search for `.amod` module files (`-I <dir>`).
@@ -178,6 +180,7 @@ impl Default for Options {
             emit_tokens: false,
             preprocess_only: false,
             preprocessor_defines: Vec::new(),
+            cpp_compat: false,
             std: Some(crate::sema::validate::FortranStandard::F2018),
             source_form_override: None,
             default_integer_8: false,
@@ -200,6 +203,7 @@ impl Default for Options {
             diagnostics_format: DiagnosticsFormat::Text,
             check_bounds: false,
             check_all: false,
+            backtrace_requested: false,
             module_search_paths: Vec::new(),
             module_output_dir: None,
             library_search_paths: Vec::new(),
@@ -283,6 +287,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-S" => opts.emit_asm = true,
             "-c" => opts.emit_obj = true,
             "-E" => opts.preprocess_only = true,
+            "-cpp" => opts.cpp_compat = true,
             "-D" => {
                 i += 1;
                 let spec = args.get(i).ok_or("-D requires a macro name")?;
@@ -359,6 +364,21 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-static" => opts.static_link = true,
 
             // ---- Standards / language flags ----
+            arg if arg.starts_with("-std=") => {
+                let val = &arg["-std=".len()..];
+                opts.std = Some(
+                    crate::sema::validate::FortranStandard::parse_flag(val)
+                        .ok_or_else(|| format!("unknown -std value: {}", val))?,
+                );
+            }
+            "-std" => {
+                i += 1;
+                let val = args.get(i).ok_or("-std requires a value")?;
+                opts.std = Some(
+                    crate::sema::validate::FortranStandard::parse_flag(val)
+                        .ok_or_else(|| format!("unknown -std value: {}", val))?,
+                );
+            }
             arg if arg.starts_with("--std=") => {
                 let val = &arg["--std=".len()..];
                 opts.std = Some(
@@ -396,6 +416,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.check_bounds = true;
                 opts.check_all = true;
             }
+            "-fbacktrace" => opts.backtrace_requested = true,
 
             // ---- Warnings (accepted; gating is gradual sprint work) ----
             "-Wall" => opts.warn_all = true,
@@ -628,6 +649,13 @@ fn set_output_path(opts: &mut Options, value: &str) -> Result<(), String> {
 }
 
 fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
+    if opts.cpp_compat {
+        opts.cli_warnings.push(
+            "-cpp is accepted for compatibility; preprocessing already runs for Fortran inputs"
+                .into(),
+        );
+    }
+
     if opts.check_all {
         opts.cli_warnings.push(
             "-fcheck=all is accepted, but only array bounds checks exist today and those are already always enabled".into(),
@@ -665,6 +693,11 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         opts.cli_warnings
             .push("-g is accepted, but debug info emission is not yet implemented".into());
     }
+    if opts.backtrace_requested {
+        opts.cli_warnings.push(
+            "-fbacktrace is accepted, but runtime backtrace control is not yet implemented".into(),
+        );
+    }
 
     let suppress_unknown_warning_option = opts
         .disabled_warnings
@@ -687,10 +720,12 @@ COMPILATION:
   -c                          Compile to object file only (no linking)
   -S                          Emit assembly text
   -E                          Preprocess only
+  -cpp                        Accept GNU-style preprocessing flag
   -D<name>[=<value>]          Define a preprocessor macro
   -o <file>                   Output file name
 
 LANGUAGE:
+  -std=<standard>             GNU-compatible alias for --std=<standard>
   --std=<standard>            Fortran standard (f77, f90, f95, f2003, f2008, f2018, f2023)
   -ffree-form                 Force free-form source
   -ffixed-form                Force fixed-form source
@@ -716,6 +751,7 @@ WARNINGS:
 
 DEBUGGING:
   -g                          Generate debug information (DWARF emission TODO)
+  -fbacktrace                 Accept GNU-style runtime backtrace flag
   --emit-ir                   Dump IR to the output path
   --emit-ast                  Dump AST to the output path
   --emit-tokens               Dump token stream to the output path
@@ -1920,6 +1956,52 @@ mod tests {
         assert_eq!(
             Options::default().std,
             Some(crate::sema::validate::FortranStandard::F2018)
+        );
+    }
+
+    #[test]
+    fn options_from_args_accepts_gnu_std_alias() {
+        let args = vec!["-std=f2008".to_string(), "hello.f90".to_string()];
+        let opts = Options::from_args(&args).expect("driver should accept -std=f2008");
+        assert_eq!(
+            opts.std,
+            Some(crate::sema::validate::FortranStandard::F2008)
+        );
+    }
+
+    #[test]
+    fn parse_cli_warns_for_cpp_compat_flag() {
+        let args = vec!["-cpp".to_string(), "hello.f90".to_string()];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should accept -cpp") else {
+            panic!("expected compile options");
+        };
+        assert!(opts.cpp_compat, "-cpp should be recorded on the options");
+        assert!(
+            opts.cli_warnings
+                .iter()
+                .any(|warning| warning.contains("-cpp is accepted for compatibility")),
+            "expected a compatibility warning for -cpp, got {:?}",
+            opts.cli_warnings
+        );
+    }
+
+    #[test]
+    fn parse_cli_warns_for_fbacktrace_flag() {
+        let args = vec!["-fbacktrace".to_string(), "hello.f90".to_string()];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should accept -fbacktrace")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(
+            opts.backtrace_requested,
+            "-fbacktrace should be recorded on the options"
+        );
+        assert!(
+            opts.cli_warnings.iter().any(|warning| warning.contains(
+                "-fbacktrace is accepted, but runtime backtrace control is not yet implemented"
+            )),
+            "expected a compatibility warning for -fbacktrace, got {:?}",
+            opts.cli_warnings
         );
     }
 

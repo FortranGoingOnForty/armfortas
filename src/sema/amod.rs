@@ -118,12 +118,33 @@ pub fn write_amod(
         .filter(|(_, sym)| matches!(sym.kind, SymbolKind::NamedInterface))
         .flat_map(|(_, sym)| sym.arg_names.iter().cloned())
         .collect();
+    // Public derived types can expose private bound procedure targets across
+    // translation units. Those targets must be serialized too so imported
+    // type-bound calls can recover full dummy-argument ABI metadata such as
+    // OPTIONAL slots.
+    let mut proc_export_names: BTreeSet<String> = interface_specifics;
+    for (name, sym) in &syms {
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) && is_public(sym, scope)
+        {
+            proc_export_names.insert(name.to_lowercase());
+        }
+    }
+    for (name, _sym) in syms
+        .iter()
+        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::DerivedType))
+    {
+        if let Some(layout) = type_layouts.get(name) {
+            for bp in &layout.bound_procs {
+                proc_export_names.insert(bp.abi_name.to_lowercase());
+            }
+        }
+    }
     let mut procs: Vec<_> = scope
         .symbols
         .iter()
         .filter(|(name, sym)| {
             matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
-                && (is_public(sym, scope) || interface_specifics.contains(&name.to_lowercase()))
+                && proc_export_names.contains(&name.to_lowercase())
         })
         .collect();
     procs.sort_by_key(|(k, _)| k.to_lowercase());
@@ -1210,9 +1231,11 @@ fn parse_type(
                 let m = clean.trim().to_string();
                 (m.clone(), m)
             };
+            let abi_name = method.to_lowercase();
             bound_procs.push(BoundProc {
                 method_name: method,
                 target_name: target,
+                abi_name,
                 nopass,
             });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {

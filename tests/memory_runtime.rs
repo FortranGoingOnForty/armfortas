@@ -224,7 +224,11 @@ fn allocate_source_array_infers_shape_and_copies_values() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("3"), "expected inferred size in output: {}", stdout);
+    assert!(
+        stdout.contains("3"),
+        "expected inferred size in output: {}",
+        stdout
+    );
     assert!(
         stdout.contains("10") && stdout.contains("20") && stdout.contains("30"),
         "expected copied values in output: {}",
@@ -261,7 +265,11 @@ fn allocate_mold_array_infers_shape_without_source_copy() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("4"), "expected inferred mold size in output: {}", stdout);
+    assert!(
+        stdout.contains("4"),
+        "expected inferred mold size in output: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -293,7 +301,11 @@ fn allocate_source_scalar_initializes_allocatable_scalar() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("7"), "expected initialized scalar in output: {}", stdout);
+    assert!(
+        stdout.contains("7"),
+        "expected initialized scalar in output: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -325,7 +337,11 @@ fn allocate_component_source_array_infers_shape_and_copies_values() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("2"), "expected inferred component size in output: {}", stdout);
+    assert!(
+        stdout.contains("2"),
+        "expected inferred component size in output: {}",
+        stdout
+    );
     assert!(
         stdout.contains("4") && stdout.contains("5"),
         "expected copied component values in output: {}",
