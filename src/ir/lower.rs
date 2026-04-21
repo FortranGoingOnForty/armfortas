@@ -7186,13 +7186,13 @@ fn actual_char_arg_runtime_len(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             locals.get(&key).and_then(|info| {
+                let by_ref_absence_guard = info.by_ref
+                    && (info.char_kind != CharKind::None
+                        || descriptor_backed_runtime_char_array(info));
                 let needs_absence_guard = optional_locals
                     .map(|names| names.contains(&key))
-                    .unwrap_or_else(|| {
-                        info.by_ref
-                            && (info.char_kind != CharKind::None
-                                || descriptor_backed_runtime_char_array(info))
-                    });
+                    .unwrap_or(false)
+                    || by_ref_absence_guard;
                 if needs_absence_guard {
                     optional_local_char_runtime_len(b, info)
                 } else {

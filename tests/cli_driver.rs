@@ -2509,6 +2509,150 @@ fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
 }
 
 #[test]
+fn cross_tu_absent_optional_char_array_forwarding_survives_function_result_wrapper() {
+    let dir = unique_dir("cross_tu_optional_char_array_forward");
+    let types_src = write_program_in(
+        &dir,
+        "types.f90",
+        "module types\n  implicit none\n  type :: terminal_size\n    integer :: rows = 24\n    integer :: cols = 80\n  end type terminal_size\n  type :: session_t\n    integer :: code = -1\n  end type session_t\nend module types\n",
+    );
+    let posix_src = write_program_in(
+        &dir,
+        "posix.f90",
+        "module posix\n  use types, only: terminal_size, session_t\n  implicit none\ncontains\n  subroutine spawn_posix_pty(program, argv, term_size, session)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in), optional :: argv(:)\n    type(terminal_size), intent(in) :: term_size\n    type(session_t), intent(inout) :: session\n    if (len_trim(program) == 0) error stop 11\n    if (present(argv)) error stop 12\n    if (term_size%rows /= 24 .or. term_size%cols /= 80) error stop 13\n    session%code = len_trim(program)\n  end subroutine spawn_posix_pty\nend module posix\n",
+    );
+    let api_src = write_program_in(
+        &dir,
+        "api.f90",
+        "module api\n  use posix, only: spawn_posix_pty\n  use types, only: terminal_size, session_t\n  implicit none\ncontains\n  function default_terminal_size() result(size)\n    type(terminal_size) :: size\n  end function default_terminal_size\n\n  logical function valid_terminal_size(size) result(valid)\n    type(terminal_size), intent(in) :: size\n    valid = size%rows > 0 .and. size%cols > 0\n  end function valid_terminal_size\n\n  function spawn_pty(program, argv, size) result(session)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in), optional :: argv(:)\n    type(terminal_size), intent(in), optional :: size\n    type(session_t) :: session\n    type(terminal_size) :: launch_size\n    session%code = -1\n    if (len_trim(program) == 0) then\n      session%code = 1\n      return\n    end if\n    if (present(size)) then\n      launch_size = size\n    else\n      launch_size = default_terminal_size()\n    end if\n    if (.not. valid_terminal_size(launch_size)) then\n      session%code = 2\n      return\n    end if\n    call spawn_posix_pty(program, argv, launch_size, session)\n  end function spawn_pty\nend module api\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use api, only: spawn_pty\n  use types, only: session_t\n  implicit none\n  type(session_t) :: session\n  session = spawn_pty('fgof-pty-missing-command')\n  if (session%code /= len('fgof-pty-missing-command')) error stop 21\n  print *, 'ok'\nend program p\n",
+    );
+
+    let types_obj = dir.join("types.o");
+    let compile_types = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            types_src.to_str().unwrap(),
+            "-o",
+            types_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("types module compile failed to spawn");
+    assert!(
+        compile_types.status.success(),
+        "types module should compile: {}",
+        String::from_utf8_lossy(&compile_types.stderr)
+    );
+
+    let posix_obj = dir.join("posix.o");
+    let compile_posix = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            posix_src.to_str().unwrap(),
+            "-o",
+            posix_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("posix module compile failed to spawn");
+    assert!(
+        compile_posix.status.success(),
+        "posix module should compile: {}",
+        String::from_utf8_lossy(&compile_posix.stderr)
+    );
+
+    let api_obj = dir.join("api.o");
+    let compile_api = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            api_src.to_str().unwrap(),
+            "-o",
+            api_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("api module compile failed to spawn");
+    assert!(
+        compile_api.status.success(),
+        "api module should compile: {}",
+        String::from_utf8_lossy(&compile_api.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("cross_tu_optional_char_array_forward.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            types_obj.to_str().unwrap(),
+            posix_obj.to_str().unwrap(),
+            api_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-tu optional char array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "cross-tu optional char array objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-tu optional char array run failed");
+    assert!(
+        run.status.success(),
+        "cross-tu optional char array binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected cross-tu optional char array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
     let dir = unique_dir("stream_read_alloc_char_scalar");
     let input_path = dir.join("external_hello.txt");
