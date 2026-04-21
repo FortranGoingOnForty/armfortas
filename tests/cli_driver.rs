@@ -2108,6 +2108,202 @@ fn bind_c_c_char_function_result_round_trips_through_wrapper_module() {
 }
 
 #[test]
+fn allocatable_c_char_array_function_result_passes_bind_c_assumed_size_dummy() {
+    let dir = unique_dir("alloc_c_char_result_bind_c");
+    let c_src = write_program_in(
+        &dir,
+        "check.c",
+        "#include <string.h>\n\nvoid ccheck(const char *s, int *ok) {\n    *ok = strcmp(s, \"printf 'hello'\") == 0 ? 1 : 0;\n}\n",
+    );
+    let c_obj = dir.join("check.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_char, c_int, c_null_char\n  implicit none\n  interface\n    subroutine ccheck(s, ok) bind(C, name='ccheck')\n      import :: c_char, c_int\n      character(kind=c_char), intent(in) :: s(*)\n      integer(c_int), intent(out) :: ok\n    end subroutine ccheck\n  end interface\ncontains\n  function to_c_string(str) result(buf)\n    character(len=*), intent(in) :: str\n    character(kind=c_char), allocatable :: buf(:)\n    integer :: i, n\n    n = len(str)\n    allocate(buf(n + 1))\n    do i = 1, n\n      buf(i) = str(i:i)\n    end do\n    buf(n + 1) = c_null_char\n  end function to_c_string\n\n  subroutine run(cmdline)\n    character(len=*), intent(in) :: cmdline\n    character(kind=c_char), allocatable :: c_command_line(:)\n    integer(c_int) :: ok\n    c_command_line = to_c_string(cmdline)\n    call ccheck(c_command_line, ok)\n    if (ok /= 1_c_int) error stop 1\n  end subroutine run\nend module m\nprogram p\n  use m\n  implicit none\n  call run(\"printf 'hello'\")\n  print *, 'ok'\nend program p\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocatable c_char result bind(c) object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "allocatable c_char result bind(c) should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("alloc_c_char_result_bind_c.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocatable c_char result bind(c) link failed to spawn");
+    assert!(
+        link.status.success(),
+        "allocatable c_char result bind(c) objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("allocatable c_char result bind(c) run failed");
+    assert!(
+        run.status.success(),
+        "allocatable c_char result bind(c) should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable c_char result bind(c) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
+    let dir = unique_dir("alloc_c_char_result_intent_out");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_char, c_int, c_null_char\n  implicit none\ncontains\n  function empty_c_string() result(buf)\n    character(kind=c_char), allocatable :: buf(:)\n    allocate(buf(1))\n    buf(1) = c_null_char\n  end function empty_c_string\n\n  subroutine pack(values, stride, buffer)\n    character(len=*), intent(in) :: values(:)\n    integer(c_int), intent(out) :: stride\n    character(kind=c_char), allocatable, intent(out) :: buffer(:)\n    if (size(values) == 0) then\n      stride = 0_c_int\n      buffer = empty_c_string()\n      return\n    end if\n    error stop 99\n  end subroutine pack\nend module m\n\nprogram p\n  use iso_c_binding, only: c_char, c_int, c_null_char\n  use m, only: pack\n  implicit none\n  character(len=1), allocatable :: values(:)\n  character(kind=c_char), allocatable :: buffer(:)\n  integer(c_int) :: stride\n  allocate(character(len=1) :: values(0))\n  call pack(values, stride, buffer)\n  if (stride /= 0_c_int) error stop 1\n  if (.not. allocated(buffer)) error stop 2\n  if (size(buffer) /= 1) error stop 3\n  if (buffer(1) /= c_null_char) error stop 4\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("alloc_c_char_result_intent_out.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("allocatable c_char intent(out) compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable c_char intent(out) should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("allocatable c_char intent(out) run failed");
+    assert!(
+        run.status.success(),
+        "allocatable c_char intent(out) should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable c_char intent(out) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_char_array_component_len_survives_function_result_and_dummy_pass() {
+    let dir = unique_dir("deferred_char_array_component_len");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  implicit none\n  type :: process_command\n    character(len=:), allocatable :: program\n    character(len=:), allocatable :: argv(:)\n  end type\ncontains\n  function command(program, argv) result(cmd)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in), optional :: argv(:)\n    type(process_command) :: cmd\n    integer :: arg_len\n    integer :: i\n    cmd%program = program\n    if (present(argv)) then\n      arg_len = max_string_length(argv)\n      allocate(character(len=arg_len) :: cmd%argv(size(argv)))\n      do i = 1, size(argv)\n        cmd%argv(i) = argv(i)\n      end do\n    else\n      allocate(character(len=1) :: cmd%argv(0))\n    end if\n  end function command\n\n  integer function max_string_length(values) result(max_len)\n    character(len=*), intent(in) :: values(:)\n    integer :: i\n    max_len = 1\n    do i = 1, size(values)\n      max_len = max(max_len, len(values(i)))\n    end do\n  end function max_string_length\n\n  subroutine consume(cmd)\n    type(process_command), intent(in) :: cmd\n    if (size(cmd%argv) /= 2) error stop 1\n    if (len(cmd%argv) /= 26) error stop 2\n    if (trim(cmd%argv(1)) /= '%s') error stop 3\n    if (trim(cmd%argv(2)) /= \"left | sed 's/left/right/'\") error stop 4\n  end subroutine consume\nend module m\n\nprogram p\n  use m\n  implicit none\n  call consume(command('printf', [character(len=26) :: '%s', \"left | sed 's/left/right/'\"]))\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("deferred_char_array_component_len.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("deferred char array component len compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred char array component len should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred char array component len run failed");
+    assert!(
+        run.status.success(),
+        "deferred char array component len should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected deferred char array component len output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
+    let dir = unique_dir("stream_read_alloc_char_scalar");
+    let input_path = dir.join("external_hello.txt");
+    std::fs::write(&input_path, b"hello").expect("failed to seed stream input");
+    let input_path_str = input_path.to_str().unwrap().replace('\\', "\\\\");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  character(len=:), allocatable :: text\n  integer :: unit\n  integer :: ios\n  integer :: file_size\n  open(newunit=unit, file='{}', status='old', access='stream', form='unformatted', action='read', iostat=ios)\n  if (ios /= 0) error stop 1\n  inquire(unit=unit, size=file_size)\n  allocate(character(len=file_size) :: text)\n  read(unit, iostat=ios) text\n  if (ios /= 0) error stop 2\n  if (text /= 'hello') error stop 3\n  close(unit)\n  print *, 'ok'\nend program p\n",
+            input_path_str
+        ),
+    );
+
+    let exe = dir.join("stream_read_alloc_char_scalar.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("stream read alloc char scalar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream read alloc char scalar should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("stream read alloc char scalar run failed");
+    assert!(
+        run.status.success(),
+        "stream read alloc char scalar should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected stream read alloc char scalar output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(

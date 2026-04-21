@@ -3306,7 +3306,11 @@ fn lower_unit(
 
                 if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                     // The hidden first param is the caller-provided array descriptor.
-                    let elem_ty = arg_type_from_decls(&result_name, decls, Some(st));
+                    let result_char_kind = arg_char_kind_from_decls(&result_name, decls, st);
+                    let elem_ty = match result_char_kind {
+                        CharKind::Fixed(len) => fixed_char_storage_ir_type(len),
+                        _ => arg_type_from_decls(&result_name, decls, Some(st)),
+                    };
                     let result_derived_type = arg_derived_type_name(&result_name, decls);
                     let local_elem_ty = derived_local_storage_ir_type(
                         &elem_ty,
@@ -3322,7 +3326,7 @@ fn lower_unit(
                             allocatable: true,
                             descriptor_arg: false,
                             by_ref: false,
-                            char_kind: CharKind::None,
+                            char_kind: result_char_kind,
                             derived_type: result_derived_type,
                             inline_const: None,
                             is_pointer: false,
@@ -6881,6 +6885,11 @@ fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(Valu
                 let zero = b.const_i64(0);
                 let ptr = b.gep(base, vec![zero], IrType::Int(IntWidth::I8));
                 Some((ptr, b.const_i64(len)))
+            } else if descriptor_backed_runtime_char_array(info) {
+                let desc = array_descriptor_addr(b, info);
+                let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let len = descriptor_elem_size(b, desc);
+                Some((base, len))
             } else if info.by_ref
                 && info.derived_type.is_none()
                 && matches!(
@@ -10586,6 +10595,9 @@ fn arg_char_kind_from_decls(
                                     return CharKind::Fixed(n);
                                 }
                             }
+                            if sel.len.is_none() {
+                                return CharKind::Fixed(1);
+                            }
                         }
                         TypeSpec::Character(None) => return CharKind::Fixed(1),
                         _ => {}
@@ -11785,6 +11797,11 @@ fn lower_string_expr_full(
         }
         Expr::ComponentAccess { .. } => {
             if let Some(tl) = type_layouts {
+                if let Some(info) = component_intrinsic_local_info(b, locals, expr, st, tl) {
+                    if let Some((ptr, len)) = local_char_ptr_and_len(b, &info) {
+                        return (ptr, len);
+                    }
+                }
                 if let Some((field_ptr, field)) =
                     resolve_component_field_access(b, locals, expr, st, tl)
                 {
@@ -18942,7 +18959,7 @@ fn lower_array_read_item(
             let Some(info) = ctx.locals.get(&key).cloned() else {
                 return false;
             };
-            if info.dims.is_empty() && !info.allocatable {
+            if !local_is_array_like(&info) {
                 return false;
             }
             lower_whole_array_read(b, &info, mode);
@@ -18956,7 +18973,7 @@ fn lower_array_read_item(
             let Some(info) = ctx.locals.get(&key).cloned() else {
                 return false;
             };
-            if info.dims.is_empty() && !info.allocatable {
+            if !local_is_array_like(&info) {
                 return false;
             }
             let has_range = args
@@ -21482,6 +21499,65 @@ fn lower_array_assign(
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) {
+    let dest_symbol_allocatable = (!dest_name.is_empty())
+        .then(|| ctx.st.find_symbol_any_scope(&dest_name.to_lowercase()))
+        .flatten()
+        .map(|sym| sym.attrs.allocatable)
+        .unwrap_or(false);
+    if local_uses_array_descriptor(dest_info)
+        && (dest_info.allocatable || dest_symbol_allocatable)
+    {
+        let dest_desc = array_descriptor_addr(b, dest_info);
+        if let Expr::FunctionCall {
+            callee,
+            args: call_args,
+        } = &value.node
+        {
+            if let Expr::Name { name: callee_name } = &callee.node {
+                let callee_key = callee_name.to_lowercase();
+                let intrinsic_arg_vals: Vec<ValueId> = call_args
+                    .iter()
+                    .map(|arg| match &arg.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            generic_dispatch_probe_value(
+                                b,
+                                &ctx.locals,
+                                e,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                                Some(ctx.internal_funcs),
+                                Some(ctx.contained_host_refs),
+                                Some(ctx.descriptor_params),
+                            )
+                        }
+                        _ => b.const_i32(0),
+                    })
+                    .collect();
+                let resolved_name =
+                    resolve_generic_call(ctx.st, b, &callee_key, &intrinsic_arg_vals)
+                        .unwrap_or_else(|| callee_name.clone());
+                let resolved_key = resolved_name.to_lowercase();
+                if ctx.alloc_return_funcs.contains(&callee_key)
+                    || ctx.alloc_return_funcs.contains(&resolved_key)
+                {
+                    lower_alloc_return_call_into_desc(b, ctx, dest_desc, callee_name, call_args);
+                    return;
+                }
+            }
+        }
+
+        if let Some((src_desc, _)) =
+            lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts))
+        {
+            b.call(
+                FuncRef::External("afs_assign_allocatable".into()),
+                vec![dest_desc, src_desc],
+                IrType::Void,
+            );
+            return;
+        }
+    }
+
     // a = [v0, v1, v2, ...] — element-wise store of an array
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
