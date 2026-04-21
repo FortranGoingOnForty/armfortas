@@ -1269,6 +1269,69 @@ fn bind_c_exit_flushes_pending_nonadvancing_stdout_output() {
 }
 
 #[test]
+fn call_flush_intrinsic_subroutine_links_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: output_unit\n  implicit none\n  write(output_unit, '(A)', advance='no') 'ok'\n  call flush(output_unit)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("call_flush_intrinsic_subroutine", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("call flush intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "call flush intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("call flush intrinsic run failed");
+    assert!(
+        run.status.success(),
+        "call flush intrinsic run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"ok");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn real_mod_intrinsic_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: x\n  x = mod(-5.5_real64, 2.0_real64)\n  if (abs(x + 1.5_real64) > 1.0e-12_real64) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real_mod_intrinsic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real mod compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "real mod compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("real mod run failed");
+    assert!(
+        run.status.success(),
+        "real mod run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_local_zero_len_buffer_substring_preserves_written_bytes() {
     let src = write_program(
         "module m\ncontains\n  function build(prompt) result(expanded)\n    character(len=*), intent(in) :: prompt\n    character(len=:), allocatable :: expanded\n    character(len=:), allocatable :: result\n    integer :: i, j\n    allocate(character(len=len(prompt) * 2 + 8) :: result)\n    result = ''\n    i = 1\n    j = 1\n    do while (i <= len(prompt))\n      result(j:j) = prompt(i:i)\n      i = i + 1\n      j = j + 1\n    end do\n    expanded = result(1:j-1)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = build('+ ')\n  if (len(s) /= 2) error stop 1\n  if (s /= '+ ') error stop 2\n  print *, s\nend program\n",
@@ -2251,6 +2314,46 @@ fn deferred_char_array_component_len_survives_function_result_and_dummy_pass() {
     assert!(
         stdout.contains("ok"),
         "unexpected deferred char array component len output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
+    let dir = unique_dir("optional_char_array_hidden_len");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  implicit none\n  type :: result_t\n    integer :: code = 0\n  end type result_t\ncontains\n  subroutine inner(program, argv, size)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in), optional :: argv(:)\n    integer, intent(in), optional :: size\n    if (len_trim(program) == 0) error stop 11\n    if (present(argv)) error stop 12\n    if (present(size)) error stop 13\n  end subroutine inner\n\n  type(result_t) function outer(program, argv, size) result(session)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in), optional :: argv(:)\n    integer, intent(in), optional :: size\n    if (len_trim(program) == 0) then\n      session%code = 1\n      return\n    end if\n    call inner(program, argv, size)\n    session%code = 2\n  end function outer\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(result_t) :: session\n  session = outer('abc')\n  if (session%code /= 2) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("optional_char_array_hidden_len.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("optional char array hidden len compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional char array hidden len should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("optional char array hidden len run failed");
+    assert!(
+        run.status.success(),
+        "optional char array hidden len should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected optional char array hidden len output: {}",
         stdout
     );
 

@@ -105,6 +105,10 @@ struct LocalInfo {
 /// Lowering context — tracks locals, loop scopes, and symbol table.
 struct LowerCtx<'a> {
     locals: HashMap<String, LocalInfo>,
+    /// Lowercase names of OPTIONAL dummy arguments in the current subprogram.
+    /// Hidden character-length forwarding must treat an absent optional
+    /// character dummy as length zero instead of dereferencing its null slot.
+    optional_locals: HashSet<String>,
     loops: Vec<LoopScope>,
     st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
@@ -185,6 +189,7 @@ impl<'a> LowerCtx<'a> {
     ) -> Self {
         Self {
             locals: HashMap::new(),
+            optional_locals: HashSet::new(),
             loops: Vec::new(),
             st,
             globals,
@@ -435,6 +440,16 @@ pub fn lower_file(
             &ambiguous_use_warnings,
             false,
         );
+    }
+    if crate::opt::pass::Pass::run(&crate::opt::dce::Dce, &mut module) {
+        for func in &mut module.functions {
+            func.rebuild_type_cache();
+        }
+    }
+    for func in &mut module.functions {
+        if crate::ir::walk::prune_unreachable(func) {
+            func.rebuild_type_cache();
+        }
     }
     (module, globals)
 }
@@ -2861,6 +2876,9 @@ fn lower_unit(
                             runtime_dim_upper: vec![],
                         };
                         ctx.locals.insert(pname.clone(), info);
+                        if decl_is_optional(pname, decls) {
+                            ctx.optional_locals.insert(pname.clone());
+                        }
                     }
                 }
 
@@ -3270,6 +3288,9 @@ fn lower_unit(
                                 runtime_dim_upper: vec![],
                             },
                         );
+                        if decl_is_optional(pname, decls) {
+                            ctx.optional_locals.insert(pname.clone());
+                        }
                     }
                 }
 
@@ -6844,6 +6865,13 @@ fn char_addr_and_len(
 }
 
 fn local_char_ptr_and_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<(ValueId, ValueId)> {
+    if descriptor_backed_runtime_char_array(info) {
+        let desc = array_descriptor_addr(b, info);
+        let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let len = descriptor_elem_size(b, desc);
+        return Some((base, len));
+    }
+
     match &info.char_kind {
         CharKind::Fixed(n) => {
             if !info.dims.is_empty() {
@@ -6935,7 +6963,43 @@ fn char_addr_and_runtime_len(
     match &arg_spanned.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
-            local_char_ptr_and_len(b, info)
+            let needs_absence_guard = info.by_ref
+                && (info.char_kind != CharKind::None
+                    || descriptor_backed_runtime_char_array(info)
+                    || (info.derived_type.is_none()
+                        && matches!(
+                            info.ty,
+                            IrType::Ptr(ref inner)
+                                if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+                        )));
+            if !needs_absence_guard {
+                return local_char_ptr_and_len(b, info);
+            }
+
+            let incoming_ptr = b.load(info.addr);
+            let zero_i64 = b.const_i64(0);
+            let incoming_addr = b.ptr_to_int(incoming_ptr);
+            let is_absent = b.icmp(CmpOp::Eq, incoming_addr, zero_i64);
+            let absent_bb = b.create_block("char_arg_absent");
+            let present_bb = b.create_block("char_arg_present");
+            let join_bb = b.create_block("char_arg_join");
+            let join_ptr = b.add_block_param(join_bb, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let join_len = b.add_block_param(join_bb, IrType::Int(IntWidth::I64));
+            b.cond_branch(is_absent, absent_bb, vec![], present_bb, vec![]);
+
+            b.set_block(absent_bb);
+            let null_ptr = b.int_to_ptr(zero_i64, IrType::Int(IntWidth::I8));
+            b.branch(join_bb, vec![null_ptr, zero_i64]);
+
+            b.set_block(present_bb);
+            if let Some((ptr, len)) = local_char_ptr_and_len(b, info) {
+                b.branch(join_bb, vec![ptr, len]);
+            } else {
+                return None;
+            }
+
+            b.set_block(join_bb);
+            Some((join_ptr, join_len))
         }
         Expr::StringLiteral { value, .. } => {
             let ptr = b.const_string(value.as_bytes());
@@ -7010,9 +7074,37 @@ fn local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<Value
     }
 }
 
+fn optional_local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<ValueId> {
+    if !info.by_ref && !info.descriptor_arg {
+        return local_char_runtime_len(b, info);
+    }
+
+    let incoming_ptr = b.load(info.addr);
+    let zero_ptr = b.const_i64(0);
+    let incoming_addr = b.ptr_to_int(incoming_ptr);
+    let is_present = b.icmp(CmpOp::Ne, incoming_addr, zero_ptr);
+    let present_bb = b.create_block("opt_char_len_present");
+    let absent_bb = b.create_block("opt_char_len_absent");
+    let join_bb = b.create_block("opt_char_len_join");
+    let join_len = b.add_block_param(join_bb, IrType::Int(IntWidth::I64));
+    b.cond_branch(is_present, present_bb, vec![], absent_bb, vec![]);
+
+    b.set_block(present_bb);
+    let present_len = local_char_runtime_len(b, info).unwrap_or_else(|| b.const_i64(0));
+    b.branch(join_bb, vec![present_len]);
+
+    b.set_block(absent_bb);
+    let absent_len = b.const_i64(0);
+    b.branch(join_bb, vec![absent_len]);
+
+    b.set_block(join_bb);
+    Some(join_len)
+}
+
 fn actual_char_arg_runtime_len(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
+    optional_locals: Option<&HashSet<String>>,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
@@ -7020,11 +7112,8 @@ fn actual_char_arg_runtime_len(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
-    if let Some((_ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
-        return Some(len);
-    }
-
     match &expr.node {
+        Expr::StringLiteral { value, .. } => Some(b.const_i64(value.len() as i64)),
         Expr::ArrayConstructor { values, .. } => {
             if let Some(len) = fixed_char_array_constructor_len(values, locals) {
                 return Some(b.const_i64(len));
@@ -7034,6 +7123,7 @@ fn actual_char_arg_runtime_len(
                     return actual_char_arg_runtime_len(
                         b,
                         locals,
+                        optional_locals,
                         first,
                         st,
                         type_layouts,
@@ -7045,9 +7135,35 @@ fn actual_char_arg_runtime_len(
             }
             None
         }
-        Expr::Name { name } => locals
-            .get(&name.to_lowercase())
-            .and_then(|info| local_char_runtime_len(b, info)),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            locals.get(&key).and_then(|info| {
+                let needs_absence_guard = optional_locals
+                    .map(|names| names.contains(&key))
+                    .unwrap_or_else(|| {
+                        info.by_ref
+                            && (info.char_kind != CharKind::None
+                                || descriptor_backed_runtime_char_array(info))
+                    });
+                if needs_absence_guard
+                {
+                    optional_local_char_runtime_len(b, info)
+                } else {
+                    local_char_runtime_len(b, info)
+                }
+            })
+        }
+        Expr::ParenExpr { inner } => actual_char_arg_runtime_len(
+            b,
+            locals,
+            optional_locals,
+            inner,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
         Expr::FunctionCall { callee, args }
             if args.len() == 1
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
@@ -7657,10 +7773,17 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "mod" => {
             // MOD(a, p) = a - INT(a/p) * p  (sign of dividend)
-            // C-style remainder matches this.
             if args.len() >= 2 {
                 let (lhs, rhs) = unify_int_widths(b, args[0], args[1]);
-                Some(b.imod(lhs, rhs))
+                let ty = b
+                    .func()
+                    .value_type(lhs)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                if ty.is_float() {
+                    Some(b.call(FuncRef::External("fmod".into()), vec![lhs, rhs], ty))
+                } else {
+                    Some(b.imod(lhs, rhs))
+                }
             } else {
                 None
             }
@@ -9686,6 +9809,7 @@ fn emit_bound_function_call(
                         actual_char_arg_runtime_len(
                             b,
                             locals,
+                            None,
                             e,
                             st,
                             type_layouts,
@@ -9878,6 +10002,7 @@ fn lower_alloc_return_call_into_desc(
                         actual_char_arg_runtime_len(
                             b,
                             &ctx.locals,
+                            Some(&ctx.optional_locals),
                             e,
                             ctx.st,
                             Some(ctx.type_layouts),
@@ -10356,6 +10481,17 @@ fn lower_intrinsic_subroutine(
             b.call(
                 FuncRef::External("afs_execute_command_line".into()),
                 vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
+                IrType::Void,
+            );
+            true
+        }
+        "flush" => {
+            let unit_raw = nth_arg_val(b, ctx, args, 0, 6);
+            let unit = coerce_to_type(b, unit_raw, &IrType::Int(IntWidth::I32));
+            let null = b.const_i64(0);
+            b.call(
+                FuncRef::External("afs_flush".into()),
+                vec![unit, null],
                 IrType::Void,
             );
             true
@@ -11077,6 +11213,25 @@ fn decl_is_pointer(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool 
             for entity in entities {
                 if entity.name.to_lowercase() == key {
                     return attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Does the named variable in `decls` carry the OPTIONAL attribute?
+fn decl_is_optional(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::Attribute;
+    let key = name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return attrs.iter().any(|a| matches!(a, Attribute::Optional));
                 }
             }
         }
@@ -14230,6 +14385,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         actual_char_arg_runtime_len(
                                             b,
                                             &ctx.locals,
+                                            Some(&ctx.optional_locals),
                                             e,
                                             ctx.st,
                                             Some(ctx.type_layouts),
@@ -20177,7 +20333,9 @@ fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.allocatable {
         info.addr
     } else if info.descriptor_arg {
-        b.load(info.addr)
+        let typed_ptr = b.load(info.addr);
+        let raw = b.ptr_to_int(typed_ptr);
+        b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
     } else {
         info.addr
     }
@@ -20311,7 +20469,9 @@ fn lower_descriptor_actual_from_info(b: &mut FuncBuilder, info: &LocalInfo) -> V
     if info.allocatable {
         info.addr
     } else if info.descriptor_arg {
-        b.load(info.addr)
+        let typed_ptr = b.load(info.addr);
+        let raw = b.ptr_to_int(typed_ptr);
+        b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
     } else if !info.dims.is_empty() {
         materialize_array_descriptor_for_info(b, info)
     } else {
@@ -25870,6 +26030,7 @@ fn lower_expr_full(
                                     actual_char_arg_runtime_len(
                                         b,
                                         locals,
+                                        None,
                                         e,
                                         st,
                                         type_layouts,
@@ -26154,6 +26315,7 @@ fn lower_expr_full(
                                                     actual_char_arg_runtime_len(
                                                         b,
                                                         locals,
+                                                        None,
                                                         e,
                                                         st,
                                                         type_layouts,
@@ -27187,6 +27349,26 @@ end subroutine
 ",
         );
         assert!(ir.contains("ret void"));
+    }
+
+    #[test]
+    fn lower_infinite_do_function_with_return() {
+        let (_, ir) = lower_and_verify(
+            "\
+logical function wait_min7() result(success)
+  do
+    success = .false.
+    return
+  end do
+end function wait_min7
+",
+        );
+        assert!(ir.contains("ret %"), "expected function return in:\n{}", ir);
+        assert!(
+            !ir.contains("do_exit"),
+            "unreachable do-exit block should be pruned in:\n{}",
+            ir
+        );
     }
 
     #[test]
