@@ -11472,6 +11472,44 @@ fn empty_allocatable_char_component_copy_stays_allocated() {
 }
 
 #[test]
+fn derived_array_growth_keeps_unallocated_allocatable_components_clear() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: trans_t\n    integer :: target = 0\n  end type\n  type :: state_t\n    type(trans_t), allocatable :: trans(:)\n    integer :: num_trans = 0\n  end type\n  type :: nfa_t\n    type(state_t), allocatable :: states(:)\n    integer :: num_states = 0\n  end type\n  type(nfa_t) :: nfa\n  type(trans_t) :: trans\n  integer :: i, start_state, accept_state, prev_accept, s2\n\n  call init(nfa)\n  start_state = add_state(nfa)\n  accept_state = add_state(nfa)\n  trans%target = accept_state\n  call add_trans(nfa%states(start_state), trans)\n\n  do i = 2, 8\n    prev_accept = accept_state\n    s2 = add_state(nfa)\n    trans%target = s2\n    call add_trans(nfa%states(prev_accept), trans)\n    accept_state = s2\n  end do\n\n  if (nfa%states(8)%num_trans /= 1) error stop 1\n  if (.not. allocated(nfa%states(8)%trans)) error stop 2\n  if (nfa%states(8)%trans(1)%target /= 9) error stop 3\n  print *, 'ok'\ncontains\n  subroutine add_trans(state, trans)\n    type(state_t), intent(inout) :: state\n    type(trans_t), intent(in) :: trans\n    type(trans_t), allocatable :: temp(:)\n    integer :: n\n    if (.not. allocated(state%trans)) then\n      allocate(state%trans(4))\n      state%num_trans = 0\n    end if\n    n = state%num_trans\n    if (n >= size(state%trans)) then\n      allocate(temp(size(state%trans) * 2))\n      temp(1:n) = state%trans(1:n)\n      call move_alloc(temp, state%trans)\n    end if\n    state%num_trans = n + 1\n    state%trans(state%num_trans) = trans\n  end subroutine\n\n  subroutine init(nfa)\n    type(nfa_t), intent(inout) :: nfa\n    allocate(nfa%states(8))\n    nfa%num_states = 0\n  end subroutine\n\n  integer function add_state(nfa) result(idx)\n    type(nfa_t), intent(inout) :: nfa\n    type(state_t), allocatable :: temp(:)\n    integer :: n\n    n = nfa%num_states\n    if (n >= size(nfa%states)) then\n      allocate(temp(size(nfa%states) * 2))\n      temp(1:n) = nfa%states(1:n)\n      call move_alloc(temp, nfa%states)\n    end if\n    nfa%num_states = n + 1\n    idx = nfa%num_states\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_growth_unalloc_components", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array growth compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array growth compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived array growth run failed");
+    assert!(
+        run.status.success(),
+        "derived array growth run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived array growth output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn module_global_derived_array_char_default_init_uses_blanks() {
     let src = write_program(
         "module m\n  implicit none\n  type :: entry_t\n    character(len=8) :: name = ''\n  end type\n  type(entry_t), save :: table(2)\ncontains\n  subroutine check()\n    if (len_trim(table(1)%name) /= 0) error stop 1\n    if (table(1)%name(1:1) /= ' ') error stop 2\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  call check()\nend program\n",

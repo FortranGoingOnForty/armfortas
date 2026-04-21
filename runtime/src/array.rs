@@ -1205,6 +1205,26 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
 
 // ---- ALLOCATABLE ASSIGNMENT ----
 
+fn descriptor_looks_sane(desc: &ArrayDescriptor) -> bool {
+    let known_flags = DESC_ALLOCATED | DESC_CONTIGUOUS | DESC_POINTER;
+    if desc.flags & !known_flags != 0 {
+        return false;
+    }
+    if desc.rank < 0 || desc.rank as usize > MAX_RANK {
+        return false;
+    }
+    if desc.elem_size < 0 {
+        return false;
+    }
+    if desc.is_allocated() && desc.base_addr.is_null() {
+        return false;
+    }
+    if !desc.is_allocated() && !desc.base_addr.is_null() {
+        return false;
+    }
+    true
+}
+
 /// Assign one array to another with automatic reallocation (F2003).
 ///
 /// If dest's shape doesn't match source's shape, deallocate dest and
@@ -1220,6 +1240,20 @@ pub extern "C" fn afs_assign_allocatable(
 
     let dest = unsafe { &mut *dest };
     let source = unsafe { &*source };
+
+    if !descriptor_looks_sane(dest) {
+        *dest = ArrayDescriptor::zeroed();
+    }
+
+    if !source.is_allocated() && source.base_addr.is_null() {
+        if dest.is_allocated() && !dest.base_addr.is_null() {
+            unsafe {
+                libc_free(dest.base_addr);
+            }
+        }
+        *dest = ArrayDescriptor::zeroed();
+        return;
+    }
 
     // Check if shapes match.
     let shapes_match = dest.rank == source.rank && {
@@ -1589,6 +1623,77 @@ mod tests {
         }
 
         afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_from_unallocated_source_clears_dest() {
+        let source = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut dest, 4, 3);
+        assert!(dest.is_allocated());
+
+        afs_assign_allocatable(&mut dest, &source);
+        assert!(!dest.is_allocated());
+        assert!(dest.base_addr.is_null());
+        assert_eq!(dest.rank, 0);
+    }
+
+    #[test]
+    fn assign_allocatable_ignores_invalid_garbage_dest_for_unallocated_source() {
+        let source = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+
+        dest.flags = DESC_ALLOCATED;
+        dest.rank = 1;
+        dest.elem_size = 4;
+        dest.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+
+        afs_assign_allocatable(&mut dest, &source);
+        assert!(!dest.is_allocated());
+        assert!(dest.base_addr.is_null());
+        assert_eq!(dest.rank, 0);
+    }
+
+    #[test]
+    fn assign_allocatable_copies_from_nonowning_section_descriptor() {
+        let mut backing = ArrayDescriptor::zeroed();
+        let mut section = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut backing, 4, 4);
+        unsafe {
+            let data = backing.base_addr as *mut i32;
+            *data.add(0) = 10;
+            *data.add(1) = 20;
+            *data.add(2) = 30;
+            *data.add(3) = 40;
+        }
+
+        let spec = SectionSpec {
+            start: 2,
+            end: 3,
+            stride: 1,
+        };
+        afs_create_section(&backing, &mut section, &spec, 1);
+        assert!(!section.is_allocated());
+        assert!(!section.base_addr.is_null());
+
+        afs_assign_allocatable(&mut dest, &section);
+        assert!(dest.is_allocated());
+        assert_eq!(dest.total_elements(), 2);
+        unsafe {
+            let data = dest.base_addr as *const i32;
+            assert_eq!(*data.add(0), 20);
+            assert_eq!(*data.add(1), 30);
+        }
+
+        afs_deallocate_array(&mut backing, ptr::null_mut());
         afs_deallocate_array(&mut dest, ptr::null_mut());
     }
 
