@@ -99,7 +99,7 @@ fn lsf_in_function(func: &mut Function) -> bool {
                         matches!(
                             alias::query(func, entry.ptr, eff_ptr),
                             AliasResult::MustAlias
-                        )
+                        ) && func.value_type(entry.val).is_some_and(|ty| ty == inst.ty)
                     }) {
                         all_rewrites.insert(inst.id, entry.val);
                         changed = true;
@@ -442,6 +442,61 @@ mod tests {
             matches!(term, Terminator::Return(Some(v)) if *v == v42),
             "return should use the stored value after forwarding, got {:?}",
             term
+        );
+    }
+
+    #[test]
+    fn does_not_forward_scalar_store_into_aggregate_load() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+        let arr_ty = IrType::Array(
+            Box::new(IrType::Float(crate::ir::types::FloatWidth::F64)),
+            2,
+        );
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(arr_ty.clone()),
+            IrType::Ptr(Box::new(arr_ty.clone())),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let elem_ptr = push(
+            &mut f,
+            InstKind::GetElementPtr(alloca, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Float(crate::ir::types::FloatWidth::F64))),
+        );
+        let scalar = push(
+            &mut f,
+            InstKind::ConstFloat(1.5, crate::ir::types::FloatWidth::F64),
+            IrType::Float(crate::ir::types::FloatWidth::F64),
+        );
+        push(&mut f, InstKind::Store(scalar, elem_ptr), IrType::Void);
+        let load = push(&mut f, InstKind::Load(alloca), arr_ty.clone());
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        let changed = LocalLsf.run(&mut m);
+        assert!(
+            !changed,
+            "LSF must not forward a scalar store into an aggregate-typed load"
+        );
+
+        let func = &m.functions[0];
+        let load_inst = func
+            .block(func.entry)
+            .insts
+            .iter()
+            .find(|inst| inst.id == load)
+            .expect("load should still exist");
+        assert!(
+            matches!(load_inst.kind, InstKind::Load(ptr) if ptr == alloca),
+            "aggregate load should remain untouched, got {:?}",
+            load_inst.kind
         );
     }
 

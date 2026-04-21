@@ -709,8 +709,11 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "sign" | "mod" | "modulo" => args.first().cloned(),
 
         // Real-valued math.
-        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "sqrt"
-        | "atan2" => Some(args.first().cloned().unwrap_or(FortranType::default_real())),
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" | "exp" | "log" | "log10" | "sqrt" | "atan2" | "gamma"
+        | "log_gamma" | "erf" | "erfc" => {
+            Some(args.first().cloned().unwrap_or(FortranType::default_real()))
+        }
 
         // Integer-valued.
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),

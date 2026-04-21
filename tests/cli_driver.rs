@@ -8099,6 +8099,123 @@ fn enum_bind_c_enumerators_compile_and_run() {
 }
 
 #[test]
+fn complex_intrinsics_preserve_complex_storage_without_i128_backend_fallback() {
+    let src = write_program(
+        r#"
+module complex_box_mod
+  use iso_fortran_env, only: real64
+  implicit none
+  type :: complex_box_t
+    complex(real64) :: z = (0.0_real64, 0.0_real64)
+    complex(real64), allocatable :: mat(:,:)
+  end type
+contains
+  function build_box(real_part, imag_part) result(box)
+    real(real64), intent(in) :: real_part, imag_part
+    type(complex_box_t) :: box
+    box%z = cmplx(real_part, imag_part, kind=real64)
+    allocate(box%mat(1,1))
+    box%mat(1,1) = conjg(box%z)
+  end function
+end module
+
+program main
+  use iso_fortran_env, only: real64
+  use complex_box_mod
+  implicit none
+  type(complex_box_t) :: box
+  box = build_box(1.5_real64, -2.5_real64)
+  if (abs(real(box%z) - 1.5_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(box%z) + 2.5_real64) > 1.0e-12_real64) error stop 2
+  if (abs(real(box%mat(1,1)) - 1.5_real64) > 1.0e-12_real64) error stop 3
+  if (abs(aimag(box%mat(1,1)) - 2.5_real64) > 1.0e-12_real64) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_intrinsics_no_i128", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex intrinsic compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex intrinsic program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "complex intrinsic runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex intrinsic smoke output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn extended_math_intrinsics_compile_and_run() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  real(real64) :: x, y
+  x = 0.5_real64
+  y = 2.0_real64
+  if (sinh(x) <= x) error stop 1
+  if (cosh(x) <= 1.0_real64) error stop 2
+  if (tanh(x) <= 0.0_real64 .or. tanh(x) >= 1.0_real64) error stop 3
+  if (asinh(1.25_real64) <= 0.0_real64) error stop 4
+  if (acosh(y) <= 0.0_real64) error stop 5
+  if (atanh(x) <= 0.0_real64) error stop 6
+  if (gamma(5.0_real64) <= 20.0_real64) error stop 7
+  if (log_gamma(5.0_real64) <= 3.0_real64) error stop 8
+  if (erf(x) <= 0.0_real64) error stop 9
+  if (erfc(x) <= 0.0_real64 .or. erfc(x) >= 1.0_real64) error stop 10
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("extended_math_intrinsics", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("extended math intrinsic compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "extended math intrinsic program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "extended math intrinsic runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected extended math intrinsic smoke output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_renamed_procedure_call_uses_remote_symbol() {
     let dir = unique_dir("use_rename_proc");
     let mod_src = write_program_in(

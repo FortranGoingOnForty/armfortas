@@ -6138,6 +6138,14 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
         return val;
     }
     match (&src, target) {
+        // Complex values commonly travel as ptr<[f32/f64 x 2]> buffers.
+        // When a by-value complex slot expects the aggregate itself,
+        // materialize it by loading the pointed-to pair.
+        (IrType::Ptr(inner), target)
+            if matches!(inner.as_ref(), IrType::Array(_, 2)) && inner.as_ref() == target =>
+        {
+            b.load_typed(val, target.clone())
+        }
         // Int → Float
         (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
         // Float → Int
@@ -7378,6 +7386,80 @@ fn lower_any_intrinsic_ast(
 /// Returns Some(ValueId) if recognized, None for external functions.
 fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<ValueId> {
     match name {
+        "cmplx" => {
+            if let Some(real_arg) = args.first() {
+                let kind = args
+                    .get(2)
+                    .and_then(|arg| extract_const_int_from_value(b, *arg))
+                    .unwrap_or_else(|| {
+                        if args.iter().any(|arg| {
+                            let ty = b.func().value_type(*arg);
+                            matches!(ty, Some(IrType::Float(FloatWidth::F64)))
+                                || ty.as_ref().is_some_and(|ty| {
+                                    is_complex_ty(ty) && complex_float_width(ty) == FloatWidth::F64
+                                })
+                        }) {
+                            8
+                        } else {
+                            4
+                        }
+                    });
+                let fw = if kind == 8 {
+                    FloatWidth::F64
+                } else {
+                    FloatWidth::F32
+                };
+                let elem_ty = IrType::Float(fw);
+                let buf = b.alloca(IrType::Array(Box::new(elem_ty.clone()), 2));
+                let zero = b.const_i64(0);
+                let imag_offset = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                let real_val = coerce_to_type(b, *real_arg, &elem_ty);
+                let imag_val = if let Some(imag_arg) = args.get(1) {
+                    coerce_to_type(b, *imag_arg, &elem_ty)
+                } else {
+                    match fw {
+                        FloatWidth::F64 => b.const_f64(0.0),
+                        FloatWidth::F32 => b.const_f32(0.0),
+                    }
+                };
+                let real_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                b.store(real_val, real_ptr);
+                let imag_ptr = b.gep(buf, vec![imag_offset], IrType::Int(IntWidth::I8));
+                b.store(imag_val, imag_ptr);
+                Some(buf)
+            } else {
+                None
+            }
+        }
+        "conjg" => {
+            if let Some(arg) = args.first() {
+                let ty = b
+                    .func()
+                    .value_type(*arg)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                if is_complex_ty(&ty) {
+                    let fw = complex_float_width(&ty);
+                    let elem_ty = IrType::Float(fw);
+                    let buf = b.alloca(IrType::Array(Box::new(elem_ty.clone()), 2));
+                    let zero = b.const_i64(0);
+                    let imag_offset = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                    let real_ptr = b.gep(*arg, vec![zero], IrType::Int(IntWidth::I8));
+                    let imag_ptr = b.gep(*arg, vec![imag_offset], IrType::Int(IntWidth::I8));
+                    let real_val = b.load_typed(real_ptr, elem_ty.clone());
+                    let imag_val = b.load_typed(imag_ptr, elem_ty.clone());
+                    let neg_imag = b.fneg(imag_val);
+                    let out_real_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                    b.store(real_val, out_real_ptr);
+                    let out_imag_ptr = b.gep(buf, vec![imag_offset], IrType::Int(IntWidth::I8));
+                    b.store(neg_imag, out_imag_ptr);
+                    Some(buf)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
         "merge" => {
             if args.len() >= 3 {
                 let mut ty = b
@@ -7840,9 +7922,9 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         // ---- Math intrinsics → libm calls ----
         // Dispatch to sinf/sin based on argument type for F32/F64 correctness.
         "sin" | "dsin" | "cos" | "dcos" | "tan" | "dtan" | "asin" | "dasin" | "acos" | "dacos"
-        | "atan" | "datan" | "sinh" | "dsinh" | "cosh" | "dcosh" | "tanh" | "dtanh" | "exp"
-        | "dexp" | "log" | "dlog" | "alog" | "log10" | "dlog10" | "alog10" | "erf" | "derf"
-        | "erfc" | "derfc" | "ceiling" | "floor" => {
+        | "atan" | "datan" | "sinh" | "dsinh" | "cosh" | "dcosh" | "tanh" | "dtanh" | "asinh"
+        | "acosh" | "atanh" | "exp" | "dexp" | "log" | "dlog" | "alog" | "log10" | "dlog10"
+        | "alog10" | "erf" | "derf" | "erfc" | "derfc" | "ceiling" | "floor" => {
             if let Some(arg) = args.first() {
                 let ty = b
                     .func()
@@ -7859,6 +7941,9 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     "dsinh" | "sinh" => "sinh",
                     "dcosh" | "cosh" => "cosh",
                     "dtanh" | "tanh" => "tanh",
+                    "asinh" => "asinh",
+                    "acosh" => "acosh",
+                    "atanh" => "atanh",
                     "dexp" | "exp" => "exp",
                     "dlog" | "log" | "alog" => "log",
                     "dlog10" | "log10" | "alog10" => "log10",
@@ -12890,6 +12975,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             src_ptr,
                                         );
                                     }
+                                } else if is_complex_ty(&type_info_to_ir_type(&field.type_info))
+                                    && !field.pointer
+                                    && !field.allocatable
+                                    && field.dims.is_empty()
+                                {
+                                    let src = lower_expr_ctx_tl(b, ctx, value);
+                                    let bytes =
+                                        complex_byte_size(&type_info_to_ir_type(&field.type_info));
+                                    let sz = b.const_i64(bytes);
+                                    b.call(
+                                        FuncRef::External("memcpy".into()),
+                                        vec![field_ptr, src, sz],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
                                 } else {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(
@@ -16356,6 +16455,7 @@ fn lower_array_element(
         .as_deref()
         .filter(|name| !is_opaque_c_handle_name(name))
         .is_some()
+        || is_complex_ty(&info.ty)
     {
         elem_ptr
     } else {
@@ -16973,6 +17073,15 @@ fn lower_array_store(
         .is_some()
     {
         let size = b.const_i64(ir_scalar_byte_size(&info.ty));
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![elem_ptr, value, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
+    if is_complex_ty(&info.ty) {
+        let size = b.const_i64(complex_byte_size(&info.ty));
         b.call(
             FuncRef::External("memcpy".into()),
             vec![elem_ptr, value, size],
@@ -21333,6 +21442,14 @@ fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
             return IrType::Int(IntWidth::I64);
         }
     }
+    if let TypeInfo::Complex { kind } = ti {
+        let fw = if kind.unwrap_or(4) == 8 {
+            FloatWidth::F64
+        } else {
+            FloatWidth::F32
+        };
+        return IrType::Array(Box::new(IrType::Float(fw)), 2);
+    }
     // Derived types lower to a byte pointer — the compiler treats
     // values of derived types as addresses into struct-shaped
     // buffers. Without this case, size_of_type for a small derived
@@ -23999,15 +24116,22 @@ fn lower_expr_full(
                                         contained_host_refs,
                                         descriptor_params,
                                     );
-                                    let coerced = coerce_to_type(
-                                        b,
-                                        val,
-                                        &type_info_to_ir_type(&layout.fields[i].type_info),
-                                    );
                                     let offset = b.const_i64(layout.fields[i].offset as i64);
                                     let field_ptr =
                                         b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
-                                    b.store(coerced, field_ptr);
+                                    let field_ty =
+                                        type_info_to_ir_type(&layout.fields[i].type_info);
+                                    if is_complex_ty(&field_ty) {
+                                        let sz = b.const_i64(complex_byte_size(&field_ty));
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![field_ptr, val, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        let coerced = coerce_to_type(b, val, &field_ty);
+                                        b.store(coerced, field_ptr);
+                                    }
                                 }
                             }
                         }
@@ -24598,6 +24722,19 @@ fn lower_expr_full(
                                 return field_ptr;
                             }
 
+                            // Complex fields follow the same address-valued
+                            // convention as ordinary complex locals: callers
+                            // expect a pointer to the inline [re, im] buffer,
+                            // not the aggregate loaded by value. Retag the
+                            // byte-addressed field pointer to the real complex
+                            // storage type so intrinsic dispatch sees
+                            // ptr<[f32/f64 x 2]> instead of ptr<i8>.
+                            if let crate::sema::symtab::TypeInfo::Complex { .. } = &field.type_info
+                            {
+                                let addr = b.ptr_to_int(field_ptr);
+                                return b.int_to_ptr(addr, type_info_to_ir_type(&field.type_info));
+                            }
+
                             let ir_ty = type_info_to_ir_type(&field.type_info);
                             return b.load_typed(field_ptr, ir_ty);
                         }
@@ -24743,6 +24880,10 @@ fn fortran_type_to_ir_scalar_type(ft: &crate::sema::types::FortranType) -> Optio
             4 => Some(IrType::Float(FloatWidth::F32)),
             8 => Some(IrType::Float(FloatWidth::F64)),
             _ => None,
+        },
+        FortranType::Complex { kind } => match kind {
+            8 => Some(IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2)),
+            _ => Some(IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2)),
         },
         FortranType::Logical { kind } => match kind {
             1 => Some(IrType::Int(IntWidth::I8)),

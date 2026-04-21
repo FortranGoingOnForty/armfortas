@@ -640,7 +640,9 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         | Stmt::WhereStmt {
             mask: condition, ..
         } => validate_const_int_expr_tree(ctx, condition),
-        Stmt::SelectCase { selector, cases, .. } => {
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
             validate_const_int_expr_tree(ctx, selector);
             for case in cases {
                 for selector in &case.selectors {
@@ -1304,10 +1306,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
-                    ctx.error(
-                        item.span,
-                        "array ALLOCATE requires bounds or SOURCE=/MOLD=",
-                    );
+                    ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
                 }
             }
         }
@@ -2771,7 +2770,8 @@ pub fn is_intrinsic_name(name: &str) -> bool {
     matches!(
         name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
-        "cos" | "sin" | "tan" | "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
+        "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" |
+        "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
         "int" | "nint" | "real" | "dble" | "cmplx" | "conjg" |
         "aimag" | "dimag" | "char" | "ichar" | "achar" | "iachar" |
@@ -2785,6 +2785,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
         "maxexponent" | "minexponent" | "digits" | "bit_size" |
         "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
+        "gamma" | "log_gamma" | "erf" | "erfc" |
         "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
         "ishft" | "ishftc" | "mvbits" | "transfer" |
         "new_line" | "null" | "move_alloc" |
