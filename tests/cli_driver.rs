@@ -443,7 +443,10 @@ fn stream_unformatted_scalar_char_read_preserves_each_byte() {
     assert_eq!(
         stdout
             .lines()
-            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>())
+            .map(|line| line
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>())
             .collect::<Vec<_>>(),
         vec!["65", "0", "66", "IOS=-1"],
         "unexpected stream unformatted char read output: {}",
@@ -490,7 +493,10 @@ fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     assert_eq!(
         stdout
             .lines()
-            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>())
+            .map(|line| line
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>())
             .collect::<Vec<_>>(),
         vec!["65", "0", "66", "IOS=-2"],
         "unexpected nonadvancing A1 char read output: {}",
@@ -1259,8 +1265,7 @@ fn bind_c_exit_flushes_pending_nonadvancing_stdout_output() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(
-        run.stdout,
-        b"hello\0",
+        run.stdout, b"hello\0",
         "bind(c) exit should flush pending non-advancing stdout writes"
     );
 
@@ -1317,15 +1322,120 @@ fn real_mod_intrinsic_compiles_and_runs() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out)
-        .output()
-        .expect("real mod run failed");
+    let run = Command::new(&out).output().expect("real mod run failed");
     assert!(
         run.status.success(),
         "real mod run failed: status={:?} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stderr)
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn reshape_array_actual_to_assumed_shape_dummy_compiles_and_runs() {
+    let src = write_program(
+        "module m\ncontains\n  function wrap(matrix_data) result(total)\n    use iso_fortran_env, only: real64\n    real(real64), intent(in) :: matrix_data(:,:)\n    real(real64) :: total\n    if (size(matrix_data, 1) /= 2 .or. size(matrix_data, 2) /= 2) error stop 11\n    total = matrix_data(2, 1) + matrix_data(1, 2)\n  end function wrap\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: total\n  total = wrap(reshape([1.0_real64, 3.0_real64, 2.0_real64, 4.0_real64], [2, 2]))\n  if (abs(total - 5.0_real64) > 1.0e-12_real64) error stop 12\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("reshape_array_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("reshape actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "reshape actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("reshape actual run failed");
+    assert!(
+        run.status.success(),
+        "reshape actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected reshape actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn reshape_array_actual_to_assumed_shape_subroutine_dummy_compiles_and_runs() {
+    let src = write_program(
+        "module m\ncontains\n  subroutine show(matrix_data)\n    use iso_fortran_env, only: real64\n    real(real64), intent(in) :: matrix_data(:,:)\n    if (size(matrix_data, 1) /= 2 .or. size(matrix_data, 2) /= 2) error stop 21\n    if (abs(matrix_data(2, 1) - 3.0_real64) > 1.0e-12_real64) error stop 22\n    if (abs(matrix_data(1, 2) - 2.0_real64) > 1.0e-12_real64) error stop 23\n    print *, 'ok'\n  end subroutine show\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  call show(reshape([1.0_real64, 3.0_real64, 2.0_real64, 4.0_real64], [2, 2]))\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("reshape_array_actual_subroutine", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("reshape subroutine actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "reshape subroutine actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("reshape subroutine actual run failed");
+    assert!(
+        run.status.success(),
+        "reshape subroutine actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected reshape subroutine actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn real_intrinsic_honors_named_kind_argument_for_integer_inputs() {
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: x\n  x = real(nint(3.5_real64), real64)\n  if (abs(x - 4.0_real64) > 1.0e-12_real64) error stop 1\n  x = real(nint(3.4_real64), real64)\n  if (abs(x - 3.0_real64) > 1.0e-12_real64) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("real_named_kind_integer_input", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real intrinsic kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "real intrinsic kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("real intrinsic kind run failed");
+    assert!(
+        run.status.success(),
+        "real intrinsic kind run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "unexpected stdout: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -9336,7 +9446,9 @@ fn imported_fixed_logical_component_array_whole_assignment_clears_all_elements()
         String::from_utf8_lossy(&link.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("logical component run failed");
+    let run = Command::new(&exe)
+        .output()
+        .expect("logical component run failed");
     assert!(
         run.status.success(),
         "logical component runtime failed: status={:?} stderr={}",
@@ -9369,7 +9481,9 @@ fn ichar_and_iachar_treat_high_bit_bytes_as_unsigned() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out).output().expect("ichar unsigned run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("ichar unsigned run failed");
     assert!(
         run.status.success(),
         "ichar unsigned runtime failed: status={:?} stderr={}",
@@ -9654,6 +9768,63 @@ end program
         "expected complex intrinsic smoke output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn real_intrinsic_preserves_complex_kind_without_explicit_kind_argument() {
+    let src = write_program(
+        r#"
+module m
+  use iso_fortran_env, only: real64
+contains
+  function phase(z) result(angle)
+    complex(real64), intent(in) :: z
+    real(real64) :: angle
+    angle = atan2(aimag(z), real(z))
+  end function
+end module
+
+program main
+  use iso_fortran_env, only: real64
+  use m
+  implicit none
+  complex(real64) :: z
+  real(real64) :: x, angle
+  z = cmplx(1.0_real64, 1.0_real64, kind=real64)
+  x = real(z)
+  if (abs(x - 1.0_real64) > 1.0e-12_real64) error stop 1
+  angle = phase(z)
+  if (abs(angle - atan(1.0_real64)) > 1.0e-12_real64) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("real_complex_kind_no_explicit_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real complex kind compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "real complex kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("real complex kind run failed");
+    assert!(
+        run.status.success(),
+        "real complex kind run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "unexpected stdout: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -10610,6 +10781,76 @@ fn pointer_function_result_can_forward_other_pointer_call() {
     assert!(
         stdout.contains("ok"),
         "unexpected pointer result forwarding output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pointer_function_result_forwarding_preserves_target_association() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\n  type(node_t), target, save :: pool\ncontains\n  subroutine init_pool(n)\n    integer, intent(in) :: n\n    pool%value = n\n  end subroutine init_pool\n\n  function leaf() result(node)\n    type(node_t), pointer :: node\n    node => pool\n  end function leaf\n\n  function forward() result(node)\n    type(node_t), pointer :: node\n    type(node_t), pointer :: tmp\n    node => leaf()\n    tmp => leaf()\n    if (.not. associated(tmp, pool)) error stop 3\n  end function forward\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  call init_pool(7)\n  root => forward()\n  if (.not. associated(root, pool)) error stop 1\n  root%value = 42\n  if (pool%value /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_result_forwarding_assoc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer result forwarding association compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer result forwarding association should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer result forwarding association should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer result forwarding association output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_array_element_assignment_deep_copies_allocatable_components() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: token_t\n    integer :: token_type = 0\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type token_t\ncontains\n  function make_token(ttype, text, pos) result(token)\n    integer, intent(in) :: ttype, pos\n    character(len=*), intent(in) :: text\n    type(token_t) :: token\n    token%token_type = ttype\n    token%text = text\n    token%position = pos\n  end function make_token\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  type(token_t) :: current\n  allocate(tokens(4))\n  current = make_token(1, '2', 1)\n  tokens(1) = current\n  current = make_token(3, '+', 3)\n  tokens(2) = current\n  current = make_token(1, '3', 5)\n  tokens(3) = current\n  if (tokens(1)%token_type /= 1) error stop 1\n  if (trim(tokens(1)%text) /= '2') error stop 2\n  if (tokens(1)%position /= 1) error stop 3\n  if (tokens(2)%token_type /= 3) error stop 4\n  if (trim(tokens(2)%text) /= '+') error stop 5\n  if (tokens(2)%position /= 3) error stop 6\n  if (tokens(3)%token_type /= 1) error stop 7\n  if (trim(tokens(3)%text) /= '3') error stop 8\n  if (tokens(3)%position /= 5) error stop 9\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_element_deep_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array element deep copy compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "derived array element deep copy should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "derived array element deep copy should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived array element deep copy output: {}",
         stdout
     );
 
@@ -12224,6 +12465,39 @@ fn fixed_char_component_substring_prints_contents() {
 }
 
 #[test]
+fn implicit_len1_char_component_assignment_preserves_bytes() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: lexer_state_t\n    character(len=:), allocatable :: input\n    character :: current_char\n  end type\n  type(lexer_state_t) :: lexer\n  lexer%current_char = '2'\n  if (iachar(lexer%current_char) /= iachar('2')) error stop 1\n  lexer%input = trim(adjustl('2 + 3'))\n  lexer%current_char = lexer%input(1:1)\n  if (iachar(lexer%current_char) /= iachar('2')) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("implicit_len1_char_component_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("implicit len1 char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "implicit len1 char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit len1 char component run failed");
+    assert!(
+        run.status.success(),
+        "implicit len1 char component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "unexpected stdout: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_whole_array_copy_preserves_elements() {
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = src\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
@@ -12406,4 +12680,201 @@ fn local_logical_array_broadcast_does_not_clobber_prior_stack_local() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_dummy_realloc_section_assign_returns_with_live_descriptor() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: vals(:)\n  allocate(vals(16))\n  vals(1) = 2\n  call resize(vals)\n  if (.not. allocated(vals)) error stop 1\n  if (size(vals) /= 1) error stop 2\n  if (vals(1) /= 7) error stop 3\n  print *, 'ok'\ncontains\n  subroutine resize(vals)\n    integer, allocatable, intent(inout) :: vals(:)\n    integer, allocatable :: temp(:)\n    allocate(temp(1))\n    temp(1) = 7\n    deallocate(vals)\n    allocate(vals(1))\n    vals = temp(1:1)\n    deallocate(temp)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_dummy_section_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable dummy section assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable dummy section assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable dummy section assign run failed");
+    assert!(
+        run.status.success(),
+        "allocatable dummy section assign run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable dummy section assign output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_assignment_generic_does_not_capture_intrinsic_assignment_of_other_derived_arrays() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: value_t\n    integer :: x = 0\n  end type\n  type :: token_t\n    integer :: token_type = 0\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type\n  public :: assignment(=)\n  interface assignment(=)\n    module procedure assign_value\n  end interface\ncontains\n  subroutine assign_value(lhs, rhs)\n    type(value_t), intent(out) :: lhs\n    type(value_t), intent(in) :: rhs\n    lhs%x = rhs%x\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: a(:), b(:)\n  allocate(a(2), b(1))\n  a(1)%token_type = 1\n  a(1)%text = '2'\n  a(1)%position = 1\n  b = a(1:1)\n  if (b(1)%token_type /= 1) error stop 1\n  if (trim(b(1)%text) /= '2') error stop 2\n  if (b(1)%position /= 1) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assignment_intrinsic_token", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined assignment intrinsic token compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined assignment intrinsic token compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("defined assignment intrinsic token run failed");
+    assert!(
+        run.status.success(),
+        "defined assignment intrinsic token run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected defined assignment intrinsic token output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn unrelated_defined_assignment_does_not_double_evaluate_intrinsic_scalar_assignment_rhs() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: token_t, lexer_state_t, tokenize, assignment(=), TOKEN_NUMBER, TOKEN_OPERATOR\n  integer, parameter :: TOKEN_EOF = 0, TOKEN_NUMBER = 1, TOKEN_OPERATOR = 3\n  type :: value_t\n    integer :: x = 0\n  end type\n  type :: token_t\n    integer :: token_type = TOKEN_EOF\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type\n  type :: lexer_state_t\n    character(len=:), allocatable :: input\n    integer :: position\n    integer :: length\n    character :: current_char\n  end type\n  interface assignment(=)\n    module procedure assign_value\n  end interface\ncontains\n  subroutine assign_value(lhs, rhs)\n    type(value_t), intent(out) :: lhs\n    type(value_t), intent(in) :: rhs\n    lhs%x = rhs%x\n  end subroutine\n\n  function tokenize(expression) result(tokens)\n    character(len=*), intent(in) :: expression\n    type(token_t), allocatable :: tokens(:)\n    type(lexer_state_t) :: lexer\n    type(token_t) :: current_token\n    integer :: token_count\n    lexer%input = trim(adjustl(expression))\n    lexer%length = len_trim(lexer%input)\n    lexer%position = 1\n    lexer%current_char = lexer%input(1:1)\n    allocate(tokens(4))\n    token_count = 0\n    do\n      call skip_whitespace(lexer)\n      if (lexer%current_char == char(0) .or. lexer%position > lexer%length) exit\n      current_token = next_token(lexer)\n      token_count = token_count + 1\n      tokens(token_count) = current_token\n      if (current_token%token_type == TOKEN_EOF) exit\n    end do\n    token_count = token_count + 1\n    tokens(token_count)%token_type = TOKEN_EOF\n  end function\n\n  function next_token(lexer) result(token)\n    type(lexer_state_t), intent(inout) :: lexer\n    type(token_t) :: token\n    token%position = lexer%position\n    select case (lexer%current_char)\n    case ('0':'9')\n      token = read_number(lexer)\n    case ('+')\n      token%text = '+'\n      call advance(lexer)\n      token%token_type = TOKEN_OPERATOR\n    case default\n      token%text = lexer%current_char\n      call advance(lexer)\n      token%token_type = TOKEN_OPERATOR\n    end select\n  end function\n\n  function read_number(lexer) result(token)\n    type(lexer_state_t), intent(inout) :: lexer\n    type(token_t) :: token\n    integer :: start_pos\n    start_pos = lexer%position\n    do while (lexer%current_char >= '0' .and. lexer%current_char <= '9')\n      call advance(lexer)\n    end do\n    token%token_type = TOKEN_NUMBER\n    token%text = lexer%input(start_pos:lexer%position-1)\n  end function\n\n  subroutine skip_whitespace(lexer)\n    type(lexer_state_t), intent(inout) :: lexer\n    do while (lexer%current_char == ' ' .and. lexer%position <= lexer%length)\n      call advance(lexer)\n    end do\n  end subroutine\n\n  subroutine advance(lexer)\n    type(lexer_state_t), intent(inout) :: lexer\n    lexer%position = lexer%position + 1\n    if (lexer%position <= lexer%length) then\n      lexer%current_char = lexer%input(lexer%position:lexer%position)\n    else\n      lexer%current_char = char(0)\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  tokens = tokenize('2 + 3')\n  if (tokens(1)%token_type /= TOKEN_NUMBER) error stop 1\n  if (trim(tokens(1)%text) /= '2') error stop 2\n  if (tokens(2)%token_type /= TOKEN_OPERATOR) error stop 3\n  if (trim(tokens(2)%text) /= '+') error stop 4\n  if (tokens(3)%token_type /= TOKEN_NUMBER) error stop 5\n  if (trim(tokens(3)%text) /= '3') error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assignment_scalar_rhs_once", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined assignment scalar rhs-once compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined assignment scalar rhs-once compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("defined assignment scalar rhs-once run failed");
+    assert!(
+        run.status.success(),
+        "defined assignment scalar rhs-once run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected defined assignment scalar rhs-once output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn direct_allocatable_array_function_actual_passes_live_descriptor() {
+    let dir = unique_dir("direct_alloc_array_actual");
+    let mod_src = write_program_in(
+        &dir,
+        "producer.f90",
+        "module producer\ncontains\n  function make_vals() result(vals)\n    implicit none\n    integer, allocatable :: vals(:)\n    allocate(vals(2))\n    vals = [2, 3]\n  end function\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use producer, only: make_vals\n  implicit none\n  call show(make_vals())\n  print *, 'ok'\ncontains\n  subroutine show(vals)\n    integer, intent(in) :: vals(:)\n    if (size(vals) /= 2) error stop 1\n    if (lbound(vals, 1) /= 1) error stop 2\n    if (ubound(vals, 1) /= 2) error stop 3\n    if (vals(1) /= 2 .or. vals(2) /= 3) error stop 4\n  end subroutine\nend program\n",
+    );
+
+    let mod_obj = dir.join("producer.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("producer compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "producer compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("user.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "user compile failed: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let exe = dir.join("user.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            user_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("direct allocatable array actual run failed");
+    assert!(
+        run.status.success(),
+        "direct allocatable array actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected direct allocatable array actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

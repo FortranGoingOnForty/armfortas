@@ -38,7 +38,7 @@
 //!   sequence remains (e.g., `MOV x1, x0`) — those are left alone.
 
 use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, PhysReg};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Run tail call optimization on a single machine function.
 ///
@@ -151,13 +151,56 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
     let mut tainted_regs: HashSet<u8> = HashSet::new();
     // FP-relative offsets whose memory contents are frame-derived pointers.
     let mut tainted_slots: HashSet<i64> = HashSet::new();
+    // GP registers known to hold `fp + offset` or `fp - offset`.
+    let mut frame_addr_regs: HashMap<u8, i64> = HashMap::new();
 
     for inst in insts {
+        if let Some(dst) = written_gp_reg(inst) {
+            frame_addr_regs.remove(&dst);
+        }
         match inst.opcode {
             // sub xN, x29, #imm  →  xN holds a frame-relative address.
             ArmOpcode::SubImm if op_is_fp(inst, 1) => {
                 if let Some(n) = op_gp(inst, 0) {
                     tainted_regs.insert(n);
+                    if let Some(imm) = op_imm(inst, 2) {
+                        frame_addr_regs.insert(n, -imm);
+                    }
+                }
+            }
+            // add xN, x29, #imm  →  xN holds a frame-relative address.
+            ArmOpcode::AddImm if op_is_fp(inst, 1) => {
+                if let Some(n) = op_gp(inst, 0) {
+                    tainted_regs.insert(n);
+                    if let Some(imm) = op_imm(inst, 2) {
+                        frame_addr_regs.insert(n, imm);
+                    }
+                }
+            }
+            // add xN, xM, #imm where xM is a known frame address.
+            ArmOpcode::AddImm => {
+                if let (Some(dst), Some(src), Some(imm)) =
+                    (op_gp(inst, 0), op_gp(inst, 1), op_imm(inst, 2))
+                {
+                    if let Some(base_off) = frame_addr_regs.get(&src).copied() {
+                        tainted_regs.insert(dst);
+                        frame_addr_regs.insert(dst, base_off + imm);
+                    } else if tainted_regs.contains(&src) {
+                        tainted_regs.insert(dst);
+                    }
+                }
+            }
+            // sub xN, xM, #imm where xM is a known frame address.
+            ArmOpcode::SubImm => {
+                if let (Some(dst), Some(src), Some(imm)) =
+                    (op_gp(inst, 0), op_gp(inst, 1), op_imm(inst, 2))
+                {
+                    if let Some(base_off) = frame_addr_regs.get(&src).copied() {
+                        tainted_regs.insert(dst);
+                        frame_addr_regs.insert(dst, base_off - imm);
+                    } else if tainted_regs.contains(&src) {
+                        tainted_regs.insert(dst);
+                    }
                 }
             }
             // add xN, xM, xP  (GEP: propagate taint from either source)
@@ -169,19 +212,15 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
                     tainted_regs.insert(n);
                 }
             }
-            // add xN, xM, #imm  (GEP with constant offset / address arithmetic)
-            ArmOpcode::AddImm
-                if op_is_fp(inst, 1)
-                    || op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n)) =>
-            {
-                if let Some(n) = op_gp(inst, 0) {
-                    tainted_regs.insert(n);
-                }
-            }
             // mov xN, xM  (register copy — propagates taint to arg reg)
             ArmOpcode::MovReg if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n)) => {
                 if let Some(n) = op_gp(inst, 0) {
                     tainted_regs.insert(n);
+                    if let Some(src) = op_gp(inst, 1) {
+                        if let Some(off) = frame_addr_regs.get(&src).copied() {
+                            frame_addr_regs.insert(n, off);
+                        }
+                    }
                 }
             }
             // mul xN, xM, xP  (index computation in GEP; conservative)
@@ -196,17 +235,21 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
             // str xN, [x29, #off] — if xN is tainted, the slot becomes tainted.
             ArmOpcode::StrImm
                 if op_gp(inst, 0).is_some_and(|n| tainted_regs.contains(&n))
-                    && op_is_fp(inst, 1) =>
+                    && effective_frame_slot_offset(inst, 1, 2, &frame_addr_regs).is_some() =>
             {
-                if let Some(off) = op_fp_offset(inst, 2) {
+                if let Some(off) = effective_frame_slot_offset(inst, 1, 2, &frame_addr_regs) {
                     tainted_slots.insert(off);
                 }
             }
-            // ldr xN, [x29, #off] — if the slot is tainted, xN becomes tainted.
-            ArmOpcode::LdrImm if op_is_fp(inst, 1) => {
-                if let Some(off) = op_fp_offset(inst, 2) {
-                    if tainted_slots.contains(&off) {
-                        if let Some(n) = op_gp(inst, 0) {
+            // ldr xN, [frame] — if the slot is known tainted, xN becomes
+            // tainted. Also conservatively reject tail calls when any 64-bit
+            // GP register is reloaded from our frame in the tail block: the
+            // slot may have been populated in a predecessor with an escaped
+            // local address, then copied into x0–x7 later in the block.
+            ArmOpcode::LdrImm => {
+                if let Some(off) = effective_frame_slot_offset(inst, 1, 2, &frame_addr_regs) {
+                    if let Some(n) = op_gp(inst, 0) {
+                        if tainted_slots.contains(&off) || n <= 30 {
                             tainted_regs.insert(n);
                         }
                     }
@@ -238,6 +281,16 @@ fn op_gp(inst: &MachineInst, idx: usize) -> Option<u8> {
     }
 }
 
+/// Integer immediate operand at `idx`, or None.
+#[inline]
+fn op_imm(inst: &MachineInst, idx: usize) -> Option<i64> {
+    match inst.operands.get(idx)? {
+        MachineOperand::Imm(v) => Some(*v),
+        MachineOperand::FrameSlot(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
 /// Frame-pointer-relative offset for the operand at `idx`, or None.
 /// Accepts both `Imm` and `FrameSlot` variants.
 #[inline]
@@ -245,6 +298,38 @@ fn op_fp_offset(inst: &MachineInst, idx: usize) -> Option<i64> {
     match inst.operands.get(idx)? {
         MachineOperand::Imm(v) => Some(*v),
         MachineOperand::FrameSlot(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
+/// Effective FP-relative offset addressed by `[base, #off]`, where `base` is
+/// either FP directly or a GP register previously materialized from FP.
+#[inline]
+fn effective_frame_slot_offset(
+    inst: &MachineInst,
+    base_idx: usize,
+    off_idx: usize,
+    frame_addr_regs: &HashMap<u8, i64>,
+) -> Option<i64> {
+    let off = op_imm(inst, off_idx).unwrap_or(0);
+    match inst.operands.get(base_idx)? {
+        MachineOperand::PhysReg(p) if *p == PhysReg::FP => Some(off),
+        MachineOperand::PhysReg(PhysReg::Gp(n)) => frame_addr_regs.get(n).map(|base| base + off),
+        _ => None,
+    }
+}
+
+/// GP register written by this instruction, if operand 0 is a GP destination.
+#[inline]
+fn written_gp_reg(inst: &MachineInst) -> Option<u8> {
+    match inst.opcode {
+        ArmOpcode::AddReg
+        | ArmOpcode::AddImm
+        | ArmOpcode::SubReg
+        | ArmOpcode::SubImm
+        | ArmOpcode::Mul
+        | ArmOpcode::MovReg
+        | ArmOpcode::LdrImm => op_gp(inst, 0),
         _ => None,
     }
 }
@@ -384,5 +469,204 @@ mod tests {
         tail_call_opt(&mut mf);
         // Should still have Bl (TCO not fired because no Ret).
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
+    }
+
+    #[test]
+    fn no_tco_when_frame_pointer_is_spilled_through_large_offset_slot() {
+        // Repro shape from fortbite O1:
+        //   sub x10, fp, #104
+        //   sub x8,  fp, #1936
+        //   str x10, [x8]
+        //   sub x8,  fp, #1936
+        //   ldr x22, [x8]
+        //   mov x1,  x22
+        //   bl _callee
+        //
+        // The arg in x1 is a pointer into our frame, just spilled/reloaded
+        // through the large-offset materialization form. Tail-branching here
+        // would tear down the frame before the callee consumes x1.
+        let mut mf = build_mf(vec![vec![
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(10)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(104),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(1936),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::StrImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(10)),
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(1936),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::LdrImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(22)),
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(1)),
+                    MachineOperand::PhysReg(PhysReg::Gp(22)),
+                ],
+                def: None,
+            },
+            bl("_callee"),
+            ldp_post(),
+            ret(),
+        ]]);
+        tail_call_opt(&mut mf);
+        assert!(
+            mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
+            "tail-call optimization must not erase the call when an arg reloads a spilled frame pointer"
+        );
+        assert!(
+            mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            "tail-call optimization must leave the normal return path intact"
+        );
+    }
+
+    #[test]
+    fn no_tco_when_arg_register_is_reloaded_from_frame_in_tail_block() {
+        let mut mf = build_mf(vec![
+            vec![
+                MachineInst {
+                    opcode: ArmOpcode::SubImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(10)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(104),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::StrImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(10)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(-1936),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::B,
+                    operands: vec![MachineOperand::BlockRef(MBlockId(1))],
+                    def: None,
+                },
+            ],
+            vec![
+                MachineInst {
+                    opcode: ArmOpcode::LdrImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(1)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(-1936),
+                    ],
+                    def: None,
+                },
+                bl("_callee"),
+                ldp_post(),
+                ret(),
+            ],
+        ]);
+        tail_call_opt(&mut mf);
+        assert!(
+            mf.blocks[1].insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
+            "tail-call optimization must not fire when x1 is reloaded from our frame in the tail block"
+        );
+        assert!(
+            mf.blocks[1].insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            "tail-call optimization must preserve the return when the arg comes from a frame reload"
+        );
+    }
+
+    #[test]
+    fn no_tco_when_temp_register_reloads_frame_slot_before_copying_to_arg() {
+        let mut mf = build_mf(vec![
+            vec![
+                MachineInst {
+                    opcode: ArmOpcode::SubImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(10)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(104),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::StrImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(10)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(-1936),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::B,
+                    operands: vec![MachineOperand::BlockRef(MBlockId(1))],
+                    def: None,
+                },
+            ],
+            vec![
+                MachineInst {
+                    opcode: ArmOpcode::LdrImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(22)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(-1936),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(1)),
+                        MachineOperand::PhysReg(PhysReg::Gp(22)),
+                    ],
+                    def: None,
+                },
+                bl("_callee"),
+                ldp_post(),
+                ret(),
+            ],
+        ]);
+        tail_call_opt(&mut mf);
+        assert!(
+            mf.blocks[1].insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
+            "tail-call optimization must not fire when a temp reloads a frame slot before copying it to x1"
+        );
+        assert!(
+            mf.blocks[1].insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            "tail-call optimization must preserve the return when a frame reload feeds x1 indirectly"
+        );
     }
 }
