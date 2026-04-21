@@ -327,6 +327,14 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 }
                 opts.module_output_dir = Some(dir);
             }
+            "-module" => {
+                i += 1;
+                let dir = PathBuf::from(args.get(i).ok_or("-module requires a directory")?);
+                if !opts.module_search_paths.iter().any(|path| path == &dir) {
+                    opts.module_search_paths.push(dir.clone());
+                }
+                opts.module_output_dir = Some(dir);
+            }
             arg if arg.starts_with("-J") => {
                 let dir = PathBuf::from(short_option_value(arg, "-J", "a directory")?);
                 if !opts.module_search_paths.iter().any(|path| path == &dir) {
@@ -2003,6 +2011,21 @@ mod tests {
             "expected a compatibility warning for -fbacktrace, got {:?}",
             opts.cli_warnings
         );
+    }
+
+    #[test]
+    fn parse_cli_accepts_module_alias() {
+        let args = vec![
+            "-module".to_string(),
+            "mods".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should accept -module")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.module_output_dir, Some(PathBuf::from("mods")));
+        assert_eq!(opts.module_search_paths, vec![PathBuf::from("mods")]);
     }
 
     fn i128_fixture() -> PathBuf {

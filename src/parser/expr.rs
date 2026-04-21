@@ -545,14 +545,14 @@ impl<'a> Parser<'a> {
     }
 
     fn try_parse_ac_type_spec(&mut self) -> Option<String> {
-        // Look for pattern: identifier ::
-        if self.peek() == &TokenKind::Identifier {
-            let next_pos = self.pos + 1;
-            if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::ColonColon {
-                let name = self.advance().text.clone();
+        let save_pos = self.pos;
+        if let Some(ts_result) = self.try_parse_type_spec() {
+            if ts_result.is_ok() && self.peek() == &TokenKind::ColonColon {
+                let spec = render_token_slice(&self.tokens[save_pos..self.pos]);
                 self.advance(); // skip ::
-                return Some(name);
+                return Some(spec);
             }
+            self.pos = save_pos;
         }
         None
     }
@@ -666,6 +666,33 @@ fn split_kind_suffix(text: &str) -> (String, Option<String>) {
     } else {
         (text.to_string(), None)
     }
+}
+
+fn render_token_slice(tokens: &[crate::lexer::Token]) -> String {
+    fn is_word_like(kind: &TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Identifier
+                | TokenKind::IntegerLiteral
+                | TokenKind::RealLiteral
+                | TokenKind::StringLiteral
+                | TokenKind::LogicalLiteral
+                | TokenKind::BozLiteral
+        )
+    }
+
+    let mut out = String::new();
+    let mut prev_kind: Option<&TokenKind> = None;
+    for tok in tokens {
+        if let Some(prev) = prev_kind {
+            if is_word_like(prev) && is_word_like(&tok.kind) {
+                out.push(' ');
+            }
+        }
+        out.push_str(&tok.text);
+        prev_kind = Some(&tok.kind);
+    }
+    out
 }
 
 pub(crate) fn span_from_to(start: Span, end: Span) -> Span {
@@ -895,6 +922,14 @@ mod tests {
     #[test]
     fn array_constructor_typed() {
         assert_eq!(sexpr("[integer :: 1, 2]"), "[integer :: 1, 2]");
+    }
+
+    #[test]
+    fn array_constructor_typed_character_len() {
+        assert_eq!(
+            sexpr("[character(len=26) :: '%s', 'left']"),
+            "[character(len=26) :: '%s', 'left']"
+        );
     }
 
     #[test]

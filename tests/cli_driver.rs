@@ -8152,6 +8152,48 @@ fn inquire_file_with_sparse_optional_string_outputs_runs() {
 }
 
 #[test]
+fn inquire_unit_size_widens_through_runtime_and_stores_back() {
+    let dir = unique_dir("inquire_unit_size");
+    let input = dir.join("payload.txt");
+    fs::write(&input, "hello").expect("write payload");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  integer :: unit, ios, file_size\n  unit = -1\n  ios = -1\n  file_size = -1\n  open(newunit=unit, file='{}', status='old', access='stream', form='unformatted', action='read', iostat=ios)\n  if (ios /= 0) error stop 1\n  inquire(unit=unit, size=file_size)\n  if (file_size /= 5) error stop 2\n  close(unit)\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+    );
+    let out = dir.join("main.out");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "INQUIRE(unit=, size=) compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "INQUIRE(unit=, size=) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected INQUIRE(unit=, size=) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn open_with_newunit_and_iostat_uses_keyword_specs() {
     let dir = unique_dir("open_newunit_iostat");
     let input = dir.join("input.txt");
@@ -10878,6 +10920,76 @@ fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
     assert!(
         stdout.contains("ok"),
         "unexpected char array constructor actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn multi_char_array_constructor_actual_to_assumed_shape_dummy_survives_derived_result_assignment() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: argv(:)\n  end type\ncontains\n  function make(argv) result(out)\n    character(len=*), intent(in) :: argv(:)\n    type(command_t) :: out\n    integer :: i, n\n    n = len(argv(1))\n    allocate(character(len=n) :: out%argv(size(argv)))\n    do i = 1, size(argv)\n      out%argv(i) = argv(i)\n    end do\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  cmd = make([\"hello\", \"world\"])\n  if (.not. allocated(cmd%argv)) error stop 1\n  if (size(cmd%argv) /= 2) error stop 2\n  if (cmd%argv(1) /= \"hello\") error stop 3\n  if (cmd%argv(2) /= \"world\") error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("multi_char_array_constructor_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("multi-element char array constructor actual compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "multi-element char array constructor actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "multi-element char array constructor actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected multi-element char array constructor actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_result_with_scalar_char_and_constructor_array_actual_survives() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: program\n    character(len=:), allocatable :: argv(:)\n  end type\ncontains\n  function make(program, argv) result(out)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in) :: argv(:)\n    type(command_t) :: out\n    integer :: i, n\n    out%program = program\n    n = len(argv(1))\n    allocate(character(len=n) :: out%argv(size(argv)))\n    do i = 1, size(argv)\n      out%argv(i) = argv(i)\n    end do\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  cmd = make(\"printf\", [\"hello\", \"world\"])\n  if (.not. allocated(cmd%program)) error stop 1\n  if (cmd%program /= \"printf\") error stop 2\n  if (.not. allocated(cmd%argv)) error stop 3\n  if (size(cmd%argv) /= 2) error stop 4\n  if (cmd%argv(1) /= \"hello\") error stop 5\n  if (cmd%argv(2) /= \"world\") error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_result_constructor_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed scalar char and constructor array actual compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "mixed scalar char and constructor array actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "mixed scalar char and constructor array actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected mixed scalar char and constructor array actual output: {}",
         stdout
     );
 

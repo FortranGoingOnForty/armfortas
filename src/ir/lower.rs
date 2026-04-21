@@ -7017,6 +7017,9 @@ fn actual_char_arg_runtime_len(
 
     match &expr.node {
         Expr::ArrayConstructor { values, .. } => {
+            if let Some(len) = fixed_char_array_constructor_len(values, locals) {
+                return Some(b.const_i64(len));
+            }
             if values.len() == 1 {
                 if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
                     return actual_char_arg_runtime_len(
@@ -7149,6 +7152,40 @@ fn actual_char_arg_runtime_len(
             len
         }),
     }
+}
+
+fn fixed_char_expr_len(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<i64> {
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => Some(value.len() as i64),
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .and_then(|info| match info.char_kind {
+                CharKind::Fixed(len) => Some(len),
+                _ => local_fixed_char_allocatable_scalar_len(info),
+            }),
+        Expr::ParenExpr { inner } => fixed_char_expr_len(inner, locals),
+        _ => None,
+    }
+}
+
+fn fixed_char_array_constructor_len(
+    values: &[crate::ast::expr::AcValue],
+    locals: &HashMap<String, LocalInfo>,
+) -> Option<i64> {
+    let mut max_len = 0_i64;
+    let mut saw_expr = false;
+    for value in values {
+        let crate::ast::expr::AcValue::Expr(expr) = value else {
+            return None;
+        };
+        let len = fixed_char_expr_len(expr, locals)?;
+        max_len = max_len.max(len);
+        saw_expr = true;
+    }
+    saw_expr.then_some(max_len)
 }
 
 /// Lower character intrinsic functions (LEN, LEN_TRIM, ICHAR, CHAR, INDEX, SCAN, VERIFY,
@@ -15969,7 +16006,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             let (form_ptr, form_len) = lower_string_spec(b, "form");
             let (action_ptr, action_len) = lower_string_spec(b, "action");
             let recl_addr = lower_ref_spec(b, "recl");
-            let size_addr = lower_ref_spec(b, "size");
+            let size_spec = spec_by_keyword("size");
+            let (size_addr, size_storeback) = if let Some(spec) = size_spec {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+                let temp = b.alloca(IrType::Int(IntWidth::I64));
+                (temp, Some(dest_addr))
+            } else {
+                (null, None)
+            };
 
             if let Some(fs) = file_spec {
                 let (fptr, flen) = lower_string_expr_with_layouts(
@@ -16023,6 +16067,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     ],
                     IrType::Void,
                 );
+            }
+            if let Some(dest_addr) = size_storeback {
+                let size_val = b.load(size_addr);
+                let dest_ty = match b.func().value_type(dest_addr) {
+                    Some(IrType::Ptr(inner)) => (*inner).clone(),
+                    _ => IrType::Int(IntWidth::I32),
+                };
+                let coerced = coerce_to_type(b, size_val, &dest_ty);
+                b.store(coerced, dest_addr);
             }
         }
 
@@ -20877,6 +20930,73 @@ fn lower_array_expr_descriptor(
                 return None;
             }
 
+            let expr_values: Vec<&crate::ast::expr::SpannedExpr> = values
+                .iter()
+                .filter_map(|v| match v {
+                    crate::ast::expr::AcValue::Expr(expr) => Some(expr),
+                    crate::ast::expr::AcValue::ImpliedDo(_) => None,
+                })
+                .collect();
+            let first = expr_values.first()?;
+
+            if expr_is_character_expr(b, locals, first, st, type_layouts) {
+                if let Some(elem_len_const) = fixed_char_array_constructor_len(values, locals) {
+                    let n = expr_values.len() as i64;
+                    let total_bytes = (elem_len_const * n).max(1) as u64;
+                    let storage =
+                        b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), total_bytes));
+                    let zero = b.const_i64(0);
+                    let base = b.gep(storage, vec![zero], IrType::Int(IntWidth::I8));
+                    let elem_len = b.const_i64(elem_len_const);
+
+                    for (idx, expr) in expr_values.iter().enumerate() {
+                        let byte_offset = b.const_i64((idx as i64) * elem_len_const);
+                        let dest_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+                        let (src_ptr, src_len) =
+                            lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
+                        b.call(
+                            FuncRef::External("afs_assign_char_fixed".into()),
+                            vec![dest_ptr, elem_len, src_ptr, src_len],
+                            IrType::Void,
+                        );
+                    }
+
+                    let desc =
+                        b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                    let zero32 = b.const_i32(0);
+                    let sz384 = b.const_i64(384);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![desc, zero32, sz384],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    store_byte_aggregate_field(
+                        b,
+                        desc,
+                        0,
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        base,
+                    );
+                    store_byte_aggregate_field(
+                        b,
+                        desc,
+                        8,
+                        IrType::Int(IntWidth::I64),
+                        elem_len,
+                    );
+                    let rank = b.const_i32(1);
+                    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+                    let flags = b.const_i32(2);
+                    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+                    let one = b.const_i64(1);
+                    let upper = b.const_i64(n);
+                    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
+                    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
+                    store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+                    return Some((desc, IrType::Int(IntWidth::I8)));
+                }
+            }
+
             if values.len() == 1 {
                 if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
                     if expr_is_character_expr(b, locals, first, st, type_layouts) {
@@ -20915,15 +21035,6 @@ fn lower_array_expr_descriptor(
                     }
                 }
             }
-
-            let expr_values: Vec<&crate::ast::expr::SpannedExpr> = values
-                .iter()
-                .filter_map(|v| match v {
-                    crate::ast::expr::AcValue::Expr(expr) => Some(expr),
-                    crate::ast::expr::AcValue::ImpliedDo(_) => None,
-                })
-                .collect();
-            let first = expr_values.first()?;
             if expr_is_character_expr(b, locals, first, st, type_layouts) {
                 return None;
             }
@@ -23113,6 +23224,29 @@ fn emit_memcpy_bytes(b: &mut FuncBuilder, dest: ValueId, src: ValueId, bytes: i6
         vec![dest, src, size],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
+}
+
+fn stabilize_derived_call_result(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    type_name: &str,
+    raw: ValueId,
+) -> ValueId {
+    if !b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+        return raw;
+    }
+    let Some(layout) = type_layouts.get(type_name) else {
+        return raw;
+    };
+    let scratch = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        (layout.size.max(1)) as u64,
+    ));
+    let zero = b.const_i64(0);
+    let scratch_base = b.gep(scratch, vec![zero], IrType::Int(IntWidth::I8));
+    let src_ptr = coerce_to_type(b, raw, &IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    emit_memcpy_bytes(b, scratch_base, src_ptr, layout.size as i64);
+    scratch_base
 }
 
 fn derived_storage_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
@@ -25702,7 +25836,15 @@ fn lower_expr_full(
                         .map(FuncRef::Internal)
                         .unwrap_or_else(|| FuncRef::External(call_name))
                 };
-                b.call(func_ref, ref_arg_vals, ret_ty)
+                let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
+                if let Some(tl) = type_layouts {
+                    if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_return_derived_type_name(st, k)
+                    }) {
+                        return stabilize_derived_call_result(b, tl, &type_name, call_result);
+                    }
+                }
+                call_result
             } else if let Expr::ComponentAccess { base, component } = &callee.node {
                 if let Some(tl) = type_layouts {
                     if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
@@ -25942,7 +26084,21 @@ fn lower_expr_full(
                                     callee_return_ir_type(st, k)
                                 })
                                 .unwrap_or(IrType::Int(IntWidth::I32));
-                                return b.call(FuncRef::External(call_name), call_args, ret_ty);
+                                let call_result =
+                                    b.call(FuncRef::External(call_name), call_args, ret_ty);
+                                if let Some(tl) = type_layouts {
+                                    if let Some(type_name) =
+                                        callee_return_derived_type_name(st, &target_key)
+                                    {
+                                        return stabilize_derived_call_result(
+                                            b,
+                                            tl,
+                                            &type_name,
+                                            call_result,
+                                        );
+                                    }
+                                }
+                                return call_result;
                             }
                         }
                     }
