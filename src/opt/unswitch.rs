@@ -29,7 +29,9 @@
 use super::loop_utils::{find_preheader, loop_defined_values};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::walk::{find_natural_loops, predecessors, prune_unreachable};
+use crate::ir::walk::{
+    find_natural_loops, inst_uses, predecessors, prune_unreachable, terminator_uses,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Maximum number of instructions in the loop body to consider for
@@ -83,6 +85,9 @@ fn unswitch_in_function(func: &mut Function) -> bool {
 
         // Find a CondBranch inside the loop whose condition is invariant.
         let loop_defs = loop_defined_values(func, lp);
+        if has_external_ssa_uses(func, lp, &loop_defs) {
+            continue;
+        }
 
         let candidate = find_unswitch_candidate(func, lp, &loop_defs);
         let Some((cond_block, cond_val, true_dest, true_args, false_dest, false_args)) = candidate
@@ -189,6 +194,38 @@ fn find_unswitch_candidate(
     None
 }
 
+/// Unswitching clones the loop body and removes the original loop blocks.
+/// If later blocks still read a loop-defined SSA value directly, the transform
+/// would need extra SSA repair on the outside uses. Until that exists, bail out.
+fn has_external_ssa_uses(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    loop_defs: &HashSet<ValueId>,
+) -> bool {
+    for block in &func.blocks {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for inst in &block.insts {
+            if inst_uses(&inst.kind)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+            {
+                return true;
+            }
+        }
+        if let Some(term) = &block.terminator {
+            if terminator_uses(term)
+                .into_iter()
+                .any(|value| loop_defs.contains(&value))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Delegate to shared loop utility.
 fn clone_loop(
     func: &mut Function,
@@ -218,6 +255,7 @@ fn build_value_map(
 mod tests {
     use super::*;
     use crate::ir::types::{IntWidth, IrType};
+    use crate::ir::verify::verify_module;
     use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
 
@@ -444,5 +482,117 @@ mod tests {
         let pass = LoopUnswitch;
         let changed = pass.run(&mut m);
         assert!(!changed, "should not unswitch a loop-variant conditional");
+    }
+
+    #[test]
+    fn does_not_unswitch_when_loop_values_escape_directly() {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+
+        let preheader = f.create_block("preheader");
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let t_body = f.create_block("t_body");
+        let f_body = f.create_block("f_body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+        let entry = f.entry;
+
+        let flag = f.next_value_id();
+        f.register_type(flag, IrType::Bool);
+        f.block_mut(entry).insts.push(Inst {
+            id: flag,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ConstBool(true),
+        });
+        let c1 = f.next_value_id();
+        f.register_type(c1, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c1,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I32),
+        });
+        let c10 = f.next_value_id();
+        f.register_type(c10, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: c10,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::ConstInt(10, IntWidth::I32),
+        });
+        f.block_mut(entry).terminator = Some(Terminator::Branch(preheader, vec![]));
+
+        f.block_mut(preheader).terminator = Some(Terminator::Branch(header, vec![c1]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I32));
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(header).terminator = Some(Terminator::Branch(body, vec![]));
+
+        f.block_mut(body).terminator = Some(Terminator::CondBranch {
+            cond: flag,
+            true_dest: t_body,
+            true_args: vec![],
+            false_dest: f_body,
+            false_args: vec![],
+        });
+        f.block_mut(t_body).terminator = Some(Terminator::Branch(latch, vec![]));
+        f.block_mut(f_body).terminator = Some(Terminator::Branch(latch, vec![]));
+
+        let nxt = f.next_value_id();
+        f.register_type(nxt, IrType::Int(IntWidth::I32));
+        f.block_mut(latch).insts.push(Inst {
+            id: nxt,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(iv, c1),
+        });
+        let cmp_v = f.next_value_id();
+        f.register_type(cmp_v, IrType::Bool);
+        f.block_mut(latch).insts.push(Inst {
+            id: cmp_v,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, nxt, c10),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::CondBranch {
+            cond: cmp_v,
+            true_dest: header,
+            true_args: vec![nxt],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let escaped = f.next_value_id();
+        f.register_type(escaped, IrType::Int(IntWidth::I32));
+        f.block_mut(exit).insts.push(Inst {
+            id: escaped,
+            ty: IrType::Int(IntWidth::I32),
+            span: span(),
+            kind: InstKind::IAdd(nxt, c1),
+        });
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+        assert!(
+            verify_module(&m).is_empty(),
+            "test setup must start valid before unswitch"
+        );
+
+        let pass = LoopUnswitch;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "unswitch should bail when loop-defined values escape directly"
+        );
+        assert!(
+            verify_module(&m).is_empty(),
+            "bailing out should keep the IR valid"
+        );
     }
 }
