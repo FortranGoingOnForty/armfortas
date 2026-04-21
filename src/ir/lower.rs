@@ -1743,7 +1743,8 @@ fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: &mut Vec<St
                 collect_name_refs_expr(e, out);
             }
         }
-        Stmt::Call { args, .. } => {
+        Stmt::Call { callee, args } => {
+            collect_name_refs_expr(callee, out);
             for arg in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                     collect_name_refs_expr(e, out);
@@ -1757,6 +1758,22 @@ fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: &mut Vec<St
         } => {
             collect_name_refs_expr(selector, out);
             for case in cases {
+                for selector in &case.selectors {
+                    match selector {
+                        crate::ast::stmt::CaseSelector::Value(expr) => {
+                            collect_name_refs_expr(expr, out);
+                        }
+                        crate::ast::stmt::CaseSelector::Range { low, high } => {
+                            if let Some(expr) = low {
+                                collect_name_refs_expr(expr, out);
+                            }
+                            if let Some(expr) = high {
+                                collect_name_refs_expr(expr, out);
+                            }
+                        }
+                        crate::ast::stmt::CaseSelector::Default => {}
+                    }
+                }
                 for s in &case.body {
                     collect_name_refs_stmt(s, out);
                 }
@@ -1832,6 +1849,163 @@ fn collect_name_refs_acvalue(v: &crate::ast::expr::AcValue, out: &mut Vec<String
             }
         }
     }
+}
+
+fn collect_name_refs_decls(decls: &[crate::ast::decl::SpannedDecl], out: &mut Vec<String>) {
+    use crate::ast::decl::{Attribute, CharSelector, Decl, EntityDecl, KindSelector, LenSpec};
+
+    fn collect_name_refs_kind_selector(sel: &KindSelector, out: &mut Vec<String>) {
+        match sel {
+            KindSelector::Expr(expr) | KindSelector::Star(expr) => {
+                collect_name_refs_expr(expr, out)
+            }
+        }
+    }
+
+    fn collect_name_refs_len_spec(len: &LenSpec, out: &mut Vec<String>) {
+        if let LenSpec::Expr(expr) = len {
+            collect_name_refs_expr(expr, out);
+        }
+    }
+
+    fn collect_name_refs_char_selector(sel: &CharSelector, out: &mut Vec<String>) {
+        if let Some(len) = &sel.len {
+            collect_name_refs_len_spec(len, out);
+        }
+        if let Some(kind) = &sel.kind {
+            collect_name_refs_expr(kind, out);
+        }
+    }
+
+    fn collect_name_refs_array_spec(spec: &crate::ast::decl::ArraySpec, out: &mut Vec<String>) {
+        match spec {
+            crate::ast::decl::ArraySpec::Explicit { lower, upper } => {
+                if let Some(expr) = lower {
+                    collect_name_refs_expr(expr, out);
+                }
+                collect_name_refs_expr(upper, out);
+            }
+            crate::ast::decl::ArraySpec::AssumedShape { lower }
+            | crate::ast::decl::ArraySpec::AssumedSize { lower } => {
+                if let Some(expr) = lower {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+            crate::ast::decl::ArraySpec::Deferred | crate::ast::decl::ArraySpec::AssumedRank => {}
+        }
+    }
+
+    fn collect_name_refs_entity(entity: &EntityDecl, out: &mut Vec<String>) {
+        if let Some(specs) = &entity.array_spec {
+            for spec in specs {
+                collect_name_refs_array_spec(spec, out);
+            }
+        }
+        if let Some(len) = &entity.char_len {
+            collect_name_refs_len_spec(len, out);
+        }
+        if let Some(init) = &entity.init {
+            collect_name_refs_expr(init, out);
+        }
+        if let Some(init) = &entity.ptr_init {
+            collect_name_refs_expr(init, out);
+        }
+    }
+
+    fn collect_name_refs_type_spec(spec: &TypeSpec, out: &mut Vec<String>) {
+        match spec {
+            TypeSpec::Integer(kind)
+            | TypeSpec::Real(kind)
+            | TypeSpec::Complex(kind)
+            | TypeSpec::Logical(kind) => {
+                if let Some(kind) = kind {
+                    collect_name_refs_kind_selector(kind, out);
+                }
+            }
+            TypeSpec::Character(sel) => {
+                if let Some(sel) = sel {
+                    collect_name_refs_char_selector(sel, out);
+                }
+            }
+            TypeSpec::DoublePrecision
+            | TypeSpec::DoubleComplex
+            | TypeSpec::Type(_)
+            | TypeSpec::Class(_)
+            | TypeSpec::ClassStar
+            | TypeSpec::TypeStar => {}
+        }
+    }
+
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } => {
+                collect_name_refs_type_spec(type_spec, out);
+                for attr in attrs {
+                    if let Attribute::Dimension(specs) = attr {
+                        for spec in specs {
+                            collect_name_refs_array_spec(spec, out);
+                        }
+                    }
+                }
+                for entity in entities {
+                    collect_name_refs_entity(entity, out);
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (_, expr) in pairs {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+            Decl::EquivalenceStmt { groups } => {
+                for group in groups {
+                    for expr in group {
+                        collect_name_refs_expr(expr, out);
+                    }
+                }
+            }
+            Decl::DataStmt { sets } => {
+                for set in sets {
+                    for expr in &set.objects {
+                        collect_name_refs_expr(expr, out);
+                    }
+                    for expr in &set.values {
+                        collect_name_refs_expr(expr, out);
+                    }
+                }
+            }
+            Decl::AttributeStmt { attr, .. } => {
+                if let Attribute::Dimension(specs) = attr {
+                    for spec in specs {
+                        collect_name_refs_array_spec(spec, out);
+                    }
+                }
+            }
+            Decl::DerivedTypeDef { components, .. } => collect_name_refs_decls(components, out),
+            Decl::AccessDefault { .. }
+            | Decl::AccessList { .. }
+            | Decl::ImplicitNone { .. }
+            | Decl::ImplicitStmt { .. }
+            | Decl::UseStmt { .. }
+            | Decl::CommonBlock { .. }
+            | Decl::EnumDef { .. } => {}
+        }
+    }
+}
+
+fn collect_required_import_names(
+    decls: &[crate::ast::decl::SpannedDecl],
+    body: &[crate::ast::stmt::SpannedStmt],
+) -> HashSet<String> {
+    let mut refs = Vec::new();
+    collect_name_refs_decls(decls, &mut refs);
+    for stmt in body {
+        collect_name_refs_stmt(stmt, &mut refs);
+    }
+    refs.into_iter().map(|name| name.to_lowercase()).collect()
 }
 
 fn collect_module_globals(
@@ -2397,6 +2571,7 @@ fn lower_unit(
 
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
+            let required_import_names = collect_required_import_names(decls, body);
 
             {
                 let mut b = FuncBuilder::new(&mut func);
@@ -2418,6 +2593,7 @@ fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
+                    Some(&required_import_names),
                     host_module,
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
@@ -2594,6 +2770,7 @@ fn lower_unit(
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
+            let required_import_names = collect_required_import_names(decls, body);
 
             // Collect param info: (name, param_id, elem_type, is_value).
             // Skip hidden params: __len_* (character-length) and __host_*
@@ -2724,6 +2901,7 @@ fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
+                    Some(&required_import_names),
                     host_module,
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
@@ -2989,6 +3167,7 @@ fn lower_unit(
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
+            let required_import_names = collect_required_import_names(decls, body);
 
             // Build param_info skipping the sret param (not a Fortran
             // variable) and __host_* closure-passing pointers (installed
@@ -3237,6 +3416,7 @@ fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
+                    Some(&required_import_names),
                     host_module,
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
@@ -4561,6 +4741,7 @@ fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
+    required_names: Option<&HashSet<String>>,
     host_module: Option<&str>,
     st: &SymbolTable,
     ambiguous_use_warnings: &Rc<RefCell<HashSet<(String, String, String)>>>,
@@ -4666,6 +4847,11 @@ fn install_globals_as_locals(
 
     let mut installed_from: HashMap<String, String> = HashMap::new();
     for (local_key, (mod_key, var_key)) in pending {
+        if let Some(required) = required_names {
+            if !required.contains(&local_key) {
+                continue;
+            }
+        }
         if let Some(info) = globals.get(&(mod_key.clone(), var_key.clone())) {
             // Collision check: two modules exporting the same local key.
             if let Some(prev_mod) = installed_from.get(&local_key) {
@@ -14174,11 +14360,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 init_decls(b, &ctx.locals, &effective_decls, ctx.st);
             }
             if !uses.is_empty() {
+                let required_import_names = collect_required_import_names(&effective_decls, body);
                 install_globals_as_locals(
                     b,
                     &mut ctx.locals,
                     ctx.globals,
                     uses,
+                    Some(&required_import_names),
                     None,
                     ctx.st,
                     &ctx.ambiguous_use_warnings,

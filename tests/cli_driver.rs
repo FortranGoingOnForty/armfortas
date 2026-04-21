@@ -3568,6 +3568,44 @@ fn select_case_on_trimmed_deferred_char_component_dispatches_correctly() {
 }
 
 #[test]
+fn imported_select_case_label_parameter_is_retained() {
+    let src = write_program(
+        "module kinds_m\n  implicit none\n  integer, parameter :: CMD_SIMPLE = 1\nend module kinds_m\n\nmodule dispatch_m\n  use kinds_m, only: CMD_SIMPLE\n  implicit none\ncontains\n  logical function is_simple(node_type) result(ok)\n    integer, intent(in) :: node_type\n    select case (node_type)\n    case (CMD_SIMPLE)\n      ok = .true.\n    case default\n      ok = .false.\n    end select\n  end function is_simple\nend module dispatch_m\n\nprogram p\n  use dispatch_m\n  implicit none\n  if (.not. is_simple(1)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_case_imported_label_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("select-case imported label parameter compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "select-case imported label parameter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("select-case imported label parameter run failed");
+    assert!(
+        run.status.success(),
+        "select-case imported label parameter should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "select-case imported label parameter should preserve CASE constants: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_component_actual_to_intent_out_dummy_updates_field() {
     let src = write_program(
         "program p\n  implicit none\n  type :: state_t\n    integer :: num_tokens = 0\n  end type state_t\n  type(state_t) :: state\n  call set_num(state%num_tokens)\n  if (state%num_tokens /= 2) error stop 1\n  print *, state%num_tokens\ncontains\n  subroutine set_num(n)\n    integer, intent(out) :: n\n    n = 2\n  end subroutine set_num\nend program p\n",
@@ -6177,6 +6215,44 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
         !asm.contains("bl _p") && !asm.contains("bl _q"),
         "procedure-pointer calls should not lower as direct symbol calls: {}",
         asm
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_procedure_pointer_call_target_is_retained_for_linking() {
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    subroutine hook_iface(msg)\n      character(len=*), intent(in) :: msg\n    end subroutine hook_iface\n  end interface\n  procedure(hook_iface), pointer :: hook => null()\ncontains\n  subroutine init()\n    hook => impl\n  end subroutine init\n\n  subroutine run(msg)\n    character(len=*), intent(in) :: msg\n    call hook(msg)\n  end subroutine run\n\n  subroutine impl(msg)\n    character(len=*), intent(in) :: msg\n    if (trim(msg) /= 'ok') error stop 1\n    print *, trim(msg)\n  end subroutine impl\nend module\n\nprogram p\n  use m\n  implicit none\n  call init()\n  call run('ok')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_proc_ptr_call_target", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module procedure pointer call-target compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module procedure pointer call target should compile and link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module procedure pointer call-target run failed");
+    assert!(
+        run.status.success(),
+        "module procedure pointer call target should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "module procedure pointer call target should preserve the procedure-pointer global: {}",
+        stdout
     );
 
     let _ = std::fs::remove_file(&out);
