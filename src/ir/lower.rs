@@ -12837,11 +12837,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     );
                                 } else if is_deferred_char_component_field(field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
-                                    b.call(
-                                        FuncRef::External("afs_assign_char_deferred".into()),
-                                        vec![field_ptr, src_ptr, src_len],
-                                        IrType::Void,
-                                    );
+                                    if field.pointer {
+                                        let (dest_ptr, dest_len) =
+                                            load_string_descriptor_substring_view(b, field_ptr);
+                                        b.call(
+                                            FuncRef::External("afs_assign_char_fixed".into()),
+                                            vec![dest_ptr, dest_len, src_ptr, src_len],
+                                            IrType::Void,
+                                        );
+                                    } else {
+                                        b.call(
+                                            FuncRef::External("afs_assign_char_deferred".into()),
+                                            vec![field_ptr, src_ptr, src_len],
+                                            IrType::Void,
+                                        );
+                                    }
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
@@ -13678,8 +13688,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // sret convention: result was written into the hidden first param.
                 b.ret(None);
             } else if let Some(addr) = ctx.result_addr {
-                let rv = b.load(addr);
-                b.ret(Some(rv));
+                let returns_derived_buffer = ctx
+                    .result_name
+                    .as_ref()
+                    .and_then(|name| ctx.locals.get(name))
+                    .map(|info| !info.is_pointer && info.derived_type.is_some())
+                    .unwrap_or(false);
+                if returns_derived_buffer {
+                    // Derived-type function results use the pointer-return
+                    // convention; explicit RETURN must mirror the implicit
+                    // fallthrough path instead of loading the aggregate bytes.
+                    let zero = b.const_i64(0);
+                    let byte_ptr = b.gep(addr, vec![zero], IrType::Int(IntWidth::I8));
+                    b.ret(Some(byte_ptr));
+                } else {
+                    let rv = b.load(addr);
+                    b.ret(Some(rv));
+                }
             } else {
                 b.ret_void();
             }
@@ -23526,7 +23551,19 @@ fn lower_expr_full(
                     b.load_typed(info.addr, info.ty.clone())
                 }
             } else {
-                b.const_i32(0)
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if let Some(cv) = sym.const_value {
+                        if i32::try_from(cv).is_ok() {
+                            b.const_i32(cv as i32)
+                        } else {
+                            b.const_i64(cv)
+                        }
+                    } else {
+                        b.const_i32(0)
+                    }
+                } else {
+                    b.const_i32(0)
+                }
             }
         }
 

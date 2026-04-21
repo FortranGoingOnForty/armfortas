@@ -3346,6 +3346,80 @@ fn allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips() {
 }
 
 #[test]
+fn allocatable_fixed_char_actual_to_deferred_char_component_array_round_trips() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32), allocatable :: words(:)\n  allocate(words(2))\n  words(1) = 'echo'\n  words(2) = 'first'\n  node => create_simple_command(words, 2)\n  if (trim(node%simple_cmd%words(1)) /= 'echo') error stop 1\n  if (trim(node%simple_cmd%words(2)) /= 'first') error stop 2\n  print *, trim(node%simple_cmd%words(1)), trim(node%simple_cmd%words(2))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_fixed_char_to_deferred_component_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable fixed-char to deferred component array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable fixed-char to deferred component array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable fixed-char to deferred component array run failed");
+    assert!(
+        run.status.success(),
+        "allocatable fixed-char to deferred component array run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo") && stdout.contains("first"),
+        "unexpected allocatable fixed-char to deferred component array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_parameter_typed_char_component_allocate_preserves_element_len() {
+    let src = write_program(
+        "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 4096\nend module cfg\nprogram p\n  use cfg\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t), pointer :: simple_cmd => null()\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  allocate(node)\n  allocate(node%simple_cmd)\n  allocate(character(len=max_token_len) :: node%simple_cmd%words(2))\n  node%simple_cmd%words(1) = 'echo'\n  node%simple_cmd%words(2) = 'first'\n  if (trim(node%simple_cmd%words(1)) /= 'echo') error stop 1\n  if (trim(node%simple_cmd%words(2)) /= 'first') error stop 2\n  print *, trim(node%simple_cmd%words(1)), trim(node%simple_cmd%words(2))\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("imported_param_char_component_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("imported parameter typed char component allocate compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "imported parameter typed char component allocate compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported parameter typed char component allocate run failed");
+    assert!(
+        run.status.success(),
+        "imported parameter typed char component allocate run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo") && stdout.contains("first"),
+        "unexpected imported parameter typed char component allocate output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens(1) = 'read'\n  tokens(2) = 'line'\n  call check(tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (trim(tokens(2)) /= 'line') error stop 1\n    print *, trim(tokens(2))\n  end subroutine check\nend program p\n",
@@ -5228,6 +5302,94 @@ fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
     assert!(
         stdout.contains("hello.world.txt") && stdout.contains("done"),
         "imported fixed-length character components should preserve their bytes: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
+    let dir = unique_dir("derived_result_return_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "sugg.f90",
+        "module sugg\n  implicit none\n  type, public :: result_t\n    character(len=16) :: text = ''\n    integer :: length = 0\n  end type\ncontains\n  function make_result(flag) result(res)\n    integer, intent(in) :: flag\n    type(result_t) :: res\n    if (flag == 0) return\n    res%text = 'exit'\n    res%length = 4\n    return\n  end function make_result\nend module sugg\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use sugg, only: result_t, make_result\n  implicit none\n  type(result_t) :: res\n  res = make_result(1)\n  if (trim(res%text) /= 'exit') error stop 1\n  if (res%length /= 4) error stop 2\n  print *, trim(res%text), res%length\nend program\n",
+    );
+
+    let mod_obj = dir.join("sugg.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("derived_result_return.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "program run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("exit") && stdout.contains("4"),
+        "expected explicit-return derived result to survive import and runtime: {}",
         stdout
     );
 
@@ -9297,6 +9459,43 @@ fn deferred_char_pointer_component_can_bind_allocatable_char_array_element() {
     assert!(
         stdout.contains("/tmp"),
         "unexpected allocatable char element pointer bind output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_pooled_char_pointer_component_whole_assign_then_char_store_round_trips() {
+    let src = write_program(
+        "module string_pool_like\n  implicit none\n  type :: string_ref\n    integer :: pool_index = 0\n    integer :: ref_count = 0\n    integer :: str_len = 0\n    character(:), pointer :: data => null()\n  end type string_ref\n  character(len=32), target :: pool(1)\ncontains\n  function pool_get_string(length) result(ref)\n    integer, intent(in) :: length\n    type(string_ref) :: ref\n    pool = ''\n    ref%str_len = length\n    ref%data => pool(1)(1:length)\n  end function pool_get_string\nend module\nprogram p\n  use string_pool_like\n  implicit none\n  type :: input_state_t\n    type(string_ref) :: buffer_ref\n    integer :: length = 0\n  end type input_state_t\n  type(input_state_t) :: state\n  state%buffer_ref = pool_get_string(32)\n  if (.not. associated(state%buffer_ref%data)) error stop 2\n  state%buffer_ref%data = ''\n  call set_char(state, 1, 'e')\n  call set_char(state, 2, 'c')\n  call set_char(state, 3, 'h')\n  call set_char(state, 4, 'o')\n  state%length = 4\n  if (trim(state%buffer_ref%data) /= 'echo') error stop 1\n  print *, trim(state%buffer_ref%data)\ncontains\n  subroutine set_char(state, pos, ch)\n    type(input_state_t), intent(inout) :: state\n    integer, intent(in) :: pos\n    character(len=1), intent(in) :: ch\n    if (pos >= 1 .and. pos <= len(state%buffer_ref%data)) then\n      state%buffer_ref%data(pos:pos) = ch\n    end if\n  end subroutine set_char\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_pooled_char_pointer_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested pooled char pointer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested pooled char pointer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested pooled char pointer run failed");
+    assert!(
+        run.status.success(),
+        "nested pooled char pointer run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("echo"),
+        "unexpected nested pooled char pointer output: {}",
         stdout
     );
 
