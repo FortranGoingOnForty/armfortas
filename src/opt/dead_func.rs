@@ -51,20 +51,32 @@ impl Pass for DeadFuncElim {
         }
 
         // Also keep functions that might be called externally (by name).
-        // Collect all External call names.
+        // Collect all External call names and any function names whose
+        // address is taken via GlobalAddr. Internal callbacks passed as
+        // procedure actuals often survive only as address-taken
+        // symbols, so treating "direct call" as the only liveness edge
+        // will incorrectly prune them.
         let mut external_names: HashSet<String> = HashSet::new();
+        let mut addressed_names: HashSet<String> = HashSet::new();
         for func in &module.functions {
             for block in &func.blocks {
                 for inst in &block.insts {
-                    if let InstKind::Call(FuncRef::External(name), _) = &inst.kind {
-                        external_names.insert(name.clone());
+                    match &inst.kind {
+                        InstKind::Call(FuncRef::External(name), _) => {
+                            external_names.insert(name.clone());
+                        }
+                        InstKind::GlobalAddr(name) => {
+                            addressed_names.insert(name.clone());
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        // Keep functions whose names match External calls.
+        // Keep functions whose names match External calls or whose
+        // addresses escaped via GlobalAddr.
         for (i, func) in module.functions.iter().enumerate() {
-            if external_names.contains(&func.name) {
+            if external_names.contains(&func.name) || addressed_names.contains(&func.name) {
                 referenced.insert(i as u32);
             }
         }
@@ -230,5 +242,36 @@ mod tests {
         );
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].name, "__prog_entry");
+    }
+
+    #[test]
+    fn keeps_internal_function_when_its_address_is_taken() {
+        let mut m = Module::new("test".into());
+
+        let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
+        let addr = prog.next_value_id();
+        prog.register_type(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        prog.block_mut(prog.entry).insts.push(Inst {
+            id: addr,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            span: span(),
+            kind: InstKind::GlobalAddr("helper".into()),
+        });
+        prog.block_mut(prog.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(prog);
+
+        let mut helper = Function::new("helper".into(), vec![], IrType::Void);
+        helper.internal_only = true;
+        helper.block_mut(helper.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(helper);
+
+        let pass = DeadFuncElim;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "address-taken internal helper should not be removed"
+        );
+        assert_eq!(m.functions.len(), 2);
+        assert_eq!(m.functions[1].name, "helper");
     }
 }

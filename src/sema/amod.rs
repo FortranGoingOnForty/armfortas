@@ -124,7 +124,8 @@ pub fn write_amod(
     // OPTIONAL slots.
     let mut proc_export_names: BTreeSet<String> = interface_specifics;
     for (name, sym) in &syms {
-        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) && is_public(sym, scope)
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
+            && is_public(sym, scope)
         {
             proc_export_names.insert(name.to_lowercase());
         }
@@ -161,12 +162,62 @@ pub fn write_amod(
     }
 
     // ---- Types ----
-    let types: Vec<_> = syms
-        .iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::DerivedType))
-        .collect();
-    for (name, _sym) in &types {
-        emit_type(&mut out, name, type_layouts);
+    let mut type_exports: BTreeSet<String> = BTreeSet::new();
+    for (name, sym) in &syms {
+        if matches!(sym.kind, SymbolKind::DerivedType) {
+            collect_exported_type_closure(&mut type_exports, name, type_layouts);
+        }
+        collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);
+    }
+    for (_name, sym) in &procs {
+        collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);
+        if let Some(pscope) = st
+            .scopes
+            .iter()
+            .find(|s| {
+                s.parent == Some(mod_scope_id)
+                    && match &s.kind {
+                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                            n.eq_ignore_ascii_case(&sym.name)
+                        }
+                        _ => false,
+                    }
+            })
+            .or_else(|| {
+                st.scopes.iter().find(|s| {
+                    let matches_name = match &s.kind {
+                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                            n.eq_ignore_ascii_case(&sym.name)
+                        }
+                        _ => false,
+                    };
+                    if !matches_name {
+                        return false;
+                    }
+                    let Some(parent_id) = s.parent else {
+                        return false;
+                    };
+                    let parent = st.scope(parent_id);
+                    matches!(parent.kind, ScopeKind::Interface)
+                        && parent.parent == Some(mod_scope_id)
+                })
+            })
+        {
+            for arg_name in &pscope.arg_order {
+                if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
+                    collect_exported_type_info_closure(
+                        &mut type_exports,
+                        arg_sym.type_info.as_ref(),
+                        type_layouts,
+                    );
+                }
+            }
+        }
+    }
+    for key in &type_exports {
+        if let Some(layout) = type_layouts.get(key) {
+            emit_type(&mut out, &layout.name, type_layouts);
+        }
     }
 
     // ---- Interfaces ----
@@ -628,6 +679,39 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
     }
     writeln!(out, "@end type").unwrap();
     writeln!(out).unwrap();
+}
+
+fn collect_exported_type_info_closure(
+    out: &mut BTreeSet<String>,
+    info: Option<&TypeInfo>,
+    type_layouts: &TypeLayoutRegistry,
+) {
+    match info {
+        Some(TypeInfo::Derived(name)) | Some(TypeInfo::Class(name)) => {
+            collect_exported_type_closure(out, name, type_layouts);
+        }
+        _ => {}
+    }
+}
+
+fn collect_exported_type_closure(
+    out: &mut BTreeSet<String>,
+    type_name: &str,
+    type_layouts: &TypeLayoutRegistry,
+) {
+    let key = type_name.to_lowercase();
+    if !out.insert(key.clone()) {
+        return;
+    }
+    let Some(layout) = type_layouts.get(&key) else {
+        return;
+    };
+    if let Some(parent) = &layout.parent {
+        collect_exported_type_closure(out, parent, type_layouts);
+    }
+    for field in &layout.fields {
+        collect_exported_type_info_closure(out, Some(&field.type_info), type_layouts);
+    }
 }
 
 fn emit_interface(out: &mut String, name: &str, sym: &Symbol) {

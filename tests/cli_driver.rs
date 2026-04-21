@@ -12972,3 +12972,278 @@ fn direct_allocatable_array_function_actual_passes_live_descriptor() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn contained_subroutine_actual_to_procedure_dummy_links_and_runs() {
+    let src = write_program(
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine remember(handler)\n    procedure(cb) :: handler\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call remember(local_handler)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_proc_actual_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained proc actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained proc actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained proc actual run failed");
+    assert!(
+        run.status.success(),
+        "contained proc actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained proc actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn o2_keeps_address_taken_contained_callback_symbols() {
+    let src = write_program(
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine remember(handler)\n    procedure(cb) :: handler\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call remember(local_handler)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_proc_actual_dummy_o2", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained proc actual O2 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained proc actual at -O2 should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained proc actual O2 run failed");
+    assert!(
+        run.status.success(),
+        "contained proc actual at -O2 should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained proc actual O2 output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: cursor_t\n    integer :: line = 0\n  end type\n  type :: pane_t\n    type(cursor_t), allocatable :: cursors(:)\n    character(len=:), allocatable :: filename\n  end type\ncontains\n  subroutine check(panes)\n    type(pane_t), intent(inout) :: panes(:)\n    associate (pane => panes(1))\n      if (.not. allocated(pane%cursors)) error stop 1\n      if (size(pane%cursors) /= 2) error stop 2\n      if (.not. allocated(pane%filename)) error stop 3\n      if (trim(pane%filename) /= 'abc') error stop 4\n    end associate\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(pane_t), allocatable :: panes(:)\n  allocate(panes(1))\n  allocate(panes(1)%cursors(2))\n  allocate(character(len=3) :: panes(1)%filename)\n  panes(1)%filename = 'abc'\n  call check(panes)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("associate_alias_component_intrinsics", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("associate alias compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "associate alias compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("associate alias run failed");
+    assert!(
+        run.status.success(),
+        "associate alias run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected associate alias output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn associated_on_procedure_pointer_component_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\ncontains\n  subroutine assign_handler(holder)\n    type(holder_t), intent(inout) :: holder\n    holder%handler => target_handler\n  end subroutine\n\n  logical function has_handler(holder)\n    type(holder_t), intent(in) :: holder\n    has_handler = associated(holder%handler)\n  end function\n\n  subroutine target_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 3\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(holder_t) :: holder\n  if (has_handler(holder)) error stop 1\n  call assign_handler(holder)\n  if (.not. has_handler(holder)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("associated_procptr_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procptr component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procptr component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procptr component run failed");
+    assert!(
+        run.status.success(),
+        "procptr component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected procptr component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn public_type_emits_private_nested_type_layouts_needed_cross_tu() {
+    let dir = unique_dir("private_nested_layout");
+    let mod_src = write_program_in(
+        &dir,
+        "tree_mod.f90",
+        "module tree_mod\n  implicit none\n  private\n  public :: tree_state_t, init_tree\n  type :: node_t\n    integer :: value = 0\n    type(node_t), pointer :: parent => null()\n  end type\n  type :: selectable_t\n    logical :: is_directory = .false.\n    type(node_t), pointer :: node => null()\n  end type\n  type :: tree_state_t\n    type(selectable_t), allocatable :: selectable_files(:)\n  end type\ncontains\n  subroutine init_tree(state)\n    type(tree_state_t), intent(out) :: state\n    allocate(state%selectable_files(1))\n    state%selectable_files(1)%is_directory = .true.\n    allocate(state%selectable_files(1)%node)\n    state%selectable_files(1)%node%value = 7\n  end subroutine\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use tree_mod\n  implicit none\n  type(tree_state_t) :: state\n  call init_tree(state)\n  if (.not. allocated(state%selectable_files)) error stop 1\n  if (.not. state%selectable_files(1)%is_directory) error stop 2\n  if (.not. associated(state%selectable_files(1)%node)) error stop 3\n  if (state%selectable_files(1)%node%value /= 7) error stop 4\n  if (associated(state%selectable_files(1)%node%parent)) error stop 5\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("tree_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("tree module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "tree module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = dir.join("tree_mod.amod");
+    let amod_text = std::fs::read_to_string(&amod).expect("missing tree_mod.amod");
+    assert!(
+        amod_text.contains("@type selectable_t") && amod_text.contains("@type node_t"),
+        "public nested type closure should be emitted to .amod: {}",
+        amod_text
+    );
+
+    let user_obj = dir.join("user.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "user compile should succeed with imported private nested layouts: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let exe = dir.join("tree_nested.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "private nested layout test should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "private nested layout test should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected private nested layout output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn module_procedure_actual_is_not_mislowered_as_internal_proc() {
+    let src = write_program(
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine register_only(handler)\n    procedure(cb) :: handler\n  end subroutine\n\n  subroutine drive()\n    call register_only(wrapper)\n    print *, 'ok'\n  end subroutine\n\n  subroutine wrapper(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call drive()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_proc_actual_not_internal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module procedure actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module procedure actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module procedure actual run failed");
+    assert!(
+        run.status.success(),
+        "module procedure actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module procedure actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}

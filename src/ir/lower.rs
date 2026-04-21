@@ -571,6 +571,15 @@ fn collect_internal_func_names(
     out: &mut HashMap<String, u32>,
     next_idx: &mut u32,
 ) {
+    collect_internal_func_names_inner(unit, false, out, next_idx);
+}
+
+fn collect_internal_func_names_inner(
+    unit: &ProgramUnit,
+    is_contained: bool,
+    out: &mut HashMap<String, u32>,
+    next_idx: &mut u32,
+) {
     match unit {
         ProgramUnit::Program { name, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -578,7 +587,7 @@ fn collect_internal_func_names(
             out.insert(body_name, *next_idx);
             *next_idx += 1;
             for sub in contains {
-                collect_internal_func_names(&sub.node, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
             }
         }
         ProgramUnit::Subroutine {
@@ -593,27 +602,29 @@ fn collect_internal_func_names(
             contains,
             ..
         } => {
-            let idx = *next_idx;
-            *next_idx += 1;
-            out.insert(name.to_lowercase(), idx);
-            if let Some(bind) = bind {
-                if let Some(bind_name) = bind.name.as_deref() {
-                    out.entry(
-                        bind_name
-                            .trim_matches('\'')
-                            .trim_matches('"')
-                            .to_lowercase(),
-                    )
-                    .or_insert(idx);
+            if is_contained {
+                let idx = *next_idx;
+                *next_idx += 1;
+                out.insert(name.to_lowercase(), idx);
+                if let Some(bind) = bind {
+                    if let Some(bind_name) = bind.name.as_deref() {
+                        out.entry(
+                            bind_name
+                                .trim_matches('\'')
+                                .trim_matches('"')
+                                .to_lowercase(),
+                        )
+                        .or_insert(idx);
+                    }
                 }
             }
             for sub in contains {
-                collect_internal_func_names(&sub.node, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
             }
         }
         ProgramUnit::Module { contains, .. } | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
-                collect_internal_func_names(&sub.node, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, false, out, next_idx);
             }
         }
         _ => {}
@@ -11821,11 +11832,7 @@ fn callee_bind_c_char_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Ve
 fn callee_return_derived_info(st: &SymbolTable, callee_name: &str) -> Option<(String, bool)> {
     use crate::sema::symtab::{ScopeKind, TypeInfo};
     let key = callee_name.to_lowercase();
-    if let Some(sym) = st
-        .scopes
-        .iter()
-        .find_map(|scope| scope.symbols.get(&key))
-    {
+    if let Some(sym) = st.scopes.iter().find_map(|scope| scope.symbols.get(&key)) {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
         }
@@ -11857,7 +11864,11 @@ fn callee_return_stabilized_derived_type_name(
     callee_name: &str,
 ) -> Option<String> {
     let (name, is_pointer) = callee_return_derived_info(st, callee_name)?;
-    if is_pointer { None } else { Some(name) }
+    if is_pointer {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
@@ -15814,6 +15825,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 assocs.iter().map(|(name, _)| name.to_lowercase()).collect();
 
             for (name, expr) in assocs {
+                if let Some(info) = associate_alias_local_info(b, ctx, expr) {
+                    ctx.locals.insert(name.to_lowercase(), info);
+                    continue;
+                }
                 let val = lower_expr_ctx(b, ctx, expr);
                 let ty = b
                     .func()
@@ -18390,7 +18405,9 @@ fn lower_array_store(
         emit_derived_value_copy(
             b,
             type_layouts.expect("derived array store requires type layouts"),
-            info.derived_type.as_deref().expect("derived array store missing type name"),
+            info.derived_type
+                .as_deref()
+                .expect("derived array store missing type name"),
             dest_ptr,
             value,
         );
@@ -22600,16 +22617,12 @@ fn lower_pointer_intrinsic(
         b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
     } else if let Some(tl) = type_layouts {
         let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
-        if !field.pointer {
-            return None;
-        }
         if is_deferred_char_component_field(&field) {
             let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
             coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64))
         } else {
-            let zero_off = b.const_i64(0);
-            let base_ptr = b.gep(field_ptr, vec![zero_off], IrType::Int(IntWidth::I64));
-            b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
+            let ptr = b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64))
         }
     } else {
         return None;
@@ -22735,6 +22748,104 @@ fn component_intrinsic_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
     })
+}
+
+fn component_field_local_info(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<LocalInfo> {
+    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+    Some(LocalInfo {
+        addr: field_ptr,
+        ty: field_storage_ir_type(&field, tl),
+        dims: field.dims.clone(),
+        allocatable: field.allocatable,
+        descriptor_arg: field_uses_array_descriptor(&field),
+        by_ref: false,
+        char_kind: field_char_kind(&field),
+        derived_type: field_derived_type_name(&field),
+        inline_const: None,
+        is_pointer: field.pointer,
+        runtime_dim_upper: vec![],
+    })
+}
+
+fn associate_alias_local_info(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<LocalInfo> {
+    match &expr.node {
+        Expr::Name { name } => ctx.locals.get(&name.to_lowercase()).cloned(),
+        Expr::ComponentAccess { .. } => {
+            component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+        }
+        Expr::FunctionCall { callee, args } => {
+            if args
+                .iter()
+                .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+            {
+                return None;
+            }
+            if let Expr::Name { name } = &callee.node {
+                let info = ctx.locals.get(&name.to_lowercase())?;
+                if !local_is_array_like(info) {
+                    return None;
+                }
+                let elem_addr = lower_array_element_addr(
+                    b,
+                    &ctx.locals,
+                    info,
+                    args,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                return Some(LocalInfo {
+                    addr: elem_addr,
+                    ty: info.ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: info.char_kind.clone(),
+                    derived_type: info.derived_type.clone(),
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                });
+            }
+            if let Expr::ComponentAccess { .. } = &callee.node {
+                let info =
+                    component_array_local_info(b, &ctx.locals, callee, ctx.st, ctx.type_layouts)?;
+                let elem_addr = lower_array_element_addr(
+                    b,
+                    &ctx.locals,
+                    &info,
+                    args,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                return Some(LocalInfo {
+                    addr: elem_addr,
+                    ty: info.ty,
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: info.char_kind,
+                    derived_type: info.derived_type,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                });
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn lower_array_intrinsic(
@@ -24828,7 +24939,22 @@ fn lower_arg_by_ref_full(
                     | crate::sema::symtab::SymbolKind::Subroutine
                     | crate::sema::symtab::SymbolKind::ExternalProc
             ) {
-                let (link_name, _) = resolved_symbol_call_target(st, &key, name);
+                let (link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
+                if let Some(internal_funcs) = internal_funcs {
+                    if internal_funcs.contains_key(&resolved_key)
+                        || internal_funcs.contains_key(&key)
+                    {
+                        let lowered = lowered_procedure_symbol_name(
+                            resolved_key.as_str(),
+                            None,
+                            Some(b.func().name.as_str()),
+                            None,
+                            true,
+                            internal_funcs,
+                        );
+                        return b.global_addr(&lowered, IrType::Int(IntWidth::I8));
+                    }
+                }
                 return b.global_addr(&link_name, IrType::Int(IntWidth::I8));
             }
         }

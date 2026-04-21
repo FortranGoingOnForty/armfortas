@@ -806,6 +806,87 @@ impl<'a> Parser<'a> {
                 break;
             }
 
+            // PROCEDURE(interface_name) [, attrs] :: name [=> null()]
+            // Procedure pointer components inside a derived type.
+            if text == "procedure" {
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::LParen {
+                    let comp_start = self.current_span();
+                    self.advance(); // consume 'procedure'
+                    self.advance(); // consume '('
+                    let iface_name = if self.peek() == &TokenKind::Identifier {
+                        self.advance().clone().text
+                    } else {
+                        String::new()
+                    };
+                    self.expect(&TokenKind::RParen)?;
+
+                    let mut comp_attrs = Vec::new();
+                    while self.eat(&TokenKind::Comma) {
+                        let attr_text = self.peek_text().to_lowercase();
+                        match attr_text.as_str() {
+                            "pointer" => {
+                                self.advance();
+                                comp_attrs.push(crate::ast::decl::Attribute::Pointer);
+                            }
+                            "nopass" | "pass" | "deferred" | "non_overridable" => {
+                                self.advance();
+                            }
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                    }
+
+                    if self.peek() == &TokenKind::ColonColon {
+                        self.advance();
+                    }
+
+                    let mut entities = Vec::new();
+                    loop {
+                        let entity_name = if self.peek() == &TokenKind::Identifier {
+                            self.advance().clone().text
+                        } else {
+                            String::new()
+                        };
+
+                        if self.eat(&TokenKind::Arrow)
+                            && self.peek_text().eq_ignore_ascii_case("null")
+                        {
+                            self.advance();
+                            if self.peek() == &TokenKind::LParen {
+                                self.advance();
+                                let _ = self.expect(&TokenKind::RParen);
+                            }
+                        }
+
+                        entities.push(crate::ast::decl::EntityDecl {
+                            name: entity_name,
+                            array_spec: None,
+                            init: None,
+                            char_len: None,
+                            ptr_init: None,
+                        });
+
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+
+                    comp_attrs.push(crate::ast::decl::Attribute::External);
+                    let span = crate::parser::expr::span_from_to(comp_start, self.prev_span());
+                    components.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::TypeDecl {
+                            type_spec: crate::ast::decl::TypeSpec::Type(iface_name),
+                            attrs: comp_attrs,
+                            entities,
+                        },
+                        span,
+                    ));
+                    continue;
+                }
+            }
+
             // Try to parse a component declaration.
             if let Some(ts_result) = self.try_parse_type_spec() {
                 let ts = ts_result?;
