@@ -985,6 +985,23 @@ fn derived_local_storage_ir_type(
         .unwrap_or_else(|| lowered_ty.clone())
 }
 
+fn dummy_local_ir_type(
+    lowered_ty: &IrType,
+    derived_type: Option<&str>,
+    is_pointer: bool,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> IrType {
+    if is_pointer && derived_type.is_some() {
+        // Derived-type POINTER dummies travel as associated addresses.
+        // Keeping the pointer-shaped IR type here prevents later
+        // pointer-association code from reinterpreting the pointee as
+        // an inline byte buffer and loading the whole struct value.
+        lowered_ty.clone()
+    } else {
+        derived_local_storage_ir_type(lowered_ty, derived_type, type_layouts)
+    }
+}
+
 /// Record which positional dummy arguments are lowered through an
 /// ArrayDescriptor rather than a raw element pointer.
 fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
@@ -2809,9 +2826,11 @@ fn lower_unit(
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
-                        let local_elem_ty = derived_local_storage_ir_type(
+                        let is_pointer = decl_is_pointer(pname, decls);
+                        let local_elem_ty = dummy_local_ir_type(
                             elem_ty,
                             dt_name.as_deref(),
+                            is_pointer,
                             type_layouts,
                         );
                         let slot = b.alloca(by_ref_storage_ir_type(
@@ -2837,7 +2856,7 @@ fn lower_unit(
                             char_kind: ck,
                             derived_type: dt_name,
                             inline_const: None,
-                            is_pointer: decl_is_pointer(pname, decls),
+                            is_pointer,
                             runtime_dim_upper: vec![],
                         };
                         ctx.locals.insert(pname.clone(), info);
@@ -3215,9 +3234,11 @@ fn lower_unit(
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
-                        let local_elem_ty = derived_local_storage_ir_type(
+                        let is_pointer = decl_is_pointer(pname, decls);
+                        let local_elem_ty = dummy_local_ir_type(
                             elem_ty,
                             dt_name.as_deref(),
+                            is_pointer,
                             type_layouts,
                         );
                         let slot = b.alloca(by_ref_storage_ir_type(
@@ -3244,7 +3265,7 @@ fn lower_unit(
                                 char_kind: ck,
                                 derived_type: dt_name,
                                 inline_const: None,
-                                is_pointer: decl_is_pointer(pname, decls),
+                                is_pointer,
                                 runtime_dim_upper: vec![],
                             },
                         );
@@ -9307,24 +9328,32 @@ fn emit_named_function_call(
                         descriptor_params,
                     )
                 } else if wants_pointer {
-                    lower_pointer_dummy_actual(b, locals, e, st, type_layouts).unwrap_or_else(
-                        || {
-                            if full_ref_context {
-                                lower_arg_by_ref_full(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                            } else {
-                                lower_arg_by_ref(b, locals, e, st)
-                            }
-                        },
+                    lower_pointer_dummy_actual(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
                     )
+                    .unwrap_or_else(|| {
+                        if full_ref_context {
+                            lower_arg_by_ref_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        } else {
+                            lower_arg_by_ref(b, locals, e, st)
+                        }
+                    })
                 } else if full_ref_context {
                     lower_arg_by_ref_full(
                         b,
@@ -9539,19 +9568,28 @@ fn emit_bound_function_call(
                             descriptor_params,
                         )
                     } else if wants_pointer {
-                        lower_pointer_dummy_actual(b, locals, e, st, type_layouts)
-                            .unwrap_or_else(|| {
-                                lower_arg_by_ref_full(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                            })
+                        lower_pointer_dummy_actual(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                        .unwrap_or_else(|| {
+                            lower_arg_by_ref_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        })
                     } else {
                         lower_arg_by_ref_full(
                             b,
@@ -9760,8 +9798,17 @@ fn lower_alloc_return_call_into_desc(
                         Some(ctx.descriptor_params),
                     )
                 } else if wants_pointer {
-                    lower_pointer_dummy_actual(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
-                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                    lower_pointer_dummy_actual(
+                        b,
+                        &ctx.locals,
+                        e,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                    )
+                    .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                 } else {
                     lower_arg_by_ref_ctx(b, ctx, e)
                 }
@@ -11548,15 +11595,11 @@ fn named_expr_callable_character_return_abi(
     callee_name: &str,
 ) -> Option<CharacterReturnAbi> {
     let key = callee_name.to_ascii_lowercase();
-    if locals.contains_key(&key) {
-        let sym = st.scopes.iter().find_map(|scope| scope.symbols.get(&key))?;
-        match sym.kind {
-            crate::sema::symtab::SymbolKind::ProcedurePointer
-            | crate::sema::symtab::SymbolKind::Function
-            | crate::sema::symtab::SymbolKind::ExternalProc
-            | crate::sema::symtab::SymbolKind::IntrinsicProc => {}
-            _ => return None,
-        }
+    if locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none() {
+        // A local variable shadows unrelated module/global procedures
+        // with the same name. Only true procedure-pointer locals stay
+        // callable through the data namespace here.
+        return None;
     }
     callee_character_return_abi(st, &key)
 }
@@ -13900,6 +13943,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                     e,
                                                     ctx.st,
                                                     Some(ctx.type_layouts),
+                                                    Some(ctx.internal_funcs),
+                                                    Some(ctx.contained_host_refs),
+                                                    Some(ctx.descriptor_params),
                                                 )
                                                 .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                                             } else {
@@ -14088,6 +14134,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             e,
                                             ctx.st,
                                             Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                         )
                                         .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                                     } else {
@@ -24243,6 +24292,9 @@ fn lower_pointer_dummy_actual(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
     if let Expr::Name { name } = &expr.node {
         let info = locals.get(&name.to_lowercase())?;
@@ -24267,15 +24319,33 @@ fn lower_pointer_dummy_actual(
             .iter()
             .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
         {
-            return None;
+            let raw = lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            if !b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+                return None;
+            }
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let ptr = coerce_to_type(b, raw, &IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            b.store(ptr, slot);
+            return Some(slot);
         }
         if let Expr::Name { name } = &callee.node {
-            let info = locals.get(&name.to_lowercase())?;
-            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
-                let elem_addr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
-                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                b.store(elem_addr, slot);
-                return Some(slot);
+            if let Some(info) = locals.get(&name.to_lowercase()) {
+                if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                    let elem_addr =
+                        lower_array_element_addr(b, locals, info, args, st, type_layouts);
+                    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    b.store(elem_addr, slot);
+                    return Some(slot);
+                }
             }
         }
         if let Expr::ComponentAccess { .. } = &callee.node {
@@ -24288,7 +24358,24 @@ fn lower_pointer_dummy_actual(
             }
         }
     }
-    None
+
+    let raw = lower_expr_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    if !b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+        return None;
+    }
+    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let ptr = coerce_to_type(b, raw, &IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(ptr, slot);
+    Some(slot)
 }
 
 /// Lower an expression to a ValueId.
@@ -25484,19 +25571,28 @@ fn lower_expr_full(
                                         descriptor_params,
                                     )
                                 } else if wants_pointer {
-                                    lower_pointer_dummy_actual(b, locals, e, st, type_layouts)
-                                        .unwrap_or_else(|| {
-                                            lower_arg_by_ref_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            )
-                                        })
+                                    lower_pointer_dummy_actual(
+                                        b,
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        lower_arg_by_ref_full(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                    })
                                 } else {
                                     lower_arg_by_ref_full(
                                         b,
@@ -25756,6 +25852,9 @@ fn lower_expr_full(
                                                         e,
                                                         st,
                                                         type_layouts,
+                                                        internal_funcs,
+                                                        contained_host_refs,
+                                                        descriptor_params,
                                                     )
                                                     .unwrap_or_else(|| {
                                                         lower_arg_by_ref_full(
