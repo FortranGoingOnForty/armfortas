@@ -4717,6 +4717,42 @@ fn compute_filtered_names(
 ) -> HashSet<String> {
     use crate::ast::decl::OnlyItem;
     let mut filtered: HashSet<String> = HashSet::new();
+    let mut visible_local_names: HashSet<String> = HashSet::new();
+
+    for decl in uses {
+        let Decl::UseStmt {
+            module,
+            only,
+            renames,
+            ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let mod_key = module.to_lowercase();
+        if let Some(only_list) = only {
+            for item in only_list {
+                match item {
+                    OnlyItem::Name(n) => {
+                        visible_local_names.insert(n.to_lowercase());
+                    }
+                    OnlyItem::Rename(rn) => {
+                        visible_local_names.insert(rn.local.to_lowercase());
+                    }
+                }
+            }
+        } else {
+            for (mk, var) in globals.keys() {
+                if *mk == mod_key {
+                    visible_local_names.insert(var.clone());
+                }
+            }
+            for rn in renames {
+                visible_local_names.insert(rn.local.to_lowercase());
+            }
+        }
+    }
+
     for decl in uses {
         let Decl::UseStmt {
             module,
@@ -4752,7 +4788,7 @@ fn compute_filtered_names(
         }
         // Anything in exports but not imported is now filtered.
         for e in &exports {
-            if !imported.contains(e) {
+            if !imported.contains(e) && !visible_local_names.contains(e) {
                 filtered.insert(e.clone());
             }
         }

@@ -182,8 +182,20 @@ impl<'a> Parser<'a> {
                 Ok(Spanned::new(Stmt::Continue { label: None }, span))
             }
             "sync" => {
-                Err(self
-                    .error("coarray SYNC statements are recognized but not yet implemented".into()))
+                let looks_like_sync_stmt = self.tokens.get(self.pos + 1).is_some_and(|tok| {
+                    tok.kind == TokenKind::Identifier
+                        && matches!(
+                            tok.text.to_ascii_lowercase().as_str(),
+                            "all" | "images" | "memory" | "team"
+                        )
+                });
+                if looks_like_sync_stmt {
+                    Err(self.error(
+                        "coarray SYNC statements are recognized but not yet implemented".into(),
+                    ))
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
             }
             _ => self.parse_assignment_or_call(start),
         }
@@ -2376,5 +2388,11 @@ end if
         assert!(err
             .msg
             .contains("coarray SYNC statements are recognized but not yet implemented"));
+    }
+
+    #[test]
+    fn sync_name_can_start_component_assignment() {
+        let s = parse_one("sync%version = 0\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
     }
 }

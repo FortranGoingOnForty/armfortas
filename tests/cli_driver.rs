@@ -254,6 +254,44 @@ end program
 }
 
 #[test]
+fn only_filtered_name_stays_accessible_when_imported_from_another_module() {
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: current_search_pattern = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: current_search_pattern = 2
+  integer :: helper = 3
+end module
+
+program demo
+  use mod_a, only: current_search_pattern
+  use mod_b, only: helper
+  implicit none
+  print *, current_search_pattern + helper
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("use_only_visible_other_module", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "name imported from one module should remain accessible even if filtered from another: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_c_produces_object_file_only() {
     let src = write_program("module foo\n  integer :: x = 1\nend module\n", "f90");
     let out = unique_path("obj", "o");
