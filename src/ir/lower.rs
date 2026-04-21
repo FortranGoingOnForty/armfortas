@@ -7989,6 +7989,28 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 None
             }
         }
+        "logical" => {
+            if let Some(arg) = args.first() {
+                let requested_ty = args
+                    .get(1)
+                    .and_then(|kind| extract_const_int_from_value(b, *kind))
+                    .and_then(|kind| match kind {
+                        1 => Some(IrType::Int(IntWidth::I8)),
+                        2 => Some(IrType::Int(IntWidth::I16)),
+                        4 => Some(IrType::Bool),
+                        8 => Some(IrType::Int(IntWidth::I64)),
+                        _ => None,
+                    })
+                    .unwrap_or(IrType::Bool);
+                let ty = b.func().value_type(*arg).unwrap_or(IrType::Bool);
+                match ty {
+                    IrType::Bool | IrType::Int(_) => Some(coerce_to_type(b, *arg, &requested_ty)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
         "aimag" | "dimag" => {
             // aimag(z) extracts the imaginary component of a complex number.
             // Complex values live as ptr<[f32/f64 x 2]>; load element 1 at

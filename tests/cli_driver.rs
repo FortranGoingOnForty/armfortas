@@ -2699,6 +2699,46 @@ fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
 }
 
 #[test]
+fn logical_intrinsic_kind_argument_compiles_and_runs() {
+    let dir = unique_dir("logical_kind_intrinsic");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_bool\n  implicit none\n  logical :: bf\n  logical(c_bool) :: out\n  bf = .true.\n  out = logical(bf, c_bool)\n  if (.not. out) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("logical_kind_intrinsic.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("logical kind intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical kind intrinsic should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("logical kind intrinsic run failed");
+    assert!(
+        run.status.success(),
+        "logical kind intrinsic should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected logical kind intrinsic output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn contained_char_function_in_comparison_uses_internal_call_target() {
     let dir = unique_dir("contained_char_fn_compare");
     let src = write_program_in(
