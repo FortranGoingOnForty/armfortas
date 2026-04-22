@@ -88,15 +88,22 @@ fn o2_reuses_pure_recursive_call_in_program_caller() {
     let helper_name = function_name(raw_sections[1]);
 
     let raw_main = function_section(&raw_ir, "__prog_pure_recursive_reuse");
+    let raw_helper = function_section(&raw_ir, helper_name);
     let opt_main = function_section(&opt_ir, "__prog_pure_recursive_reuse");
 
     let raw_pure_calls = count(raw_main, &format!("call @{}(", helper_name));
+    let raw_recursive_calls = count(raw_helper, &format!("call @{}(", helper_name));
     let opt_pure_calls = count(opt_main, &format!("call @{}(", helper_name));
 
     assert_eq!(
         raw_pure_calls, 2,
         "lowered caller should materialize two recursive PURE calls before optimization:\n{}",
         raw_main
+    );
+    assert_eq!(
+        raw_recursive_calls, 1,
+        "recursive PURE helper should target its own internal symbol before optimization:\n{}",
+        raw_helper
     );
     assert_eq!(
         opt_pure_calls, 1,

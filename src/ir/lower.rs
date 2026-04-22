@@ -10737,36 +10737,30 @@ fn lowered_procedure_symbol_name(
     name.to_string()
 }
 
-fn immediate_host_link_name_for_internal_calls(current_func_name: &str) -> String {
-    if let Some(rest) = current_func_name.strip_prefix("afs_internal_") {
-        if let Some((host, suffix)) = rest.rsplit_once('_') {
-            if suffix.chars().all(|ch| ch.is_ascii_digit()) {
-                return host.to_string();
-            }
-        }
-    }
-    current_func_name.to_string()
-}
-
-fn current_internal_proc_name(
-    current_func_name: &str,
-    internal_funcs: &HashMap<String, u32>,
-) -> Option<String> {
-    let rest = current_func_name.strip_prefix("afs_internal_")?;
-    let (_, suffix) = rest.rsplit_once('_')?;
-    let idx: u32 = suffix.parse().ok()?;
-    internal_funcs
-        .iter()
-        .find_map(|(name, value)| (*value == idx).then(|| name.clone()))
-}
-
 fn scope_matches_procedure_name(scope: &crate::sema::symtab::Scope, name: &str) -> bool {
     matches!(
         &scope.kind,
-        crate::sema::symtab::ScopeKind::Program(scope_name)
-            | crate::sema::symtab::ScopeKind::Function(scope_name)
+        crate::sema::symtab::ScopeKind::Function(scope_name)
             | crate::sema::symtab::ScopeKind::Subroutine(scope_name)
             if scope_name.eq_ignore_ascii_case(name)
+    )
+}
+
+fn scope_has_linkable_parent(
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> bool {
+    let Some(parent_id) = st.scope(scope_id).parent else {
+        return false;
+    };
+    matches!(
+        &st.scope(parent_id).kind,
+        crate::sema::symtab::ScopeKind::Global
+            | crate::sema::symtab::ScopeKind::Module(_)
+            | crate::sema::symtab::ScopeKind::Submodule(_)
+            | crate::sema::symtab::ScopeKind::Program(_)
+            | crate::sema::symtab::ScopeKind::Subroutine(_)
+            | crate::sema::symtab::ScopeKind::Function(_)
     )
 }
 
@@ -10775,42 +10769,62 @@ fn find_procedure_scope_id(st: &SymbolTable, name: &str) -> Option<crate::sema::
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(idx, scope)| scope_matches_procedure_name(scope, name).then_some(idx))
+        .find_map(|(idx, scope)| {
+            (scope_matches_procedure_name(scope, name) && scope_has_linkable_parent(st, idx))
+                .then_some(idx)
+        })
 }
 
-fn internal_call_host_link_name(
+fn lowered_scope_symbol_name(
     st: &SymbolTable,
-    current_func_name: &str,
     internal_funcs: &HashMap<String, u32>,
-    callee_name: &str,
-) -> String {
-    if !current_func_name.starts_with("afs_internal_") {
-        return current_func_name.to_string();
-    }
-    let fallback = immediate_host_link_name_for_internal_calls(current_func_name);
-    let Some(current_proc_name) = current_internal_proc_name(current_func_name, internal_funcs)
-    else {
-        return fallback;
-    };
-    if callee_name.eq_ignore_ascii_case(&current_proc_name) {
-        return current_func_name.to_string();
-    }
-    let Some(current_scope_id) = find_procedure_scope_id(st, &current_proc_name) else {
-        return fallback;
-    };
-    let Some(callee_scope_id) = find_procedure_scope_id(st, callee_name) else {
-        return fallback;
-    };
-    if st.scope(callee_scope_id).parent == Some(current_scope_id) {
-        current_func_name.to_string()
-    } else {
-        fallback
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<String> {
+    let scope = st.scope(scope_id);
+    match &scope.kind {
+        crate::sema::symtab::ScopeKind::Program(name) => Some(format!("__prog_{}", name)),
+        crate::sema::symtab::ScopeKind::Function(name)
+        | crate::sema::symtab::ScopeKind::Subroutine(name) => {
+            let parent_id = scope.parent?;
+            let parent_scope = st.scope(parent_id);
+            match &parent_scope.kind {
+                crate::sema::symtab::ScopeKind::Program(program_name) => {
+                    let host_link_name = format!("__prog_{}", program_name);
+                    Some(lowered_procedure_symbol_name(
+                        name,
+                        None,
+                        Some(host_link_name.as_str()),
+                        None,
+                        true,
+                        internal_funcs,
+                    ))
+                }
+                crate::sema::symtab::ScopeKind::Function(_)
+                | crate::sema::symtab::ScopeKind::Subroutine(_) => {
+                    let host_link_name = lowered_scope_symbol_name(st, internal_funcs, parent_id)?;
+                    Some(lowered_procedure_symbol_name(
+                        name,
+                        None,
+                        Some(host_link_name.as_str()),
+                        None,
+                        true,
+                        internal_funcs,
+                    ))
+                }
+                crate::sema::symtab::ScopeKind::Module(module_name)
+                | crate::sema::symtab::ScopeKind::Submodule(module_name) => {
+                    Some(module_procedure_symbol_name(module_name, name))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
 fn same_unit_func_ref(
     st: &SymbolTable,
-    current_func_name: &str,
+    _current_func_name: &str,
     internal_funcs: Option<&HashMap<String, u32>>,
     keys: &[&str],
     fallback_call_name: String,
@@ -10825,15 +10839,12 @@ fn same_unit_func_ref(
     else {
         return FuncRef::External(fallback_call_name);
     };
-    let host_link_name = internal_call_host_link_name(st, current_func_name, internal_funcs, matched_key);
-    let lowered = lowered_procedure_symbol_name(
-        matched_key,
-        None,
-        Some(host_link_name.as_str()),
-        None,
-        true,
-        internal_funcs,
-    );
+    let Some(scope_id) = find_procedure_scope_id(st, matched_key) else {
+        return FuncRef::External(fallback_call_name);
+    };
+    let Some(lowered) = lowered_scope_symbol_name(st, internal_funcs, scope_id) else {
+        return FuncRef::External(fallback_call_name);
+    };
     FuncRef::External(lowered)
 }
 
