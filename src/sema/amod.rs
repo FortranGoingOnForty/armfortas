@@ -23,6 +23,103 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    hex
+}
+
+fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut idx = 0usize;
+    while idx < value.len() {
+        let next = idx + 2;
+        let byte = u8::from_str_radix(&value[idx..next], 16).ok()?;
+        bytes.push(byte);
+        idx = next;
+    }
+    Some(bytes)
+}
+
+fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaultInit) -> String {
+    use crate::sema::type_layout::FieldDefaultInit;
+    match init {
+        FieldDefaultInit::Character(value) => format!("C{}", hex_encode_bytes(value.as_bytes())),
+        FieldDefaultInit::Integer(value) => format!("I{}", value),
+        FieldDefaultInit::Logical(value) => format!("L{}", if *value { '1' } else { '0' }),
+        FieldDefaultInit::Derived(fields) => {
+            let rendered = fields
+                .iter()
+                .map(|(name, value)| format!("{name}={}", encode_nested_field_default_init(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("D({rendered})")
+        }
+    }
+}
+
+fn split_nested_default_fields(payload: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in payload.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&payload[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    if !payload.is_empty() {
+        out.push(&payload[start..]);
+    }
+    Some(out)
+}
+
+fn decode_nested_field_default_init(
+    encoded: &str,
+) -> Option<crate::sema::type_layout::FieldDefaultInit> {
+    use crate::sema::type_layout::FieldDefaultInit;
+    if let Some(value) = encoded.strip_prefix('C') {
+        let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+        return Some(FieldDefaultInit::Character(decoded));
+    }
+    if let Some(value) = encoded.strip_prefix('I') {
+        return value.parse::<i128>().ok().map(FieldDefaultInit::Integer);
+    }
+    if let Some(value) = encoded.strip_prefix('L') {
+        return match value {
+            "1" => Some(FieldDefaultInit::Logical(true)),
+            "0" => Some(FieldDefaultInit::Logical(false)),
+            _ => None,
+        };
+    }
+    if let Some(value) = encoded.strip_prefix("D(").and_then(|s| s.strip_suffix(')')) {
+        let mut fields = Vec::new();
+        for entry in split_nested_default_fields(value)? {
+            let (name, payload) = entry.split_once('=')?;
+            let init = decode_nested_field_default_init(payload)?;
+            fields.push((name.to_string(), init));
+        }
+        return Some(FieldDefaultInit::Derived(fields));
+    }
+    None
+}
+
 // =====================================================================
 // Writer
 // =====================================================================
@@ -37,6 +134,7 @@ pub fn write_amod(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     type_layouts: &TypeLayoutRegistry,
     ir_module: &IrModule,
+    descriptor_params: &HashMap<String, Vec<bool>>,
     char_len_star_params: &HashMap<String, Vec<bool>>,
 ) -> String {
     let mut out = String::new();
@@ -115,7 +213,10 @@ pub fn write_amod(
     // ---- Procedures ----
     let interface_specifics: BTreeSet<String> = syms
         .iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::NamedInterface))
+        .filter(|(_, sym)| {
+            matches!(sym.kind, SymbolKind::NamedInterface)
+                || (matches!(sym.kind, SymbolKind::DerivedType) && !sym.arg_names.is_empty())
+        })
         .flat_map(|(_, sym)| sym.arg_names.iter().cloned())
         .collect();
     // Public derived types can expose private bound procedure targets across
@@ -157,6 +258,7 @@ pub fn write_amod(
             st,
             mod_scope_id,
             ir_module,
+            descriptor_params,
             char_len_star_params,
         );
     }
@@ -223,7 +325,10 @@ pub fn write_amod(
     // ---- Interfaces ----
     let ifaces: Vec<_> = syms
         .iter()
-        .filter(|(_, sym)| matches!(sym.kind, SymbolKind::NamedInterface))
+        .filter(|(_, sym)| {
+            matches!(sym.kind, SymbolKind::NamedInterface)
+                || (matches!(sym.kind, SymbolKind::DerivedType) && !sym.arg_names.is_empty())
+        })
         .collect();
     for (name, sym) in &ifaces {
         emit_interface(&mut out, name, sym);
@@ -345,6 +450,7 @@ fn emit_procedure(
     st: &SymbolTable,
     mod_scope_id: ScopeId,
     ir_module: &IrModule,
+    descriptor_params: &HashMap<String, Vec<bool>>,
     _char_len_star_params: &HashMap<String, Vec<bool>>,
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
@@ -418,6 +524,7 @@ fn emit_procedure(
         });
 
     let is_bind_c = sym.attrs.binding_label.is_some();
+    let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
 
     // Compute hidden char-length count from the scope's arg types.
     let mut hidden_count = 0usize;
@@ -484,7 +591,11 @@ fn emit_procedure(
                                 )
                         )
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || declared_descriptor_params
+                        .and_then(|flags| flags.get(arg_idx))
+                        .copied()
+                        .unwrap_or(false);
                 if is_descriptor_arg {
                     arg_attrs.push("descriptor");
                 }
@@ -658,17 +769,17 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         fn render_field_default_init(init: &crate::sema::type_layout::FieldDefaultInit) -> String {
             match init {
                 crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-                    let mut hex = String::with_capacity(value.len() * 2);
-                    for byte in value.as_bytes() {
-                        hex.push_str(&format!("{:02x}", byte));
-                    }
-                    format!(" @init=charhex:{}", hex)
+                    format!(" @init=charhex:{}", hex_encode_bytes(value.as_bytes()))
                 }
                 crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
                     format!(" @init=int:{}", value)
                 }
                 crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
                     format!(" @init=logical:{}", if *value { "true" } else { "false" })
+                }
+                crate::sema::type_layout::FieldDefaultInit::Derived(_) => {
+                    let encoded = encode_nested_field_default_init(init);
+                    format!(" @init=exprhex:{}", hex_encode_bytes(encoded.as_bytes()))
                 }
             }
         }
@@ -1189,19 +1300,12 @@ fn parse_type(
             };
         }
         if let Some(value) = payload.strip_prefix("charhex:") {
-            if value.len() % 2 != 0 {
-                return None;
-            }
-            let mut bytes = Vec::with_capacity(value.len() / 2);
-            let mut idx = 0usize;
-            while idx < value.len() {
-                let next = idx + 2;
-                let byte = u8::from_str_radix(&value[idx..next], 16).ok()?;
-                bytes.push(byte);
-                idx = next;
-            }
-            let decoded = String::from_utf8(bytes).ok()?;
+            let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
             return Some(FieldDefaultInit::Character(decoded));
+        }
+        if let Some(value) = payload.strip_prefix("exprhex:") {
+            let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+            return decode_nested_field_default_init(&decoded);
         }
         None
     }

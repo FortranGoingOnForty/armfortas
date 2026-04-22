@@ -1472,6 +1472,10 @@ _main:
         eprintln!(" assembled: {}", obj_path.display());
     }
 
+    let local_descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(&units);
+    let local_char_len_star_params =
+        crate::ir::lower::collect_char_len_star_params_for_units(&units);
+
     // Emit .amod files for each MODULE in the compilation unit.
     // -J <dir> overrides where they go. For compile-only (-c) builds
     // without -J, keep the traditional compiler behavior of writing
@@ -1491,7 +1495,8 @@ _main:
                     &module_globals,
                     &type_layouts,
                     &ir_module,
-                    &std::collections::HashMap::new(), // char_len_star computed by writer from scope
+                    &local_descriptor_params,
+                    &local_char_len_star_params,
                 );
                 let amod_dir: std::path::PathBuf =
                     opts.module_output_dir.clone().unwrap_or_else(|| {

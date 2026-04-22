@@ -665,6 +665,9 @@ fn function_hidden_result_abi(
                 continue;
             }
             let has_dims = entity.array_spec.as_ref().or(attr_dims).is_some();
+            if has_dims {
+                return HiddenResultAbi::ArrayDescriptor;
+            }
             if matches!(type_spec, TypeSpec::Character(_)) && !has_dims {
                 return if bind.is_some() {
                     HiddenResultAbi::None
@@ -821,8 +824,35 @@ fn collect_char_len_star_params(unit: &ProgramUnit, out: &mut HashMap<String, Ve
                 collect_char_len_star_params(&sub.node, out);
             }
         }
+        ProgramUnit::InterfaceBlock { bodies, .. } => {
+            for body in bodies {
+                if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
+                    collect_char_len_star_params(&sub.node, out);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+pub fn collect_descriptor_params_for_units(
+    units: &[crate::ast::unit::SpannedUnit],
+) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for unit in units {
+        collect_descriptor_params(&unit.node, &mut out);
+    }
+    out
+}
+
+pub fn collect_char_len_star_params_for_units(
+    units: &[crate::ast::unit::SpannedUnit],
+) -> HashMap<String, Vec<bool>> {
+    let mut out = HashMap::new();
+    for unit in units {
+        collect_char_len_star_params(&unit.node, &mut out);
+    }
+    out
 }
 
 fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
@@ -904,7 +934,10 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
     let key = arg_name.to_lowercase();
     for decl in decls {
         if let Decl::TypeDecl {
-            attrs, entities, ..
+            type_spec,
+            attrs,
+            entities,
+            ..
         } = &decl.node
         {
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
@@ -918,18 +951,30 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
                 if entity.name.to_lowercase() != key {
                     continue;
                 }
-                let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
-                    return false;
+                let allocatable = attrs
+                    .iter()
+                    .any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
+                let specs = entity.array_spec.as_ref().or(attr_dims);
+                if let Some(specs) = specs {
+                    return specs.iter().any(|spec| {
+                        matches!(
+                            spec,
+                            ArraySpec::AssumedShape { .. }
+                                | ArraySpec::AssumedSize { .. }
+                                | ArraySpec::Deferred
+                                | ArraySpec::AssumedRank
+                        )
+                    });
+                }
+                if allocatable {
+                    let is_deferred_char_scalar = matches!(
+                        type_spec,
+                        TypeSpec::Character(Some(sel))
+                            if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
+                    );
+                    return !is_deferred_char_scalar;
                 };
-                return specs.iter().any(|spec| {
-                    matches!(
-                        spec,
-                        ArraySpec::AssumedShape { .. }
-                            | ArraySpec::AssumedSize { .. }
-                            | ArraySpec::Deferred
-                            | ArraySpec::AssumedRank
-                    )
-                });
+                return false;
             }
         }
     }
@@ -1086,6 +1131,13 @@ fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<b
         | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
                 collect_descriptor_params(&sub.node, out);
+            }
+        }
+        ProgramUnit::InterfaceBlock { bodies, .. } => {
+            for body in bodies {
+                if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
+                    collect_descriptor_params(&sub.node, out);
+                }
             }
         }
         _ => {}
@@ -2645,7 +2697,7 @@ fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
-                init_decls(&mut b, &ctx.locals, decls, st);
+                init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
                 if b.func().block(b.current_block()).terminator.is_none() {
@@ -2965,7 +3017,7 @@ fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Subroutine(name));
-                init_decls(&mut b, &ctx.locals, decls, st);
+                init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -3116,7 +3168,9 @@ fn lower_unit(
                 params.extend(real);
                 (params, IrType::Void)
             } else {
-                let ret_ty = if bind.is_some()
+                let result_name = result.as_deref().unwrap_or(name.as_str());
+                let result_is_pointer = decl_is_pointer(result_name, decls);
+                let mut ret_ty = if bind.is_some()
                     && matches!(return_type.as_ref(), Some(TypeSpec::Character(_)))
                 {
                     IrType::Int(IntWidth::I8)
@@ -3124,11 +3178,11 @@ fn lower_unit(
                     return_type
                         .as_ref()
                         .map(|ts| lower_type_spec_st(ts, Some(st)))
-                        .unwrap_or_else(|| {
-                            let result_name = result.as_deref().unwrap_or(name.as_str());
-                            arg_type_from_decls(result_name, decls, Some(st))
-                        })
+                        .unwrap_or_else(|| arg_type_from_decls(result_name, decls, Some(st)))
                 };
+                if result_is_pointer && !ret_ty.is_ptr() {
+                    ret_ty = IrType::Ptr(Box::new(ret_ty));
+                }
                 let params: Vec<Param> = args
                     .iter()
                     .enumerate()
@@ -3490,7 +3544,7 @@ fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
-                init_decls(&mut b, &ctx.locals, decls, st);
+                init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 lower_stmts(&mut b, &mut ctx, body);
 
@@ -3498,8 +3552,17 @@ fn lower_unit(
                     if hidden_result_abi == HiddenResultAbi::StringDescriptor {
                         lower_hidden_string_result_copy(&mut b, &ctx);
                     }
+                    let result_is_pointer = ctx
+                        .locals
+                        .get(&result_name)
+                        .map(|info| info.is_pointer)
+                        .unwrap_or(false);
+                    let derived_result_type =
+                        derived_type_name_for_result_var(return_type, &result_name, decls);
                     let skip = if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                         Some(ValueId(0))
+                    } else if !result_is_pointer && derived_result_type.is_some() {
+                        ctx.result_addr
                     } else {
                         None
                     };
@@ -3513,17 +3576,9 @@ fn lower_unit(
                         Some(ctx.contained_host_refs),
                         skip,
                     );
-                    let result_is_pointer = ctx
-                        .locals
-                        .get(&result_name)
-                        .map(|info| info.is_pointer)
-                        .unwrap_or(false);
                     if uses_hidden_result {
                         b.ret(None);
-                    } else if !result_is_pointer
-                        && derived_type_name_for_result_var(return_type, &result_name, decls)
-                            .is_some()
-                    {
+                    } else if !result_is_pointer && derived_result_type.is_some() {
                         // Derived-type result: return the buffer
                         // address as a Ptr(i8) (the declared return
                         // type). A zero-offset GEP through `i8`
@@ -3681,7 +3736,10 @@ fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType
     match (c, target) {
         (ConstScalar::Int(i), IrType::Int(IntWidth::I128)) => b.const_i128(i),
         (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i as i64),
-        (ConstScalar::Int(i), IrType::Int(_)) => b.const_i32(i as i32),
+        (ConstScalar::Int(i), IrType::Int(IntWidth::I32)) => b.const_i32(i as i32),
+        (ConstScalar::Int(i), IrType::Int(width @ (IntWidth::I8 | IntWidth::I16))) => {
+            b.const_int(i, *width)
+        }
         (ConstScalar::Int(i), IrType::Bool) => b.const_bool(i != 0),
         (ConstScalar::Int(i), IrType::Float(FloatWidth::F64)) => b.const_f64(i as f64),
         (ConstScalar::Int(i), IrType::Float(FloatWidth::F32)) => b.const_f32(i as f32),
@@ -3776,6 +3834,12 @@ fn eval_const_char_bytes(
                 return None;
             };
             let intrinsic = name.to_lowercase();
+            if intrinsic == "new_line" {
+                if args.len() != 1 || args[0].keyword.is_some() {
+                    return None;
+                }
+                return Some(vec![b'\n']);
+            }
             if intrinsic != "char" && intrinsic != "achar" {
                 return None;
             }
@@ -3932,50 +3996,85 @@ fn apply_derived_const_default_bytes(
         let Some(default_init) = &field.default_init else {
             continue;
         };
-
-        match default_init {
-            crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-                let end = field_offset + field.size;
-                if end > bytes.len() {
-                    return false;
-                }
-                bytes[field_offset..end].fill(b' ');
-                let value_bytes = value.as_bytes();
-                let copy_len = value_bytes.len().min(field.size);
-                bytes[field_offset..field_offset + copy_len]
-                    .copy_from_slice(&value_bytes[..copy_len]);
-                wrote_defaults = true;
-            }
-            crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
-                let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
-                let Some(encoded) = encode_const_scalar_bytes(*value, field_size) else {
-                    return false;
-                };
-                let end = field_offset + encoded.len();
-                if end > bytes.len() {
-                    return false;
-                }
-                bytes[field_offset..end].copy_from_slice(&encoded);
-                wrote_defaults = true;
-            }
-            crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
-                let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
-                let Some(encoded) =
-                    encode_const_scalar_bytes(if *value { 1 } else { 0 }, field_size)
-                else {
-                    return false;
-                };
-                let end = field_offset + encoded.len();
-                if end > bytes.len() {
-                    return false;
-                }
-                bytes[field_offset..end].copy_from_slice(&encoded);
-                wrote_defaults = true;
-            }
-        }
+        wrote_defaults |= apply_field_default_init_const_bytes(
+            bytes,
+            field_offset,
+            field,
+            default_init,
+            registry,
+        );
     }
 
     wrote_defaults
+}
+
+fn apply_field_default_init_const_bytes(
+    bytes: &mut [u8],
+    field_offset: usize,
+    field: &crate::sema::type_layout::FieldLayout,
+    default_init: &crate::sema::type_layout::FieldDefaultInit,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    match default_init {
+        crate::sema::type_layout::FieldDefaultInit::Character(value) => {
+            let end = field_offset + field.size;
+            if end > bytes.len() {
+                return false;
+            }
+            bytes[field_offset..end].fill(b' ');
+            let value_bytes = value.as_bytes();
+            let copy_len = value_bytes.len().min(field.size);
+            bytes[field_offset..field_offset + copy_len].copy_from_slice(&value_bytes[..copy_len]);
+            true
+        }
+        crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
+            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let Some(encoded) = encode_const_scalar_bytes(*value, field_size) else {
+                return false;
+            };
+            let end = field_offset + encoded.len();
+            if end > bytes.len() {
+                return false;
+            }
+            bytes[field_offset..end].copy_from_slice(&encoded);
+            true
+        }
+        crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
+            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let Some(encoded) = encode_const_scalar_bytes(if *value { 1 } else { 0 }, field_size)
+            else {
+                return false;
+            };
+            let end = field_offset + encoded.len();
+            if end > bytes.len() {
+                return false;
+            }
+            bytes[field_offset..end].copy_from_slice(&encoded);
+            true
+        }
+        crate::sema::type_layout::FieldDefaultInit::Derived(overrides) => {
+            let Some(nested_name) = field_derived_type_name(field) else {
+                return false;
+            };
+            let Some(nested_layout) = registry.get(&nested_name) else {
+                return false;
+            };
+            let mut wrote = false;
+            for (nested_field_name, nested_init) in overrides {
+                let Some(nested_field) = nested_layout.field(nested_field_name) else {
+                    return false;
+                };
+                wrote |= apply_field_default_init_const_bytes(
+                    bytes,
+                    field_offset + nested_field.offset,
+                    nested_field,
+                    nested_init,
+                    registry,
+                );
+            }
+            wrote
+        }
+    }
 }
 
 fn eval_const_derived_global_init(
@@ -4747,6 +4846,9 @@ fn compute_filtered_names(
                     OnlyItem::Name(n) => {
                         visible_local_names.insert(n.to_lowercase());
                     }
+                    OnlyItem::Generic(n) => {
+                        visible_local_names.insert(n.to_lowercase());
+                    }
                     OnlyItem::Rename(rn) => {
                         visible_local_names.insert(rn.local.to_lowercase());
                     }
@@ -4790,6 +4892,9 @@ fn compute_filtered_names(
         for item in only_list {
             match item {
                 OnlyItem::Name(n) => {
+                    imported.insert(n.to_lowercase());
+                }
+                OnlyItem::Generic(n) => {
                     imported.insert(n.to_lowercase());
                 }
                 OnlyItem::Rename(rn) => {
@@ -4908,6 +5013,10 @@ fn install_globals_as_locals(
             for item in only_list {
                 match item {
                     OnlyItem::Name(n) => {
+                        let n_lc = n.to_lowercase();
+                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
+                    }
+                    OnlyItem::Generic(n) => {
                         let n_lc = n.to_lowercase();
                         pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
                     }
@@ -6057,6 +6166,7 @@ fn init_decls(
     locals: &HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) {
     // Pre-collect the set of GlobalAddr-defining ValueIds so the
     // inner skip check is O(1). Audit Maj-3.
@@ -6098,7 +6208,19 @@ fn init_decls(
                         && info.derived_type.is_none()
                     {
                         if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
-                            store_ac_values_into(b, locals, info.addr, &info.ty, values, st);
+                            store_ac_values_into(
+                                b,
+                                locals,
+                                info.addr,
+                                &info.ty,
+                                info.derived_type.as_deref(),
+                                values,
+                                st,
+                                type_layouts,
+                                None,
+                                None,
+                                None,
+                            );
                         }
                         continue;
                     }
@@ -6109,7 +6231,18 @@ fn init_decls(
                     {
                         if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
                             if let CharKind::Fixed(len) = info.char_kind {
-                                store_char_ac_values_into(b, locals, info.addr, len, values, st);
+                                store_char_ac_values_into(
+                                    b,
+                                    locals,
+                                    info.addr,
+                                    len,
+                                    values,
+                                    st,
+                                    type_layouts,
+                                    None,
+                                    None,
+                                    None,
+                                );
                             }
                         }
                         continue;
@@ -6142,6 +6275,31 @@ fn init_decls(
                             IrType::Void,
                         );
                         continue;
+                    }
+                    if info.dims.is_empty() && !info.allocatable && !info.is_pointer {
+                        if let Some(type_name) = info.derived_type.as_deref() {
+                            if let Some(tl) = type_layouts {
+                                if let Some(layout) = tl.get(type_name) {
+                                    let src = lower_expr_full(
+                                        b,
+                                        locals,
+                                        init_expr,
+                                        st,
+                                        type_layouts,
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                    let sz = b.const_i64(layout.size as i64);
+                                    b.call(
+                                        FuncRef::External("memcpy".into()),
+                                        vec![info.addr, src, sz],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     // Other non-plain-scalar shapes are handled
                     // elsewhere (allocatables, derived types) or not
@@ -7216,7 +7374,8 @@ fn actual_char_arg_runtime_len(
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(b.const_i64(value.len() as i64)),
         Expr::ArrayConstructor { values, .. } => {
-            if let Some(len) = fixed_char_array_constructor_len(values, locals) {
+            if let Some(len) = fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
+            {
                 return Some(b.const_i64(len));
             }
             if values.len() == 1 {
@@ -7267,7 +7426,8 @@ fn actual_char_arg_runtime_len(
         Expr::FunctionCall { callee, args }
             if args.len() == 1
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
-                && !expr_is_array_designator(b, locals, callee, st, type_layouts) =>
+                && !expr_is_array_designator(b, locals, callee, st, type_layouts)
+                && !expr_is_callable_character_callee(b, locals, callee, st, type_layouts) =>
         {
             Some(
                 lower_string_expr_full(
@@ -7380,8 +7540,11 @@ fn actual_char_arg_runtime_len(
 }
 
 fn fixed_char_expr_len(
+    b: &mut FuncBuilder,
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<i64> {
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.len() as i64),
@@ -7393,14 +7556,25 @@ fn fixed_char_expr_len(
                     _ => local_fixed_char_allocatable_scalar_len(info),
                 })
         }
-        Expr::ParenExpr { inner } => fixed_char_expr_len(inner, locals),
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (_field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            match field_char_kind(&field) {
+                CharKind::Fixed(len) => Some(len),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => fixed_char_expr_len(b, inner, locals, st, type_layouts),
         _ => None,
     }
 }
 
 fn fixed_char_array_constructor_len(
+    b: &mut FuncBuilder,
     values: &[crate::ast::expr::AcValue],
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<i64> {
     let mut max_len = 0_i64;
     let mut saw_expr = false;
@@ -7408,11 +7582,62 @@ fn fixed_char_array_constructor_len(
         let crate::ast::expr::AcValue::Expr(expr) = value else {
             return None;
         };
-        let len = fixed_char_expr_len(expr, locals)?;
+        let len = fixed_char_expr_len(b, expr, locals, st, type_layouts)?;
         max_len = max_len.max(len);
         saw_expr = true;
     }
     saw_expr.then_some(max_len)
+}
+
+fn first_array_constructor_expr<'a>(
+    values: &'a [crate::ast::expr::AcValue],
+) -> Option<&'a crate::ast::expr::SpannedExpr> {
+    for value in values {
+        match value {
+            crate::ast::expr::AcValue::Expr(expr) => return Some(expr),
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                if let Some(expr) = first_array_constructor_expr(&ido.values) {
+                    return Some(expr);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn const_array_constructor_len(values: &[crate::ast::expr::AcValue]) -> Option<i64> {
+    fn const_implied_do_trip_count(ido: &crate::ast::expr::ImpliedDoLoop) -> Option<i64> {
+        let start = eval_const_int(&ido.start)?;
+        let end = eval_const_int(&ido.end)?;
+        let step = ido.step.as_ref().and_then(eval_const_int).unwrap_or(1);
+        if step == 0 {
+            return None;
+        }
+        let trip_count = if step > 0 {
+            if start > end {
+                0
+            } else {
+                ((end - start) / step) + 1
+            }
+        } else if start < end {
+            0
+        } else {
+            ((start - end) / (-step)) + 1
+        };
+        Some(trip_count)
+    }
+
+    let mut total = 0_i64;
+    for value in values {
+        match value {
+            crate::ast::expr::AcValue::Expr(_) => total += 1,
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                let inner = const_array_constructor_len(&ido.values)?;
+                total += inner * const_implied_do_trip_count(ido)?;
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Lower character intrinsic functions (LEN, LEN_TRIM, ICHAR, CHAR, INDEX, SCAN, VERIFY,
@@ -7502,6 +7727,7 @@ fn lower_char_intrinsic(
             b.store(byte_val, byte_ptr);
             Some(buf)
         }
+        "new_line" => Some(b.const_string(b"\n")),
         "index" => {
             let (hay_ptr, hay_len_val) = lower_string_arg(b, arg_spanned(0)?);
             let (needle_ptr, needle_len_val) = lower_string_arg(b, arg_spanned(1)?);
@@ -7658,7 +7884,112 @@ fn lower_char_intrinsic(
     }
 }
 
-fn lower_any_intrinsic_ast(
+fn expand_vector_subscript_designator(
+    b: &mut FuncBuilder,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<Vec<crate::ast::expr::SpannedExpr>> {
+    use crate::ast::expr::{AcValue, Expr, SectionSubscript};
+
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let SectionSubscript::Element(index_expr) = &args[0].value else {
+        return None;
+    };
+    let Expr::ArrayConstructor { values, .. } = &index_expr.node else {
+        return None;
+    };
+
+    let is_array_designator = match &callee.node {
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .is_some_and(local_is_array_like),
+        Expr::ComponentAccess { .. } => type_layouts
+            .and_then(|tl| component_intrinsic_local_info(b, locals, callee, st, tl))
+            .is_some_and(|info| local_is_array_like(&info)),
+        _ => false,
+    };
+    if !is_array_designator {
+        return None;
+    }
+
+    let mut expanded = Vec::with_capacity(values.len());
+    for value in values {
+        let AcValue::Expr(index) = value else {
+            return None;
+        };
+        expanded.push(crate::ast::Spanned::new(
+            Expr::FunctionCall {
+                callee: callee.clone(),
+                args: vec![crate::ast::expr::Argument {
+                    keyword: None,
+                    value: SectionSubscript::Element(index.clone()),
+                }],
+            },
+            expr.span,
+        ));
+    }
+    Some(expanded)
+}
+
+fn init_logical_reduction_acc(b: &mut FuncBuilder, name: &str) -> ValueId {
+    match name {
+        "any" => b.const_bool(false),
+        "all" => b.const_bool(true),
+        "count" => b.const_i32(0),
+        _ => b.const_i32(0),
+    }
+}
+
+fn step_logical_reduction_acc(
+    b: &mut FuncBuilder,
+    name: &str,
+    acc: ValueId,
+    pred: ValueId,
+) -> ValueId {
+    match name {
+        "any" => b.or(acc, pred),
+        "all" => b.and(acc, pred),
+        "count" => {
+            let one = b.const_i32(1);
+            let next = b.iadd(acc, one);
+            b.select(pred, next, acc)
+        }
+        _ => acc,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_logical_reduction_predicate(
+    b: &mut FuncBuilder,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> ValueId {
+    let raw = lower_expr_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    coerce_to_type(b, raw, &IrType::Bool)
+}
+
+fn lower_logical_reduction_intrinsic_ast(
     b: &mut FuncBuilder,
     name: &str,
     args: &[crate::ast::expr::Argument],
@@ -7671,7 +8002,7 @@ fn lower_any_intrinsic_ast(
 ) -> Option<ValueId> {
     use crate::ast::expr::{AcValue, BinaryOp, Expr, SectionSubscript};
 
-    if name != "any" {
+    if !matches!(name, "any" | "all" | "count") {
         return None;
     }
 
@@ -7683,55 +8014,144 @@ fn lower_any_intrinsic_ast(
         }
     })?;
 
-    let lower_bool_expr = |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| {
-        let raw = lower_expr_full(
-            b,
-            locals,
-            expr,
-            st,
-            type_layouts,
-            internal_funcs,
-            contained_host_refs,
-            descriptor_params,
+    if let Some((desc, _elem_ty)) =
+        lower_array_expr_descriptor(b, locals, arg0, st, type_layouts, None, None, None)
+    {
+        let runtime = match name {
+            "any" => "afs_array_any_logical",
+            "all" => "afs_array_all_logical",
+            "count" => "afs_array_count_logical",
+            _ => return None,
+        };
+        let raw = b.call(
+            FuncRef::External(runtime.into()),
+            vec![desc],
+            IrType::Int(IntWidth::I32),
         );
-        coerce_to_type(b, raw, &IrType::Bool)
-    };
+        if name == "count" {
+            return Some(raw);
+        }
+        let zero = b.const_i32(0);
+        return Some(b.icmp(CmpOp::Ne, raw, zero));
+    }
 
     match &arg0.node {
         Expr::ArrayConstructor { values, .. } => {
-            let mut acc = b.const_bool(false);
+            let mut acc = init_logical_reduction_acc(b, name);
             for value in values {
                 let AcValue::Expr(expr) = value else {
                     return None;
                 };
-                let pred = lower_bool_expr(b, expr);
-                acc = b.or(acc, pred);
+                let pred = lower_logical_reduction_predicate(
+                    b,
+                    expr,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                acc = step_logical_reduction_acc(b, name, acc, pred);
             }
             Some(acc)
         }
-        Expr::BinaryOp { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+        Expr::BinaryOp { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) =>
+        {
+            if let Some(expanded) =
+                expand_vector_subscript_designator(b, left, locals, st, type_layouts)
+            {
+                let mut acc = init_logical_reduction_acc(b, name);
+                for lhs in expanded {
+                    let cmp = crate::ast::Spanned::new(
+                        Expr::BinaryOp {
+                            op: op.clone(),
+                            left: Box::new(lhs),
+                            right: Box::new(right.as_ref().clone()),
+                        },
+                        left.span,
+                    );
+                    let pred = lower_logical_reduction_predicate(
+                        b,
+                        &cmp,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    acc = step_logical_reduction_acc(b, name, acc, pred);
+                }
+                return Some(acc);
+            }
+            if let Some(expanded) =
+                expand_vector_subscript_designator(b, right, locals, st, type_layouts)
+            {
+                let mut acc = init_logical_reduction_acc(b, name);
+                for rhs in expanded {
+                    let cmp = crate::ast::Spanned::new(
+                        Expr::BinaryOp {
+                            op: op.clone(),
+                            left: Box::new(left.as_ref().clone()),
+                            right: Box::new(rhs),
+                        },
+                        right.span,
+                    );
+                    let pred = lower_logical_reduction_predicate(
+                        b,
+                        &cmp,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    acc = step_logical_reduction_acc(b, name, acc, pred);
+                }
+                return Some(acc);
+            }
             match (&left.node, &right.node) {
                 (Expr::ArrayConstructor { values, .. }, _) => {
-                    let mut acc = b.const_bool(false);
+                    let mut acc = init_logical_reduction_acc(b, name);
                     for value in values {
-                        let AcValue::Expr(rhs) = value else {
+                        let AcValue::Expr(lhs) = value else {
                             return None;
                         };
                         let cmp = crate::ast::Spanned::new(
                             Expr::BinaryOp {
                                 op: op.clone(),
-                                left: Box::new(right.as_ref().clone()),
-                                right: Box::new(rhs.clone()),
+                                left: Box::new(lhs.clone()),
+                                right: Box::new(right.as_ref().clone()),
                             },
-                            right.span,
+                            left.span,
                         );
-                        let pred = lower_bool_expr(b, &cmp);
-                        acc = b.or(acc, pred);
+                        let pred = lower_logical_reduction_predicate(
+                            b,
+                            &cmp,
+                            locals,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        acc = step_logical_reduction_acc(b, name, acc, pred);
                     }
-                    Some(acc)
+                    return Some(acc);
                 }
                 (_, Expr::ArrayConstructor { values, .. }) => {
-                    let mut acc = b.const_bool(false);
+                    let mut acc = init_logical_reduction_acc(b, name);
                     for value in values {
                         let AcValue::Expr(rhs) = value else {
                             return None;
@@ -7744,15 +8164,216 @@ fn lower_any_intrinsic_ast(
                             },
                             left.span,
                         );
-                        let pred = lower_bool_expr(b, &cmp);
-                        acc = b.or(acc, pred);
+                        let pred = lower_logical_reduction_predicate(
+                            b,
+                            &cmp,
+                            locals,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        acc = step_logical_reduction_acc(b, name, acc, pred);
                     }
-                    Some(acc)
+                    return Some(acc);
                 }
-                _ => None,
+                _ => {}
             }
+
+            let mut arrays = Vec::new();
+            collect_array_names(arg0, locals, &mut arrays);
+            let control_name = arrays.first()?;
+            let control = locals.get(control_name)?;
+            let loop_var = fresh_synth_loop_var(locals);
+            let (mapped, changed) =
+                rewrite_scalarized_rank1_array_refs(arg0, locals, control, &loop_var)?;
+            if !changed {
+                return None;
+            }
+
+            let loop_var_addr = b.alloca(IrType::Int(IntWidth::I32));
+            let mut scratch_locals = locals.clone();
+            scratch_locals.insert(
+                loop_var,
+                LocalInfo {
+                    addr: loop_var_addr,
+                    ty: IrType::Int(IntWidth::I32),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                },
+            );
+
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let zero64 = b.const_i64(0);
+            b.store(zero64, i_addr);
+            let acc_addr = match name {
+                "count" => {
+                    let slot = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    b.store(zero, slot);
+                    slot
+                }
+                _ => {
+                    let slot = b.alloca(IrType::Bool);
+                    let init = if name == "all" {
+                        b.const_bool(true)
+                    } else {
+                        b.const_bool(false)
+                    };
+                    b.store(init, slot);
+                    slot
+                }
+            };
+            let n = array_total_elems_value(b, control);
+
+            let bb_check = b.create_block("logical_reduce_check");
+            let bb_body = b.create_block("logical_reduce_body");
+            let bb_exit = b.create_block("logical_reduce_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+            let one64 = b.const_i64(1);
+            let one_based = b.iadd(i_val, one64);
+            let one_based_i32 = coerce_to_type(b, one_based, &IrType::Int(IntWidth::I32));
+            b.store(one_based_i32, loop_var_addr);
+            let pred = lower_logical_reduction_predicate(
+                b,
+                &mapped,
+                &scratch_locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let acc = b.load(acc_addr);
+            let next = step_logical_reduction_acc(b, name, acc, pred);
+            b.store(next, acc_addr);
+            let next_i = b.iadd(i_val, one64);
+            b.store(next_i, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
+            Some(b.load(acc_addr))
         }
-        _ => None,
+        _ => {
+            let mut scratch_locals = locals.clone();
+            let mut next_ctor_id = 0usize;
+            let normalized = materialize_scalarized_rank1_constructors(
+                b,
+                arg0,
+                &mut scratch_locals,
+                st,
+                type_layouts,
+                &mut next_ctor_id,
+            )?;
+
+            let mut arrays = Vec::new();
+            collect_array_names(&normalized, &scratch_locals, &mut arrays);
+            let control_name = arrays.first()?;
+            let control = scratch_locals.get(control_name)?.clone();
+            let loop_var = fresh_synth_loop_var(&scratch_locals);
+            let (mapped, changed) = rewrite_scalarized_rank1_array_refs(
+                &normalized,
+                &scratch_locals,
+                &control,
+                &loop_var,
+            )?;
+            if !changed {
+                return None;
+            }
+
+            let loop_var_addr = b.alloca(IrType::Int(IntWidth::I32));
+            scratch_locals.insert(
+                loop_var,
+                LocalInfo {
+                    addr: loop_var_addr,
+                    ty: IrType::Int(IntWidth::I32),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                },
+            );
+
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let zero64 = b.const_i64(0);
+            b.store(zero64, i_addr);
+            let acc_addr = match name {
+                "count" => {
+                    let slot = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    b.store(zero, slot);
+                    slot
+                }
+                _ => {
+                    let slot = b.alloca(IrType::Bool);
+                    let init = if name == "all" {
+                        b.const_bool(true)
+                    } else {
+                        b.const_bool(false)
+                    };
+                    b.store(init, slot);
+                    slot
+                }
+            };
+            let n = array_total_elems_value(b, &control);
+
+            let bb_check = b.create_block("logical_reduce_check");
+            let bb_body = b.create_block("logical_reduce_body");
+            let bb_exit = b.create_block("logical_reduce_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+            let one64 = b.const_i64(1);
+            let one_based = b.iadd(i_val, one64);
+            let one_based_i32 = coerce_to_type(b, one_based, &IrType::Int(IntWidth::I32));
+            b.store(one_based_i32, loop_var_addr);
+            let pred = lower_logical_reduction_predicate(
+                b,
+                &mapped,
+                &scratch_locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let acc = b.load(acc_addr);
+            let next = step_logical_reduction_acc(b, name, acc, pred);
+            b.store(next, acc_addr);
+            let next_i = b.iadd(i_val, one64);
+            b.store(next_i, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
+            Some(b.load(acc_addr))
+        }
     }
 }
 
@@ -7953,10 +8574,15 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     .func()
                     .value_type(*arg)
                     .unwrap_or(IrType::Int(IntWidth::I32));
+                let requested_width = args
+                    .get(1)
+                    .and_then(|kind| extract_const_int_from_value(b, *kind))
+                    .and_then(int_width_from_kind_value)
+                    .unwrap_or(IntWidth::I32);
                 if ty.is_float() {
-                    Some(b.float_to_int(*arg, IntWidth::I32))
+                    Some(b.float_to_int(*arg, requested_width))
                 } else {
-                    Some(*arg)
+                    Some(coerce_to_type(b, *arg, &IrType::Int(requested_width)))
                 }
             } else {
                 None
@@ -7970,6 +8596,11 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     .func()
                     .value_type(*arg)
                     .unwrap_or(IrType::Float(FloatWidth::F64));
+                let requested_width = args
+                    .get(1)
+                    .and_then(|kind| extract_const_int_from_value(b, *kind))
+                    .and_then(int_width_from_kind_value)
+                    .unwrap_or(IntWidth::I32);
                 if ty.is_float() {
                     let func = if matches!(ty, IrType::Float(FloatWidth::F32)) {
                         "roundf"
@@ -7977,9 +8608,9 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                         "round"
                     };
                     let rounded = b.call(FuncRef::External(func.into()), vec![*arg], ty.clone());
-                    Some(b.float_to_int(rounded, IntWidth::I32))
+                    Some(b.float_to_int(rounded, requested_width))
                 } else {
-                    Some(*arg)
+                    Some(coerce_to_type(b, *arg, &IrType::Int(requested_width)))
                 }
             } else {
                 None
@@ -8695,6 +9326,28 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             vec![],
             IrType::Int(IntWidth::I32),
         )),
+        "is_iostat_end" => args.first().map(|status| {
+            let zero = match b
+                .func()
+                .value_type(*status)
+                .unwrap_or(IrType::Int(IntWidth::I32))
+            {
+                IrType::Int(IntWidth::I64) => b.const_i64(-1),
+                _ => b.const_i32(-1),
+            };
+            b.icmp(CmpOp::Eq, *status, zero)
+        }),
+        "is_iostat_eor" => args.first().map(|status| {
+            let zero = match b
+                .func()
+                .value_type(*status)
+                .unwrap_or(IrType::Int(IntWidth::I32))
+            {
+                IrType::Int(IntWidth::I64) => b.const_i64(-2),
+                _ => b.const_i32(-2),
+            };
+            b.icmp(CmpOp::Eq, *status, zero)
+        }),
 
         // ---- iso_c_binding functions ----
         "c_loc" => None,
@@ -8833,6 +9486,45 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
             // These return .TRUE. for supported types on ARM64.
             Some(b.const_bool(true))
         }
+        "ieee_value" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let class = extract_const_int_from_value(b, args[1]).unwrap_or(0);
+                let zero = match ty {
+                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                    _ => b.const_f64(0.0),
+                };
+                let one = match ty {
+                    IrType::Float(FloatWidth::F32) => b.const_f32(1.0),
+                    _ => b.const_f64(1.0),
+                };
+                match class {
+                    1 | 4 => Some(b.fdiv(zero, zero)),
+                    2 => Some(b.fdiv(one, zero)),
+                    3 => {
+                        let neg_one = match ty {
+                            IrType::Float(FloatWidth::F32) => b.const_f32(-1.0),
+                            _ => b.const_f64(-1.0),
+                        };
+                        Some(b.fdiv(neg_one, zero))
+                    }
+                    5 => Some(zero),
+                    6 => {
+                        let neg_one = match ty {
+                            IrType::Float(FloatWidth::F32) => b.const_f32(-1.0),
+                            _ => b.const_f64(-1.0),
+                        };
+                        Some(b.fmul(neg_one, zero))
+                    }
+                    _ => Some(args[0]),
+                }
+            }
+        }
 
         _ => None,
     }
@@ -8841,75 +9533,92 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
 /// Resolve a generic interface call to a specific procedure.
 /// Returns Some(specific_name) if the callee is a NamedInterface
 /// and a matching specific is found. Returns None otherwise.
-fn resolve_generic_call(
+fn find_named_interface_symbol<'a>(
+    st: &'a SymbolTable,
+    name: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    let key = name.to_ascii_lowercase();
+    for scope in st.all_scopes() {
+        if let Some(sym) = scope.symbols.get(&key) {
+            if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface
+                || (sym.kind == crate::sema::symtab::SymbolKind::DerivedType
+                    && !sym.arg_names.is_empty())
+            {
+                return Some(sym);
+            }
+        }
+    }
+    match st.find_symbol_any_scope(&key) {
+        Some(sym)
+            if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface
+                || (sym.kind == crate::sema::symtab::SymbolKind::DerivedType
+                    && !sym.arg_names.is_empty()) =>
+        {
+            Some(sym)
+        }
+        _ => None,
+    }
+}
+
+fn append_named_interface_specifics(
+    sym: &crate::sema::symtab::Symbol,
+    specifics: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface
+        || (sym.kind == crate::sema::symtab::SymbolKind::DerivedType && !sym.arg_names.is_empty())
+    {
+        for specific in &sym.arg_names {
+            let specific_key = specific.to_ascii_lowercase();
+            if seen.insert(specific_key) {
+                specifics.push(specific.clone());
+            }
+        }
+    }
+}
+
+fn named_interface_specifics(st: &SymbolTable, name: &str) -> Option<Vec<String>> {
+    let key = name.to_ascii_lowercase();
+    let mut specifics = Vec::new();
+    let mut seen = HashSet::new();
+
+    for scope in st.all_scopes() {
+        if let Some(sym) = scope.symbols.get(&key) {
+            append_named_interface_specifics(sym, &mut specifics, &mut seen);
+        }
+    }
+
+    if specifics.is_empty() {
+        if let Some(sym) = st.find_symbol_any_scope(&key) {
+            append_named_interface_specifics(sym, &mut specifics, &mut seen);
+        }
+    }
+
+    (!specifics.is_empty()).then_some(specifics)
+}
+
+fn resolve_generic_call_slots(
     st: &SymbolTable,
     b: &FuncBuilder,
     callee: &str,
-    arg_vals: &[ValueId],
+    arg_slots: &[Option<ValueId>],
 ) -> Option<String> {
     // Find the generic interface symbol in any scope.
-    let sym = st.find_symbol_any_scope(callee)?;
-    if sym.kind != crate::sema::symtab::SymbolKind::NamedInterface {
-        return None;
-    }
-    if sym.arg_names.is_empty() {
-        return None;
-    }
+    let specifics = named_interface_specifics(st, callee)?;
 
-    // Classify actual argument types.
-    let actual_types: Vec<Option<IrType>> =
-        arg_vals.iter().map(|v| b.func().value_type(*v)).collect();
+    let supplied = arg_slots.iter().filter(|slot| slot.is_some()).count();
 
     // For each specific procedure, look up its declared argument types
     // from the symbol table and check if they match the actual types.
     // Match on the full IR type (category AND width) so real vs double
     // precision resolve to the right specific. Also require the arity
     // to match exactly before attempting per-arg checks.
-    for specific in &sym.arg_names {
-        let scope = st.all_scopes().iter().find(|s| match &s.kind {
-            crate::sema::symtab::ScopeKind::Function(n)
-            | crate::sema::symtab::ScopeKind::Subroutine(n) => n.to_lowercase() == *specific,
-            _ => false,
-        });
-        let Some(scope) = scope else {
+    for specific in &specifics {
+        let Some(scope) = procedure_scope_by_name(st, specific) else {
             continue;
         };
-
-        // Use the ordered argument list from the scope, not the
-        // arbitrary symbols-map iteration order (which doesn't honor
-        // declaration order and was previously confusing position with
-        // hash order on multi-arg specifics).
-        let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
-            .arg_order
-            .iter()
-            .filter_map(|n| scope.symbols.get(n))
-            .collect();
-
-        if declared_args.len() != actual_types.len() {
-            continue;
-        }
-
-        let mut type_match = true;
-        for ((decl_sym, actual_ty), arg_val) in declared_args
-            .iter()
-            .zip(actual_types.iter())
-            .zip(arg_vals.iter())
-        {
-            let Some(ti) = decl_sym.type_info.as_ref() else {
-                type_match = false;
-                break;
-            };
-            let Some(at) = actual_ty.as_ref() else {
-                type_match = false;
-                break;
-            };
-            if !arg_matches_declared(ti, at, *arg_val, b) {
-                type_match = false;
-                break;
-            }
-        }
-
-        if type_match {
+        let declared_args = declared_args_for_scope(scope);
+        if generic_candidate_matches_slots(b, &declared_args, arg_slots, supplied) {
             return Some(specific.clone());
         }
     }
@@ -8917,6 +9626,134 @@ fn resolve_generic_call(
     // No specific matched the actual argument types. Return None so
     // the caller can report a diagnostic instead of silently dispatching
     // to an arbitrary specific (which mis-interprets bits across kinds).
+    None
+}
+
+fn resolve_generic_call(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    callee: &str,
+    arg_vals: &[ValueId],
+) -> Option<String> {
+    let arg_slots: Vec<Option<ValueId>> = arg_vals.iter().copied().map(Some).collect();
+    resolve_generic_call_slots(st, b, callee, &arg_slots)
+}
+
+fn procedure_scope_by_name<'a>(
+    st: &'a SymbolTable,
+    name: &str,
+) -> Option<&'a crate::sema::symtab::Scope> {
+    st.all_scopes().iter().find(|scope| match &scope.kind {
+        crate::sema::symtab::ScopeKind::Function(n)
+        | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(name),
+        _ => false,
+    })
+}
+
+fn declared_args_for_scope<'a>(
+    scope: &'a crate::sema::symtab::Scope,
+) -> Vec<&'a crate::sema::symtab::Symbol> {
+    scope
+        .arg_order
+        .iter()
+        .filter_map(|n| scope.symbols.get(n))
+        .collect()
+}
+
+fn generic_candidate_matches_slots(
+    b: &FuncBuilder,
+    declared_args: &[&crate::sema::symtab::Symbol],
+    arg_slots: &[Option<ValueId>],
+    supplied: usize,
+) -> bool {
+    let required = declared_args
+        .iter()
+        .filter(|sym| !sym.attrs.optional)
+        .count();
+    if supplied < required || arg_slots.len() > declared_args.len() {
+        return false;
+    }
+
+    for (idx, decl_sym) in declared_args.iter().enumerate() {
+        match arg_slots.get(idx) {
+            Some(Some(arg_val)) => {
+                let Some(ti) = decl_sym.type_info.as_ref() else {
+                    return false;
+                };
+                let Some(at) = b.func().value_type(*arg_val) else {
+                    return false;
+                };
+                if !arg_matches_declared(ti, &at, *arg_val, b) {
+                    return false;
+                }
+            }
+            Some(None) | None => {
+                if !decl_sym.attrs.optional {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn reorder_value_slots_by_formal_skip(
+    args: &[crate::ast::expr::Argument],
+    actual_vals: &[ValueId],
+    formal_order: &[String],
+    formal_skip: usize,
+) -> Vec<Option<ValueId>> {
+    if args.len() != actual_vals.len() {
+        return actual_vals.iter().copied().map(Some).collect();
+    }
+
+    let mut slots: Vec<Option<ValueId>> = vec![None; formal_order.len()];
+    let mut last_positional = formal_skip.min(slots.len());
+    for (arg, actual_val) in args.iter().zip(actual_vals.iter()) {
+        if let Some(kw) = &arg.keyword {
+            let key = kw.to_ascii_lowercase();
+            if let Some(idx) = formal_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&key))
+            {
+                slots[idx] = Some(*actual_val);
+                continue;
+            }
+            slots.push(Some(*actual_val));
+            continue;
+        }
+        if last_positional < slots.len() {
+            slots[last_positional] = Some(*actual_val);
+            last_positional += 1;
+        } else {
+            slots.push(Some(*actual_val));
+        }
+    }
+    slots
+}
+
+fn resolve_generic_call_actuals(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    callee: &str,
+    args: &[crate::ast::expr::Argument],
+    actual_vals: &[ValueId],
+) -> Option<String> {
+    let specifics = named_interface_specifics(st, callee)?;
+
+    for specific in &specifics {
+        let Some(scope) = procedure_scope_by_name(st, specific) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        let arg_slots = reorder_value_slots_by_formal_skip(args, actual_vals, &scope.arg_order, 0);
+        let supplied = arg_slots.iter().filter(|slot| slot.is_some()).count();
+        if generic_candidate_matches_slots(b, &declared_args, &arg_slots, supplied) {
+            return Some(specific.clone());
+        }
+    }
+
     None
 }
 
@@ -8956,6 +9793,69 @@ fn defined_assignment_arg_semantic_match(
     }
 }
 
+fn operator_arg_semantic_match(
+    declared: &crate::sema::symtab::TypeInfo,
+    actual: Option<&crate::sema::symtab::TypeInfo>,
+) -> bool {
+    use crate::sema::symtab::TypeInfo;
+
+    match declared {
+        TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. })),
+        TypeInfo::Derived(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Derived(actual_name)) if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
+        TypeInfo::Class(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
+        TypeInfo::ClassStar => matches!(actual, Some(TypeInfo::ClassStar)),
+        TypeInfo::TypeStar => matches!(actual, Some(TypeInfo::TypeStar)),
+        _ => true,
+    }
+}
+
+fn operator_expr_type_info(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    use crate::ast::expr::Expr;
+    use crate::sema::symtab::TypeInfo;
+
+    match &expr.node {
+        Expr::Name { name } => st
+            .find_symbol_any_scope(&name.to_lowercase())
+            .and_then(|sym| sym.type_info.clone()),
+        Expr::FunctionCall { callee, .. } => {
+            if let Expr::Name { name } = &callee.node {
+                st.find_symbol_any_scope(&name.to_lowercase())
+                    .and_then(|sym| sym.type_info.clone())
+            } else {
+                None
+            }
+        }
+        Expr::StringLiteral { value, .. } => Some(TypeInfo::Character {
+            len: Some(value.len() as i64),
+            kind: Some(1),
+        }),
+        Expr::ComponentAccess { base, component } => {
+            let tl = type_layouts?;
+            let base_ti = operator_expr_type_info(base, st, Some(tl))?;
+            let type_name = match base_ti {
+                TypeInfo::Derived(name) | TypeInfo::Class(name) => name,
+                _ => return None,
+            };
+            tl.get(&type_name)
+                .and_then(|layout| layout.field(component))
+                .map(|field| field.type_info.clone())
+        }
+        Expr::ParenExpr { inner } => operator_expr_type_info(inner, st, type_layouts),
+        _ => None,
+    }
+}
+
 fn generic_dispatch_probe_value(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -8974,7 +9874,9 @@ fn generic_dispatch_probe_value(
             return b.int_to_ptr(zero, elem_ty);
         }
     }
-    if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(b, locals, expr, st, type_layouts) {
+    if let Some((_desc, elem_ty)) =
+        lower_array_expr_descriptor(b, locals, expr, st, type_layouts, None, None, None)
+    {
         let zero = b.const_i64(0);
         return b.int_to_ptr(zero, elem_ty);
     }
@@ -9178,7 +10080,7 @@ fn binary_op_interface_name(op: &BinaryOp) -> Option<String> {
 }
 
 /// Attempt to resolve a binary expression through a user-defined
-/// `INTERFACE OPERATOR(<op>)`. Returns `(specific_name, [lhs, rhs])`
+/// `INTERFACE OPERATOR(<op>)`. Returns the specific procedure name
 /// when a specific matches both operand types; `None` when no
 /// operator interface exists or no specific matches. Intrinsic ops
 /// between numerics keep their fast path by returning None for
@@ -9186,14 +10088,18 @@ fn binary_op_interface_name(op: &BinaryOp) -> Option<String> {
 /// under the same operator (the language allows user overloads only
 /// for types not already handled by the intrinsic operator).
 fn resolve_operator_overload(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
-    b: &FuncBuilder,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     op: &BinaryOp,
     lty: &IrType,
     rty: &IrType,
+    left_expr: &crate::ast::expr::SpannedExpr,
+    right_expr: &crate::ast::expr::SpannedExpr,
     lhs: ValueId,
     rhs: ValueId,
-) -> Option<(String, Vec<ValueId>)> {
+) -> Option<String> {
     // Both operands numeric: fall through to intrinsic arithmetic.
     // Derived-type and character overloads are the common case for
     // user operators; numeric-on-numeric keeps the cheap path.
@@ -9209,9 +10115,323 @@ fn resolve_operator_overload(
         return None;
     }
 
-    let arg_vals = vec![lhs, rhs];
-    let resolved = resolve_generic_call(st, b, &iface_name, &arg_vals)?;
-    Some((resolved, arg_vals))
+    let left_semantic_ti = operator_expr_type_info(left_expr, st, type_layouts);
+    let right_semantic_ti = operator_expr_type_info(right_expr, st, type_layouts);
+    let semantic_candidates: Vec<String> = sym
+        .arg_names
+        .iter()
+        .filter_map(|specific| {
+            let scope = procedure_scope_by_name(st, specific)?;
+            let declared_args = declared_args_for_scope(scope);
+            if declared_args.len() != 2 {
+                return None;
+            }
+            let left_decl = declared_args.first()?.type_info.as_ref()?;
+            let right_decl = declared_args.get(1)?.type_info.as_ref()?;
+            if !operator_arg_semantic_match(left_decl, left_semantic_ti.as_ref()) {
+                return None;
+            }
+            if !operator_arg_semantic_match(right_decl, right_semantic_ti.as_ref()) {
+                return None;
+            }
+            Some(specific.clone())
+        })
+        .collect();
+    let specifics = if semantic_candidates.is_empty() {
+        sym.arg_names.clone()
+    } else {
+        semantic_candidates
+    };
+
+    let lhs_probe = if expr_is_character_expr(b, locals, left_expr, st, type_layouts) {
+        b.const_int(0, IntWidth::I8)
+    } else {
+        lhs
+    };
+    let rhs_probe = if expr_is_character_expr(b, locals, right_expr, st, type_layouts) {
+        b.const_int(0, IntWidth::I8)
+    } else {
+        rhs
+    };
+    let arg_vals = vec![Some(lhs_probe), Some(rhs_probe)];
+    let supplied = arg_vals.len();
+    for specific in &specifics {
+        let Some(scope) = procedure_scope_by_name(st, specific) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        if generic_candidate_matches_slots(b, &declared_args, &arg_vals, supplied) {
+            return Some(specific.clone());
+        }
+    }
+    None
+}
+
+fn lower_operator_actual_by_ref(b: &mut FuncBuilder, actual: ValueId) -> ValueId {
+    match b.func().value_type(actual) {
+        Some(ty) if ty.is_ptr() => actual,
+        Some(ty) => {
+            let slot = b.alloca(ty);
+            b.store(actual, slot);
+            slot
+        }
+        None => actual,
+    }
+}
+
+fn lowered_operator_char_actual_view(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    actual: ValueId,
+) -> Option<(ValueId, ValueId)> {
+    if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
+        return Some((ptr, len));
+    }
+
+    if matches!(expr.node, Expr::ComponentAccess { .. })
+        && expr_is_character_expr(b, locals, expr, st, type_layouts)
+    {
+        return Some(lower_string_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ));
+    }
+
+    match b.func().value_type(actual) {
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(elem, 32) if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
+            ) =>
+        {
+            Some(load_string_descriptor_view(b, actual))
+        }
+        Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) => {
+            Some((actual, b.const_i64(0)))
+        }
+        _ => None,
+    }
+}
+
+fn emit_resolved_operator_call(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    specific: &str,
+    left_expr: &crate::ast::expr::SpannedExpr,
+    right_expr: &crate::ast::expr::SpannedExpr,
+    lhs: ValueId,
+    rhs: ValueId,
+) -> ValueId {
+    let specific_key = specific.to_lowercase();
+    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[&specific_key]);
+    let abi_primary_key = abi_lookup_keys
+        .first()
+        .map(String::as_str)
+        .unwrap_or(specific_key.as_str());
+    let hidden_abi = first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k));
+    let callee_value_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
+    let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        descriptor_params.and_then(|m| m.get(k).cloned())
+    });
+    let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_string_descriptor_arg_mask(st, k)
+    });
+    let callee_bind_c_char_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
+    let callee_pointer_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+    let callee_char_len_star_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+    let (call_name, _) = resolved_symbol_call_target(st, &specific_key, specific);
+
+    let hidden_result = hidden_abi.and_then(|abi| {
+        let bytes = match abi {
+            HiddenResultAbi::None => return None,
+            HiddenResultAbi::ArrayDescriptor => 384,
+            HiddenResultAbi::StringDescriptor => 32,
+        };
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
+        let zero_i32 = b.const_i32(0);
+        let size = b.const_i64(bytes as i64);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![desc, zero_i32, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        Some(desc)
+    });
+
+    let mut call_args = Vec::with_capacity(2 + hidden_result.is_some() as usize + 4);
+    let mut char_actual_lens = [None, None];
+    if let Some(desc) = hidden_result {
+        call_args.push(desc);
+    }
+
+    for (i, (expr, actual)) in [(&left_expr, lhs), (&right_expr, rhs)]
+        .into_iter()
+        .enumerate()
+    {
+        let is_value = callee_value_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_descriptor = callee_descriptor_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_string_descriptor = callee_string_descriptor_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_bind_c_char = callee_bind_c_char_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_pointer = callee_pointer_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+
+        let lowered = if is_value && wants_bind_c_char {
+            lower_bind_c_char_value_arg(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+        } else if is_value {
+            coerce_value_call_arg(b, st, abi_primary_key, i, actual)
+        } else if wants_descriptor {
+            lower_arg_descriptor(b, locals, expr, st, type_layouts)
+        } else if wants_string_descriptor {
+            lower_arg_string_descriptor(b, locals, expr, st, type_layouts)
+        } else if wants_bind_c_char {
+            lower_bind_c_char_arg_raw(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+        } else if wants_pointer {
+            lower_pointer_dummy_actual(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .unwrap_or_else(|| lower_operator_actual_by_ref(b, actual))
+        } else {
+            if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+                let (char_ptr, char_len) = lowered_operator_char_actual_view(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    actual,
+                )
+                .unwrap_or_else(|| (lower_operator_actual_by_ref(b, actual), b.const_i64(0)));
+                char_actual_lens[i] = Some(char_len);
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(char_ptr, slot);
+                slot
+            } else {
+                lower_operator_actual_by_ref(b, actual)
+            }
+        };
+        call_args.push(lowered);
+    }
+
+    if let Some(cls_flags) = &callee_char_len_star_args {
+        for (i, flag) in cls_flags.iter().enumerate().take(2) {
+            if !*flag {
+                continue;
+            }
+            let len = char_actual_lens[i].unwrap_or_else(|| {
+                let expr = if i == 0 { left_expr } else { right_expr };
+                actual_char_arg_runtime_len(
+                    b,
+                    locals,
+                    None,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .unwrap_or_else(|| b.const_i64(0))
+            });
+            call_args.push(len);
+        }
+    }
+
+    append_host_closure_args_raw(
+        b,
+        locals,
+        contained_host_refs,
+        &specific_key,
+        &mut call_args,
+    );
+
+    let func_ref = internal_funcs
+        .and_then(|map| map.get(&specific_key).copied())
+        .map(FuncRef::Internal)
+        .unwrap_or_else(|| FuncRef::External(call_name));
+    let ret_ty = if hidden_result.is_some() {
+        IrType::Void
+    } else {
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
+            .unwrap_or(IrType::Int(IntWidth::I32))
+    };
+    let call_result = b.call(func_ref, call_args, ret_ty);
+
+    if let Some(desc) = hidden_result {
+        return desc;
+    }
+
+    if let Some(tl) = type_layouts {
+        if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
+            callee_return_stabilized_derived_type_name(st, k)
+        }) {
+            return stabilize_derived_call_result(b, tl, &type_name, call_result);
+        }
+    }
+
+    call_result
 }
 
 /// Reorder a call's actual-arg list so keyword arguments land in
@@ -9253,8 +10473,48 @@ fn reorder_args_by_keyword_slots_with_formal_skip(
         }
         match found {
             Some(v) if !v.is_empty() => Some(v),
-            _ => intrinsic_subroutine_arg_order(callee_key)
-                .map(|names| names.iter().map(|name| (*name).to_string()).collect()),
+            _ => {
+                if let Some(sym) = st.find_symbol_any_scope(callee_key) {
+                    if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
+                        let mut specific_orders = sym.arg_names.iter().filter_map(|specific| {
+                            st.all_scopes().iter().find_map(|scope| match &scope.kind {
+                                ScopeKind::Function(n) | ScopeKind::Subroutine(n)
+                                    if n.eq_ignore_ascii_case(specific)
+                                        && !scope.arg_order.is_empty() =>
+                                {
+                                    Some(scope.arg_order.clone())
+                                }
+                                _ => None,
+                            })
+                        });
+                        if let Some(first) = specific_orders.next() {
+                            let consistent = specific_orders.all(|order| {
+                                order.len() == first.len()
+                                    && order
+                                        .iter()
+                                        .zip(first.iter())
+                                        .all(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+                            });
+                            if consistent {
+                                Some(first)
+                            } else {
+                                intrinsic_subroutine_arg_order(callee_key).map(|names| {
+                                    names.iter().map(|name| (*name).to_string()).collect()
+                                })
+                            }
+                        } else {
+                            intrinsic_subroutine_arg_order(callee_key)
+                                .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+                        }
+                    } else {
+                        intrinsic_subroutine_arg_order(callee_key)
+                            .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+                    }
+                } else {
+                    intrinsic_subroutine_arg_order(callee_key)
+                        .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+                }
+            }
         }
     };
     let Some(arg_order) = arg_order else {
@@ -9395,29 +10655,27 @@ fn resolve_subroutine_call_name(
     b: &FuncBuilder,
     orig_name: &str,
     key: &str,
-    arg_vals: &[ValueId],
+    args: &[crate::ast::expr::Argument],
+    actual_vals: &[ValueId],
     span: crate::lexer::Span,
 ) -> (String, String) {
-    if let Some(sym) = st.find_symbol_any_scope(key) {
-        if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
-            match resolve_generic_call(st, b, key, arg_vals) {
-                Some(resolved) => {
-                    let rk = resolved.to_lowercase();
-                    let (call_name, _) = resolved_symbol_call_target(st, &rk, &resolved);
-                    return (call_name, rk);
-                }
-                None => {
-                    let specifics = sym.arg_names.join(", ");
-                    eprintln!(
-                        "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                        span.start.line,
-                        span.start.col,
-                        orig_name,
-                        specifics,
-                    );
-                    let _ = std::io::stderr().flush();
-                    std::process::exit(1);
-                }
+    if let Some(specifics) = named_interface_specifics(st, key) {
+        match resolve_generic_call_actuals(st, b, key, args, actual_vals) {
+            Some(resolved) => {
+                let rk = resolved.to_lowercase();
+                let (call_name, _) = resolved_symbol_call_target(st, &rk, &resolved);
+                return (call_name, rk);
+            }
+            None => {
+                eprintln!(
+                    "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                    span.start.line,
+                    span.start.col,
+                    orig_name,
+                    specifics.join(", "),
+                );
+                let _ = std::io::stderr().flush();
+                std::process::exit(1);
             }
         }
     }
@@ -10310,7 +11568,9 @@ fn lower_alloc_return_call_into_desc(
 
 fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
     let sym = st.find_symbol_any_scope(key)?;
-    if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer {
+    if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer
+        && !(sym.attrs.external && sym.attrs.procedure_iface.is_some())
+    {
         return None;
     }
     Some(
@@ -10338,6 +11598,30 @@ fn procedure_pointer_call_target(
     Some((b.load_typed(info.addr, load_ty), signature_key))
 }
 
+fn procedure_pointer_component_call_target(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, String)> {
+    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, type_layouts)?;
+    if !field.pointer {
+        return None;
+    }
+    let crate::sema::symtab::TypeInfo::Derived(signature_name) = &field.type_info else {
+        return None;
+    };
+    if type_layouts.get(signature_name).is_some() {
+        return None;
+    }
+    let load_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    Some((
+        b.load_typed(field_ptr, load_ty),
+        signature_name.to_lowercase(),
+    ))
+}
+
 fn procedure_pointer_symbol_addr_elem_type(info: &LocalInfo) -> IrType {
     match &info.ty {
         IrType::Ptr(inner) => inner.as_ref().clone(),
@@ -10359,7 +11643,28 @@ fn arg_matches_declared(
     b: &FuncBuilder,
 ) -> bool {
     use crate::sema::symtab::TypeInfo;
-    if let TypeInfo::Derived(decl_name) = decl_ti {
+    if matches!(decl_ti, TypeInfo::Character { .. }) {
+        // Character actuals arrive in several ABI shapes depending on
+        // storage class and expression form:
+        //   * fixed-length local/name         -> Array(i8, N)
+        //   * string literal                  -> Ptr(Array(i8, N))
+        //   * assumed/deferred length scalar  -> Ptr(i8) / nested Ptrs
+        // Generic resolution should classify all of those as
+        // character-compatible instead of collapsing the declared
+        // dummy to size-based Int(I8), which rejects perfectly valid
+        // constructor and interface calls like
+        // `diagnostic_t(1, "hello", [label_t(2)])`.
+        let mut peeled = actual_ir.clone();
+        while let IrType::Ptr(inner) = peeled {
+            peeled = *inner;
+        }
+        return match peeled {
+            IrType::Int(IntWidth::I8) => true,
+            IrType::Array(inner, _) => matches!(inner.as_ref(), IrType::Int(IntWidth::I8)),
+            _ => false,
+        };
+    }
+    if matches!(decl_ti, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         // Walk through any pointer wrappers — the caller passes an
         // address to the struct and dispatch has to look through it.
         // Derived-type arguments arrive in two shapes:
@@ -10373,7 +11678,13 @@ fn arg_matches_declared(
         while let IrType::Ptr(inner) = peeled {
             peeled = *inner;
         }
-        let _ = decl_name;
+        return matches!(peeled, IrType::Array(_, _) | IrType::Int(IntWidth::I8));
+    }
+    if matches!(decl_ti, TypeInfo::ClassStar | TypeInfo::TypeStar) {
+        let mut peeled = actual_ir.clone();
+        while let IrType::Ptr(inner) = peeled {
+            peeled = *inner;
+        }
         return matches!(peeled, IrType::Array(_, _) | IrType::Int(IntWidth::I8));
     }
     let decl_ir = type_info_to_ir_type(decl_ti);
@@ -10414,6 +11725,17 @@ fn int_kind_to_width(kind_str: &str, st: &SymbolTable) -> u8 {
         }
     }
     crate::driver::defaults::default_int_kind()
+}
+
+fn int_width_from_kind_value(kind: i64) -> Option<IntWidth> {
+    match kind {
+        1 => Some(IntWidth::I8),
+        2 => Some(IntWidth::I16),
+        4 => Some(IntWidth::I32),
+        8 => Some(IntWidth::I64),
+        16 => Some(IntWidth::I128),
+        _ => None,
+    }
 }
 
 /// Resolve a kind suffix (literal integer or named constant) to a kind width.
@@ -10574,6 +11896,8 @@ fn lower_intrinsic_subroutine(
                         if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32
                         {
                             Some((field_ptr, true))
+                        } else if field.allocatable && field.size == 384 {
+                            Some((field_ptr, false))
                         } else {
                             None
                         }
@@ -11945,13 +13269,14 @@ fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> 
     use crate::sema::symtab::ScopeKind;
 
     let key = callee_name.to_lowercase();
-    if let Some(type_info) = st
-        .scopes
-        .iter()
-        .find_map(|scope| scope.symbols.get(&key))
-        .and_then(|sym| sym.type_info.as_ref())
-    {
-        return Some(type_info_to_ir_type(type_info));
+    if let Some(sym) = st.scopes.iter().find_map(|scope| scope.symbols.get(&key)) {
+        if let Some(type_info) = sym.type_info.as_ref() {
+            let mut ir_ty = type_info_to_ir_type(type_info);
+            if sym.attrs.pointer && !ir_ty.is_ptr() {
+                ir_ty = IrType::Ptr(Box::new(ir_ty));
+            }
+            return Some(ir_ty);
+        }
     }
 
     let callee_scope = st.scopes.iter().find(
@@ -11971,7 +13296,11 @@ fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> 
             if result_type.is_some() {
                 return None;
             }
-            result_type = Some(type_info_to_ir_type(type_info));
+            let mut ir_ty = type_info_to_ir_type(type_info);
+            if sym.attrs.pointer && !ir_ty.is_ptr() {
+                ir_ty = IrType::Ptr(Box::new(ir_ty));
+            }
+            result_type = Some(ir_ty);
         }
     }
     result_type
@@ -12348,6 +13677,7 @@ fn lower_string_expr_full(
             if args.len() == 1
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts)
+                && !expr_is_callable_character_callee(b, locals, callee, st, type_layouts)
             {
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
@@ -12987,6 +14317,80 @@ fn lower_string_expr_full(
             left,
             right,
         } => {
+            let left_is_char = expr_is_character_expr(b, locals, left, st, type_layouts);
+            let right_is_char = expr_is_character_expr(b, locals, right, st, type_layouts);
+            if !(left_is_char && right_is_char) {
+                let lhs = lower_expr_full(
+                    b,
+                    locals,
+                    left,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let rhs = lower_expr_full(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let lty = b
+                    .func()
+                    .value_type(lhs)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                let rty = b
+                    .func()
+                    .value_type(rhs)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                if let Some(specific) = resolve_operator_overload(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    &BinaryOp::Concat,
+                    &lty,
+                    &rty,
+                    left,
+                    right,
+                    lhs,
+                    rhs,
+                )
+                {
+                    let specific_key = specific.to_lowercase();
+                    let char_abi = callee_character_return_abi(st, &specific_key);
+                    let result = emit_resolved_operator_call(
+                        b,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                        &specific,
+                        left,
+                        right,
+                        lhs,
+                        rhs,
+                    );
+                    return match char_abi {
+                        Some(CharacterReturnAbi::HiddenDescriptor) => {
+                            load_string_descriptor_view(b, result)
+                        }
+                        Some(CharacterReturnAbi::BindCScalarByte) => {
+                            let slot = b.alloca(IrType::Int(IntWidth::I8));
+                            b.store(result, slot);
+                            (slot, b.const_i64(1))
+                        }
+                        None => (result, b.const_i64(0)),
+                    };
+                }
+            }
             // Concatenation: get both sides as (ptr, len), allocate temp, call afs_concat.
             let (a_ptr, a_len) = lower_string_expr_full(
                 b,
@@ -14468,8 +15872,186 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                             b.call(FuncRef::External(call_name), call_args, IrType::Void);
+                            return;
                         }
                     }
+                }
+                if let Some((target, signature_key)) = procedure_pointer_component_call_target(
+                    b,
+                    &ctx.locals,
+                    callee,
+                    ctx.st,
+                    ctx.type_layouts,
+                ) {
+                    let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
+                    let abi_lookup_keys = procedure_abi_lookup_keys(ctx.st, &[&signature_key]);
+                    let abi_primary_key = abi_lookup_keys
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(signature_key.as_str());
+                    let value_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_value_arg_mask(ctx.st, k)
+                    });
+                    let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.descriptor_params.get(k).cloned()
+                    });
+                    let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_bind_c_char_arg_mask(ctx.st, k)
+                    });
+                    let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_pointer_arg_mask(ctx.st, k)
+                    });
+                    let string_desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_string_descriptor_arg_mask(ctx.st, k)
+                    });
+                    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.optional_params
+                            .get(k)
+                            .cloned()
+                            .or_else(|| callee_optional_arg_mask(ctx.st, k))
+                    });
+                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    for (i, slot) in arg_slots.iter().enumerate() {
+                        let is_value = value_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_descriptor = desc_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_bind_c_char = bind_c_char_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_pointer = pointer_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let wants_string_descriptor = string_desc_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let value = match slot {
+                            Some(arg) => match &arg.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => {
+                                    if is_value && wants_bind_c_char {
+                                        lower_bind_c_char_value_arg(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                    } else if is_value {
+                                        let raw = lower_expr_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        );
+                                        coerce_value_call_arg(b, ctx.st, abi_primary_key, i, raw)
+                                    } else if wants_descriptor {
+                                        lower_arg_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                    } else if wants_string_descriptor {
+                                        lower_arg_string_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                    } else if wants_bind_c_char {
+                                        lower_bind_c_char_arg_raw(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                    } else if wants_pointer {
+                                        lower_pointer_dummy_actual(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                    } else {
+                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                    }
+                                }
+                                _ => b.const_i32(0),
+                            },
+                            None => {
+                                missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
+                            }
+                        };
+                        arg_vals.push(value);
+                    }
+                    if let Some(opt_flags) = opt_flags {
+                        for flag in opt_flags.iter().skip(arg_vals.len()) {
+                            if *flag {
+                                arg_vals.push(b.const_i64(0));
+                            }
+                        }
+                    }
+                    if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        ctx.char_len_star_params
+                            .get(k)
+                            .cloned()
+                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                    }) {
+                        for (i, flag) in cls_flags.iter().enumerate() {
+                            if !*flag || i >= arg_slots.len() {
+                                continue;
+                            }
+                            if let Some(arg) = &arg_slots[i] {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                    arg_vals.push(
+                                        actual_char_arg_runtime_len(
+                                            b,
+                                            &ctx.locals,
+                                            Some(&ctx.optional_locals),
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                        .unwrap_or_else(|| b.const_i64(0)),
+                                    );
+                                } else {
+                                    arg_vals.push(b.const_i64(0));
+                                }
+                            } else {
+                                arg_vals.push(b.const_i64(0));
+                            }
+                        }
+                    }
+                    b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
+                    return;
                 }
             } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
@@ -14489,13 +16071,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     // param order; the rest of the call-site code
                     // then runs positionally against that reordered
                     // list.
-                    let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
-                    let present_args: Vec<crate::ast::expr::Argument> =
-                        arg_slots.iter().flatten().cloned().collect();
-                    let args: &[crate::ast::expr::Argument] = &present_args;
                     let resolution_arg_vals: Vec<ValueId> = args
                         .iter()
-                        .map(|a| match &a.value {
+                        .map(|arg| match &arg.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
                                 generic_dispatch_probe_value(
                                     b,
@@ -14524,10 +16102,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             b,
                             name,
                             &key,
+                            args,
                             &resolution_arg_vals,
                             callee.span,
                         )
                     };
+                    let arg_slots = reorder_args_by_keyword_slots(
+                        args,
+                        if procptr_target.is_some() {
+                            &signature_key
+                        } else {
+                            &resolved_key
+                        },
+                        ctx.st,
+                    );
                     let abi_lookup_keys =
                         procedure_abi_lookup_keys(ctx.st, &[&resolved_key, &signature_key, &key]);
                     let abi_primary_key = abi_lookup_keys
@@ -15014,7 +16602,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         Stmt::SelectType {
             selector,
             guards,
-            assoc_name: _,
+            assoc_name,
             ..
         } => {
             // SELECT TYPE: compare the type tag of a polymorphic variable.
@@ -15051,7 +16639,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
 
                                     b.set_block(bb_match);
-                                    lower_stmts(b, ctx, body);
+                                    with_select_type_guard_binding(
+                                        b,
+                                        ctx,
+                                        selector,
+                                        assoc_name.as_deref(),
+                                        guard_type,
+                                        |b, ctx| lower_stmts(b, ctx, body),
+                                    );
                                     if b.func().block(b.current_block()).terminator.is_none() {
                                         b.branch(bb_end, vec![]);
                                     }
@@ -15061,7 +16656,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     // Unknown guard type — skip.
                                     let tag_matches = type_name.eq_ignore_ascii_case(guard_type);
                                     if tag_matches {
-                                        lower_stmts(b, ctx, body);
+                                        with_select_type_guard_binding(
+                                            b,
+                                            ctx,
+                                            selector,
+                                            assoc_name.as_deref(),
+                                            guard_type,
+                                            |b, ctx| lower_stmts(b, ctx, body),
+                                        );
                                         if b.func().block(b.current_block()).terminator.is_none() {
                                             b.branch(bb_end, vec![]);
                                         }
@@ -15078,7 +16680,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 let is_match =
                                     is_type_or_extends(type_name, guard_type, ctx.type_layouts);
                                 if is_match {
-                                    lower_stmts(b, ctx, body);
+                                    with_select_type_guard_binding(
+                                        b,
+                                        ctx,
+                                        selector,
+                                        assoc_name.as_deref(),
+                                        guard_type,
+                                        |b, ctx| lower_stmts(b, ctx, body),
+                                    );
                                     if b.func().block(b.current_block()).terminator.is_none() {
                                         b.branch(bb_end, vec![]);
                                     }
@@ -15846,7 +17455,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     "",
                     ctx.st,
                 );
-                init_decls(b, &ctx.locals, &effective_decls, ctx.st);
+                init_decls(
+                    b,
+                    &ctx.locals,
+                    &effective_decls,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
             }
             if !uses.is_empty() {
                 let required_import_names = collect_required_import_names(&effective_decls, body);
@@ -17246,6 +18861,31 @@ fn is_pure_expr(expr: &crate::ast::expr::Expr) -> bool {
     }
 }
 
+fn expr_uses_optional_by_ref_local(
+    expr: &crate::ast::expr::Expr,
+    locals: &HashMap<String, LocalInfo>,
+    optional_locals: &HashSet<String>,
+) -> bool {
+    use crate::ast::expr::Expr;
+    match expr {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            optional_locals.contains(&key) && locals.get(&key).map(|info| info.by_ref).unwrap_or(false)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_uses_optional_by_ref_local(&left.node, locals, optional_locals)
+                || expr_uses_optional_by_ref_local(&right.node, locals, optional_locals)
+        }
+        Expr::UnaryOp { operand, .. } => {
+            expr_uses_optional_by_ref_local(&operand.node, locals, optional_locals)
+        }
+        Expr::ParenExpr { inner } => {
+            expr_uses_optional_by_ref_local(&inner.node, locals, optional_locals)
+        }
+        _ => false,
+    }
+}
+
 /// Try to lower `if (cond) x = a; else x = b` as a Select instruction
 /// instead of a diamond of basic blocks. Returns true on success.
 ///
@@ -17332,6 +18972,11 @@ fn try_lower_select(
         return false;
     }
     if !is_pure_expr(&else_val_expr.node) {
+        return false;
+    }
+    if expr_uses_optional_by_ref_local(&then_val_expr.node, &ctx.locals, &ctx.optional_locals)
+        || expr_uses_optional_by_ref_local(&else_val_expr.node, &ctx.locals, &ctx.optional_locals)
+    {
         return false;
     }
 
@@ -18267,8 +19912,13 @@ fn store_ac_values_into(
     locals: &HashMap<String, LocalInfo>,
     dest_base: ValueId,
     elem_ty: &IrType,
+    derived_type: Option<&str>,
     values: &[crate::ast::expr::AcValue],
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) {
     let elem_bytes = ir_scalar_byte_size(elem_ty);
     // Runtime byte offset. Starts at 0 and is bumped by elem_bytes
@@ -18282,11 +19932,24 @@ fn store_ac_values_into(
     for v in values {
         match v {
             crate::ast::expr::AcValue::Expr(e) => {
-                let raw = lower_expr(b, locals, e, st);
-                let coerced = coerce_to_type(b, raw, elem_ty);
+                let raw = lower_expr_full(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 let cur_off = b.load(off_slot);
                 let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
-                b.store(coerced, p);
+                if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
+                    emit_derived_value_copy(b, tl, type_name, p, raw);
+                } else {
+                    let coerced = coerce_to_type(b, raw, elem_ty);
+                    b.store(coerced, p);
+                }
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
             }
@@ -18297,6 +19960,7 @@ fn store_ac_values_into(
                     dest_base,
                     elem_ty,
                     elem_bytes,
+                    derived_type,
                     off_slot,
                     &ido.values,
                     &ido.var,
@@ -18304,6 +19968,10 @@ fn store_ac_values_into(
                     &ido.end,
                     ido.step.as_ref(),
                     st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
                 );
             }
         }
@@ -18317,6 +19985,10 @@ fn store_char_ac_values_into(
     elem_len: i64,
     values: &[crate::ast::expr::AcValue],
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) {
     let off_slot = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
@@ -18329,7 +20001,16 @@ fn store_char_ac_values_into(
             crate::ast::expr::AcValue::Expr(e) => {
                 let cur_off = b.load(off_slot);
                 let elem_ptr = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
-                let (src_ptr, src_len) = lower_string_expr(b, locals, e, st);
+                let (src_ptr, src_len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 b.call(
                     FuncRef::External("afs_assign_char_fixed".into()),
                     vec![elem_ptr, dest_len, src_ptr, src_len],
@@ -18357,6 +20038,7 @@ fn store_ac_implied_do(
     dest_base: ValueId,
     elem_ty: &IrType,
     elem_bytes: i64,
+    derived_type: Option<&str>,
     off_slot: ValueId,
     inner: &[crate::ast::expr::AcValue],
     var: &str,
@@ -18364,20 +20046,51 @@ fn store_ac_implied_do(
     end: &crate::ast::expr::SpannedExpr,
     step: Option<&crate::ast::expr::SpannedExpr>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) {
     // DO variable as a fresh i32 alloca, installed in a scratch
     // locals map so the inner expressions can reference it.
     let var_ty = IrType::Int(IntWidth::I32);
     let var_addr = b.alloca(var_ty.clone());
-    let start_val = lower_expr(b, locals, start, st);
+    let start_val = lower_expr_full(
+        b,
+        locals,
+        start,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
     let start_coerced = coerce_to_type(b, start_val, &var_ty);
     b.store(start_coerced, var_addr);
 
-    let end_val = lower_expr(b, locals, end, st);
+    let end_val = lower_expr_full(
+        b,
+        locals,
+        end,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
     let end_coerced = coerce_to_type(b, end_val, &var_ty);
 
     let step_val_raw = match step {
-        Some(e) => lower_expr(b, locals, e, st),
+        Some(e) => lower_expr_full(
+            b,
+            locals,
+            e,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
         None => b.const_i32(1),
     };
     let step_val = coerce_to_type(b, step_val_raw, &var_ty);
@@ -18444,11 +20157,24 @@ fn store_ac_implied_do(
     for iv in inner {
         match iv {
             crate::ast::expr::AcValue::Expr(e) => {
-                let raw = lower_expr(b, &scratch_locals, e, st);
-                let coerced = coerce_to_type(b, raw, elem_ty);
+                let raw = lower_expr_full(
+                    b,
+                    &scratch_locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
                 let cur_off = b.load(off_slot);
                 let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
-                b.store(coerced, p);
+                if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
+                    emit_derived_value_copy(b, tl, type_name, p, raw);
+                } else {
+                    let coerced = coerce_to_type(b, raw, elem_ty);
+                    b.store(coerced, p);
+                }
                 let step_bytes = b.const_i64(elem_bytes);
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
@@ -18460,6 +20186,7 @@ fn store_ac_implied_do(
                     dest_base,
                     elem_ty,
                     elem_bytes,
+                    derived_type,
                     off_slot,
                     &ido.values,
                     &ido.var,
@@ -18467,6 +20194,10 @@ fn store_ac_implied_do(
                     &ido.end,
                     ido.step.as_ref(),
                     st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
                 );
             }
         }
@@ -18574,9 +20305,31 @@ fn lower_write_items_adv(
     advance: bool,
 ) {
     for item in items {
+        let generic_char_call = match &item.node {
+            Expr::FunctionCall { callee, args } => {
+                if let Expr::Name { name } = &callee.node {
+                    resolved_character_return_abi_for_call(
+                        b,
+                        &ctx.locals,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                        name,
+                        args,
+                    )
+                    .is_some()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
         let is_char = matches!(item.node, Expr::StringLiteral { .. })
             || (expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
-                && !expr_is_array_designator(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)));
+                && !expr_is_array_designator(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)))
+            || generic_char_call;
 
         // Whole-array print: a plain Name reference whose local
         // has array dims. Iterate elements and call the per-element
@@ -20827,7 +22580,9 @@ fn lower_arg_descriptor(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
-    if let Some((desc, _)) = lower_array_expr_descriptor(b, locals, expr, st, type_layouts) {
+    if let Some((desc, _)) =
+        lower_array_expr_descriptor(b, locals, expr, st, type_layouts, None, None, None)
+    {
         return desc;
     }
     if let Expr::Name { name } = &expr.node {
@@ -21114,6 +22869,21 @@ fn synth_int_expr(value: i64, span: crate::lexer::Span) -> crate::ast::expr::Spa
     )
 }
 
+fn synth_size_expr(array_name: &str, span: crate::lexer::Span) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr("size", span)),
+            args: vec![crate::ast::expr::Argument {
+                keyword: None,
+                value: crate::ast::expr::SectionSubscript::Element(synth_name_expr(
+                    array_name, span,
+                )),
+            }],
+        },
+        span,
+    )
+}
+
 fn synth_indexed_array_expr(
     array_name: &str,
     index_name: &str,
@@ -21131,6 +22901,426 @@ fn synth_indexed_array_expr(
         },
         span,
     )
+}
+
+fn expr_contains_array_refs_in_subscripts(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> bool {
+    match &expr.node {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_array_refs_in_subscripts(left, locals)
+                || expr_contains_array_refs_in_subscripts(right, locals)
+        }
+        Expr::UnaryOp { operand, .. } => expr_contains_array_refs_in_subscripts(operand, locals),
+        Expr::ParenExpr { inner } => expr_contains_array_refs_in_subscripts(inner, locals),
+        Expr::ComponentAccess { base, .. } => expr_contains_array_refs_in_subscripts(base, locals),
+        Expr::FunctionCall { callee, args } => {
+            expr_contains_array_refs_in_subscripts(callee, locals)
+                || args.iter().any(|arg| match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(e) => {
+                        expr_contains_array_refs(e, locals)
+                            || expr_contains_array_refs_in_subscripts(e, locals)
+                    }
+                    crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                        start.as_ref().is_some_and(|e| {
+                            expr_contains_array_refs(e, locals)
+                                || expr_contains_array_refs_in_subscripts(e, locals)
+                        }) || end.as_ref().is_some_and(|e| {
+                            expr_contains_array_refs(e, locals)
+                                || expr_contains_array_refs_in_subscripts(e, locals)
+                        }) || stride.as_ref().is_some_and(|e| {
+                            expr_contains_array_refs(e, locals)
+                                || expr_contains_array_refs_in_subscripts(e, locals)
+                        })
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_scalarized_rank1_array_refs(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    dest_info: &LocalInfo,
+    loop_var: &str,
+) -> Option<(crate::ast::expr::SpannedExpr, bool)> {
+    if let Some((array_name, array_info)) = whole_array_named_info(locals, expr) {
+        if (array_info.dims.len() != 1 && !local_uses_array_descriptor(&array_info))
+            || !scalarization_arrays_compatible(dest_info, &array_info)
+        {
+            return None;
+        }
+        return Some((
+            synth_indexed_array_expr(&array_name, loop_var, expr.span),
+            true,
+        ));
+    }
+
+    match &expr.node {
+        Expr::Name { .. }
+        | Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::StringLiteral { .. } => Some((expr.clone(), false)),
+        Expr::ParenExpr { inner } => {
+            let (inner, changed) =
+                rewrite_scalarized_rank1_array_refs(inner, locals, dest_info, loop_var)?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::ParenExpr {
+                        inner: Box::new(inner),
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        Expr::UnaryOp { op, operand } => {
+            let (operand, changed) =
+                rewrite_scalarized_rank1_array_refs(operand, locals, dest_info, loop_var)?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::UnaryOp {
+                        op: op.clone(),
+                        operand: Box::new(operand),
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let (left, left_changed) =
+                rewrite_scalarized_rank1_array_refs(left, locals, dest_info, loop_var)?;
+            let (right, right_changed) =
+                rewrite_scalarized_rank1_array_refs(right, locals, dest_info, loop_var)?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::BinaryOp {
+                        op: op.clone(),
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    expr.span,
+                ),
+                left_changed || right_changed,
+            ))
+        }
+        Expr::ComponentAccess { base, component } => {
+            let (base, changed) =
+                rewrite_scalarized_rank1_array_refs(base, locals, dest_info, loop_var)?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::ComponentAccess {
+                        base: Box::new(base),
+                        component: component.clone(),
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        Expr::FunctionCall { callee, args } => {
+            let callee = (**callee).clone();
+            let mut changed = false;
+            let mut mapped_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let value = match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(e) => {
+                        let (mapped, arg_changed) =
+                            rewrite_scalarized_rank1_array_refs(e, locals, dest_info, loop_var)?;
+                        changed |= arg_changed;
+                        crate::ast::expr::SectionSubscript::Element(mapped)
+                    }
+                    crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                        let map_opt = |expr_opt: &Option<crate::ast::expr::SpannedExpr>,
+                                       changed: &mut bool|
+                         -> Option<Option<crate::ast::expr::SpannedExpr>> {
+                            expr_opt.as_ref().map_or(Some(None), |e| {
+                                let (mapped, did_change) = rewrite_scalarized_rank1_array_refs(
+                                    e, locals, dest_info, loop_var,
+                                )?;
+                                *changed |= did_change;
+                                Some(Some(mapped))
+                            })
+                        };
+                        let start = map_opt(start, &mut changed)?;
+                        let end = map_opt(end, &mut changed)?;
+                        let stride = map_opt(stride, &mut changed)?;
+                        crate::ast::expr::SectionSubscript::Range { start, end, stride }
+                    }
+                };
+                mapped_args.push(crate::ast::expr::Argument {
+                    keyword: arg.keyword.clone(),
+                    value,
+                });
+            }
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::FunctionCall {
+                        callee: Box::new(callee),
+                        args: mapped_args,
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn fresh_scalarized_ctor_name(locals: &HashMap<String, LocalInfo>, next_id: &mut usize) -> String {
+    loop {
+        let name = format!("afs_reduce_ctor_{}", *next_id);
+        *next_id += 1;
+        if !locals.contains_key(&name) {
+            return name;
+        }
+    }
+}
+
+fn materialize_scalarized_rank1_constructors(
+    b: &mut FuncBuilder,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &mut HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    next_id: &mut usize,
+) -> Option<crate::ast::expr::SpannedExpr> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let (desc, elem_ty) =
+                lower_array_expr_descriptor(b, locals, expr, st, type_layouts, None, None, None)?;
+            let first = first_array_constructor_expr(values)?;
+            let ft = crate::sema::types::expr_type(first, st);
+            let derived_type = match ft {
+                crate::sema::types::FortranType::Derived { name, .. } => Some(name),
+                _ => None,
+            };
+            let (local_ty, char_kind) =
+                if expr_is_character_expr(b, locals, first, st, type_layouts) {
+                    let elem_len =
+                        fixed_char_array_constructor_len(b, values, locals, st, type_layouts)?;
+                    (
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        CharKind::Fixed(elem_len),
+                    )
+                } else {
+                    (elem_ty, CharKind::None)
+                };
+            let name = fresh_scalarized_ctor_name(locals, next_id);
+            locals.insert(
+                name.clone(),
+                LocalInfo {
+                    addr: desc,
+                    ty: local_ty,
+                    dims: vec![],
+                    allocatable: true,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind,
+                    derived_type,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                },
+            );
+            Some(synth_name_expr(&name, expr.span))
+        }
+        Expr::ParenExpr { inner } => Some(crate::ast::Spanned::new(
+            Expr::ParenExpr {
+                inner: Box::new(materialize_scalarized_rank1_constructors(
+                    b,
+                    inner,
+                    locals,
+                    st,
+                    type_layouts,
+                    next_id,
+                )?),
+            },
+            expr.span,
+        )),
+        Expr::UnaryOp { op, operand } => Some(crate::ast::Spanned::new(
+            Expr::UnaryOp {
+                op: op.clone(),
+                operand: Box::new(materialize_scalarized_rank1_constructors(
+                    b,
+                    operand,
+                    locals,
+                    st,
+                    type_layouts,
+                    next_id,
+                )?),
+            },
+            expr.span,
+        )),
+        Expr::BinaryOp { op, left, right } => Some(crate::ast::Spanned::new(
+            Expr::BinaryOp {
+                op: op.clone(),
+                left: Box::new(materialize_scalarized_rank1_constructors(
+                    b,
+                    left,
+                    locals,
+                    st,
+                    type_layouts,
+                    next_id,
+                )?),
+                right: Box::new(materialize_scalarized_rank1_constructors(
+                    b,
+                    right,
+                    locals,
+                    st,
+                    type_layouts,
+                    next_id,
+                )?),
+            },
+            expr.span,
+        )),
+        Expr::ComponentAccess { base, component } => Some(crate::ast::Spanned::new(
+            Expr::ComponentAccess {
+                base: Box::new(materialize_scalarized_rank1_constructors(
+                    b,
+                    base,
+                    locals,
+                    st,
+                    type_layouts,
+                    next_id,
+                )?),
+                component: component.clone(),
+            },
+            expr.span,
+        )),
+        Expr::FunctionCall { callee, args } => {
+            let callee = materialize_scalarized_rank1_constructors(
+                b,
+                callee,
+                locals,
+                st,
+                type_layouts,
+                next_id,
+            )?;
+            let mut mapped_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let value = match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(inner) => {
+                        crate::ast::expr::SectionSubscript::Element(
+                            materialize_scalarized_rank1_constructors(
+                                b,
+                                inner,
+                                locals,
+                                st,
+                                type_layouts,
+                                next_id,
+                            )?,
+                        )
+                    }
+                    crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                        let mut map_opt = |expr_opt: &Option<crate::ast::expr::SpannedExpr>,
+                                           locals: &mut HashMap<String, LocalInfo>,
+                                           next_id: &mut usize|
+                         -> Option<Option<crate::ast::expr::SpannedExpr>> {
+                            expr_opt.as_ref().map_or(Some(None), |e| {
+                                materialize_scalarized_rank1_constructors(
+                                    b,
+                                    e,
+                                    locals,
+                                    st,
+                                    type_layouts,
+                                    next_id,
+                                )
+                                .map(Some)
+                            })
+                        };
+                        crate::ast::expr::SectionSubscript::Range {
+                            start: map_opt(start, locals, next_id)?,
+                            end: map_opt(end, locals, next_id)?,
+                            stride: map_opt(stride, locals, next_id)?,
+                        }
+                    }
+                };
+                mapped_args.push(crate::ast::expr::Argument {
+                    keyword: arg.keyword.clone(),
+                    value,
+                });
+            }
+            Some(crate::ast::Spanned::new(
+                Expr::FunctionCall {
+                    callee: Box::new(callee),
+                    args: mapped_args,
+                },
+                expr.span,
+            ))
+        }
+        _ => Some(expr.clone()),
+    }
+}
+
+fn scalarization_arrays_compatible(control_info: &LocalInfo, other_info: &LocalInfo) -> bool {
+    if !local_uses_array_descriptor(control_info) && !local_uses_array_descriptor(other_info) {
+        return control_info.dims == other_info.dims;
+    }
+
+    let control_rank = if !control_info.dims.is_empty() {
+        control_info.dims.len()
+    } else if local_uses_array_descriptor(control_info) {
+        1
+    } else {
+        0
+    };
+    let other_rank = if !other_info.dims.is_empty() {
+        other_info.dims.len()
+    } else if local_uses_array_descriptor(other_info) {
+        1
+    } else {
+        0
+    };
+
+    control_rank == other_rank
+}
+
+fn try_lower_scalarized_subscript_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_name: &str,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_name.is_empty() || !expr_contains_array_refs_in_subscripts(value, &ctx.locals) {
+        return false;
+    }
+    if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
+        return false;
+    }
+
+    let loop_var = fresh_synth_loop_var(&ctx.locals);
+    let Some((mapped_value, changed)) =
+        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var)
+    else {
+        return false;
+    };
+    if !changed {
+        return false;
+    }
+
+    let target = synth_indexed_array_expr(dest_name, &loop_var, value.span);
+    let body = vec![crate::ast::Spanned::new(
+        Stmt::Assignment {
+            target,
+            value: mapped_value,
+        },
+        value.span,
+    )];
+    let controls = vec![ConcurrentControl {
+        var: loop_var,
+        start: synth_int_expr(1, value.span),
+        end: synth_size_expr(dest_name, value.span),
+        step: None,
+    }];
+    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    true
 }
 
 fn try_lower_elemental_array_assign(
@@ -21399,6 +23589,9 @@ fn lower_reshape_array_expr_descriptor(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
     if args.len() < 2 {
         return None;
@@ -21411,8 +23604,16 @@ fn lower_reshape_array_expr_descriptor(
         return None;
     };
 
-    let (source_desc, elem_ty) =
-        lower_array_expr_descriptor(b, locals, source_expr, st, type_layouts)?;
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        source_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
     let extents = reshape_shape_extents(shape_expr, st)?;
     if extents.is_empty() {
         return None;
@@ -21538,10 +23739,219 @@ fn lower_array_function_result_descriptor(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
     let elem_ty = array_function_result_elem_type(b, locals, callee, args, st, type_layouts)?;
-    let desc = lower_expr_with_optional_layouts(b, locals, expr, st, type_layouts);
+    let desc = lower_expr_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
     Some((desc, elem_ty))
+}
+
+fn allocate_like_array_temp_descriptor(b: &mut FuncBuilder, source_desc: ValueId) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![desc, source_desc, stat],
+        IrType::Void,
+    );
+    desc
+}
+
+fn load_rank1_array_desc_elem(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+) -> ValueId {
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    let stride = load_array_desc_i64_field(b, desc, 24 + 16);
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let logical_index = b.imul(index, stride);
+    let byte_off = b.imul(logical_index, elem_size);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    b.load_typed(ptr, elem_ty.clone())
+}
+
+fn store_rank1_array_desc_elem(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+    value: ValueId,
+) {
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    let stride = load_array_desc_i64_field(b, desc, 24 + 16);
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let logical_index = b.imul(index, stride);
+    let byte_off = b.imul(logical_index, elem_size);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let stored = coerce_to_type(b, value, elem_ty);
+    b.store(stored, ptr);
+}
+
+fn lower_rank1_numeric_array_binary_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    op: &BinaryOp,
+    left: &crate::ast::expr::SpannedExpr,
+    right: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    let lhs = lower_array_expr_descriptor(
+        b,
+        locals,
+        left,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let rhs = lower_array_expr_descriptor(
+        b,
+        locals,
+        right,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+
+    if lhs.is_none() && rhs.is_none() {
+        return None;
+    }
+    if lhs.is_none() && expr_contains_array_refs(left, locals) {
+        return None;
+    }
+    if rhs.is_none() && expr_contains_array_refs(right, locals) {
+        return None;
+    }
+
+    let elem_ty = lhs
+        .as_ref()
+        .map(|(_, ty)| ty.clone())
+        .or_else(|| rhs.as_ref().map(|(_, ty)| ty.clone()))?;
+    match elem_ty {
+        IrType::Int(_) | IrType::Float(_) => {}
+        _ => return None,
+    }
+    let op_supported = matches!(
+        (&elem_ty, op),
+        (IrType::Int(_), BinaryOp::Add)
+            | (IrType::Int(_), BinaryOp::Sub)
+            | (IrType::Int(_), BinaryOp::Mul)
+            | (IrType::Int(_), BinaryOp::Div)
+            | (IrType::Float(_), BinaryOp::Add)
+            | (IrType::Float(_), BinaryOp::Sub)
+            | (IrType::Float(_), BinaryOp::Mul)
+            | (IrType::Float(_), BinaryOp::Div)
+    );
+    if !op_supported {
+        return None;
+    }
+
+    let source_desc = lhs
+        .as_ref()
+        .map(|(desc, _)| *desc)
+        .or_else(|| rhs.as_ref().map(|(desc, _)| *desc))?;
+    let result_desc = allocate_like_array_temp_descriptor(b, source_desc);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("array_expr_check");
+    let bb_body = b.create_block("array_expr_body");
+    let bb_exit = b.create_block("array_expr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let lhs_val = if let Some((desc, _)) = lhs.as_ref() {
+        load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+    } else {
+        let scalar = lower_expr_full(
+            b,
+            locals,
+            left,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        coerce_to_type(b, scalar, &elem_ty)
+    };
+    let rhs_val = if let Some((desc, _)) = rhs.as_ref() {
+        load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+    } else {
+        let scalar = lower_expr_full(
+            b,
+            locals,
+            right,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        coerce_to_type(b, scalar, &elem_ty)
+    };
+
+    let result = match (&elem_ty, op) {
+        (IrType::Int(_), BinaryOp::Add) => b.iadd(lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
+        _ => unreachable!("unsupported array op should have returned before block creation"),
+    };
+    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some((result_desc, elem_ty))
 }
 
 fn lower_array_expr_descriptor(
@@ -21550,11 +23960,33 @@ fn lower_array_expr_descriptor(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
     match &expr.node {
-        Expr::ParenExpr { inner } => {
-            lower_array_expr_descriptor(b, locals, inner, st, type_layouts)
-        }
+        Expr::ParenExpr { inner } => lower_array_expr_descriptor(
+            b,
+            locals,
+            inner,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
+        Expr::BinaryOp { op, left, right } => lower_rank1_numeric_array_binary_descriptor(
+            b,
+            locals,
+            op,
+            left,
+            right,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             if local_is_array_like(info) {
@@ -21585,7 +24017,16 @@ fn lower_array_expr_descriptor(
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 if name.eq_ignore_ascii_case("reshape") {
-                    return lower_reshape_array_expr_descriptor(b, locals, args, st, type_layouts);
+                    return lower_reshape_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
                 }
             }
             let info = match &callee.node {
@@ -21617,28 +24058,27 @@ fn lower_array_expr_descriptor(
                     ));
                 }
             }
-            lower_array_function_result_descriptor(b, locals, expr, callee, args, st, type_layouts)
+            lower_array_function_result_descriptor(
+                b,
+                locals,
+                expr,
+                callee,
+                args,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
         }
         Expr::ArrayConstructor { values, .. } => {
-            if values
-                .iter()
-                .any(|v| matches!(v, crate::ast::expr::AcValue::ImpliedDo(_)))
-            {
-                return None;
-            }
-
-            let expr_values: Vec<&crate::ast::expr::SpannedExpr> = values
-                .iter()
-                .filter_map(|v| match v {
-                    crate::ast::expr::AcValue::Expr(expr) => Some(expr),
-                    crate::ast::expr::AcValue::ImpliedDo(_) => None,
-                })
-                .collect();
-            let first = expr_values.first()?;
+            let first = first_array_constructor_expr(values)?;
 
             if expr_is_character_expr(b, locals, first, st, type_layouts) {
-                if let Some(elem_len_const) = fixed_char_array_constructor_len(values, locals) {
-                    let n = expr_values.len() as i64;
+                if let Some(elem_len_const) =
+                    fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
+                {
+                    let n = const_array_constructor_len(values)?;
                     let total_bytes = (elem_len_const * n).max(1) as u64;
                     let storage = b.alloca(IrType::Array(
                         Box::new(IrType::Int(IntWidth::I8)),
@@ -21648,17 +24088,18 @@ fn lower_array_expr_descriptor(
                     let base = b.gep(storage, vec![zero], IrType::Int(IntWidth::I8));
                     let elem_len = b.const_i64(elem_len_const);
 
-                    for (idx, expr) in expr_values.iter().enumerate() {
-                        let byte_offset = b.const_i64((idx as i64) * elem_len_const);
-                        let dest_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
-                        let (src_ptr, src_len) =
-                            lower_string_expr_with_layouts(b, locals, expr, st, type_layouts);
-                        b.call(
-                            FuncRef::External("afs_assign_char_fixed".into()),
-                            vec![dest_ptr, elem_len, src_ptr, src_len],
-                            IrType::Void,
-                        );
-                    }
+                    store_char_ac_values_into(
+                        b,
+                        locals,
+                        base,
+                        elem_len_const,
+                        values,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
 
                     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
                     let zero32 = b.const_i32(0);
@@ -21692,8 +24133,16 @@ fn lower_array_expr_descriptor(
             if values.len() == 1 {
                 if let crate::ast::expr::AcValue::Expr(first) = &values[0] {
                     if expr_is_character_expr(b, locals, first, st, type_layouts) {
-                        let (ptr, len) =
-                            lower_string_expr_with_layouts(b, locals, first, st, type_layouts);
+                        let (ptr, len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            first,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
                         let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                         b.store(ptr, slot);
                         let zero = b.const_i64(0);
@@ -21732,14 +24181,44 @@ fn lower_array_expr_descriptor(
             }
 
             let first_ft = crate::sema::types::expr_type(first, st);
-            let elem_ty = fortran_type_to_ir_scalar_type(&first_ft)
-                .unwrap_or_else(|| infer_const_expr_ty(&first.node, st));
-            let n = expr_values.len() as i64;
+            let elem_ty = match &first_ft {
+                crate::sema::types::FortranType::Derived { name, .. } => type_layouts
+                    .and_then(|tl| derived_storage_ir_type(name, tl))
+                    .unwrap_or_else(|| infer_const_expr_ty(&first.node, st)),
+                _ => fortran_type_to_ir_scalar_type(&first_ft)
+                    .unwrap_or_else(|| infer_const_expr_ty(&first.node, st)),
+            };
+            let n = const_array_constructor_len(values)?;
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1) as u64);
             let buf = b.alloca(arr_ty);
             let zero = b.const_i64(0);
             let base = b.gep(buf, vec![zero], elem_ty.clone());
-            store_ac_values_into(b, locals, base, &elem_ty, values, st);
+            let derived_type = match &first_ft {
+                crate::sema::types::FortranType::Derived { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            if derived_type.is_some() {
+                let zero32 = b.const_i32(0);
+                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1) as i64);
+                b.call(
+                    FuncRef::External("memset".into()),
+                    vec![buf, zero32, total_bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            }
+            store_ac_values_into(
+                b,
+                locals,
+                base,
+                &elem_ty,
+                derived_type,
+                values,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
 
             let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero32 = b.const_i32(0);
@@ -21797,8 +24276,50 @@ fn lower_1d_section_assign(
         IrType::Int(IntWidth::I64),
     );
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let src_desc =
-        lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
+    let scalarized_value = if expr_contains_array_refs_in_subscripts(value, &ctx.locals) {
+        let loop_var = fresh_synth_loop_var(&ctx.locals);
+        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var).and_then(
+            |(mapped, changed)| {
+                if !changed {
+                    return None;
+                }
+                let index_addr = b.alloca(IrType::Int(IntWidth::I32));
+                ctx.locals.insert(
+                    loop_var,
+                    LocalInfo {
+                        addr: index_addr,
+                        ty: IrType::Int(IntWidth::I32),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: false,
+                        runtime_dim_upper: vec![],
+                    },
+                );
+                Some((index_addr, mapped))
+            },
+        )
+    } else {
+        None
+    };
+    let src_desc = if scalarized_value.is_none() {
+        lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            value,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        )
+    } else {
+        None
+    };
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
@@ -21833,6 +24354,12 @@ fn lower_1d_section_assign(
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
+    if let Some((index_addr, _)) = scalarized_value.as_ref() {
+        let one = b.const_i64(1);
+        let one_based = b.iadd(i_val, one);
+        let one_based_i32 = coerce_to_type(b, one_based, &IrType::Int(IntWidth::I32));
+        b.store(one_based_i32, *index_addr);
+    }
 
     if dest_info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(dest_info) {
         let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
@@ -21841,7 +24368,9 @@ fn lower_1d_section_assign(
         let dest_off = b.imul(dest_index, dest_elem_len);
         let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-        let (src_ptr, src_len) = if let Some((desc, _)) = src_desc.as_ref() {
+        let (src_ptr, src_len) = if let Some((_, mapped)) = scalarized_value.as_ref() {
+            lower_string_expr_ctx(b, ctx, mapped)
+        } else if let Some((desc, _)) = src_desc.as_ref() {
             let src_base = b.load_typed(*desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             let src_stride = load_array_desc_i64_field(b, *desc, 24 + 16);
             let src_index = b.imul(i_val, src_stride);
@@ -21860,10 +24389,15 @@ fn lower_1d_section_assign(
     } else {
         let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(dest_info.ty.clone())));
         let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-        let scalar = src_desc.is_none().then(|| {
+        let scalar = if let Some((_, mapped)) = scalarized_value.as_ref() {
+            let raw = lower_expr_ctx_tl(b, ctx, mapped);
+            Some(coerce_to_type(b, raw, &dest_info.ty))
+        } else if src_desc.is_none() {
             let raw = lower_expr_ctx_tl(b, ctx, value);
-            coerce_to_type(b, raw, &dest_info.ty)
-        });
+            Some(coerce_to_type(b, raw, &dest_info.ty))
+        } else {
+            None
+        };
         let (src_base, src_stride, src_ty) = if let Some((desc, ty)) = src_desc.as_ref() {
             (
                 Some(b.load_typed(*desc, IrType::Ptr(Box::new(ty.clone())))),
@@ -22174,6 +24708,10 @@ fn lower_array_assign(
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) {
+    if try_lower_scalarized_subscript_array_assign(b, ctx, dest_name, dest_info, value) {
+        return;
+    }
+
     let dest_symbol_allocatable = (!dest_name.is_empty())
         .then(|| ctx.st.find_symbol_any_scope(&dest_name.to_lowercase()))
         .flatten()
@@ -22220,9 +24758,16 @@ fn lower_array_assign(
             }
         }
 
-        if let Some((src_desc, _)) =
-            lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts))
-        {
+        if let Some((src_desc, _)) = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            value,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        ) {
             b.call(
                 FuncRef::External("afs_assign_allocatable".into()),
                 vec![dest_desc, src_desc],
@@ -22237,9 +24782,32 @@ fn lower_array_assign(
     if let Expr::ArrayConstructor { values, .. } = &value.node {
         let dest_base = array_base_addr(b, dest_info);
         if let CharKind::Fixed(len) = dest_info.char_kind {
-            store_char_ac_values_into(b, &ctx.locals, dest_base, len, values, ctx.st);
+            store_char_ac_values_into(
+                b,
+                &ctx.locals,
+                dest_base,
+                len,
+                values,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            );
         } else {
-            store_ac_values_into(b, &ctx.locals, dest_base, &dest_info.ty, values, ctx.st);
+            store_ac_values_into(
+                b,
+                &ctx.locals,
+                dest_base,
+                &dest_info.ty,
+                dest_info.derived_type.as_deref(),
+                values,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            );
         }
         return;
     }
@@ -22256,8 +24824,16 @@ fn lower_array_assign(
         );
         let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
         let dest_elem_len = descriptor_elem_size(b, dest_desc);
-        let src_desc =
-            lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
+        let src_desc = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            value,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        );
         let src_n = src_desc.as_ref().map(|(desc, _)| {
             b.call(
                 FuncRef::External("afs_array_size".into()),
@@ -22457,6 +25033,7 @@ fn collect_array_names(
         }
         Expr::UnaryOp { operand, .. } => collect_array_names(operand, locals, out),
         Expr::ParenExpr { inner } => collect_array_names(inner, locals, out),
+        Expr::ComponentAccess { base, .. } => collect_array_names(base, locals, out),
         Expr::FunctionCall { args, .. } => {
             if let Expr::FunctionCall { callee, .. } = &expr.node {
                 collect_array_names(callee, locals, out);
@@ -22475,6 +25052,25 @@ fn collect_array_names(
                     }
                     if let Some(e) = stride {
                         collect_array_names(e, locals, out);
+                    }
+                }
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                match value {
+                    crate::ast::expr::AcValue::Expr(e) => collect_array_names(e, locals, out),
+                    crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                        collect_array_names(&ido.start, locals, out);
+                        collect_array_names(&ido.end, locals, out);
+                        if let Some(step) = &ido.step {
+                            collect_array_names(step, locals, out);
+                        }
+                        for inner in &ido.values {
+                            if let crate::ast::expr::AcValue::Expr(e) = inner {
+                                collect_array_names(e, locals, out);
+                            }
+                        }
                     }
                 }
             }
@@ -22786,26 +25382,39 @@ fn lower_scalar_allocated_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
-    let desc = match &expr.node {
+    let (desc, is_string) = match &expr.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             if !matches!(info.char_kind, CharKind::Deferred) {
-                return None;
+                if local_uses_array_descriptor(info) {
+                    (array_descriptor_addr(b, info), false)
+                } else {
+                    return None;
+                }
+            } else {
+                (string_descriptor_addr(b, info), true)
             }
-            string_descriptor_addr(b, info)
         }
         Expr::ComponentAccess { .. } => {
             let tl = type_layouts?;
             let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
-            if !matches!(field_char_kind(&field), CharKind::Deferred) || field.size != 32 {
+            if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32 {
+                (field_ptr, true)
+            } else if field.allocatable && field.size == 384 {
+                (field_ptr, false)
+            } else {
                 return None;
             }
-            field_ptr
         }
         _ => return None,
     };
+    let runtime = if is_string {
+        "afs_string_allocated"
+    } else {
+        "afs_array_allocated"
+    };
     let raw = b.call(
-        FuncRef::External("afs_string_allocated".into()),
+        FuncRef::External(runtime.into()),
         vec![desc],
         IrType::Int(IntWidth::I32),
     );
@@ -22952,6 +25561,51 @@ fn associate_alias_local_info(
     }
 }
 
+fn select_type_guard_alias_info(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    selector: &crate::ast::expr::SpannedExpr,
+    guard_type: &str,
+) -> Option<LocalInfo> {
+    let mut info = associate_alias_local_info(b, ctx, selector)?;
+    info.derived_type = Some(guard_type.to_string());
+    Some(info)
+}
+
+fn with_select_type_guard_binding<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    selector: &crate::ast::expr::SpannedExpr,
+    assoc_name: Option<&str>,
+    guard_type: &str,
+    f: F,
+) where
+    F: FnOnce(&mut FuncBuilder, &mut LowerCtx),
+{
+    let Some(info) = select_type_guard_alias_info(b, ctx, selector, guard_type) else {
+        f(b, ctx);
+        return;
+    };
+    let binding_name =
+        assoc_name
+            .map(|name| name.to_lowercase())
+            .or_else(|| match &selector.node {
+                Expr::Name { name } => Some(name.to_lowercase()),
+                _ => None,
+            });
+    let Some(binding_name) = binding_name else {
+        f(b, ctx);
+        return;
+    };
+    let saved = ctx.locals.insert(binding_name.clone(), info);
+    f(b, ctx);
+    if let Some(orig) = saved {
+        ctx.locals.insert(binding_name, orig);
+    } else {
+        ctx.locals.remove(&binding_name);
+    }
+}
+
 fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -22960,6 +25614,13 @@ fn lower_array_intrinsic(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<ValueId> {
+    let first_expr = args.first().and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            Some(e)
+        } else {
+            None
+        }
+    })?;
     let first_arg_info = args.first().and_then(|a| {
         if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
             match &e.node {
@@ -22979,12 +25640,19 @@ fn lower_array_intrinsic(
             None
         }
     });
-
-    let info = first_arg_info?;
-    let desc = if local_uses_array_descriptor(&info) {
-        array_descriptor_addr(b, &info)
+    let desc_and_ty =
+        lower_array_expr_descriptor(b, locals, first_expr, st, type_layouts, None, None, None);
+    let desc_from_expr = desc_and_ty.is_some();
+    let (desc, elem_ty) = if let Some((desc, elem_ty)) = desc_and_ty {
+        (desc, elem_ty)
     } else {
-        materialize_array_descriptor_for_info(b, &info)
+        let info = first_arg_info.clone()?;
+        let desc = if local_uses_array_descriptor(&info) {
+            array_descriptor_addr(b, &info)
+        } else {
+            materialize_array_descriptor_for_info(b, &info)
+        };
+        (desc, info.ty.clone())
     };
 
     match name {
@@ -22993,29 +25661,36 @@ fn lower_array_intrinsic(
                 // SIZE(array, dim)
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = if local_uses_array_descriptor(&info) {
-                        let desc = array_descriptor_addr(b, &info);
+                    let result64 = if let Some(info) = first_arg_info.as_ref() {
+                        if !desc_from_expr && !local_uses_array_descriptor(info) {
+                            let raw_dim = match b.func().value_type(dim) {
+                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                                _ => dim,
+                            };
+                            let one = b.const_i32(1);
+                            let zero = b.const_i64(0);
+                            let idx0 = b.isub(raw_dim, one);
+                            let mut result = zero;
+                            for (idx, (_lower, extent)) in info.dims.iter().enumerate() {
+                                let cond_idx = b.const_i32(idx as i32);
+                                let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                                let extent_val = b.const_i64(*extent);
+                                result = b.select(is_match, extent_val, result);
+                            }
+                            result
+                        } else {
+                            b.call(
+                                FuncRef::External("afs_array_size_dim".into()),
+                                vec![desc, dim],
+                                IrType::Int(IntWidth::I64),
+                            )
+                        }
+                    } else {
                         b.call(
                             FuncRef::External("afs_array_size_dim".into()),
                             vec![desc, dim],
                             IrType::Int(IntWidth::I64),
                         )
-                    } else {
-                        let raw_dim = match b.func().value_type(dim) {
-                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
-                            _ => dim,
-                        };
-                        let one = b.const_i32(1);
-                        let zero = b.const_i64(0);
-                        let idx0 = b.isub(raw_dim, one);
-                        let mut result = zero;
-                        for (idx, (_lower, extent)) in info.dims.iter().enumerate() {
-                            let cond_idx = b.const_i32(idx as i32);
-                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                            let extent_val = b.const_i64(*extent);
-                            result = b.select(is_match, extent_val, result);
-                        }
-                        result
                     };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else {
@@ -23023,16 +25698,23 @@ fn lower_array_intrinsic(
                 }
             } else {
                 // SIZE(array)
-                let result64 = if local_uses_array_descriptor(&info) {
-                    let desc = array_descriptor_addr(b, &info);
+                let result64 = if let Some(info) = first_arg_info.as_ref() {
+                    if !desc_from_expr && !local_uses_array_descriptor(info) {
+                        let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
+                        b.const_i64(total.max(0))
+                    } else {
+                        b.call(
+                            FuncRef::External("afs_array_size".into()),
+                            vec![desc],
+                            IrType::Int(IntWidth::I64),
+                        )
+                    }
+                } else {
                     b.call(
                         FuncRef::External("afs_array_size".into()),
                         vec![desc],
                         IrType::Int(IntWidth::I64),
                     )
-                } else {
-                    let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
-                    b.const_i64(total.max(0))
                 };
                 Some(b.int_trunc(result64, IntWidth::I32))
             }
@@ -23041,29 +25723,36 @@ fn lower_array_intrinsic(
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = if local_uses_array_descriptor(&info) {
-                        let desc = array_descriptor_addr(b, &info);
+                    let result64 = if let Some(info) = first_arg_info.as_ref() {
+                        if !desc_from_expr && !local_uses_array_descriptor(info) {
+                            let raw_dim = match b.func().value_type(dim) {
+                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                                _ => dim,
+                            };
+                            let one = b.const_i32(1);
+                            let default = b.const_i64(1);
+                            let idx0 = b.isub(raw_dim, one);
+                            let mut result = default;
+                            for (idx, (lower, _extent)) in info.dims.iter().enumerate() {
+                                let cond_idx = b.const_i32(idx as i32);
+                                let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                                let lower_val = b.const_i64(*lower);
+                                result = b.select(is_match, lower_val, result);
+                            }
+                            result
+                        } else {
+                            b.call(
+                                FuncRef::External("afs_array_lbound".into()),
+                                vec![desc, dim],
+                                IrType::Int(IntWidth::I64),
+                            )
+                        }
+                    } else {
                         b.call(
                             FuncRef::External("afs_array_lbound".into()),
                             vec![desc, dim],
                             IrType::Int(IntWidth::I64),
                         )
-                    } else {
-                        let raw_dim = match b.func().value_type(dim) {
-                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
-                            _ => dim,
-                        };
-                        let one = b.const_i32(1);
-                        let default = b.const_i64(1);
-                        let idx0 = b.isub(raw_dim, one);
-                        let mut result = default;
-                        for (idx, (lower, _extent)) in info.dims.iter().enumerate() {
-                            let cond_idx = b.const_i32(idx as i32);
-                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                            let lower_val = b.const_i64(*lower);
-                            result = b.select(is_match, lower_val, result);
-                        }
-                        result
                     };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else {
@@ -23077,29 +25766,36 @@ fn lower_array_intrinsic(
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
-                    let result64 = if local_uses_array_descriptor(&info) {
-                        let desc = array_descriptor_addr(b, &info);
+                    let result64 = if let Some(info) = first_arg_info.as_ref() {
+                        if !desc_from_expr && !local_uses_array_descriptor(info) {
+                            let raw_dim = match b.func().value_type(dim) {
+                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                                _ => dim,
+                            };
+                            let one = b.const_i32(1);
+                            let default = b.const_i64(0);
+                            let idx0 = b.isub(raw_dim, one);
+                            let mut result = default;
+                            for (idx, (lower, extent)) in info.dims.iter().enumerate() {
+                                let cond_idx = b.const_i32(idx as i32);
+                                let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                                let upper_val = b.const_i64(lower + extent - 1);
+                                result = b.select(is_match, upper_val, result);
+                            }
+                            result
+                        } else {
+                            b.call(
+                                FuncRef::External("afs_array_ubound".into()),
+                                vec![desc, dim],
+                                IrType::Int(IntWidth::I64),
+                            )
+                        }
+                    } else {
                         b.call(
                             FuncRef::External("afs_array_ubound".into()),
                             vec![desc, dim],
                             IrType::Int(IntWidth::I64),
                         )
-                    } else {
-                        let raw_dim = match b.func().value_type(dim) {
-                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
-                            _ => dim,
-                        };
-                        let one = b.const_i32(1);
-                        let default = b.const_i64(0);
-                        let idx0 = b.isub(raw_dim, one);
-                        let mut result = default;
-                        for (idx, (lower, extent)) in info.dims.iter().enumerate() {
-                            let cond_idx = b.const_i32(idx as i32);
-                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                            let upper_val = b.const_i64(lower + extent - 1);
-                            result = b.select(is_match, upper_val, result);
-                        }
-                        result
                     };
                     Some(b.int_trunc(result64, IntWidth::I32))
                 } else {
@@ -23119,7 +25815,7 @@ fn lower_array_intrinsic(
             Some(b.icmp(CmpOp::Ne, raw, zero))
         }
         "sum" => {
-            let is_real = first_arg_is_real(args, locals);
+            let is_real = elem_ty.is_float();
             if is_real {
                 Some(b.call(
                     FuncRef::External("afs_array_sum_real8".into()),
@@ -23135,7 +25831,7 @@ fn lower_array_intrinsic(
             }
         }
         "product" => {
-            let is_real = first_arg_is_real(args, locals);
+            let is_real = elem_ty.is_float();
             if is_real {
                 Some(b.call(
                     FuncRef::External("afs_array_product_real8".into()),
@@ -23151,7 +25847,7 @@ fn lower_array_intrinsic(
             }
         }
         "maxval" => {
-            let is_real = first_arg_is_real(args, locals);
+            let is_real = elem_ty.is_float();
             if is_real {
                 Some(b.call(
                     FuncRef::External("afs_array_maxval_real8".into()),
@@ -23167,7 +25863,7 @@ fn lower_array_intrinsic(
             }
         }
         "minval" => {
-            let is_real = first_arg_is_real(args, locals);
+            let is_real = elem_ty.is_float();
             if is_real {
                 Some(b.call(
                     FuncRef::External("afs_array_minval_real8".into()),
@@ -23333,7 +26029,7 @@ fn is_type_or_extends(
 /// Convert TypeInfo to IR type for field loads.
 fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     use crate::sema::symtab::TypeInfo;
-    if let TypeInfo::Derived(name) = ti {
+    if let TypeInfo::Derived(name) | TypeInfo::Class(name) = ti {
         let lower = name.to_lowercase();
         if lower == "c_ptr" || lower == "c_funptr" {
             return IrType::Int(IntWidth::I64);
@@ -23353,7 +26049,7 @@ fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     // type (e.g. one real field → 4 bytes) would fall into the
     // Int(I32) arm and the generic dispatcher would compare pointers
     // as integers.
-    if matches!(ti, TypeInfo::Derived(_)) {
+    if matches!(ti, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         return IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
     }
     let (size, _) = crate::sema::type_layout::size_of_type(ti);
@@ -23525,34 +26221,66 @@ fn apply_derived_field_default_inits(
         let Some(default_init) = &field.default_init else {
             continue;
         };
-        match default_init {
-            crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-                let src_ptr = b.const_string(value.as_bytes());
-                let dest_len = b.const_i64(field.size as i64);
-                let src_len = b.const_i64(value.len() as i64);
-                b.call(
-                    FuncRef::External("afs_assign_char_fixed".into()),
-                    vec![field_ptr, dest_len, src_ptr, src_len],
-                    IrType::Void,
-                );
-            }
-            crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
-                let field_ty = type_info_to_ir_type(&field.type_info);
-                let raw = materialize_const_scalar(
+        apply_field_default_init_runtime(b, field_ptr, field, default_init, registry);
+    }
+}
+
+fn apply_field_default_init_runtime(
+    b: &mut FuncBuilder,
+    field_ptr: ValueId,
+    field: &crate::sema::type_layout::FieldLayout,
+    default_init: &crate::sema::type_layout::FieldDefaultInit,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    match default_init {
+        crate::sema::type_layout::FieldDefaultInit::Character(value) => {
+            let src_ptr = b.const_string(value.as_bytes());
+            let dest_len = b.const_i64(field.size as i64);
+            let src_len = b.const_i64(value.len() as i64);
+            b.call(
+                FuncRef::External("afs_assign_char_fixed".into()),
+                vec![field_ptr, dest_len, src_ptr, src_len],
+                IrType::Void,
+            );
+        }
+        crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
+            let field_ty = type_info_to_ir_type(&field.type_info);
+            let raw = materialize_const_scalar(
+                b,
+                clamp_const_to_type(ConstScalar::Int(*value), &field_ty),
+                &field_ty,
+            );
+            b.store(raw, field_ptr);
+        }
+        crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
+            let field_ty = type_info_to_ir_type(&field.type_info);
+            let raw = materialize_const_scalar(
+                b,
+                clamp_const_to_type(ConstScalar::Int(if *value { 1 } else { 0 }), &field_ty),
+                &field_ty,
+            );
+            b.store(raw, field_ptr);
+        }
+        crate::sema::type_layout::FieldDefaultInit::Derived(overrides) => {
+            let Some(nested_name) = field_derived_type_name(field) else {
+                return;
+            };
+            let Some(nested_layout) = registry.get(&nested_name) else {
+                return;
+            };
+            for (nested_field_name, nested_init) in overrides {
+                let Some(nested_field) = nested_layout.field(nested_field_name) else {
+                    continue;
+                };
+                let nested_offset = b.const_i64(nested_field.offset as i64);
+                let nested_ptr = b.gep(field_ptr, vec![nested_offset], IrType::Int(IntWidth::I8));
+                apply_field_default_init_runtime(
                     b,
-                    clamp_const_to_type(ConstScalar::Int(*value), &field_ty),
-                    &field_ty,
+                    nested_ptr,
+                    nested_field,
+                    nested_init,
+                    registry,
                 );
-                b.store(raw, field_ptr);
-            }
-            crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
-                let field_ty = type_info_to_ir_type(&field.type_info);
-                let raw = materialize_const_scalar(
-                    b,
-                    clamp_const_to_type(ConstScalar::Int(if *value { 1 } else { 0 }), &field_ty),
-                    &field_ty,
-                );
-                b.store(raw, field_ptr);
             }
         }
     }
@@ -23671,7 +26399,7 @@ fn resolve_component_base(
                 } else {
                     b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                 }
-            } else if info.allocatable {
+            } else if local_uses_array_descriptor(info) && info.dims.is_empty() {
                 array_base_addr(b, info)
             } else if info.by_ref {
                 b.load(info.addr)
@@ -23690,11 +26418,9 @@ fn resolve_component_base(
             let field = layout.field(component)?;
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
-            // The field must be a derived type for chaining to continue.
-            if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
-                if is_opaque_c_handle_type(&field.type_info) {
-                    return None;
-                }
+            // The field must be a concrete typed derived/class component for
+            // chaining to continue.
+            if let Some(nested_type) = field_derived_type_name(field) {
                 let addr = if field.pointer {
                     // Scalar derived POINTER components store an address slot,
                     // while descriptor-backed POINTER components store the
@@ -23709,7 +26435,7 @@ fn resolve_component_base(
                 } else {
                     field_ptr
                 };
-                Some((addr, nested_type.clone()))
+                Some((addr, nested_type))
             } else {
                 None // Terminal field — caller should load, not chain further.
             }
@@ -23825,6 +26551,7 @@ fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> CharKind {
 fn field_derived_type_name(field: &crate::sema::type_layout::FieldLayout) -> Option<String> {
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Derived(name)
+        | crate::sema::symtab::TypeInfo::Class(name)
             if !is_opaque_c_handle_type(&field.type_info) =>
         {
             Some(name.clone())
@@ -23910,6 +26637,52 @@ fn expr_is_array_designator(
     }
 }
 
+fn expr_is_callable_character_callee(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    use crate::sema::symtab::SymbolKind;
+
+    match &expr.node {
+        Expr::Name { name } => {
+            if named_expr_callable_character_return_abi(st, locals, name).is_some() {
+                return true;
+            }
+            let key = name.to_lowercase();
+            if procedure_pointer_signature_key(st, &key).is_some() {
+                return true;
+            }
+            st.find_symbol_any_scope(&key).is_some_and(|sym| {
+                matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                        | SymbolKind::NamedInterface
+                )
+            })
+        }
+        Expr::ComponentAccess { base, component } => {
+            if let Some(tl) = type_layouts {
+                if let Some((_, type_name)) =
+                    resolve_component_base_for_method(b, locals, base, st, tl)
+                {
+                    if let Some(layout) = tl.get(&type_name) {
+                        return layout.bound_proc(component).is_some();
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn expr_is_character_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -23929,7 +26702,11 @@ fn expr_is_character_expr(
                 info.char_kind != CharKind::None
                     || local_fixed_char_allocatable_scalar_len(info).is_some()
             })
-            .unwrap_or(false),
+            .unwrap_or_else(|| {
+                st.find_symbol_any_scope(name)
+                    .and_then(|sym| sym.type_info.as_ref())
+                    .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Character { .. }))
+            }),
         Expr::ComponentAccess { .. } => type_layouts
             .and_then(|tl| resolve_component_field_access(b, locals, expr, st, tl))
             .map(|(_, field)| {
@@ -24416,8 +27193,16 @@ fn lower_derived_array_copy_loop(
         .map(|layout| layout.size as i64)
         .unwrap_or(8);
     let elem_bytes_val = b.const_i64(elem_bytes);
-    let src_desc =
-        lower_array_expr_descriptor(b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts));
+    let src_desc = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
@@ -24882,8 +27667,17 @@ fn allocate_descriptor_keyword_expr(
     keyword: &str,
 ) -> Option<ValueId> {
     let expr = allocate_keyword_expr(opts, keyword)?;
-    lower_array_expr_descriptor(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
-        .map(|(desc, _)| desc)
+    lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )
+    .map(|(desc, _)| desc)
 }
 
 fn emit_allocatable_source_copy_on_success(
@@ -25826,16 +28620,15 @@ fn lower_expr_full(
                 .as_deref()
                 .map(|kind_str| int_kind_to_width(kind_str, st))
                 .unwrap_or_else(crate::driver::defaults::default_int_kind);
-            if kind_width >= 16 {
-                b.const_i128(clean.parse::<i128>().unwrap_or(0))
-            } else {
-                let val: i128 = clean.parse().unwrap_or(0);
-                if kind_width >= 8 || val > i32::MAX as i128 || val < i32::MIN as i128 {
-                    b.const_i64(val as i64)
-                } else {
-                    b.const_i32(val as i32)
-                }
-            }
+            let val: i128 = clean.parse().unwrap_or(0);
+            let width = match kind_width {
+                0..=1 => IntWidth::I8,
+                2 => IntWidth::I16,
+                3..=4 => IntWidth::I32,
+                5..=8 => IntWidth::I64,
+                _ => IntWidth::I128,
+            };
+            b.const_int(val, width)
         }
         Expr::RealLiteral { text, kind } => {
             let val: f64 = text
@@ -25968,7 +28761,12 @@ fn lower_expr_full(
             } else {
                 if let Some(sym) = st.find_symbol_any_scope(&key) {
                     if let Some(cv) = sym.const_value {
-                        if i32::try_from(cv).is_ok() {
+                        if let Some(type_info) = sym.type_info.as_ref() {
+                            let target = type_info_to_ir_type(type_info);
+                            let clamped =
+                                clamp_const_to_type(ConstScalar::Int(cv as i128), &target);
+                            materialize_const_scalar(b, clamped, &target)
+                        } else if i32::try_from(cv).is_ok() {
                             b.const_i32(cv as i32)
                         } else {
                             b.const_i64(cv)
@@ -25983,6 +28781,22 @@ fn lower_expr_full(
         }
 
         Expr::BinaryOp { op, left, right } => {
+            if matches!(op, BinaryOp::Concat)
+                && expr_is_character_expr(b, locals, left, st, type_layouts)
+                && expr_is_character_expr(b, locals, right, st, type_layouts)
+            {
+                let (ptr, _len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                return ptr;
+            }
             if matches!(
                 op,
                 BinaryOp::Eq
@@ -26076,17 +28890,33 @@ fn lower_expr_full(
             // matches the actual operand types, emit a call instead of
             // arithmetic. Needed for e.g. `type(vec) + type(vec)` — the
             // default arithmetic would ICE trying to `iadd` pointers.
-            if let Some(resolved) = resolve_operator_overload(st, b, op, &lty, &rty, lhs, rhs) {
-                let (specific, arg_vals) = resolved;
-                let ret_ty =
-                    callee_return_ir_type(st, &specific).unwrap_or(IrType::Int(IntWidth::I32));
-                let specific_key = specific.to_lowercase();
-                let (call_name, _) = resolved_symbol_call_target(st, &specific_key, &specific);
-                let func_ref = internal_funcs
-                    .and_then(|m| m.get(&specific_key).copied())
-                    .map(FuncRef::Internal)
-                    .unwrap_or_else(|| FuncRef::External(call_name));
-                return b.call(func_ref, arg_vals, ret_ty);
+            if let Some(specific) = resolve_operator_overload(
+                b,
+                locals,
+                st,
+                type_layouts,
+                op,
+                &lty,
+                &rty,
+                left,
+                right,
+                lhs,
+                rhs,
+            ) {
+                return emit_resolved_operator_call(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    &specific,
+                    left,
+                    right,
+                    lhs,
+                    rhs,
+                );
             }
 
             // Complex arithmetic: both operands are ptr<[f32/f64 x 2]>.
@@ -26296,6 +29126,7 @@ fn lower_expr_full(
             if args.len() == 1
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts)
+                && !expr_is_callable_character_callee(b, locals, callee, st, type_layouts)
             {
                 match &args[0].value {
                     crate::ast::expr::SectionSubscript::Range { start, end, .. } => {
@@ -26343,6 +29174,7 @@ fn lower_expr_full(
                     .as_ref()
                     .map(|(_, sig_key)| sig_key.clone())
                     .unwrap_or_else(|| key.clone());
+                let has_named_interface = find_named_interface_symbol(st, &key).is_some();
 
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
@@ -26360,96 +29192,54 @@ fn lower_expr_full(
                 // Check for pointer intrinsics (ASSOCIATED) first —
                 // these work on every pointer shape and don't care
                 // about the array-intrinsic filter.
-                if let Some(result) =
-                    lower_pointer_intrinsic(b, locals, &key, args, st, type_layouts)
-                {
-                    return result;
-                }
-
-                if let Some(result) =
-                    lower_scalar_allocated_intrinsic(b, locals, &key, args, st, type_layouts)
-                {
-                    return result;
-                }
-
-                if let Some(result) = lower_any_intrinsic_ast(
-                    b,
-                    &key,
-                    args,
-                    locals,
-                    st,
-                    type_layouts,
-                    internal_funcs,
-                    contained_host_refs,
-                    descriptor_params,
-                ) {
-                    return result;
-                }
-
-                // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
-                if let Some(result) = lower_array_intrinsic(b, locals, &key, args, st, type_layouts)
-                {
-                    return result;
-                }
-
-                // Check if this is a structure constructor: type_name(val1, val2, ...).
-                if let Some(tl) = type_layouts {
-                    if let Some(layout) = tl.get(&key) {
-                        // Allocate a temporary struct on the stack and apply
-                        // the same runtime defaults as ordinary derived storage.
-                        let struct_ty =
-                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
-                        let tmp = b.alloca(struct_ty);
-                        if derived_layout_needs_runtime_initialization(layout, tl) {
-                            initialize_derived_storage(b, tmp, layout, tl);
-                        } else {
-                            zero_fill_bytes(b, tmp, layout.size as i64);
-                        }
-
-                        if args.len() != layout.fields.len() {
-                            eprintln!("warning: structure constructor for '{}' has {} args but type has {} fields",
-                                key, args.len(), layout.fields.len());
-                        }
-
-                        // Store each argument into the corresponding field.
-                        for (i, arg) in args.iter().enumerate() {
-                            if i < layout.fields.len() {
-                                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                    let offset = b.const_i64(layout.fields[i].offset as i64);
-                                    let field_ptr =
-                                        b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
-                                    store_derived_field_expr(
-                                        b,
-                                        locals,
-                                        field_ptr,
-                                        &layout.fields[i],
-                                        e,
-                                        st,
-                                        tl,
-                                        internal_funcs,
-                                        contained_host_refs,
-                                        descriptor_params,
-                                    );
-                                }
-                            }
-                        }
-                        return tmp;
+                if !has_named_interface {
+                    if let Some(result) =
+                        lower_pointer_intrinsic(b, locals, &key, args, st, type_layouts)
+                    {
+                        return result;
                     }
-                }
 
-                // Try character intrinsics (need access to locals for CharKind).
-                if let Some(result) = lower_char_intrinsic(
-                    b,
-                    &key,
-                    args,
-                    locals,
-                    st,
-                    type_layouts,
-                    internal_funcs,
-                    contained_host_refs,
-                    descriptor_params,
-                ) {
-                    return result;
+                    if let Some(result) =
+                        lower_scalar_allocated_intrinsic(b, locals, &key, args, st, type_layouts)
+                    {
+                        return result;
+                    }
+
+                    if let Some(result) = lower_logical_reduction_intrinsic_ast(
+                        b,
+                        &key,
+                        args,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+
+                    // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
+                    if let Some(result) =
+                        lower_array_intrinsic(b, locals, &key, args, st, type_layouts)
+                    {
+                        return result;
+                    }
+
+                    // Try character intrinsics (need access to locals for CharKind).
+                    if let Some(result) = lower_char_intrinsic(
+                        b,
+                        &key,
+                        args,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
                 }
 
                 // PRESENT(x): check if optional dummy argument x was passed.
@@ -26641,13 +29431,57 @@ fn lower_expr_full(
                 // (symmetric with the Stmt::Call path). Binds by name
                 // when the callee's arg_order is resolvable.
                 let original_args = args;
-                let arg_slots = reorder_args_by_keyword_slots(original_args, &signature_key, st);
-                let present_args: Vec<crate::ast::expr::Argument> =
-                    arg_slots.iter().flatten().cloned().collect();
-                let args: &[crate::ast::expr::Argument] = &present_args;
+                let resolution_arg_vals: Vec<ValueId> = original_args
+                    .iter()
+                    .map(|arg| match &arg.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            generic_dispatch_probe_value(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        }
+                        _ => b.const_i32(0),
+                    })
+                    .collect();
+
+                let fallback_to_structure_ctor = has_named_interface
+                    && type_layouts.is_some_and(|tl| tl.get(&key).is_some())
+                    && resolve_generic_call_actuals(
+                        st,
+                        b,
+                        &key,
+                        original_args,
+                        &resolution_arg_vals,
+                    )
+                    .is_none();
+
+                if !has_named_interface || fallback_to_structure_ctor {
+                    if let Some(tmp) = lower_structure_constructor_expr(
+                        b,
+                        locals,
+                        &key,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return tmp;
+                    }
+                }
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
-                let intrinsic_arg_vals: Vec<ValueId> = args
+                let intrinsic_arg_slots = reorder_args_by_keyword_slots(original_args, &key, st);
+                let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                    intrinsic_arg_slots.iter().flatten().cloned().collect();
+                let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
                     .iter()
                     .map(|a| match &a.value {
                         crate::ast::expr::SectionSubscript::Element(e) => {
@@ -26666,8 +29500,10 @@ fn lower_expr_full(
                     })
                     .collect();
 
-                if let Some(result) = lower_intrinsic(b, &key, &intrinsic_arg_vals) {
-                    return result;
+                if !has_named_interface {
+                    if let Some(result) = lower_intrinsic(b, &key, &intrinsic_arg_vals) {
+                        return result;
+                    }
                 }
 
                 // Resolve generic interface names to specific procedures.
@@ -26680,23 +29516,25 @@ fn lower_expr_full(
                 let (call_name, callee_key) = if procptr_target.is_some() {
                     (String::new(), signature_key.clone())
                 } else {
-                    let resolved_name = match resolve_generic_call(st, b, &key, &intrinsic_arg_vals)
-                    {
+                    let resolved_name = match resolve_generic_call_actuals(
+                        st,
+                        b,
+                        &key,
+                        original_args,
+                        &resolution_arg_vals,
+                    ) {
                         Some(n) => n,
                         None => {
-                            if let Some(sym) = st.find_symbol_any_scope(&key) {
-                                if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface {
-                                    let specifics = sym.arg_names.join(", ");
-                                    eprintln!(
-                                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                                            expr.span.start.line,
-                                            expr.span.start.col,
-                                            name,
-                                            specifics,
-                                        );
-                                    let _ = std::io::stderr().flush();
-                                    std::process::exit(1);
-                                }
+                            if let Some(specifics) = named_interface_specifics(st, &key) {
+                                eprintln!(
+                                    "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                                    expr.span.start.line,
+                                    expr.span.start.col,
+                                    name,
+                                    specifics.join(", "),
+                                );
+                                let _ = std::io::stderr().flush();
+                                std::process::exit(1);
                             }
                             name.clone()
                         }
@@ -26704,43 +29542,79 @@ fn lower_expr_full(
                     let resolved_key = resolved_name.to_lowercase();
                     resolved_symbol_call_target(st, &resolved_key, &resolved_name)
                 };
+                let arg_slots = reorder_args_by_keyword_slots(
+                    original_args,
+                    if procptr_target.is_some() {
+                        &signature_key
+                    } else {
+                        &callee_key
+                    },
+                    st,
+                );
                 let abi_lookup_keys =
                     procedure_abi_lookup_keys(st, &[&callee_key, &signature_key, &key]);
                 let abi_primary_key = abi_lookup_keys
                     .first()
                     .map(String::as_str)
                     .unwrap_or(callee_key.as_str());
-                if procptr_target.is_none()
-                    && matches!(
-                        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(
-                            st, k
-                        )),
-                        Some(HiddenResultAbi::ArrayDescriptor)
-                    )
-                {
-                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-                    let zero_i32 = b.const_i32(0);
-                    let size384 = b.const_i64(384);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![desc, zero_i32, size384],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    emit_named_function_call(
-                        b,
-                        locals,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                        name,
-                        original_args,
-                        Some(desc),
-                        true,
-                        IrType::Void,
-                    );
-                    return desc;
+                if procptr_target.is_none() {
+                    match first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_hidden_result_abi(st, k)
+                    }) {
+                        Some(HiddenResultAbi::ArrayDescriptor) => {
+                            let desc =
+                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                            let zero_i32 = b.const_i32(0);
+                            let size384 = b.const_i64(384);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![desc, zero_i32, size384],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            emit_named_function_call(
+                                b,
+                                locals,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                name,
+                                original_args,
+                                Some(desc),
+                                true,
+                                IrType::Void,
+                            );
+                            return desc;
+                        }
+                        Some(HiddenResultAbi::StringDescriptor) => {
+                            let desc =
+                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32));
+                            let zero_i32 = b.const_i32(0);
+                            let size32 = b.const_i64(32);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![desc, zero_i32, size32],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            emit_named_function_call(
+                                b,
+                                locals,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                name,
+                                original_args,
+                                Some(desc),
+                                true,
+                                IrType::Void,
+                            );
+                            return desc;
+                        }
+                        _ => {}
+                    }
                 }
                 let callee_value_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
@@ -27368,24 +30242,62 @@ fn lower_expr_full(
             // appears as a function argument or print item; the
             // assignment form (`a = [1,2,3]`) bypasses this and
             // routes through lower_array_assign for direct stores.
-            let elem_ty = values
-                .iter()
-                .find_map(|v| match v {
-                    crate::ast::expr::AcValue::Expr(e) => {
-                        // Peek at the first element's type by
-                        // lowering it on a scratch path. Rather
-                        // than actually lower (and have to undo),
-                        // approximate from the AST: integer
-                        // literals → i32, real → f64, etc.
-                        Some(infer_const_expr_ty(&e.node, st))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(IrType::Int(IntWidth::I32));
-            let n = values.len() as u64;
+            let first_expr = first_array_constructor_expr(values);
+            let first_ft = first_expr.map(|e| crate::sema::types::expr_type(e, st));
+            let elem_ty = match first_ft.as_ref() {
+                Some(crate::sema::types::FortranType::Derived { name, .. }) => type_layouts
+                    .and_then(|tl| derived_storage_ir_type(name, tl))
+                    .or_else(|| {
+                        first_expr.map(|e| {
+                            // Peek at the first element's type by lowering
+                            // it on a scratch path. Rather than actually
+                            // lower (and have to undo), approximate from
+                            // the AST: integer literals → i32, real → f64,
+                            // etc.
+                            infer_const_expr_ty(&e.node, st)
+                        })
+                    })
+                    .unwrap_or(IrType::Int(IntWidth::I32)),
+                _ => first_expr
+                    .map(|e| {
+                        // Peek at the first element's type by lowering
+                        // it on a scratch path. Rather than actually
+                        // lower (and have to undo), approximate from
+                        // the AST: integer literals → i32, real → f64,
+                        // etc.
+                        infer_const_expr_ty(&e.node, st)
+                    })
+                    .unwrap_or(IrType::Int(IntWidth::I32)),
+            };
+            let n = const_array_constructor_len(values).unwrap_or(values.len() as i64) as u64;
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1));
             let buf = b.alloca(arr_ty);
-            store_ac_values_into(b, locals, buf, &elem_ty, values, st);
+            let derived_type = first_ft.as_ref().and_then(|ft| match ft {
+                crate::sema::types::FortranType::Derived { name, .. } => Some(name.as_str()),
+                _ => None,
+            });
+            if derived_type.is_some() {
+                let zero32 = b.const_i32(0);
+                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1) as i64);
+                b.call(
+                    FuncRef::External("memset".into()),
+                    vec![buf, zero32, total_bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            }
+            store_ac_values_into(
+                b,
+                locals,
+                buf,
+                &elem_ty,
+                derived_type,
+                values,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             buf
         }
 
@@ -27471,6 +30383,65 @@ fn infer_const_expr_ty(e: &Expr, st: &SymbolTable) -> IrType {
         Expr::ParenExpr { inner } => infer_const_expr_ty(&inner.node, st),
         _ => IrType::Int(IntWidth::I32),
     }
+}
+
+fn lower_structure_constructor_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    type_name: &str,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let tl = type_layouts?;
+    let layout = tl.get(type_name)?;
+
+    let struct_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
+    let tmp = b.alloca(struct_ty);
+    if derived_layout_needs_runtime_initialization(layout, tl) {
+        initialize_derived_storage(b, tmp, layout, tl);
+    } else {
+        zero_fill_bytes(b, tmp, layout.size as i64);
+    }
+
+    let mut positional_idx = 0usize;
+    for arg in args {
+        let field = if let Some(keyword) = &arg.keyword {
+            layout.field(keyword)
+        } else {
+            let field = layout.fields.get(positional_idx);
+            positional_idx += 1;
+            field
+        };
+        let Some(field) = field else {
+            eprintln!(
+                "warning: structure constructor for '{}' has invalid field initializer",
+                type_name
+            );
+            continue;
+        };
+        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+            let offset = b.const_i64(field.offset as i64);
+            let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
+            store_derived_field_expr(
+                b,
+                locals,
+                field_ptr,
+                field,
+                e,
+                st,
+                tl,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+        }
+    }
+
+    Some(tmp)
 }
 
 fn fortran_type_to_ir_scalar_type(ft: &crate::sema::types::FortranType) -> Option<IrType> {
@@ -27567,6 +30538,33 @@ end program
         assert!(ir.contains("const_int 10"));
         assert!(ir.contains("const_int 20"));
         assert!(ir.contains("iadd"));
+    }
+
+    #[test]
+    fn select_type_pointer_result_component_assignment_verifies() {
+        lower_and_verify(
+            "\
+module m
+  implicit none
+  type :: base_t
+  end type base_t
+  type, extends(base_t) :: float_box
+    real(8) :: raw = 0.0d0
+  end type float_box
+contains
+  function cast_float(val) result(ptr)
+    class(base_t), intent(in), target :: val
+    real(8), pointer :: ptr
+    select type (val)
+    type is (float_box)
+      ptr => val%raw
+    class default
+      nullify(ptr)
+    end select
+  end function cast_float
+end module m
+",
+        );
     }
 
     #[test]
@@ -27736,6 +30734,46 @@ end program
 ",
         );
         assert!(ir.contains("ineg"));
+    }
+
+    #[test]
+    fn vector_subscripted_component_assign_does_not_poison_following_array_use() {
+        let _ = lower_and_verify(
+            "\
+module m
+  implicit none
+  type :: toml_label
+    integer :: first
+  end type
+  type :: line_token
+    integer :: first, last
+  end type
+contains
+  pure function line_tokens(input) result(token)
+    character(len=*), intent(in) :: input
+    type(line_token), allocatable :: token(:)
+    allocate(token(2))
+    token = [line_token(1, 1), line_token(2, len(input))]
+  end function
+
+  pure function f(input, label) result(first)
+    character(len=*), intent(in) :: input
+    type(toml_label), intent(in) :: label(:)
+    integer :: first
+    integer :: line(size(label))
+    integer :: shift(size(label))
+    type(line_token), allocatable :: token(:)
+    integer :: it
+
+    allocate(token(0))
+    token = line_tokens(input)
+    line(:) = [(count(token%first <= label(it)%first), it = 1, size(label))]
+    shift(:) = token(line)%first
+    first = line(1)
+  end function
+end module
+",
+        );
     }
 
     #[test]
