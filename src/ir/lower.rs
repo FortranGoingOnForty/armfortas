@@ -10306,6 +10306,8 @@ fn emit_resolved_operator_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -11060,6 +11062,8 @@ fn emit_named_function_call(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
@@ -11332,6 +11336,8 @@ fn emit_bound_function_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -11546,6 +11552,8 @@ fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
@@ -15885,6 +15893,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     .as_ref()
                                     .map(|mask| mask.get(i).copied().unwrap_or(false))
                                     .unwrap_or(false);
+                                let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                                let wants_string_descriptor =
+                                    wants_string_descriptor && !wants_bind_c_char;
                                 let value = match slot {
                                     Some(arg) => match &arg.value {
                                         crate::ast::expr::SectionSubscript::Element(e) => {
@@ -16040,6 +16051,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                        let wants_string_descriptor =
+                            wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -16275,6 +16289,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                        let wants_string_descriptor =
+                            wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -29759,6 +29776,8 @@ fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                    let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                     let wants_pointer = callee_pointer_args
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -30017,6 +30036,9 @@ fn lower_expr_full(
                                         .as_ref()
                                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                                         .unwrap_or(false);
+                                    let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                                    let wants_string_descriptor =
+                                        wants_string_descriptor && !wants_bind_c_char;
                                     let wants_pointer = callee_pointer_args
                                         .as_ref()
                                         .map(|mask| mask.get(i).copied().unwrap_or(false))
