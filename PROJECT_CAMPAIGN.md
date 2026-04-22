@@ -58,6 +58,15 @@ Secondary targets worth keeping warm:
 - `fgof-watch`
   - portable file-watching library with polling-backed watch-session semantics
   - good low-dependency target for filesystem change detection and library packaging behavior
+- `fgof-temp`
+  - temp-file, temp-directory, and atomic-write library with real filesystem lifecycle coverage
+  - good low-noise target for ownership, cleanup, and exact-text I/O truthfulness
+- `fgof-cache`
+  - disk-cache library with sharding, stale pruning, and atomic text persistence
+  - good layered package target once `fgof-temp` stays green
+- `fgof-state`
+  - persistent state library with versioned document load/save and atomic replacement
+  - good layered package target for durable app/workspace state semantics after `fgof-temp`
 
 Current de-prioritized projects:
 
