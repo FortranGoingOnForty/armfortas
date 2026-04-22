@@ -19,6 +19,18 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
     }
 }
 
+fn assert_i128_return_stored_after_call(asm: &str, call_marker: &str, context: &str) {
+    let call_idx = asm
+        .find(call_marker)
+        .unwrap_or_else(|| panic!("missing call marker '{}' in:\n{}", call_marker, asm));
+    assert!(
+        asm[call_idx..].contains("stp x0, x1, [x29, #-"),
+        "{}:\n{}",
+        context,
+        asm
+    );
+}
+
 #[test]
 fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
     let asm = capture_text(
@@ -45,10 +57,10 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
         "callee should load the incoming stack-passed integer(16) arg from [x29, #16]:\n{}",
         asm
     );
-    assert!(
-        asm.contains("stp x0, x1, [x29, #-360]"),
-        "caller should still receive the returned integer(16) value in x0/x1 even when args spill to the stack:\n{}",
-        asm
+    assert_i128_return_stored_after_call(
+        &asm,
+        "bl _afs_internal_",
+        "caller should still receive the returned integer(16) value in x0/x1 even when args spill to the stack",
     );
 }
 
@@ -165,10 +177,10 @@ fn external_i128_stack_call_spills_fifth_arg_and_tracks_symbol_at_o0() {
         "fifth external integer(16) arg should spill to the outgoing stack area:\n{}",
         asm
     );
-    assert!(
-        asm.contains("stp x0, x1, [x29, #-360]"),
-        "external integer(16) stack-call should still receive the returned value in x0/x1:\n{}",
-        asm
+    assert_i128_return_stored_after_call(
+        &asm,
+        "bl _add5_ext",
+        "external integer(16) stack-call should still receive the returned value in x0/x1",
     );
 }
 

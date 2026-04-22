@@ -1363,10 +1363,10 @@ fn select_inst(
         // Slow path (unfused): the condition is an arbitrary boolean in a
         // register. Materialize with `CMP cond, #0; CSEL dest, tv, fv, NE`.
         InstKind::Select(cond, tv, fv) => {
-            let true_reg = ctx.lookup_vreg(*tv);
-            let false_reg = ctx.lookup_vreg(*fv);
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
+            let true_reg = coerce_select_operand_vreg(mf, ctx, mb, func, *tv, &inst.ty);
+            let false_reg = coerce_select_operand_vreg(mf, ctx, mb, func, *fv, &inst.ty);
 
             let arm_cond = if let Some(&fused_cond) = ctx.fused_arm_cond.get(cond) {
                 // Flags already set by the fused CMP — no extra compare needed.
@@ -2773,6 +2773,60 @@ fn icmp_operand_vreg(
     dest
 }
 
+fn machine_vreg_class(mf: &MachineFunction, vreg: VRegId) -> RegClass {
+    mf.vregs
+        .iter()
+        .find(|r| r.id == vreg)
+        .map(|r| r.class)
+        .expect("isel: vreg not registered")
+}
+
+fn coerce_select_operand_vreg(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    func: &Function,
+    value: ValueId,
+    target_ty: &IrType,
+) -> VRegId {
+    let src = ctx.lookup_vreg(value);
+    let src_class = machine_vreg_class(mf, src);
+    let target_class = type_to_reg_class(target_ty);
+    if src_class == target_class {
+        return src;
+    }
+
+    let dest = mf.new_vreg(target_class);
+    let src_ty = func.value_type(value);
+    let opcode = match (src_class, target_class) {
+        (RegClass::Gp32, RegClass::Gp64) => {
+            if matches!(target_ty, IrType::Ptr(_) | IrType::FuncPtr(_))
+                || zero_extend_cmp_type(src_ty.as_ref())
+            {
+                ArmOpcode::MovReg
+            } else {
+                match src_ty.as_ref() {
+                    Some(IrType::Int(IntWidth::I8)) => ArmOpcode::Sxtb,
+                    Some(IrType::Int(IntWidth::I16)) => ArmOpcode::Sxth,
+                    Some(IrType::Int(IntWidth::I32)) | Some(IrType::Bool) => ArmOpcode::Sxtw,
+                    _ => ArmOpcode::MovReg,
+                }
+            }
+        }
+        (RegClass::Gp64, RegClass::Gp32) => ArmOpcode::MovReg,
+        (RegClass::Fp32, RegClass::Fp64) => ArmOpcode::FcvtDS,
+        (RegClass::Fp64, RegClass::Fp32) => ArmOpcode::FcvtSD,
+        _ => ArmOpcode::MovReg,
+    };
+
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+        def: Some(dest),
+    });
+    dest
+}
+
 fn int_width_class(w: &IntWidth) -> RegClass {
     match w {
         IntWidth::I64 => RegClass::Gp64,
@@ -3101,6 +3155,32 @@ mod tests {
             2,
             "wide i128 selects should lower with one CSEL per limb"
         );
+    }
+
+    #[test]
+    fn select_coerces_mixed_gp_widths_before_csel() {
+        let mf = select_simple(|b| {
+            let cond = b.const_bool(true);
+            let wide = b.const_i64(7);
+            let narrow = b.const_i32(-1);
+            let _s = b.select(cond, wide, narrow);
+            b.ret_void();
+        });
+        let csel = mf.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.opcode == ArmOpcode::CselReg)
+            .expect("expected CSEL for mixed-width select");
+        for operand in csel.operands.iter().take(3) {
+            let MachineOperand::VReg(vreg) = operand else {
+                continue;
+            };
+            assert_eq!(
+                machine_vreg_class(&mf, *vreg),
+                RegClass::Gp64,
+                "mixed-width select operands should be coerced to the result width before CSEL"
+            );
+        }
     }
 
     #[test]
