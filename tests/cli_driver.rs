@@ -1599,6 +1599,43 @@ fn deferred_char_component_substring_reads_back_written_chars() {
 }
 
 #[test]
+fn local_parameter_from_range_sizes_fixed_char_before_substring_assignment() {
+    let src = write_program(
+        "module m\ncontains\n  function f(val) result(s)\n    integer, intent(in) :: val\n    character(len=:), allocatable :: s\n    integer, parameter :: buffer_len = range(val)+2\n    character(len=buffer_len) :: buffer\n    buffer = '       1234'\n    s = buffer(8:)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = f(-1234)\n  if (len(s) /= 4) error stop 1\n  if (s /= '1234') error stop 2\n  print *, s\nend program\n",
+        "f90",
+    );
+    let out = unique_path("local_parameter_range_substring", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("local parameter range substring compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "local parameter range substring compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("local parameter range substring run failed");
+    assert!(
+        run.status.success(),
+        "local parameter range substring run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1234"),
+        "unexpected local parameter range substring output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_character_component_descriptor_starts_zeroed() {
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  if (.not. allocated(shell%vars(1)%value)) call c_exit(1_c_int)\n  deallocate(shell%vars(1)%value)\n  call c_exit(0_c_int)\nend program\n",

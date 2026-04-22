@@ -1729,6 +1729,45 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                             _ => eval_const_int_expr(e, st),
                         }
                     }
+                    "range" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        let ty = match &e.node {
+                            Expr::Name { name } => st
+                                .lookup_in(st.current_scope(), &name.to_lowercase())
+                                .and_then(|sym| sym.type_info.as_ref()),
+                            Expr::ParenExpr { inner } => match &inner.node {
+                                Expr::Name { name } => st
+                                    .lookup_in(st.current_scope(), &name.to_lowercase())
+                                    .and_then(|sym| sym.type_info.as_ref()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }?;
+                        match ty {
+                            TypeInfo::Integer { kind } => Some(match kind.unwrap_or(
+                                crate::driver::defaults::default_int_kind() as u8,
+                            ) {
+                                1 => 2,
+                                2 => 4,
+                                4 => 9,
+                                8 => 18,
+                                16 => 38,
+                                _ => return None,
+                            }),
+                            TypeInfo::Real { kind } => Some(match kind.unwrap_or(
+                                crate::driver::defaults::default_real_kind() as u8,
+                            ) {
+                                4 => 37,
+                                8 => 307,
+                                _ => return None,
+                            }),
+                            TypeInfo::DoublePrecision => Some(307),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 }
             } else {

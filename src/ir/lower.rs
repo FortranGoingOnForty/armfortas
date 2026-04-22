@@ -5100,7 +5100,8 @@ fn alloc_decls(
     //
     // Parameters can reference earlier parameters (`tau = 2 * pi`),
     // so we walk decls in order and build the map incrementally.
-    let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
+    let mut param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
+    enrich_param_consts_from_symbol_table(decls, &mut param_consts, st);
     let param_char_consts = collect_decl_param_char_consts(decls);
 
     for decl in decls {
@@ -5946,7 +5947,10 @@ fn alloc_decls(
                         // so other code paths that touch info.addr
                         // still work, but never load through it.
                         let folded = init_expr
-                            .and_then(|e| eval_const_scalar(e, &param_consts))
+                            .and_then(|e| {
+                                eval_const_scalar(e, &param_consts)
+                                    .or_else(|| symbol_table_parameter_const(st, &key))
+                            })
                             .map(|raw| clamp_const_to_type(raw, &elem_ty));
                         if let Some(value) = folded {
                             // Sentinel alloca — never read.
@@ -6556,6 +6560,55 @@ fn eval_const_int_in_scope_or_any_scope(
     match eval_const_scalar_with_any_scope(expr, param_consts, st)? {
         ConstScalar::Int(v) => i64::try_from(v).ok(),
         ConstScalar::Float(_) => None,
+    }
+}
+
+fn symbol_table_parameter_const(st: &SymbolTable, name: &str) -> Option<ConstScalar> {
+    st.find_symbol_any_scope(name).and_then(|sym| {
+        if sym.attrs.parameter {
+            sym.const_value.map(|value| ConstScalar::Int(value as i128))
+        } else {
+            None
+        }
+    })
+}
+
+fn enrich_param_consts_from_symbol_table(
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &mut HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) {
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Parameter)) =>
+            {
+                for entity in entities {
+                    let key = entity.name.to_ascii_lowercase();
+                    if param_consts.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(value) = symbol_table_parameter_const(st, &key) {
+                        param_consts.insert(key, value);
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, _) in pairs {
+                    let key = name.to_ascii_lowercase();
+                    if param_consts.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(value) = symbol_table_parameter_const(st, &key) {
+                        param_consts.insert(key, value);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
