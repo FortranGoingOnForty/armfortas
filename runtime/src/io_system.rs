@@ -97,6 +97,10 @@ struct Unit {
 }
 
 impl Unit {
+    fn is_stream_unformatted(&self) -> bool {
+        self.form == Form::Unformatted && self.access == Access::Stream
+    }
+
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         match &mut self.stream {
             UnitStream::Stdout => {
@@ -510,14 +514,42 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
 /// Close a unit.
 #[no_mangle]
 pub extern "C" fn afs_close(unit: i32, iostat: *mut i32) {
+    afs_close_ex(unit, std::ptr::null(), 0, iostat);
+}
+
+/// Close a unit with optional STATUS= semantics.
+#[no_mangle]
+pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, iostat: *mut i32) {
+    let delete_on_close = if status.is_null() || status_len <= 0 {
+        false
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(status, status_len as usize) };
+        std::str::from_utf8(raw)
+            .map(|s| s.trim().eq_ignore_ascii_case("delete"))
+            .unwrap_or(false)
+    };
+
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut u) = state.units.remove(&unit) {
         let _ = u.flush();
-        // File is dropped here, closing the handle.
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
+        let filename = u.filename.clone();
+        drop(u);
+
+        let mut close_status = 0;
+        if delete_on_close
+            && !matches!(filename.as_str(), "stdin" | "stdout" | "stderr")
+            && !filename.is_empty()
+        {
+            if let Err(e) = std::fs::remove_file(&filename) {
+                close_status = e.raw_os_error().unwrap_or(1);
             }
+        }
+
+        if !iostat.is_null() {
+            unsafe { *iostat = close_status };
+        } else if close_status != 0 {
+            eprintln!("CLOSE: {}: {}", filename, io::Error::from_raw_os_error(close_status));
+            std::process::exit(1);
         }
     } else {
         if !iostat.is_null() {
@@ -535,7 +567,11 @@ pub extern "C" fn afs_close(unit: i32, iostat: *mut i32) {
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" {}", val));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" {}", val));
+        }
     }
 }
 
@@ -544,7 +580,11 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
 pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" {}", val));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" {}", val));
+        }
     }
 }
 
@@ -553,7 +593,11 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
 pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" {}", val));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" {}", val));
+        }
     }
 }
 
@@ -562,7 +606,11 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!("  {:14.7E}", val));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!("  {:14.7E}", val));
+        }
     }
 }
 
@@ -571,7 +619,11 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
 pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!("  {:22.15E}", val));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!("  {:22.15E}", val));
+        }
     }
 }
 
@@ -582,7 +634,12 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&re.to_ne_bytes());
+            let _ = u.write_raw(&im.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
+        }
     }
 }
 
@@ -593,7 +650,12 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&re.to_ne_bytes());
+            let _ = u.write_raw(&im.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
+        }
     }
 }
 
@@ -602,10 +664,17 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(" ");
-        if !ptr.is_null() && len > 0 {
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-            let _ = u.write_bytes(slice);
+        if u.is_stream_unformatted() {
+            if !ptr.is_null() && len > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                let _ = u.write_raw(slice);
+            }
+        } else {
+            let _ = u.write_str(" ");
+            if !ptr.is_null() && len > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                let _ = u.write_bytes(slice);
+            }
         }
     }
 }
@@ -615,7 +684,11 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
 pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(if val != 0 { " T" } else { " F" });
+        if u.is_stream_unformatted() {
+            let _ = u.write_raw(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(if val != 0 { " T" } else { " F" });
+        }
     }
 }
 
@@ -624,6 +697,10 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
 pub extern "C" fn afs_write_newline(unit: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if u.is_stream_unformatted() {
+            let _ = u.flush();
+            return;
+        }
         let _ = u.write_str("\n");
         let _ = u.flush();
     }
@@ -943,7 +1020,12 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
 
     match u.next_read_token() {
         Ok(Some(token)) => {
-            crate::string::afs_assign_char_fixed(dest, dest_len, token.as_ptr(), token.len() as i64);
+            crate::string::afs_assign_char_fixed(
+                dest,
+                dest_len,
+                token.as_ptr(),
+                token.len() as i64,
+            );
             if !iostat.is_null() {
                 unsafe {
                     *iostat = 0;
@@ -3266,6 +3348,40 @@ mod tests {
         // This test just verifies no panic — output goes to test runner's stdout.
         afs_write_int(6, 42);
         afs_write_newline(6);
+    }
+
+    #[test]
+    fn stream_unformatted_string_write_preserves_exact_bytes() {
+        let path = "/tmp/afs_stream_unformatted_string_write.dat";
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 94,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: "stream".as_ptr(),
+            access_len: 6,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "expected stream-unformatted OPEN to succeed");
+
+        afs_write_string(94, "alpha".as_ptr(), 5);
+        afs_write_newline(94);
+        afs_close(94, std::ptr::null_mut());
+
+        let content = std::fs::read(path).unwrap();
+        assert_eq!(content, b"alpha", "expected exact stream bytes");
     }
 
     #[test]

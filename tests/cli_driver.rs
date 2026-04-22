@@ -497,6 +497,50 @@ fn stream_unformatted_scalar_char_read_preserves_each_byte() {
 }
 
 #[test]
+fn stream_unformatted_char_write_preserves_exact_bytes() {
+    let output_file = unique_path("stream_unformatted_char_write", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  open(newunit=unit_num, file='{}', status='replace', action='write', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) 'alpha'\n  if (ios /= 0) error stop 2\n  close(unit_num)\nend program\n",
+            output_file.display()
+        ),
+        "stream_unformatted_char_write.f90",
+    );
+    let out = unique_path("stream_unformatted_char_write", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted char write compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted char write compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted char write run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted char write run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read stream unformatted char output");
+    assert_eq!(
+        bytes,
+        b"alpha",
+        "expected exact bytes from stream-unformatted character write, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
@@ -2778,6 +2822,47 @@ fn contained_char_function_in_comparison_uses_internal_call_target() {
 
     let _ = std::fs::remove_file(dir.join("x"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn close_status_delete_removes_file() {
+    let path = unique_path("close_status_delete", "txt");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit, ios\n  open(newunit=unit, file='{}', status='replace', action='write', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit, '(a)', iostat=ios) 'hello'\n  if (ios /= 0) error stop 2\n  close(unit, status='delete', iostat=ios)\n  if (ios /= 0) error stop 3\n  print *, 'ok'\nend program\n",
+            path.display()
+        ),
+        "f90",
+    );
+    let out = unique_path("close_status_delete", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("close status delete compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "close status delete compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("close status delete run failed");
+    assert!(
+        run.status.success(),
+        "close status delete run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        !path.exists(),
+        "close(status='delete') should remove the file: {}",
+        path.display()
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -12532,6 +12617,43 @@ fn empty_allocatable_char_component_copy_stays_allocated() {
     assert!(
         stdout.contains("ok"),
         "unexpected empty alloc-char component copy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_function_result_keeps_unallocated_allocatable_char_components_unallocated() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: options_t\n    logical :: cleanup_on_close = .true.\n    character(len=:), allocatable :: prefix\n    character(len=:), allocatable :: suffix\n    character(len=:), allocatable :: parent_dir\n  end type options_t\ncontains\n  function clear_options() result(options)\n    type(options_t) :: options\n    options%cleanup_on_close = .true.\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(options_t) :: options\n  options = clear_options()\n  if (.not. options%cleanup_on_close) error stop 1\n  if (allocated(options%prefix)) error stop 2\n  if (allocated(options%suffix)) error stop 3\n  if (allocated(options%parent_dir)) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_result_unalloc_char_components", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived result unalloc char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived result unalloc char component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived result unalloc char component run failed");
+    assert!(
+        run.status.success(),
+        "derived result unalloc char component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived result unalloc char component output: {}",
         stdout
     );
 

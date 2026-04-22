@@ -16228,15 +16228,51 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::Close { specs } => {
-            let unit = if let Some(s) = specs.first() {
+            let unit_spec = specs
+                .iter()
+                .find(|s| {
+                    s.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("unit"))
+                        .unwrap_or(false)
+                })
+                .or_else(|| specs.iter().find(|s| s.keyword.is_none()));
+            let iostat_spec = specs.iter().find(|s| {
+                s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iostat"))
+                    .unwrap_or(false)
+            });
+            let status_spec = specs.iter().find(|s| {
+                s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("status"))
+                    .unwrap_or(false)
+            });
+            let unit = if let Some(s) = unit_spec {
                 lower_expr_ctx(b, ctx, &s.value)
             } else {
                 b.const_i32(6)
             };
             let null = b.const_i64(0);
+            let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+            let iostat_ptr = iostat_spec
+                .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
+                .unwrap_or(null);
+            let (status_ptr, status_len) = status_spec
+                .map(|spec| {
+                    lower_string_expr_with_layouts(
+                        b,
+                        &ctx.locals,
+                        &spec.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    )
+                })
+                .unwrap_or_else(|| (null, null));
             b.call(
-                FuncRef::External("afs_close".into()),
-                vec![unit, null],
+                FuncRef::External("afs_close_ex".into()),
+                vec![unit_i32, status_ptr, status_len, iostat_ptr],
                 IrType::Void,
             );
         }
@@ -24015,12 +24051,36 @@ fn emit_derived_value_copy(
         let src_field = b.gep(src_ptr, vec![offset], IrType::Int(IntWidth::I8));
 
         if field.allocatable && is_deferred_char_component_field(field) {
+            let src_alloc = b.call(
+                FuncRef::External("afs_string_allocated".into()),
+                vec![src_field],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero_i32 = b.const_i32(0);
+            let is_unallocated = b.icmp(CmpOp::Eq, src_alloc, zero_i32);
+            let unalloc_bb = b.create_block("derived_char_unalloc");
+            let copy_bb = b.create_block("derived_char_copy");
+            let join_bb = b.create_block("derived_char_copy_join");
+            b.cond_branch(is_unallocated, unalloc_bb, vec![], copy_bb, vec![]);
+
+            b.set_block(unalloc_bb);
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![dest_field],
+                IrType::Void,
+            );
+            b.branch(join_bb, vec![]);
+
+            b.set_block(copy_bb);
             let (src_data, src_len) = load_string_descriptor_view(b, src_field);
             b.call(
                 FuncRef::External("afs_assign_char_deferred".into()),
                 vec![dest_field, src_data, src_len],
                 IrType::Void,
             );
+            b.branch(join_bb, vec![]);
+
+            b.set_block(join_bb);
             continue;
         }
 
