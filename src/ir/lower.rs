@@ -10031,12 +10031,12 @@ fn try_defined_assignment(
     };
     let rk = resolved.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
-    let func_ref = ctx
-        .internal_funcs
-        .get(&rk)
-        .copied()
-        .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(call_name));
+    let func_ref = same_unit_func_ref(
+        b.func().name.as_str(),
+        Some(ctx.internal_funcs),
+        &[&rk],
+        call_name,
+    );
     // RHS for ASSIGNMENT(=) is passed by reference to match
     // intent(in) dummy semantics — build a temp slot for scalar
     // values (the common case for user assignment from integer etc).
@@ -10407,10 +10407,12 @@ fn emit_resolved_operator_call(
         &mut call_args,
     );
 
-    let func_ref = internal_funcs
-        .and_then(|map| map.get(&specific_key).copied())
-        .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(call_name));
+    let func_ref = same_unit_func_ref(
+        b.func().name.as_str(),
+        internal_funcs,
+        &[&specific_key],
+        call_name,
+    );
     let ret_ty = if hidden_result.is_some() {
         IrType::Void
     } else {
@@ -10729,6 +10731,45 @@ fn lowered_procedure_symbol_name(
         return module_procedure_symbol_name(module_name, name);
     }
     name.to_string()
+}
+
+fn immediate_host_link_name_for_internal_calls(current_func_name: &str) -> String {
+    if let Some(rest) = current_func_name.strip_prefix("afs_internal_") {
+        if let Some((host, suffix)) = rest.rsplit_once('_') {
+            if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                return host.to_string();
+            }
+        }
+    }
+    current_func_name.to_string()
+}
+
+fn same_unit_func_ref(
+    current_func_name: &str,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    keys: &[&str],
+    fallback_call_name: String,
+) -> FuncRef {
+    let Some(internal_funcs) = internal_funcs else {
+        return FuncRef::External(fallback_call_name);
+    };
+    let Some(matched_key) = keys
+        .iter()
+        .copied()
+        .find(|key| internal_funcs.contains_key(*key))
+    else {
+        return FuncRef::External(fallback_call_name);
+    };
+    let host_link_name = immediate_host_link_name_for_internal_calls(current_func_name);
+    let lowered = lowered_procedure_symbol_name(
+        matched_key,
+        None,
+        Some(host_link_name.as_str()),
+        None,
+        true,
+        internal_funcs,
+    );
+    FuncRef::External(lowered)
 }
 
 fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> String {
@@ -11139,10 +11180,12 @@ fn emit_named_function_call(
     };
     append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut call_args);
 
-    let func_ref = internal_funcs
-        .and_then(|map| map.get(&callee_key).or_else(|| map.get(&key)).copied())
-        .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(call_name));
+    let func_ref = same_unit_func_ref(
+        b.func().name.as_str(),
+        internal_funcs,
+        &[&callee_key, &key],
+        call_name,
+    );
     b.call(func_ref, call_args, ret_ty)
 }
 
@@ -11556,13 +11599,12 @@ fn lower_alloc_return_call_into_desc(
 
     append_host_closure_args(b, ctx, &callee_key, &mut call_args);
 
-    let func_ref = ctx
-        .internal_funcs
-        .get(&callee_key)
-        .or_else(|| ctx.internal_funcs.get(&key))
-        .copied()
-        .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(call_name));
+    let func_ref = same_unit_func_ref(
+        b.func().name.as_str(),
+        Some(ctx.internal_funcs),
+        &[&callee_key, &key],
+        call_name,
+    );
     b.call(func_ref, call_args, IrType::Void);
 }
 
@@ -14573,12 +14615,12 @@ fn emit_final_proc_call(
         &resolved_key,
         &mut call_args,
     );
-    let func_ref = internal_funcs
-        .get(&resolved_key)
-        .or_else(|| internal_funcs.get(&key))
-        .copied()
-        .map(FuncRef::Internal)
-        .unwrap_or_else(|| FuncRef::External(call_name));
+    let func_ref = same_unit_func_ref(
+        b.func().name.as_str(),
+        Some(internal_funcs),
+        &[&resolved_key, &key],
+        call_name,
+    );
     b.call(func_ref, call_args, IrType::Void);
 }
 
@@ -16302,11 +16344,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     let func_ref = if let Some((target, _)) = procptr_target {
                         FuncRef::Indirect(target)
                     } else {
-                        ctx.internal_funcs
-                            .get(&resolved_key)
-                            .copied()
-                            .map(FuncRef::Internal)
-                            .unwrap_or_else(|| FuncRef::External(resolved_name))
+                        same_unit_func_ref(
+                            b.func().name.as_str(),
+                            Some(ctx.internal_funcs),
+                            &[&resolved_key],
+                            resolved_name,
+                        )
                     };
                     b.call(func_ref, arg_vals, IrType::Void);
                 }
@@ -29806,15 +29849,12 @@ fn lower_expr_full(
                 let func_ref = if let Some((target, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
-                    internal_funcs
-                        .and_then(|map| {
-                            map.get(&callee_key)
-                                .or_else(|| map.get(&signature_key))
-                                .or_else(|| map.get(&key))
-                                .copied()
-                        })
-                        .map(FuncRef::Internal)
-                        .unwrap_or_else(|| FuncRef::External(call_name))
+                    same_unit_func_ref(
+                        b.func().name.as_str(),
+                        internal_funcs,
+                        &[&callee_key, &signature_key, &key],
+                        call_name,
+                    )
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
                 if let Some(tl) = type_layouts {
