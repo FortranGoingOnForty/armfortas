@@ -49,6 +49,15 @@ Secondary targets worth keeping warm:
 - `fgof-pty`
   - PTY/session library with interactive subprocess and resize coverage
   - good terminal-truthfulness target before the heavier TUI/editor programs
+- `fgof-termios`
+  - terminal-mode helper library with raw/cbreak/echo and terminal-size coverage
+  - good low-noise tty truthfulness target before the heavier expect and line-edit stacks
+- `fgof-lineedit`
+  - line editing state/history library for shells and REPL-style tools
+  - good focused target for interactive editing semantics without terminal-mode noise
+- `fgof-watch`
+  - portable file-watching library with polling-backed watch-session semantics
+  - good low-dependency target for filesystem change detection and library packaging behavior
 
 Current de-prioritized projects:
 
