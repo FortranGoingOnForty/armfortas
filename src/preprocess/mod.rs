@@ -257,12 +257,18 @@ impl Preprocessor {
             // have C semantics, not Fortran semantics.
             if !self.fixed_form && !logical_line.trim_start().starts_with('#') {
                 while has_trailing_continuation(&logical_line) {
-                    // Remove the trailing & from the code portion.
-                    let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
-                    logical_line.truncate(amp_pos);
-                    // Consume the next line, skipping leading & if present.
                     if i < raw_lines.len() {
                         let next = raw_lines[i].trim_start();
+                        // A directive between free-form continued lines must
+                        // remain its own logical line so conditional blocks
+                        // can be evaluated before later Fortran continuation.
+                        if next.starts_with('#') {
+                            break;
+                        }
+                        // Remove the trailing & from the code portion.
+                        let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
+                        logical_line.truncate(amp_pos);
+                        // Consume the next line, skipping leading & if present.
                         let next = next.strip_prefix('&').unwrap_or(next);
                         logical_line.push_str(next);
                         i += 1;
@@ -1698,6 +1704,36 @@ end module
             assert!(out.contains("call macos_specific()"));
             assert!(!out.contains("call linux_specific()"));
         }
+    }
+
+    #[test]
+    fn directive_between_free_form_continuations_stays_a_directive() {
+        let src = "\
+program p
+  integer :: x
+  x = 1 + &
+#if FLAG
+    2 + &
+#endif
+    3
+end program
+";
+        let out = pp(src);
+        assert!(
+            out.contains("x = 1 + &"),
+            "continued line head should remain intact: {:?}",
+            out
+        );
+        assert!(
+            out.contains("    3"),
+            "continued line tail should remain after the stripped directive block: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("#if FLAG") && !out.contains("2 + &") && !out.contains("#endif"),
+            "false branch should remain removed: {:?}",
+            out
+        );
     }
 
     #[test]
