@@ -21,7 +21,7 @@ fn find_compiler() -> PathBuf {
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
         if p.exists() {
-            return p;
+            return std::fs::canonicalize(&p).unwrap();
         }
     }
     panic!("armfortas binary not found");
@@ -48,6 +48,9 @@ fn sdk_path() -> String {
 /// Compile a .f90 file with -c, producing .o and optionally .amod.
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: Option<&Path>) {
     let mut cmd = Command::new(compiler);
+    if let Some(parent) = source.parent() {
+        cmd.current_dir(parent);
+    }
     cmd.args([
         source.to_str().unwrap(),
         "-c",

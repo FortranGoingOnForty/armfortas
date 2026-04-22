@@ -35,6 +35,7 @@ fn find_compiler() -> PathBuf {
 
 fn compile(compiler: &Path, source: &Path, obj: &Path, search: &Path) {
     let result = Command::new(compiler)
+        .current_dir(search)
         .args([
             source.to_str().unwrap(),
             "-c",
