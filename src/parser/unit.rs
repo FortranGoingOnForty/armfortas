@@ -575,21 +575,22 @@ impl<'a> Parser<'a> {
                     };
                     self.expect(&TokenKind::RParen)?;
 
-                    // Parse attributes: , pointer, nopass, pass, deferred, etc.
+                    // Parse attributes: regular declaration attrs like
+                    // OPTIONAL/VALUE plus procedure-specific ones like POINTER.
                     let mut attrs = Vec::new();
                     while self.eat(&TokenKind::Comma) {
                         let attr_text = self.peek_text().to_lowercase();
-                        match attr_text.as_str() {
-                            "pointer" => {
-                                self.advance();
-                                attrs.push(crate::ast::decl::Attribute::Pointer);
-                            }
-                            "nopass" | "pass" | "deferred" | "non_overridable" => {
-                                self.advance(); /* skip type-bound attrs for now */
-                            }
-                            _ => {
-                                self.advance();
-                            } // skip unknown attrs for now
+                        if matches!(
+                            attr_text.as_str(),
+                            "nopass" | "pass" | "deferred" | "non_overridable"
+                        ) {
+                            self.advance();
+                            continue;
+                        }
+                        if let Some(attr) = self.try_parse_attribute() {
+                            attrs.push(attr?);
+                        } else {
+                            self.advance();
                         }
                     }
 
@@ -1072,6 +1073,19 @@ mod tests {
         if let ProgramUnit::InterfaceBlock { name, bodies, .. } = &u.node {
             assert_eq!(name.as_deref(), Some("sort"));
             assert_eq!(bodies.len(), 2);
+        } else {
+            panic!("not InterfaceBlock");
+        }
+    }
+
+    #[test]
+    fn interface_operator_end_spec() {
+        let u = parse_unit(
+            "interface operator(+)\n  module procedure add_int\nend interface operator(+)\n",
+        );
+        if let ProgramUnit::InterfaceBlock { name, bodies, .. } = &u.node {
+            assert_eq!(name.as_deref(), Some("operator(+)"));
+            assert_eq!(bodies.len(), 1);
         } else {
             panic!("not InterfaceBlock");
         }

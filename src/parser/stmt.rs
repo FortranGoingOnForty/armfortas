@@ -1453,6 +1453,14 @@ impl<'a> Parser<'a> {
                     // Not a typed allocate — restore.
                     self.pos = save;
                 }
+            } else if self.peek() == &TokenKind::Identifier {
+                let type_name = self.advance().clone().text;
+                if self.peek() == &TokenKind::ColonColon {
+                    type_spec = Some(crate::ast::decl::TypeSpec::Type(type_name));
+                    self.advance(); // consume ::
+                } else {
+                    self.pos = save;
+                }
             }
         }
 
@@ -1563,8 +1571,20 @@ impl<'a> Parser<'a> {
             )));
         }
         // Skip optional construct name after end, but only on the same line.
+        // For END INTERFACE, Fortran also permits a trailing generic-spec such
+        // as `operator(+)` or `assignment(=)`.
         if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
-            self.advance();
+            let trailing = self.advance().clone().text;
+            if matches!(keyword, "interface")
+                && (trailing.eq_ignore_ascii_case("operator")
+                    || trailing.eq_ignore_ascii_case("assignment"))
+                && self.eat(&TokenKind::LParen)
+            {
+                while self.peek() != &TokenKind::RParen && !self.at_stmt_end() {
+                    self.advance();
+                }
+                self.expect(&TokenKind::RParen)?;
+            }
         }
         Ok(())
     }
@@ -2333,6 +2353,20 @@ end if
         {
         } else {
             panic!("typed allocation should preserve the type-spec");
+        }
+    }
+
+    #[test]
+    fn allocate_typed_derived_name() {
+        let s = parse_one("allocate(toml_array :: val)\n");
+        if let Stmt::Allocate {
+            type_spec: Some(crate::ast::decl::TypeSpec::Type(name)),
+            ..
+        } = s.node
+        {
+            assert_eq!(name, "toml_array");
+        } else {
+            panic!("derived typed allocation should preserve the bare type-spec");
         }
     }
 
