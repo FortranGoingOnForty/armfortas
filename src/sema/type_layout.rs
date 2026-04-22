@@ -11,6 +11,7 @@ pub enum FieldDefaultInit {
     Character(String),
     Integer(i128),
     Logical(bool),
+    Derived(Vec<(String, FieldDefaultInit)>),
 }
 
 /// Layout of a single field in a derived type.
@@ -245,6 +246,73 @@ fn eval_const_logical_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<bool>
     }
 }
 
+fn eval_const_field_default_init(
+    type_info: &TypeInfo,
+    expr: &crate::ast::expr::SpannedExpr,
+    registry: &TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+) -> Option<FieldDefaultInit> {
+    match type_info {
+        TypeInfo::Character { .. } => match &expr.node {
+            crate::ast::expr::Expr::StringLiteral { value, .. } => {
+                Some(FieldDefaultInit::Character(value.clone()))
+            }
+            _ => None,
+        },
+        TypeInfo::Integer { .. } => eval_const_int_expr(expr, const_params)
+            .map(|value| FieldDefaultInit::Integer(value as i128)),
+        TypeInfo::Logical { .. } => eval_const_logical_expr(expr).map(FieldDefaultInit::Logical),
+        TypeInfo::Derived(type_name) | TypeInfo::Class(type_name) => {
+            eval_const_derived_default_init(type_name, expr, registry, const_params)
+        }
+        _ => None,
+    }
+}
+
+fn eval_const_derived_default_init(
+    type_name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    registry: &TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+) -> Option<FieldDefaultInit> {
+    use crate::ast::expr::{Expr, SectionSubscript};
+
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name: callee_name } = &callee.node else {
+        return None;
+    };
+    if !callee_name.eq_ignore_ascii_case(type_name) {
+        return None;
+    }
+
+    let layout = registry.get(type_name)?;
+    let mut positional_idx = 0usize;
+    let mut overrides = Vec::new();
+
+    for arg in args {
+        let field = if let Some(keyword) = &arg.keyword {
+            layout.field(keyword)?
+        } else {
+            let field = layout.fields.get(positional_idx)?;
+            positional_idx += 1;
+            field
+        };
+        if !field.dims.is_empty() || field.allocatable || field.pointer {
+            return None;
+        }
+        let SectionSubscript::Element(value_expr) = &arg.value else {
+            return None;
+        };
+        let init =
+            eval_const_field_default_init(&field.type_info, value_expr, registry, const_params)?;
+        overrides.push((field.name.clone(), init));
+    }
+
+    Some(FieldDefaultInit::Derived(overrides))
+}
+
 fn eval_explicit_array_dims(
     specs: Option<&Vec<crate::ast::decl::ArraySpec>>,
     const_params: &HashMap<String, i64>,
@@ -415,22 +483,9 @@ pub fn compute_layout(
                 };
                 let field_size = elem_size.saturating_mul(elem_count.max(1));
                 let default_init = if dims.is_empty() && !is_allocatable && !is_pointer {
-                    match (&ti, entity.init.as_ref()) {
-                        (TypeInfo::Character { .. }, Some(init)) => match &init.node {
-                            crate::ast::expr::Expr::StringLiteral { value, .. } => {
-                                Some(FieldDefaultInit::Character(value.clone()))
-                            }
-                            _ => None,
-                        },
-                        (TypeInfo::Integer { .. }, Some(init)) => {
-                            eval_const_int_expr(init, const_params)
-                                .map(|value| FieldDefaultInit::Integer(value as i128))
-                        }
-                        (TypeInfo::Logical { .. }, Some(init)) => {
-                            eval_const_logical_expr(init).map(FieldDefaultInit::Logical)
-                        }
-                        _ => None,
-                    }
+                    entity.init.as_ref().and_then(|init| {
+                        eval_const_field_default_init(&ti, init, registry, const_params)
+                    })
                 } else {
                     None
                 };
@@ -482,13 +537,28 @@ pub fn compute_layout(
         })
         .collect();
 
+    let final_procs: Vec<String> = final_proc_names
+        .iter()
+        .map(|name| {
+            if let Some(module_name) = host_module {
+                format!(
+                    "afs_modproc_{}_{}",
+                    module_name.to_lowercase(),
+                    name.to_lowercase()
+                )
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+
     TypeLayout {
         name: type_name.to_string(),
         size: offset,
         align: max_align,
         fields,
         bound_procs,
-        final_procs: final_proc_names.to_vec(),
+        final_procs,
         type_tag: 0, // assigned by registry after insertion
         parent: parent_layout.map(|p| p.name.clone()),
     }
@@ -982,6 +1052,135 @@ mod tests {
                 .field("tag")
                 .and_then(|field| field.default_init.clone()),
             Some(FieldDefaultInit::Character(String::new()))
+        );
+    }
+
+    #[test]
+    fn compute_layout_captures_derived_component_constructor_defaults() {
+        use crate::ast::decl::TypeSpec;
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+
+        let nested_components = vec![
+            make_component_with_init(
+                "style",
+                TypeSpec::Integer(None),
+                Expr::IntegerLiteral {
+                    text: "-1".into(),
+                    kind: Some("i1".into()),
+                },
+            ),
+            make_component_with_init(
+                "bg",
+                TypeSpec::Integer(None),
+                Expr::IntegerLiteral {
+                    text: "-1".into(),
+                    kind: Some("i1".into()),
+                },
+            ),
+            make_component_with_init(
+                "fg",
+                TypeSpec::Integer(None),
+                Expr::IntegerLiteral {
+                    text: "-1".into(),
+                    kind: Some("i1".into()),
+                },
+            ),
+        ];
+        let mut reg = TypeLayoutRegistry::new();
+        reg.insert(compute_layout(
+            "color_code",
+            None,
+            &[],
+            &[],
+            &nested_components,
+            None,
+            &reg,
+            &empty_params(),
+        ));
+
+        let components = vec![
+            make_component_with_init(
+                "bold",
+                TypeSpec::Type("color_code".into()),
+                Expr::FunctionCall {
+                    callee: Box::new(Spanned::new(
+                        Expr::Name {
+                            name: "color_code".into(),
+                        },
+                        span,
+                    )),
+                    args: vec![Argument {
+                        keyword: Some("style".into()),
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: "1".into(),
+                                kind: Some("i1".into()),
+                            },
+                            span,
+                        )),
+                    }],
+                },
+            ),
+            make_component_with_init(
+                "blue",
+                TypeSpec::Type("color_code".into()),
+                Expr::FunctionCall {
+                    callee: Box::new(Spanned::new(
+                        Expr::Name {
+                            name: "color_code".into(),
+                        },
+                        span,
+                    )),
+                    args: vec![Argument {
+                        keyword: Some("fg".into()),
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: "4".into(),
+                                kind: Some("i1".into()),
+                            },
+                            span,
+                        )),
+                    }],
+                },
+            ),
+        ];
+
+        let layout = compute_layout(
+            "color_output",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+        );
+
+        assert_eq!(
+            layout
+                .field("bold")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Derived(vec![(
+                "style".into(),
+                FieldDefaultInit::Integer(1),
+            )]))
+        );
+        assert_eq!(
+            layout
+                .field("blue")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Derived(vec![(
+                "fg".into(),
+                FieldDefaultInit::Integer(4),
+            )]))
         );
     }
 
