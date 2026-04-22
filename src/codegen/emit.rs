@@ -659,10 +659,15 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 op_str(&inst.operands[1])
             )
         }
-        ArmOpcode::FcvtSD | ArmOpcode::FcvtDS => format!(
+        ArmOpcode::FcvtSD => format!(
             "fcvt {}, {}",
-            op_str(&inst.operands[0]),
-            op_str(&inst.operands[1])
+            fp_reg_str(&inst.operands[0], false),
+            fp_reg_str(&inst.operands[1], true)
+        ),
+        ArmOpcode::FcvtDS => format!(
+            "fcvt {}, {}",
+            fp_reg_str(&inst.operands[0], true),
+            fp_reg_str(&inst.operands[1], false)
         ),
 
         ArmOpcode::Movz => {
@@ -1052,6 +1057,19 @@ fn op_str(op: &MachineOperand) -> String {
     }
 }
 
+fn fp_reg_str(op: &MachineOperand, is_f64: bool) -> String {
+    match op {
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            if is_f64 {
+                format!("d{}", n)
+            } else {
+                format!("s{}", n)
+            }
+        }
+        _ => op_str(op),
+    }
+}
+
 fn cond_str(c: ArmCond) -> &'static str {
     match c {
         ArmCond::Eq => "eq",
@@ -1313,6 +1331,30 @@ mod tests {
         };
 
         assert_eq!(emit_inst(&inst, &mf), "mov w21, w20");
+    }
+
+    #[test]
+    fn emit_fcvt_uses_fp_register_widths() {
+        let mf = MachineFunction::new("test".into());
+        let to_single = MachineInst {
+            opcode: ArmOpcode::FcvtSD,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Fp(0)),
+                MachineOperand::PhysReg(PhysReg::Fp(1)),
+            ],
+            def: None,
+        };
+        let to_double = MachineInst {
+            opcode: ArmOpcode::FcvtDS,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Fp32(2)),
+                MachineOperand::PhysReg(PhysReg::Fp32(3)),
+            ],
+            def: None,
+        };
+
+        assert_eq!(emit_inst(&to_single, &mf), "fcvt s0, d1");
+        assert_eq!(emit_inst(&to_double, &mf), "fcvt d2, s3");
     }
 
     #[test]
