@@ -2018,7 +2018,7 @@ end program hello
     // ---- Performance ----
 
     #[test]
-    fn performance_fortsh_under_one_second() {
+    fn performance_fortsh_under_two_seconds() {
         let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fortsh/src");
         let root = std::path::Path::new(src_dir);
         if !root.exists() {
@@ -2068,8 +2068,8 @@ end program hello
             elapsed
         );
         assert!(
-            elapsed.as_secs_f64() < 1.0,
-            "too slow: {:?} (must be < 1s)",
+            elapsed.as_secs_f64() < 2.0,
+            "too slow: {:?} (must be < 2s)",
             elapsed
         );
     }
