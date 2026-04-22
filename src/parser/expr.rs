@@ -218,7 +218,18 @@ impl<'a> Parser<'a> {
             TokenKind::BozLiteral => self.parse_boz_literal(),
 
             // Identifier (name, keyword used as name, potential function call).
-            TokenKind::Identifier => self.parse_name(),
+            TokenKind::Identifier => {
+                if self.peek_text().ends_with('_')
+                    && self
+                        .tokens
+                        .get(self.pos + 1)
+                        .is_some_and(|tok| tok.kind == TokenKind::StringLiteral)
+                {
+                    self.parse_kind_prefixed_string_literal()
+                } else {
+                    self.parse_name()
+                }
+            }
 
             _ => Err(self.error(format!("expected expression, got {}", self.peek()))),
         }
@@ -309,7 +320,11 @@ impl<'a> Parser<'a> {
         Ok(Spanned::new(Expr::RealLiteral { text, kind }, tok.span))
     }
 
-    fn parse_string_literal(&mut self) -> Result<SpannedExpr, ParseError> {
+    fn parse_string_literal_with_kind(
+        &mut self,
+        kind: Option<String>,
+        prefix_span: Option<Span>,
+    ) -> Result<SpannedExpr, ParseError> {
         let tok = self.advance().clone();
         // Strip outer quotes for the value.
         let value = if tok.text.len() >= 2 {
@@ -319,10 +334,36 @@ impl<'a> Parser<'a> {
         } else {
             tok.text.clone()
         };
-        Ok(Spanned::new(
-            Expr::StringLiteral { value, kind: None },
-            tok.span,
-        ))
+        let span = prefix_span
+            .map(|prefix| span_from_to(prefix, tok.span))
+            .unwrap_or(tok.span);
+        Ok(Spanned::new(Expr::StringLiteral { value, kind }, span))
+    }
+
+    fn parse_string_literal(&mut self) -> Result<SpannedExpr, ParseError> {
+        self.parse_string_literal_with_kind(None, None)
+    }
+
+    fn parse_kind_prefixed_string_literal(&mut self) -> Result<SpannedExpr, ParseError> {
+        let kind_tok = self.advance().clone();
+        let Some(kind) = kind_tok
+            .text
+            .strip_suffix('_')
+            .filter(|text| !text.is_empty())
+            .map(|text| text.to_string())
+        else {
+            return Err(ParseError {
+                span: kind_tok.span,
+                msg: "expected string kind prefix before string literal".into(),
+            });
+        };
+        if self.peek() != &TokenKind::StringLiteral {
+            return Err(self.error(format!(
+                "expected string literal after kind prefix, got {}",
+                self.peek()
+            )));
+        }
+        self.parse_string_literal_with_kind(Some(kind), Some(kind_tok.span))
     }
 
     fn parse_logical_literal(&mut self) -> Result<SpannedExpr, ParseError> {
@@ -747,6 +788,17 @@ mod tests {
     #[test]
     fn string_double() {
         assert_eq!(sexpr("\"hello\""), "'hello'");
+    }
+    #[test]
+    fn string_kind_prefix_named_constant() {
+        let expr = parse_expression("tfc_\"'\"");
+        match expr.node {
+            Expr::StringLiteral { value, kind } => {
+                assert_eq!(value, "'");
+                assert_eq!(kind.as_deref(), Some("tfc"));
+            }
+            other => panic!("expected string literal, got {:?}", other),
+        }
     }
     #[test]
     fn logical_true() {
