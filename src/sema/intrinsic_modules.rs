@@ -249,6 +249,22 @@ fn register_ieee_stubs(st: &mut SymbolTable) {
             "ieee_arithmetic" => {
                 insert_type(st, m, "ieee_class_type");
                 insert_type(st, m, "ieee_round_type");
+                let ik4 = TypeInfo::Integer { kind: Some(4) };
+                for (name, value) in [
+                    ("ieee_quiet_nan", 1),
+                    ("ieee_positive_inf", 2),
+                    ("ieee_negative_inf", 3),
+                    ("ieee_signaling_nan", 4),
+                    ("ieee_positive_zero", 5),
+                    ("ieee_negative_zero", 6),
+                    ("ieee_positive_denormal", 7),
+                    ("ieee_negative_denormal", 8),
+                    ("ieee_positive_normal", 9),
+                    ("ieee_negative_normal", 10),
+                    ("ieee_other_value", 11),
+                ] {
+                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                }
                 insert_proc(st, m, "ieee_is_nan");
                 insert_proc(st, m, "ieee_is_finite");
                 insert_proc(st, m, "ieee_value");

@@ -428,6 +428,52 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
     }
 }
 
+fn resolve_kind_suffix(kind: &str, symtab: &super::symtab::SymbolTable) -> Option<u8> {
+    kind.parse::<u8>().ok().or_else(|| {
+        symtab
+            .find_symbol_any_scope(kind)
+            .and_then(|sym| sym.const_value)
+            .and_then(|v| u8::try_from(v).ok())
+    })
+}
+
+fn resolve_intrinsic_kind_arg(
+    expr: &crate::ast::expr::SpannedExpr,
+    symtab: &super::symtab::SymbolTable,
+) -> Option<u8> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
+        Expr::Name { name } => symtab
+            .find_symbol_any_scope(name)
+            .and_then(|sym| sym.const_value)
+            .and_then(|v| u8::try_from(v).ok()),
+        Expr::ParenExpr { inner } => resolve_intrinsic_kind_arg(inner, symtab),
+        _ => None,
+    }
+}
+
+fn resolve_intrinsic_kind_call_arg(
+    args: &[crate::ast::expr::Argument],
+    positional_index: usize,
+    keyword: &str,
+    symtab: &super::symtab::SymbolTable,
+) -> Option<u8> {
+    let arg = args
+        .iter()
+        .find(|arg| {
+            arg.keyword
+                .as_deref()
+                .map(|kw| kw.eq_ignore_ascii_case(keyword))
+                .unwrap_or(false)
+        })
+        .or_else(|| args.get(positional_index))?;
+    match &arg.value {
+        crate::ast::expr::SectionSubscript::Element(e) => resolve_intrinsic_kind_arg(e, symtab),
+        crate::ast::expr::SectionSubscript::Range { .. } => None,
+    }
+}
+
 /// Compute the type of an expression given a symbol table context.
 /// Returns Unknown for expressions that can't be resolved without more context.
 pub fn expr_type(
@@ -435,18 +481,68 @@ pub fn expr_type(
     symtab: &super::symtab::SymbolTable,
 ) -> FortranType {
     use crate::ast::expr::Expr;
+    fn same_name_derived_constructor_type(
+        symtab: &super::symtab::SymbolTable,
+        name: &str,
+    ) -> Option<FortranType> {
+        let key = name.to_ascii_lowercase();
+        symtab.scopes.iter().find_map(|scope| {
+            let sym = scope.symbols.get(&key)?;
+            if matches!(sym.kind, super::symtab::SymbolKind::DerivedType)
+                && !sym.arg_names.is_empty()
+            {
+                Some(
+                    sym.type_info
+                        .as_ref()
+                        .map(type_info_to_fortran_type)
+                        .unwrap_or_else(|| FortranType::Derived {
+                            name: sym.name.clone(),
+                        }),
+                )
+            } else {
+                None
+            }
+        })
+    }
+
     match &expr.node {
         // Literals
-        Expr::IntegerLiteral { .. }
-        | Expr::RealLiteral { .. }
-        | Expr::StringLiteral { .. }
-        | Expr::LogicalLiteral { .. }
-        | Expr::ComplexLiteral { .. }
-        | Expr::BozLiteral { .. } => literal_type(&expr.node),
+        Expr::IntegerLiteral { kind, .. } => FortranType::Integer {
+            kind: kind
+                .as_deref()
+                .and_then(|k| resolve_kind_suffix(k, symtab))
+                .unwrap_or(4),
+        },
+        Expr::RealLiteral { text, kind, .. } => {
+            if let Some(kind) = kind.as_deref().and_then(|k| resolve_kind_suffix(k, symtab)) {
+                FortranType::Real { kind }
+            } else if text.to_lowercase().contains('d') {
+                FortranType::Real { kind: 8 }
+            } else {
+                FortranType::Real { kind: 4 }
+            }
+        }
+        Expr::StringLiteral { kind, value, .. } => FortranType::Character {
+            kind: kind
+                .as_deref()
+                .and_then(|k| resolve_kind_suffix(k, symtab))
+                .unwrap_or(1),
+            len: CharLen::Known(value.len() as i64),
+        },
+        Expr::LogicalLiteral { kind, .. } => FortranType::Logical {
+            kind: kind
+                .as_deref()
+                .and_then(|k| resolve_kind_suffix(k, symtab))
+                .unwrap_or(4),
+        },
+        Expr::ComplexLiteral { .. } | Expr::BozLiteral { .. } => literal_type(&expr.node),
 
         // Name — look up in symbol table
         Expr::Name { name } => {
-            if let Some(sym) = symtab.lookup(name) {
+            if let Some(sym) = symtab
+                .lookup(name)
+                .or_else(|| symtab.find_symbol_any_scope(name))
+            {
                 match &sym.type_info {
                     Some(info) => type_info_to_fortran_type(info),
                     None => FortranType::Unknown,
@@ -486,12 +582,52 @@ pub fn expr_type(
                     })
                     .collect();
 
+                if matches!(name.to_lowercase().as_str(), "real" | "float") {
+                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
+                        return FortranType::Real { kind };
+                    }
+                }
+
+                if matches!(
+                    name.to_lowercase().as_str(),
+                    "int" | "nint" | "floor" | "ceiling"
+                ) {
+                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
+                        return FortranType::Integer { kind };
+                    }
+                }
+
+                if matches!(name.to_lowercase().as_str(), "cmplx") {
+                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab) {
+                        return FortranType::Complex { kind };
+                    }
+                }
+
                 if let Some(result) = intrinsic_result_type(name, &arg_types) {
                     return result;
                 }
 
                 // Look up in symbol table
-                if let Some(sym) = symtab.lookup(name) {
+                if let Some(sym) = symtab
+                    .lookup(name)
+                    .or_else(|| symtab.find_symbol_any_scope(name))
+                {
+                    if matches!(sym.kind, super::symtab::SymbolKind::DerivedType)
+                        && !sym.arg_names.is_empty()
+                    {
+                        return sym
+                            .type_info
+                            .as_ref()
+                            .map(type_info_to_fortran_type)
+                            .unwrap_or_else(|| FortranType::Derived {
+                                name: sym.name.clone(),
+                            });
+                    }
+                    if matches!(sym.kind, super::symtab::SymbolKind::NamedInterface) {
+                        if let Some(ty) = same_name_derived_constructor_type(symtab, name) {
+                            return ty;
+                        }
+                    }
                     let has_range = args.iter().any(|a| {
                         matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                     });
@@ -724,7 +860,15 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "bit_size" | "leadz" | "trailz" | "popcount" => Some(FortranType::default_integer()),
 
         // Real-valued conversions.
-        "real" | "float" => Some(FortranType::default_real()),
+        "real" | "float" => match args.first()? {
+            FortranType::Real { kind } | FortranType::Complex { kind } => {
+                Some(FortranType::Real { kind: *kind })
+            }
+            FortranType::Integer { .. } | FortranType::Logical { .. } => {
+                Some(FortranType::default_real())
+            }
+            _ => None,
+        },
         "dble" | "dfloat" => Some(FortranType::double_precision()),
         "aimag" => {
             // aimag(complex(k)) → real(k)
@@ -796,6 +940,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Status inquiry.
         "is_iostat_end" | "is_iostat_eor" => Some(FortranType::default_logical()),
+
+        // IEEE arithmetic.
+        "ieee_value" => args.first().cloned(),
 
         _ => None, // Unknown intrinsic.
     }
@@ -1701,6 +1848,134 @@ mod tests {
         assert!(expr_type(&expr, &st).is_character());
     }
 
+    #[test]
+    fn expr_type_same_name_generic_constructor_uses_derived_result_type() {
+        use super::super::symtab::*;
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("m".into()));
+        st.define(Symbol {
+            name: "label_t".into(),
+            kind: SymbolKind::DerivedType,
+            type_info: Some(TypeInfo::Derived("label_t".into())),
+            attrs: SymbolAttrs::default(),
+            defined_at: span,
+            scope: 0,
+            arg_names: vec!["new_label".into()],
+            const_value: None,
+        })
+        .unwrap();
+
+        let callee = Box::new(Spanned::new(
+            Expr::Name {
+                name: "label_t".into(),
+            },
+            span,
+        ));
+        let arg = Argument {
+            keyword: None,
+            value: SectionSubscript::Element(Spanned::new(
+                Expr::IntegerLiteral {
+                    text: "2".into(),
+                    kind: None,
+                },
+                span,
+            )),
+        };
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![arg],
+            },
+            span,
+        );
+
+        assert_eq!(
+            expr_type(&expr, &st),
+            FortranType::Derived {
+                name: "label_t".into()
+            }
+        );
+    }
+
+    #[test]
+    fn expr_type_named_interface_prefers_same_name_derived_constructor_type() {
+        use super::super::symtab::*;
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("m".into()));
+        st.define(Symbol {
+            name: "label_t".into(),
+            kind: SymbolKind::NamedInterface,
+            type_info: None,
+            attrs: SymbolAttrs::default(),
+            defined_at: span,
+            scope: 0,
+            arg_names: vec!["new_label".into()],
+            const_value: None,
+        })
+        .unwrap();
+        st.push_scope(ScopeKind::Module("hidden".into()));
+        st.define(Symbol {
+            name: "label_t".into(),
+            kind: SymbolKind::DerivedType,
+            type_info: None,
+            attrs: SymbolAttrs::default(),
+            defined_at: span,
+            scope: 1,
+            arg_names: vec!["new_label".into()],
+            const_value: None,
+        })
+        .unwrap();
+
+        let callee = Box::new(Spanned::new(
+            Expr::Name {
+                name: "label_t".into(),
+            },
+            span,
+        ));
+        let arg = Argument {
+            keyword: None,
+            value: SectionSubscript::Element(Spanned::new(
+                Expr::IntegerLiteral {
+                    text: "2".into(),
+                    kind: None,
+                },
+                span,
+            )),
+        };
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![arg],
+            },
+            span,
+        );
+
+        assert_eq!(
+            expr_type(&expr, &st),
+            FortranType::Derived {
+                name: "label_t".into()
+            }
+        );
+    }
+
     // ---- Argument matching ----
 
     #[test]
@@ -2181,6 +2456,122 @@ mod tests {
     #[test]
     fn conjg_non_complex_returns_none() {
         assert!(intrinsic_result_type("conjg", &[FortranType::Real { kind: 4 }]).is_none());
+    }
+
+    #[test]
+    fn expr_type_cmplx_keyword_kind_respects_requested_kind() {
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let st = super::super::symtab::SymbolTable::new();
+        let callee = Box::new(Spanned::new(
+            Expr::Name {
+                name: "cmplx".into(),
+            },
+            span,
+        ));
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![
+                    Argument {
+                        keyword: None,
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::RealLiteral {
+                                text: "1.0".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                    Argument {
+                        keyword: None,
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::RealLiteral {
+                                text: "2.0".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                    Argument {
+                        keyword: Some("kind".into()),
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: "8".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                ],
+            },
+            span,
+        );
+        assert_eq!(expr_type(&expr, &st), FortranType::Complex { kind: 8 });
+    }
+
+    #[test]
+    fn expr_type_cmplx_positional_kind_respects_requested_kind() {
+        use crate::ast::expr::{Argument, Expr, SectionSubscript};
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let st = super::super::symtab::SymbolTable::new();
+        let callee = Box::new(Spanned::new(
+            Expr::Name {
+                name: "cmplx".into(),
+            },
+            span,
+        ));
+        let expr = Spanned::new(
+            Expr::FunctionCall {
+                callee,
+                args: vec![
+                    Argument {
+                        keyword: None,
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::RealLiteral {
+                                text: "1.0".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                    Argument {
+                        keyword: None,
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::RealLiteral {
+                                text: "2.0".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                    Argument {
+                        keyword: None,
+                        value: SectionSubscript::Element(Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: "16".into(),
+                                kind: None,
+                            },
+                            span,
+                        )),
+                    },
+                ],
+            },
+            span,
+        );
+        assert_eq!(expr_type(&expr, &st), FortranType::Complex { kind: 16 });
     }
 
     // ---- Audit fix: M7 — complex→integer implicit conversion blocked ----
