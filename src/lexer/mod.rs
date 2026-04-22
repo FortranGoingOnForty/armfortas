@@ -556,6 +556,17 @@ impl<'a> Lexer<'a> {
         ch
     }
 
+    fn advance_utf8_char(&mut self) -> char {
+        if let Some(ch) = self.char_at(self.pos) {
+            for _ in 0..ch.len_utf8() {
+                self.advance();
+            }
+            ch
+        } else {
+            self.advance() as char
+        }
+    }
+
     fn at_end(&self) -> bool {
         self.pos >= self.src.len()
     }
@@ -826,10 +837,9 @@ impl<'a> Lexer<'a> {
                 return Err(self.err(start, "unterminated string literal".into()));
             }
 
-            let c = self.advance();
-            text.push(c as char);
-
-            if c == quote {
+            if self.peek() == quote {
+                let c = self.advance();
+                text.push(c as char);
                 if self.peek() == quote {
                     // Doubled quote escape.
                     text.push(self.advance() as char);
@@ -837,7 +847,10 @@ impl<'a> Lexer<'a> {
                     // End of string.
                     break;
                 }
+                continue;
             }
+
+            text.push(self.advance_utf8_char());
         }
 
         Ok(Token {
@@ -1271,6 +1284,13 @@ mod tests {
         let toks = toks("'it''s'");
         assert_eq!(toks[0].kind, TokenKind::StringLiteral);
         assert_eq!(toks[0].text, "'it''s'");
+    }
+
+    #[test]
+    fn string_utf8_preserves_multibyte_codepoints() {
+        let toks = toks("'├──'");
+        assert_eq!(toks[0].kind, TokenKind::StringLiteral);
+        assert_eq!(toks[0].text, "'├──'");
     }
 
     #[test]

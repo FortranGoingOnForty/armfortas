@@ -4622,6 +4622,42 @@ fn whole_fixed_char_array_scalar_fill_preserves_element_slots() {
 }
 
 #[test]
+fn utf8_string_literal_preserves_source_bytes_at_runtime() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = '├──'\n  if (len(s) /= 9) error stop 1\n  if (len_trim(s) /= 9) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("utf8_string_literal_runtime", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("utf8 string literal compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "utf8 string literal should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("utf8 string literal run failed");
+    assert!(
+        run.status.success(),
+        "utf8 string literal should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected utf8 string literal output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_array_element_fixed_char_component_survives_nested_dummy_call() {
     let src = write_program(
         "program p\n  implicit none\n\n  type :: command_t\n    integer :: num_tokens = 0\n    character(len=32), allocatable :: tokens(:)\n  end type command_t\n\n  type :: pipeline_t\n    type(command_t), allocatable :: commands(:)\n    integer :: num_commands = 0\n  end type pipeline_t\n\n  type(pipeline_t) :: pipeline\n\n  allocate(pipeline%commands(1))\n  pipeline%num_commands = 1\n  pipeline%commands(1)%num_tokens = 1\n  allocate(character(len=32) :: pipeline%commands(1)%tokens(1))\n  pipeline%commands(1)%tokens(1) = 'true'\n\n  call exec(pipeline)\n\ncontains\n\n  subroutine exec(p)\n    type(pipeline_t), intent(inout) :: p\n    call run_single(p%commands(1))\n  end subroutine exec\n\n  subroutine run_single(cmd)\n    type(command_t), intent(inout) :: cmd\n    if (trim(cmd%tokens(1)) /= 'true') error stop 1\n    print *, 'ok'\n  end subroutine run_single\n\nend program p\n",
