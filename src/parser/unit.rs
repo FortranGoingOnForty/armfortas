@@ -531,20 +531,18 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Check for derived type definition: type [, attrs] :: name
+            // Check for derived type definition: type name
+            // or type [, attrs] :: name.
             if text == "type" {
                 let next_pos = self.pos + 1;
-                let next_text = if next_pos < self.tokens.len() {
-                    self.tokens[next_pos].text.to_lowercase()
-                } else {
-                    String::new()
-                };
-                // type :: or type , → derived type definition (not type(name) specifier).
-                if next_text == "::"
-                    || self.tokens.get(next_pos).is_some_and(|t| {
-                        t.kind == TokenKind::Comma || t.kind == TokenKind::ColonColon
-                    })
-                {
+                // type(name) is a declaration type-specifier, but bare
+                // type name starts a derived-type definition.
+                if self.tokens.get(next_pos).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Identifier | TokenKind::Comma | TokenKind::ColonColon
+                    )
+                }) {
                     self.advance(); // consume 'type'
                     decls.push(self.parse_derived_type_def()?);
                     continue;
@@ -1100,6 +1098,20 @@ mod tests {
                     "box_t".to_string()
                 ]
             );
+        } else {
+            panic!("not Module");
+        }
+    }
+
+    #[test]
+    fn module_accepts_derived_type_def_without_colon_colon() {
+        let u = parse_unit(
+            "module m\n  implicit none\n  type node_ptr\n    integer :: value\n  end type node_ptr\nend module\n",
+        );
+        if let ProgramUnit::Module { decls, .. } = &u.node {
+            assert!(decls
+                .iter()
+                .any(|decl| matches!(decl.node, crate::ast::decl::Decl::DerivedTypeDef { .. })));
         } else {
             panic!("not Module");
         }

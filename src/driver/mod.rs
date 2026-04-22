@@ -122,6 +122,7 @@ pub struct Options {
     pub force_implicit_none: bool,
     pub recursive_default: bool,
     pub backslash_escapes: bool,
+    pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
 
     // ---- Optimization ----
@@ -188,6 +189,7 @@ impl Default for Options {
             force_implicit_none: false,
             recursive_default: false,
             backslash_escapes: false,
+            free_line_length_none_compat: false,
             max_stack_var_size: None,
             opt_level: OptLevel::O0,
             warn_all: false,
@@ -404,6 +406,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             "-ffree-form" => opts.source_form_override = Some(SourceFormOverride::Free),
             "-ffixed-form" => opts.source_form_override = Some(SourceFormOverride::Fixed),
+            "-ffree-line-length-none" => opts.free_line_length_none_compat = true,
             "-fdefault-integer-8" => opts.default_integer_8 = true,
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
@@ -678,6 +681,11 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         opts.cli_warnings
             .push("-fmax-stack-var-size is recognized but not yet implemented".into());
     }
+    if opts.free_line_length_none_compat {
+        opts.cli_warnings.push(
+            "-ffree-line-length-none is accepted for compatibility; free-form inputs already have no line-length limit".into(),
+        );
+    }
     if opts.recursive_default {
         opts.cli_warnings
             .push("-frecursive is recognized but not yet implemented".into());
@@ -737,6 +745,7 @@ LANGUAGE:
   --std=<standard>            Fortran standard (f77, f90, f95, f2003, f2008, f2018, f2023)
   -ffree-form                 Force free-form source
   -ffixed-form                Force fixed-form source
+  -ffree-line-length-none     GNU-compatible alias; free-form inputs are already unlimited
   -fdefault-integer-8         Make default integer kind 8 bytes
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
@@ -2017,6 +2026,28 @@ mod tests {
                 "-fbacktrace is accepted, but runtime backtrace control is not yet implemented"
             )),
             "expected a compatibility warning for -fbacktrace, got {:?}",
+            opts.cli_warnings
+        );
+    }
+
+    #[test]
+    fn parse_cli_warns_for_ffree_line_length_none_flag() {
+        let args = vec![
+            "-ffree-line-length-none".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept -ffree-line-length-none")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(opts.free_line_length_none_compat);
+        assert!(
+            opts.cli_warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("-ffree-line-length-none is accepted for compatibility")),
+            "expected a compatibility warning for -ffree-line-length-none, got {:?}",
             opts.cli_warnings
         );
     }

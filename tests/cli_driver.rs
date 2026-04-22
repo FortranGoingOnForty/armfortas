@@ -6362,6 +6362,31 @@ fn werror_promotes_cli_warnings_to_errors() {
 }
 
 #[test]
+fn ffree_line_length_none_is_accepted_with_warning() {
+    let src = write_program("program p\n  print *, 7\nend program\n", "f90");
+    let out = unique_path("ffree_line_length_none", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-ffree-line-length-none",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(result.status.success(), "flag should be accepted");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("-ffree-line-length-none is accepted for compatibility"),
+        "expected compatibility warning: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn unknown_warning_flag_emits_warning() {
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("wunknown", "o");
@@ -13504,6 +13529,42 @@ fn associated_on_procedure_pointer_component_runs() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected procptr component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn structure_constructor_preserves_procptr_char_and_trailing_defaults() {
+    let src = write_program(
+        "program p\n  implicit none\n  abstract interface\n    subroutine cb()\n    end subroutine\n  end interface\n  type :: result_t\n    logical :: passed = .true.\n    character(len=16) :: message = ''\n  end type\n  type :: case_t\n    character(len=32) :: name = ''\n    procedure(cb), pointer, nopass :: proc => null()\n    type(result_t) :: result\n  end type\n  type(case_t) :: test\n  test = case_t('hello', local)\n  if (trim(test%name) /= 'hello') error stop 1\n  if (.not. associated(test%proc)) error stop 2\n  if (.not. test%result%passed) error stop 3\n  if (len_trim(test%result%message) /= 0) error stop 4\n  call test%proc()\n  print *, 'ok'\ncontains\n  subroutine local()\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("structure_constructor_procptr_defaults", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("structure constructor procptr compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "structure constructor procptr compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("structure constructor procptr run failed");
+    assert!(
+        run.status.success(),
+        "structure constructor procptr run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected structure constructor procptr output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

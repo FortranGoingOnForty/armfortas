@@ -24054,6 +24054,240 @@ fn emit_derived_value_copy(
     }
 }
 
+fn pointer_slot_addr_elem_type(slot_pointee_ty: &IrType) -> IrType {
+    match slot_pointee_ty {
+        IrType::Ptr(inner) => inner.as_ref().clone(),
+        ty => ty.clone(),
+    }
+}
+
+fn store_derived_field_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    field_ptr: ValueId,
+    field: &crate::sema::type_layout::FieldLayout,
+    value: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) {
+    if let CharKind::Fixed(flen) = field_char_kind(field) {
+        let (src_ptr, src_len) = lower_string_expr_full(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let dest_len = b.const_i64(flen);
+        b.call(
+            FuncRef::External("afs_assign_char_fixed".into()),
+            vec![field_ptr, dest_len, src_ptr, src_len],
+            IrType::Void,
+        );
+        return;
+    }
+
+    if is_deferred_char_component_field(field) {
+        let (src_ptr, src_len) = lower_string_expr_full(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        if field.pointer {
+            let (dest_ptr, dest_len) = load_string_descriptor_substring_view(b, field_ptr);
+            b.call(
+                FuncRef::External("afs_assign_char_fixed".into()),
+                vec![dest_ptr, dest_len, src_ptr, src_len],
+                IrType::Void,
+            );
+        } else {
+            b.call(
+                FuncRef::External("afs_assign_char_deferred".into()),
+                vec![field_ptr, src_ptr, src_len],
+                IrType::Void,
+            );
+        }
+        return;
+    }
+
+    if field.pointer {
+        match &value.node {
+            Expr::Name { name: src_name } => {
+                let src_key = src_name.to_lowercase();
+                if let Some(src_info) = locals.get(&src_key) {
+                    let addr = if src_info.is_pointer {
+                        let load_ty = if src_info.ty.is_ptr() {
+                            src_info.ty.clone()
+                        } else {
+                            IrType::Ptr(Box::new(src_info.ty.clone()))
+                        };
+                        b.load_typed(src_info.addr, load_ty)
+                    } else if src_info.derived_type.is_some() {
+                        derived_storage_addr(b, src_info)
+                    } else if src_info.by_ref {
+                        b.load(src_info.addr)
+                    } else {
+                        src_info.addr
+                    };
+                    b.store(addr, field_ptr);
+                    return;
+                }
+
+                if let Some(sym) = find_linkable_symbol_any_scope(st, &src_key) {
+                    if matches!(
+                        sym.kind,
+                        crate::sema::symtab::SymbolKind::Function
+                            | crate::sema::symtab::SymbolKind::Subroutine
+                            | crate::sema::symtab::SymbolKind::ExternalProc
+                            | crate::sema::symtab::SymbolKind::ProcedurePointer
+                    ) {
+                        let (link_name, resolved_key) =
+                            resolved_symbol_call_target(st, &src_key, src_name);
+                        let lowered_name = internal_funcs
+                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
+                            .map(|m| {
+                                lowered_procedure_symbol_name(
+                                    resolved_key.as_str(),
+                                    None,
+                                    Some(b.func().name.as_str()),
+                                    None,
+                                    true,
+                                    m,
+                                )
+                            })
+                            .unwrap_or(link_name);
+                        let slot_pointee_ty = field_storage_ir_type(field, type_layouts);
+                        let addr = b.global_addr(
+                            &lowered_name,
+                            pointer_slot_addr_elem_type(&slot_pointee_ty),
+                        );
+                        b.store(addr, field_ptr);
+                        return;
+                    }
+                }
+            }
+            Expr::ComponentAccess { .. } => {
+                if let Some((src_field_ptr, src_field)) =
+                    resolve_component_field_access(b, locals, value, st, type_layouts)
+                {
+                    if is_deferred_char_component_field(&src_field) {
+                        let (ptr, _len) = load_string_descriptor_view(b, src_field_ptr);
+                        b.store(ptr, field_ptr);
+                        return;
+                    }
+                    if src_field.pointer && src_field.size == 384 {
+                        emit_memcpy_bytes(b, field_ptr, src_field_ptr, 384);
+                        return;
+                    }
+                    if src_field.pointer {
+                        let slot_value_ty = match &src_field.type_info {
+                            crate::sema::symtab::TypeInfo::Derived(_) => {
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+                            }
+                            _ => IrType::Ptr(Box::new(field_storage_ir_type(
+                                &src_field,
+                                type_layouts,
+                            ))),
+                        };
+                        let associated = b.load_typed(src_field_ptr, slot_value_ty);
+                        b.store(associated, field_ptr);
+                        return;
+                    }
+                    let zero = b.const_i64(0);
+                    let typed_ptr = b.gep(
+                        src_field_ptr,
+                        vec![zero],
+                        field_storage_ir_type(field, type_layouts),
+                    );
+                    b.store(typed_ptr, field_ptr);
+                    return;
+                }
+            }
+            Expr::FunctionCall { .. } => {
+                let addr = lower_expr_full(
+                    b,
+                    locals,
+                    value,
+                    st,
+                    Some(type_layouts),
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                b.store(addr, field_ptr);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_))
+        && !is_opaque_c_handle_type(&field.type_info)
+        && !field.pointer
+        && !field.allocatable
+        && field.dims.is_empty()
+    {
+        let src_ptr = lower_expr_full(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        if let Some(nested_name) = field_derived_type_name(field) {
+            emit_derived_value_copy(b, type_layouts, &nested_name, field_ptr, src_ptr);
+        }
+        return;
+    }
+
+    if is_complex_ty(&type_info_to_ir_type(&field.type_info))
+        && !field.pointer
+        && !field.allocatable
+        && field.dims.is_empty()
+    {
+        let src = lower_expr_full(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let bytes = complex_byte_size(&type_info_to_ir_type(&field.type_info));
+        emit_memcpy_bytes(b, field_ptr, src, bytes);
+        return;
+    }
+
+    let val = lower_expr_full(
+        b,
+        locals,
+        value,
+        st,
+        Some(type_layouts),
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let coerced = coerce_to_type(b, val, &type_info_to_ir_type(&field.type_info));
+    b.store(coerced, field_ptr);
+}
+
 fn lower_derived_array_copy_loop(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -26048,17 +26282,16 @@ fn lower_expr_full(
                 // Check if this is a structure constructor: type_name(val1, val2, ...).
                 if let Some(tl) = type_layouts {
                     if let Some(layout) = tl.get(&key) {
-                        // Allocate a temporary struct on the stack and zero-initialize.
+                        // Allocate a temporary struct on the stack and apply
+                        // the same runtime defaults as ordinary derived storage.
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let tmp = b.alloca(struct_ty);
-                        let zero = b.const_i32(0);
-                        let sz = b.const_i64(layout.size as i64);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![tmp, zero, sz],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
+                        if derived_layout_needs_runtime_initialization(layout, tl) {
+                            initialize_derived_storage(b, tmp, layout, tl);
+                        } else {
+                            zero_fill_bytes(b, tmp, layout.size as i64);
+                        }
 
                         if args.len() != layout.fields.len() {
                             eprintln!("warning: structure constructor for '{}' has {} args but type has {} fields",
@@ -26069,32 +26302,21 @@ fn lower_expr_full(
                         for (i, arg) in args.iter().enumerate() {
                             if i < layout.fields.len() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                    let val = lower_expr_full(
+                                    let offset = b.const_i64(layout.fields[i].offset as i64);
+                                    let field_ptr =
+                                        b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
+                                    store_derived_field_expr(
                                         b,
                                         locals,
+                                        field_ptr,
+                                        &layout.fields[i],
                                         e,
                                         st,
-                                        type_layouts,
+                                        tl,
                                         internal_funcs,
                                         contained_host_refs,
                                         descriptor_params,
                                     );
-                                    let offset = b.const_i64(layout.fields[i].offset as i64);
-                                    let field_ptr =
-                                        b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
-                                    let field_ty =
-                                        type_info_to_ir_type(&layout.fields[i].type_info);
-                                    if is_complex_ty(&field_ty) {
-                                        let sz = b.const_i64(complex_byte_size(&field_ty));
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![field_ptr, val, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        let coerced = coerce_to_type(b, val, &field_ty);
-                                        b.store(coerced, field_ptr);
-                                    }
                                 }
                             }
                         }
