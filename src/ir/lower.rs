@@ -10032,6 +10032,7 @@ fn try_defined_assignment(
     let rk = resolved.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
     let func_ref = same_unit_func_ref(
+        ctx.st,
         b.func().name.as_str(),
         Some(ctx.internal_funcs),
         &[&rk],
@@ -10408,6 +10409,7 @@ fn emit_resolved_operator_call(
     );
 
     let func_ref = same_unit_func_ref(
+        st,
         b.func().name.as_str(),
         internal_funcs,
         &[&specific_key],
@@ -10744,7 +10746,68 @@ fn immediate_host_link_name_for_internal_calls(current_func_name: &str) -> Strin
     current_func_name.to_string()
 }
 
+fn current_internal_proc_name(
+    current_func_name: &str,
+    internal_funcs: &HashMap<String, u32>,
+) -> Option<String> {
+    let rest = current_func_name.strip_prefix("afs_internal_")?;
+    let (_, suffix) = rest.rsplit_once('_')?;
+    let idx: u32 = suffix.parse().ok()?;
+    internal_funcs
+        .iter()
+        .find_map(|(name, value)| (*value == idx).then(|| name.clone()))
+}
+
+fn scope_matches_procedure_name(scope: &crate::sema::symtab::Scope, name: &str) -> bool {
+    matches!(
+        &scope.kind,
+        crate::sema::symtab::ScopeKind::Program(scope_name)
+            | crate::sema::symtab::ScopeKind::Function(scope_name)
+            | crate::sema::symtab::ScopeKind::Subroutine(scope_name)
+            if scope_name.eq_ignore_ascii_case(name)
+    )
+}
+
+fn find_procedure_scope_id(st: &SymbolTable, name: &str) -> Option<crate::sema::symtab::ScopeId> {
+    st.all_scopes()
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, scope)| scope_matches_procedure_name(scope, name).then_some(idx))
+}
+
+fn internal_call_host_link_name(
+    st: &SymbolTable,
+    current_func_name: &str,
+    internal_funcs: &HashMap<String, u32>,
+    callee_name: &str,
+) -> String {
+    if !current_func_name.starts_with("afs_internal_") {
+        return current_func_name.to_string();
+    }
+    let fallback = immediate_host_link_name_for_internal_calls(current_func_name);
+    let Some(current_proc_name) = current_internal_proc_name(current_func_name, internal_funcs)
+    else {
+        return fallback;
+    };
+    if callee_name.eq_ignore_ascii_case(&current_proc_name) {
+        return current_func_name.to_string();
+    }
+    let Some(current_scope_id) = find_procedure_scope_id(st, &current_proc_name) else {
+        return fallback;
+    };
+    let Some(callee_scope_id) = find_procedure_scope_id(st, callee_name) else {
+        return fallback;
+    };
+    if st.scope(callee_scope_id).parent == Some(current_scope_id) {
+        current_func_name.to_string()
+    } else {
+        fallback
+    }
+}
+
 fn same_unit_func_ref(
+    st: &SymbolTable,
     current_func_name: &str,
     internal_funcs: Option<&HashMap<String, u32>>,
     keys: &[&str],
@@ -10760,7 +10823,7 @@ fn same_unit_func_ref(
     else {
         return FuncRef::External(fallback_call_name);
     };
-    let host_link_name = immediate_host_link_name_for_internal_calls(current_func_name);
+    let host_link_name = internal_call_host_link_name(st, current_func_name, internal_funcs, matched_key);
     let lowered = lowered_procedure_symbol_name(
         matched_key,
         None,
@@ -11181,6 +11244,7 @@ fn emit_named_function_call(
     append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut call_args);
 
     let func_ref = same_unit_func_ref(
+        st,
         b.func().name.as_str(),
         internal_funcs,
         &[&callee_key, &key],
@@ -11600,6 +11664,7 @@ fn lower_alloc_return_call_into_desc(
     append_host_closure_args(b, ctx, &callee_key, &mut call_args);
 
     let func_ref = same_unit_func_ref(
+        ctx.st,
         b.func().name.as_str(),
         Some(ctx.internal_funcs),
         &[&callee_key, &key],
@@ -14616,6 +14681,7 @@ fn emit_final_proc_call(
         &mut call_args,
     );
     let func_ref = same_unit_func_ref(
+        st,
         b.func().name.as_str(),
         Some(internal_funcs),
         &[&resolved_key, &key],
@@ -16345,6 +16411,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         FuncRef::Indirect(target)
                     } else {
                         same_unit_func_ref(
+                            ctx.st,
                             b.func().name.as_str(),
                             Some(ctx.internal_funcs),
                             &[&resolved_key],
@@ -29850,6 +29917,7 @@ fn lower_expr_full(
                     FuncRef::Indirect(target)
                 } else {
                     same_unit_func_ref(
+                        st,
                         b.func().name.as_str(),
                         internal_funcs,
                         &[&callee_key, &signature_key, &key],
