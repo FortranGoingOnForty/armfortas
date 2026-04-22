@@ -13194,6 +13194,42 @@ fn contained_subroutine_actual_to_procedure_dummy_links_and_runs() {
 }
 
 #[test]
+fn contained_subroutine_pointer_component_assignment_links_and_runs() {
+    let src = write_program(
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\ncontains\n  subroutine invoke(holder)\n    type(holder_t), intent(in) :: holder\n    call holder%handler(7)\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  holder%handler => local_handler\n  call invoke(holder)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value /= 7) error stop 1\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_proc_component_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained proc component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained proc component assignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained proc component assignment run failed");
+    assert!(
+        run.status.success(),
+        "contained proc component assignment should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained proc component assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn o2_keeps_address_taken_contained_callback_symbols() {
     let src = write_program(
         "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine remember(handler)\n    procedure(cb) :: handler\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call remember(local_handler)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend program\n",

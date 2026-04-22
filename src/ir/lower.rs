@@ -17019,10 +17019,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         crate::sema::symtab::SymbolKind::Function
                             | crate::sema::symtab::SymbolKind::Subroutine
                     ) {
-                        let (link_name, _) =
+                        let (link_name, resolved_key) =
                             resolved_symbol_call_target(ctx.st, &src_key, src_name);
+                        let lowered_name = if ctx.internal_funcs.contains_key(&resolved_key)
+                            || ctx.internal_funcs.contains_key(&src_key)
+                        {
+                            lowered_procedure_symbol_name(
+                                resolved_key.as_str(),
+                                None,
+                                Some(b.func().name.as_str()),
+                                None,
+                                true,
+                                ctx.internal_funcs,
+                            )
+                        } else {
+                            link_name
+                        };
                         let addr = b.global_addr(
-                            &link_name,
+                            &lowered_name,
                             procedure_pointer_symbol_addr_elem_type(&tgt_info),
                         );
                         b.store(addr, tgt_info.addr);
