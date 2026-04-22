@@ -5,6 +5,7 @@
 //! symbol resolution (resolve.rs) and type checking (types.rs).
 
 use super::symtab::*;
+use super::types::expr_type;
 use crate::ast::decl::{Attribute, Decl, TypeAttr, TypeSpec};
 use crate::ast::expr::Expr;
 use crate::ast::stmt::*;
@@ -1317,9 +1318,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- I/O in pure ----
-        Stmt::Write { .. }
-        | Stmt::Read { .. }
-        | Stmt::Print { .. }
+        Stmt::Write { controls, .. } | Stmt::Read { controls, .. }
+            if ctx.in_pure && !uses_internal_character_file(ctx, controls) =>
+        {
+            ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+        }
+        Stmt::Print { .. }
         | Stmt::Open { .. }
         | Stmt::Close { .. }
         | Stmt::Inquire { .. }
@@ -1996,6 +2000,37 @@ fn reject_pure_nonlocal_definition(
     }
 }
 
+fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
+    let Some(unit) = controls.iter().find(|control| {
+        control
+            .keyword
+            .as_deref()
+            .map_or(true, |kw| kw.eq_ignore_ascii_case("unit"))
+    }) else {
+        return false;
+    };
+
+    if matches!(&unit.value.node, Expr::Name { name } if name == "*") {
+        return false;
+    }
+
+    match &unit.value.node {
+        Expr::StringLiteral { .. } => true,
+        Expr::Name { name } => ctx
+            .lookup(name)
+            .and_then(|sym| sym.type_info.as_ref())
+            .is_some_and(|ty| matches!(ty, TypeInfo::Character { .. })),
+        Expr::ParenExpr { inner } => uses_internal_character_file(
+            ctx,
+            &[IoControl {
+                keyword: None,
+                value: (**inner).clone(),
+            }],
+        ),
+        _ => expr_type(&unit.value, ctx.st).is_character(),
+    }
+}
+
 /// Validate call-site argument intent constraints.
 /// Can't pass a literal, parameter, or expression to intent(out/inout).
 fn validate_call_site_intent(
@@ -2628,6 +2663,9 @@ fn block_use_imported_names(
                     OnlyItem::Name(name) => {
                         imported.insert(name.to_lowercase());
                     }
+                    OnlyItem::Generic(name) => {
+                        imported.insert(name.to_lowercase());
+                    }
                     OnlyItem::Rename(rename) => {
                         imported.insert(rename.local.to_lowercase());
                     }
@@ -2805,6 +2843,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
         "execute_command_line" | "compiler_version" | "compiler_options" |
+        "is_iostat_end" | "is_iostat_eor" |
         "c_loc" | "c_funloc" | "c_f_pointer" | "c_associated" | "c_sizeof" |
         "ieee_is_nan" | "ieee_is_finite" | "ieee_value" |
         "ieee_support_datatype" | "ieee_support_denormal" |
@@ -3053,6 +3092,20 @@ end subroutine
 ",
         );
         assert!(errs.iter().any(|e| e.contains("I/O") && e.contains("pure")));
+    }
+
+    #[test]
+    fn internal_write_in_pure_ok() {
+        let errs = errors_from(
+            "\
+pure function fmt_value(x) result(str)
+  integer, intent(in) :: x
+  character(16) :: str
+  write(str, '(i0)') x
+end function
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
     #[test]
