@@ -1453,6 +1453,43 @@ fn reshape_array_actual_to_assumed_shape_dummy_compiles_and_runs() {
 }
 
 #[test]
+fn function_result_kind_alias_flows_to_caller_abi() {
+    let src = write_program(
+        "module m\ncontains\n  function wrap() result(total)\n    use iso_fortran_env, only: real64\n    real(real64) :: total\n    total = 5.0_real64\n  end function wrap\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: total\n  total = wrap()\n  if (abs(total - 5.0_real64) > 1.0e-12_real64) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("function_result_kind_alias", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("function result kind alias compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "function result kind alias compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("function result kind alias run failed");
+    assert!(
+        run.status.success(),
+        "function result kind alias run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected function result kind alias output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_array_actual_to_assumed_shape_subroutine_dummy_compiles_and_runs() {
     let src = write_program(
         "module m\ncontains\n  subroutine show(matrix_data)\n    use iso_fortran_env, only: real64\n    real(real64), intent(in) :: matrix_data(:,:)\n    if (size(matrix_data, 1) /= 2 .or. size(matrix_data, 2) /= 2) error stop 21\n    if (abs(matrix_data(2, 1) - 3.0_real64) > 1.0e-12_real64) error stop 22\n    if (abs(matrix_data(1, 2) - 2.0_real64) > 1.0e-12_real64) error stop 23\n    print *, 'ok'\n  end subroutine show\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  call show(reshape([1.0_real64, 3.0_real64, 2.0_real64, 4.0_real64], [2, 2]))\nend program p\n",

@@ -96,6 +96,34 @@ fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId
     }
 }
 
+fn backfill_function_result_type(
+    st: &mut SymbolTable,
+    host_scope: ScopeId,
+    function_scope: ScopeId,
+    function_name: &str,
+    result_name: &str,
+) {
+    let result_key = result_name.to_ascii_lowercase();
+    let (type_info, pointer, allocatable) = match st.scope(function_scope).symbols.get(&result_key)
+    {
+        Some(sym) => (sym.type_info.clone(), sym.attrs.pointer, sym.attrs.allocatable),
+        None => return,
+    };
+    let Some(type_info) = type_info else {
+        return;
+    };
+    let function_key = function_name.to_ascii_lowercase();
+    if let Some(sym) = st.scope_mut(host_scope).symbols.get_mut(&function_key) {
+        sym.type_info = Some(type_info);
+        if pointer {
+            sym.attrs.pointer = true;
+        }
+        if allocatable {
+            sym.attrs.allocatable = true;
+        }
+    }
+}
+
 fn normalized_bind_name(
     bind: Option<&crate::ast::unit::BindInfo>,
     default_name: &str,
@@ -227,6 +255,7 @@ fn resolve_unit(
             body,
             contains,
         } => {
+            let host_scope = st.current_scope();
             let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
             st.scope_mut(scope_id).arg_order = args
                 .iter()
@@ -267,6 +296,13 @@ fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            backfill_function_result_type(
+                st,
+                host_scope,
+                scope_id,
+                name,
+                result.as_deref().unwrap_or(name.as_str()),
+            );
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
