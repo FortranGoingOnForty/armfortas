@@ -15555,11 +15555,19 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 vec![size_val],
                                 IrType::Ptr(Box::new(info.ty.clone())),
                             );
-                            b.store(ptr, info.addr);
+                            let slot = if info.is_pointer && info.by_ref {
+                                b.load_typed(
+                                    info.addr,
+                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                )
+                            } else {
+                                info.addr
+                            };
+                            b.store(ptr, slot);
                             if let Some(type_name) = &info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
                                     let base_ptr = b.load_typed(
-                                        info.addr,
+                                        slot,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
                                     if derived_layout_needs_runtime_initialization(

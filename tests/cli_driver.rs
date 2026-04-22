@@ -11718,6 +11718,41 @@ fn pointer_dummy_rhs_name_component_assignment_preserves_pointee() {
 }
 
 #[test]
+fn allocate_pointer_intent_out_dummy_updates_caller_slot_and_components() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: value = 0\n    character(len=16) :: name = ''\n  end type\n  type(node_t), pointer :: root\n  call init(root)\n  if (.not. associated(root)) error stop 1\n  if (root%value /= 7) error stop 2\n  if (trim(root%name) /= 'root') error stop 3\n  print *, 'ok'\ncontains\n  subroutine init(root)\n    type(node_t), pointer, intent(out) :: root\n    allocate(root)\n    root%value = 7\n    root%name = 'root'\n  end subroutine\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_intent_out_allocate_components", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer intent(out) allocate compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer intent(out) allocate should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer intent(out) allocate should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer intent(out) allocate output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(node_t), pointer :: child => null()\n  end type\n  type :: pipeline_t\n    type(node_t), pointer :: commands(:) => null()\n  end type\n  type :: wrapper_t\n    type(pipeline_t), pointer :: pipe => null()\n  end type\n  type(node_t), target :: storage(2)\n  type(node_t), pointer :: cmds(:)\n  type(wrapper_t) :: w\n\n  storage(1)%node_type = 11\n  storage(2)%node_type = 22\n  cmds => storage\n\n  allocate(w%pipe)\n  w%pipe%commands => cmds\n\n  call show_node(w%pipe%commands(1))\n  call show_node(w%pipe%commands(2))\ncontains\n  subroutine show_node(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node)) error stop 1\n    print '(A,I0)', 'NODE=', node%node_type\n  end subroutine show_node\nend program p\n",
