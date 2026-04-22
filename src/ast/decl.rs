@@ -232,6 +232,7 @@ pub struct Rename {
 pub enum OnlyItem {
     Name(String),
     Rename(Rename),
+    Generic(String),
 }
 
 // ---- IMPLICIT parts ----

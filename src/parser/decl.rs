@@ -611,13 +611,38 @@ impl<'a> Parser<'a> {
             return Ok(items);
         }
         loop {
-            let name = self.advance().clone().text;
+            let mut name = self.advance().clone().text;
+            let mut is_generic_spec = false;
+            if name.eq_ignore_ascii_case("operator") || name.eq_ignore_ascii_case("assignment") {
+                self.expect(&TokenKind::LParen)?;
+                let op = self.advance().clone().text;
+                self.expect(&TokenKind::RParen)?;
+                name = format!("{}({})", name, op);
+                is_generic_spec = true;
+            }
             if self.eat(&TokenKind::Arrow) {
                 let remote = self.advance().clone().text;
                 items.push(OnlyItem::Rename(Rename {
                     local: name,
                     remote,
                 }));
+            } else if is_generic_spec {
+                items.push(OnlyItem::Generic(name));
+            } else if name.eq_ignore_ascii_case("operator(+)")
+                || name.eq_ignore_ascii_case("operator(-)")
+                || name.eq_ignore_ascii_case("operator(*)")
+                || name.eq_ignore_ascii_case("operator(/)")
+                || name.eq_ignore_ascii_case("operator(**)")
+                || name.eq_ignore_ascii_case("operator(//)")
+                || name.eq_ignore_ascii_case("operator(==)")
+                || name.eq_ignore_ascii_case("operator(/=)")
+                || name.eq_ignore_ascii_case("operator(<)")
+                || name.eq_ignore_ascii_case("operator(<=)")
+                || name.eq_ignore_ascii_case("operator(>)")
+                || name.eq_ignore_ascii_case("operator(>=)")
+                || name.eq_ignore_ascii_case("assignment(=)")
+            {
+                items.push(OnlyItem::Generic(name));
             } else {
                 items.push(OnlyItem::Name(name));
             }
@@ -1450,6 +1475,20 @@ mod tests {
         if let Decl::UseStmt { only, .. } = &d.node {
             let items = only.as_ref().unwrap();
             assert!(matches!(&items[0], OnlyItem::Rename(_)));
+        } else {
+            panic!("not UseStmt");
+        }
+    }
+
+    #[test]
+    fn use_only_generic_specs() {
+        let d = parse_decl("use my_module, only: operator(+), operator(//), assignment(=)");
+        if let Decl::UseStmt { only, .. } = &d.node {
+            let items = only.as_ref().unwrap();
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], OnlyItem::Generic(name) if name == "operator(+)"));
+            assert!(matches!(&items[1], OnlyItem::Generic(name) if name == "operator(//)"));
+            assert!(matches!(&items[2], OnlyItem::Generic(name) if name == "assignment(=)"));
         } else {
             panic!("not UseStmt");
         }
