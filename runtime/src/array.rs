@@ -1859,6 +1859,66 @@ pub extern "C" fn afs_array_allocated(desc: *const ArrayDescriptor) -> i32 {
     unsafe { (*desc).is_allocated() as i32 }
 }
 
+fn logical_desc_value(desc: &ArrayDescriptor, index: usize) -> bool {
+    if desc.base_addr.is_null() || desc.rank < 1 {
+        return false;
+    }
+    let stride = desc.dims[0].stride.max(1) as usize;
+    let elem_size = desc.elem_size.max(1) as usize;
+    let byte_offset = index.saturating_mul(stride).saturating_mul(elem_size);
+    let ptr = unsafe { desc.base_addr.add(byte_offset) };
+    unsafe { *ptr != 0 }
+}
+
+/// ANY(array) for logical arrays — return 1 when any element is true.
+#[no_mangle]
+pub extern "C" fn afs_array_any_logical(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    let n = d.total_elements().max(0) as usize;
+    for i in 0..n {
+        if logical_desc_value(d, i) {
+            return 1;
+        }
+    }
+    0
+}
+
+/// ALL(array) for logical arrays — return 1 when every element is true.
+#[no_mangle]
+pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    let n = d.total_elements().max(0) as usize;
+    for i in 0..n {
+        if !logical_desc_value(d, i) {
+            return 0;
+        }
+    }
+    1
+}
+
+/// COUNT(array) for logical arrays — number of true elements.
+#[no_mangle]
+pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    let n = d.total_elements().max(0) as usize;
+    let mut count = 0i32;
+    for i in 0..n {
+        if logical_desc_value(d, i) {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// SUM(array) — sum all elements (real(8) version).
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
