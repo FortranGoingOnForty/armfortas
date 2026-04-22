@@ -1811,9 +1811,9 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                             _ => None,
                         }?;
                         match ty {
-                            TypeInfo::Integer { kind } => Some(match kind.unwrap_or(
-                                crate::driver::defaults::default_int_kind() as u8,
-                            ) {
+                            TypeInfo::Integer { kind } => Some(match kind
+                                .unwrap_or(crate::driver::defaults::default_int_kind())
+                            {
                                 1 => 2,
                                 2 => 4,
                                 4 => 9,
@@ -1821,9 +1821,9 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                                 16 => 38,
                                 _ => return None,
                             }),
-                            TypeInfo::Real { kind } => Some(match kind.unwrap_or(
-                                crate::driver::defaults::default_real_kind() as u8,
-                            ) {
+                            TypeInfo::Real { kind } => Some(match kind
+                                .unwrap_or(crate::driver::defaults::default_real_kind())
+                            {
                                 4 => 37,
                                 8 => 307,
                                 _ => return None,

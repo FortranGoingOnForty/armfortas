@@ -7589,9 +7589,9 @@ fn fixed_char_array_constructor_len(
     saw_expr.then_some(max_len)
 }
 
-fn first_array_constructor_expr<'a>(
-    values: &'a [crate::ast::expr::AcValue],
-) -> Option<&'a crate::ast::expr::SpannedExpr> {
+fn first_array_constructor_expr(
+    values: &[crate::ast::expr::AcValue],
+) -> Option<&crate::ast::expr::SpannedExpr> {
     for value in values {
         match value {
             crate::ast::expr::AcValue::Expr(expr) => return Some(expr),
@@ -9650,9 +9650,9 @@ fn procedure_scope_by_name<'a>(
     })
 }
 
-fn declared_args_for_scope<'a>(
-    scope: &'a crate::sema::symtab::Scope,
-) -> Vec<&'a crate::sema::symtab::Symbol> {
+fn declared_args_for_scope(
+    scope: &crate::sema::symtab::Scope,
+) -> Vec<&crate::sema::symtab::Symbol> {
     scope
         .arg_order
         .iter()
@@ -9986,7 +9986,7 @@ fn try_defined_assignment(
     // For ASSIGNMENT(=) resolution, the conceptual argument list is
     // (lhs, rhs). The LHS is represented by its address (matching the
     // subroutine's intent(out) dummy), the RHS by its value.
-    let arg_vals = vec![lhs_val, rhs_val];
+    let arg_vals = [lhs_val, rhs_val];
     let actual_types: Vec<Option<IrType>> =
         arg_vals.iter().map(|v| b.func().value_type(*v)).collect();
     let resolved = semantic_candidates.iter().find_map(|specific| {
@@ -16184,7 +16184,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                     b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
-                    return;
                 }
             } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
@@ -22566,8 +22565,6 @@ fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
         let typed_ptr = b.load(info.addr);
         let raw = b.ptr_to_int(typed_ptr);
         b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
-    } else if info.allocatable {
-        info.addr
     } else {
         info.addr
     }

@@ -2005,7 +2005,7 @@ fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
         control
             .keyword
             .as_deref()
-            .map_or(true, |kw| kw.eq_ignore_ascii_case("unit"))
+            .is_none_or(|kw| kw.eq_ignore_ascii_case("unit"))
     }) else {
         return false;
     };

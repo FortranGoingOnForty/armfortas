@@ -32,7 +32,7 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
 }
 
 fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);

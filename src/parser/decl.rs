@@ -626,9 +626,8 @@ impl<'a> Parser<'a> {
                     local: name,
                     remote,
                 }));
-            } else if is_generic_spec {
-                items.push(OnlyItem::Generic(name));
-            } else if name.eq_ignore_ascii_case("operator(+)")
+            } else if is_generic_spec
+                || name.eq_ignore_ascii_case("operator(+)")
                 || name.eq_ignore_ascii_case("operator(-)")
                 || name.eq_ignore_ascii_case("operator(*)")
                 || name.eq_ignore_ascii_case("operator(/)")
