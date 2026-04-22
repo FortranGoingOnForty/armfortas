@@ -456,7 +456,7 @@ fn resolve_unit(
             if let Some(generic_name) = name {
                 if !generic_name.is_empty() && !specific_names.is_empty() {
                     let span = unit.span;
-                    let _ = st.define(Symbol {
+                    let define_result = st.define(Symbol {
                         name: generic_name.clone(),
                         kind: SymbolKind::NamedInterface,
                         type_info: None,
@@ -465,9 +465,19 @@ fn resolve_unit(
                         },
                         defined_at: span,
                         scope: st.current_scope(),
-                        arg_names: specific_names,
+                        arg_names: specific_names.clone(),
                         const_value: None,
                     });
+                    if define_result.is_err() {
+                        let key = generic_name.to_ascii_lowercase();
+                        if let Some(existing) =
+                            st.scope_mut(st.current_scope()).symbols.get_mut(&key)
+                        {
+                            if existing.kind == SymbolKind::DerivedType {
+                                existing.arg_names = specific_names;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -506,6 +516,14 @@ fn process_uses(
                     for item in only_items {
                         match item {
                             OnlyItem::Name(name) => {
+                                st.add_use_association(UseAssociation {
+                                    local_name: name.clone(),
+                                    original_name: name.clone(),
+                                    source_scope: mod_scope,
+                                    is_submodule_access: false,
+                                });
+                            }
+                            OnlyItem::Generic(name) => {
                                 st.add_use_association(UseAssociation {
                                     local_name: name.clone(),
                                     original_name: name.clone(),
@@ -868,7 +886,7 @@ fn load_external_module(
             access: Access::Public,
             ..Default::default()
         };
-        let _ = st.define(Symbol {
+        let define_result = st.define(Symbol {
             name: iface_def.name.clone(),
             kind: SymbolKind::NamedInterface,
             type_info: None,
@@ -878,6 +896,14 @@ fn load_external_module(
             arg_names: iface_def.specifics.clone(),
             const_value: None,
         });
+        if define_result.is_err() {
+            let key = iface_def.name.to_ascii_lowercase();
+            if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
+                if existing.kind == SymbolKind::DerivedType {
+                    existing.arg_names = iface_def.specifics.clone();
+                }
+            }
+        }
     }
 
     st.pop_scope();
@@ -1393,10 +1419,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 };
                 let mut arg_names = Vec::new();
 
-                if sym_attrs.pointer && sym_attrs.external {
-                    kind = SymbolKind::ProcedurePointer;
+                if sym_attrs.external {
                     if let TypeSpec::Type(iface_name) = type_spec {
                         sym_attrs.procedure_iface = Some(iface_name.clone());
+                        if sym_attrs.pointer {
+                            kind = SymbolKind::ProcedurePointer;
+                        }
                         if let Some(iface_sym) =
                             st.find_symbol_any_scope(&iface_name.to_lowercase())
                         {
@@ -1787,7 +1815,7 @@ fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8
                 Expr::Name { name } => {
                     // Resolve named constant (e.g., c_double, real64, int64).
                     let key = name.to_lowercase();
-                    st.lookup(&key)
+                    st.lookup_in(st.current_scope(), &key)
                         .and_then(|sym| sym.const_value.map(|v| v as u8))
                 }
                 _ => None,
