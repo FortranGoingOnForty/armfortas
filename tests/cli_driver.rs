@@ -7512,6 +7512,67 @@ fn component_bound_dispatch_keeps_module_specific_target_name() {
 }
 
 #[test]
+fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: node_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: node_t\n      class(node_t), intent(inout) :: self\n    end subroutine\n    subroutine visit_i(self, val)\n      import :: visitor_t, node_t\n      class(visitor_t), intent(inout) :: self\n      class(node_t), intent(inout) :: val\n    end subroutine\n  end interface\n  type, extends(node_t) :: leaf_t\n  contains\n    procedure :: destroy => leaf_destroy\n  end type\n  type, extends(visitor_t) :: print_visitor_t\n  contains\n    procedure :: visit => print_visit\n  end type\ncontains\n  subroutine leaf_destroy(self)\n    class(leaf_t), intent(inout) :: self\n    print *, 'destroy'\n  end subroutine\n  subroutine print_visit(self, val)\n    class(print_visitor_t), intent(inout) :: self\n    class(node_t), intent(inout) :: val\n    print *, 'visit'\n    call val%destroy()\n  end subroutine\n  subroutine run()\n    class(node_t), allocatable :: val\n    class(visitor_t), allocatable :: vis\n    allocate(leaf_t :: val)\n    allocate(print_visitor_t :: vis)\n    call vis%visit(val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call run()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_name_bound_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic name bound dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic name bound dispatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic name bound dispatch run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic name bound dispatch should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("visit") && stdout.contains("destroy"),
+        "unexpected polymorphic name bound dispatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_component_bound_call_without_visible_concretes_errors() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine\n  end interface\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type\n  type :: holder_t\n    type(node_t), allocatable :: items(:)\n  contains\n    procedure :: zap\n  end type\ncontains\n  subroutine zap(self)\n    class(holder_t), intent(inout) :: self\n    call self%items(1)%val%destroy()\n  end subroutine\nend module\n",
+        "f90",
+    );
+    let compile = Command::new(compiler("armfortas"))
+        .arg(src.to_str().unwrap())
+        .output()
+        .expect("polymorphic component missing-concrete compile failed to spawn");
+    assert!(
+        !compile.status.success(),
+        "polymorphic component missing-concrete case should fail to compile"
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("no visible concrete override targets"),
+        "unexpected stderr for missing-concrete polymorphic component call: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
     let dir = unique_dir("derived_result_return_amod");
     let mod_src = write_program_in(

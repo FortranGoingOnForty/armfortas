@@ -11785,18 +11785,38 @@ fn resolve_polymorphic_component_method_base_for_dispatch(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, ValueId, String)> {
-    let (desc_addr, field) = resolve_component_field_access(b, locals, base, st, tl)?;
-    let crate::sema::symtab::TypeInfo::Class(base_type) = &field.type_info else {
-        return None;
-    };
-    if !field.allocatable || field.pointer || field.declared_array || !field.dims.is_empty() {
-        return None;
+    match &base.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?;
+            let sym = st.find_symbol_any_scope(&key)?;
+            let crate::sema::symtab::TypeInfo::Class(base_type) = sym.type_info.as_ref()? else {
+                return None;
+            };
+            if !local_uses_array_descriptor(info) || !info.dims.is_empty() {
+                return None;
+            }
+            let desc_addr = array_descriptor_addr(b, info);
+            let obj_addr = b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            Some((desc_addr, obj_addr, base_type.clone()))
+        }
+        Expr::ComponentAccess { .. } => {
+            let (desc_addr, field) = resolve_component_field_access(b, locals, base, st, tl)?;
+            let crate::sema::symtab::TypeInfo::Class(base_type) = &field.type_info else {
+                return None;
+            };
+            if !field.allocatable || field.pointer || field.declared_array || !field.dims.is_empty()
+            {
+                return None;
+            }
+            if field.size != 384 {
+                return None;
+            }
+            let obj_addr = b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            Some((desc_addr, obj_addr, base_type.clone()))
+        }
+        _ => None,
     }
-    if field.size != 384 {
-        return None;
-    }
-    let obj_addr = b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-    Some((desc_addr, obj_addr, base_type.clone()))
 }
 
 fn concrete_bound_proc_dispatch_candidates(
@@ -11839,7 +11859,15 @@ fn emit_polymorphic_component_bound_dispatch(
         resolve_polymorphic_component_method_base_for_dispatch(b, locals, base, st, tl)?;
     let candidates = concrete_bound_proc_dispatch_candidates(tl, &base_type, component);
     if candidates.is_empty() {
-        return None;
+        eprintln!(
+            "armfortas: error: {}:{}: type-bound calls through CLASS({}) bases have no visible concrete override targets for '{}'",
+            base.span.start.line,
+            base.span.start.col,
+            base_type,
+            component,
+        );
+        let _ = std::io::stderr().flush();
+        std::process::exit(1);
     }
 
     let call_ret_ty = if let Some(ret_ty) = explicit_ret_ty {
