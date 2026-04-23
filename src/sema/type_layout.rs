@@ -101,7 +101,11 @@ impl TypeLayoutRegistry {
     }
 
     pub fn insert(&mut self, mut layout: TypeLayout) {
-        layout.type_tag = self.alloc_tag();
+        if layout.type_tag == 0 {
+            layout.type_tag = self.alloc_tag();
+        } else if layout.type_tag >= self.next_tag {
+            self.next_tag = layout.type_tag + 1;
+        }
         self.layouts.insert(layout.name.to_lowercase(), layout);
     }
 }

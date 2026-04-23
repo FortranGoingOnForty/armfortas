@@ -12030,6 +12030,145 @@ fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
 }
 
 #[test]
+fn imported_amod_type_tags_stay_stable_across_tus() {
+    let dir = unique_dir("amod_type_tags_cross_tu");
+    let types_src = write_program_in(
+        &dir,
+        "types_m.f90",
+        "module types_m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: payload = 0\n  end type\nend module\n",
+    );
+    let helper_src = write_program_in(
+        &dir,
+        "helper_m.f90",
+        "module helper_m\n  implicit none\n  type :: filler_t\n    integer :: pad = 0\n  end type\nend module\n",
+    );
+    let producer_src = write_program_in(
+        &dir,
+        "producer_m.f90",
+        "module producer_m\n  use types_m\n  implicit none\ncontains\n  subroutine init(val)\n    class(base_t), allocatable, intent(out) :: val\n    allocate(child_t :: val)\n  end subroutine\nend module\n",
+    );
+    let consumer_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use helper_m\n  use types_m\n  use producer_m\n  implicit none\n  class(base_t), allocatable :: val\n  call init(val)\n  select type (val)\n  type is (child_t)\n    print *, 'ok'\n  class default\n    error stop 1\n  end select\nend program\n",
+    );
+
+    let types_obj = dir.join("types_m.o");
+    let helper_obj = dir.join("helper_m.o");
+    let producer_obj = dir.join("producer_m.o");
+    let consumer_obj = dir.join("consumer.o");
+    let exe = dir.join("consumer.bin");
+
+    let compile_types = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            types_src.to_str().unwrap(),
+            "-o",
+            types_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("types module compile spawn failed");
+    assert!(
+        compile_types.status.success(),
+        "types module compile failed: {}",
+        String::from_utf8_lossy(&compile_types.stderr)
+    );
+
+    let compile_helper = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            helper_src.to_str().unwrap(),
+            "-o",
+            helper_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("helper module compile spawn failed");
+    assert!(
+        compile_helper.status.success(),
+        "helper module compile failed: {}",
+        String::from_utf8_lossy(&compile_helper.stderr)
+    );
+
+    let compile_producer = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            producer_src.to_str().unwrap(),
+            "-o",
+            producer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("producer module compile spawn failed");
+    assert!(
+        compile_producer.status.success(),
+        "producer module compile failed: {}",
+        String::from_utf8_lossy(&compile_producer.stderr)
+    );
+
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer_src.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compile spawn failed");
+    assert!(
+        compile_consumer.status.success(),
+        "consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer_obj.to_str().unwrap(),
+            producer_obj.to_str().unwrap(),
+            helper_obj.to_str().unwrap(),
+            types_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("consumer run failed");
+    assert!(
+        run.status.success(),
+        "cross-TU imported type tags should remain stable at runtime: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected cross-TU imported type tag output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  q%x = 11\n  if (q%x /= 11) error stop 2\n  if (q%y /= 9) error stop 3\n  print *, 'ok'\nend program\n",
