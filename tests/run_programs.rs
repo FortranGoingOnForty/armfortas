@@ -405,6 +405,7 @@ fn compile_to_object(
     search_dir: &Path,
 ) -> Result<(), String> {
     let result = Command::new(compiler)
+        .current_dir(search_dir)
         .args([
             source.to_str().unwrap(),
             "-c",
@@ -1540,6 +1541,8 @@ fn compile_stage_bytes(
     opt_flag: &str,
     stage: ReproStage,
 ) -> Result<Vec<u8>, String> {
+    let source_path = fs::canonicalize(source)
+        .map_err(|e| format!("{}: cannot canonicalize source path: {}", source.display(), e))?;
     let stem = source.file_stem().unwrap().to_str().unwrap();
     let level = opt_flag.trim_start_matches('-');
     let (kind, ext, extra_args): (&str, &str, &[&str]) = match stage {
@@ -1551,8 +1554,19 @@ fn compile_stage_bytes(
         }
     };
     let out = unique_temp_path(kind, stem, level, ext);
+    let compile_sandbox = unique_temp_path("compile_sandbox", stem, &format!("{}_{}", level, kind), "");
+    fs::create_dir_all(&compile_sandbox).map_err(|e| {
+        format!(
+            "{}: cannot create {} compile sandbox {}: {}",
+            source.display(),
+            kind,
+            compile_sandbox.display(),
+            e
+        )
+    })?;
     let compile = Command::new(compiler)
-        .args([source.to_str().unwrap(), opt_flag])
+        .current_dir(&compile_sandbox)
+        .args([source_path.to_str().unwrap(), opt_flag])
         .args(extra_args)
         .args(["-o", out.to_str().unwrap()])
         .output()
@@ -1567,6 +1581,7 @@ fn compile_stage_bytes(
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr);
         let _ = fs::remove_file(&out);
+        let _ = fs::remove_dir_all(&compile_sandbox);
         return Err(format!(
             "{} [{}]: {} reproducibility compile failed:\n{}",
             source.file_name().unwrap().to_string_lossy(),
@@ -1585,6 +1600,7 @@ fn compile_stage_bytes(
         )
     })?;
     let _ = fs::remove_file(&out);
+    let _ = fs::remove_dir_all(&compile_sandbox);
     Ok(bytes)
 }
 
@@ -1594,14 +1610,27 @@ fn compile_and_run_snapshot(
     opt_flag: &str,
     filename: &str,
 ) -> Result<RunSnapshot, String> {
+    let source_path = fs::canonicalize(source)
+        .map_err(|e| format!("{}: cannot canonicalize source path: {}", filename, e))?;
     let stem = source.file_stem().unwrap().to_str().unwrap();
     let level = opt_flag.trim_start_matches('-');
     let binary = unique_temp_path("test_bin", stem, level, "");
     let sandbox = unique_temp_path("test_sandbox", stem, &format!("{}_opt_eq", level), "");
+    let compile_sandbox =
+        unique_temp_path("compile_sandbox", stem, &format!("{}_opt_eq", level), "");
+    fs::create_dir_all(&compile_sandbox).map_err(|e| {
+        format!(
+            "{}: cannot create OPT_EQ compile sandbox {}: {}",
+            filename,
+            compile_sandbox.display(),
+            e
+        )
+    })?;
 
     let compile = Command::new(compiler)
+        .current_dir(&compile_sandbox)
         .args([
-            source.to_str().unwrap(),
+            source_path.to_str().unwrap(),
             opt_flag,
             "-o",
             binary.to_str().unwrap(),
@@ -1610,6 +1639,7 @@ fn compile_and_run_snapshot(
         .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr);
+        let _ = fs::remove_dir_all(&compile_sandbox);
         let _ = fs::remove_file(&binary);
         return Err(format!(
             "{} [{}]: OPT_EQ comparison compile failed:\n{}",
@@ -1627,6 +1657,7 @@ fn compile_and_run_snapshot(
     })?;
     let snapshot = run_binary_in_sandbox(&binary, &sandbox, filename)?;
     let _ = fs::remove_file(&binary);
+    let _ = fs::remove_dir_all(&compile_sandbox);
     let _ = fs::remove_dir_all(&sandbox);
     Ok(snapshot)
 }
@@ -2119,9 +2150,27 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             let _ = fs::remove_dir_all(&build_dir);
         } else {
             // ---- Single-file path ----
+            let source_path = fs::canonicalize(source).map_err(|e| {
+                format!(
+                    "{}: cannot canonicalize source {}: {}",
+                    filename,
+                    source.display(),
+                    e
+                )
+            })?;
+            let compile_sandbox = unique_temp_path("compile_sandbox", stem, level, "");
+            fs::create_dir_all(&compile_sandbox).map_err(|e| {
+                format!(
+                    "{}: cannot create compile sandbox dir {}: {}",
+                    filename,
+                    compile_sandbox.display(),
+                    e
+                )
+            })?;
             let compile = Command::new(compiler)
+                .current_dir(&compile_sandbox)
                 .args([
-                    source.to_str().unwrap(),
+                    source_path.to_str().unwrap(),
                     opt_flag,
                     "-o",
                     binary.to_str().unwrap(),
@@ -2133,6 +2182,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             // expected stderr substring. CHECKs are ignored.
             if let Some(expected) = &error_expected {
                 if compile.status.success() {
+                    let _ = fs::remove_dir_all(&compile_sandbox);
                     let _ = fs::remove_file(&binary);
                     return Err(format!(
                         "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
@@ -2141,6 +2191,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 }
                 let stderr = String::from_utf8_lossy(&compile.stderr);
                 if !stderr.contains(expected.as_str()) {
+                    let _ = fs::remove_dir_all(&compile_sandbox);
                     return Err(format!(
                         "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
                          Full stderr:\n{}",
@@ -2149,6 +2200,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 }
                 if let Some(expected_span) = error_span {
                     if !diagnostic_contains_span(&stderr, expected_span) {
+                        let _ = fs::remove_dir_all(&compile_sandbox);
                         return Err(format!(
                             "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
                              Full stderr:\n{}",
@@ -2156,16 +2208,19 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                         ));
                     }
                 }
+                let _ = fs::remove_dir_all(&compile_sandbox);
                 return Ok(());
             }
 
             if !compile.status.success() {
                 let stderr = String::from_utf8_lossy(&compile.stderr);
+                let _ = fs::remove_dir_all(&compile_sandbox);
                 return Err(format!(
                     "{} [{}]: compilation failed:\n{}",
                     filename, opt_flag, stderr,
                 ));
             }
+            let _ = fs::remove_dir_all(&compile_sandbox);
         }
 
         // Per-(file,level) sandbox directory. Test programs that touch the
@@ -3125,6 +3180,21 @@ fn multifile_error_circular_direct_detected() {
 }
 
 #[test]
+fn multifile_error_circular_direct_detected_at_o1() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_direct.f90");
+    assert!(source.exists(), "error_circular_use_direct.f90 missing");
+    match run_test(&compiler, &source, "-O1") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "circular use direct should pass (ERROR_EXPECTED match) at -O1, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn multifile_error_circular_indirect_detected() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
@@ -3137,4 +3207,41 @@ fn multifile_error_circular_indirect_detected() {
             other
         ),
     }
+}
+
+#[test]
+fn multifile_error_circular_indirect_detected_at_o1() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("error_circular_use_indirect.f90");
+    assert!(source.exists(), "error_circular_use_indirect.f90 missing");
+    match run_test(&compiler, &source, "-O1") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "circular use indirect should pass (ERROR_EXPECTED match) at -O1, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn single_file_module_program_does_not_leave_root_amod() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("module_global_host_assoc.f90");
+    assert!(source.exists(), "module_global_host_assoc.f90 missing");
+    let leaked = PathBuf::from("module_global_host_assoc_mod.amod");
+    let _ = fs::remove_file(&leaked);
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "module_global_host_assoc.f90 should pass at -O0 without leaking .amod, got {:?}",
+            other
+        ),
+    }
+    assert!(
+        !leaked.exists(),
+        "single-file run_test should not leak {} into the repo root",
+        leaked.display()
+    );
 }
