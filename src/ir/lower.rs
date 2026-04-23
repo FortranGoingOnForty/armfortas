@@ -973,7 +973,10 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
                             if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
                     );
                     return !is_deferred_char_scalar;
-                };
+                }
+                if specs.is_none() && matches!(type_spec, TypeSpec::Class(_)) {
+                    return true;
+                }
                 return false;
             }
         }
@@ -5372,6 +5375,37 @@ fn alloc_decls(
                         continue;
                     }
                 }
+                if is_pointer_attr && matches!(type_spec, TypeSpec::Class(_)) && array_spec.is_none()
+                {
+                    if let TypeSpec::Class(ref type_name) = type_spec {
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let addr = b.alloca(desc_ty);
+                        let zero = b.const_i32(0);
+                        let size384 = b.const_i64(384);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![addr, zero, size384],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                dims: vec![],
+                                allocatable: false,
+                                descriptor_arg: true,
+                                by_ref: false,
+                                char_kind: CharKind::None,
+                                derived_type: Some(type_name.clone()),
+                                inline_const: None,
+                                is_pointer: true,
+                                runtime_dim_upper: vec![],
+                            },
+                        );
+                        continue;
+                    }
+                }
                 if is_deferred_char && (is_allocatable || is_pointer_attr) && array_spec.is_none() {
                     // Deferred-length allocatable/pointer scalar character:
                     // 32-byte StringDescriptor. Deferred-length arrays fall
@@ -5825,7 +5859,9 @@ fn alloc_decls(
                             by_ref: false,
                             char_kind,
                             derived_type: match type_spec {
-                                TypeSpec::Type(type_name) => Some(type_name.clone()),
+                                TypeSpec::Type(type_name) | TypeSpec::Class(type_name) => {
+                                    Some(type_name.clone())
+                                }
                                 _ => None,
                             },
                             inline_const: None,
@@ -11489,6 +11525,375 @@ fn emit_bound_function_call(
     Some(b.call(FuncRef::External(call_name), call_args, ret_ty))
 }
 
+fn emit_resolved_bound_proc_call(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    optional_params: Option<&HashMap<String, Vec<bool>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    obj_addr: ValueId,
+    bp: &crate::sema::type_layout::BoundProc,
+    args: &[crate::ast::expr::Argument],
+    hidden_result: Option<ValueId>,
+    ret_ty: IrType,
+) -> Option<ValueId> {
+    let target = bp.target_name.clone();
+    let target_key = abi_key_for_link_name(st, &target).unwrap_or_else(|| bp.abi_name.clone());
+    let (call_name, _callee_key) = resolved_symbol_call_target(st, &target_key, &target);
+    let nopass = bp.nopass;
+    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+        args,
+        &target_key,
+        st,
+        if nopass { 0 } else { 1 },
+    );
+    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[&target_key]);
+    let abi_primary_key = abi_lookup_keys
+        .first()
+        .map(String::as_str)
+        .unwrap_or(target_key.as_str());
+    let callee_value_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
+    let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        descriptor_params.and_then(|m| m.get(k).cloned())
+    });
+    let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_string_descriptor_arg_mask(st, k)
+    });
+    let callee_bind_c_char_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
+    let callee_pointer_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
+        optional_params
+            .and_then(|m| m.get(k).cloned())
+            .or_else(|| callee_optional_arg_mask(st, k))
+    });
+    let callee_char_len_star_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+
+    let mut call_args =
+        Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
+    if let Some(result) = hidden_result {
+        call_args.push(result);
+    }
+    if !nopass {
+        call_args.push(obj_addr);
+    }
+
+    for (i, slot) in arg_slots
+        .iter()
+        .enumerate()
+        .skip(if nopass { 0 } else { 1 })
+    {
+        let is_value = callee_value_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_descriptor = callee_descriptor_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_string_descriptor = callee_string_descriptor_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_bind_c_char = callee_bind_c_char_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
+        let wants_pointer = callee_pointer_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let value = match slot {
+            Some(arg) => match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    if is_value && wants_bind_c_char {
+                        lower_bind_c_char_value_arg(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                    } else if is_value {
+                        let raw = lower_expr_full(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        coerce_value_call_arg(b, st, abi_primary_key, i, raw)
+                    } else if wants_descriptor {
+                        lower_arg_descriptor(b, locals, e, st, type_layouts)
+                    } else if wants_string_descriptor {
+                        lower_arg_string_descriptor(b, locals, e, st, type_layouts)
+                    } else if wants_bind_c_char {
+                        lower_bind_c_char_arg_raw(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                    } else if wants_pointer {
+                        lower_pointer_dummy_actual(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                        .unwrap_or_else(|| {
+                            lower_arg_by_ref_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        })
+                    } else {
+                        lower_arg_by_ref_full(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                    }
+                }
+                _ => b.const_i32(0),
+            },
+            None => missing_optional_call_arg(b, st, abi_primary_key, i, is_value),
+        };
+        call_args.push(value);
+    }
+
+    if let Some(opt_flags) = opt_flags {
+        for (i, flag) in opt_flags.iter().enumerate().skip(arg_slots.len()) {
+            if *flag {
+                let is_value = callee_value_args
+                    .as_ref()
+                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                    .unwrap_or(false);
+                call_args.push(missing_optional_call_arg(
+                    b,
+                    st,
+                    abi_primary_key,
+                    i,
+                    is_value,
+                ));
+            }
+        }
+    }
+
+    if let Some(cls_flags) = &callee_char_len_star_args {
+        for (i, flag) in cls_flags.iter().enumerate() {
+            if !*flag || i >= arg_slots.len() || (!nopass && i == 0) {
+                continue;
+            }
+            if let Some(arg) = &arg_slots[i] {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    call_args.push(
+                        actual_char_arg_runtime_len(
+                            b,
+                            locals,
+                            None,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                        .unwrap_or_else(|| b.const_i64(0)),
+                    );
+                } else {
+                    call_args.push(b.const_i64(0));
+                }
+            } else {
+                call_args.push(b.const_i64(0));
+            }
+        }
+    }
+
+    let call_result = b.call(FuncRef::External(call_name), call_args, ret_ty);
+    if let Some(tl) = type_layouts {
+        if let Some(type_name) = callee_return_stabilized_derived_type_name(st, &target_key) {
+            return Some(stabilize_derived_call_result(b, tl, &type_name, call_result));
+        }
+    }
+    Some(call_result)
+}
+
+fn resolve_polymorphic_component_method_base_for_dispatch(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(ValueId, ValueId, String)> {
+    let (desc_addr, field) = resolve_component_field_access(b, locals, base, st, tl)?;
+    let crate::sema::symtab::TypeInfo::Class(base_type) = &field.type_info else {
+        return None;
+    };
+    if !field.allocatable || field.pointer || field.declared_array || !field.dims.is_empty() {
+        return None;
+    }
+    if field.size != 384 {
+        return None;
+    }
+    let obj_addr = b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    Some((desc_addr, obj_addr, base_type.clone()))
+}
+
+fn concrete_bound_proc_dispatch_candidates(
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+    base_type: &str,
+    component: &str,
+) -> Vec<(u64, crate::sema::type_layout::BoundProc)> {
+    let mut out: Vec<(u64, crate::sema::type_layout::BoundProc)> = tl
+        .layouts
+        .values()
+        .filter(|layout| !layout.is_abstract)
+        .filter(|layout| is_type_or_extends(&layout.name, base_type, tl))
+        .filter_map(|layout| {
+            layout
+                .bound_proc(component)
+                .cloned()
+                .map(|bp| (layout.type_tag, bp))
+        })
+        .collect();
+    out.sort_by_key(|(tag, _)| *tag);
+    out
+}
+
+fn emit_polymorphic_component_bound_dispatch(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    optional_params: Option<&HashMap<String, Vec<bool>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    base: &crate::ast::expr::SpannedExpr,
+    component: &str,
+    args: &[crate::ast::expr::Argument],
+    explicit_ret_ty: Option<IrType>,
+) -> Option<Option<ValueId>> {
+    let tl = type_layouts?;
+    let (desc_addr, obj_addr, base_type) =
+        resolve_polymorphic_component_method_base_for_dispatch(b, locals, base, st, tl)?;
+    let candidates = concrete_bound_proc_dispatch_candidates(tl, &base_type, component);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let call_ret_ty = if let Some(ret_ty) = explicit_ret_ty {
+        ret_ty
+    } else {
+        let (_, bp) = candidates.first()?;
+        let target_key =
+            abi_key_for_link_name(st, &bp.target_name).unwrap_or_else(|| bp.abi_name.clone());
+        first_procedure_lookup(&procedure_abi_lookup_keys(st, &[&target_key]), |k| {
+            callee_return_ir_type(st, k)
+        })
+        .unwrap_or(IrType::Int(IntWidth::I32))
+    };
+    let returns_value = call_ret_ty != IrType::Void;
+    let result_slot = if returns_value {
+        Some(b.alloca(call_ret_ty.clone()))
+    } else {
+        None
+    };
+    let runtime_tag = load_array_desc_type_tag(b, desc_addr);
+    let test_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("tbp_dispatch_test_{}", i)))
+        .collect();
+    let case_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("tbp_dispatch_case_{}", i)))
+        .collect();
+    let fail_bb = b.create_block("tbp_dispatch_fail");
+    let done_bb = b.create_block("tbp_dispatch_done");
+
+    b.branch(test_blocks[0], vec![]);
+
+    for (idx, (type_tag, bp)) in candidates.iter().enumerate() {
+        b.set_block(test_blocks[idx]);
+        let expected_tag = b.const_i64(*type_tag as i64);
+        let is_match = b.icmp(CmpOp::Eq, runtime_tag, expected_tag);
+        let next_test = if idx + 1 < test_blocks.len() {
+            test_blocks[idx + 1]
+        } else {
+            fail_bb
+        };
+        b.cond_branch(is_match, case_blocks[idx], vec![], next_test, vec![]);
+
+        b.set_block(case_blocks[idx]);
+        let call_result = emit_resolved_bound_proc_call(
+            b,
+            locals,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            optional_params,
+            descriptor_params,
+            obj_addr,
+            bp,
+            args,
+            None,
+            call_ret_ty.clone(),
+        )?;
+        if let Some(slot) = result_slot {
+            b.store(call_result, slot);
+        }
+        b.branch(done_bb, vec![]);
+    }
+
+    b.set_block(fail_bb);
+    b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+    b.unreachable();
+
+    b.set_block(done_bb);
+    if let Some(slot) = result_slot {
+        Some(Some(b.load_typed(slot, call_ret_ty)))
+    } else {
+        Some(None)
+    }
+}
+
 fn lower_alloc_return_call_into_desc(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
@@ -15837,6 +16242,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             // Handle type-bound procedure calls: call obj%method(args)
             if let Expr::ComponentAccess { base, component } = &callee.node {
+                if emit_polymorphic_component_bound_dispatch(
+                    b,
+                    &ctx.locals,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.optional_params),
+                    Some(ctx.descriptor_params),
+                    base,
+                    component,
+                    args,
+                    Some(IrType::Void),
+                )
+                .is_some()
+                {
+                    return;
+                }
                 reject_unsupported_polymorphic_component_method_base(
                     callee.span,
                     base,
@@ -16755,34 +17178,122 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             assoc_name,
             ..
         } => {
-            if matches!(
-                operator_expr_type_info(selector, ctx.st, Some(ctx.type_layouts)),
-                Some(crate::sema::symtab::TypeInfo::Class(_))
-            ) {
-                eprintln!(
-                    "armfortas: error: {}:{}: SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet",
-                    stmt.span.start.line, stmt.span.start.col
-                );
-                let _ = std::io::stderr().flush();
-                std::process::exit(1);
-            }
-            // SELECT TYPE: compare the type tag of a polymorphic variable.
-            // For now, support basic pattern where selector is a local derived type
-            // variable and TYPE IS guards match by type tag.
             let bb_end = b.create_block("select_type_end");
-
-            // Get the selector's type tag. For non-polymorphic variables,
-            // we know the static type and can match directly.
-            let static_type = if let Expr::Name { name } = &selector.node {
-                let key = name.to_lowercase();
-                ctx.locals
-                    .get(&key)
-                    .and_then(|info| info.derived_type.clone())
+            let selector_type = operator_expr_type_info(selector, ctx.st, Some(ctx.type_layouts));
+            let selector_info = if let Expr::Name { name } = &selector.node {
+                ctx.locals.get(&name.to_lowercase()).cloned()
             } else {
                 None
             };
+            let dynamic_class_selector = selector_info.as_ref().filter(|info| {
+                matches!(selector_type, Some(crate::sema::symtab::TypeInfo::Class(_)))
+                    && info.derived_type.is_some()
+                    && local_uses_array_descriptor(info)
+                    && info.dims.is_empty()
+            });
 
-            if let Some(ref type_name) = static_type {
+            if let Some(info) = dynamic_class_selector {
+                let desc = array_descriptor_addr(b, info);
+                let tag_val = load_array_desc_type_tag(b, desc);
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs {
+                            type_name: guard_type,
+                            body,
+                        } => {
+                            if let Some(guard_layout) = ctx.type_layouts.get(guard_type) {
+                                let guard_tag = b.const_i64(guard_layout.type_tag as i64);
+                                let matches = b.icmp(CmpOp::Eq, tag_val, guard_tag);
+                                let bb_match = b.create_block("type_is_match");
+                                let bb_next = b.create_block("type_is_next");
+                                b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
+
+                                b.set_block(bb_match);
+                                with_select_type_guard_binding(
+                                    b,
+                                    ctx,
+                                    selector,
+                                    assoc_name.as_deref(),
+                                    guard_type,
+                                    |b, ctx| lower_stmts(b, ctx, body),
+                                );
+                                if b.func().block(b.current_block()).terminator.is_none() {
+                                    b.branch(bb_end, vec![]);
+                                }
+
+                                b.set_block(bb_next);
+                            }
+                        }
+                        crate::ast::stmt::TypeGuard::ClassIs {
+                            type_name: guard_type,
+                            body,
+                        } => {
+                            let mut matching_tags: Vec<u64> = ctx
+                                .type_layouts
+                                .layouts
+                                .values()
+                                .filter(|layout| !layout.is_abstract)
+                                .filter(|layout| {
+                                    is_type_or_extends(&layout.name, guard_type, ctx.type_layouts)
+                                })
+                                .map(|layout| layout.type_tag)
+                                .collect();
+                            matching_tags.sort_unstable();
+                            if !matching_tags.is_empty() {
+                                let mut matches = None;
+                                for tag in matching_tags {
+                                    let tag_val_const = b.const_i64(tag as i64);
+                                    let eq = b.icmp(CmpOp::Eq, tag_val, tag_val_const);
+                                    matches = Some(match matches {
+                                        Some(prev) => b.or(prev, eq),
+                                        None => eq,
+                                    });
+                                }
+                                let bb_match = b.create_block("class_is_match");
+                                let bb_next = b.create_block("class_is_next");
+                                b.cond_branch(
+                                    matches.expect("non-empty CLASS IS candidate set"),
+                                    bb_match,
+                                    vec![],
+                                    bb_next,
+                                    vec![],
+                                );
+
+                                b.set_block(bb_match);
+                                with_select_type_guard_binding(
+                                    b,
+                                    ctx,
+                                    selector,
+                                    assoc_name.as_deref(),
+                                    guard_type,
+                                    |b, ctx| lower_stmts(b, ctx, body),
+                                );
+                                if b.func().block(b.current_block()).terminator.is_none() {
+                                    b.branch(bb_end, vec![]);
+                                }
+
+                                b.set_block(bb_next);
+                            }
+                        }
+                        crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            lower_stmts(b, ctx, body);
+                            if b.func().block(b.current_block()).terminator.is_none() {
+                                b.branch(bb_end, vec![]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                if matches!(selector_type, Some(crate::sema::symtab::TypeInfo::Class(_))) {
+                    eprintln!(
+                        "armfortas: error: {}:{}: SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet",
+                        stmt.span.start.line, stmt.span.start.col
+                    );
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(1);
+                }
+                let static_type = selector_info.as_ref().and_then(|info| info.derived_type.clone());
+                if let Some(ref type_name) = static_type {
                 if let Some(layout) = ctx.type_layouts.get(type_name) {
                     let tag_val = b.const_i64(layout.type_tag as i64);
 
@@ -16864,6 +17375,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                 }
+            }
             }
 
             if b.func().block(b.current_block()).terminator.is_none() {
@@ -18680,7 +19192,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             return;
                         }
                         let zero_byte = b.const_i32(0);
-                        let size = if tgt_info.allocatable { 384i64 } else { 8i64 };
+                        let size = if local_uses_array_descriptor(&tgt_info) {
+                            384i64
+                        } else {
+                            8i64
+                        };
                         let size_val = b.const_i64(size);
                         b.call(
                             FuncRef::External("memset".into()),
@@ -18903,13 +19419,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 b.store(ptr, tgt_info.addr);
                                 return;
                             }
-                            if field.pointer && field.size == 384 {
-                                let size = b.const_i64(384);
-                                b.call(
-                                    FuncRef::External("memcpy".into()),
-                                    vec![tgt_info.addr, field_ptr, size],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
+                            if field.size == 384 && (field.pointer || field.allocatable) {
+                                if local_uses_array_descriptor(&tgt_info) {
+                                    let size = b.const_i64(384);
+                                    b.call(
+                                        FuncRef::External("memcpy".into()),
+                                        vec![tgt_info.addr, field_ptr, size],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                } else {
+                                    let associated = b.load_typed(
+                                        field_ptr,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    b.store(associated, tgt_info.addr);
+                                }
                                 return;
                             }
                             if field.pointer {
@@ -18939,7 +19463,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
 
             if matches!(value.node, Expr::FunctionCall { .. }) {
                 let addr = lower_expr_ctx_tl(b, ctx, value);
-                b.store(addr, tgt_info.addr);
+                if local_uses_array_descriptor(&tgt_info) && tgt_info.dims.is_empty() {
+                    let type_tag = static_expr_type_tag_value(b, value, ctx.st, ctx.type_layouts);
+                    store_scalar_polymorphic_descriptor_view(b, tgt_info.addr, addr, type_tag);
+                } else {
+                    b.store(addr, tgt_info.addr);
+                }
                 return;
             }
 
@@ -18992,12 +19521,17 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 } else {
                     materialize_array_descriptor_for_info(b, &src_info)
                 };
-                let size = b.const_i64(384);
-                b.call(
-                    FuncRef::External("memcpy".into()),
-                    vec![tgt_info.addr, src_desc, size],
-                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                );
+                if local_uses_array_descriptor(&tgt_info) {
+                    let size = b.const_i64(384);
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![tgt_info.addr, src_desc, size],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                } else if src_info.dims.is_empty() {
+                    let src_base = array_base_addr(b, &src_info);
+                    b.store(src_base, tgt_info.addr);
+                }
                 return;
             }
 
@@ -19050,7 +19584,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 // alloca address IS the associated target.
                 src_info.addr
             };
-            b.store(addr, tgt_info.addr);
+            if local_uses_array_descriptor(&tgt_info) && tgt_info.dims.is_empty() {
+                let type_tag = static_expr_type_tag_value(b, value, ctx.st, ctx.type_layouts);
+                store_scalar_polymorphic_descriptor_view(b, tgt_info.addr, addr, type_tag);
+            } else {
+                b.store(addr, tgt_info.addr);
+            }
         }
 
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
@@ -22169,6 +22708,31 @@ fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
     b.store(tag, ptr);
 }
 
+fn store_scalar_polymorphic_descriptor_view(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    base_ptr: ValueId,
+    type_tag: Option<ValueId>,
+) {
+    let zero32 = b.const_i32(0);
+    let size384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, size384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        base_ptr,
+    );
+    if let Some(tag) = type_tag {
+        store_array_desc_type_tag(b, desc, tag);
+    }
+}
+
 fn load_array_desc_i32_field(b: &mut FuncBuilder, desc: ValueId, offset: i64) -> ValueId {
     let off = b.const_i64(offset);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
@@ -22657,7 +23221,7 @@ fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
 
 fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
-    if info.descriptor_arg {
+    if info.by_ref && info.descriptor_arg {
         let typed_ptr = b.load(info.addr);
         let raw = b.ptr_to_int(typed_ptr);
         b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
@@ -22790,13 +23354,27 @@ fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &LocalInfo) 
     desc
 }
 
-fn lower_descriptor_actual_from_info(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
-    if info.descriptor_arg {
+fn lower_descriptor_actual_from_info(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> ValueId {
+    if info.by_ref && info.descriptor_arg {
         let typed_ptr = b.load(info.addr);
         let raw = b.ptr_to_int(typed_ptr);
         b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
     } else if info.allocatable {
         info.addr
+    } else if info.dims.is_empty() && info.derived_type.is_some() && !info.is_pointer {
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+        let base = derived_scalar_storage_addr_for_call(b, info);
+        let tag = info
+            .derived_type
+            .as_ref()
+            .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
+            .map(|layout| b.const_i64(layout.type_tag as i64));
+        store_scalar_polymorphic_descriptor_view(b, desc, base, tag);
+        desc
     } else if !info.dims.is_empty() {
         materialize_array_descriptor_for_info(b, info)
     } else {
@@ -22819,13 +23397,13 @@ fn lower_arg_descriptor(
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
-            return lower_descriptor_actual_from_info(b, info);
+            return lower_descriptor_actual_from_info(b, info, type_layouts);
         }
     }
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(tl) = type_layouts {
             if let Some(info) = component_array_local_info(b, locals, expr, st, tl) {
-                return lower_descriptor_actual_from_info(b, &info);
+                return lower_descriptor_actual_from_info(b, &info, type_layouts);
             }
         }
     }
@@ -26619,7 +27197,10 @@ fn resolve_component_base(
             // Pointer dummies passed by reference add one more layer:
             // info.addr points at the caller's pointer slot, whose
             // contents then point at the associated struct.
-            let addr = if info.is_pointer {
+            let addr = if info.is_pointer && local_uses_array_descriptor(info) && info.dims.is_empty()
+            {
+                array_base_addr(b, info)
+            } else if info.is_pointer {
                 if info.by_ref {
                     let caller_slot =
                         b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
@@ -28040,7 +28621,10 @@ fn resolve_component_base_for_method(
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
             let type_name = info.derived_type.as_ref()?.clone();
-            let addr = if info.is_pointer {
+            let addr = if info.is_pointer && local_uses_array_descriptor(info) && info.dims.is_empty()
+            {
+                array_base_addr(b, info)
+            } else if info.is_pointer {
                 b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
             } else if info.allocatable {
                 array_base_addr(b, info)
@@ -29038,11 +29622,16 @@ fn lower_expr_full(
                     let tgt = b.load_typed(info.addr, IrType::Ptr(Box::new(info.ty.clone())));
                     b.load_typed(tgt, info.ty.clone())
                 } else if info.is_pointer && info.derived_type.is_some() {
-                    // Derived-type POINTER used as a bare Name (e.g.
-                    // passed to a subroutine expecting type(t)).  The
-                    // consumer wants the struct address, which is
-                    // what's stored in the pointer slot.
-                    b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    if local_uses_array_descriptor(info) && info.dims.is_empty() {
+                        array_base_addr(b, info)
+                    } else {
+                        // Derived-type POINTER used as a bare Name
+                        // (e.g. passed to a subroutine expecting
+                        // type(t)). The consumer wants the struct
+                        // address, which is what's stored in the
+                        // pointer slot.
+                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    }
                 } else if info.derived_type.is_some() {
                     if info
                         .derived_type
@@ -30165,6 +30754,22 @@ fn lower_expr_full(
                 call_result
             } else if let Expr::ComponentAccess { base, component } = &callee.node {
                 if let Some(tl) = type_layouts {
+                    if let Some(Some(result)) = emit_polymorphic_component_bound_dispatch(
+                        b,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        None,
+                        descriptor_params,
+                        base,
+                        component,
+                        args,
+                        None,
+                    ) {
+                        return result;
+                    }
                     reject_unsupported_polymorphic_component_method_base(
                         callee.span,
                         base,

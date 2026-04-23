@@ -484,10 +484,13 @@ pub fn compute_layout_with_attrs(
                         && !declared_array
                     {
                         (32, 8) // StringDescriptor for deferred-length scalar char components
-                    } else if is_pointer && !declared_array {
-                        (8, 8) // Scalar POINTER components are pointer slots, not descriptors
-                    } else if is_allocatable || is_pointer {
-                        (384, 8) // ArrayDescriptor size for allocatable/pointer array components
+                } else if is_pointer
+                    && !declared_array
+                    && !matches!(ti, TypeInfo::Class(_))
+                {
+                    (8, 8) // Scalar POINTER components are pointer slots, not descriptors
+                } else if is_allocatable || is_pointer {
+                    (384, 8) // ArrayDescriptor size for allocatable/pointer array components
                     } else if let TypeInfo::Derived(ref dname) = ti {
                         registry
                             .get(dname)

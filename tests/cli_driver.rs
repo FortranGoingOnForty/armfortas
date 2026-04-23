@@ -7405,31 +7405,38 @@ fn deferred_type_bound_proc_interface_survives_amod_export() {
 }
 
 #[test]
-fn polymorphic_component_type_bound_call_errors_instead_of_miscompiling() {
-    let dir = unique_dir("polymorphic_component_tbp_error");
-    let mod_src = write_program_in(
-        &dir,
-        "m.f90",
-        "module m\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_base_t\n      class(list_base_t), intent(in) :: self\n    end function\n  end interface\n  type, extends(list_base_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: size_of => array_size_of\n  end type\ncontains\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\n  integer function array_size_of(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\nend module\n",
+fn polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_descriptor() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n    procedure(push_i), deferred :: push\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_base_t\n      class(list_base_t), intent(in) :: self\n    end function\n    subroutine push_i(self, n)\n      import :: list_base_t\n      class(list_base_t), intent(inout) :: self\n      integer, intent(in) :: n\n    end subroutine\n  end interface\n  type, extends(list_base_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n    procedure :: push => impl_push\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init => array_init\n    procedure :: size_of => array_size_of\n    procedure :: push_one => array_push_one\n  end type\ncontains\n  subroutine array_init(self, n)\n    class(array_t), intent(out) :: self\n    integer, intent(in) :: n\n    type(list_impl_t), allocatable :: list\n    allocate(list)\n    list%n = n\n    call move_alloc(list, self%list)\n  end subroutine\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\n  subroutine impl_push(self, n)\n    class(list_impl_t), intent(inout) :: self\n    integer, intent(in) :: n\n    self%n = self%n + n\n  end subroutine\n  integer function array_size_of(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\n  subroutine array_push_one(self, n)\n    class(array_t), intent(inout) :: self\n    integer, intent(in) :: n\n    call self%list%push(n)\n  end subroutine\nend module\nprogram main\n  use m\n  implicit none\n  type(array_t) :: arr\n  call arr%init(3)\n  call arr%push_one(4)\n  if (arr%size_of() /= 7) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
     );
-    let mod_obj = dir.join("m.o");
-    let compile_mod = Command::new(compiler("armfortas"))
-        .current_dir(&dir)
-        .args(["-c", mod_src.to_str().unwrap(), "-o", mod_obj.to_str().unwrap()])
+    let out = unique_path("polymorphic_component_tbp_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
-        .expect("module compile spawn failed");
+        .expect("compile spawn failed");
     assert!(
-        !compile_mod.status.success(),
-        "compile should fail instead of silently miscompiling unsupported polymorphic component method call"
-    );
-    let stderr = String::from_utf8_lossy(&compile_mod.stderr);
-    assert!(
-        stderr.contains("type-bound calls through CLASS(...) component bases are not implemented yet"),
-        "expected explicit polymorphic component bound-call error, got: {}",
-        stderr
+        compile.status.success(),
+        "polymorphic component bound-call dispatch program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic component bound-call dispatch runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected polymorphic component bound-call dispatch to reach concrete implementation, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -11820,7 +11827,7 @@ fn pointer_function_result_forwarding_preserves_target_association() {
 }
 
 #[test]
-fn select_type_polymorphic_dummy_errors_instead_of_miscompiling() {
+fn select_type_polymorphic_dummy_dispatches_via_descriptor_tag() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type base_t\n  type, extends(base_t) :: float_box\n    real(8) :: raw = 0.0d0\n  end type float_box\ncontains\n  function cast_float(val) result(ptr)\n    class(base_t), intent(in), target :: val\n    real(8), pointer :: ptr\n    select type (val)\n    type is (float_box)\n      ptr => val%raw\n    class default\n      nullify(ptr)\n    end select\n  end function cast_float\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(float_box), target :: box\n  real(8), pointer :: ptr\n  box%raw = 3.5d0\n  ptr => cast_float(box)\n  if (.not. associated(ptr)) error stop 1\n  if (abs(ptr - 3.5d0) > 1.0d-12) error stop 2\n  ptr = 9.25d0\n  if (abs(box%raw - 9.25d0) > 1.0d-12) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -11831,14 +11838,23 @@ fn select_type_polymorphic_dummy_errors_instead_of_miscompiling() {
         .output()
         .expect("select type pointer result compile spawn failed");
     assert!(
-        !compile.status.success(),
-        "polymorphic SELECT TYPE should fail explicitly instead of miscompiling"
-    );
-    let stderr = String::from_utf8_lossy(&compile.stderr);
-    assert!(
-        stderr.contains("SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet"),
-        "expected explicit polymorphic SELECT TYPE error, got: {}",
+        compile.status.success(),
+        "polymorphic SELECT TYPE dummy should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic SELECT TYPE dummy runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected polymorphic SELECT TYPE dummy to bind the concrete guard, got: {}",
+        stdout
     );
 
     let _ = std::fs::remove_file(&out);
@@ -11846,25 +11862,55 @@ fn select_type_polymorphic_dummy_errors_instead_of_miscompiling() {
 }
 
 #[test]
-fn select_type_allocatable_polymorphic_local_errors_instead_of_miscompiling() {
+fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
     let src = write_program(
-        "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  class(base_t), allocatable :: tmp\n  allocate(tmp, source=child_t(17))\n  select type (tmp)\n  type is (child_t)\n    print *, tmp%x\n  class default\n    error stop 1\n  end select\nend program p\n",
+        "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  class(base_t), pointer :: tmp\n  type(child_t), target :: child\n  integer :: seen\n  nullify(tmp)\n  child%x = 17\n  tmp => child\n  seen = 0\n  select type (tmp)\n  type is (child_t)\n    seen = tmp%x\n  class default\n    error stop 1\n  end select\n  if (seen /= 17) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
     );
-    let out = unique_path("select_type_allocatable_poly_local", "bin");
+    let out = unique_path("select_type_pointer_poly_local", "bin");
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
-        .expect("allocatable polymorphic select type compile spawn failed");
+        .expect("pointer polymorphic select type compile spawn failed");
     assert!(
-        !compile.status.success(),
-        "allocatable polymorphic SELECT TYPE should fail explicitly instead of miscompiling"
+        compile.status.success(),
+        "pointer polymorphic local SELECT TYPE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
     );
-    let stderr = String::from_utf8_lossy(&compile.stderr);
+
+    let run = Command::new(&out).output().expect("run failed");
     assert!(
-        stderr.contains("SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet"),
-        "expected explicit allocatable polymorphic SELECT TYPE error, got: {}",
-        stderr
+        run.status.success(),
+        "pointer polymorphic local SELECT TYPE runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected pointer polymorphic local SELECT TYPE to bind the concrete guard, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  q%x = 11\n  if (q%x /= 11) error stop 2\n  if (q%y /= 9) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_ptr_func_result_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("descriptor-backed class pointer function result compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "descriptor-backed class pointer function result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
