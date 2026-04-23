@@ -11337,7 +11337,7 @@ fn emit_bound_function_call(
     let bp = layout.bound_proc(component)?;
     let target = bp.target_name.clone();
     let target_key = abi_key_for_link_name(st, &target).unwrap_or_else(|| bp.abi_name.clone());
-    let (call_name, _callee_key) = resolved_symbol_call_target(st, &target_key, &target);
+    let call_name = target.clone();
     let nopass = bp.nopass;
     let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
         args,
@@ -11547,6 +11547,7 @@ fn emit_resolved_bound_proc_call(
     optional_params: Option<&HashMap<String, Vec<bool>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
     obj_addr: ValueId,
+    pass_desc_addr: Option<ValueId>,
     bp: &crate::sema::type_layout::BoundProc,
     args: &[crate::ast::expr::Argument],
     hidden_result: Option<ValueId>,
@@ -11554,7 +11555,7 @@ fn emit_resolved_bound_proc_call(
 ) -> Option<ValueId> {
     let target = bp.target_name.clone();
     let target_key = abi_key_for_link_name(st, &target).unwrap_or_else(|| bp.abi_name.clone());
-    let (call_name, _callee_key) = resolved_symbol_call_target(st, &target_key, &target);
+    let call_name = target.clone();
     let nopass = bp.nopass;
     let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
         args,
@@ -11593,7 +11594,20 @@ fn emit_resolved_bound_proc_call(
         call_args.push(result);
     }
     if !nopass {
-        call_args.push(obj_addr);
+        let wants_bind_c_char = callee_bind_c_char_args
+            .as_ref()
+            .map(|mask| mask.first().copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_descriptor = callee_descriptor_args
+            .as_ref()
+            .map(|mask| mask.first().copied().unwrap_or(false))
+            .unwrap_or(false)
+            && !wants_bind_c_char;
+        call_args.push(if wants_descriptor {
+            pass_desc_addr.unwrap_or(obj_addr)
+        } else {
+            obj_addr
+        });
     }
 
     for (i, slot) in arg_slots
@@ -11883,6 +11897,7 @@ fn emit_polymorphic_component_bound_dispatch(
             optional_params,
             descriptor_params,
             obj_addr,
+            Some(desc_addr),
             bp,
             args,
             None,
@@ -16290,8 +16305,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             let target = bp.target_name.clone();
                             let target_key = abi_key_for_link_name(ctx.st, &target)
                                 .unwrap_or_else(|| bp.abi_name.clone());
-                            let (call_name, _) =
-                                resolved_symbol_call_target(ctx.st, &target_key, &target);
+                            let call_name = target.clone();
                             let nopass = bp.nopass;
                             let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
                                 args,
@@ -16329,7 +16343,26 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             let mut call_args = Vec::with_capacity(arg_slots.len());
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 if !nopass && i == 0 {
-                                    call_args.push(obj_addr);
+                                    let wants_bind_c_char = bind_c_char_mask
+                                        .as_ref()
+                                        .map(|mask| mask.first().copied().unwrap_or(false))
+                                        .unwrap_or(false);
+                                    let wants_descriptor = desc_mask
+                                        .as_ref()
+                                        .map(|mask| mask.first().copied().unwrap_or(false))
+                                        .unwrap_or(false)
+                                        && !wants_bind_c_char;
+                                    call_args.push(if wants_descriptor {
+                                        lower_arg_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            base,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                    } else {
+                                        obj_addr
+                                    });
                                     continue;
                                 }
                                 let is_value = value_mask
@@ -17508,6 +17541,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 ctx.st,
                 Some(ctx.type_layouts),
             );
+            let typed_type_tag =
+                typed_allocate_type_tag_value(b, type_spec.as_ref(), ctx.type_layouts);
             let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
             let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
             let shape_desc = source_desc.or(mold_desc);
@@ -17669,7 +17704,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                             if rank == 0 {
-                                let type_tag = if let Some(source_desc) = source_desc {
+                                let type_tag = if let Some(tag) = typed_type_tag {
+                                    Some(tag)
+                                } else if let Some(source_desc) = source_desc {
                                     Some(load_array_desc_type_tag(b, source_desc))
                                 } else if let Some(source_expr) = source_expr {
                                     static_expr_type_tag_value(
@@ -17905,7 +17942,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                             if rank == 0 {
-                                let type_tag = if let Some(source_desc) = source_desc {
+                                let type_tag = if let Some(tag) = typed_type_tag {
+                                    Some(tag)
+                                } else if let Some(source_desc) = source_desc {
                                     Some(load_array_desc_type_tag(b, source_desc))
                                 } else if let Some(source_expr) = source_expr {
                                     static_expr_type_tag_value(
@@ -28566,6 +28605,20 @@ fn static_alloc_target_type_tag_value(
     }
 }
 
+fn typed_allocate_type_tag_value(
+    b: &mut FuncBuilder,
+    type_spec: Option<&crate::ast::decl::TypeSpec>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ValueId> {
+    match type_spec {
+        Some(crate::ast::decl::TypeSpec::Type(name))
+        | Some(crate::ast::decl::TypeSpec::Class(name)) => type_layouts
+            .get(name)
+            .map(|layout| b.const_i64(layout.type_tag as i64)),
+        _ => None,
+    }
+}
+
 fn emit_scalar_alloc_type_tag_on_success(
     b: &mut FuncBuilder,
     stat_addr: ValueId,
@@ -30806,8 +30859,7 @@ fn lower_expr_full(
                                 let target = bp.target_name.clone();
                                 let target_key = abi_key_for_link_name(st, &target)
                                     .unwrap_or_else(|| bp.abi_name.clone());
-                                let (call_name, _callee_key) =
-                                    resolved_symbol_call_target(st, &target_key, &target);
+                                let call_name = target.clone();
                                 let nopass = bp.nopass;
                                 let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
                                     args,
@@ -30851,7 +30903,26 @@ fn lower_expr_full(
                                 let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     if !nopass && i == 0 {
-                                        call_args.push(obj_addr);
+                                        let wants_bind_c_char = callee_bind_c_char_args
+                                            .as_ref()
+                                            .map(|mask| mask.first().copied().unwrap_or(false))
+                                            .unwrap_or(false);
+                                        let wants_descriptor = callee_descriptor_args
+                                            .as_ref()
+                                            .map(|mask| mask.first().copied().unwrap_or(false))
+                                            .unwrap_or(false)
+                                            && !wants_bind_c_char;
+                                        call_args.push(if wants_descriptor {
+                                            lower_arg_descriptor(
+                                                b,
+                                                locals,
+                                                base,
+                                                st,
+                                                type_layouts,
+                                            )
+                                        } else {
+                                            obj_addr
+                                        });
                                         continue;
                                     }
                                     let is_value = callee_value_args

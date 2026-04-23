@@ -7440,6 +7440,78 @@ fn polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_d
 }
 
 #[test]
+fn typed_allocate_class_component_sets_runtime_type_tag_for_dispatch() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base\n  contains\n    procedure(get_keys_i), deferred :: get_keys\n  end type\n  abstract interface\n    subroutine get_keys_i(self)\n      import :: base\n      class(base), intent(inout) :: self\n    end subroutine\n  end interface\n  type, extends(base) :: child\n  contains\n    procedure :: get_keys => child_get_keys\n  end type\n  type :: holder\n    class(base), allocatable :: map\n  contains\n    procedure :: ping\n  end type\ncontains\n  subroutine child_get_keys(self)\n    class(child), intent(inout) :: self\n    print *, 'keys'\n  end subroutine\n  subroutine ping(self)\n    class(holder), intent(inout) :: self\n    call self%map%get_keys()\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(holder) :: h\n  allocate(child :: h%map)\n  call h%ping()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("typed_allocate_class_component_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed allocate class component dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed allocate class component dispatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("typed allocate class component dispatch run failed");
+    assert!(
+        run.status.success(),
+        "typed allocate class component dispatch should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("keys"),
+        "unexpected typed allocate class component dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn component_bound_dispatch_keeps_module_specific_target_name() {
+    let src = write_program(
+        "module list_m\n  implicit none\n  type, abstract :: list_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_t\n      class(list_t), intent(in) :: self\n    end function\n  end interface\n  type, extends(list_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n  end type\ncontains\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\nend module\n\nmodule array_m\n  use list_m, only : list_t, list_impl_t\n  implicit none\n  type :: array_t\n    class(list_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: get_len => array_get_len\n  end type\ncontains\n  subroutine init(self, n)\n    class(array_t), intent(out) :: self\n    integer, intent(in) :: n\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%n = n\n    call move_alloc(tmp, self%list)\n  end subroutine\n  integer function array_get_len(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\nend module\n\nprogram p\n  use array_m\n  implicit none\n  type(array_t) :: arr\n  call arr%init(7)\n  if (arr%get_len() /= 7) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_specific_bound_target", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module-specific bound target compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module-specific bound target should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module-specific bound target run failed");
+    assert!(
+        run.status.success(),
+        "module-specific bound target should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module-specific bound target output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
     let dir = unique_dir("derived_result_return_amod");
     let mod_src = write_program_in(
