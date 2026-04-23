@@ -11820,20 +11820,51 @@ fn pointer_function_result_forwarding_preserves_target_association() {
 }
 
 #[test]
-fn select_type_pointer_result_component_target_compiles() {
+fn select_type_polymorphic_dummy_errors_instead_of_miscompiling() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type base_t\n  type, extends(base_t) :: float_box\n    real(8) :: raw = 0.0d0\n  end type float_box\ncontains\n  function cast_float(val) result(ptr)\n    class(base_t), intent(in), target :: val\n    real(8), pointer :: ptr\n    select type (val)\n    type is (float_box)\n      ptr => val%raw\n    class default\n      nullify(ptr)\n    end select\n  end function cast_float\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(float_box), target :: box\n  real(8), pointer :: ptr\n  box%raw = 3.5d0\n  ptr => cast_float(box)\n  if (.not. associated(ptr)) error stop 1\n  if (abs(ptr - 3.5d0) > 1.0d-12) error stop 2\n  ptr = 9.25d0\n  if (abs(box%raw - 9.25d0) > 1.0d-12) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
     );
-    let out = unique_path("select_type_pointer_result_component", "bin");
+    let out = unique_path("select_type_polymorphic_dummy", "bin");
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
         .expect("select type pointer result compile spawn failed");
     assert!(
-        compile.status.success(),
-        "select type pointer result should compile: {}",
+        !compile.status.success(),
+        "polymorphic SELECT TYPE should fail explicitly instead of miscompiling"
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet"),
+        "expected explicit polymorphic SELECT TYPE error, got: {}",
         String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn select_type_allocatable_polymorphic_local_errors_instead_of_miscompiling() {
+    let src = write_program(
+        "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  class(base_t), allocatable :: tmp\n  allocate(tmp, source=child_t(17))\n  select type (tmp)\n  type is (child_t)\n    print *, tmp%x\n  class default\n    error stop 1\n  end select\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_type_allocatable_poly_local", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable polymorphic select type compile spawn failed");
+    assert!(
+        !compile.status.success(),
+        "allocatable polymorphic SELECT TYPE should fail explicitly instead of miscompiling"
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet"),
+        "expected explicit allocatable polymorphic SELECT TYPE error, got: {}",
+        stderr
     );
 
     let _ = std::fs::remove_file(&out);

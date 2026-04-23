@@ -16755,6 +16755,17 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             assoc_name,
             ..
         } => {
+            if matches!(
+                operator_expr_type_info(selector, ctx.st, Some(ctx.type_layouts)),
+                Some(crate::sema::symtab::TypeInfo::Class(_))
+            ) {
+                eprintln!(
+                    "armfortas: error: {}:{}: SELECT TYPE on polymorphic CLASS(...) selectors is not implemented yet",
+                    stmt.span.start.line, stmt.span.start.col
+                );
+                let _ = std::io::stderr().flush();
+                std::process::exit(1);
+            }
             // SELECT TYPE: compare the type tag of a polymorphic variable.
             // For now, support basic pattern where selector is a local derived type
             // variable and TYPE IS guards match by type tag.
