@@ -55,6 +55,8 @@ pub struct TypeLayout {
     pub type_tag: u64,
     /// Parent type name (from EXTENDS). None for base types.
     pub parent: Option<String>,
+    /// Whether this type is ABSTRACT and therefore not a concrete dispatch target.
+    pub is_abstract: bool,
 }
 
 impl TypeLayout {
@@ -410,6 +412,30 @@ pub fn compute_layout(
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
 ) -> TypeLayout {
+    compute_layout_with_attrs(
+        type_name,
+        host_module,
+        type_bound_procs,
+        final_proc_names,
+        components,
+        parent_layout,
+        false,
+        registry,
+        const_params,
+    )
+}
+
+pub fn compute_layout_with_attrs(
+    type_name: &str,
+    host_module: Option<&str>,
+    type_bound_procs: &[crate::ast::decl::TypeBoundProc],
+    final_proc_names: &[String],
+    components: &[crate::ast::decl::SpannedDecl],
+    parent_layout: Option<&TypeLayout>,
+    is_abstract: bool,
+    registry: &TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+) -> TypeLayout {
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
     let mut fields = Vec::new();
@@ -513,10 +539,11 @@ pub fn compute_layout(
         offset += padding;
     }
 
-    // Collect type-bound procedure mappings.
-    let bound_procs: Vec<BoundProc> = type_bound_procs
-        .iter()
-        .map(|tbp| {
+    // Inherit parent's bindings, then let the local type override by method name.
+    let mut bound_procs = parent_layout
+        .map(|parent| parent.bound_procs.clone())
+        .unwrap_or_default();
+    for tbp in type_bound_procs {
             let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
             let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
             let target_name = if let Some(module_name) = host_module {
@@ -528,14 +555,21 @@ pub fn compute_layout(
             } else {
                 target.to_string()
             };
-            BoundProc {
+            let proc = BoundProc {
                 method_name: tbp.name.clone(),
                 target_name,
                 abi_name: target.to_lowercase(),
                 nopass,
+            };
+            if let Some(existing) = bound_procs
+                .iter_mut()
+                .find(|bp| bp.method_name.eq_ignore_ascii_case(&proc.method_name))
+            {
+                *existing = proc;
+            } else {
+                bound_procs.push(proc);
             }
-        })
-        .collect();
+    }
 
     let final_procs: Vec<String> = final_proc_names
         .iter()
@@ -561,6 +595,7 @@ pub fn compute_layout(
         final_procs,
         type_tag: 0, // assigned by registry after insertion
         parent: parent_layout.map(|p| p.name.clone()),
+        is_abstract,
     }
 }
 
@@ -622,6 +657,7 @@ mod tests {
             final_procs: vec![],
             type_tag: 0,
             parent: None,
+            is_abstract: false,
         };
         assert_eq!(layout.field("x").unwrap().offset, 0);
         assert_eq!(layout.field("y").unwrap().offset, 4);
@@ -682,6 +718,7 @@ mod tests {
             final_procs: vec![],
             type_tag: 0,
             parent: None,
+            is_abstract: false,
         };
         // Verify padding: a(1) + 7 pad + b(8) + c(4) + 4 pad = 24
         assert_eq!(layout.size, 24);
@@ -703,6 +740,7 @@ mod tests {
             final_procs: vec![],
             type_tag: 0,
             parent: None,
+            is_abstract: false,
         });
         assert!(reg.get("mytype").is_some()); // case insensitive
         assert!(reg.get("MYTYPE").is_some());
@@ -915,6 +953,7 @@ mod tests {
             final_procs: vec![],
             type_tag: 0,
             parent: None,
+            is_abstract: false,
         });
         let components = vec![make_component_with_attrs(
             "left",

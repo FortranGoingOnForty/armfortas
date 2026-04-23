@@ -982,6 +982,7 @@ pub extern "C" fn afs_allocate_array(
     // Copy dimensions.
     desc.rank = rank;
     desc.elem_size = elem_size;
+    desc.clear_scalar_type_tag();
     if !dims_ptr.is_null() && rank > 0 {
         let dims_slice = unsafe { std::slice::from_raw_parts(dims_ptr, rank as usize) };
         for (i, dim) in dims_slice.iter().enumerate() {
@@ -1086,6 +1087,8 @@ pub extern "C" fn afs_allocate_like(
         ptr::null()
     };
     afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
+    let dest = unsafe { &mut *dest };
+    dest.set_scalar_type_tag(source.scalar_type_tag());
 }
 
 /// Copy array payload from `source` into an already-allocated `dest` without
@@ -1145,6 +1148,7 @@ pub extern "C" fn afs_copy_array_data(
             ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
         }
     }
+    dest.set_scalar_type_tag(source.scalar_type_tag());
 
     if !stat.is_null() {
         unsafe {
@@ -1194,6 +1198,7 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
     // Clear the descriptor.
     desc.base_addr = ptr::null_mut();
     desc.flags &= !DESC_ALLOCATED;
+    desc.clear_scalar_type_tag();
     // Leave rank, elem_size, dims intact (they describe the shape for future allocate).
 
     if !stat.is_null() {
@@ -1297,6 +1302,7 @@ pub extern "C" fn afs_assign_allocatable(
             ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
         }
     }
+    dest.set_scalar_type_tag(source.scalar_type_tag());
 }
 
 // ---- MOVE_ALLOC ----
@@ -1327,6 +1333,7 @@ pub extern "C" fn afs_move_alloc(from: *mut ArrayDescriptor, to: *mut ArrayDescr
     // Clear `from`.
     from_desc.base_addr = ptr::null_mut();
     from_desc.flags &= !DESC_ALLOCATED;
+    from_desc.clear_scalar_type_tag();
 }
 
 // ---- ALLOCATED INTRINSIC ----
@@ -1587,6 +1594,20 @@ mod tests {
     }
 
     #[test]
+    fn move_alloc_preserves_scalar_type_tag() {
+        let mut from = ArrayDescriptor::zeroed();
+        let mut to = ArrayDescriptor::zeroed();
+        afs_allocate_array(&mut from, 8, 0, ptr::null(), ptr::null_mut());
+        from.set_scalar_type_tag(77);
+
+        afs_move_alloc(&mut from, &mut to);
+        assert_eq!(to.scalar_type_tag(), 77);
+        assert_eq!(from.scalar_type_tag(), 0);
+
+        afs_deallocate_array(&mut to, ptr::null_mut());
+    }
+
+    #[test]
     fn allocated_intrinsic() {
         let mut desc = ArrayDescriptor::zeroed();
         assert_eq!(afs_allocated(&desc), 0);
@@ -1621,6 +1642,21 @@ mod tests {
                 assert_eq!(*data.add(i), (i + 1) as i32);
             }
         }
+
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_preserves_scalar_type_tag() {
+        let mut source = ArrayDescriptor::zeroed();
+        let mut dest = ArrayDescriptor::zeroed();
+
+        afs_allocate_array(&mut source, 8, 0, ptr::null(), ptr::null_mut());
+        source.set_scalar_type_tag(42);
+
+        afs_assign_allocatable(&mut dest, &source);
+        assert_eq!(dest.scalar_type_tag(), 42);
 
         afs_deallocate_array(&mut source, ptr::null_mut());
         afs_deallocate_array(&mut dest, ptr::null_mut());

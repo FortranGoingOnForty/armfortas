@@ -1167,6 +1167,7 @@ fn collect_derived_type_layouts(
         if let Decl::DerivedTypeDef {
             name,
             extends,
+            attrs,
             components,
             type_bound_procs,
             final_procs,
@@ -1174,13 +1175,17 @@ fn collect_derived_type_layouts(
         } = &decl.node
         {
             let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
-            let layout = super::type_layout::compute_layout(
+            let is_abstract = attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
+            let layout = super::type_layout::compute_layout_with_attrs(
                 name,
                 host_module,
                 type_bound_procs,
                 final_procs,
                 components,
                 parent.as_ref(),
+                is_abstract,
                 layouts,
                 &const_params,
             );

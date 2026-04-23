@@ -706,6 +706,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         if let Some(ref parent) = layout.parent {
             writeln!(out, "  @extends {}", parent).unwrap();
         }
+        if layout.is_abstract {
+            writeln!(out, "  @abstract").unwrap();
+        }
         for field in &layout.fields {
             let ft = type_info_to_string(Some(&field.type_info));
             let dims = if field.dims.is_empty() {
@@ -1322,6 +1325,7 @@ fn parse_type(
     let mut bound_procs = Vec::new();
     let mut final_procs = Vec::new();
     let mut type_tag = 0u64;
+    let mut is_abstract = false;
 
     for line in lines.by_ref() {
         let trimmed = line.trim();
@@ -1430,6 +1434,8 @@ fn parse_type(
             final_procs.push(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
             type_tag = rest.trim().parse().unwrap_or(0);
+        } else if trimmed == "@abstract" {
+            is_abstract = true;
         }
     }
 
@@ -1442,6 +1448,7 @@ fn parse_type(
         final_procs,
         type_tag,
         parent,
+        is_abstract,
     }
 }
 

@@ -140,6 +140,31 @@ impl ArrayDescriptor {
         }
         self.flags |= DESC_CONTIGUOUS;
     }
+
+    /// Runtime concrete-type tag for scalar polymorphic allocatables.
+    ///
+    /// The current ABI stores this in `dims[0].lower_bound` when `rank == 0`.
+    pub fn scalar_type_tag(&self) -> i64 {
+        if self.rank == 0 {
+            self.dims[0].lower_bound
+        } else {
+            0
+        }
+    }
+
+    pub fn set_scalar_type_tag(&mut self, tag: i64) {
+        if self.rank == 0 {
+            self.dims[0].lower_bound = tag;
+            self.dims[0].upper_bound = 0;
+            self.dims[0].stride = 0;
+        }
+    }
+
+    pub fn clear_scalar_type_tag(&mut self) {
+        if self.rank == 0 {
+            self.dims[0] = DimDescriptor::default();
+        }
+    }
 }
 
 /// String descriptor — the runtime representation of a Fortran character variable.

@@ -17145,6 +17145,37 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                             if rank == 0 {
+                                let type_tag = if let Some(source_desc) = source_desc {
+                                    Some(load_array_desc_type_tag(b, source_desc))
+                                } else if let Some(source_expr) = source_expr {
+                                    static_expr_type_tag_value(
+                                        b,
+                                        source_expr,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                } else {
+                                    static_alloc_target_type_tag_value(
+                                        b,
+                                        item,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                };
+                                emit_scalar_alloc_type_tag_on_success(
+                                    b,
+                                    stat_addr,
+                                    field_ptr,
+                                    type_tag,
+                                );
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                                         let base_ptr = b.load_typed(
@@ -17350,6 +17381,37 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 }
                             }
                             if rank == 0 {
+                                let type_tag = if let Some(source_desc) = source_desc {
+                                    Some(load_array_desc_type_tag(b, source_desc))
+                                } else if let Some(source_expr) = source_expr {
+                                    static_expr_type_tag_value(
+                                        b,
+                                        source_expr,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                } else {
+                                    static_alloc_target_type_tag_value(
+                                        b,
+                                        item,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                };
+                                emit_scalar_alloc_type_tag_on_success(
+                                    b,
+                                    stat_addr,
+                                    desc,
+                                    type_tag,
+                                );
                                 if let Some(type_name) = &info.derived_type {
                                     if let Some(layout) = ctx.type_layouts.get(type_name) {
                                         let base_ptr = b.load_typed(
@@ -22095,6 +22157,16 @@ fn load_array_desc_i64_field(b: &mut FuncBuilder, desc: ValueId, offset: i64) ->
     let off = b.const_i64(offset);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
     b.load_typed(ptr, IrType::Int(IntWidth::I64))
+}
+
+fn load_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    load_array_desc_i64_field(b, desc, 24)
+}
+
+fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
+    let off = b.const_i64(24);
+    let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
+    b.store(tag, ptr);
 }
 
 fn load_array_desc_i32_field(b: &mut FuncBuilder, desc: ValueId, offset: i64) -> ValueId {
@@ -27869,6 +27941,56 @@ fn emit_allocatable_source_copy_on_success(
             IrType::Void,
         );
     }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn static_expr_type_tag_value(
+    b: &mut FuncBuilder,
+    expr: &SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ValueId> {
+    match operator_expr_type_info(expr, st, Some(type_layouts)) {
+        Some(crate::sema::symtab::TypeInfo::Derived(name)) => type_layouts
+            .get(&name)
+            .map(|layout| b.const_i64(layout.type_tag as i64)),
+        _ => None,
+    }
+}
+
+fn static_alloc_target_type_tag_value(
+    b: &mut FuncBuilder,
+    expr: &SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ValueId> {
+    match operator_expr_type_info(expr, st, Some(type_layouts)) {
+        Some(crate::sema::symtab::TypeInfo::Derived(name)) => type_layouts
+            .get(&name)
+            .map(|layout| b.const_i64(layout.type_tag as i64)),
+        _ => None,
+    }
+}
+
+fn emit_scalar_alloc_type_tag_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    tag_value: Option<ValueId>,
+) {
+    let Some(tag) = tag_value else {
+        return;
+    };
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let set_bb = b.create_block("alloc_type_tag_set");
+    let done_bb = b.create_block("alloc_type_tag_done");
+    b.cond_branch(ok, set_bb, vec![], done_bb, vec![]);
+
+    b.set_block(set_bb);
+    store_array_desc_type_tag(b, dest_desc, tag);
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
 }
