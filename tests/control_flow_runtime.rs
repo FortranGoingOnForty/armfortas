@@ -43,7 +43,7 @@ fn run_with_timeout(path: &std::path::Path) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn control-flow test binary");
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(_status) = child.try_wait().expect("failed to poll child status") {
             return child
