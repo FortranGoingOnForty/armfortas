@@ -2270,8 +2270,8 @@ fn validate_derived_type(
             );
         }
 
-        // Deferred procedures must have an interface (binding).
-        if is_deferred && tbp.binding.is_none() {
+        // Deferred procedures must declare an explicit interface.
+        if is_deferred && tbp.interface.is_none() {
             ctx.error(
                 span,
                 format!(

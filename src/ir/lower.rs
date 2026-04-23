@@ -11283,6 +11283,7 @@ fn emit_bound_function_call(
     ret_ty: IrType,
 ) -> Option<ValueId> {
     let tl = type_layouts?;
+    reject_unsupported_polymorphic_component_method_base(base.span, base, locals, tl);
     let (obj_addr, type_name) = resolve_component_base_for_method(b, locals, base, st, tl)?;
     let layout = tl.get(&type_name)?;
     let bp = layout.bound_proc(component)?;
@@ -14253,6 +14254,12 @@ fn lower_string_expr_full(
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
                     if let Expr::ComponentAccess { base, component } = &callee.node {
+                        reject_unsupported_polymorphic_component_method_base(
+                            callee.span,
+                            base,
+                            locals,
+                            tl,
+                        );
                         if let Some((_obj_addr, type_name)) =
                             resolve_component_base_for_method(b, locals, base, st, tl)
                         {
@@ -15830,6 +15837,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             // Handle type-bound procedure calls: call obj%method(args)
             if let Expr::ComponentAccess { base, component } = &callee.node {
+                reject_unsupported_polymorphic_component_method_base(
+                    callee.span,
+                    base,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                );
                 if let Some((obj_addr, type_name)) = resolve_component_base_for_method(
                     b,
                     &ctx.locals,
@@ -27975,6 +27988,63 @@ fn resolve_component_base_for_method(
     }
 }
 
+enum MethodBaseKind {
+    Derived(String),
+    PolymorphicClass(String),
+}
+
+fn method_base_kind_for_call(
+    base: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<MethodBaseKind> {
+    match &base.node {
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .and_then(|info| info.derived_type.clone())
+            .map(MethodBaseKind::Derived),
+        Expr::ComponentAccess {
+            base: inner_base,
+            component,
+        } => {
+            let inner_type = match method_base_kind_for_call(inner_base, locals, tl)? {
+                MethodBaseKind::Derived(name) | MethodBaseKind::PolymorphicClass(name) => name,
+            };
+            let layout = tl.get(&inner_type)?;
+            let field = layout.field(component)?;
+            match &field.type_info {
+                crate::sema::symtab::TypeInfo::Derived(name) => {
+                    Some(MethodBaseKind::Derived(name.clone()))
+                }
+                crate::sema::symtab::TypeInfo::Class(name) => {
+                    Some(MethodBaseKind::PolymorphicClass(name.clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn reject_unsupported_polymorphic_component_method_base(
+    span: crate::lexer::Span,
+    base: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    if matches!(
+        method_base_kind_for_call(base, locals, tl),
+        Some(MethodBaseKind::PolymorphicClass(_))
+    ) {
+        eprintln!(
+            "armfortas: error: {}:{}: type-bound calls through CLASS(...) component bases are not implemented yet",
+            span.start.line, span.start.col
+        );
+        let _ = std::io::stderr().flush();
+        std::process::exit(1);
+    }
+}
+
 fn lower_char_arg_by_ref(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -29962,6 +30032,12 @@ fn lower_expr_full(
                 call_result
             } else if let Expr::ComponentAccess { base, component } = &callee.node {
                 if let Some(tl) = type_layouts {
+                    reject_unsupported_polymorphic_component_method_base(
+                        callee.span,
+                        base,
+                        locals,
+                        tl,
+                    );
                     if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
                         let has_range = args.iter().any(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })

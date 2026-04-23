@@ -960,7 +960,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_bound_proc(&mut self) -> Result<TypeBoundProc, ParseError> {
-        // procedure [, attrs] :: name [=> binding]
+        // procedure [(iface)] [, attrs] :: name [=> binding]
+        let interface = if self.eat(&TokenKind::LParen) {
+            let iface = self.advance().clone().text;
+            self.expect(&TokenKind::RParen)?;
+            Some(iface)
+        } else {
+            None
+        };
         let mut proc_attrs = Vec::new();
         while self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
@@ -980,6 +987,7 @@ impl<'a> Parser<'a> {
         };
         Ok(TypeBoundProc {
             name,
+            interface,
             binding,
             attrs: proc_attrs,
             is_generic: false,
@@ -1005,6 +1013,7 @@ impl<'a> Parser<'a> {
         };
         Ok(TypeBoundProc {
             name,
+            interface: None,
             binding,
             attrs: Vec::new(),
             is_generic: true,
@@ -1265,6 +1274,18 @@ mod tests {
         } else {
             panic!("not TypeDecl");
         }
+    }
+
+    #[test]
+    fn type_bound_proc_with_interface_spec_preserves_method_name() {
+        let tokens = Lexer::tokenize("procedure(push_iface), deferred :: push", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let tbp = parser.parse_type_bound_proc().unwrap();
+        assert_eq!(tbp.name, "push");
+        assert_eq!(tbp.interface.as_deref(), Some("push_iface"));
+        assert!(tbp.binding.is_none());
+        assert_eq!(tbp.attrs, vec!["deferred"]);
     }
 
     #[test]

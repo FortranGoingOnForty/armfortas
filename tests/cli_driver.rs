@@ -7362,6 +7362,77 @@ fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
 }
 
 #[test]
+fn deferred_type_bound_proc_interface_survives_amod_export() {
+    let dir = unique_dir("deferred_tbp_interface_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type, abstract, public :: list_t\n  contains\n    procedure(push_iface), deferred :: push\n  end type\n  abstract interface\n    subroutine push_iface(self)\n      import :: list_t\n      class(list_t), intent(inout) :: self\n    end subroutine\n  end interface\nend module\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = dir.join("m.amod");
+    let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
+    assert!(
+        amod_text.contains("@binds push"),
+        "deferred type-bound procedure binding should survive into .amod: {}",
+        amod_text
+    );
+    assert!(
+        !amod_text.contains("@binds ("),
+        "interface-spec type-bound procedure should not degrade into '(' in .amod: {}",
+        amod_text
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn polymorphic_component_type_bound_call_errors_instead_of_miscompiling() {
+    let dir = unique_dir("polymorphic_component_tbp_error");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_base_t\n      class(list_base_t), intent(in) :: self\n    end function\n  end interface\n  type, extends(list_base_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: size_of => array_size_of\n  end type\ncontains\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\n  integer function array_size_of(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\nend module\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", mod_src.to_str().unwrap(), "-o", mod_obj.to_str().unwrap()])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        !compile_mod.status.success(),
+        "compile should fail instead of silently miscompiling unsupported polymorphic component method call"
+    );
+    let stderr = String::from_utf8_lossy(&compile_mod.stderr);
+    assert!(
+        stderr.contains("type-bound calls through CLASS(...) component bases are not implemented yet"),
+        "expected explicit polymorphic component bound-call error, got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
     let dir = unique_dir("derived_result_return_amod");
     let mod_src = write_program_in(
