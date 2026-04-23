@@ -10256,7 +10256,19 @@ fn lowered_operator_char_actual_view(
             Some(load_string_descriptor_view(b, actual))
         }
         Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) => {
-            Some((actual, b.const_i64(0)))
+            let len = actual_char_arg_runtime_len(
+                b,
+                locals,
+                None,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .unwrap_or_else(|| b.const_i64(0));
+            Some((actual, len))
         }
         _ => None,
     }

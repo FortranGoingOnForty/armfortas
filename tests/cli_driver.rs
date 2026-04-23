@@ -17087,3 +17087,39 @@ fn module_character_parameter_still_uses_intrinsic_concat_with_user_defined_slas
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn module_global_component_overloaded_concat_preserves_nested_character_actual_len() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: color_output\n    type(color_code) :: dim = color_code(style=2_i1)\n    type(color_code) :: reset = color_code()\n    type(color_code) :: blue = color_code(fg=4_i1)\n  end type\n  type(color_output), protected :: color\n  interface operator(//)\n    module procedure :: concat_color_left\n    module procedure :: concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = lval // 'X'\n    else\n      str = lval // 'Y'\n    end if\n  end function\n  pure function concat_color_right(code, rval) result(str)\n    type(color_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = 'Z' // rval\n    else\n      str = 'W' // rval\n    end if\n  end function\n  pure function anycolor(code) result(flag)\n    type(color_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'A' // color%dim // 'B' // color%reset // 'C' // color%blue\n  if (s /= 'AXBYCX') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_global_component_overloaded_concat_nested_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module global component overloaded concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module global component overloaded concat should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module global component overloaded concat run failed");
+    assert!(
+        run.status.success(),
+        "module global component overloaded concat should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module global component overloaded concat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
