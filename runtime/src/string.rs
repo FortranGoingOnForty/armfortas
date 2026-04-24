@@ -185,10 +185,14 @@ pub extern "C" fn afs_concat(result: *mut u8, a: *const u8, a_len: i64, b: *cons
     }
     unsafe {
         if !a.is_null() && a_len > 0 {
-            ptr::copy_nonoverlapping(a, result, a_len as usize);
+            // Some compiler paths still materialize concatenation into a
+            // buffer that aliases one of the source slices. `ptr::copy`
+            // tolerates overlap and keeps the runtime from tripping Rust's
+            // UB guards on otherwise valid self-referential Fortran shapes.
+            ptr::copy(a, result, a_len as usize);
         }
         if !b.is_null() && b_len > 0 {
-            ptr::copy_nonoverlapping(b, result.add(a_len as usize), b_len as usize);
+            ptr::copy(b, result.add(a_len as usize), b_len as usize);
         }
     }
 }
@@ -633,6 +637,14 @@ mod tests {
             6,
         );
         assert_eq!(&result, b"hello world");
+    }
+
+    #[test]
+    fn concat_tolerates_result_aliasing_lhs() {
+        let mut result = [0u8; 6];
+        result[..3].copy_from_slice(b"abc");
+        afs_concat(result.as_mut_ptr(), result.as_ptr(), 3, b"def".as_ptr(), 3);
+        assert_eq!(&result, b"abcdef");
     }
 
     // ---- Comparison ----
