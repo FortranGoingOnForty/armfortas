@@ -17539,6 +17539,24 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     if let Some(ref tn) = info.derived_type {
                                         emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
                                     }
+                                    // Scalar descriptor-backed TYPE allocatables keep their
+                                    // dynamic type identity in the descriptor sidecar, so
+                                    // constructor/function-result assignment must restamp the
+                                    // concrete metadata after copying the value bytes.
+                                    if let Some(tag) = derived_type_tag_value(
+                                        b,
+                                        info.derived_type.as_deref(),
+                                        ctx.type_layouts,
+                                    ) {
+                                        store_array_desc_type_tag(b, desc, tag);
+                                    }
+                                    if let Some(lookup) = derived_type_tbp_lookup_value(
+                                        b,
+                                        info.derived_type.as_deref(),
+                                        ctx.type_layouts,
+                                    ) {
+                                        store_array_desc_tbp_lookup_ptr(b, desc, lookup);
+                                    }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
                                     return;
@@ -18167,6 +18185,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         dest_ptr,
                                         src_ptr,
                                     );
+                                    if let Some(tag) = derived_type_tag_value(
+                                        b,
+                                        Some(type_name.as_str()),
+                                        ctx.type_layouts,
+                                    ) {
+                                        store_array_desc_type_tag(b, desc, tag);
+                                    }
+                                    if let Some(lookup) = derived_type_tbp_lookup_value(
+                                        b,
+                                        Some(type_name.as_str()),
+                                        ctx.type_layouts,
+                                    ) {
+                                        store_array_desc_tbp_lookup_ptr(b, desc, lookup);
+                                    }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
                                     return;

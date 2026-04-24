@@ -4056,6 +4056,43 @@ fn allocatable_derived_component_structure_constructor_persists_after_return() {
 }
 
 #[test]
+fn allocatable_derived_component_structure_constructor_preserves_class_dispatch() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  type :: parser_t\n    type(child_t), allocatable :: root\n  end type parser_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\n  subroutine init(parser)\n    type(parser_t), intent(out) :: parser\n    parser%root = child_t(7)\n  end subroutine init\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  type(printer_t) :: vis\n  call init(parser)\n  call parser%root%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_ctor_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable component ctor dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable component ctor dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable component ctor dispatch run failed");
+    assert!(
+        run.status.success(),
+        "allocatable component ctor dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocatable component ctor dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
     let src = write_program(
         "module m\n  implicit none\n  integer :: count = 0\n  type :: child_t\n    integer :: tag = 0\n  end type\ncontains\n  subroutine destroy_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (.not. associated(n)) return\n    count = count + 1\n    deallocate(n)\n    nullify(n)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: cached\n  allocate(cached)\n  cached%tag = 42\n  call destroy_child(cached)\n  print *, 'COUNT', count\n  if (associated(cached)) then\n    print *, 'CACHED', cached%tag\n  else\n    print *, 'CACHED', -1\n  end if\nend program\n",
@@ -21645,6 +21682,80 @@ fn allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allo
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected alloc intent(out) scalar ctor assign output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_scalar_function_result_assignment_preserves_class_dispatch() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\n  function make_child() result(out)\n    type(child_t) :: out\n    out%x = 7\n  end function make_child\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t), allocatable :: x\n  type(printer_t) :: vis\n  x = make_child()\n  call x%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_scalar_function_result_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc scalar function-result dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc scalar function-result dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc scalar function-result dispatch run failed");
+    assert!(
+        run.status.success(),
+        "alloc scalar function-result dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc scalar function-result dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t), allocatable :: x\n  type(printer_t) :: vis\n  x = child_t(7)\n  call x%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_scalar_ctor_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc scalar structure-constructor dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc scalar structure-constructor dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc scalar structure-constructor dispatch run failed");
+    assert!(
+        run.status.success(),
+        "alloc scalar structure-constructor dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc scalar structure-constructor dispatch output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
