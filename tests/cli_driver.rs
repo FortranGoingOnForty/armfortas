@@ -9259,6 +9259,42 @@ fn scalar_pointer_actual_materializes_descriptor_for_class_dummy() {
 }
 
 #[test]
+fn scalar_allocatable_actual_materializes_descriptor_for_class_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n    integer :: n = 0\n  contains\n    procedure :: set_n\n  end type\ncontains\n  subroutine set_n(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    self%n = v\n  end subroutine\n  subroutine set_box(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    call self%set_n(v)\n  end subroutine\nend module\nprogram p\n  use m, only : box_t, set_box\n  implicit none\n  type(box_t), allocatable :: value\n  allocate(value)\n  call set_box(value, 7)\n  if (.not.allocated(value)) error stop 1\n  if (value%n /= 7) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_class_dummy_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable class dummy descriptor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable class dummy descriptor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable class dummy descriptor run failed");
+    assert!(
+        run.status.success(),
+        "allocatable class dummy descriptor run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocatable class dummy descriptor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_allocated_concrete_moved_into_class_component_dispatches_concrete_len() {
     let dir = unique_dir("imported_concrete_move_alloc_dispatch");
     let base_src = write_program_in(
@@ -18158,6 +18194,35 @@ fn generic_resolution_uses_scope_local_kind_aliases() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("i4"), "expected i4 output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scope_local_named_kinds_do_not_bleed_across_sibling_functions() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  integer, parameter :: i2 = selected_int_kind(4)\ncontains\n  pure integer function keep_i1(v) result(r)\n    integer, parameter :: ik = i1\n    integer(ik), intent(in) :: v\n    r = v\n  end function\n  pure integer function literal_i2() result(r)\n    integer, parameter :: ik = i2\n    integer(ik) :: tmp\n    tmp = 256_ik\n    r = tmp\n  end function\n  pure integer function halve_i2(v) result(r)\n    integer, parameter :: ik = i2\n    integer(ik), intent(in) :: v\n    r = v / 2_ik\n  end function\nend module m\nprogram p\n  use m\n  implicit none\n  if (keep_i1(7_i1) /= 7) error stop 1\n  if (literal_i2() /= 256) error stop 2\n  if (halve_i2(256_i2) /= 128) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scope_local_named_kinds_do_not_bleed", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scope-local named kind bleed repro compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scope-local named kind bleed repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "scope-local named kind bleed repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
