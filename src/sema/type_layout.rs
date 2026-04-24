@@ -331,6 +331,86 @@ fn eval_const_field_logical_expr(
     }
 }
 
+fn eval_const_field_char_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+) -> Option<String> {
+    use crate::ast::expr::Expr;
+
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::ComponentAccess { base, component } => {
+            let Expr::Name { name } = &base.node else {
+                return None;
+            };
+            match const_derived_field_inits.get(&derived_param_field_lookup_key(name, component)) {
+                Some(FieldDefaultInit::Character(value)) => Some(value.clone()),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => {
+            eval_const_field_char_expr(inner, const_params, const_derived_field_inits)
+        }
+        Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let mut out = eval_const_field_char_expr(left, const_params, const_derived_field_inits)?;
+            out.push_str(&eval_const_field_char_expr(
+                right,
+                const_params,
+                const_derived_field_inits,
+            )?);
+            Some(out)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            match name.to_lowercase().as_str() {
+                "char" | "achar" => {
+                    let first_arg = args.first().and_then(|arg| {
+                        if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                            Some(expr)
+                        } else {
+                            None
+                        }
+                    })?;
+                    let code =
+                        eval_const_field_int_expr(first_arg, const_params, const_derived_field_inits)?;
+                    if !(0..=255).contains(&code) {
+                        return None;
+                    }
+                    Some((code as u8 as char).to_string())
+                }
+                "new_line" => Some("\n".to_string()),
+                "repeat" if args.len() == 2 => {
+                    let pattern = match &args[0].value {
+                        crate::ast::expr::SectionSubscript::Element(expr) => {
+                            eval_const_field_char_expr(expr, const_params, const_derived_field_inits)?
+                        }
+                        _ => return None,
+                    };
+                    let copies = match &args[1].value {
+                        crate::ast::expr::SectionSubscript::Element(expr) => {
+                            eval_const_field_int_expr(expr, const_params, const_derived_field_inits)?
+                        }
+                        _ => return None,
+                    };
+                    if copies < 0 {
+                        return None;
+                    }
+                    Some(pattern.repeat(copies as usize))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn eval_const_field_default_init_for_layout(
     type_info: &TypeInfo,
     expr: &crate::ast::expr::SpannedExpr,
@@ -339,12 +419,12 @@ pub fn eval_const_field_default_init_for_layout(
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     match type_info {
-        TypeInfo::Character { .. } => match &expr.node {
-            crate::ast::expr::Expr::StringLiteral { value, .. } => {
-                Some(FieldDefaultInit::Character(value.clone()))
-            }
-            _ => None,
-        },
+        TypeInfo::Character { .. } => eval_const_field_char_expr(
+            expr,
+            const_params,
+            const_derived_field_inits,
+        )
+        .map(FieldDefaultInit::Character),
         TypeInfo::Integer { .. } => eval_const_field_int_expr(expr, const_params, const_derived_field_inits)
             .map(|value| FieldDefaultInit::Integer(value as i128)),
         TypeInfo::Logical { .. } => {

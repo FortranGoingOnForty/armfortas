@@ -9212,6 +9212,341 @@ fn imported_allocated_concrete_moved_into_class_component_dispatches_concrete_le
 }
 
 #[test]
+fn imported_generic_keyword_real_expression_actual_resolves() {
+    let dir = unique_dir("generic_imported_keyword_real_expr");
+    let mod_src = write_program_in(
+        &dir,
+        "testdrive.f90",
+        "module testdrive\n  implicit none\n  type :: error_type\n    integer :: dummy = 0\n  end type\n  interface check\n    module procedure :: check_float_dp\n  end interface\ncontains\n  subroutine check_float_dp(error, actual, expected, message, more, thr, rel)\n    type(error_type), allocatable, intent(out) :: error\n    real(8), intent(in) :: actual\n    real(8), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    real(8), intent(in), optional :: thr\n    logical, intent(in), optional :: rel\n    real(8) :: tol\n    tol = 0.0d0\n    if (present(thr)) tol = thr\n    if (abs(actual - expected) > tol) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use testdrive\n  implicit none\n  type(error_type), allocatable :: error\n  real(8) :: val1, val2\n  val1 = 1.0d0\n  val2 = 1.0d0 + epsilon(val1)\n  call check(error, val2, val1, thr=2*epsilon(val1))\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("testdrive.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("generic_imported_keyword_real_expr.bin");
+
+    for (src, obj) in [(&mod_src, &mod_obj), (&main_src, &main_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("imported generic keyword real expr compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "imported generic keyword real expr compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported generic keyword real expr link failed to spawn");
+    assert!(
+        link.status.success(),
+        "imported generic keyword real expr link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported generic keyword real expr run failed");
+    assert!(
+        run.status.success(),
+        "imported generic keyword real expr run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported generic keyword real expr output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_unary_array_element_actual_preserves_integer_kind() {
+    let dir = unique_dir("generic_imported_unary_array_element_kind");
+    let mod_src = write_program_in(
+        &dir,
+        "testdrive.f90",
+        "module testdrive\n  implicit none\n  type :: error_type\n    integer :: dummy = 0\n  end type\n  interface check\n    module procedure :: check_int_i2\n  end interface\ncontains\n  subroutine check_int_i2(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    integer(2), intent(in) :: actual\n    integer(2), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    if (actual /= expected) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use testdrive\n  implicit none\n  type(error_type), allocatable :: error\n  integer(2), parameter :: ref(4) = [integer(2) :: 1, 3, 5, 7]\n  integer(2) :: val\n  integer :: ii\n  ii = 2\n  val = -ref(ii)\n  call check(error, val, -ref(ii))\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("testdrive.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("generic_imported_unary_array_element_kind.bin");
+
+    for (src, obj) in [(&mod_src, &mod_obj), (&main_src, &main_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("imported generic unary array element compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "imported generic unary array element compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported generic unary array element link failed to spawn");
+    assert!(
+        link.status.success(),
+        "imported generic unary array element link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported generic unary array element run failed");
+    assert!(
+        run.status.success(),
+        "imported generic unary array element run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported generic unary array element output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn assumed_size_parameter_array_constructor_uses_initializer_extent() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [1, 2, 3, 4]\n  character(1), parameter :: truth(4) = ['t', 'r', 'u', 'e']\n  logical :: ok\n  ok = match_all('true', offset, truth)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("assumed_size_parameter_initializer_extent", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("assumed-size parameter initializer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "assumed-size parameter initializer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("assumed-size parameter initializer run failed");
+    assert!(
+        run.status.success(),
+        "assumed-size parameter initializer run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected assumed-size parameter initializer output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: offset(4) = [0, 1, 2, 3]\n  character(1), parameter :: truth(4) = ['t', 'r', 'u', 'e']\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  logical :: ok\n  if (iachar(truth(1)) /= 116) error stop 1\n  if (iachar(truth(2)) /= 114) error stop 2\n  if (iachar(truth(3)) /= 117) error stop 3\n  if (iachar(truth(4)) /= 101) error stop 4\n  ok = match_all('true', 1 + offset, truth)\n  if (.not. ok) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_char_parameter_array_init", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module char parameter array init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module char parameter array init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module char parameter array init run failed");
+    assert!(
+        run.status.success(),
+        "module char parameter array init run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module char parameter array init output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  elemental function pick(pos) result(ch)\n    integer, intent(in) :: pos\n    character(1) :: ch\n    ch = merge('X', 'Y', pos > 0)\n  end function\n\n  logical function want_ten_chars(string)\n    character(1), intent(in) :: string(:)\n    want_ten_chars = string(5) == 'X'\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n  integer, parameter :: offset_date = 10\n  if (.not. want_ten_chars(pick(1 + offset(:offset_date)))) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_char_array_descriptor_actual", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental char array descriptor actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental char array descriptor actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental char array descriptor actual run failed");
+    assert!(
+        run.status.success(),
+        "elemental char array descriptor actual run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected elemental char array descriptor actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_character_star_parameter_from_component_concat_initializes_runtime_bytes() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: enum_char\n    character(1) :: space = ' '\n    character(1) :: hash = '#'\n    character(1) :: comma = ','\n  end type\n  type(enum_char), parameter :: char_kind = enum_char()\n  character(len=*), parameter :: terminated = char_kind%space // char_kind%hash // char_kind%comma\ncontains\n  subroutine check()\n    if (len(terminated) /= 3) error stop 1\n    if (iachar(terminated(1:1)) /= 32) error stop 2\n    if (iachar(terminated(2:2)) /= 35) error stop 3\n    if (iachar(terminated(3:3)) /= 44) error stop 4\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call check()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_char_star_component_concat", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module char star component concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module char star component concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module char star component concat run failed");
+    assert!(
+        run.status.success(),
+        "module char star component concat run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module char star component concat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_character_star_parameter_with_achar_and_repeat_defaults_initializes_runtime_bytes() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: tfc = kind('a')\n  type :: enum_char\n    character(1, tfc) :: space = \" \"\n    character(1, tfc) :: hash = \"#\"\n    character(3, tfc) :: squote3 = repeat(\"'\", 3)\n    character(1, tfc) :: comma = \",\"\n    character(1, tfc) :: equal = \"=\"\n    character(1, tfc) :: rbrace = \"}\"\n    character(1, tfc) :: rbracket = \"]\"\n    character(1, tfc) :: newline = achar(10, kind=tfc)\n    character(1, tfc) :: carriage_return = achar(13, kind=tfc)\n    character(1, tfc) :: tab = achar(9, kind=tfc)\n  end type\n  type(enum_char), parameter :: char_kind = enum_char()\n  character(*, tfc), parameter :: terminated = &\n    char_kind%space // char_kind%tab // char_kind%newline // char_kind%carriage_return // &\n    char_kind%hash // char_kind%rbrace // char_kind%rbracket // char_kind%comma // &\n    char_kind%equal\ncontains\n  subroutine check()\n    if (len(terminated) /= 9) error stop 1\n    if (iachar(terminated(1:1)) /= 32) error stop 2\n    if (iachar(terminated(2:2)) /= 9) error stop 3\n    if (iachar(terminated(3:3)) /= 10) error stop 4\n    if (iachar(terminated(4:4)) /= 13) error stop 5\n    if (terminated(5:9) /= '#}],=') error stop 6\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call check()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_char_star_achar_repeat", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module char star achar/repeat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module char star achar/repeat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module char star achar/repeat run failed");
+    assert!(
+        run.status.success(),
+        "module char star achar/repeat run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module char star achar/repeat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: node_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: node_t\n      class(node_t), intent(inout) :: self\n    end subroutine\n    subroutine visit_i(self, val)\n      import :: visitor_t, node_t\n      class(visitor_t), intent(inout) :: self\n      class(node_t), intent(inout) :: val\n    end subroutine\n  end interface\n  type, extends(node_t) :: leaf_t\n  contains\n    procedure :: destroy => leaf_destroy\n  end type\n  type, extends(visitor_t) :: print_visitor_t\n  contains\n    procedure :: visit => print_visit\n  end type\ncontains\n  subroutine leaf_destroy(self)\n    class(leaf_t), intent(inout) :: self\n    print *, 'destroy'\n  end subroutine\n  subroutine print_visit(self, val)\n    class(print_visitor_t), intent(inout) :: self\n    class(node_t), intent(inout) :: val\n    print *, 'visit'\n    call val%destroy()\n  end subroutine\n  subroutine run()\n    class(node_t), allocatable :: val\n    class(visitor_t), allocatable :: vis\n    allocate(leaf_t :: val)\n    allocate(print_visitor_t :: vis)\n    call vis%visit(val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call run()\nend program\n",
@@ -9249,27 +9584,174 @@ fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
 }
 
 #[test]
-fn polymorphic_component_bound_call_without_visible_concretes_errors() {
-    let src = write_program(
-        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine\n  end interface\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type\n  type :: holder_t\n    type(node_t), allocatable :: items(:)\n  contains\n    procedure :: zap\n  end type\ncontains\n  subroutine zap(self)\n    class(holder_t), intent(inout) :: self\n    call self%items(1)%val%destroy()\n  end subroutine\nend module\n",
-        "f90",
+fn cross_tu_polymorphic_component_bound_call_uses_descriptor_lookup() {
+    let dir = unique_dir("cross_tu_polymorphic_component_bound_dispatch");
+    let base_src = write_program_in(
+        &dir,
+        "base_m.f90",
+        "module base_m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine\n  end interface\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type\n  type :: holder_t\n    type(node_t), allocatable :: items(:)\n  contains\n    procedure :: zap\n  end type\ncontains\n  subroutine zap(self)\n    class(holder_t), intent(inout) :: self\n    call self%items(1)%val%destroy()\n  end subroutine\nend module\n",
     );
-    let compile = Command::new(compiler("armfortas"))
-        .arg(src.to_str().unwrap())
-        .output()
-        .expect("polymorphic component missing-concrete compile failed to spawn");
-    assert!(
-        !compile.status.success(),
-        "polymorphic component missing-concrete case should fail to compile"
+    let impl_src = write_program_in(
+        &dir,
+        "impl_m.f90",
+        "module impl_m\n  use base_m, only : base_t\n  implicit none\n  type, extends(base_t) :: leaf_t\n  contains\n    procedure :: destroy => leaf_destroy\n  end type\ncontains\n  subroutine leaf_destroy(self)\n    class(leaf_t), intent(inout) :: self\n    print *, 'destroy'\n  end subroutine\nend module\n",
     );
-    let stderr = String::from_utf8_lossy(&compile.stderr);
-    assert!(
-        stderr.contains("no visible concrete override targets"),
-        "unexpected stderr for missing-concrete polymorphic component call: {}",
-        stderr
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use base_m, only : holder_t\n  use impl_m, only : leaf_t\n  implicit none\n  type(holder_t) :: holder\n  allocate(holder%items(1))\n  allocate(leaf_t :: holder%items(1)%val)\n  call holder%zap()\n  print *, 'ok'\nend program\n",
     );
 
-    let _ = std::fs::remove_file(&src);
+    let base_obj = dir.join("base_m.o");
+    let impl_obj = dir.join("impl_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("cross_tu_polymorphic_component_bound_dispatch.bin");
+
+    for (src, obj, needs_i) in [
+        (&base_src, &base_obj, false),
+        (&impl_src, &impl_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "cross-tu polymorphic component dispatch compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            base_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-tu polymorphic component dispatch link spawn failed");
+    assert!(
+        link.status.success(),
+        "cross-tu polymorphic component dispatch should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-tu polymorphic component dispatch run failed");
+    assert!(
+        run.status.success(),
+        "cross-tu polymorphic component dispatch should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("destroy") && stdout.contains("ok"),
+        "unexpected cross-tu polymorphic component dispatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_polymorphic_name_bound_call_uses_descriptor_lookup() {
+    let dir = unique_dir("cross_tu_polymorphic_name_bound_dispatch");
+    let base_src = write_program_in(
+        &dir,
+        "base_m.f90",
+        "module base_m\n  implicit none\n  type, abstract :: value_t\n  contains\n    procedure :: accept\n  end type\n  type, extends(value_t) :: leaf_t\n    integer :: payload = 17\n  end type\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type\n  abstract interface\n    subroutine visit_i(self, val)\n      import :: visitor_t, value_t\n      class(visitor_t), intent(inout) :: self\n      class(value_t), intent(inout) :: val\n    end subroutine\n  end interface\ncontains\n  subroutine accept(self, visitor)\n    class(value_t), intent(inout) :: self\n    class(visitor_t), intent(inout) :: visitor\n    call visitor%visit(self)\n  end subroutine\nend module\n",
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "impl_m.f90",
+        "module impl_m\n  use base_m, only : visitor_t, value_t, leaf_t\n  implicit none\n  type, extends(visitor_t) :: counting_visitor_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => visit_leaf\n  end type\ncontains\n  subroutine visit_leaf(self, val)\n    class(counting_visitor_t), intent(inout) :: self\n    class(value_t), intent(inout) :: val\n    select type(val)\n    type is (leaf_t)\n      self%seen = val%payload\n    class default\n      self%seen = -2\n    end select\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use base_m, only : leaf_t\n  use impl_m, only : counting_visitor_t\n  implicit none\n  type(leaf_t) :: leaf\n  type(counting_visitor_t) :: visitor\n  call leaf%accept(visitor)\n  if (visitor%seen /= 17) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let base_obj = dir.join("base_m.o");
+    let impl_obj = dir.join("impl_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("cross_tu_polymorphic_name_bound_dispatch.bin");
+
+    for (src, obj, needs_i) in [
+        (&base_src, &base_obj, false),
+        (&impl_src, &impl_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "cross-tu polymorphic name dispatch compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            base_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-tu polymorphic name dispatch link spawn failed");
+    assert!(
+        link.status.success(),
+        "cross-tu polymorphic name dispatch should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-tu polymorphic name dispatch run failed");
+    assert!(
+        run.status.success(),
+        "cross-tu polymorphic name dispatch should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected cross-tu polymorphic name dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
