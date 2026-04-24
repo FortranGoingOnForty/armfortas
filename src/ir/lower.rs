@@ -25093,12 +25093,11 @@ fn lower_arg_descriptor(
             let info = match &callee.node {
                 Expr::Name { name } => locals
                     .get(&name.to_lowercase())
-                    .filter(|info| local_is_array_like(info))
-                    .cloned(),
+                    .and_then(|info| local_is_array_like(info).then_some(info.clone())),
                 Expr::ComponentAccess { .. } => type_layouts.and_then(|tl| {
                     component_array_local_info(b, locals, callee, st, tl).or_else(|| {
                         component_intrinsic_local_info(b, locals, callee, st, tl)
-                            .filter(|info| local_is_array_like(info))
+                            .and_then(|info| local_is_array_like(&info).then_some(info))
                     })
                 }),
                 _ => None,
