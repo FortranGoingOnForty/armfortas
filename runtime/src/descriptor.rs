@@ -155,7 +155,21 @@ impl ArrayDescriptor {
     pub fn set_scalar_type_tag(&mut self, tag: i64) {
         if self.rank == 0 {
             self.dims[0].lower_bound = tag;
-            self.dims[0].upper_bound = 0;
+            self.dims[0].stride = 0;
+        }
+    }
+
+    pub fn scalar_tbp_lookup_ptr(&self) -> *mut u8 {
+        if self.rank == 0 {
+            self.dims[0].upper_bound as usize as *mut u8
+        } else {
+            ptr::null_mut()
+        }
+    }
+
+    pub fn set_scalar_tbp_lookup_ptr(&mut self, ptr: *mut u8) {
+        if self.rank == 0 {
+            self.dims[0].upper_bound = ptr as usize as i64;
             self.dims[0].stride = 0;
         }
     }

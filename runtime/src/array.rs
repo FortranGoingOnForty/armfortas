@@ -1089,6 +1089,7 @@ pub extern "C" fn afs_allocate_like(
     afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
     let dest = unsafe { &mut *dest };
     dest.set_scalar_type_tag(source.scalar_type_tag());
+    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 }
 
 /// Copy array payload from `source` into an already-allocated `dest` without
@@ -1149,6 +1150,7 @@ pub extern "C" fn afs_copy_array_data(
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
+    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 
     if !stat.is_null() {
         unsafe {
@@ -1303,6 +1305,7 @@ pub extern "C" fn afs_assign_allocatable(
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
+    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 }
 
 // ---- MOVE_ALLOC ----
