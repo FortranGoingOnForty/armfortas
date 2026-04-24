@@ -14,6 +14,10 @@ pub enum FieldDefaultInit {
     Derived(Vec<(String, FieldDefaultInit)>),
 }
 
+pub fn derived_param_field_lookup_key(base: &str, field: &str) -> String {
+    format!("{}.{}", base.to_lowercase(), field.to_lowercase())
+}
+
 /// Layout of a single field in a derived type.
 #[derive(Debug, Clone)]
 pub struct FieldLayout {
@@ -46,6 +50,7 @@ pub struct BoundProc {
 #[derive(Debug, Clone)]
 pub struct TypeLayout {
     pub name: String,
+    pub owner_module: Option<String>,
     pub size: usize,
     pub align: usize,
     pub fields: Vec<FieldLayout>,
@@ -72,6 +77,14 @@ impl TypeLayout {
         self.bound_procs
             .iter()
             .find(|p| p.method_name.to_lowercase() == key)
+    }
+
+    pub fn bound_proc_candidates(&self, name: &str) -> Vec<&BoundProc> {
+        let key = name.to_lowercase();
+        self.bound_procs
+            .iter()
+            .filter(|p| p.method_name.to_lowercase() == key)
+            .collect()
     }
 }
 
@@ -252,11 +265,78 @@ fn eval_const_logical_expr(expr: &crate::ast::expr::SpannedExpr) -> Option<bool>
     }
 }
 
-fn eval_const_field_default_init(
+fn eval_const_field_int_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+) -> Option<i64> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::ComponentAccess { base, component } => {
+            let Expr::Name { name } = &base.node else {
+                return None;
+            };
+            match const_derived_field_inits.get(&derived_param_field_lookup_key(name, component)) {
+                Some(FieldDefaultInit::Integer(value)) => i64::try_from(*value).ok(),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => {
+            eval_const_field_int_expr(inner, const_params, const_derived_field_inits)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let value = eval_const_field_int_expr(operand, const_params, const_derived_field_inits)?;
+            match op {
+                crate::ast::expr::UnaryOp::Minus => Some(-value),
+                crate::ast::expr::UnaryOp::Plus => Some(value),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let lhs = eval_const_field_int_expr(left, const_params, const_derived_field_inits)?;
+            let rhs = eval_const_field_int_expr(right, const_params, const_derived_field_inits)?;
+            match op {
+                crate::ast::expr::BinaryOp::Add => Some(lhs + rhs),
+                crate::ast::expr::BinaryOp::Sub => Some(lhs - rhs),
+                crate::ast::expr::BinaryOp::Mul => Some(lhs * rhs),
+                crate::ast::expr::BinaryOp::Div if rhs != 0 => Some(lhs / rhs),
+                _ => None,
+            }
+        }
+        _ => eval_const_int_expr(expr, const_params),
+    }
+}
+
+fn eval_const_field_logical_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+) -> Option<bool> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::ComponentAccess { base, component } => {
+            let Expr::Name { name } = &base.node else {
+                return None;
+            };
+            match const_derived_field_inits.get(&derived_param_field_lookup_key(name, component)) {
+                Some(FieldDefaultInit::Logical(value)) => Some(*value),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_field_logical_expr(inner, const_derived_field_inits),
+        Expr::UnaryOp {
+            op: crate::ast::expr::UnaryOp::Not,
+            operand,
+        } => eval_const_field_logical_expr(operand, const_derived_field_inits).map(|value| !value),
+        _ => eval_const_logical_expr(expr),
+    }
+}
+
+pub fn eval_const_field_default_init_for_layout(
     type_info: &TypeInfo,
     expr: &crate::ast::expr::SpannedExpr,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     match type_info {
         TypeInfo::Character { .. } => match &expr.node {
@@ -265,11 +345,19 @@ fn eval_const_field_default_init(
             }
             _ => None,
         },
-        TypeInfo::Integer { .. } => eval_const_int_expr(expr, const_params)
+        TypeInfo::Integer { .. } => eval_const_field_int_expr(expr, const_params, const_derived_field_inits)
             .map(|value| FieldDefaultInit::Integer(value as i128)),
-        TypeInfo::Logical { .. } => eval_const_logical_expr(expr).map(FieldDefaultInit::Logical),
+        TypeInfo::Logical { .. } => {
+            eval_const_field_logical_expr(expr, const_derived_field_inits).map(FieldDefaultInit::Logical)
+        }
         TypeInfo::Derived(type_name) | TypeInfo::Class(type_name) => {
-            eval_const_derived_default_init(type_name, expr, registry, const_params)
+            eval_const_derived_default_init(
+                type_name,
+                expr,
+                registry,
+                const_params,
+                const_derived_field_inits,
+            )
         }
         _ => None,
     }
@@ -280,6 +368,7 @@ fn eval_const_derived_default_init(
     expr: &crate::ast::expr::SpannedExpr,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     use crate::ast::expr::{Expr, SectionSubscript};
 
@@ -311,8 +400,13 @@ fn eval_const_derived_default_init(
         let SectionSubscript::Element(value_expr) = &arg.value else {
             return None;
         };
-        let init =
-            eval_const_field_default_init(&field.type_info, value_expr, registry, const_params)?;
+        let init = eval_const_field_default_init_for_layout(
+            &field.type_info,
+            value_expr,
+            registry,
+            const_params,
+            const_derived_field_inits,
+        )?;
         overrides.push((field.name.clone(), init));
     }
 
@@ -416,6 +510,7 @@ pub fn compute_layout(
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
 ) -> TypeLayout {
+    let const_derived_field_inits = HashMap::new();
     compute_layout_with_attrs(
         type_name,
         host_module,
@@ -426,6 +521,7 @@ pub fn compute_layout(
         false,
         registry,
         const_params,
+        &const_derived_field_inits,
     )
 }
 
@@ -439,6 +535,7 @@ pub fn compute_layout_with_attrs(
     is_abstract: bool,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> TypeLayout {
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
@@ -517,7 +614,13 @@ pub fn compute_layout_with_attrs(
                 let field_size = elem_size.saturating_mul(elem_count.max(1));
                 let default_init = if dims.is_empty() && !is_allocatable && !is_pointer {
                     entity.init.as_ref().and_then(|init| {
-                        eval_const_field_default_init(&ti, init, registry, const_params)
+                        eval_const_field_default_init_for_layout(
+                            &ti,
+                            init,
+                            registry,
+                            const_params,
+                            const_derived_field_inits,
+                        )
                     })
                 } else {
                     None
@@ -546,36 +649,105 @@ pub fn compute_layout_with_attrs(
         offset += padding;
     }
 
+    fn lowered_bound_proc_target(host_module: Option<&str>, target: &str) -> String {
+        if let Some(module_name) = host_module {
+            format!(
+                "afs_modproc_{}_{}",
+                module_name.to_lowercase(),
+                target.to_lowercase()
+            )
+        } else {
+            target.to_string()
+        }
+    }
+
+    fn upsert_bound_proc(bound_procs: &mut Vec<BoundProc>, proc: BoundProc) {
+        if let Some(existing) = bound_procs.iter_mut().find(|bp| {
+            bp.method_name.eq_ignore_ascii_case(&proc.method_name)
+                && bp.abi_name.eq_ignore_ascii_case(&proc.abi_name)
+        }) {
+            *existing = proc;
+        } else {
+            bound_procs.push(proc);
+        }
+    }
+
     // Inherit parent's bindings, then let the local type override by method name.
     let mut bound_procs = parent_layout
         .map(|parent| parent.bound_procs.clone())
         .unwrap_or_default();
     for tbp in type_bound_procs {
-            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
-            let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
-            let target_name = if let Some(module_name) = host_module {
-                format!(
-                    "afs_modproc_{}_{}",
-                    module_name.to_lowercase(),
-                    target.to_lowercase()
-                )
-            } else {
-                target.to_string()
-            };
-            let proc = BoundProc {
-                method_name: tbp.name.clone(),
-                target_name,
-                abi_name: target.to_lowercase(),
-                nopass,
-            };
-            if let Some(existing) = bound_procs
-                .iter_mut()
-                .find(|bp| bp.method_name.eq_ignore_ascii_case(&proc.method_name))
-            {
-                *existing = proc;
-            } else {
-                bound_procs.push(proc);
+        if tbp.is_generic {
+            continue;
+        }
+        let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
+        let nopass = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("nopass"));
+        let existing_abi = bound_procs
+            .iter()
+            .find(|bp| bp.method_name.eq_ignore_ascii_case(&tbp.name))
+            .map(|bp| bp.abi_name.clone());
+        let target_name = lowered_bound_proc_target(host_module, target);
+        let abi_name = tbp
+            .interface
+            .as_ref()
+            .map(|iface| iface.to_lowercase())
+            .or(existing_abi)
+            .unwrap_or_else(|| target.to_lowercase());
+        let proc = BoundProc {
+            method_name: tbp.name.clone(),
+            target_name,
+            abi_name,
+            nopass,
+        };
+        upsert_bound_proc(&mut bound_procs, proc);
+        if let Some(override_proc) = bound_procs
+            .iter()
+            .find(|bp| bp.method_name.eq_ignore_ascii_case(&tbp.name))
+            .cloned()
+        {
+            for inherited_alias in &mut bound_procs {
+                if inherited_alias
+                    .method_name
+                    .eq_ignore_ascii_case(&override_proc.method_name)
+                {
+                    continue;
+                }
+                if inherited_alias
+                    .abi_name
+                    .eq_ignore_ascii_case(&override_proc.abi_name)
+                {
+                    inherited_alias.target_name = override_proc.target_name.clone();
+                    inherited_alias.nopass = override_proc.nopass;
+                }
             }
+        }
+    }
+
+    for tbp in type_bound_procs {
+        if !tbp.is_generic {
+            continue;
+        }
+        for specific in &tbp.bindings {
+            let alias = bound_procs
+                .iter()
+                .find(|bp| bp.method_name.eq_ignore_ascii_case(specific))
+                .cloned()
+                .unwrap_or_else(|| BoundProc {
+                    method_name: tbp.name.clone(),
+                    target_name: lowered_bound_proc_target(host_module, specific),
+                    abi_name: specific.to_lowercase(),
+                    nopass: false,
+                });
+            upsert_bound_proc(
+                &mut bound_procs,
+                BoundProc {
+                    method_name: tbp.name.clone(),
+                    target_name: alias.target_name,
+                    abi_name: alias.abi_name,
+                    nopass: alias.nopass,
+                },
+            );
+        }
     }
 
     let final_procs: Vec<String> = final_proc_names
@@ -595,6 +767,7 @@ pub fn compute_layout_with_attrs(
 
     TypeLayout {
         name: type_name.to_string(),
+        owner_module: host_module.map(str::to_string),
         size: offset,
         align: max_align,
         fields,
@@ -632,6 +805,7 @@ mod tests {
     fn layout_field_lookup() {
         let layout = TypeLayout {
             name: "point".into(),
+            owner_module: None,
             size: 8,
             align: 4,
             fields: vec![
@@ -681,6 +855,7 @@ mod tests {
         // end type            ! total: 24 bytes (padded to 8-byte alignment)
         let layout = TypeLayout {
             name: "mixed".into(),
+            owner_module: None,
             size: 24,
             align: 8,
             fields: vec![
@@ -740,6 +915,7 @@ mod tests {
         let mut reg = TypeLayoutRegistry::new();
         reg.insert(TypeLayout {
             name: "MyType".into(),
+            owner_module: None,
             size: 16,
             align: 8,
             fields: vec![],
@@ -953,6 +1129,7 @@ mod tests {
         let mut reg = TypeLayoutRegistry::new();
         reg.insert(TypeLayout {
             name: "node_t".into(),
+            owner_module: None,
             size: 16,
             align: 8,
             fields: vec![],

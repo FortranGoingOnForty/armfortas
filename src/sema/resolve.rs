@@ -16,6 +16,34 @@ thread_local! {
     static LOADED_EXTERNAL_MODULES: RefCell<Vec<super::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
 }
 
+fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
+    let mut seen: HashSet<String> = into.iter().map(|name| name.to_ascii_lowercase()).collect();
+    for name in additional {
+        let key = name.to_ascii_lowercase();
+        if seen.insert(key) {
+            into.push(name.clone());
+        }
+    }
+}
+
+fn merged_visible_generic_specifics(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+    local_specifics: &[String],
+) -> Vec<String> {
+    let mut merged = Vec::new();
+    if let Some(existing) = st.lookup_in(scope_id, generic_name) {
+        if existing.kind == SymbolKind::NamedInterface
+            || (existing.kind == SymbolKind::DerivedType && !existing.arg_names.is_empty())
+        {
+            merge_specific_names(&mut merged, &existing.arg_names);
+        }
+    }
+    merge_specific_names(&mut merged, local_specifics);
+    merged
+}
+
 /// Walk a list of program units and build the symbol table.
 /// Result of resolving a file: symbol table, type layouts, and any
 /// external module interfaces loaded from .amod files during USE
@@ -491,6 +519,12 @@ fn resolve_unit(
             // Register the generic interface name in the enclosing scope.
             if let Some(generic_name) = name {
                 if !generic_name.is_empty() && !specific_names.is_empty() {
+                    let merged_specifics = merged_visible_generic_specifics(
+                        st,
+                        st.current_scope(),
+                        generic_name,
+                        &specific_names,
+                    );
                     let span = unit.span;
                     let define_result = st.define(Symbol {
                         name: generic_name.clone(),
@@ -501,7 +535,7 @@ fn resolve_unit(
                         },
                         defined_at: span,
                         scope: st.current_scope(),
-                        arg_names: specific_names.clone(),
+                        arg_names: merged_specifics.clone(),
                         const_value: None,
                     });
                     if define_result.is_err() {
@@ -509,8 +543,10 @@ fn resolve_unit(
                         if let Some(existing) =
                             st.scope_mut(st.current_scope()).symbols.get_mut(&key)
                         {
-                            if existing.kind == SymbolKind::DerivedType {
-                                existing.arg_names = specific_names;
+                            if existing.kind == SymbolKind::NamedInterface
+                                || existing.kind == SymbolKind::DerivedType
+                            {
+                                merge_specific_names(&mut existing.arg_names, &merged_specifics);
                             }
                         }
                     }
@@ -935,8 +971,10 @@ fn load_external_module(
         if define_result.is_err() {
             let key = iface_def.name.to_ascii_lowercase();
             if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-                if existing.kind == SymbolKind::DerivedType {
-                    existing.arg_names = iface_def.specifics.clone();
+                if existing.kind == SymbolKind::NamedInterface
+                    || existing.kind == SymbolKind::DerivedType
+                {
+                    merge_specific_names(&mut existing.arg_names, &iface_def.specifics);
                 }
             }
         }
@@ -1163,48 +1201,23 @@ fn collect_derived_type_layouts(
         _ => None,
     };
     let const_params = collect_const_int_params(decls, &seed_params);
-    for decl in decls {
-        if let Decl::DerivedTypeDef {
-            name,
-            extends,
-            attrs,
-            components,
-            type_bound_procs,
-            final_procs,
-            ..
-        } = &decl.node
-        {
-            let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
-            let is_abstract = attrs
-                .iter()
-                .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
-            let layout = super::type_layout::compute_layout_with_attrs(
-                name,
-                host_module,
-                type_bound_procs,
-                final_procs,
-                components,
-                parent.as_ref(),
-                is_abstract,
-                layouts,
-                &const_params,
-            );
-            // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
-            // This handles the case where a subroutine redefines a type without CONTAINS.
-            let dominated = layouts
-                .get(&name.to_lowercase())
-                .map(|existing| {
-                    let existing_has =
-                        !existing.bound_procs.is_empty() || !existing.final_procs.is_empty();
-                    let new_has = !layout.bound_procs.is_empty() || !layout.final_procs.is_empty();
-                    existing_has && !new_has
-                })
-                .unwrap_or(false);
-            if !dominated {
-                layouts.insert(layout);
-            }
-        }
-    }
+    let empty_derived_field_inits = HashMap::new();
+    register_local_type_layouts(
+        decls,
+        host_module,
+        layouts,
+        &const_params,
+        &empty_derived_field_inits,
+    );
+    let const_derived_field_inits =
+        collect_const_derived_field_inits(decls, layouts, &const_params);
+    register_local_type_layouts(
+        decls,
+        host_module,
+        layouts,
+        &const_params,
+        &const_derived_field_inits,
+    );
     for sub in contains {
         let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
         collect_derived_type_layouts(
@@ -1396,6 +1409,143 @@ fn collect_const_int_params(
     }
 
     params
+}
+
+fn collect_const_derived_field_inits(
+    decls: &[SpannedDecl],
+    layouts: &super::type_layout::TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+) -> HashMap<String, super::type_layout::FieldDefaultInit> {
+    use super::type_layout::{
+        derived_param_field_lookup_key, eval_const_field_default_init_for_layout, FieldDefaultInit,
+    };
+
+    let mut field_inits = HashMap::new();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for decl in decls {
+            let Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } = &decl.node
+            else {
+                continue;
+            };
+            if !attrs.iter().any(|a| matches!(a, Attribute::Parameter)) {
+                continue;
+            }
+
+            let type_name = match type_spec {
+                TypeSpec::Type(name) | TypeSpec::Class(name) => name.as_str(),
+                _ => continue,
+            };
+            let Some(layout) = layouts.get(type_name) else {
+                continue;
+            };
+
+            for entity in entities {
+                let Some(init_expr) = entity.init.as_ref() else {
+                    continue;
+                };
+                let Some(FieldDefaultInit::Derived(overrides)) =
+                    eval_const_field_default_init_for_layout(
+                        &TypeInfo::Derived(type_name.to_string()),
+                        init_expr,
+                        layouts,
+                        const_params,
+                        &field_inits,
+                    )
+                else {
+                    continue;
+                };
+
+                let mut combined = HashMap::new();
+                for field in &layout.fields {
+                    if let Some(default_init) = &field.default_init {
+                        combined.insert(
+                            field.name.to_ascii_lowercase(),
+                            (field.name.clone(), default_init.clone()),
+                        );
+                    }
+                }
+                for (field_name, field_init) in overrides {
+                    combined.insert(
+                        field_name.to_ascii_lowercase(),
+                        (field_name, field_init),
+                    );
+                }
+
+                for (_field_key, (field_name, field_init)) in combined {
+                    let key = derived_param_field_lookup_key(&entity.name, &field_name);
+                    let should_update = field_inits
+                        .get(&key)
+                        .map(|existing| existing != &field_init)
+                        .unwrap_or(true);
+                    if should_update {
+                        field_inits.insert(key, field_init);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    field_inits
+}
+
+fn register_local_type_layouts(
+    decls: &[SpannedDecl],
+    host_module: Option<&str>,
+    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, super::type_layout::FieldDefaultInit>,
+) {
+    for decl in decls {
+        if let Decl::DerivedTypeDef {
+            name,
+            extends,
+            attrs,
+            components,
+            type_bound_procs,
+            final_procs,
+            ..
+        } = &decl.node
+        {
+            let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
+            let is_abstract = attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
+            let layout = super::type_layout::compute_layout_with_attrs(
+                name,
+                host_module,
+                type_bound_procs,
+                final_procs,
+                components,
+                parent.as_ref(),
+                is_abstract,
+                layouts,
+                const_params,
+                const_derived_field_inits,
+            );
+            // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
+            // This handles the case where a subroutine redefines a type without CONTAINS.
+            let dominated = layouts
+                .get(&name.to_lowercase())
+                .map(|existing| {
+                    let existing_has =
+                        !existing.bound_procs.is_empty() || !existing.final_procs.is_empty();
+                    let new_has = !layout.bound_procs.is_empty() || !layout.final_procs.is_empty();
+                    existing_has && !new_has
+                })
+                .unwrap_or(false);
+            if !dominated {
+                layouts.insert(layout);
+            }
+        }
+    }
 }
 
 fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Result<(), SemaError> {

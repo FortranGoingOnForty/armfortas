@@ -488,6 +488,18 @@ fn emit_procedure(
             || f.name.eq_ignore_ascii_case(&name_lc)
             || f.name.to_lowercase().ends_with(&format!("_{}", name_lc))
     });
+    let visible_ir_params: Vec<_> = ir_func
+        .map(|func| {
+            func.params
+                .iter()
+                .filter(|param| {
+                    param.name != "_sret"
+                        && !param.name.starts_with("__len_")
+                        && !param.name.starts_with("__host_")
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     // Walk into the procedure's scope for full arg info. Interface-declared
     // procedures sit under an intermediate Interface scope rather than
@@ -548,13 +560,6 @@ fn emit_procedure(
 
     let mut reg_idx = 0usize;
     if let Some(pscope) = proc_scope {
-        let ir_arg_base = ir_func
-            .map(|func| {
-                func.params
-                    .len()
-                    .saturating_sub(pscope.arg_order.len() + hidden_count)
-            })
-            .unwrap_or(0);
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
                 let type_str = type_info_to_string(arg_sym.type_info.as_ref());
@@ -574,7 +579,7 @@ fn emit_procedure(
                     arg_attrs.push("value");
                 }
                 let is_descriptor_arg = ir_func
-                    .and_then(|func| func.params.get(ir_arg_base + arg_idx))
+                    .and_then(|_| visible_ir_params.get(arg_idx))
                     .map(|param| {
                         matches!(
                             &param.ty,
@@ -595,7 +600,8 @@ fn emit_procedure(
                     || declared_descriptor_params
                         .and_then(|flags| flags.get(arg_idx))
                         .copied()
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                    || matches!(arg_sym.type_info, Some(TypeInfo::Class(_)) | Some(TypeInfo::ClassStar));
                 if is_descriptor_arg {
                     arg_attrs.push("descriptor");
                 }
@@ -749,22 +755,28 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             .unwrap();
         }
         for bp in &layout.bound_procs {
+            let abi_suffix = if bp.abi_name != bp.method_name.to_lowercase() {
+                format!(" @abi {}", bp.abi_name)
+            } else {
+                String::new()
+            };
             if bp.method_name == bp.target_name {
                 if bp.nopass {
-                    writeln!(out, "  @binds {}, nopass", bp.method_name).unwrap();
+                    writeln!(out, "  @binds {}, nopass{}", bp.method_name, abi_suffix).unwrap();
                 } else {
-                    writeln!(out, "  @binds {}", bp.method_name).unwrap();
+                    writeln!(out, "  @binds {}{}", bp.method_name, abi_suffix).unwrap();
                 }
             } else {
                 if bp.nopass {
                     writeln!(
                         out,
-                        "  @binds {} => {}, nopass",
-                        bp.method_name, bp.target_name
+                        "  @binds {} => {}, nopass{}",
+                        bp.method_name, bp.target_name, abi_suffix
                     )
                     .unwrap();
                 } else {
-                    writeln!(out, "  @binds {} => {}", bp.method_name, bp.target_name).unwrap();
+                    writeln!(out, "  @binds {} => {}{}", bp.method_name, bp.target_name, abi_suffix)
+                        .unwrap();
                 }
             }
         }
@@ -788,6 +800,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         }
         for fp in &layout.final_procs {
             writeln!(out, "  @final {}", fp).unwrap();
+        }
+        if let Some(owner_module) = &layout.owner_module {
+            writeln!(out, "  @owner {}", owner_module).unwrap();
         }
         writeln!(out, "  @tag {}", layout.type_tag).unwrap();
     }
@@ -1324,6 +1339,7 @@ fn parse_type(
     let mut fields = Vec::new();
     let mut bound_procs = Vec::new();
     let mut final_procs = Vec::new();
+    let mut owner_module = None;
     let mut type_tag = 0u64;
     let mut is_abstract = false;
 
@@ -1415,23 +1431,34 @@ fn parse_type(
                 });
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
-            let nopass = rest.contains(", nopass");
-            let clean = rest.replace(", nopass", "");
+            let (clean, abi_name) = if let Some((bind_part, abi_part)) = rest.split_once(" @abi ") {
+                (bind_part.trim().to_string(), abi_part.trim().to_lowercase())
+            } else {
+                (rest.trim().to_string(), String::new())
+            };
+            let nopass = clean.contains(", nopass");
+            let clean = clean.replace(", nopass", "");
             let (method, target) = if let Some((m, t)) = clean.split_once(" => ") {
                 (m.trim().to_string(), t.trim().to_string())
             } else {
                 let m = clean.trim().to_string();
                 (m.clone(), m)
             };
-            let abi_name = method.to_lowercase();
+            let parsed_abi_name = if abi_name.is_empty() {
+                method.to_lowercase()
+            } else {
+                abi_name
+            };
             bound_procs.push(BoundProc {
                 method_name: method,
                 target_name: target,
-                abi_name,
+                abi_name: parsed_abi_name,
                 nopass,
             });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             final_procs.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
+            owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
             type_tag = rest.trim().parse().unwrap_or(0);
         } else if trimmed == "@abstract" {
@@ -1441,6 +1468,7 @@ fn parse_type(
 
     TypeLayout {
         name,
+        owner_module,
         size,
         align,
         fields,
@@ -1622,8 +1650,17 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
     for proc in &iface.procedures {
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args.iter().map(|a| a.optional).collect();
-        if flags.iter().any(|f| *f) {
-            out.insert(proc.name.to_lowercase(), flags);
+        if !flags.is_empty() {
+            let key = proc.name.to_lowercase();
+            out.insert(key.clone(), flags.clone());
+            out.insert(
+                format!(
+                    "afs_modproc_{}_{}",
+                    iface.module_name.to_lowercase(),
+                    key
+                ),
+                flags,
+            );
         }
     }
     out
@@ -1645,8 +1682,17 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
                     && !is_bind_c
             })
             .collect();
-        if flags.iter().any(|f| *f) {
-            out.insert(proc.name.to_lowercase(), flags);
+        if !flags.is_empty() {
+            let key = proc.name.to_lowercase();
+            out.insert(key.clone(), flags.clone());
+            out.insert(
+                format!(
+                    "afs_modproc_{}_{}",
+                    iface.module_name.to_lowercase(),
+                    key
+                ),
+                flags,
+            );
         }
     }
     out
@@ -1660,8 +1706,17 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
     for proc in &iface.procedures {
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args.iter().map(|a| a.descriptor).collect();
-        if flags.iter().any(|f| *f) {
-            out.insert(proc.name.to_lowercase(), flags);
+        if !flags.is_empty() {
+            let key = proc.name.to_lowercase();
+            out.insert(key.clone(), flags.clone());
+            out.insert(
+                format!(
+                    "afs_modproc_{}_{}",
+                    iface.module_name.to_lowercase(),
+                    key
+                ),
+                flags,
+            );
         }
     }
     out
