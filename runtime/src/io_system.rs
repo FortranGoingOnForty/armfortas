@@ -353,6 +353,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let recl = cb.recl;
     let iostat = cb.iostat;
     let newunit = cb.newunit;
+    let missing_filename = fname.trim().is_empty();
 
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
 
@@ -366,6 +367,70 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     } else {
         unit
     };
+
+    let existing_unit = state.units.get(&actual_unit).map(|u| {
+        (
+            u.filename.clone(),
+            u.access,
+            u.form.clone(),
+            u.action.clone(),
+            u.recl,
+        )
+    });
+    let fname = if missing_filename {
+        existing_unit
+            .as_ref()
+            .map(|(filename, _, _, _, _)| filename.clone())
+            .unwrap_or(fname)
+    } else {
+        fname
+    };
+
+    let update_existing_in_place = missing_filename
+        && existing_unit.is_some()
+        && status_str.trim().is_empty()
+        && action_str.trim().is_empty()
+        && access_str.trim().is_empty()
+        && form_str.trim().is_empty()
+        && recl <= 0
+        && newunit.is_null();
+    if update_existing_in_place {
+        if let Some(unit) = state.get_unit(actual_unit) {
+            match position_str.trim() {
+                "append" => match &mut unit.stream {
+                    UnitStream::FileRaw(f) => {
+                        let _ = f.seek(SeekFrom::End(0));
+                    }
+                    UnitStream::FileRead(r) => {
+                        let _ = r.seek(SeekFrom::End(0));
+                    }
+                    UnitStream::FileWrite(w) => {
+                        let _ = w.seek(SeekFrom::End(0));
+                    }
+                    _ => {}
+                },
+                "rewind" => match &mut unit.stream {
+                    UnitStream::FileRaw(f) => {
+                        let _ = f.seek(SeekFrom::Start(0));
+                    }
+                    UnitStream::FileRead(r) => {
+                        let _ = r.seek(SeekFrom::Start(0));
+                    }
+                    UnitStream::FileWrite(w) => {
+                        let _ = w.seek(SeekFrom::Start(0));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
+        return;
+    }
 
     // Build OpenOptions based on status/action.
     let mut opts = OpenOptions::new();
@@ -393,11 +458,18 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         "read" => "read",
         "write" => "write",
         "readwrite" => "readwrite",
-        "" => match status_str.trim() {
-            "old" => "read",
-            "new" | "replace" => "write",
-            _ => "readwrite",
-        },
+        "" => existing_unit
+            .as_ref()
+            .map(|(_, _, _, action, _)| match action {
+                Action::Read => "read",
+                Action::Write => "write",
+                Action::ReadWrite => "readwrite",
+            })
+            .unwrap_or_else(|| match status_str.trim() {
+                "old" => "read",
+                "new" | "replace" => "write",
+                _ => "readwrite",
+            }),
         _ => "readwrite",
     };
 
@@ -429,10 +501,18 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             let file_access = match access_str.trim() {
                 "direct" => Access::Direct,
                 "stream" => Access::Stream,
+                "" => existing_unit
+                    .as_ref()
+                    .map(|(_, access, _, _, _)| *access)
+                    .unwrap_or(Access::Sequential),
                 _ => Access::Sequential,
             };
             let file_form = match form_str.trim() {
                 "unformatted" => Form::Unformatted,
+                "" => existing_unit
+                    .as_ref()
+                    .map(|(_, _, form, _, _)| form.clone())
+                    .unwrap_or(Form::Formatted),
                 _ => Form::Formatted,
             };
 
@@ -456,7 +536,13 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     access: file_access,
                     form: file_form,
                     action: file_action,
-                    recl: if recl > 0 { Some(recl) } else { None },
+                    recl: if recl > 0 {
+                        Some(recl)
+                    } else {
+                        existing_unit
+                            .as_ref()
+                            .and_then(|(_, _, _, _, existing_recl)| *existing_recl)
+                    },
                     read_tokens: Vec::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
