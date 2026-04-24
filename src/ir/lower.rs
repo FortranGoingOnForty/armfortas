@@ -10587,6 +10587,47 @@ fn reorder_semantic_type_slots_by_formal_skip(
     Some(slots)
 }
 
+fn reorder_argument_slots_by_formal_skip(
+    args: &[crate::ast::expr::Argument],
+    formal_order: &[String],
+    formal_skip: usize,
+) -> Option<Vec<Option<crate::ast::expr::Argument>>> {
+    let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; formal_order.len()];
+    let mut last_positional = formal_skip.min(slots.len());
+    for arg in args {
+        if let Some(kw) = &arg.keyword {
+            let key = kw.to_ascii_lowercase();
+            let idx = formal_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&key))?;
+            if idx < last_positional || slots[idx].is_some() {
+                return None;
+            }
+            slots[idx] = Some(arg.clone());
+            continue;
+        }
+        if last_positional < slots.len() {
+            if slots[last_positional].is_some() {
+                return None;
+            }
+            slots[last_positional] = Some(arg.clone());
+            last_positional += 1;
+        } else {
+            slots.push(Some(arg.clone()));
+        }
+    }
+    Some(slots)
+}
+
+fn reorder_args_for_specific_candidate(
+    st: &SymbolTable,
+    candidate: &SpecificProcCandidate,
+    args: &[crate::ast::expr::Argument],
+) -> Option<Vec<Option<crate::ast::expr::Argument>>> {
+    let scope = procedure_scope_for_candidate(st, candidate)?;
+    reorder_argument_slots_by_formal_skip(args, &scope.arg_order, 0)
+}
+
 fn resolve_generic_call_by_semantics(
     st: &SymbolTable,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -12538,12 +12579,7 @@ fn emit_named_function_call(
     ret_ty: IrType,
 ) -> ValueId {
     let key = callee_name.to_lowercase();
-    let arg_slots = reorder_args_by_keyword_slots(args, &key, st);
-    let present_args: Vec<crate::ast::expr::Argument> =
-        arg_slots.iter().flatten().cloned().collect();
-    let args: &[crate::ast::expr::Argument] = &present_args;
-
-    let intrinsic_arg_vals: Vec<ValueId> = args
+    let resolution_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
             crate::ast::expr::SectionSubscript::Element(e) => generic_dispatch_probe_value(
@@ -12560,22 +12596,28 @@ fn emit_named_function_call(
         })
         .collect();
 
-    let (call_name, callee_key) = match resolve_generic_call_actuals(
+    let resolved_generic = resolve_generic_call_actuals(
         st,
         b,
         Some(locals),
         &key,
         args,
-        &intrinsic_arg_vals,
+        &resolution_arg_vals,
         type_layouts,
-    ) {
-        Some(candidate) => resolved_symbol_call_target_for_candidate(st, &candidate),
+    );
+
+    let (call_name, callee_key) = match resolved_generic.as_ref() {
+        Some(candidate) => resolved_symbol_call_target_for_candidate(st, candidate),
         None => {
             let resolved_name = callee_name.to_string();
             let resolved_key = resolved_name.to_lowercase();
             resolved_symbol_call_target(st, &resolved_key, &resolved_name)
         }
     };
+    let arg_slots = resolved_generic
+        .as_ref()
+        .and_then(|candidate| reorder_args_for_specific_candidate(st, candidate, args))
+        .unwrap_or_else(|| reorder_args_by_keyword_slots(args, &callee_key, st));
     let abi_lookup_keys = procedure_abi_lookup_keys(st, &[call_name.as_str(), &callee_key, &key]);
     let abi_primary_key = abi_lookup_keys
         .first()
@@ -33554,10 +33596,10 @@ fn lower_expr_full(
                 // instead of silently falling back to the generic name,
                 // which would either mismatch the callee ABI or produce
                 // an unresolved link-time symbol.
-                let (call_name, callee_key) = if procptr_target.is_some() {
-                    (String::new(), signature_key.clone())
+                let resolved_generic = if procptr_target.is_some() {
+                    None
                 } else {
-                    match resolve_generic_call_actuals(
+                    resolve_generic_call_actuals(
                         st,
                         b,
                         Some(locals),
@@ -33565,87 +33607,82 @@ fn lower_expr_full(
                         original_args,
                         &resolution_arg_vals,
                         type_layouts,
-                    ) {
-                        Some(candidate) => resolved_symbol_call_target_for_candidate(st, &candidate),
-                        None => {
-                            if let Some(result) =
-                                lower_pointer_intrinsic(b, locals, &key, args, st, type_layouts)
-                            {
-                                return result;
-                            }
-
-                            if let Some(result) = lower_scalar_allocated_intrinsic(
-                                b,
-                                locals,
-                                &key,
-                                args,
-                                st,
-                                type_layouts,
-                            ) {
-                                return result;
-                            }
-
-                            if let Some(result) = lower_logical_reduction_intrinsic_ast(
-                                b,
-                                &key,
-                                args,
-                                locals,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            ) {
-                                return result;
-                            }
-
-                            if let Some(result) =
-                                lower_array_intrinsic(
-                                    b,
-                                    locals,
-                                    &key,
-                                    args,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                            {
-                                return result;
-                            }
-
-                            if let Some(result) = lower_char_intrinsic(
-                                b,
-                                &key,
-                                args,
-                                locals,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            ) {
-                                return result;
-                            }
-
-                            if let Some(result) = intrinsic_result {
-                                return result;
-                            }
-                            if let Some(specifics) = named_interface_specifics(st, &key) {
-                                eprintln!(
-                                    "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                                    expr.span.start.line,
-                                    expr.span.start.col,
-                                    name,
-                                    specifics.join(", "),
-                                );
-                                let _ = std::io::stderr().flush();
-                                std::process::exit(1);
-                            }
-                            resolved_symbol_call_target(st, &key, name)
-                        }
+                    )
+                };
+                let (call_name, callee_key) = if procptr_target.is_some() {
+                    (String::new(), signature_key.clone())
+                } else if let Some(candidate) = resolved_generic.as_ref() {
+                    resolved_symbol_call_target_for_candidate(st, candidate)
+                } else {
+                    if let Some(result) =
+                        lower_pointer_intrinsic(b, locals, &key, args, st, type_layouts)
+                    {
+                        return result;
                     }
+
+                    if let Some(result) =
+                        lower_scalar_allocated_intrinsic(b, locals, &key, args, st, type_layouts)
+                    {
+                        return result;
+                    }
+
+                    if let Some(result) = lower_logical_reduction_intrinsic_ast(
+                        b,
+                        &key,
+                        args,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+
+                    if let Some(result) = lower_array_intrinsic(
+                        b,
+                        locals,
+                        &key,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+
+                    if let Some(result) = lower_char_intrinsic(
+                        b,
+                        &key,
+                        args,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+
+                    if let Some(result) = intrinsic_result {
+                        return result;
+                    }
+                    if let Some(specifics) = named_interface_specifics(st, &key) {
+                        eprintln!(
+                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                            expr.span.start.line,
+                            expr.span.start.col,
+                            name,
+                            specifics.join(", "),
+                        );
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(1);
+                    }
+                    resolved_symbol_call_target(st, &key, name)
                 };
                 let arg_slots = reorder_args_by_keyword_slots(
                     original_args,
@@ -33656,6 +33693,12 @@ fn lower_expr_full(
                     },
                     st,
                 );
+                let arg_slots = if let Some(candidate) = resolved_generic.as_ref() {
+                    reorder_args_for_specific_candidate(st, candidate, original_args)
+                        .unwrap_or(arg_slots)
+                } else {
+                    arg_slots
+                };
                 let abi_lookup_keys = procedure_abi_lookup_keys(
                     st,
                     &[call_name.as_str(), &callee_key, &signature_key, &key],
