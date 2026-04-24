@@ -5988,6 +5988,42 @@ fn move_alloc_nested_class_allocatable_container_preserves_real_payload() {
 }
 
 #[test]
+fn alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_value\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: base_value\n      class(base_value), intent(inout) :: self\n    end subroutine\n  end interface\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: bool_value\n    logical :: raw = .false.\n  end type\n  type, extends(base_value) :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: destroy => keyval_destroy\n    procedure :: set_bool\n    procedure :: get_bool\n  end type\ncontains\n  subroutine set_bool(self, x)\n    class(keyval_t), intent(inout) :: self\n    logical, intent(in) :: x\n    type(bool_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_bool(self, x)\n    class(keyval_t), intent(in) :: self\n    logical, intent(out) :: x\n    logical, pointer :: ptr\n    ptr => cast_bool(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end subroutine\n  function cast_bool(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    logical, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(bool_value)\n      ptr => val%raw\n    end select\n  end function\n  subroutine keyval_destroy(self)\n    class(keyval_t), intent(inout) :: self\n    if (allocated(self%val)) deallocate(self%val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t), allocatable, target :: src\n  class(base_value), allocatable :: clone\n  class(base_value), pointer :: ptr\n  logical :: x\n  allocate(src)\n  call src%set_bool(.false.)\n  ptr => src\n  allocate(clone, source=ptr)\n  call src%destroy()\n  deallocate(src)\n  select type(clone)\n  type is(keyval_t)\n    call clone%get_bool(x)\n  class default\n    error stop 2\n  end select\n  if (x .neqv. .false.) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_source_class_pointer_nested_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-source nested payload compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-source nested payload compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc-source nested payload run failed");
+    assert!(
+        run.status.success(),
+        "alloc-source nested payload run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc-source nested payload output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_bound_get_through_class_holder_returns_allocatable_component_pointer() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: payload_t\n  end type\n  type, extends(payload_t) :: keyval_t\n    real :: x = 0.0\n  end type\n  type, abstract :: list_base_t\n  contains\n    procedure(get_i), deferred :: get\n    procedure(push_i), deferred :: push_back\n  end type\n  abstract interface\n    subroutine get_i(self, idx, ptr)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      integer, intent(in) :: idx\n      class(payload_t), pointer, intent(out) :: ptr\n    end subroutine\n    subroutine push_i(self, val)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      class(payload_t), allocatable, intent(inout) :: val\n    end subroutine\n  end interface\n  type :: node_t\n    class(payload_t), allocatable :: val\n  end type\n  type, extends(list_base_t) :: list_impl_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: get => impl_get\n    procedure :: push_back => impl_push_back\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: set_first\n    procedure :: get_first\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    call move_alloc(tmp, self%list)\n  end subroutine\n  subroutine impl_push_back(self, val)\n    class(list_impl_t), intent(inout), target :: self\n    class(payload_t), allocatable, intent(inout) :: val\n    if (.not. allocated(self%lst)) allocate(self%lst(1))\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine impl_get(self, idx, ptr)\n    class(list_impl_t), intent(inout), target :: self\n    integer, intent(in) :: idx\n    class(payload_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    if (idx > 0 .and. idx <= self%n) then\n      if (allocated(self%lst(idx)%val)) ptr => self%lst(idx)%val\n    end if\n  end subroutine\n  subroutine set_first(self, x)\n    class(array_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%x = x\n    call self%list%push_back(tmp)\n  end subroutine\n  real function get_first(self) result(x)\n    class(array_t), intent(inout) :: self\n    class(payload_t), pointer :: ptr\n    x = -1.0\n    call self%list%get(1, ptr)\n    if (.not. associated(ptr)) error stop 1\n    select type(ptr)\n    type is(keyval_t)\n      x = ptr%x\n    class default\n      error stop 2\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(array_t) :: arr\n  call arr%init()\n  call arr%set_first(1.0)\n  if (abs(arr%get_first() - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",

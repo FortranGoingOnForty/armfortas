@@ -12961,6 +12961,21 @@ fn emit_dynamic_bound_proc_lookup_dispatch(
     }
 }
 
+fn abstract_layout_base_type(
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+    type_info: &crate::sema::symtab::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        crate::sema::symtab::TypeInfo::Class(base_type) => Some(base_type.clone()),
+        crate::sema::symtab::TypeInfo::Derived(base_type)
+            if tl.get(base_type).is_some_and(|layout| layout.is_abstract) =>
+        {
+            Some(base_type.clone())
+        }
+        _ => None,
+    }
+}
+
 fn resolve_polymorphic_component_method_base_for_dispatch(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -12968,21 +12983,6 @@ fn resolve_polymorphic_component_method_base_for_dispatch(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, ValueId, String)> {
-    fn abstract_layout_base_type(
-        tl: &crate::sema::type_layout::TypeLayoutRegistry,
-        type_info: &crate::sema::symtab::TypeInfo,
-    ) -> Option<String> {
-        match type_info {
-            crate::sema::symtab::TypeInfo::Class(base_type) => Some(base_type.clone()),
-            crate::sema::symtab::TypeInfo::Derived(base_type)
-                if tl.get(base_type).is_some_and(|layout| layout.is_abstract) =>
-            {
-                Some(base_type.clone())
-            }
-            _ => None,
-        }
-    }
-
     match &base.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
@@ -13041,6 +13041,21 @@ fn concrete_bound_proc_dispatch_candidates(
                 .cloned()
                 .map(|bp| (layout.type_tag, bp))
         })
+        .collect();
+    out.sort_by_key(|(tag, _)| *tag);
+    out
+}
+
+fn concrete_type_dispatch_candidates(
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+    base_type: &str,
+) -> Vec<(u64, String)> {
+    let mut out: Vec<(u64, String)> = tl
+        .layouts
+        .values()
+        .filter(|layout| !layout.is_abstract)
+        .filter(|layout| is_type_or_extends(&layout.name, base_type, tl))
+        .map(|layout| (layout.type_tag, layout.name.clone()))
         .collect();
     out.sort_by_key(|(tag, _)| *tag);
     out
@@ -18783,6 +18798,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
+                            let scalar_source_copy_plan = if rank == 0 {
+                                source_expr.and_then(|expr| {
+                                    expr_scalar_alloc_source_copy_plan(
+                                        expr,
+                                        &ctx.locals,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
                             let elem_size_bytes = dynamic_layout
                                 .map(|layout| layout.size as i64)
                                 .unwrap_or_else(|| descriptor_element_size_bytes(&field_info));
@@ -18855,6 +18882,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     field_ptr,
                                     source_desc,
                                     rank > 0,
+                                    scalar_source_copy_plan.as_ref(),
+                                    ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
                             } else if rank == 0 {
@@ -18865,6 +18894,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         field_ptr,
                                         source_desc,
                                         false,
+                                        scalar_source_copy_plan.as_ref(),
+                                        ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
                                 } else if let Some(source_expr) = source_expr {
@@ -19111,6 +19142,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
+                            let scalar_source_copy_plan = if rank == 0 {
+                                source_expr.and_then(|expr| {
+                                    expr_scalar_alloc_source_copy_plan(
+                                        expr,
+                                        &ctx.locals,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
                             // Build a stack DimDescriptor[rank] honoring
                             // each subscript's actual (lower, upper) bounds,
                             // then call afs_allocate_array. Descriptor-backed
@@ -19190,6 +19233,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     desc,
                                     source_desc,
                                     rank > 0,
+                                    scalar_source_copy_plan.as_ref(),
+                                    ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
                             } else if rank == 0 {
@@ -19200,6 +19245,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         desc,
                                         source_desc,
                                         false,
+                                        scalar_source_copy_plan.as_ref(),
+                                        ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
                                 } else if let Some(source_expr) = source_expr {
@@ -30428,6 +30475,8 @@ fn emit_allocatable_source_copy_on_success(
     dest_desc: ValueId,
     source_desc: ValueId,
     preserve_shape: bool,
+    scalar_copy_plan: Option<&ScalarAllocSourceCopyPlan>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     errmsg_target: Option<&RuntimeErrmsgTarget>,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
@@ -30446,11 +30495,78 @@ fn emit_allocatable_source_copy_on_success(
         );
         emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
     } else {
-        b.call(
-            FuncRef::External("afs_assign_allocatable".into()),
-            vec![dest_desc, source_desc],
-            IrType::Void,
-        );
+        let deep_copied = match scalar_copy_plan {
+            Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
+                let dest_base =
+                    b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let source_base =
+                    b.load_typed(source_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                emit_derived_value_copy(b, type_layouts, type_name, dest_base, source_base);
+                true
+            }
+            Some(ScalarAllocSourceCopyPlan::Dynamic(base_type)) => {
+                let candidates = concrete_type_dispatch_candidates(type_layouts, base_type);
+                if candidates.is_empty() {
+                    false
+                } else {
+                    let source_tag = load_array_desc_type_tag(b, source_desc);
+                    let dest_base =
+                        b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let source_base = b.load_typed(
+                        source_desc,
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    let fallback = b.create_block("alloc_source_dispatch_fallback");
+                    let test_blocks: Vec<BlockId> = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| b.create_block(&format!("alloc_source_dispatch_test_{}", i)))
+                        .collect();
+                    let case_blocks: Vec<BlockId> = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| b.create_block(&format!("alloc_source_dispatch_case_{}", i)))
+                        .collect();
+                    b.branch(test_blocks[0], vec![]);
+                    for (idx, ((type_tag, type_name), case_bb)) in candidates
+                        .iter()
+                        .zip(case_blocks.iter())
+                        .enumerate()
+                    {
+                        b.set_block(test_blocks[idx]);
+                        let want_tag = b.const_i64(*type_tag as i64);
+                        let is_match = b.icmp(CmpOp::Eq, source_tag, want_tag);
+                        let next_bb = if idx + 1 < test_blocks.len() {
+                            test_blocks[idx + 1]
+                        } else {
+                            fallback
+                        };
+                        b.cond_branch(is_match, *case_bb, vec![], next_bb, vec![]);
+
+                        b.set_block(*case_bb);
+                        emit_derived_value_copy(
+                            b,
+                            type_layouts,
+                            type_name,
+                            dest_base,
+                            source_base,
+                        );
+                        b.branch(done_bb, vec![]);
+                    }
+                    b.set_block(fallback);
+                    false
+                }
+            }
+            None => false,
+        };
+
+        if !deep_copied {
+            b.call(
+                FuncRef::External("afs_assign_allocatable".into()),
+                vec![dest_desc, source_desc],
+                IrType::Void,
+            );
+        }
     }
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
@@ -30549,6 +30665,28 @@ fn expr_type_layout<'a>(
         | Some(crate::sema::symtab::TypeInfo::Class(name)) => type_layouts.get(&name),
         _ => None,
     }
+}
+
+#[derive(Clone)]
+enum ScalarAllocSourceCopyPlan {
+    Static(String),
+    Dynamic(String),
+}
+
+fn expr_scalar_alloc_source_copy_plan(
+    expr: &SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ScalarAllocSourceCopyPlan> {
+    if let Some(layout) = expr_type_layout(expr, Some(locals), st, type_layouts) {
+        if !layout.is_abstract {
+            return Some(ScalarAllocSourceCopyPlan::Static(layout.name.clone()));
+        }
+    }
+    operator_expr_type_info(expr, Some(locals), st, Some(type_layouts))
+        .and_then(|ti| abstract_layout_base_type(type_layouts, &ti))
+        .map(ScalarAllocSourceCopyPlan::Dynamic)
 }
 
 fn expr_type_tag_value(
