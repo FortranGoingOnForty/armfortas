@@ -14,7 +14,9 @@ use crate::sema::symtab::SymbolTable;
 
 use crate::ast::decl::ArraySpec;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::rc::Rc;
 
@@ -442,7 +444,7 @@ pub fn lower_file(
             false,
         );
     }
-    emit_type_bound_lookup_thunks(&mut module, units, type_layouts);
+    emit_type_bound_lookup_thunks(&mut module, units, st, type_layouts, &internal_funcs);
     if crate::opt::pass::Pass::run(&crate::opt::dce::Dce, &mut module) {
         for func in &mut module.functions {
             func.rebuild_type_cache();
@@ -481,7 +483,9 @@ fn bound_proc_target_is_local_to_owner(layout: &crate::sema::type_layout::TypeLa
 fn emit_type_bound_lookup_thunks(
     module: &mut Module,
     units: &[SpannedUnit],
+    st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    internal_funcs: &HashMap<String, u32>,
 ) {
     let local_modules = collect_local_owner_modules(units);
     let available_targets: HashSet<String> =
@@ -495,7 +499,7 @@ fn emit_type_bound_lookup_thunks(
                 .owner_module
                 .as_ref()
                 .map(|owner| local_modules.contains(&owner.to_lowercase()))
-                .unwrap_or(false)
+                .unwrap_or(true)
         })
         .collect();
     layouts.sort_by_key(|layout| {
@@ -533,11 +537,21 @@ fn emit_type_bound_lookup_thunks(
             b.switch(ValueId(0), cases, default_bb);
             for (bb, bp) in case_blocks.into_iter().zip(layout.bound_procs.iter()) {
                 b.set_block(bb);
+                let local_target = if layout.owner_module.is_none() {
+                    find_procedure_scope_id(st, &bp.target_name)
+                        .or_else(|| find_procedure_scope_id(st, &bp.abi_name))
+                        .and_then(|scope_id| {
+                            lowered_scope_symbol_name(st, internal_funcs, scope_id)
+                        })
+                } else {
+                    None
+                };
                 let target_is_external_inherited =
                     !layout.is_abstract
                         && !bound_proc_target_is_local_to_owner(layout, &bp.target_name);
-                let addr = if available_targets.contains(&bp.target_name)
-                    || target_is_external_inherited
+                let addr = if let Some(local_target) = local_target {
+                    b.global_addr(&local_target, IrType::Int(IntWidth::I8))
+                } else if available_targets.contains(&bp.target_name) || target_is_external_inherited
                 {
                     b.global_addr(&bp.target_name, IrType::Int(IntWidth::I8))
                 } else {
@@ -31523,13 +31537,32 @@ fn derived_type_tag_value(
 fn type_layout_tbp_lookup_symbol(
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> Option<String> {
-    let owner = layout.owner_module.as_ref()?;
     if layout.bound_procs.is_empty() {
         return None;
     }
+    if let Some(owner) = layout.owner_module.as_ref() {
+        return Some(format!(
+            "afs_tbplookup_{}_{}",
+            owner.to_lowercase(),
+            layout.name.to_lowercase()
+        ));
+    }
+
+    let mut hasher = DefaultHasher::new();
+    layout.name.to_lowercase().hash(&mut hasher);
+    layout.size.hash(&mut hasher);
+    layout.align.hash(&mut hasher);
+    layout.parent.hash(&mut hasher);
+    layout.is_abstract.hash(&mut hasher);
+    for bp in &layout.bound_procs {
+        bp.method_name.to_lowercase().hash(&mut hasher);
+        bp.target_name.to_lowercase().hash(&mut hasher);
+        bp.abi_name.to_lowercase().hash(&mut hasher);
+        bp.nopass.hash(&mut hasher);
+    }
     Some(format!(
-        "afs_tbplookup_{}_{}",
-        owner.to_lowercase(),
+        "afs_tbplookup_local_{:016x}_{}",
+        hasher.finish(),
         layout.name.to_lowercase()
     ))
 }
