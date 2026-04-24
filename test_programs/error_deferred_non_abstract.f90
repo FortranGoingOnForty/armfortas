@@ -1,5 +1,4 @@
 ! DEFERRED type-bound procedure requires ABSTRACT type.
-! XFAIL: DEFERRED on non-ABSTRACT type not yet diagnosed
 ! ERROR_EXPECTED: not ABSTRACT
 program t
   implicit none
