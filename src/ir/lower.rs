@@ -10892,7 +10892,6 @@ fn operator_expr_type_info(
                 .map(|field| field.type_info.clone())
         }
         Expr::ParenExpr { inner } => operator_expr_type_info(inner, locals, st, type_layouts),
-        _ => None,
     }
 }
 
@@ -12513,7 +12512,7 @@ fn emit_bound_function_call(
     ret_ty: IrType,
 ) -> Option<ValueId> {
     let tl = type_layouts?;
-    reject_unsupported_polymorphic_component_method_base(base.span, base, locals, tl);
+    reject_unsupported_polymorphic_component_method_base(base.span, base, locals, st, tl);
     let (obj_addr, type_name) = resolve_component_base_for_method(b, locals, base, st, tl)?;
     let pass_desc_addr = lower_arg_descriptor(b, locals, base, st, type_layouts);
     let layout = tl.get(&type_name)?;
@@ -12823,6 +12822,23 @@ fn emit_dynamic_bound_proc_lookup_dispatch(
     )
     .or_else(|| base_layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, base_layout, component));
+    let candidates = concrete_bound_proc_dispatch_candidates(
+        type_layouts,
+        base_type,
+        component,
+        &declared_bp.abi_name,
+    );
+    if candidates.is_empty() {
+        eprintln!(
+            "armfortas: error: {}:{}: type-bound calls through CLASS({}) bases have no visible concrete override targets for '{}'",
+            call_span.start.line,
+            call_span.start.col,
+            base_type,
+            component,
+        );
+        let _ = std::io::stderr().flush();
+        std::process::exit(1);
+    }
     let slot_index = base_layout
         .bound_procs
         .iter()
@@ -12892,16 +12908,8 @@ fn emit_dynamic_bound_proc_lookup_dispatch(
     b.branch(done_bb, vec![]);
 
     b.set_block(fallback_bb);
-    let candidates = concrete_bound_proc_dispatch_candidates(
-        type_layouts,
-        base_type,
-        component,
-        &declared_bp.abi_name,
-    );
     let fail_bb = b.create_block("tbp_dispatch_fail");
-    if candidates.is_empty() {
-        b.branch(fail_bb, vec![]);
-    } else {
+    {
         let runtime_tag = load_array_desc_type_tag(b, desc_addr);
         let test_blocks: Vec<BlockId> = candidates
             .iter()
@@ -15961,6 +15969,7 @@ fn lower_string_expr_full(
                             callee.span,
                             base,
                             locals,
+                            st,
                             tl,
                         );
                         if let Some((_obj_addr, type_name)) =
@@ -17587,12 +17596,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 {
                     return;
                 }
-                reject_unsupported_polymorphic_component_method_base(
-                    callee.span,
-                    base,
-                    &ctx.locals,
-                    ctx.type_layouts,
-                );
                 if let Some((obj_addr, type_name)) = resolve_component_base_for_method(
                     b,
                     &ctx.locals,
@@ -17647,6 +17650,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                 }
+                reject_unsupported_polymorphic_component_method_base(
+                    callee.span,
+                    base,
+                    &ctx.locals,
+                    ctx.st,
+                    ctx.type_layouts,
+                );
                 if let Some((target, signature_key)) = procedure_pointer_component_call_target(
                     b,
                     &ctx.locals,
@@ -24989,6 +24999,38 @@ fn lower_descriptor_actual_from_info(
     }
 }
 
+fn materialize_scalar_element_descriptor_from_info(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> ValueId {
+    let elem_addr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
+    let elem_raw = b.ptr_to_int(elem_addr);
+    let elem_base = b.int_to_ptr(elem_raw, IrType::Int(IntWidth::I8));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let elem_size = info
+        .derived_type
+        .as_ref()
+        .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
+        .map(|layout| b.const_i64(layout.size as i64))
+        .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info))));
+    let tag = info
+        .derived_type
+        .as_ref()
+        .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
+        .map(|layout| b.const_i64(layout.type_tag as i64));
+    let tbp_lookup = info
+        .derived_type
+        .as_ref()
+        .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
+        .and_then(|layout| type_layout_tbp_lookup_value(b, layout));
+    store_scalar_polymorphic_descriptor_view(b, desc, elem_base, elem_size, tag, tbp_lookup);
+    desc
+}
+
 fn lower_arg_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -25040,6 +25082,36 @@ fn lower_arg_descriptor(
                         return desc;
                     }
                 }
+            }
+        }
+    }
+    if let Expr::FunctionCall { callee, args } = &expr.node {
+        if args
+            .iter()
+            .all(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+        {
+            let info = match &callee.node {
+                Expr::Name { name } => locals
+                    .get(&name.to_lowercase())
+                    .filter(|info| local_is_array_like(info))
+                    .cloned(),
+                Expr::ComponentAccess { .. } => type_layouts.and_then(|tl| {
+                    component_array_local_info(b, locals, callee, st, tl).or_else(|| {
+                        component_intrinsic_local_info(b, locals, callee, st, tl)
+                            .filter(|info| local_is_array_like(info))
+                    })
+                }),
+                _ => None,
+            };
+            if let Some(info) = info {
+                return materialize_scalar_element_descriptor_from_info(
+                    b,
+                    locals,
+                    &info,
+                    args,
+                    st,
+                    type_layouts,
+                );
             }
         }
     }
@@ -30939,32 +31011,12 @@ enum MethodBaseKind {
 fn method_base_kind_for_call(
     base: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<MethodBaseKind> {
-    match &base.node {
-        Expr::Name { name } => locals
-            .get(&name.to_lowercase())
-            .and_then(|info| info.derived_type.clone())
-            .map(MethodBaseKind::Derived),
-        Expr::ComponentAccess {
-            base: inner_base,
-            component,
-        } => {
-            let inner_type = match method_base_kind_for_call(inner_base, locals, tl)? {
-                MethodBaseKind::Derived(name) | MethodBaseKind::PolymorphicClass(name) => name,
-            };
-            let layout = tl.get(&inner_type)?;
-            let field = layout.field(component)?;
-            match &field.type_info {
-                crate::sema::symtab::TypeInfo::Derived(name) => {
-                    Some(MethodBaseKind::Derived(name.clone()))
-                }
-                crate::sema::symtab::TypeInfo::Class(name) => {
-                    Some(MethodBaseKind::PolymorphicClass(name.clone()))
-                }
-                _ => None,
-            }
-        }
+    match operator_expr_type_info(base, Some(locals), st, Some(tl))? {
+        crate::sema::symtab::TypeInfo::Derived(name) => Some(MethodBaseKind::Derived(name)),
+        crate::sema::symtab::TypeInfo::Class(name) => Some(MethodBaseKind::PolymorphicClass(name)),
         _ => None,
     }
 }
@@ -30973,10 +31025,11 @@ fn reject_unsupported_polymorphic_component_method_base(
     span: crate::lexer::Span,
     base: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     if matches!(
-        method_base_kind_for_call(base, locals, tl),
+        method_base_kind_for_call(base, locals, st, tl),
         Some(MethodBaseKind::PolymorphicClass(_))
     ) {
         eprintln!(
@@ -33078,12 +33131,6 @@ fn lower_expr_full(
                     ) {
                         return result;
                     }
-                    reject_unsupported_polymorphic_component_method_base(
-                        callee.span,
-                        base,
-                        locals,
-                        tl,
-                    );
                     if let Some(info) = component_intrinsic_local_info(b, locals, callee, st, tl) {
                         let has_range = args.iter().any(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
@@ -33093,6 +33140,13 @@ fn lower_expr_full(
                         }
                         return lower_array_element(b, locals, &info, args, st, type_layouts);
                     }
+                    reject_unsupported_polymorphic_component_method_base(
+                        callee.span,
+                        base,
+                        locals,
+                        st,
+                        tl,
+                    );
 
                     if let Some((obj_addr, type_name)) =
                         resolve_component_base_for_method(b, locals, base, st, tl)
@@ -33133,6 +33187,46 @@ fn lower_expr_full(
                                     .first()
                                     .map(String::as_str)
                                     .unwrap_or(target_key.as_str());
+                                if let Some(hidden_abi) =
+                                    first_procedure_lookup(&abi_lookup_keys, |k| {
+                                        callee_hidden_result_abi(st, k)
+                                    })
+                                {
+                                    if let Some(bytes) = hidden_result_temp_bytes_for_callee(
+                                        st,
+                                        type_layouts,
+                                        &abi_lookup_keys,
+                                        hidden_abi,
+                                    ) {
+                                        let desc = b.alloca(IrType::Array(
+                                            Box::new(IrType::Int(IntWidth::I8)),
+                                            bytes,
+                                        ));
+                                        let zero_i32 = b.const_i32(0);
+                                        let size = b.const_i64(bytes as i64);
+                                        b.call(
+                                            FuncRef::External("memset".into()),
+                                            vec![desc, zero_i32, size],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                        emit_bound_function_call(
+                                            b,
+                                            locals,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                            callee.span,
+                                            base,
+                                            component,
+                                            args,
+                                            Some(desc),
+                                            IrType::Void,
+                                        );
+                                        return desc;
+                                    }
+                                }
                                 let callee_value_args =
                                     first_procedure_lookup(&abi_lookup_keys, |k| {
                                         callee_value_arg_mask(st, k)
