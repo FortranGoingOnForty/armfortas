@@ -9473,6 +9473,43 @@ fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
 }
 
 #[test]
+fn elemental_character_compare_uses_hidden_result_bytes() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [1, 2, 3]\n  character(1), parameter :: truth(3) = ['t', 'r', 'u']\n  logical :: ok\n  ok = match_all('tru', offset, truth)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_char_compare_hidden_result", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental char compare hidden-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental char compare hidden-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental char compare hidden-result run failed");
+    assert!(
+        run.status.success(),
+        "elemental char compare hidden-result run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected elemental char compare hidden-result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
     let src = write_program(
         "module m\n  implicit none\ncontains\n  elemental function pick(pos) result(ch)\n    integer, intent(in) :: pos\n    character(1) :: ch\n    ch = merge('X', 'Y', pos > 0)\n  end function\n\n  logical function want_ten_chars(string)\n    character(1), intent(in) :: string(:)\n    want_ten_chars = string(5) == 'X'\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n  integer, parameter :: offset_date = 10\n  if (.not. want_ten_chars(pick(1 + offset(:offset_date)))) error stop 1\n  print *, 'ok'\nend program\n",

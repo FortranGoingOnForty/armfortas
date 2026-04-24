@@ -16179,26 +16179,7 @@ fn lower_string_expr_full(
                     }
                 }
 
-                if let Some(sym) = st.find_symbol_any_scope(&key) {
-                    if let Some(crate::sema::symtab::TypeInfo::Character {
-                        len: Some(len), ..
-                    }) = sym.type_info.as_ref()
-                    {
-                        let ptr = lower_expr_full(
-                            b,
-                            locals,
-                            expr,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        );
-                        return (ptr, b.const_i64(*len));
-                    }
-                }
-
-                if let Some(ret_abi) = resolved_character_return_abi_for_call(
+                let resolved_char_return_abi = resolved_character_return_abi_for_call(
                     b,
                     locals,
                     st,
@@ -16208,7 +16189,9 @@ fn lower_string_expr_full(
                     descriptor_params,
                     &key,
                     args,
-                ) {
+                );
+
+                if let Some(ret_abi) = resolved_char_return_abi {
                     match ret_abi {
                         CharacterReturnAbi::HiddenDescriptor => {
                             let desc =
@@ -16255,6 +16238,25 @@ fn lower_string_expr_full(
                             b.store(byte, slot);
                             return (slot, b.const_i64(1));
                         }
+                    }
+                }
+
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if let Some(crate::sema::symtab::TypeInfo::Character {
+                        len: Some(len), ..
+                    }) = sym.type_info.as_ref()
+                    {
+                        let ptr = lower_expr_full(
+                            b,
+                            locals,
+                            expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        return (ptr, b.const_i64(*len));
                     }
                 }
                 if internal_funcs.is_some_and(|funcs| funcs.contains_key(&key)) {
