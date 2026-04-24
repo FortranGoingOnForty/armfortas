@@ -985,10 +985,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let bindings = binding.iter().cloned().collect();
         Ok(TypeBoundProc {
             name,
             interface,
             binding,
+            bindings,
             attrs: proc_attrs,
             is_generic: false,
         })
@@ -1006,15 +1008,19 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RParen)?;
             name = format!("{}({})", name, op);
         }
-        let binding = if self.eat(&TokenKind::Arrow) {
-            Some(self.advance().clone().text)
-        } else {
-            None
-        };
+        let mut bindings = Vec::new();
+        if self.eat(&TokenKind::Arrow) {
+            bindings.push(self.advance().clone().text);
+            while self.eat(&TokenKind::Comma) {
+                bindings.push(self.advance().clone().text);
+            }
+        }
+        let binding = bindings.first().cloned();
         Ok(TypeBoundProc {
             name,
             interface: None,
             binding,
+            bindings,
             attrs: Vec::new(),
             is_generic: true,
         })
@@ -1285,7 +1291,29 @@ mod tests {
         assert_eq!(tbp.name, "push");
         assert_eq!(tbp.interface.as_deref(), Some("push_iface"));
         assert!(tbp.binding.is_none());
+        assert!(tbp.bindings.is_empty());
         assert_eq!(tbp.attrs, vec!["deferred"]);
+    }
+
+    #[test]
+    fn generic_type_bound_proc_preserves_all_specific_bindings() {
+        let tokens =
+            Lexer::tokenize("generic :: set => set_float, set_integer, set_datetime", 0)
+                .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let tbp = parser.parse_type_bound_proc_generic().unwrap();
+        assert_eq!(tbp.name, "set");
+        assert_eq!(tbp.binding.as_deref(), Some("set_float"));
+        assert_eq!(
+            tbp.bindings,
+            vec![
+                "set_float".to_string(),
+                "set_integer".to_string(),
+                "set_datetime".to_string()
+            ]
+        );
+        assert!(tbp.is_generic);
     }
 
     #[test]
