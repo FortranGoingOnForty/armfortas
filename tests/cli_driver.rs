@@ -20814,6 +20814,43 @@ fn imported_framework_testsuite_array_constructor_reallocates_zero_len_target() 
 }
 
 #[test]
+fn allocatable_intent_out_testsuite_array_constructor_keeps_procptr_elements() {
+    let src = write_program(
+        "module framework\n  implicit none\n  type :: error_type\n    integer :: stat = 0\n  end type error_type\n  abstract interface\n    subroutine test_interface(error)\n      import :: error_type\n      type(error_type), allocatable, intent(out) :: error\n    end subroutine test_interface\n  end interface\n  type :: unittest_type\n    character(len=:), allocatable :: name\n    procedure(test_interface), pointer, nopass :: test => null()\n    logical :: should_fail = .false.\n  end type unittest_type\ncontains\n  function new_unittest(name, test) result(self)\n    character(len=*), intent(in) :: name\n    procedure(test_interface) :: test\n    type(unittest_type) :: self\n    self%name = name\n    self%test => test\n  end function new_unittest\n  subroutine collect_tests(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t1', test_1)]\n  end subroutine collect_tests\n  subroutine test_1(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine test_1\nend module framework\nprogram p\n  use framework\n  implicit none\n  type(unittest_type), allocatable :: testsuite(:)\n  call collect_tests(testsuite)\n  if (.not. allocated(testsuite)) error stop 1\n  if (size(testsuite) /= 1) error stop 2\n  if (.not. allocated(testsuite(1)%name)) error stop 3\n  if (testsuite(1)%name /= 't1') error stop 4\n  if (.not. associated(testsuite(1)%test)) error stop 5\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("intent_out_testsuite_array_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intent(out) testsuite array ctor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intent(out) testsuite array ctor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("intent(out) testsuite array ctor run failed");
+    assert!(
+        run.status.success(),
+        "intent(out) testsuite array ctor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected intent(out) testsuite array ctor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn public_type_emits_private_nested_type_layouts_needed_cross_tu() {
     let dir = unique_dir("private_nested_layout");
     let mod_src = write_program_in(
@@ -21537,6 +21574,90 @@ fn allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allo
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected alloc intent(out) scalar ctor assign output: {}",
         String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: lexer_t\n    character(len=:), allocatable :: filename\n    integer, allocatable :: stack(:)\n  end type lexer_t\ncontains\n  subroutine init_all(lexer, string)\n    type(lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    if (allocated(lexer%filename)) print *, 'STALE_NAME'\n    if (allocated(lexer%stack)) print *, 'STALE_STACK', size(lexer%stack)\n    lexer%filename = string\n    allocate(lexer%stack(8))\n    print *, 'OK'\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  call init_all(lexer, 'first')\n  call init_all(lexer, 'second')\n  call init_all(lexer, 'third')\n  if (.not. allocated(lexer%filename)) error stop 1\n  if (.not. allocated(lexer%stack)) error stop 2\n  if (lexer%filename /= 'third') error stop 3\n  if (size(lexer%stack) /= 8) error stop 4\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("intent_out_derived_dummy_reset", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intent(out) derived dummy reset compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intent(out) derived dummy reset compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("intent(out) derived dummy reset run failed");
+    assert!(
+        run.status.success(),
+        "intent(out) derived dummy reset run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        !stdout.contains("STALE_NAME"),
+        "intent(out) derived dummy reused stale filename storage: {stdout}"
+    );
+    assert!(
+        !stdout.contains("STALE_STACK"),
+        "intent(out) derived dummy reused stale allocatable storage: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("OK").count(),
+        3,
+        "unexpected intent(out) derived dummy output: {stdout}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn optional_intent_out_derived_dummy_absent_does_not_touch_null_storage() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: name\n  end type box_t\ncontains\n  subroutine reset(box)\n    type(box_t), intent(out), optional :: box\n    if (.not. present(box)) then\n      print *, 'absent'\n      return\n    end if\n    box%name = 'fresh'\n  end subroutine reset\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(box_t) :: box\n  box%name = 'stale'\n  call reset()\n  if (.not. allocated(box%name)) error stop 1\n  if (box%name /= 'stale') error stop 2\n  call reset(box)\n  if (.not. allocated(box%name)) error stop 3\n  if (box%name /= 'fresh') error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("optional_intent_out_derived_absent", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional intent(out) derived absent compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional intent(out) derived absent compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("optional intent(out) derived absent run failed");
+    assert!(
+        run.status.success(),
+        "optional intent(out) derived absent run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("absent") && stdout.contains("ok"),
+        "unexpected optional intent(out) derived absent output: {stdout}"
     );
 
     let _ = std::fs::remove_file(&out);

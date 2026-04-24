@@ -3205,6 +3205,13 @@ fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
+                clear_intent_out_derived_params(
+                    &mut b,
+                    &param_info,
+                    &ctx.locals,
+                    decls,
+                    type_layouts,
+                );
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls);
@@ -3619,6 +3626,13 @@ fn lower_unit(
                     decls,
                     &visible_param_consts,
                     ctx.st,
+                    type_layouts,
+                );
+                clear_intent_out_derived_params(
+                    &mut b,
+                    &param_info,
+                    &ctx.locals,
+                    decls,
                     type_layouts,
                 );
 
@@ -15036,6 +15050,91 @@ fn decl_is_optional(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool
         }
     }
     false
+}
+
+fn decl_has_intent_out(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::{Attribute, Intent};
+    let key = name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return attrs
+                        .iter()
+                        .any(|attr| matches!(attr, Attribute::Intent(Intent::Out)));
+                }
+            }
+        }
+    }
+    false
+}
+
+fn clear_intent_out_derived_params(
+    b: &mut FuncBuilder,
+    param_info: &[(String, ValueId, IrType, bool)],
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let mut stat_addr: Option<ValueId> = None;
+
+    for (pname, _, _, is_value) in param_info {
+        if *is_value || !decl_has_intent_out(pname, decls) {
+            continue;
+        }
+
+        let Some(info) = locals.get(pname) else {
+            continue;
+        };
+        if info.is_pointer
+            || info.allocatable
+            || local_uses_array_descriptor(info)
+            || !info.dims.is_empty()
+        {
+            continue;
+        }
+
+        let Some(type_name) = info.derived_type.as_ref() else {
+            continue;
+        };
+        let Some(layout) = type_layouts.get(type_name) else {
+            continue;
+        };
+
+        let stat = match stat_addr {
+            Some(addr) => addr,
+            None => {
+                let addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, addr);
+                stat_addr = Some(addr);
+                addr
+            }
+        };
+
+        if decl_is_optional(pname, decls) && info.by_ref {
+            let ptr_val = b.load(info.addr);
+            let zero = b.const_i64(0);
+            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let bb_clear = b.create_block("intent_out_clear_present");
+            let bb_skip = b.create_block("intent_out_clear_skip");
+            b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
+
+            b.set_block(bb_clear);
+            let storage = derived_storage_addr(b, info);
+            clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+            b.branch(bb_skip, vec![]);
+
+            b.set_block(bb_skip);
+            continue;
+        }
+
+        let storage = derived_storage_addr(b, info);
+        clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+    }
 }
 
 /// Metadata for one host-associated variable threaded into a contained
@@ -30316,6 +30415,72 @@ fn initialize_derived_array_storage_dynamic(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+}
+
+fn clear_derived_storage_for_intent_out(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+
+        if field.allocatable && is_deferred_char_component_field(field) {
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![field_ptr],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        if field.allocatable && field.size == 384 {
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![field_ptr, stat_addr],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        if field.pointer || field.allocatable {
+            continue;
+        }
+
+        let Some(nested_name) = field_derived_type_name(field) else {
+            continue;
+        };
+        let Some(nested_layout) = registry.get(&nested_name) else {
+            continue;
+        };
+
+        if field.dims.is_empty() {
+            clear_derived_storage_for_intent_out(b, field_ptr, nested_layout, registry, stat_addr);
+            continue;
+        }
+
+        let elem_count: i64 = field.dims.iter().map(|(_, extent)| *extent).product();
+        if elem_count <= 0 {
+            continue;
+        }
+        let elem_bytes = nested_layout.size as i64;
+        for idx in 0..elem_count {
+            let byte_off = b.const_i64(idx * elem_bytes);
+            let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
+            clear_derived_storage_for_intent_out(
+                b,
+                elem_ptr,
+                nested_layout,
+                registry,
+                stat_addr,
+            );
+        }
+    }
+
+    zero_fill_bytes(b, base_addr, layout.size as i64);
 }
 
 fn apply_derived_field_default_inits(
