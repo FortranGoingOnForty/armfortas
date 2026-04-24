@@ -14019,10 +14019,10 @@ fn lower_intrinsic_subroutine(
         }
     }
 
-    fn nth_arg_expr<'a>(
-        args: &'a [Option<crate::ast::expr::Argument>],
+    fn nth_arg_expr(
+        args: &[Option<crate::ast::expr::Argument>],
         idx: usize,
-    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+    ) -> Option<&crate::ast::expr::SpannedExpr> {
         let arg = args.get(idx)?.as_ref()?;
         if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
             Some(expr)
