@@ -32681,7 +32681,26 @@ fn lower_expr_full(
                                 }
                                 _ => None,
                             })
-                            .map(|target_ty| coerce_to_type(b, result, &target_ty))
+                            .map(|target_ty| {
+                                // Complex intrinsics materialize pointer-backed
+                                // two-lane buffers. Keep that pointer form at the
+                                // expression boundary so downstream complex
+                                // assignment/call paths can memcpy from the
+                                // buffer address instead of treating lane 0 as a
+                                // fake pointer.
+                                let result_ty = b.func().value_type(result);
+                                if is_complex_ty(&target_ty)
+                                    && matches!(
+                                        result_ty,
+                                        Some(IrType::Ptr(ref inner))
+                                            if inner.as_ref() == &target_ty
+                                    )
+                                {
+                                    result
+                                } else {
+                                    coerce_to_type(b, result, &target_ty)
+                                }
+                            })
                             .unwrap_or(result);
                         return coerced;
                     }
