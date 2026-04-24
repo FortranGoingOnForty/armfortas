@@ -3641,12 +3641,14 @@ fn lower_unit(
                         result_derived_type.as_deref(),
                         type_layouts,
                     );
+                    let result_dims =
+                        arg_dims_from_decls(&result_name, decls, &visible_param_consts, st);
                     ctx.locals.insert(
                         result_name.clone(),
                         LocalInfo {
                             addr: ValueId(0),
                             ty: local_elem_ty,
-                            dims: vec![],
+                            dims: result_dims,
                             allocatable: true,
                             descriptor_arg: false,
                             by_ref: false,
@@ -5915,7 +5917,10 @@ fn alloc_decls(
                             },
                             inline_const: None,
                             is_pointer: true,
-                            runtime_dim_upper: vec![],
+                            runtime_dim_upper: array_spec
+                                .as_ref()
+                                .map(|specs| vec![None; specs.len()])
+                                .unwrap_or_default(),
                         },
                     );
                     continue;
@@ -6456,7 +6461,10 @@ fn alloc_decls(
                             },
                             inline_const: None,
                             is_pointer: false,
-                            runtime_dim_upper: vec![],
+                            runtime_dim_upper: array_spec
+                                .as_ref()
+                                .map(|specs| vec![None; specs.len()])
+                                .unwrap_or_default(),
                         },
                     );
                 } else if let Some(specs) = array_spec {
@@ -15623,6 +15631,10 @@ fn local_fixed_char_allocatable_scalar_len(info: &LocalInfo) -> Option<i64> {
     }
 }
 
+fn local_declared_rank(info: &LocalInfo) -> usize {
+    info.dims.len().max(info.runtime_dim_upper.len())
+}
+
 fn allocated_array_elem_size(
     b: &mut FuncBuilder,
     info: &LocalInfo,
@@ -15643,12 +15655,14 @@ fn allocated_array_elem_size(
 }
 
 fn local_is_string_scalar(info: &LocalInfo) -> bool {
-    (info.allocatable && info.dims.is_empty() && matches!(info.char_kind, CharKind::Deferred))
+    (info.allocatable
+        && local_declared_rank(info) == 0
+        && matches!(info.char_kind, CharKind::Deferred))
         || local_fixed_char_allocatable_scalar_len(info).is_some()
 }
 
 fn local_is_array_like(info: &LocalInfo) -> bool {
-    (!info.dims.is_empty() || info.allocatable) && !local_is_string_scalar(info)
+    (local_declared_rank(info) > 0 || info.allocatable) && !local_is_string_scalar(info)
 }
 
 fn resolved_named_character_return_abi_for_call(
@@ -17315,6 +17329,77 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             IrType::Void,
                                         );
                                     }
+                                } else if local_uses_array_descriptor(&info)
+                                    && local_declared_rank(&info) == 0
+                                    && info.derived_type.is_some()
+                                    && ctx
+                                        .st
+                                        .find_symbol_any_scope(&key)
+                                        .and_then(|sym| sym.type_info.as_ref())
+                                        .is_some_and(|ti| {
+                                            matches!(ti, crate::sema::symtab::TypeInfo::Derived(_))
+                                        })
+                                {
+                                    let desc = array_descriptor_addr(b, &info);
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero32 = b.const_i32(0);
+                                    let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let alloc_bb = b.create_block("scalar_derived_assign_alloc");
+                                    let copy_bb = b.create_block("scalar_derived_assign_copy");
+                                    let done_bb = b.create_block("scalar_derived_assign_done");
+                                    b.cond_branch(
+                                        needs_alloc,
+                                        alloc_bb,
+                                        vec![],
+                                        copy_bb,
+                                        vec![],
+                                    );
+
+                                    b.set_block(alloc_bb);
+                                    if let Some(ref tn) = info.derived_type {
+                                        if let Some(layout) = ctx.type_layouts.get(tn) {
+                                            let elem_size = b.const_i64(layout.size as i64);
+                                            let rank_val = b.const_i32(0);
+                                            let null_ptr = b.const_i64(0);
+                                            b.call(
+                                                FuncRef::External("afs_allocate_array".into()),
+                                                vec![desc, elem_size, rank_val, null_ptr, null_ptr],
+                                                IrType::Void,
+                                            );
+                                            if derived_layout_needs_runtime_initialization(
+                                                layout,
+                                                ctx.type_layouts,
+                                            ) {
+                                                let base_ptr = b.load_typed(
+                                                    desc,
+                                                    IrType::Ptr(Box::new(IrType::Int(
+                                                        IntWidth::I8,
+                                                    ))),
+                                                );
+                                                initialize_derived_storage(
+                                                    b,
+                                                    base_ptr,
+                                                    layout,
+                                                    ctx.type_layouts,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    b.branch(copy_bb, vec![]);
+
+                                    b.set_block(copy_bb);
+                                    let val = lower_expr_ctx_tl(b, ctx, value);
+                                    let dest = derived_storage_addr(b, &info);
+                                    if let Some(ref tn) = info.derived_type {
+                                        emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
+                                    }
+                                    b.branch(done_bb, vec![]);
+                                    b.set_block(done_bb);
+                                    return;
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {
@@ -22614,6 +22699,129 @@ fn local_storage_size_bytes(
     descriptor_element_size_bytes(info)
 }
 
+fn whole_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<(ValueId, LocalInfo)> {
+    let tl = type_layouts?;
+    let info = whole_array_expr_local_info(b, locals, expr, st, tl)?;
+    let desc = if local_uses_array_descriptor(&info) {
+        array_descriptor_addr(b, &info)
+    } else {
+        materialize_array_descriptor_for_info(b, &info)
+    };
+    Some((desc, info))
+}
+
+fn array_constructor_contains_whole_array_expr(
+    locals: &HashMap<String, LocalInfo>,
+    values: &[crate::ast::expr::AcValue],
+) -> bool {
+    values.iter().any(|value| match value {
+        crate::ast::expr::AcValue::Expr(expr) => whole_array_expr_info(locals, expr).is_some(),
+        crate::ast::expr::AcValue::ImpliedDo(ido) => {
+            array_constructor_contains_whole_array_expr(locals, &ido.values)
+        }
+    })
+}
+
+fn lower_runtime_array_constructor_len(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    let mut total = b.const_i64(0);
+    for value in values {
+        let item_len = match value {
+            crate::ast::expr::AcValue::Expr(expr) => {
+                if let Some((desc, _)) = whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
+                {
+                    b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    )
+                } else {
+                    b.const_i64(1)
+                }
+            }
+            crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+        };
+        total = b.iadd(total, item_len);
+    }
+    Some(total)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_runtime_array_constructor_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    elem_ty: &IrType,
+    derived_type: Option<&str>,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let total_n = lower_runtime_array_constructor_len(b, locals, values, st, type_layouts)?;
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
+    let lower = b.const_i64(1);
+    let zero64 = b.const_i64(0);
+    let has_elems = b.icmp(CmpOp::Gt, total_n, zero64);
+    let upper = b.select(has_elems, total_n, zero64);
+    let stride = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let eight = b.const_i64(8);
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let sixteen = b.const_i64(16);
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(lower, lower_ptr);
+    b.store(upper, upper_ptr);
+    b.store(stride, stride_ptr);
+
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let rank = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![desc, elem_size, rank, bounds, stat],
+        IrType::Void,
+    );
+
+    let dest_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    store_ac_values_into(
+        b,
+        locals,
+        dest_base,
+        elem_ty,
+        derived_type,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    Some(desc)
+}
+
 /// Store the literal values of an array constructor into a
 /// destination buffer, one element at a time via byte-level GEP.
 ///
@@ -22657,6 +22865,57 @@ fn store_ac_values_into(
     for v in values {
         match v {
             crate::ast::expr::AcValue::Expr(e) => {
+                if let Some((src_desc, _)) =
+                    whole_array_expr_descriptor(b, locals, e, st, type_layouts)
+                {
+                    let src_n = b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![src_desc],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    let src_stride = load_array_desc_i64_field(b, src_desc, 24 + 16);
+                    let src_base =
+                        b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+                    b.store(zero64, i_addr);
+
+                    let bb_check = b.create_block("ac_whole_array_check");
+                    let bb_body = b.create_block("ac_whole_array_body");
+                    let bb_exit = b.create_block("ac_whole_array_exit");
+                    b.branch(bb_check, vec![]);
+
+                    b.set_block(bb_check);
+                    let i = b.load(i_addr);
+                    let done = b.icmp(CmpOp::Ge, i, src_n);
+                    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+                    b.set_block(bb_body);
+                    let i_val = b.load(i_addr);
+                    let src_index = b.imul(i_val, src_stride);
+                    let src_off = b.imul(src_index, step_bytes);
+                    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+
+                    let cur_off = b.load(off_slot);
+                    let dest_ptr = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+
+                    if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
+                        emit_derived_value_copy(b, tl, type_name, dest_ptr, src_ptr);
+                    } else {
+                        let raw = b.load_typed(src_ptr, elem_ty.clone());
+                        b.store(raw, dest_ptr);
+                    }
+
+                    let next_off = b.iadd(cur_off, step_bytes);
+                    b.store(next_off, off_slot);
+                    let one = b.const_i64(1);
+                    let next_i = b.iadd(i_val, one);
+                    b.store(next_i, i_addr);
+                    b.branch(bb_check, vec![]);
+
+                    b.set_block(bb_exit);
+                    continue;
+                }
+
                 let raw = lower_expr_full(
                     b,
                     locals,
@@ -28276,7 +28535,7 @@ fn lower_array_assign(
         .derived_type
         .as_deref()
         .and_then(|name| ctx.type_layouts.get(name))
-        .is_some_and(|layout| derived_layout_needs_runtime_initialization(layout, ctx.type_layouts));
+        .is_some_and(|layout| derived_layout_needs_deep_copy(layout, ctx.type_layouts));
 
     let dest_symbol_allocatable = (!dest_name.is_empty())
         .then(|| ctx.st.find_symbol_any_scope(&dest_name.to_lowercase()))
@@ -28286,6 +28545,85 @@ fn lower_array_assign(
     if local_uses_array_descriptor(dest_info) && (dest_info.allocatable || dest_symbol_allocatable)
     {
         let dest_desc = array_descriptor_addr(b, dest_info);
+        if let Expr::ArrayConstructor { values, .. } = &value.node {
+            if array_constructor_contains_whole_array_expr(&ctx.locals, values) {
+                if let Some(src_desc) = lower_runtime_array_constructor_descriptor(
+                    b,
+                    &ctx.locals,
+                    &dest_info.ty,
+                    dest_info.derived_type.as_deref(),
+                    values,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) {
+                    if !derived_array_needs_deep_copy {
+                        b.call(
+                            FuncRef::External("afs_assign_allocatable".into()),
+                            vec![dest_desc, src_desc],
+                            IrType::Void,
+                        );
+                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                        let zero32 = b.const_i32(0);
+                        b.store(zero32, tmp_stat);
+                        b.call(
+                            FuncRef::External("afs_deallocate_array".into()),
+                            vec![src_desc, tmp_stat],
+                            IrType::Void,
+                        );
+                        return;
+                    }
+
+                    if let Some(type_name) = dest_info.derived_type.as_deref() {
+                        if ctx.type_layouts.get(type_name).is_some() {
+                            let stat = b.alloca(IrType::Int(IntWidth::I32));
+                            let zero32 = b.const_i32(0);
+                            b.store(zero32, stat);
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![dest_desc, stat],
+                                IrType::Void,
+                            );
+                            let null_stat = b.const_i64(0);
+                            b.call(
+                                FuncRef::External("afs_allocate_like".into()),
+                                vec![dest_desc, src_desc, null_stat],
+                                IrType::Void,
+                            );
+                            let dest_base = b.load_typed(
+                                dest_desc,
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let dest_n = b.call(
+                                FuncRef::External("afs_array_size".into()),
+                                vec![dest_desc],
+                                IrType::Int(IntWidth::I64),
+                            );
+                            let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+                            lower_derived_array_copy_from_desc(
+                                b,
+                                ctx,
+                                type_name,
+                                dest_base,
+                                dest_n,
+                                dest_stride,
+                                src_desc,
+                            );
+                            let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                            b.store(zero32, tmp_stat);
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![src_desc, tmp_stat],
+                                IrType::Void,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if let Expr::FunctionCall {
             callee,
             args: call_args,
@@ -28350,6 +28688,54 @@ fn lower_array_assign(
                     IrType::Void,
                 );
                 return;
+            }
+
+            if let Some(type_name) = dest_info.derived_type.as_deref() {
+                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero32 = b.const_i32(0);
+                    b.store(zero32, stat);
+                    b.call(
+                        FuncRef::External("afs_deallocate_array".into()),
+                        vec![dest_desc, stat],
+                        IrType::Void,
+                    );
+                    let null_stat = b.const_i64(0);
+                    b.call(
+                        FuncRef::External("afs_allocate_like".into()),
+                        vec![dest_desc, src_desc, null_stat],
+                        IrType::Void,
+                    );
+                    let dest_base = b.load_typed(
+                        dest_desc,
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    let dest_n = b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![dest_desc],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    if derived_layout_needs_runtime_initialization(layout, ctx.type_layouts) {
+                        initialize_derived_array_storage_dynamic(
+                            b,
+                            dest_base,
+                            layout,
+                            dest_n,
+                            ctx.type_layouts,
+                        );
+                    }
+                    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+                    lower_derived_array_copy_from_desc(
+                        b,
+                        ctx,
+                        type_name,
+                        dest_base,
+                        dest_n,
+                        dest_stride,
+                        src_desc,
+                    );
+                    return;
+                }
             }
         }
     }
@@ -29794,6 +30180,28 @@ fn derived_layout_needs_runtime_initialization(
         || derived_layout_has_runtime_field_defaults(layout, registry)
 }
 
+fn derived_layout_needs_deep_copy(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    layout.fields.iter().any(|field| {
+        if field.allocatable && is_deferred_char_component_field(field) {
+            return true;
+        }
+        if field.allocatable && field.size == 384 {
+            return true;
+        }
+        if !field.pointer && !field.allocatable && field.dims.is_empty() {
+            if let Some(nested_name) = field_derived_type_name(field) {
+                return registry
+                    .get(&nested_name)
+                    .is_some_and(|nested| derived_layout_needs_deep_copy(nested, registry));
+            }
+        }
+        false
+    })
+}
+
 fn initialize_derived_storage(
     b: &mut FuncBuilder,
     base_addr: ValueId,
@@ -29824,6 +30232,42 @@ fn initialize_derived_array_storage(
         let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
         initialize_derived_storage(b, elem_ptr, layout, registry);
     }
+}
+
+fn initialize_derived_array_storage_dynamic(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    elem_count: ValueId,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("derived_array_init_check");
+    let bb_body = b.create_block("derived_array_init_body");
+    let bb_exit = b.create_block("derived_array_init_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, elem_count);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let elem_bytes = b.const_i64(layout.size as i64);
+    let i_val = b.load(i_addr);
+    let byte_off = b.imul(i_val, elem_bytes);
+    let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
+    initialize_derived_storage(b, elem_ptr, layout, registry);
+
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
 }
 
 fn apply_derived_field_default_inits(
@@ -30534,7 +30978,7 @@ fn stabilize_derived_call_result(
 fn derived_storage_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.is_pointer {
         b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-    } else if info.allocatable {
+    } else if local_uses_array_descriptor(info) {
         array_base_addr(b, info)
     } else if info.by_ref {
         b.load(info.addr)
@@ -32256,6 +32700,26 @@ fn lower_arg_by_ref_full(
             if let Some((field_ptr, field)) =
                 resolve_component_field_access(b, locals, expr, st, tl)
             {
+                if matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_))
+                    && !is_opaque_c_handle_type(&field.type_info)
+                    && field.dims.is_empty()
+                    && !field.pointer
+                {
+                    let info = LocalInfo {
+                        addr: field_ptr,
+                        ty: field_storage_ir_type(&field, tl),
+                        dims: field.dims.clone(),
+                        allocatable: field.allocatable,
+                        descriptor_arg: field_uses_array_descriptor(&field),
+                        by_ref: false,
+                        char_kind: field_char_kind(&field),
+                        derived_type: field_derived_type_name(&field),
+                        inline_const: None,
+                        is_pointer: false,
+                        runtime_dim_upper: vec![],
+                    };
+                    return derived_scalar_storage_addr_for_call(b, &info);
+                }
                 if field.pointer {
                     if is_deferred_char_component_field(&field) {
                         return field_ptr;

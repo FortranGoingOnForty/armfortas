@@ -20386,6 +20386,250 @@ fn imported_cross_module_descriptor_callback_array_constructor_preserves_procptr
 }
 
 #[test]
+fn imported_framework_testsuite_array_constructor_reallocates_zero_len_target() {
+    let dir = unique_dir("imported_framework_testsuite_zero_len");
+    let framework_src = write_program_in(
+        &dir,
+        "framework.f90",
+        "module framework\n  implicit none\n  type :: error_type\n    integer :: stat = 0\n  end type\n  abstract interface\n    subroutine test_interface(error)\n      import :: error_type\n      type(error_type), allocatable, intent(out) :: error\n    end subroutine\n  end interface\n  type :: unittest_type\n    character(len=:), allocatable :: name\n    procedure(test_interface), pointer, nopass :: test => null()\n    logical :: should_fail = .false.\n  contains\n    final :: destroy_unittest\n  end type\n  abstract interface\n    subroutine collect_interface(testsuite)\n      import :: unittest_type\n      type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    end subroutine\n  end interface\n  type :: testsuite_type\n    character(len=:), allocatable :: name\n    procedure(collect_interface), pointer, nopass :: collect => null()\n  contains\n    final :: destroy_testsuite\n  end type\ncontains\n  function new_unittest(name, test) result(self)\n    character(len=*), intent(in) :: name\n    procedure(test_interface) :: test\n    type(unittest_type) :: self\n    self%name = name\n    self%test => test\n  end function\n  subroutine destroy_unittest(self)\n    type(unittest_type), intent(inout) :: self\n    if (allocated(self%name)) deallocate(self%name)\n    self%test => null()\n  end subroutine\n  function new_testsuite(name, collect) result(self)\n    character(len=*), intent(in) :: name\n    procedure(collect_interface) :: collect\n    type(testsuite_type) :: self\n    self%name = name\n    self%collect => collect\n  end function\n  subroutine destroy_testsuite(self)\n    type(testsuite_type), intent(inout) :: self\n    if (allocated(self%name)) deallocate(self%name)\n    self%collect => null()\n  end subroutine\nend module\n",
+    );
+    let collect_1_src = write_program_in(
+        &dir,
+        "collect_1.f90",
+        "module collect_1_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_1(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t1', test_1)]\n  end subroutine\n  subroutine test_1(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let collect_2_src = write_program_in(
+        &dir,
+        "collect_2.f90",
+        "module collect_2_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_2(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t2', test_2)]\n  end subroutine\n  subroutine test_2(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let collect_3_src = write_program_in(
+        &dir,
+        "collect_3.f90",
+        "module collect_3_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_3(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t3', test_3)]\n  end subroutine\n  subroutine test_3(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let collect_4_src = write_program_in(
+        &dir,
+        "collect_4.f90",
+        "module collect_4_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_4(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t4', test_4)]\n  end subroutine\n  subroutine test_4(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let collect_5_src = write_program_in(
+        &dir,
+        "collect_5.f90",
+        "module collect_5_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_5(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t5', test_5)]\n  end subroutine\n  subroutine test_5(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let collect_6_src = write_program_in(
+        &dir,
+        "collect_6.f90",
+        "module collect_6_mod\n  use framework, only : unittest_type, error_type, new_unittest\n  implicit none\ncontains\n  subroutine collect_6(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t6', test_6)]\n  end subroutine\n  subroutine test_6(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use framework, only : testsuite_type, new_testsuite\n  use collect_1_mod, only : collect_1\n  use collect_2_mod, only : collect_2\n  use collect_3_mod, only : collect_3\n  use collect_4_mod, only : collect_4\n  use collect_5_mod, only : collect_5\n  use collect_6_mod, only : collect_6\n  implicit none\n  type(testsuite_type), allocatable :: testsuites(:)\n\n  allocate(testsuites(0))\n  testsuites = [ &\n    new_testsuite('one', collect_1), &\n    new_testsuite('two', collect_2), &\n    new_testsuite('three', collect_3), &\n    new_testsuite('four', collect_4), &\n    new_testsuite('five', collect_5), &\n    new_testsuite('six', collect_6) &\n  ]\n\n  if (size(testsuites) /= 6) error stop 1\n  if (.not. associated(testsuites(1)%collect)) error stop 2\n  if (.not. associated(testsuites(6)%collect)) error stop 3\n  if (trim(testsuites(1)%name) /= 'one') error stop 4\n  if (trim(testsuites(6)%name) /= 'six') error stop 5\n  print *, 'ok'\nend program\n",
+    );
+
+    let framework_obj = dir.join("framework.o");
+    let compile_framework = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            framework_src.to_str().unwrap(),
+            "-o",
+            framework_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("framework compile spawn failed");
+    assert!(
+        compile_framework.status.success(),
+        "framework compile should succeed: {}",
+        String::from_utf8_lossy(&compile_framework.stderr)
+    );
+
+    let collect_1_obj = dir.join("collect_1.o");
+    let compile_collect_1 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_1_src.to_str().unwrap(),
+            "-o",
+            collect_1_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_1 compile spawn failed");
+    assert!(
+        compile_collect_1.status.success(),
+        "collect_1 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_1.stderr)
+    );
+    let collect_2_obj = dir.join("collect_2.o");
+    let compile_collect_2 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_2_src.to_str().unwrap(),
+            "-o",
+            collect_2_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_2 compile spawn failed");
+    assert!(
+        compile_collect_2.status.success(),
+        "collect_2 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_2.stderr)
+    );
+    let collect_3_obj = dir.join("collect_3.o");
+    let compile_collect_3 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_3_src.to_str().unwrap(),
+            "-o",
+            collect_3_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_3 compile spawn failed");
+    assert!(
+        compile_collect_3.status.success(),
+        "collect_3 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_3.stderr)
+    );
+    let collect_4_obj = dir.join("collect_4.o");
+    let compile_collect_4 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_4_src.to_str().unwrap(),
+            "-o",
+            collect_4_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_4 compile spawn failed");
+    assert!(
+        compile_collect_4.status.success(),
+        "collect_4 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_4.stderr)
+    );
+    let collect_5_obj = dir.join("collect_5.o");
+    let compile_collect_5 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_5_src.to_str().unwrap(),
+            "-o",
+            collect_5_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_5 compile spawn failed");
+    assert!(
+        compile_collect_5.status.success(),
+        "collect_5 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_5.stderr)
+    );
+    let collect_6_obj = dir.join("collect_6.o");
+    let compile_collect_6 = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            collect_6_src.to_str().unwrap(),
+            "-o",
+            collect_6_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("collect_6 compile spawn failed");
+    assert!(
+        compile_collect_6.status.success(),
+        "collect_6 compile should succeed: {}",
+        String::from_utf8_lossy(&compile_collect_6.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "main compile should succeed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_framework_testsuite_zero_len.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            framework_obj.to_str().unwrap(),
+            collect_1_obj.to_str().unwrap(),
+            collect_2_obj.to_str().unwrap(),
+            collect_3_obj.to_str().unwrap(),
+            collect_4_obj.to_str().unwrap(),
+            collect_5_obj.to_str().unwrap(),
+            collect_6_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported framework testsuite link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported framework testsuite link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported framework testsuite run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported framework testsuite output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn public_type_emits_private_nested_type_layouts_needed_cross_tu() {
     let dir = unique_dir("private_nested_layout");
     let mod_src = write_program_in(
@@ -20960,6 +21204,228 @@ fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected polymorphic component array indexing output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn extended_type_allocatable_component_array_assignment_handles_default_inited_elements() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: token_t\n    integer :: x = 0\n  end type token_t\n  type, abstract :: abstract_lexer\n  contains\n    procedure(next_i), deferred :: next\n  end type abstract_lexer\n  abstract interface\n    subroutine next_i(self, tok)\n      import :: abstract_lexer, token_t\n      class(abstract_lexer), intent(inout) :: self\n      type(token_t), intent(out) :: tok\n    end subroutine next_i\n  end interface\n  type, extends(abstract_lexer) :: lexer_t\n    character(len=:), allocatable :: filename\n    integer :: pos = 0\n    character(len=:), allocatable :: chunk\n  contains\n    procedure :: next => lexer_noop\n  end type lexer_t\n  type, extends(lexer_t) :: mocked_lexer_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next => mocked_next\n  end type mocked_lexer_t\ncontains\n  subroutine lexer_noop(self, tok)\n    class(lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos\n    tok%x = -1\n  end subroutine lexer_noop\n  subroutine mocked_next(self, tok)\n    class(mocked_lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos + 1\n    tok = self%token(self%pos)\n  end subroutine mocked_next\n  subroutine init_all(lexer, string, token)\n    type(mocked_lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    type(token_t), intent(in) :: token(:)\n    lexer%filename = 'mocked'\n    lexer%pos = 0\n    lexer%chunk = string\n    lexer%token = token\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(mocked_lexer_t) :: lex\n  type(token_t) :: tok(1)\n  tok(1)%x = 7\n  call init_all(lex, '}', tok)\n  if (.not. allocated(lex%filename)) error stop 1\n  if (.not. allocated(lex%chunk)) error stop 2\n  if (.not. allocated(lex%token)) error stop 3\n  if (trim(lex%filename) /= 'mocked') error stop 4\n  if (lex%chunk /= '}') error stop 5\n  if (size(lex%token) /= 1) error stop 6\n  if (lex%token(1)%x /= 7) error stop 7\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("extended_component_array_default_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("extended component array default-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "extended component array default-init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("extended component array default-init run failed");
+    assert!(
+        run.status.success(),
+        "extended component array default-init run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected extended component array default-init output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn extended_type_allocatable_component_array_assignment_deep_copies_nested_allocatables() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: token_t\n    character(len=:), allocatable :: text\n  end type token_t\n  type, abstract :: abstract_lexer\n  contains\n    procedure(next_i), deferred :: next\n  end type abstract_lexer\n  abstract interface\n    subroutine next_i(self, tok)\n      import :: abstract_lexer, token_t\n      class(abstract_lexer), intent(inout) :: self\n      type(token_t), intent(out) :: tok\n    end subroutine next_i\n  end interface\n  type, extends(abstract_lexer) :: lexer_t\n    character(len=:), allocatable :: filename\n    integer :: pos = 0\n    character(len=:), allocatable :: chunk\n  contains\n    procedure :: next => lexer_noop\n  end type lexer_t\n  type, extends(lexer_t) :: mocked_lexer_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next => mocked_next\n  end type mocked_lexer_t\ncontains\n  subroutine lexer_noop(self, tok)\n    class(lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos\n    tok%text = ''\n  end subroutine lexer_noop\n  subroutine mocked_next(self, tok)\n    class(mocked_lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos + 1\n    tok = self%token(self%pos)\n  end subroutine mocked_next\n  subroutine init_all(lexer, string, token)\n    type(mocked_lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    type(token_t), intent(in) :: token(:)\n    lexer%filename = 'mocked'\n    lexer%pos = 0\n    lexer%chunk = string\n    lexer%token = token\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(mocked_lexer_t) :: lex\n  type(token_t), allocatable :: tok(:)\n  allocate(tok(1))\n  tok(1)%text = 'abc'\n  call init_all(lex, '}', tok)\n  tok(1)%text = 'zzz'\n  if (.not. allocated(lex%token)) error stop 1\n  if (.not. allocated(lex%token(1)%text)) error stop 2\n  if (lex%token(1)%text /= 'abc') error stop 3\n  print *, trim(lex%token(1)%text)\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("extended_component_array_deep_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("extended component array deep-copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "extended component array deep-copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("extended component array deep-copy run failed");
+    assert!(
+        run.status.success(),
+        "extended component array deep-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("abc"),
+        "unexpected extended component array deep-copy output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_scalar_derived_structure_constructor_assignment_preserves_allocatable_fields() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: label_t\n    integer :: level = 0\n    logical :: primary = .false.\n    integer :: first = 0\n    integer :: last = 0\n    character(len=:), allocatable :: text\n    character(len=:), allocatable :: source\n  end type label_t\n  interface label_t\n    module procedure new_label\n  end interface\n  type :: diagnostic_t\n    integer :: level = 0\n    character(len=:), allocatable :: message\n    character(len=:), allocatable :: source\n    type(label_t), allocatable :: label(:)\n  end type diagnostic_t\n  interface diagnostic_t\n    module procedure new_diagnostic\n  end interface\ncontains\n  pure function new_label(level, first, last, text, primary) result(new)\n    integer, intent(in) :: level, first, last\n    character(len=*), intent(in), optional :: text\n    logical, intent(in), optional :: primary\n    type(label_t) :: new\n    new%level = level\n    new%first = first\n    new%last = last\n    if (present(text)) new%text = text\n    if (present(primary)) new%primary = primary\n  end function new_label\n  pure function new_diagnostic(level, message, source, label) result(new)\n    integer, intent(in) :: level\n    character(len=*), intent(in), optional :: message, source\n    type(label_t), intent(in), optional :: label(:)\n    type(diagnostic_t) :: new\n    new%level = level\n    if (present(message)) new%message = message\n    if (present(source)) new%source = source\n    if (present(label)) new%label = label\n  end function new_diagnostic\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(diagnostic_t), allocatable :: diagnostic\n  allocate(diagnostic)\n  diagnostic = diagnostic_t(0, 'Invalid expression', 'mocked', [label_t(0, 1, 1, 'unexpected token', .true.)])\n  if (.not. allocated(diagnostic)) error stop 1\n  if (.not. allocated(diagnostic%message)) error stop 2\n  if (.not. allocated(diagnostic%source)) error stop 3\n  if (.not. allocated(diagnostic%label)) error stop 4\n  if (diagnostic%message /= 'Invalid expression') error stop 5\n  if (diagnostic%source /= 'mocked') error stop 6\n  if (size(diagnostic%label) /= 1) error stop 7\n  if (.not. allocated(diagnostic%label(1)%text)) error stop 8\n  if (diagnostic%label(1)%text /= 'unexpected token') error stop 9\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_scalar_ctor_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc scalar ctor assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc scalar ctor assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc scalar ctor assign run failed");
+    assert!(
+        run.status.success(),
+        "alloc scalar ctor assign run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc scalar ctor assign output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allocatable_fields() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: label_t\n    integer :: level = 0\n    logical :: primary = .false.\n    integer :: first = 0\n    integer :: last = 0\n    character(len=:), allocatable :: text\n    character(len=:), allocatable :: source\n  end type label_t\n  interface label_t\n    module procedure new_label\n  end interface\n  type :: diagnostic_t\n    integer :: level = 0\n    character(len=:), allocatable :: message\n    character(len=:), allocatable :: source\n    type(label_t), allocatable :: label(:)\n  end type diagnostic_t\n  interface diagnostic_t\n    module procedure new_diagnostic\n  end interface\ncontains\n  pure function new_label(level, first, last, text, primary) result(new)\n    integer, intent(in) :: level, first, last\n    character(len=*), intent(in), optional :: text\n    logical, intent(in), optional :: primary\n    type(label_t) :: new\n    new%level = level\n    new%first = first\n    new%last = last\n    if (present(text)) new%text = text\n    if (present(primary)) new%primary = primary\n  end function new_label\n  pure function new_diagnostic(level, message, source, label) result(new)\n    integer, intent(in) :: level\n    character(len=*), intent(in), optional :: message, source\n    type(label_t), intent(in), optional :: label(:)\n    type(diagnostic_t) :: new\n    new%level = level\n    if (present(message)) new%message = message\n    if (present(source)) new%source = source\n    if (present(label)) new%label = label\n  end function new_diagnostic\n  subroutine syntax_error(diagnostic, message, source)\n    type(diagnostic_t), allocatable, intent(out) :: diagnostic\n    character(len=*), intent(in) :: message, source\n    allocate(diagnostic)\n    diagnostic = diagnostic_t(0, message, source, [label_t(0, 1, 1, 'unexpected token', .true.)])\n  end subroutine syntax_error\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(diagnostic_t), allocatable :: diagnostic\n  call syntax_error(diagnostic, 'Invalid expression', 'mocked')\n  if (.not. allocated(diagnostic)) error stop 1\n  if (.not. allocated(diagnostic%message)) error stop 2\n  if (.not. allocated(diagnostic%source)) error stop 3\n  if (.not. allocated(diagnostic%label)) error stop 4\n  if (diagnostic%message /= 'Invalid expression') error stop 5\n  if (diagnostic%source /= 'mocked') error stop 6\n  if (size(diagnostic%label) /= 1) error stop 7\n  if (.not. allocated(diagnostic%label(1)%text)) error stop 8\n  if (diagnostic%label(1)%text /= 'unexpected token') error stop 9\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_intent_out_scalar_ctor_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc intent(out) scalar ctor assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc intent(out) scalar ctor assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc intent(out) scalar ctor assign run failed");
+    assert!(
+        run.status.success(),
+        "alloc intent(out) scalar ctor assign run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc intent(out) scalar ctor assign output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_derived_component_actual_passes_base_storage_to_value_dummy() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: diagnostic_t\n    character(len=:), allocatable :: message\n  end type diagnostic_t\ncontains\n  function render(diag) result(n)\n    type(diagnostic_t), intent(in) :: diag\n    integer :: n\n    if (.not. allocated(diag%message)) then\n      n = -1\n    else\n      n = len(diag%message)\n    end if\n  end function render\nend module repro\nprogram p\n  use repro\n  implicit none\n  type :: parser_t\n    type(diagnostic_t), allocatable :: diagnostic\n  end type parser_t\n  type(parser_t) :: parser\n  call syntax_error(parser%diagnostic, 'Invalid syntax')\n  if (render(parser%diagnostic) /= 14) error stop 1\n  print *, 'ok'\ncontains\n  subroutine syntax_error(diagnostic, message)\n    type(diagnostic_t), allocatable, intent(out) :: diagnostic\n    character(len=*), intent(in) :: message\n    allocate(diagnostic)\n    diagnostic%message = message\n  end subroutine syntax_error\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_render_base_storage", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc derived component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc derived component actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc derived component actual run failed");
+    assert!(
+        run.status.success(),
+        "alloc derived component actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc derived component actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_array_result_append_preserves_declared_rank() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: line_token\n    integer :: first = 0\n    integer :: last = 0\n  end type line_token\n  character(len=*), parameter :: nl = new_line('a')\ncontains\n  pure function line_tokens(input) result(token)\n    character(len=*), intent(in) :: input\n    type(line_token), allocatable :: token(:)\n    integer :: first, last\n    first = 1\n    last = 1\n    allocate(token(0))\n    do while (last <= len(input))\n      if (input(last:last) /= nl) then\n        last = last + 1\n        cycle\n      end if\n      token = [token, line_token(first, last - 1)]\n      first = last + 1\n      last = first\n    end do\n    if (first <= len(input)) then\n      token = [token, line_token(first, len(input))]\n    end if\n  end function line_tokens\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(line_token), allocatable :: token(:)\n  token = line_tokens('}')\n  if (size(token) /= 1) error stop 1\n  if (token(1)%first /= 1) error stop 2\n  if (token(1)%last /= 1) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_array_result_append_rank", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc array result append compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc array result append compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc array result append run failed");
+    assert!(
+        run.status.success(),
+        "alloc array result append run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc array result append output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
