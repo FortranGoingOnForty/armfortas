@@ -21764,6 +21764,43 @@ fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch(
 }
 
 #[test]
+fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: indexarray(:)\n  integer :: i, low, high\n  low = 1\n  high = 10\n  allocate(indexarray(high), source=[(i, i=low, high)])\n  do i = 1, high\n    if (indexarray(i) /= i) error stop 1\n  end do\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_source_implied_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc source implied-do compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc source implied-do compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc source implied-do run failed");
+    assert!(
+        run.status.success(),
+        "alloc source implied-do run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc source implied-do output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
     let src = write_program(
         "module repro\n  implicit none\n  type :: lexer_t\n    character(len=:), allocatable :: filename\n    integer, allocatable :: stack(:)\n  end type lexer_t\ncontains\n  subroutine init_all(lexer, string)\n    type(lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    if (allocated(lexer%filename)) print *, 'STALE_NAME'\n    if (allocated(lexer%stack)) print *, 'STALE_STACK', size(lexer%stack)\n    lexer%filename = string\n    allocate(lexer%stack(8))\n    print *, 'OK'\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  call init_all(lexer, 'first')\n  call init_all(lexer, 'second')\n  call init_all(lexer, 'third')\n  if (.not. allocated(lexer%filename)) error stop 1\n  if (.not. allocated(lexer%stack)) error stop 2\n  if (lexer%filename /= 'third') error stop 3\n  if (size(lexer%stack) /= 8) error stop 4\nend program p\n",

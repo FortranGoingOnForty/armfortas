@@ -22978,12 +22978,112 @@ fn lower_runtime_array_constructor_len(
     values: &[crate::ast::expr::AcValue],
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    fn lower_runtime_implied_do_trip_count(
+        b: &mut FuncBuilder,
+        locals: &HashMap<String, LocalInfo>,
+        ido: &crate::ast::expr::ImpliedDoLoop,
+        st: &SymbolTable,
+        type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+        internal_funcs: Option<&HashMap<String, u32>>,
+        contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+        descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    ) -> ValueId {
+        let start_raw = lower_expr_full(
+            b,
+            locals,
+            &ido.start,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let start = widen_idx_to_i64(b, start_raw);
+        let end_raw = lower_expr_full(
+            b,
+            locals,
+            &ido.end,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let end = widen_idx_to_i64(b, end_raw);
+        let step = ido
+            .step
+            .as_ref()
+            .map(|expr| {
+                let step_raw = lower_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                widen_idx_to_i64(b, step_raw)
+            })
+            .unwrap_or_else(|| b.const_i64(1));
+
+        let zero = b.const_i64(0);
+        let one = b.const_i64(1);
+        let done_bb = b.create_block("ac_len_impdo_done");
+        let done_val = b.add_block_param(done_bb, IrType::Int(IntWidth::I64));
+        let zero_bb = b.create_block("ac_len_impdo_zero");
+        let sign_bb = b.create_block("ac_len_impdo_sign");
+        let neg_bb = b.create_block("ac_len_impdo_neg");
+        let pos_bb = b.create_block("ac_len_impdo_pos");
+        let calc_neg_bb = b.create_block("ac_len_impdo_calc_neg");
+        let calc_pos_bb = b.create_block("ac_len_impdo_calc_pos");
+
+        let step_is_zero = b.icmp(CmpOp::Eq, step, zero);
+        b.cond_branch(step_is_zero, zero_bb, vec![], sign_bb, vec![]);
+
+        b.set_block(zero_bb);
+        b.branch(done_bb, vec![zero]);
+
+        b.set_block(sign_bb);
+        let step_is_neg = b.icmp(CmpOp::Lt, step, zero);
+        b.cond_branch(step_is_neg, neg_bb, vec![], pos_bb, vec![]);
+
+        b.set_block(neg_bb);
+        let neg_empty = b.icmp(CmpOp::Lt, start, end);
+        b.cond_branch(neg_empty, zero_bb, vec![], calc_neg_bb, vec![]);
+
+        b.set_block(calc_neg_bb);
+        let neg_span = b.isub(start, end);
+        let step_abs = b.ineg(step);
+        let neg_div = b.idiv(neg_span, step_abs);
+        let neg_trip = b.iadd(neg_div, one);
+        b.branch(done_bb, vec![neg_trip]);
+
+        b.set_block(pos_bb);
+        let pos_empty = b.icmp(CmpOp::Gt, start, end);
+        b.cond_branch(pos_empty, zero_bb, vec![], calc_pos_bb, vec![]);
+
+        b.set_block(calc_pos_bb);
+        let pos_span = b.isub(end, start);
+        let pos_div = b.idiv(pos_span, step);
+        let pos_trip = b.iadd(pos_div, one);
+        b.branch(done_bb, vec![pos_trip]);
+
+        b.set_block(done_bb);
+        done_val
+    }
+
     let mut total = b.const_i64(0);
     for value in values {
         let item_len = match value {
             crate::ast::expr::AcValue::Expr(expr) => {
-                if let Some((desc, _)) = whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
+                if let Some((desc, _)) =
+                    whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
                 {
                     b.call(
                         FuncRef::External("afs_array_size".into()),
@@ -22994,7 +23094,29 @@ fn lower_runtime_array_constructor_len(
                     b.const_i64(1)
                 }
             }
-            crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                let inner = lower_runtime_array_constructor_len(
+                    b,
+                    locals,
+                    &ido.values,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )?;
+                let trips = lower_runtime_implied_do_trip_count(
+                    b,
+                    locals,
+                    ido,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                b.imul(inner, trips)
+            }
         };
         total = b.iadd(total, item_len);
     }
@@ -23014,7 +23136,16 @@ fn lower_runtime_array_constructor_descriptor(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
-    let total_n = lower_runtime_array_constructor_len(b, locals, values, st, type_layouts)?;
+    let total_n = lower_runtime_array_constructor_len(
+        b,
+        locals,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
     let sz384 = b.const_i64(384);
@@ -28228,16 +28359,30 @@ fn lower_array_expr_descriptor(
                 Some(ti) => type_info_to_ir_type(ti),
                 None => infer_const_expr_ty(&first.node, st),
             };
-            let n = const_array_constructor_len(values)?;
-            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1) as u64);
-            let buf = b.alloca(arr_ty);
-            let zero = b.const_i64(0);
-            let base = b.gep(buf, vec![zero], elem_ty.clone());
             let derived_type = match first_ti.as_ref() {
                 Some(crate::sema::symtab::TypeInfo::Derived(name))
                 | Some(crate::sema::symtab::TypeInfo::Class(name)) => Some(name.as_str()),
                 _ => None,
             };
+            let Some(n) = const_array_constructor_len(values) else {
+                let desc = lower_runtime_array_constructor_descriptor(
+                    b,
+                    locals,
+                    &elem_ty,
+                    derived_type,
+                    values,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )?;
+                return Some((desc, elem_ty));
+            };
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1) as u64);
+            let buf = b.alloca(arr_ty);
+            let zero = b.const_i64(0);
+            let base = b.gep(buf, vec![zero], elem_ty.clone());
             if derived_type.is_some() {
                 let zero32 = b.const_i32(0);
                 let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1));
