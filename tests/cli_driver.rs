@@ -15009,6 +15009,116 @@ fn imported_amod_type_tags_stay_stable_across_tus() {
 }
 
 #[test]
+fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
+    let dir = unique_dir("amod_sibling_type_tags");
+    let value_src = write_program_in(
+        &dir,
+        "value_m.f90",
+        "module value_m\n  implicit none\n  type, abstract :: value_t\n    integer :: origin = 0\n  end type\nend module\n",
+    );
+    let table_src = write_program_in(
+        &dir,
+        "table_m.f90",
+        "module table_m\n  use value_m, only : value_t\n  implicit none\n  type, extends(value_t) :: table_t\n    integer :: a = 1\n  end type\nend module\n",
+    );
+    let array_src = write_program_in(
+        &dir,
+        "array_m.f90",
+        "module array_m\n  use value_m, only : value_t\n  implicit none\n  type, extends(value_t) :: array_t\n    integer :: b = 2\n  end type\nend module\n",
+    );
+    let holder_src = write_program_in(
+        &dir,
+        "holder_m.f90",
+        "module holder_m\n  use value_m, only : value_t\n  implicit none\n  type :: holder_t\n    class(value_t), allocatable :: val\n  contains\n    procedure :: get\n  end type\ncontains\n  subroutine get(self, ptr)\n    class(holder_t), intent(in), target :: self\n    class(value_t), pointer, intent(out) :: ptr\n    ptr => self%val\n  end subroutine\nend module\n",
+    );
+    let cast_src = write_program_in(
+        &dir,
+        "cast_m.f90",
+        "module cast_m\n  use value_m, only : value_t\n  use array_m, only : array_t\n  implicit none\ncontains\n  function cast_to_array(ptr) result(array)\n    class(value_t), intent(in), target :: ptr\n    type(array_t), pointer :: array\n    nullify(array)\n    select type(ptr)\n    type is(array_t)\n      array => ptr\n    end select\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use table_m, only : table_t\n  use holder_m, only : holder_t\n  use value_m, only : value_t\n  use cast_m, only : cast_to_array\n  use array_m, only : array_t\n  implicit none\n  type(holder_t) :: h\n  class(value_t), pointer :: ptr\n  type(array_t), pointer :: arr\n  allocate(table_t :: h%val)\n  h%val%origin = 7\n  call h%get(ptr)\n  arr => cast_to_array(ptr)\n  print *, 'ASSOC', associated(arr)\n  print *, 'ORIGIN', ptr%origin\n  if (associated(arr)) error stop 1\nend program\n",
+    );
+
+    let value_obj = dir.join("value_m.o");
+    let table_obj = dir.join("table_m.o");
+    let array_obj = dir.join("array_m.o");
+    let holder_obj = dir.join("holder_m.o");
+    let cast_obj = dir.join("cast_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("sibling_tags.bin");
+
+    for (src, obj, label, needs_imports) in [
+        (&value_src, &value_obj, "value module", false),
+        (&table_src, &table_obj, "table module", true),
+        (&array_src, &array_obj, "array module", true),
+        (&holder_src, &holder_obj, "holder module", true),
+        (&cast_src, &cast_obj, "cast module", true),
+        (&main_src, &main_obj, "main program", true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c").arg("-J").arg(dir.to_str().unwrap());
+        if needs_imports {
+            cmd.arg("-I").arg(dir.to_str().unwrap());
+        }
+        cmd.args([src.to_str().unwrap(), "-o", obj.to_str().unwrap()]);
+        let output = cmd.output().expect("split module compile spawn failed");
+        assert!(
+            output.status.success(),
+            "{} compile failed: {}",
+            label,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            cast_obj.to_str().unwrap(),
+            holder_obj.to_str().unwrap(),
+            array_obj.to_str().unwrap(),
+            table_obj.to_str().unwrap(),
+            value_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("sibling type-tag link spawn failed");
+    assert!(
+        link.status.success(),
+        "sibling type-tag link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("sibling type-tag run failed");
+    assert!(
+        run.status.success(),
+        "sibling type-tag runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ASSOC F"),
+        "sibling extensions should not share runtime tags: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ORIGIN 7"),
+        "unexpected sibling type-tag output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice() {
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n    integer :: origin = 0\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%origin = 5\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  if (q%origin /= 5) error stop 2\n  if (q%x /= 7) error stop 3\n  if (q%y /= 9) error stop 4\n  q%origin = 1\n  q%x = 11\n  if (q%origin /= 1) error stop 5\n  if (q%x /= 11) error stop 6\n  if (q%y /= 9) error stop 7\n  print *, 'ok'\nend program\n",
