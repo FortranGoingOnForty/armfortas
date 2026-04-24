@@ -1337,6 +1337,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             let liveness = crate::codegen::liveness::compute_liveness(mf);
             let result = linearscan::linear_scan(mf);
             linearscan::apply_allocation(mf, &result, &liveness);
+            linearscan::parallelize_call_arg_moves(mf);
             linearscan::insert_callee_saves(mf, &result.callee_saved_used);
             linearscan::coalesce_moves(mf);
             // 8.5. Tail call optimization (O1+): BL + epilogue → epilogue + B.

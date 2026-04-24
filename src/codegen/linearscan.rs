@@ -575,7 +575,124 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
     }
 }
 
+/// Reorder physical argument-register copies immediately before calls so later
+/// sources are not clobbered by earlier destination writes.
+pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
+    for block in &mut mf.blocks {
+        let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(block.insts.len());
+        for inst in std::mem::take(&mut block.insts) {
+            if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
+                let mut start = rebuilt.len();
+                while start > 0 && is_call_arg_copy(&rebuilt[start - 1]) {
+                    start -= 1;
+                }
+                if start < rebuilt.len() {
+                    let pending = rebuilt.split_off(start);
+                    rebuilt.extend(rewrite_call_arg_copies(pending));
+                }
+                rebuilt.push(inst);
+            } else {
+                rebuilt.push(inst);
+            }
+        }
+        block.insts = rebuilt;
+    }
+}
+
 // ---- Helpers ----
+
+fn is_call_arg_copy(inst: &MachineInst) -> bool {
+    matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
+        && matches!(
+            inst.operands.as_slice(),
+            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(_src)] if is_call_arg_reg(*dst)
+        )
+}
+
+fn is_call_arg_reg(reg: PhysReg) -> bool {
+    match reg {
+        PhysReg::Gp(n) | PhysReg::Gp32(n) => n < 8,
+        PhysReg::Fp(n) | PhysReg::Fp32(n) => n < 8,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PhysRegAlias {
+    Gp(u8),
+    Fp(u8),
+}
+
+fn phys_reg_alias(reg: PhysReg) -> Option<PhysRegAlias> {
+    match reg {
+        PhysReg::Gp(n) | PhysReg::Gp32(n) => Some(PhysRegAlias::Gp(n)),
+        PhysReg::Fp(n) | PhysReg::Fp32(n) => Some(PhysRegAlias::Fp(n)),
+        _ => None,
+    }
+}
+
+fn scratch_phys_for(reg: PhysReg) -> PhysReg {
+    match reg {
+        PhysReg::Gp(_) => PhysReg::Gp(9),
+        PhysReg::Gp32(_) => PhysReg::Gp32(9),
+        PhysReg::Fp(_) => PhysReg::Fp(29),
+        PhysReg::Fp32(_) => PhysReg::Fp32(29),
+        _ => panic!("call-arg scratch requested for non-register operand"),
+    }
+}
+
+fn move_opcode_for_phys(reg: PhysReg) -> ArmOpcode {
+    match reg {
+        PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::FmovReg,
+        PhysReg::Gp(_) | PhysReg::Gp32(_) => ArmOpcode::MovReg,
+        _ => panic!("move opcode requested for non-register operand"),
+    }
+}
+
+fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> {
+    let mut pending: Vec<(ArmOpcode, PhysReg, PhysReg)> = pending_moves
+        .into_iter()
+        .map(|inst| match inst.operands.as_slice() {
+            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)] => {
+                (inst.opcode, *dst, *src)
+            }
+            _ => panic!("call-arg copy rewrite saw unexpected operand shape"),
+        })
+        .collect();
+    let mut rewritten = Vec::with_capacity(pending.len() + 1);
+
+    while !pending.is_empty() {
+        let safe_idx = (0..pending.len()).find(|&i| {
+            let (_, dst, _) = pending[i];
+            let dst_alias = phys_reg_alias(dst).expect("call-arg copy dst should alias");
+            !pending
+                .iter()
+                .enumerate()
+                .any(|(j, &(_, _, src))| j != i && phys_reg_alias(src) == Some(dst_alias))
+        });
+
+        if let Some(idx) = safe_idx {
+            let (opcode, dst, src) = pending.remove(idx);
+            rewritten.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)],
+                def: None,
+            });
+            continue;
+        }
+
+        let (_, _, src) = pending[0];
+        let scratch = scratch_phys_for(src);
+        rewritten.push(MachineInst {
+            opcode: move_opcode_for_phys(src),
+            operands: vec![MachineOperand::PhysReg(scratch), MachineOperand::PhysReg(src)],
+            def: None,
+        });
+        pending[0].2 = scratch;
+    }
+
+    rewritten
+}
 
 fn expire_intervals(active: &mut Vec<(u8, u32, VRegId)>, free: &mut Vec<u8>, pos: u32) {
     let mut i = 0;
@@ -688,6 +805,101 @@ mod tests {
             mf.blocks[0].insts.len(),
             1,
             "self-move should be eliminated"
+        );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_preserves_later_source_registers() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(28)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::PhysReg(PhysReg::Gp(12))],
+            def: None,
+        });
+
+        parallelize_call_arg_moves(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts.len(), 3);
+        assert_eq!(
+            mf.blocks[0].insts[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ]
+        );
+        assert_eq!(
+            mf.blocks[0].insts[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(28)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_breaks_cycles_with_scratch() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::Extern("_callee".into())],
+            def: None,
+        });
+
+        parallelize_call_arg_moves(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts.len(), 4);
+        assert_eq!(
+            mf.blocks[0].insts[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+            ]
+        );
+        assert_eq!(
+            mf.blocks[0].insts[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ]
+        );
+        assert_eq!(
+            mf.blocks[0].insts[2].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+            ]
         );
     }
 }

@@ -438,6 +438,7 @@ fn select_call_inst(
         mf.reserve_outgoing_args(abi_state.stack_offset as u32);
     }
 
+    let mut pending_reg_arg_moves: Vec<(ArmOpcode, PhysReg, VRegId)> = Vec::new();
     for (arg_val, loc, arg_ty) in arg_locs {
         if matches!(arg_ty, IrType::Int(IntWidth::I128)) {
             let arg_slot = ctx.lookup_wide_slot(arg_val);
@@ -481,44 +482,16 @@ fn select_call_inst(
         let arg_class = mf.vregs.iter().find(|v| v.id == arg_vreg).map(|v| v.class);
         match (arg_class, loc) {
             (Some(RegClass::Fp64), AbiArgLoc::Fp(reg)) => {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::FmovReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Fp(reg)),
-                        MachineOperand::VReg(arg_vreg),
-                    ],
-                    def: None,
-                });
+                pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp(reg), arg_vreg));
             }
             (Some(RegClass::Fp32), AbiArgLoc::Fp32(reg)) => {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::FmovReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Fp32(reg)),
-                        MachineOperand::VReg(arg_vreg),
-                    ],
-                    def: None,
-                });
+                pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp32(reg), arg_vreg));
             }
             (Some(RegClass::Gp32), AbiArgLoc::Gp32(reg)) => {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::MovReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp32(reg)),
-                        MachineOperand::VReg(arg_vreg),
-                    ],
-                    def: None,
-                });
+                pending_reg_arg_moves.push((ArmOpcode::MovReg, PhysReg::Gp32(reg), arg_vreg));
             }
             (Some(RegClass::Gp64), AbiArgLoc::Gp(reg)) => {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::MovReg,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp(reg)),
-                        MachineOperand::VReg(arg_vreg),
-                    ],
-                    def: None,
-                });
+                pending_reg_arg_moves.push((ArmOpcode::MovReg, PhysReg::Gp(reg), arg_vreg));
             }
             (Some(class), AbiArgLoc::Stack(stack_offset)) => {
                 emit_store_stack_arg_from_vreg(mf, mb, arg_vreg, class, &arg_ty, stack_offset);
@@ -533,6 +506,14 @@ fn select_call_inst(
                 panic!("isel: call arg vreg class missing for %{}", arg_val.0);
             }
         }
+    }
+
+    for (opcode, dst, src) in pending_reg_arg_moves {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode,
+            operands: vec![MachineOperand::PhysReg(dst), MachineOperand::VReg(src)],
+            def: None,
+        });
     }
 
     if let Some(target) = indirect_target {
