@@ -11247,15 +11247,24 @@ fn operator_expr_type_info(
             kind: Some(1),
         }),
         Expr::ComponentAccess { base, component } => {
-            let tl = type_layouts?;
-            let base_ti = operator_expr_type_info(base, locals, st, Some(tl))?;
-            let type_name = match base_ti {
-                TypeInfo::Derived(name) | TypeInfo::Class(name) => name,
-                _ => return None,
-            };
-            tl.get(&type_name)
-                .and_then(|layout| layout.field(component))
-                .map(|field| field.type_info.clone())
+            if let Some(tl) = type_layouts {
+                if let Some(base_ti) = operator_expr_type_info(base, locals, st, Some(tl)) {
+                    let type_name = match base_ti {
+                        TypeInfo::Derived(name) | TypeInfo::Class(name) => Some(name),
+                        _ => None,
+                    };
+                    if let Some(type_name) = type_name {
+                        if let Some(field_ti) = tl
+                            .get(&type_name)
+                            .and_then(|layout| layout.field(component))
+                            .map(|field| field.type_info.clone())
+                        {
+                            return Some(field_ti);
+                        }
+                    }
+                }
+            }
+            fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st))
         }
         Expr::ParenExpr { inner } => operator_expr_type_info(inner, locals, st, type_layouts),
     }
@@ -11691,7 +11700,38 @@ fn resolve_operator_overload(
         })
         .collect();
     let specifics = if semantic_candidates.is_empty() {
-        sym.arg_names.clone()
+        let left_is_char = expr_is_character_expr(b, locals, left_expr, st, type_layouts);
+        let right_is_char = expr_is_character_expr(b, locals, right_expr, st, type_layouts);
+        let char_position_candidates: Vec<String> = if left_is_char != right_is_char {
+            sym.arg_names
+                .iter()
+                .filter_map(|specific| {
+                    let scope = procedure_scope_by_name(st, specific)?;
+                    let declared_args = declared_args_for_scope(scope);
+                    if declared_args.len() != 2 {
+                        return None;
+                    }
+                    let left_decl_char = matches!(
+                        declared_args.first()?.type_info.as_ref(),
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    );
+                    let right_decl_char = matches!(
+                        declared_args.get(1)?.type_info.as_ref(),
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    );
+                    (left_decl_char == left_is_char && right_decl_char == right_is_char)
+                        .then(|| specific.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if char_position_candidates.is_empty() {
+            sym.arg_names.clone()
+        } else {
+            char_position_candidates
+        }
     } else {
         semantic_candidates
     };

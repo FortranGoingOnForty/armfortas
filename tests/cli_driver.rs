@@ -20695,6 +20695,42 @@ fn module_global_component_overloaded_concat_preserves_nested_character_actual_l
 }
 
 #[test]
+fn chained_hidden_result_concat_with_stub_ansi_codes_runs() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: ansi_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: term\n    type(ansi_code) :: reset = ansi_code()\n    type(ansi_code) :: bold = ansi_code()\n    type(ansi_code) :: blue = ansi_code(fg=4_i1)\n  end type\n  interface operator(+)\n    module procedure :: add\n  end interface\n  interface operator(//)\n    module procedure :: concat_left\n    module procedure :: concat_right\n  end interface\ncontains\n  pure function add(lval, rval) result(code)\n    type(ansi_code), intent(in) :: lval, rval\n    type(ansi_code) :: code\n    code%style = merge(rval%style, lval%style, rval%style >= 0)\n    code%fg = merge(rval%fg, lval%fg, rval%fg >= 0)\n    code%bg = merge(rval%bg, lval%bg, rval%bg >= 0)\n  end function\n  pure function anycolor(code) result(flag)\n    type(ansi_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\n  pure function escape(code) result(str)\n    type(ansi_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = '[C]'\n    else\n      str = ''\n    end if\n  end function\n  pure function concat_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(ansi_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    str = lval // escape(code)\n  end function\n  pure function concat_right(code, rval) result(str)\n    type(ansi_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    str = escape(code) // rval\n  end function\n  pure function level_name(level, color) result(string)\n    integer, intent(in) :: level\n    type(term), intent(in) :: color\n    character(len=:), allocatable :: string\n    if (level == 0) then\n      string = color%bold + color%blue // 'error' // color%reset\n    else\n      string = color%bold + color%blue // 'unknown' // color%reset\n    end if\n  end function\n  pure function render_message(level, message, color) result(string)\n    integer, intent(in) :: level\n    character(len=*), intent(in) :: message\n    type(term), intent(in) :: color\n    character(len=:), allocatable :: string\n    string = level_name(level, color) // color%bold // ': ' // message // color%reset\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(term) :: color\n  character(len=:), allocatable :: msg\n  msg = render_message(0, 'Invalid syntax', color)\n  if (msg /= '[C]error: Invalid syntax') error stop 1\n  print *, trim(msg)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("chained_hidden_result_concat_stub_ansi", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stub ansi concat chain compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stub ansi concat chain should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stub ansi concat chain run failed");
+    assert!(
+        run.status.success(),
+        "stub ansi concat chain should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("[C]error: Invalid syntax"),
+        "unexpected stub ansi concat chain output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
     let src = write_program(
         "module m\n  implicit none\n  type :: datetime_t\n    integer :: year = 0\n    integer :: month = 0\n    integer :: day = 0\n  end type\n  type :: keyval_t\n    real :: as_float = -1.0\n    type(datetime_t) :: as_datetime\n  contains\n    procedure :: set_float\n    procedure :: set_datetime\n    procedure :: get_float\n    procedure :: get_datetime\n    generic :: set => set_float, set_datetime\n    generic :: get => get_float, get_datetime\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    self%as_float = x\n  end subroutine\n  subroutine set_datetime(self, x)\n    class(keyval_t), intent(inout) :: self\n    type(datetime_t), intent(in) :: x\n    self%as_datetime = x\n  end subroutine\n  subroutine get_float(self, x)\n    class(keyval_t), intent(in) :: self\n    real, intent(out) :: x\n    x = self%as_float\n  end subroutine\n  subroutine get_datetime(self, x)\n    class(keyval_t), intent(in) :: self\n    type(datetime_t), intent(out) :: x\n    x = self%as_datetime\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  type(datetime_t) :: in_dt, out_dt\n  real :: out_float\n  in_dt = datetime_t(2022, 7, 31)\n  call kv%set(in_dt)\n  call kv%get(out_dt)\n  if (out_dt%year /= 2022) error stop 1\n  if (out_dt%month /= 7) error stop 2\n  if (out_dt%day /= 31) error stop 3\n  call kv%set(3.5)\n  call kv%get(out_float)\n  if (abs(out_float - 3.5) > 1.0e-6) error stop 4\n  print *, out_dt%year, out_dt%month, out_dt%day, out_float\nend program\n",
