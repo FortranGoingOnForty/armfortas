@@ -328,9 +328,12 @@ impl<'a> Parser<'a> {
         let tok = self.advance().clone();
         // Strip outer quotes for the value.
         let value = if tok.text.len() >= 2 {
-            tok.text[1..tok.text.len() - 1]
-                .replace("''", "'")
-                .replace("\"\"", "\"")
+            let inner = &tok.text[1..tok.text.len() - 1];
+            match tok.text.as_bytes().first().copied() {
+                Some(b'\'') => inner.replace("''", "'"),
+                Some(b'"') => inner.replace("\"\"", "\""),
+                _ => inner.to_string(),
+            }
         } else {
             tok.text.clone()
         };

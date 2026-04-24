@@ -9510,6 +9510,51 @@ fn elemental_character_compare_uses_hidden_result_bytes() {
 }
 
 #[test]
+fn opposite_quote_runs_preserve_fixed_character_lengths() {
+    let src = write_program(
+        r#"program p
+  implicit none
+  if (len("'''") /= 3) error stop 1
+  if ("'''" /= "'''") error stop 2
+  if (len('"""') /= 3) error stop 3
+  if ('"""' /= '"""') error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("opposite_quote_lengths", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("opposite quote length compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "opposite quote length compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("opposite quote length run failed");
+    assert!(
+        run.status.success(),
+        "opposite quote length run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected opposite quote length output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
     let src = write_program(
         "module m\n  implicit none\ncontains\n  elemental function pick(pos) result(ch)\n    integer, intent(in) :: pos\n    character(1) :: ch\n    ch = merge('X', 'Y', pos > 0)\n  end function\n\n  logical function want_ten_chars(string)\n    character(1), intent(in) :: string(:)\n    want_ten_chars = string(5) == 'X'\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n  integer, parameter :: offset_date = 10\n  if (.not. want_ten_chars(pick(1 + offset(:offset_date)))) error stop 1\n  print *, 'ok'\nend program\n",
