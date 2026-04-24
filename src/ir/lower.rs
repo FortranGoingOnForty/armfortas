@@ -17961,6 +17961,76 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
+                                ) && field.allocatable
+                                    && field.size == 384
+                                    && field.dims.is_empty()
+                                {
+                                    let Some(type_name) = field_derived_type_name(field) else {
+                                        return;
+                                    };
+                                    let desc = field_ptr;
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero32 = b.const_i32(0);
+                                    let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let alloc_bb =
+                                        b.create_block("component_scalar_derived_assign_alloc");
+                                    let copy_bb =
+                                        b.create_block("component_scalar_derived_assign_copy");
+                                    let done_bb =
+                                        b.create_block("component_scalar_derived_assign_done");
+                                    b.cond_branch(needs_alloc, alloc_bb, vec![], copy_bb, vec![]);
+
+                                    b.set_block(alloc_bb);
+                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                        let elem_size = b.const_i64(layout.size as i64);
+                                        let rank_val = b.const_i32(0);
+                                        let null_ptr = b.const_i64(0);
+                                        b.call(
+                                            FuncRef::External("afs_allocate_array".into()),
+                                            vec![desc, elem_size, rank_val, null_ptr, null_ptr],
+                                            IrType::Void,
+                                        );
+                                        if derived_layout_needs_runtime_initialization(
+                                            layout,
+                                            ctx.type_layouts,
+                                        ) {
+                                            let base_ptr = b.load_typed(
+                                                desc,
+                                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                            );
+                                            initialize_derived_storage(
+                                                b,
+                                                base_ptr,
+                                                layout,
+                                                ctx.type_layouts,
+                                            );
+                                        }
+                                    }
+                                    b.branch(copy_bb, vec![]);
+
+                                    b.set_block(copy_bb);
+                                    let src_ptr = lower_expr_ctx_tl(b, ctx, value);
+                                    let dest_ptr = b.load_typed(
+                                        desc,
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    emit_derived_value_copy(
+                                        b,
+                                        ctx.type_layouts,
+                                        &type_name,
+                                        dest_ptr,
+                                        src_ptr,
+                                    );
+                                    b.branch(done_bb, vec![]);
+                                    b.set_block(done_bb);
+                                    return;
+                                } else if matches!(
+                                    field.type_info,
+                                    crate::sema::symtab::TypeInfo::Derived(_)
                                 ) && !is_opaque_c_handle_type(&field.type_info)
                                     && !field.pointer
                                     && !field.allocatable
@@ -25778,33 +25848,11 @@ fn lower_arg_descriptor(
             if let Some(info) = component_array_local_info(b, locals, expr, st, tl) {
                 return lower_descriptor_actual_from_info(b, &info, type_layouts);
             }
-            if let Some((field_ptr, field)) = resolve_component_field_access(b, locals, expr, st, tl)
-            {
-                if field.size == 384 && (field.allocatable || field.pointer) {
-                    return field_ptr;
-                }
-                if field.dims.is_empty() {
-                    if let crate::sema::symtab::TypeInfo::Derived(type_name) = &field.type_info {
-                        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-                        let tag = tl
-                            .get(type_name)
-                            .map(|layout| b.const_i64(layout.type_tag as i64));
-                        let elem_size = tl
-                            .get(type_name)
-                            .map(|layout| b.const_i64(layout.size as i64));
-                        let tbp_lookup = tl
-                            .get(type_name)
-                            .and_then(|layout| type_layout_tbp_lookup_value(b, layout));
-                        store_scalar_polymorphic_descriptor_view(
-                            b,
-                            desc,
-                            field_ptr,
-                            elem_size,
-                            tag,
-                            tbp_lookup,
-                        );
-                        return desc;
-                    }
+            if let Some(info) = component_field_local_info(b, locals, expr, st, tl) {
+                if local_uses_array_descriptor(&info)
+                    || (info.dims.is_empty() && info.derived_type.is_some())
+                {
+                    return lower_descriptor_actual_from_info(b, &info, type_layouts);
                 }
             }
         }

@@ -3982,6 +3982,80 @@ fn nullified_pointer_component_actual_passes_slot_to_pointer_dummy() {
 }
 
 #[test]
+fn pointer_component_actual_to_class_dummy_uses_associated_target() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: table_t\n    integer :: value = 0\n  end type table_t\n  type :: parser_t\n    type(table_t), allocatable :: root\n    type(table_t), pointer :: current\n  end type parser_t\ncontains\n  subroutine init(parser)\n    type(parser_t), intent(out), target :: parser\n    parser%root = table_t(1)\n    parser%current => parser%root\n  end subroutine init\n  subroutine bump(self)\n    class(table_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine bump\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  call init(parser)\n  call bump(parser%current)\n  if (parser%root%value /= 2) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("pointer_component_to_class_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer component to class dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer component to class dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer component to class dummy run failed");
+    assert!(
+        run.status.success(),
+        "pointer component to class dummy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected pointer component to class dummy output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_derived_component_structure_constructor_persists_after_return() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: table_t\n    integer :: value = 0\n  end type table_t\n  type :: parser_t\n    type(table_t), allocatable :: root\n  end type parser_t\ncontains\n  subroutine init(parser)\n    type(parser_t), intent(out) :: parser\n    parser%root = table_t(1)\n  end subroutine init\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  call init(parser)\n  if (.not. allocated(parser%root)) error stop 1\n  if (parser%root%value /= 1) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_ctor_persists", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable component ctor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable component ctor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable component ctor run failed");
+    assert!(
+        run.status.success(),
+        "allocatable component ctor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocatable component ctor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
     let src = write_program(
         "module m\n  implicit none\n  integer :: count = 0\n  type :: child_t\n    integer :: tag = 0\n  end type\ncontains\n  subroutine destroy_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (.not. associated(n)) return\n    count = count + 1\n    deallocate(n)\n    nullify(n)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: cached\n  allocate(cached)\n  cached%tag = 42\n  call destroy_child(cached)\n  print *, 'COUNT', count\n  if (associated(cached)) then\n    print *, 'CACHED', cached%tag\n  else\n    print *, 'CACHED', -1\n  end if\nend program\n",
