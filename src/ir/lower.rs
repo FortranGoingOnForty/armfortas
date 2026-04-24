@@ -12454,25 +12454,20 @@ fn emit_named_function_call(
             }
             if let Some(arg) = &arg_slots[i] {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    if let Some((_ptr, len)) = char_addr_and_runtime_len(b, e, locals) {
-                        call_args.push(len);
-                    } else if let Expr::StringLiteral { value, .. } = &e.node {
-                        call_args.push(b.const_i64(value.len() as i64));
-                    } else if expr_is_character_expr(b, locals, e, st, type_layouts) {
-                        let (_ptr, len) = lower_string_expr_full(
+                    call_args.push(
+                        actual_char_arg_runtime_len(
                             b,
                             locals,
+                            None,
                             e,
                             st,
                             type_layouts,
                             internal_funcs,
                             contained_host_refs,
                             descriptor_params,
-                        );
-                        call_args.push(len);
-                    } else {
-                        call_args.push(b.const_i64(0));
-                    }
+                        )
+                        .unwrap_or_else(|| b.const_i64(0)),
+                    );
                 } else {
                     call_args.push(b.const_i64(0));
                 }
