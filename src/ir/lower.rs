@@ -10106,10 +10106,10 @@ fn procedure_scope_by_name<'a>(
     })
 }
 
-fn enclosing_scope_module_name<'a>(
-    st: &'a SymbolTable,
+fn enclosing_scope_module_name(
+    st: &SymbolTable,
     mut scope_id: crate::sema::symtab::ScopeId,
-) -> Option<&'a str> {
+) -> Option<&str> {
     loop {
         let scope = st.scope(scope_id);
         match &scope.kind {
@@ -10235,12 +10235,10 @@ fn reorder_value_slots_by_formal_skip(
     for (arg, actual_val) in args.iter().zip(actual_vals.iter()) {
         if let Some(kw) = &arg.keyword {
             let key = kw.to_ascii_lowercase();
-            let Some(idx) = formal_order
+            let idx = formal_order
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case(&key))
-            else {
-                return None;
-            };
+                ?;
             if idx < last_positional || slots[idx].is_some() {
                 return None;
             }
@@ -10275,12 +10273,10 @@ fn reorder_semantic_type_slots_by_formal_skip(
     for (arg, actual_type) in args.iter().zip(actual_types.iter()) {
         if let Some(kw) = &arg.keyword {
             let key = kw.to_ascii_lowercase();
-            let Some(idx) = formal_order
+            let idx = formal_order
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case(&key))
-            else {
-                return None;
-            };
+                ?;
             if idx < last_positional || slots[idx].is_some() {
                 return None;
             }
@@ -10711,7 +10707,7 @@ fn local_semantic_type_info(
             _ => None,
         };
         return Some(TypeInfo::Character {
-            len: len.map(|value| value as i64),
+            len,
             kind: Some(1),
         });
     }
@@ -10761,17 +10757,12 @@ fn name_expr_type_info(
         if info.descriptor_arg
             && info.dims.is_empty()
             && info.char_kind == CharKind::None
-            && info.derived_type.is_some()
         {
-            Some(TypeInfo::Class(
-                info.derived_type
-                    .as_ref()
-                    .expect("derived_type just checked")
-                    .clone(),
-            ))
-        } else {
-            None
+            if let Some(derived_type) = &info.derived_type {
+                return Some(TypeInfo::Class(derived_type.clone()));
+            }
         }
+        None
     });
 
     let local_ti = descriptor_backed_class.or_else(|| info.and_then(local_semantic_type_info));
