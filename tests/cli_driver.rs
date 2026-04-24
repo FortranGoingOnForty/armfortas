@@ -9324,6 +9324,150 @@ fn imported_generic_keyword_real_expression_actual_resolves() {
 }
 
 #[test]
+fn generic_function_resolution_uses_specific_keyword_slots() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: stamp_t\n    integer :: year = -1\n    integer :: month = -1\n    integer :: day = -1\n    integer :: hour = -1\n    integer :: minute = -1\n    integer :: second = -1\n  end type\n  interface build_stamp\n    module procedure :: build_stamp_fields\n    module procedure :: build_stamp_string\n  end interface\ncontains\n  function build_stamp_fields(year, month, day, hour, minute, second) result(stamp)\n    integer, intent(in), optional :: year, month, day\n    integer, intent(in), optional :: hour, minute, second\n    type(stamp_t) :: stamp\n    if (present(year)) stamp%year = year\n    if (present(month)) stamp%month = month\n    if (present(day)) stamp%day = day\n    if (present(hour)) stamp%hour = hour\n    if (present(minute)) stamp%minute = minute\n    if (present(second)) stamp%second = second\n  end function\n\n  function build_stamp_string(string) result(stamp)\n    character(len=*), intent(in) :: string\n    type(stamp_t) :: stamp\n    stamp%year = len_trim(string)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(stamp_t) :: stamp\n  stamp = build_stamp(hour=17, minute=45, second=0)\n  if (stamp%year /= -1) error stop 1\n  if (stamp%month /= -1) error stop 2\n  if (stamp%day /= -1) error stop 3\n  if (stamp%hour /= 17) error stop 4\n  if (stamp%minute /= 45) error stop 5\n  if (stamp%second /= 0) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_function_keyword_slots", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic function keyword slots compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic function keyword slots compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("generic function keyword slots run failed");
+    assert!(
+        run.status.success(),
+        "generic function keyword slots run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected generic function keyword slots output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn random_number_default_real_in_hidden_result_function_uses_scalar_width() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15) :: name\n  name = get_name()\n  if (name(1:7) /= 'toml-f-') error stop 1\n  print *, trim(name)\ncontains\n  function get_name() result(filename)\n    character(len=15) :: filename\n    real :: val\n    call random_number(val)\n    write(filename, '(a, z8.8)') 'toml-f-', int(val*1.0e9)\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("random_number_hidden_result_f32", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("random_number hidden-result f32 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "random_number hidden-result f32 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("random_number hidden-result f32 run failed");
+    assert!(
+        run.status.success(),
+        "random_number hidden-result f32 run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("toml-f-"),
+        "unexpected random_number hidden-result f32 output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn open_connected_unit_without_file_preserves_existing_connection() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: io, stat, chunk\n  logical :: opened\n  character(4096) :: buffer\n  character(len=*), parameter :: filename = 'open_connected_unit_repro.txt'\n\n  open(file=filename, newunit=io, status='replace')\n  write(io, '(a)') 'abc'\n  close(io)\n\n  open(file=filename, newunit=io, status='old')\n  inquire(unit=io, opened=opened)\n  if (.not. opened) error stop 1\n  open(unit=io, pad='yes', iostat=stat)\n  if (stat /= 0) error stop 2\n  read(io, '(a)', advance='no', iostat=stat, size=chunk) buffer\n  if (stat > 0) error stop 3\n  if (chunk /= 3) error stop 4\n  if (buffer(:chunk) /= 'abc') error stop 5\n  close(io, status='delete')\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("open_connected_unit_reuses_file", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("open connected unit compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "open connected unit compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("open connected unit run failed");
+    assert!(
+        run.status.success(),
+        "open connected unit run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected open connected unit output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn open_connected_unit_without_file_does_not_rewind_nonadvancing_reads() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: io, stat\n  character(:), allocatable :: line\n  character(len=*), parameter :: filename = 'open_connected_unit_loop_repro.txt'\n\n  open(file=filename, newunit=io, status='replace')\n  write(io, '(a)') 'abc'\n  close(io)\n\n  open(file=filename, newunit=io, status='old')\n  call read_line(io, line, stat)\n  if (stat /= 0) error stop 1\n  if (line /= 'abc') error stop 2\n  call read_line(io, line, stat)\n  if (stat >= 0) error stop 3\n  close(io, status='delete')\n  print *, 'ok'\ncontains\n  subroutine read_line(io, string, stat)\n    integer, intent(in) :: io\n    character(:), allocatable, intent(out) :: string\n    integer, intent(out) :: stat\n    integer, parameter :: bufsize = 16\n    character(bufsize) :: buffer\n    integer :: chunk\n\n    open(unit=io, pad='yes', iostat=stat)\n    string = ''\n    do while (stat == 0)\n      read(io, '(a)', advance='no', iostat=stat, size=chunk) buffer\n      if (stat > 0) exit\n      string = string // buffer(:chunk)\n    end do\n    if (is_iostat_eor(stat)) stat = 0\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("open_connected_unit_no_rewind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("open connected unit no-rewind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "open connected unit no-rewind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("open connected unit no-rewind run failed");
+    assert!(
+        run.status.success(),
+        "open connected unit no-rewind run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected open connected unit no-rewind output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_unary_array_element_actual_preserves_integer_kind() {
     let dir = unique_dir("generic_imported_unary_array_element_kind");
     let mod_src = write_program_in(
