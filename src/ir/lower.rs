@@ -789,6 +789,12 @@ fn function_hidden_result_abi(
             return HiddenResultAbi::None;
         }
     }
+    if bind.is_none()
+        && !decl_is_pointer(&result_key, decls)
+        && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls).is_some()
+    {
+        return HiddenResultAbi::DerivedAggregate;
+    }
     if matches!(return_type, Some(TypeSpec::Character(_))) {
         return if bind.is_some() {
             HiddenResultAbi::None

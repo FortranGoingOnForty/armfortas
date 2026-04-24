@@ -9324,6 +9324,44 @@ fn imported_derived_function_result_with_explicit_return_round_trips_through_amo
 }
 
 #[test]
+fn typed_header_derived_function_result_uses_hidden_result_abi() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: vec\n    real :: x\n  end type\ncontains\n  type(vec) function add_vec(a, b)\n    type(vec), intent(in) :: a, b\n    add_vec%x = a%x + b%x\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(vec) :: a, b, r\n  a%x = 1.0\n  b%x = 2.0\n  r = add_vec(a, b)\n  if (abs(r%x - 3.0) > 1.0e-6) error stop 1\n  print *, r%x\nend program\n",
+        "f90",
+    );
+    let out = unique_path("typed_header_derived_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed-header derived result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed-header derived result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("typed-header derived result run failed");
+    assert!(
+        run.status.success(),
+        "typed-header derived result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("3.0000000E0"),
+        "unexpected typed-header derived result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_type_finalizer_round_trips_through_amod_and_runs() {
     let dir = unique_dir("finalizer_amod");
     let mod_src = write_program_in(
