@@ -14587,6 +14587,41 @@ fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
 }
 
 #[test]
+fn select_type_pointer_polymorphic_local_bound_function_uses_guarded_static_dispatch() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: keyval_t\n  contains\n    procedure :: get_type\n  end type\ncontains\n  integer function get_type(self)\n    class(keyval_t), intent(in) :: self\n    get_type = 17\n  end function\nend module m\n\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: ptr\n  type(keyval_t), target :: kv\n  ptr => kv\n  select type (ptr)\n  class is (keyval_t)\n    select case (ptr%get_type())\n    case (17)\n      print *, 'ok'\n    case default\n      error stop 1\n    end select\n  class default\n    error stop 2\n  end select\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_type_pointer_poly_bound_function", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer polymorphic select type bound-function compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "pointer polymorphic local SELECT TYPE bound function should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "pointer polymorphic local SELECT TYPE bound function runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected pointer polymorphic local SELECT TYPE bound function to reach the guarded dispatch, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn select_type_allocatable_polymorphic_component_dispatches_via_descriptor_tag() {
     let src = write_program(
         "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: val\n  end type\n  type(holder_t) :: holder\n  integer :: seen\n  allocate(child_t :: holder%val)\n  select type (val => holder%val)\n  type is (child_t)\n    val%x = 23\n  class default\n    error stop 1\n  end select\n  seen = -1\n  select type (val => holder%val)\n  type is (child_t)\n    seen = val%x\n  class default\n    error stop 2\n  end select\n  if (seen /= 23) error stop 3\n  print *, 'ok'\nend program p\n",
@@ -21425,6 +21460,43 @@ fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected polymorphic component array indexing output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn renamed_imported_abstract_tbp_dispatch_uses_canonical_type_layout() {
+    let src = write_program(
+        "module base_mod\n  implicit none\n  type, abstract :: abstract_lexer\n  contains\n    procedure(get_info_i), deferred :: get_info\n  end type\n  abstract interface\n    subroutine get_info_i(lexer, meta, output)\n      import :: abstract_lexer\n      class(abstract_lexer), intent(in) :: lexer\n      character(*), intent(in) :: meta\n      character(:), allocatable, intent(out) :: output\n    end subroutine\n  end interface\nend module\nmodule concrete_mod\n  use base_mod, only : abstract_lexer\n  implicit none\n  type, extends(abstract_lexer) :: concrete_lexer\n  contains\n    procedure :: get_info\n  end type\ncontains\n  subroutine get_info(lexer, meta, output)\n    class(concrete_lexer), intent(in) :: lexer\n    character(*), intent(in) :: meta\n    character(:), allocatable, intent(out) :: output\n    if (len(meta) == 0) then\n      output = 'empty'\n    else\n      output = meta\n    end if\n  end subroutine\nend module\nmodule parser_mod\n  use base_mod, only : lexer_t => abstract_lexer\n  implicit none\ncontains\n  subroutine parse(lexer, output)\n    class(lexer_t), intent(in) :: lexer\n    character(:), allocatable, intent(out) :: output\n    call lexer%get_info('ok', output)\n  end subroutine\nend module\nprogram p\n  use concrete_mod, only : concrete_lexer\n  use parser_mod, only : parse\n  implicit none\n  type(concrete_lexer) :: lexer\n  character(:), allocatable :: output\n  call parse(lexer, output)\n  if (.not. allocated(output)) error stop 1\n  if (output /= 'ok') error stop 2\n  print *, trim(output)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("renamed_imported_abstract_tbp_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("renamed imported abstract tbp dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "renamed imported abstract tbp dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("renamed imported abstract tbp dispatch run failed");
+    assert!(
+        run.status.success(),
+        "renamed imported abstract tbp dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected renamed imported abstract tbp dispatch output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

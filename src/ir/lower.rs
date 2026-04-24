@@ -12941,8 +12941,11 @@ fn emit_bound_function_call(
     ret_ty: IrType,
 ) -> Option<ValueId> {
     let tl = type_layouts?;
-    reject_unsupported_polymorphic_component_method_base(base.span, base, locals, st, tl);
-    let (obj_addr, type_name) = resolve_component_base_for_method(b, locals, base, st, tl)?;
+    let Some((obj_addr, type_name)) = resolve_component_base_for_method(b, locals, base, st, tl)
+    else {
+        reject_unsupported_polymorphic_component_method_base(base.span, base, locals, st, tl);
+        return None;
+    };
     let pass_desc_addr = lower_arg_descriptor(b, locals, base, st, type_layouts);
     let layout = tl.get(&type_name)?;
     let bp = resolved_bound_proc_for_call(
@@ -13406,6 +13409,26 @@ fn abstract_layout_base_type(
     }
 }
 
+fn canonical_layout_type_name_for_scope(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    raw_name: &str,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<String> {
+    if tl.get(raw_name).is_some() {
+        return Some(raw_name.to_string());
+    }
+    let key = raw_name.to_lowercase();
+    let sym = scope_id
+        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+        .or_else(|| st.lookup(&key))
+        .or_else(|| st.find_symbol_any_scope(&key))?;
+    if sym.kind != crate::sema::symtab::SymbolKind::DerivedType {
+        return None;
+    }
+    tl.get(&sym.name).map(|_| sym.name.clone())
+}
+
 fn resolve_polymorphic_component_method_base_for_dispatch(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -13417,20 +13440,40 @@ fn resolve_polymorphic_component_method_base_for_dispatch(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
-            let sym = st.find_symbol_any_scope(&key)?;
             if !local_uses_array_descriptor(info) || !info.dims.is_empty() {
                 return None;
             }
-            let base_type = info
-                .derived_type
-                .as_ref()
-                .filter(|base_type| tl.get(base_type.as_str()).is_some())
-                .cloned()
+            let proc_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+            let type_info = proc_scope_id
+                .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                .and_then(|sym| sym.type_info.as_ref())
+                .or_else(|| st.lookup(&key).and_then(|sym| sym.type_info.as_ref()))
                 .or_else(|| {
-                    sym.type_info
-                        .as_ref()
-                        .and_then(|ti| abstract_layout_base_type(tl, ti))
+                    st.find_symbol_any_scope(&key)
+                        .and_then(|sym| sym.type_info.as_ref())
                 })?;
+            let base_type = match type_info {
+                crate::sema::symtab::TypeInfo::Class(base_type) => canonical_layout_type_name_for_scope(
+                    st,
+                    proc_scope_id,
+                    base_type,
+                    tl,
+                )
+                .or_else(|| Some(base_type.clone()))?,
+                crate::sema::symtab::TypeInfo::Derived(base_type) => {
+                    let layout_name = canonical_layout_type_name_for_scope(
+                        st,
+                        proc_scope_id,
+                        base_type,
+                        tl,
+                    )
+                    .or_else(|| Some(base_type.clone()))?;
+                    tl.get(&layout_name)
+                        .filter(|layout| layout.is_abstract)
+                        .map(|_| layout_name)?
+                }
+                _ => return None,
+            };
             let desc_addr = array_descriptor_addr(b, info);
             let obj_addr = b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             Some((desc_addr, obj_addr, base_type))
@@ -16529,13 +16572,6 @@ fn lower_string_expr_full(
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
                     if let Expr::ComponentAccess { base, component } = &callee.node {
-                        reject_unsupported_polymorphic_component_method_base(
-                            callee.span,
-                            base,
-                            locals,
-                            st,
-                            tl,
-                        );
                         if let Some((_obj_addr, type_name)) =
                             resolve_component_base_for_method(b, locals, base, st, tl)
                         {
@@ -16617,6 +16653,13 @@ fn lower_string_expr_full(
                                 }
                             }
                         }
+                        reject_unsupported_polymorphic_component_method_base(
+                            callee.span,
+                            base,
+                            locals,
+                            st,
+                            tl,
+                        );
                     }
                     if args.len() == 1 {
                         if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
@@ -34763,13 +34806,6 @@ fn lower_expr_full(
                         }
                         return lower_array_element(b, locals, &info, args, st, type_layouts);
                     }
-                    reject_unsupported_polymorphic_component_method_base(
-                        callee.span,
-                        base,
-                        locals,
-                        st,
-                        tl,
-                    );
 
                     if let Some((obj_addr, type_name)) =
                         resolve_component_base_for_method(b, locals, base, st, tl)
@@ -35094,6 +35130,13 @@ fn lower_expr_full(
                                 return call_result;
                         }
                     }
+                    reject_unsupported_polymorphic_component_method_base(
+                        callee.span,
+                        base,
+                        locals,
+                        st,
+                        tl,
+                    );
                 }
                 b.const_i32(0)
             } else {
