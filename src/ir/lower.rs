@@ -14939,16 +14939,18 @@ fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
     }) else {
         return false;
     };
-    let Some(parent_id) = scope.parent else {
-        return false;
-    };
-    st.scope(parent_id)
-        .symbols
-        .get(&proc_name)
-        .is_some_and(|sym| {
+    let mut owner_scope = scope.parent;
+    while let Some(scope_id) = owner_scope {
+        let scope = st.scope(scope_id);
+        if scope.symbols.get(&proc_name).is_some_and(|sym| {
             matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
                 && sym.attrs.binding_label.is_some()
-        })
+        }) {
+            return true;
+        }
+        owner_scope = scope.parent;
+    }
+    false
 }
 
 /// Check if a callee has `character(len=*)` dummies via its scope in the
