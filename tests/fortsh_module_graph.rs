@@ -20,6 +20,9 @@ use std::process::Command;
 const FORTSH_COMPILED_FLOOR: usize = 14;
 
 fn find_compiler() -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
+        return PathBuf::from(path);
+    }
     for c in &["target/debug/armfortas", "target/release/armfortas"] {
         let p = PathBuf::from(c);
         if p.exists() {
@@ -37,7 +40,7 @@ fn find_fortsh() -> Option<PathBuf> {
     ];
     for c in &candidates {
         if c.is_dir() {
-            return Some(c.clone());
+            return fs::canonicalize(c).ok();
         }
     }
     None
@@ -224,6 +227,7 @@ fn fortsh_module_graph_resolves() {
         let obj = build_dir.join(format!("{}.o", stem));
 
         let result = Command::new(&compiler)
+            .current_dir(&build_dir)
             .args([
                 src.to_str().unwrap(),
                 "-c",
@@ -231,6 +235,7 @@ fn fortsh_module_graph_resolves() {
                 "-DUSE_C_STRINGS",
                 "-o",
                 obj.to_str().unwrap(),
+                &format!("-J{}", build_dir.display()),
                 &format!("-I{}", build_dir.display()),
             ])
             .output()
