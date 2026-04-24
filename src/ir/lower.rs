@@ -14019,6 +14019,18 @@ fn lower_intrinsic_subroutine(
         }
     }
 
+    fn nth_arg_expr<'a>(
+        args: &'a [Option<crate::ast::expr::Argument>],
+        idx: usize,
+    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+        let arg = args.get(idx)?.as_ref()?;
+        if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+            Some(expr)
+        } else {
+            None
+        }
+    }
+
     match name {
         "move_alloc" => {
             let from_expr = args.first().and_then(|arg| {
@@ -14161,8 +14173,28 @@ fn lower_intrinsic_subroutine(
         }
         "random_number" => {
             let harvest = nth_arg_ref(b, ctx, args, 0);
+            let runtime = nth_arg_expr(args, 0)
+                .and_then(|expr| {
+                    generic_actual_expr_type_info(
+                        expr,
+                        &ctx.locals,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    )
+                })
+                .map(|ty| match ty {
+                    crate::sema::symtab::TypeInfo::Real { kind: Some(kind) } if kind <= 4 => {
+                        "afs_random_number_f32"
+                    }
+                    crate::sema::symtab::TypeInfo::Real { .. }
+                    | crate::sema::symtab::TypeInfo::DoublePrecision => {
+                        "afs_random_number_f64"
+                    }
+                    _ => "afs_random_number_f64",
+                })
+                .unwrap_or("afs_random_number_f64");
             b.call(
-                FuncRef::External("afs_random_number_f64".into()),
+                FuncRef::External(runtime.into()),
                 vec![harvest],
                 IrType::Void,
             );

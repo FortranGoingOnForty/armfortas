@@ -373,22 +373,39 @@ thread_local! {
     static RNG_SEED: Cell<u64> = const { Cell::new(12345678901234567) };
 }
 
-/// RANDOM_NUMBER: fill a scalar with a random value in [0, 1).
-#[no_mangle]
-pub extern "C" fn afs_random_number_f64(harvest: *mut f64) {
-    if harvest.is_null() {
-        return;
-    }
+fn next_random_u64() -> u64 {
     RNG_SEED.with(|s| {
         let mut x = s.get();
         x = x
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         s.set(x);
-        unsafe {
-            *harvest = (x >> 11) as f64 / (1u64 << 53) as f64;
-        }
-    });
+        x
+    })
+}
+
+/// RANDOM_NUMBER: fill a scalar single-precision real with a random value in [0, 1).
+#[no_mangle]
+pub extern "C" fn afs_random_number_f32(harvest: *mut f32) {
+    if harvest.is_null() {
+        return;
+    }
+    let x = next_random_u64();
+    unsafe {
+        *harvest = ((x >> 40) as f32) / (1u32 << 24) as f32;
+    }
+}
+
+/// RANDOM_NUMBER: fill a scalar with a random value in [0, 1).
+#[no_mangle]
+pub extern "C" fn afs_random_number_f64(harvest: *mut f64) {
+    if harvest.is_null() {
+        return;
+    }
+    let x = next_random_u64();
+    unsafe {
+        *harvest = (x >> 11) as f64 / (1u64 << 53) as f64;
+    }
 }
 
 /// RANDOM_SEED: seed the random number generator.
