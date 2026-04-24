@@ -7261,7 +7261,7 @@ fn lower_substring(
 fn widen_to_i64(b: &mut FuncBuilder, value: ValueId) -> ValueId {
     match b.func().value_type(value) {
         Some(IrType::Int(IntWidth::I64)) => value,
-        _ => b.int_extend(value, IntWidth::I64, true),
+        _ => coerce_to_type(b, value, &IrType::Int(IntWidth::I64)),
     }
 }
 
@@ -10837,6 +10837,16 @@ fn operator_expr_type_info(
     use crate::sema::symtab::TypeInfo;
 
     match &expr.node {
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::ArrayConstructor { .. } => {
+            fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st))
+        }
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let symbol_ti = st.lookup(&key)

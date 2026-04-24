@@ -4858,6 +4858,43 @@ fn imported_parameter_typed_char_component_allocate_preserves_element_len() {
 }
 
 #[test]
+fn character_len_max_integer_expr_preserves_exact_large_length() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer(kind=8) :: n\n  character(len=:), allocatable :: s\n  n = 16777217_8\n  allocate(character(len=max(n, 1_8)) :: s)\n  if (len(s) /= n) error stop 1\n  print *, len(s)\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("char_len_max_integer_expr_exact", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character len max integer expr compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character len max integer expr compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("character len max integer expr run failed");
+    assert!(
+        run.status.success(),
+        "character len max integer expr run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("16777217"),
+        "unexpected character len max integer expr output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens(1) = 'read'\n  tokens(2) = 'line'\n  call check(tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (trim(tokens(2)) /= 'line') error stop 1\n    print *, trim(tokens(2))\n  end subroutine check\nend program p\n",
