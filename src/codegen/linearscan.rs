@@ -605,7 +605,8 @@ fn is_call_arg_copy(inst: &MachineInst) -> bool {
     matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
         && matches!(
             inst.operands.as_slice(),
-            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(_src)] if is_call_arg_reg(*dst)
+            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)]
+                if is_call_arg_reg(*dst) && !matches!(src, PhysReg::Xzr | PhysReg::Wzr)
         )
 }
 
@@ -899,6 +900,50 @@ mod tests {
             vec![
                 MachineOperand::PhysReg(PhysReg::Gp(0)),
                 MachineOperand::PhysReg(PhysReg::Gp(9)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_ignores_zero_materialization_into_arg_regs() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Xzr),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::PhysReg(PhysReg::Gp(19))],
+            def: None,
+        });
+
+        parallelize_call_arg_moves(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts.len(), 3);
+        assert_eq!(
+            mf.blocks[0].insts[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Xzr),
+            ]
+        );
+        assert_eq!(
+            mf.blocks[0].insts[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
             ]
         );
     }
