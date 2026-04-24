@@ -4544,6 +4544,43 @@ fn imported_param_c_char_array_scan_in_char_result_function_runs() {
 }
 
 #[test]
+fn verify_on_indexed_parameter_character_array_element_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(*), parameter :: toml_base(4) = [ &\n    '0123456789abcdefABCDEF', &\n    '0123456789000000000000', &\n    '0123456700000000000000', &\n    '0100000000000000000000' ]\n  character(1) :: ch\n  integer :: base\n\n  ch = '0'\n  do base = 1, 4\n    if (verify(ch, toml_base(base)) /= 0) error stop base\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("verify_param_char_array_elem", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("verify parameter char array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "verify parameter char array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("verify parameter char array run failed");
+    assert!(
+        run.status.success(),
+        "verify parameter char array run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected verify parameter char array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), allocatable, target :: c_tokens(:,:)\n  type(c_ptr) :: raw\n  integer :: i\n  allocate(c_tokens(4, 1))\n  do i = 1, 3\n    c_tokens(i, 1) = achar(96 + i, kind=c_char)\n  end do\n  c_tokens(4, 1) = c_null_char\n  raw = c_loc(c_tokens(1, 1))\n  if (.not. c_associated(raw)) stop 1\n  print *, 'ok'\nend program\n",
@@ -17401,6 +17438,42 @@ fn logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_an
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected logical reduction component ctor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: equal\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t), parameter :: char_kind = chars_t('=', ' ', achar(9))\n\n  if (any(match(char_kind%equal, 1, [char_kind%space, char_kind%tab]))) error stop 1\n\n  print *, 'ok'\ncontains\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_reduce_component_ctor_actuals_nonmatching", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("logical reduction nonmatching component ctor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "logical reduction nonmatching component ctor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("logical reduction nonmatching component ctor run failed");
+    assert!(
+        run.status.success(),
+        "logical reduction nonmatching component ctor run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected logical reduction nonmatching component ctor output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
