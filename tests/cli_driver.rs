@@ -5836,6 +5836,642 @@ fn move_alloc_from_scalar_allocatable_polymorphic_dummy_compiles() {
 }
 
 #[test]
+fn move_alloc_scalar_class_allocatable_preserves_real_payload_through_select_type() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real :: raw = -1.0\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real, pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real :: x\n  call kv%set_float(1.0)\n  x = kv%read_float()\n  if (abs(x - 1.0) > 1.0e-6) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("move_alloc_scalar_class_real_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar class payload compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar class payload repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar class payload run failed");
+    assert!(
+        run.status.success(),
+        "scalar class payload repro should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected scalar class payload repro to preserve the float value, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn move_alloc_scalar_class_allocatable_preserves_real8_payload_through_select_type() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: rk = selected_real_kind(15)\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real(rk) :: raw = -1.0_rk\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real(rk) function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real(rk), pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real(rk), pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real(rk) :: x\n  call kv%set_float(1.0_rk)\n  x = kv%read_float()\n  if (abs(x - 1.0_rk) > 1.0e-12_rk) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("move_alloc_scalar_class_real8_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar class real8 payload compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar class real8 payload repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar class real8 payload run failed");
+    assert!(
+        run.status.success(),
+        "scalar class real8 payload repro should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected scalar class real8 payload repro to preserve the float value, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn real8_payload_round_trips_through_real4_getter_wrapper() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: tf_sp = selected_real_kind(6)\n  integer, parameter :: rk = selected_real_kind(15)\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real(rk) :: raw = -1.0_rk\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: get_float_ptr\n    procedure :: get_float_sp\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_float_ptr(self, ptr)\n    class(keyval_t), intent(in) :: self\n    real(rk), pointer, intent(out) :: ptr\n    ptr => cast_float(self%val)\n  end subroutine\n  subroutine get_float_sp(self, x)\n    class(keyval_t), intent(in) :: self\n    real(tf_sp), intent(out) :: x\n    real(rk), pointer :: ptr\n    call self%get_float_ptr(ptr)\n    if (.not.associated(ptr)) error stop 1\n    x = real(ptr, tf_sp)\n  end subroutine\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real(rk), pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real(tf_sp) :: x\n  call kv%set_float(1.0_rk)\n  call kv%get_float_sp(x)\n  if (abs(x - 1.0_tf_sp) > 1.0e-6_tf_sp) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real8_to_real4_getter_wrapper", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real8->real4 getter wrapper compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "real8->real4 getter wrapper repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("real8->real4 getter wrapper run failed");
+    assert!(
+        run.status.success(),
+        "real8->real4 getter wrapper repro should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected real8->real4 getter wrapper repro to preserve the value, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn move_alloc_nested_class_allocatable_container_preserves_real_payload() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real :: raw = -1.0\n  end type\n  type, abstract :: value_t\n  end type\n  type, extends(value_t) :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\n  type :: node_t\n    class(value_t), allocatable :: val\n  end type\n  type :: list_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: push_back\n    procedure :: get_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real, pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\n  subroutine push_back(self, val)\n    class(list_t), intent(inout) :: self\n    class(value_t), allocatable, intent(inout) :: val\n    if (.not.allocated(self%lst)) then\n      allocate(self%lst(1))\n    end if\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine get_float(self, idx, x)\n    class(list_t), intent(inout) :: self\n    integer, intent(in) :: idx\n    real, intent(out) :: x\n    class(value_t), pointer :: any\n    nullify(any)\n    if (allocated(self%lst(idx)%val)) any => self%lst(idx)%val\n    if (.not.associated(any)) error stop 2\n    select type(any)\n    type is(keyval_t)\n      x = any%read_float()\n    class default\n      error stop 3\n    end select\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(list_t) :: list\n  type(keyval_t), allocatable :: item\n  real :: x\n  allocate(item)\n  call item%set_float(1.0)\n  call list%push_back(item)\n  call list%get_float(1, x)\n  if (abs(x - 1.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("move_alloc_nested_class_real_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested class payload compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested class payload repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested class payload run failed");
+    assert!(
+        run.status.success(),
+        "nested class payload repro should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected nested class payload repro to preserve the float value, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_bound_get_through_class_holder_returns_allocatable_component_pointer() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: payload_t\n  end type\n  type, extends(payload_t) :: keyval_t\n    real :: x = 0.0\n  end type\n  type, abstract :: list_base_t\n  contains\n    procedure(get_i), deferred :: get\n    procedure(push_i), deferred :: push_back\n  end type\n  abstract interface\n    subroutine get_i(self, idx, ptr)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      integer, intent(in) :: idx\n      class(payload_t), pointer, intent(out) :: ptr\n    end subroutine\n    subroutine push_i(self, val)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      class(payload_t), allocatable, intent(inout) :: val\n    end subroutine\n  end interface\n  type :: node_t\n    class(payload_t), allocatable :: val\n  end type\n  type, extends(list_base_t) :: list_impl_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: get => impl_get\n    procedure :: push_back => impl_push_back\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: set_first\n    procedure :: get_first\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    call move_alloc(tmp, self%list)\n  end subroutine\n  subroutine impl_push_back(self, val)\n    class(list_impl_t), intent(inout), target :: self\n    class(payload_t), allocatable, intent(inout) :: val\n    if (.not. allocated(self%lst)) allocate(self%lst(1))\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine impl_get(self, idx, ptr)\n    class(list_impl_t), intent(inout), target :: self\n    integer, intent(in) :: idx\n    class(payload_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    if (idx > 0 .and. idx <= self%n) then\n      if (allocated(self%lst(idx)%val)) ptr => self%lst(idx)%val\n    end if\n  end subroutine\n  subroutine set_first(self, x)\n    class(array_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%x = x\n    call self%list%push_back(tmp)\n  end subroutine\n  real function get_first(self) result(x)\n    class(array_t), intent(inout) :: self\n    class(payload_t), pointer :: ptr\n    x = -1.0\n    call self%list%get(1, ptr)\n    if (.not. associated(ptr)) error stop 1\n    select type(ptr)\n    type is(keyval_t)\n      x = ptr%x\n    class default\n      error stop 2\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(array_t) :: arr\n  call arr%init()\n  call arr%set_first(1.0)\n  if (abs(arr%get_first() - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("deferred_bound_get_class_holder", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred bound get class-holder compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "deferred bound get class-holder repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("deferred bound get class-holder run failed");
+    assert!(
+        run.status.success(),
+        "deferred bound get class-holder repro should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected deferred bound get class-holder repro to preserve the payload pointer, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_deferred_bound_get_through_class_holder_preserves_payload_pointer() {
+    let dir = unique_dir("imported_deferred_bound_get_holder");
+    let payload_src = write_program_in(
+        &dir,
+        "payload_m.f90",
+        "module payload_m\n  implicit none\n  type, abstract :: payload_t\n  end type\n  type, extends(payload_t) :: keyval_t\n    real :: x = 0.0\n  end type\nend module\n",
+    );
+    let list_base_src = write_program_in(
+        &dir,
+        "list_base_m.f90",
+        "module list_base_m\n  use payload_m, only : payload_t\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_i), deferred :: get\n    procedure(push_i), deferred :: push_back\n  end type\n  abstract interface\n    subroutine get_i(self, idx, ptr)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      integer, intent(in) :: idx\n      class(payload_t), pointer, intent(out) :: ptr\n    end subroutine\n    subroutine push_i(self, val)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      class(payload_t), allocatable, intent(inout) :: val\n    end subroutine\n  end interface\nend module\n",
+    );
+    let list_impl_src = write_program_in(
+        &dir,
+        "list_impl_m.f90",
+        "module list_impl_m\n  use payload_m, only : payload_t\n  use list_base_m, only : list_base_t\n  implicit none\n  type :: node_t\n    class(payload_t), allocatable :: val\n  end type\n  type, extends(list_base_t) :: list_impl_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: get => impl_get\n    procedure :: push_back => impl_push_back\n  end type\ncontains\n  subroutine impl_push_back(self, val)\n    class(list_impl_t), intent(inout), target :: self\n    class(payload_t), allocatable, intent(inout) :: val\n    if (.not. allocated(self%lst)) allocate(self%lst(1))\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine impl_get(self, idx, ptr)\n    class(list_impl_t), intent(inout), target :: self\n    integer, intent(in) :: idx\n    class(payload_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    if (idx > 0 .and. idx <= self%n) then\n      if (allocated(self%lst(idx)%val)) ptr => self%lst(idx)%val\n    end if\n  end subroutine\nend module\n",
+    );
+    let holder_src = write_program_in(
+        &dir,
+        "holder_m.f90",
+        "module holder_m\n  use payload_m, only : payload_t, keyval_t\n  use list_base_m, only : list_base_t\n  use list_impl_m, only : list_impl_t\n  implicit none\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: set_first\n    procedure :: get_first\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    call move_alloc(tmp, self%list)\n  end subroutine\n  subroutine set_first(self, x)\n    class(array_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%x = x\n    call self%list%push_back(tmp)\n  end subroutine\n  real function get_first(self) result(x)\n    class(array_t), intent(inout) :: self\n    class(payload_t), pointer :: ptr\n    x = -1.0\n    call self%list%get(1, ptr)\n    if (.not. associated(ptr)) error stop 1\n    select type(ptr)\n    type is(keyval_t)\n      x = ptr%x\n    class default\n      error stop 2\n    end select\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use holder_m, only : array_t\n  implicit none\n  type(array_t) :: arr\n  call arr%init()\n  call arr%set_first(1.0)\n  if (abs(arr%get_first() - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+    );
+
+    let payload_obj = dir.join("payload_m.o");
+    let list_base_obj = dir.join("list_base_m.o");
+    let list_impl_obj = dir.join("list_impl_m.o");
+    let holder_obj = dir.join("holder_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_deferred_bound_get_holder.bin");
+
+    for (src, obj, needs_i) in [
+        (&payload_src, &payload_obj, false),
+        (&list_base_src, &list_base_obj, true),
+        (&list_impl_src, &list_impl_obj, true),
+        (&holder_src, &holder_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "imported deferred bound get compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            payload_obj.to_str().unwrap(),
+            list_base_obj.to_str().unwrap(),
+            list_impl_obj.to_str().unwrap(),
+            holder_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported deferred bound get link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported deferred bound get runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected imported deferred bound get to preserve the payload pointer, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_keyval_cast_after_deferred_bound_get_preserves_real8_payload() {
+    let dir = unique_dir("imported_keyval_cast_after_get");
+    let value_src = write_program_in(
+        &dir,
+        "value_m.f90",
+        "module value_m\n  implicit none\n  integer, parameter :: tf_sp = selected_real_kind(6)\n  integer, parameter :: rk = selected_real_kind(15)\n  type, abstract :: inner_value_t\n  end type\n  type, extends(inner_value_t) :: float_value_t\n    real(rk) :: raw = -1.0_rk\n  end type\n  type, abstract :: value_t\n  end type\n  type, extends(value_t) :: keyval_t\n    class(inner_value_t), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: get_float_ptr\n    procedure :: get_float_sp\n  end type\n  interface cast_to_keyval\n    module procedure :: cast_to_keyval_impl\n  end interface\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(float_value_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_float_ptr(self, ptr)\n    class(keyval_t), intent(in) :: self\n    real(rk), pointer, intent(out) :: ptr\n    ptr => cast_float(self%val)\n  end subroutine\n  subroutine get_float_sp(self, x)\n    class(keyval_t), intent(in) :: self\n    real(tf_sp), intent(out) :: x\n    real(rk), pointer :: ptr\n    call self%get_float_ptr(ptr)\n    if (.not.associated(ptr)) error stop 1\n    x = real(ptr, tf_sp)\n  end subroutine\n  function cast_float(val) result(ptr)\n    class(inner_value_t), intent(in), target :: val\n    real(rk), pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value_t)\n      ptr => val%raw\n    end select\n  end function\n  function cast_to_keyval_impl(ptr) result(kval)\n    class(value_t), intent(in), target :: ptr\n    type(keyval_t), pointer :: kval\n    nullify(kval)\n    select type(ptr)\n    type is(keyval_t)\n      kval => ptr\n    end select\n  end function\nend module\n",
+    );
+    let list_base_src = write_program_in(
+        &dir,
+        "list_base_m.f90",
+        "module list_base_m\n  use value_m, only : value_t\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_i), deferred :: get\n    procedure(push_i), deferred :: push_back\n  end type\n  abstract interface\n    subroutine get_i(self, idx, ptr)\n      import :: list_base_t, value_t\n      class(list_base_t), intent(inout), target :: self\n      integer, intent(in) :: idx\n      class(value_t), pointer, intent(out) :: ptr\n    end subroutine\n    subroutine push_i(self, val)\n      import :: list_base_t, value_t\n      class(list_base_t), intent(inout), target :: self\n      class(value_t), allocatable, intent(inout) :: val\n    end subroutine\n  end interface\nend module\n",
+    );
+    let list_impl_src = write_program_in(
+        &dir,
+        "list_impl_m.f90",
+        "module list_impl_m\n  use value_m, only : value_t\n  use list_base_m, only : list_base_t\n  implicit none\n  type :: node_t\n    class(value_t), allocatable :: val\n  end type\n  type, extends(list_base_t) :: list_impl_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: get => impl_get\n    procedure :: push_back => impl_push_back\n  end type\ncontains\n  subroutine impl_push_back(self, val)\n    class(list_impl_t), intent(inout), target :: self\n    class(value_t), allocatable, intent(inout) :: val\n    if (.not. allocated(self%lst)) allocate(self%lst(1))\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine impl_get(self, idx, ptr)\n    class(list_impl_t), intent(inout), target :: self\n    integer, intent(in) :: idx\n    class(value_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    if (idx > 0 .and. idx <= self%n) then\n      if (allocated(self%lst(idx)%val)) ptr => self%lst(idx)%val\n    end if\n  end subroutine\nend module\n",
+    );
+    let holder_src = write_program_in(
+        &dir,
+        "holder_m.f90",
+        "module holder_m\n  use value_m, only : tf_sp, rk, value_t, keyval_t, cast_to_keyval\n  use list_base_m, only : list_base_t\n  use list_impl_m, only : list_impl_t\n  implicit none\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: set_first\n    procedure :: get_first\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    call move_alloc(tmp, self%list)\n  end subroutine\n  subroutine set_first(self, x)\n    class(array_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    call tmp%set_float(x)\n    call self%list%push_back(tmp)\n  end subroutine\n  real(tf_sp) function get_first(self) result(x)\n    class(array_t), intent(inout) :: self\n    class(value_t), pointer :: tmp\n    type(keyval_t), pointer :: ptr\n    x = -1.0_tf_sp\n    call self%list%get(1, tmp)\n    if (.not.associated(tmp)) error stop 2\n    ptr => cast_to_keyval(tmp)\n    if (.not.associated(ptr)) error stop 3\n    call ptr%get_float_sp(x)\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use holder_m, only : array_t\n  use value_m, only : rk, tf_sp\n  implicit none\n  type(array_t) :: arr\n  real(tf_sp) :: x\n  call arr%init()\n  call arr%set_first(1.0_rk)\n  x = arr%get_first()\n  if (abs(x - 1.0_tf_sp) > 1.0e-6_tf_sp) error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let value_obj = dir.join("value_m.o");
+    let list_base_obj = dir.join("list_base_m.o");
+    let list_impl_obj = dir.join("list_impl_m.o");
+    let holder_obj = dir.join("holder_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_keyval_cast_after_get.bin");
+
+    for (src, obj, needs_i) in [
+        (&value_src, &value_obj, false),
+        (&list_base_src, &list_base_obj, true),
+        (&list_impl_src, &list_impl_obj, true),
+        (&holder_src, &holder_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "imported keyval cast-after-get compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            value_obj.to_str().unwrap(),
+            list_base_obj.to_str().unwrap(),
+            list_impl_obj.to_str().unwrap(),
+            holder_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported keyval cast-after-get link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported keyval cast-after-get runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected imported keyval cast-after-get to preserve the value, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_function_accepts_imported_derived_actual() {
+    let dir = unique_dir("imported_generic_function_derived");
+    let types_src = write_program_in(
+        &dir,
+        "types_m.f90",
+        "module types_m\n  implicit none\n  type :: date_t\n    integer :: year = 0\n  end type\nend module\n",
+    );
+    let utils_src = write_program_in(
+        &dir,
+        "utils_m.f90",
+        "module utils_m\n  use types_m, only : date_t\n  implicit none\n  interface to_string\n    module procedure :: to_string_date\n  end interface\ncontains\n  function to_string_date(val) result(str)\n    type(date_t), intent(in) :: val\n    character(len=:), allocatable :: str\n    if (val%year == 1987) then\n      str = 'ok'\n    else\n      str = 'bad'\n    end if\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use types_m, only : date_t\n  use utils_m, only : to_string\n  implicit none\n  type(date_t) :: ref\n  ref%year = 1987\n  if (to_string(ref) /= 'ok') error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let types_obj = dir.join("types_m.o");
+    let utils_obj = dir.join("utils_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_generic_function_derived.bin");
+
+    for (src, obj, needs_i) in [
+        (&types_src, &types_obj, false),
+        (&utils_src, &utils_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "imported generic function compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            types_obj.to_str().unwrap(),
+            utils_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported generic function link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported generic function runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected imported generic function to accept the derived actual, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merged_imported_generic_function_preserves_imported_derived_specifics() {
+    let dir = unique_dir("merged_imported_generic_function");
+    let types_src = write_program_in(
+        &dir,
+        "types_m.f90",
+        "module types_m\n  implicit none\n  type :: date_t\n    integer :: year = 0\n  end type\nend module\n",
+    );
+    let date_src = write_program_in(
+        &dir,
+        "date_utils_m.f90",
+        "module date_utils_m\n  use types_m, only : date_t\n  implicit none\n  interface to_string\n    module procedure :: to_string_date\n  end interface\ncontains\n  function to_string_date(val) result(str)\n    type(date_t), intent(in) :: val\n    character(len=:), allocatable :: str\n    if (val%year == 1987) then\n      str = 'date'\n    else\n      str = 'bad'\n    end if\n  end function\nend module\n",
+    );
+    let merged_src = write_program_in(
+        &dir,
+        "merged_utils_m.f90",
+        "module merged_utils_m\n  use date_utils_m, only : to_string\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n  end interface\ncontains\n  function to_string_i4(val) result(str)\n    integer, intent(in) :: val\n    character(len=:), allocatable :: str\n    if (val == 7) then\n      str = 'int'\n    else\n      str = 'bad'\n    end if\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use types_m, only : date_t\n  use merged_utils_m, only : to_string\n  implicit none\n  type(date_t) :: ref\n  ref%year = 1987\n  if (to_string(ref) /= 'date') error stop 1\n  if (to_string(7) /= 'int') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let types_obj = dir.join("types_m.o");
+    let date_obj = dir.join("date_utils_m.o");
+    let merged_obj = dir.join("merged_utils_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_imported_generic_function.bin");
+
+    for (src, obj, needs_i) in [
+        (&types_src, &types_obj, false),
+        (&date_src, &date_obj, true),
+        (&merged_src, &merged_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged imported generic function compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            types_obj.to_str().unwrap(),
+            date_obj.to_str().unwrap(),
+            merged_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged imported generic function link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "merged imported generic function runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected merged imported generic function to keep imported specifics, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merged_imported_generic_amod_reexports_imported_specifics() {
+    let dir = unique_dir("merged_imported_generic_amod");
+    let types_src = write_program_in(
+        &dir,
+        "types_m.f90",
+        "module types_m\n  implicit none\n  type :: date_t\n    integer :: year = 0\n  end type\nend module\n",
+    );
+    let date_src = write_program_in(
+        &dir,
+        "date_utils_m.f90",
+        "module date_utils_m\n  use types_m, only : date_t\n  implicit none\n  interface to_string\n    module procedure :: to_string_date\n  end interface\ncontains\n  function to_string_date(val) result(str)\n    type(date_t), intent(in) :: val\n    character(len=:), allocatable :: str\n    if (val%year == 1987) then\n      str = 'date'\n    else\n      str = 'bad'\n    end if\n  end function\nend module\n",
+    );
+    let merged_src = write_program_in(
+        &dir,
+        "merged_utils_m.f90",
+        "module merged_utils_m\n  use date_utils_m, only : to_string\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n  end interface\ncontains\n  function to_string_i4(val) result(str)\n    integer, intent(in) :: val\n    character(len=:), allocatable :: str\n    if (val == 7) then\n      str = 'int'\n    else\n      str = 'bad'\n    end if\n  end function\nend module\n",
+    );
+
+    for (src, obj, needs_i) in [
+        (&types_src, dir.join("types_m.o"), false),
+        (&date_src, dir.join("date_utils_m.o"), true),
+        (&merged_src, dir.join("merged_utils_m.o"), true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged imported generic amod compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let amod_text = std::fs::read_to_string(dir.join("merged_utils_m.amod"))
+        .expect("missing merged_utils_m.amod");
+    assert!(
+        amod_text.contains("@interface to_string"),
+        "expected merged generic interface in amod, got: {}",
+        amod_text
+    );
+    assert!(
+        amod_text.contains("@specific to_string_date"),
+        "expected imported specific to be preserved in merged amod, got: {}",
+        amod_text
+    );
+    assert!(
+        amod_text.contains("@specific to_string_i4"),
+        "expected local specific to remain in merged amod, got: {}",
+        amod_text
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn type_bound_subroutine_call_uses_module_qualified_symbol_and_links() {
     let src = write_program(
         "module m\n  implicit none\n  type :: counter_t\n    integer :: value = 0\n  contains\n    procedure :: bump => counter_bump\n  end type\ncontains\n  subroutine counter_bump(this, delta)\n    class(counter_t), intent(inout) :: this\n    integer, intent(in) :: delta\n    this%value = this%value + delta\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(counter_t) :: counter\n  call counter%bump(7)\n  print *, counter%value\nend program\n",
@@ -7509,6 +8145,997 @@ fn component_bound_dispatch_keeps_module_specific_target_name() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn inherited_generic_tbp_alias_retargets_to_cross_tu_override() {
+    let dir = unique_dir("generic_tbp_alias_override");
+    let base_src = write_program_in(
+        &dir,
+        "base_m.f90",
+        "module base_m\n  implicit none\n  type, abstract :: base_t\n  contains\n    generic :: ping => ping_int\n    procedure(ping_int), deferred :: ping_int\n  end type\n  abstract interface\n    subroutine ping_int(self, out)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n      integer, intent(out) :: out\n    end subroutine\n  end interface\nend module\n",
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "impl_m.f90",
+        "module impl_m\n  use base_m, only : base_t\n  implicit none\n  type, extends(base_t) :: child_t\n  contains\n    procedure :: ping_int => child_ping\n  end type\ncontains\n  subroutine child_ping(self, out)\n    class(child_t), intent(inout) :: self\n    integer, intent(out) :: out\n    out = 17\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use impl_m, only : child_t\n  implicit none\n  type(child_t) :: x\n  integer :: out\n  call x%ping(out)\n  if (out /= 17) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let base_obj = dir.join("base_m.o");
+    let impl_obj = dir.join("impl_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("generic_tbp_alias_override.bin");
+
+    for (src, obj, needs_i) in [
+        (&base_src, &base_obj, false),
+        (&impl_src, &impl_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "generic tbp alias override compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            base_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("generic tbp alias override link spawn failed");
+    assert!(
+        link.status.success(),
+        "generic tbp alias override should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("generic tbp alias override run failed");
+    assert!(
+        run.status.success(),
+        "generic tbp alias override should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected generic tbp alias override output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_inherited_bound_proc_dispatches_from_external_base_module() {
+    let dir = unique_dir("imported_inherited_bound_proc_dispatch");
+    let base_src = write_program_in(
+        &dir,
+        "base_m.f90",
+        "module base_m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure :: match => base_match\n  end type\ncontains\n  logical function base_match(self, n) result(ok)\n    class(base_t), intent(in) :: self\n    integer, intent(in) :: n\n    ok = n == 17\n  end function\nend module\n",
+    );
+    let child_src = write_program_in(
+        &dir,
+        "child_m.f90",
+        "module child_m\n  use base_m, only : base_t\n  implicit none\n  type, extends(base_t) :: child_t\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use base_m, only : base_t\n  use child_m, only : child_t\n  implicit none\n  class(base_t), allocatable :: x\n  allocate(child_t :: x)\n  if (.not. x%match(17)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let base_obj = dir.join("base_m.o");
+    let child_obj = dir.join("child_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_inherited_bound_proc_dispatch.bin");
+
+    for (src, obj, needs_i) in [
+        (&base_src, &base_obj, false),
+        (&child_src, &child_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "imported inherited bound proc compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            base_obj.to_str().unwrap(),
+            child_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported inherited bound proc link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported inherited bound proc runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported inherited bound proc output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merged_generic_prefers_imported_pointer_specific_over_local_array_specific() {
+    let dir = unique_dir("merged_generic_pointer_specific");
+    let keyval_src = write_program_in(
+        &dir,
+        "keyval_m.f90",
+        "module keyval_m\n  implicit none\n  type :: keyval_t\n    real :: value = -1.0\n  end type\n  interface set_value\n    module procedure :: set_value_float_sp\n  end interface\ncontains\n  subroutine set_value_float_sp(ptr, val, stat, origin)\n    type(keyval_t), pointer, intent(inout) :: ptr\n    real, intent(in) :: val\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    if (.not.associated(ptr)) error stop 91\n    ptr%value = val\n    if (present(stat)) stat = 0\n    if (present(origin)) origin = 11\n  end subroutine\nend module\n",
+    );
+    let array_src = write_program_in(
+        &dir,
+        "array_m.f90",
+        "module array_m\n  use keyval_m, only : keyval_t, set_value\n  implicit none\n  type :: array_t\n    type(keyval_t), target :: node\n  end type\n  interface set_value\n    module procedure :: set_elem_value_float_sp\n    module procedure :: set_array_value_float_sp\n  end interface\ncontains\n  subroutine set_elem_value_float_sp(array, pos, val, stat, origin)\n    class(array_t), intent(inout) :: array\n    integer, intent(in) :: pos\n    real, intent(in) :: val\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    type(keyval_t), pointer :: ptr\n    if (pos /= 1) error stop 92\n    ptr => array%node\n    call set_value(ptr, val, stat, origin)\n  end subroutine\n  subroutine set_array_value_float_sp(array, val, stat, origin)\n    class(array_t), intent(inout) :: array\n    real, intent(in) :: val(:)\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    error stop 93\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use array_m, only : array_t, set_value\n  implicit none\n  type(array_t) :: array\n  integer :: stat\n  call set_value(array, 1, 3.5, stat=stat)\n  if (stat /= 0) error stop 94\n  if (abs(array%node%value - 3.5) > 1.0e-6) error stop 95\n  print *, 'ok'\nend program\n",
+    );
+
+    let keyval_obj = dir.join("keyval_m.o");
+    let array_obj = dir.join("array_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_generic_pointer_specific.bin");
+
+    for (src, obj, needs_i) in [
+        (&keyval_src, &keyval_obj, false),
+        (&array_src, &array_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged generic pointer specific compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            keyval_obj.to_str().unwrap(),
+            array_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged generic pointer specific link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "merged generic pointer specific run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected merged generic pointer specific output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merged_use_associated_generic_char_function_inside_concat_runs() {
+    let dir = unique_dir("merged_generic_char_concat");
+    let dt_src = write_program_in(
+        &dir,
+        "m_dt.f90",
+        "module m_dt\n  implicit none\n  type :: dt_t\n    integer :: v = 0\n  end type\n  interface to_string\n    module procedure :: to_string_dt\n  end interface\ncontains\n  function to_string_dt(x) result(s)\n    type(dt_t), intent(in) :: x\n    character(len=:), allocatable :: s\n    s = \"dt\"\n  end function\nend module\n",
+    );
+    let num_src = write_program_in(
+        &dir,
+        "m_num.f90",
+        "module m_num\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n  end interface\ncontains\n  function to_string_i4(x) result(s)\n    integer, intent(in) :: x\n    character(len=:), allocatable :: s\n    s = \"int\"\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use m_dt, only : dt_t, to_string\n  use m_num\n  implicit none\n  type(dt_t) :: x\n  character(len=:), allocatable :: msg\n  x%v = 1\n  msg = \"expected '\" // to_string(x) // \"'\"\n  if (trim(msg) /= \"expected 'dt'\") error stop 91\n  print *, trim(msg)\nend program\n",
+    );
+
+    let dt_obj = dir.join("m_dt.o");
+    let num_obj = dir.join("m_num.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_generic_char_concat.bin");
+
+    for (src, obj, needs_i) in [
+        (&dt_src, &dt_obj, false),
+        (&num_src, &num_obj, false),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged generic char concat compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            dt_obj.to_str().unwrap(),
+            num_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("merged generic char concat link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged generic char concat should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("merged generic char concat run failed");
+    assert!(
+        run.status.success(),
+        "merged generic char concat should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("expected 'dt'"),
+        "unexpected merged generic char concat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn module_subroutine_uses_datetime_stringifier_across_other_generic_modules() {
+    let dir = unique_dir("module_subroutine_datetime_to_string");
+    let dt_src = write_program_in(
+        &dir,
+        "m_dt.f90",
+        "module m_dt\n  implicit none\n  type :: dt_t\n    integer :: v = 0\n  end type\n  interface to_string\n    module procedure :: to_string_dt\n  end interface\ncontains\n  function to_string_dt(x) result(s)\n    type(dt_t), intent(in) :: x\n    character(len=:), allocatable :: s\n    if (x%v == 1) then\n      s = \"dt\"\n    else\n      s = \"bad\"\n    end if\n  end function\nend module\n",
+    );
+    let td_src = write_program_in(
+        &dir,
+        "td_m.f90",
+        "module td_m\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n    module procedure :: to_string_r8\n  end interface\ncontains\n  function to_string_i4(x) result(s)\n    integer, intent(in) :: x\n    character(len=:), allocatable :: s\n    s = \"int\"\n  end function\n  function to_string_r8(x) result(s)\n    real(8), intent(in) :: x\n    character(len=:), allocatable :: s\n    s = \"real\"\n  end function\nend module\n",
+    );
+    let util_src = write_program_in(
+        &dir,
+        "util_m.f90",
+        "module util_m\n  use m_dt, only : to_string\n  implicit none\n  private\n  public :: helper\n  public :: to_string\n  interface to_string\n    module procedure :: to_string_i2\n  end interface\ncontains\n  subroutine helper()\n  end subroutine\n  function to_string_i2(x) result(s)\n    integer(2), intent(in) :: x\n    character(len=:), allocatable :: s\n    s = \"i2\"\n  end function\nend module\n",
+    );
+    let lexer_src = write_program_in(
+        &dir,
+        "lexer_m.f90",
+        "module lexer_m\n  use td_m\n  use m_dt, only : dt_t, to_string\n  use util_m, only : helper\n  implicit none\ncontains\n  subroutine run()\n    type(dt_t) :: ref\n    character(len=:), allocatable :: msg\n    call helper()\n    ref%v = 1\n    msg = \"expected '\" // to_string(ref) // \"'\"\n    if (trim(msg) /= \"expected 'dt'\") error stop 91\n    print *, trim(msg)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use lexer_m, only : run\n  implicit none\n  call run()\nend program\n",
+    );
+
+    let dt_obj = dir.join("m_dt.o");
+    let td_obj = dir.join("td_m.o");
+    let util_obj = dir.join("util_m.o");
+    let lexer_obj = dir.join("lexer_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("module_subroutine_datetime_to_string.bin");
+
+    for (src, obj, needs_i) in [
+        (&dt_src, &dt_obj, false),
+        (&td_src, &td_obj, false),
+        (&util_src, &util_obj, true),
+        (&lexer_src, &lexer_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "module-subroutine datetime to_string compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            dt_obj.to_str().unwrap(),
+            td_obj.to_str().unwrap(),
+            util_obj.to_str().unwrap(),
+            lexer_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module-subroutine datetime to_string link spawn failed");
+    assert!(
+        link.status.success(),
+        "module-subroutine datetime to_string should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("module-subroutine datetime to_string run failed");
+    assert!(
+        run.status.success(),
+        "module-subroutine datetime to_string run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("expected 'dt'"),
+        "unexpected module-subroutine datetime to_string output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_name_semantic_type_beats_cross_scope_fallback_in_generic_dispatch() {
+    let dir = unique_dir("generic_local_name_precedence");
+    let noise_src = write_program_in(
+        &dir,
+        "noise_m.f90",
+        "module noise_m\n  implicit none\ncontains\n  subroutine seed()\n    complex(8) :: val\n    val = (1.0d0, 2.0d0)\n    if (real(val) < 0.0d0) print *, val\n  end subroutine\nend module\n",
+    );
+    let dt_src = write_program_in(
+        &dir,
+        "m_dt.f90",
+        "module m_dt\n  implicit none\n  type :: dt_t\n    integer :: v = 0\n  end type\n  interface to_string\n    module procedure :: to_string_dt\n  end interface\ncontains\n  function to_string_dt(x) result(s)\n    type(dt_t), intent(in) :: x\n    character(len=:), allocatable :: s\n    if (x%v == 1) then\n      s = \"dt\"\n    else\n      s = \"bad\"\n    end if\n  end function\nend module\n",
+    );
+    let driver_src = write_program_in(
+        &dir,
+        "driver_m.f90",
+        "module driver_m\n  use noise_m, only : seed\n  use m_dt, only : dt_t, to_string\n  implicit none\ncontains\n  subroutine run()\n    type(dt_t) :: val\n    call seed()\n    val%v = 1\n    if (to_string(val) /= \"dt\") error stop 91\n    print *, 'ok'\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use driver_m, only : run\n  implicit none\n  call run()\nend program\n",
+    );
+
+    let noise_obj = dir.join("noise_m.o");
+    let dt_obj = dir.join("m_dt.o");
+    let driver_obj = dir.join("driver_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("generic_local_name_precedence.bin");
+
+    for (src, obj, needs_i) in [
+        (&noise_src, &noise_obj, false),
+        (&dt_src, &dt_obj, false),
+        (&driver_src, &driver_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "generic local-name precedence compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            noise_obj.to_str().unwrap(),
+            dt_obj.to_str().unwrap(),
+            driver_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("generic local-name precedence link spawn failed");
+    assert!(
+        link.status.success(),
+        "generic local-name precedence should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("generic local-name precedence run failed");
+    assert!(
+        run.status.success(),
+        "generic local-name precedence run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected generic local-name precedence output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_pointer_semantic_type_beats_cross_scope_class_fallback_in_generic_dispatch() {
+    let dir = unique_dir("generic_local_pointer_precedence");
+    let noise_src = write_program_in(
+        &dir,
+        "noise_m.f90",
+        "module noise_m\n  implicit none\n  type, abstract :: base_t\n  end type\ncontains\n  subroutine seed()\n    class(base_t), pointer :: ptr\n    nullify(ptr)\n  end subroutine\nend module\n",
+    );
+    let tables_src = write_program_in(
+        &dir,
+        "tables_m.f90",
+        "module tables_m\n  implicit none\n  type :: table_t\n    integer :: mark = 0\n  end type\n  interface add_table\n    module procedure :: add_table_to_table\n  end interface\ncontains\n  subroutine add_table_to_table(table, key, ptr, stat)\n    class(table_t), intent(inout) :: table\n    character(len=*), intent(in) :: key\n    type(table_t), pointer, intent(out) :: ptr\n    integer, intent(out), optional :: stat\n    nullify(ptr)\n    table%mark = len_trim(key)\n    if (present(stat)) stat = 0\n  end subroutine\n  subroutine add_table_key(table, key, ptr, stat)\n    class(table_t), intent(inout) :: table\n    character(len=*), intent(in) :: key\n    type(table_t), pointer, intent(out) :: ptr\n    integer, intent(out), optional :: stat\n    call add_table(table, key, ptr, stat)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program main\n  use noise_m, only : seed\n  use tables_m, only : table_t, add_table_key\n  implicit none\n  type(table_t) :: table\n  type(table_t), pointer :: ptr\n  integer :: stat\n  call seed()\n  call add_table_key(table, 'abc', ptr, stat)\n  if (stat /= 0) error stop 91\n  if (table%mark /= 3) error stop 92\n  print *, 'ok'\nend program\n",
+    );
+
+    let noise_obj = dir.join("noise_m.o");
+    let tables_obj = dir.join("tables_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("generic_local_pointer_precedence.bin");
+
+    for (src, obj, needs_i) in [
+        (&noise_src, &noise_obj, false),
+        (&tables_src, &tables_obj, false),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "generic local-pointer precedence compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            noise_obj.to_str().unwrap(),
+            tables_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("generic local-pointer precedence link spawn failed");
+    assert!(
+        link.status.success(),
+        "generic local-pointer precedence should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("generic local-pointer precedence run failed");
+    assert!(
+        run.status.success(),
+        "generic local-pointer precedence run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected generic local-pointer precedence output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merged_generic_keeps_same_named_specifics_scoped_to_owner_module() {
+    let dir = unique_dir("merged_generic_owner_scope");
+    let storage_src = write_program_in(
+        &dir,
+        "storage_m.f90",
+        "module storage_m\n  implicit none\n  type :: storage_t\n  contains\n    procedure :: get_len\n  end type\ncontains\n  pure integer function get_len(self) result(length)\n    class(storage_t), intent(in) :: self\n    length = 111\n  end function\nend module\n",
+    );
+    let array_src = write_program_in(
+        &dir,
+        "array_m.f90",
+        "module array_m\n  use storage_m, only : storage_t\n  implicit none\n  type :: box_t\n    type(storage_t) :: storage\n  end type\n  interface len\n    module procedure :: get_len\n  end interface\ncontains\n  pure integer function get_len(self) result(length)\n    class(box_t), intent(in) :: self\n    length = 222\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use array_m, only : box_t, len\n  implicit none\n  type(box_t) :: box\n  if (len(box) /= 222) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let storage_obj = dir.join("storage_m.o");
+    let array_obj = dir.join("array_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_generic_owner_scope.bin");
+
+    for (src, obj, needs_i) in [
+        (&storage_src, &storage_obj, false),
+        (&array_src, &array_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged generic owner-scope compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            storage_obj.to_str().unwrap(),
+            array_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged generic owner-scope link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "merged generic owner-scope run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected merged generic owner-scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n  end type\n  interface len\n    module procedure :: get_len\n  end interface\ncontains\n  integer function get_len(self) result(length)\n    class(box_t), intent(in) :: self\n    length = 7\n  end function\n  integer function escaped_len(raw) result(length)\n    character(len=*), intent(in) :: raw\n    length = len(raw)\n  end function\nend module\nprogram p\n  use m, only : box_t, len, escaped_len\n  implicit none\n  type(box_t) :: box\n  if (len(box) /= 7) error stop 1\n  if (escaped_len('abc') /= 3) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("intrinsic_len_generic_fallback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intrinsic len generic fallback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intrinsic len generic fallback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("intrinsic len generic fallback run failed");
+    assert!(
+        run.status.success(),
+        "intrinsic len generic fallback run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected intrinsic len generic fallback output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_subroutine_accepts_derived_array_element_actual() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: dt\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure :: get_dt\n  end interface\ncontains\n  subroutine get_dt(array, pos, val, stat)\n    integer, intent(in) :: array\n    integer, intent(in) :: pos\n    type(dt), intent(out) :: val\n    integer, intent(out), optional :: stat\n    val%n = array + pos\n    if (present(stat)) stat = 0\n  end subroutine\n  subroutine fill(vals)\n    type(dt), allocatable, intent(out) :: vals(:)\n    integer :: i, info\n    allocate(vals(2))\n    do i = 1, size(vals)\n      call get_value(10, i, vals(i), info)\n      if (info /= 0) error stop 1\n    end do\n  end subroutine\nend module\nprogram p\n  use m, only : dt, fill\n  implicit none\n  type(dt), allocatable :: vals(:)\n  call fill(vals)\n  if (vals(1)%n /= 11 .or. vals(2)%n /= 12) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_derived_array_elem", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic derived array elem compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic derived array elem compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("generic derived array elem run failed");
+    assert!(
+        run.status.success(),
+        "generic derived array elem run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected generic derived array elem output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_subroutine_accepts_imported_derived_array_element_actual() {
+    let dir = unique_dir("generic_imported_derived_array_elem");
+    let types_src = write_program_in(
+        &dir,
+        "types.f90",
+        "module types_m\n  implicit none\n  type :: dt\n    integer :: n = 0\n  end type\nend module\n",
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "impl.f90",
+        "module impl_m\n  use types_m, only : dt\n  implicit none\n  interface get_value\n    module procedure :: get_dt\n  end interface\ncontains\n  subroutine get_dt(array, pos, val, stat, origin)\n    integer, intent(in) :: array\n    integer, intent(in) :: pos\n    type(dt), intent(out) :: val\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    val%n = array + pos\n    if (present(stat)) stat = 0\n    if (present(origin)) origin = pos\n  end subroutine\n  subroutine fill(vals)\n    type(dt), allocatable, intent(out) :: vals(:)\n    integer :: i, info, origin\n    allocate(vals(2))\n    do i = 1, size(vals)\n      call get_value(10, i, vals(i), info, origin)\n      if (info /= 0) error stop 1\n    end do\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use types_m, only : dt\n  use impl_m, only : fill\n  implicit none\n  type(dt), allocatable :: vals(:)\n  call fill(vals)\n  if (vals(1)%n /= 11 .or. vals(2)%n /= 12) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let types_obj = dir.join("types.o");
+    let impl_obj = dir.join("impl.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("generic_imported_derived_array_elem");
+
+    for (src, obj) in [(&types_src, &types_obj), (&impl_src, &impl_obj), (&main_src, &main_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                src.to_str().unwrap(),
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("imported derived array elem compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "imported derived array elem compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            types_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported derived array elem link failed to spawn");
+    assert!(
+        link.status.success(),
+        "imported derived array elem link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported derived array elem run failed");
+    assert!(
+        run.status.success(),
+        "imported derived array elem run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported derived array elem output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scalar_pointer_actual_materializes_descriptor_for_class_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n    integer :: n = 0\n  contains\n    procedure :: set_n\n  end type\ncontains\n  subroutine set_n(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    self%n = v\n  end subroutine\n  subroutine set_box(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    call self%set_n(v)\n  end subroutine\nend module\nprogram p\n  use m, only : box_t, set_box\n  implicit none\n  type(box_t), pointer :: ptr\n  allocate(ptr)\n  call set_box(ptr, 7)\n  if (.not.associated(ptr)) error stop 1\n  if (ptr%n /= 7) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pointer_class_dummy_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer class dummy descriptor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer class dummy descriptor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer class dummy descriptor run failed");
+    assert!(
+        run.status.success(),
+        "pointer class dummy descriptor run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected pointer class dummy descriptor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_allocated_concrete_moved_into_class_component_dispatches_concrete_len() {
+    let dir = unique_dir("imported_concrete_move_alloc_dispatch");
+    let base_src = write_program_in(
+        &dir,
+        "base_m.f90",
+        "module base_m\n  implicit none\n  type, abstract :: list_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_t\n      class(list_t), intent(in) :: self\n    end function\n  end interface\nend module\n",
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "impl_m.f90",
+        "module impl_m\n  use base_m, only : list_t\n  implicit none\n  type, extends(list_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n  end type\ncontains\n  subroutine new_list_impl(self)\n    type(list_impl_t), intent(out) :: self\n    self%n = 17\n  end subroutine\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\nend module\n",
+    );
+    let factory_src = write_program_in(
+        &dir,
+        "factory_m.f90",
+        "module factory_m\n  use base_m, only : list_t\n  use impl_m, only : list_impl_t, new_list_impl\n  implicit none\ncontains\n  subroutine make_list(self)\n    class(list_t), allocatable, intent(out) :: self\n    block\n      type(list_impl_t), allocatable :: list\n      allocate(list)\n      call new_list_impl(list)\n      call move_alloc(list, self)\n    end block\n  end subroutine\nend module\n",
+    );
+    let array_src = write_program_in(
+        &dir,
+        "array_m.f90",
+        "module array_m\n  use base_m, only : list_t\n  use factory_m, only : make_list\n  implicit none\n  type :: array_t\n    class(list_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: get_len => array_get_len\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    call make_list(self%list)\n  end subroutine\n  integer function array_get_len(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use array_m, only : array_t\n  implicit none\n  type(array_t) :: arr\n  call arr%init()\n  if (arr%get_len() /= 17) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let base_obj = dir.join("base_m.o");
+    let impl_obj = dir.join("impl_m.o");
+    let factory_obj = dir.join("factory_m.o");
+    let array_obj = dir.join("array_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_concrete_move_alloc_dispatch.bin");
+
+    for (src, obj, needs_i) in [
+        (&base_src, &base_obj, false),
+        (&impl_src, &impl_obj, true),
+        (&factory_src, &factory_obj, true),
+        (&array_src, &array_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "cross-tu move_alloc dispatch compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            base_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            factory_obj.to_str().unwrap(),
+            array_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cross-tu move_alloc dispatch link spawn failed");
+    assert!(
+        link.status.success(),
+        "cross-tu move_alloc dispatch should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-tu move_alloc dispatch run failed");
+    assert!(
+        run.status.success(),
+        "cross-tu move_alloc dispatch runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected cross-tu move_alloc dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -12030,6 +13657,289 @@ fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
 }
 
 #[test]
+fn select_type_allocatable_polymorphic_component_dispatches_via_descriptor_tag() {
+    let src = write_program(
+        "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: val\n  end type\n  type(holder_t) :: holder\n  integer :: seen\n  allocate(child_t :: holder%val)\n  select type (val => holder%val)\n  type is (child_t)\n    val%x = 23\n  class default\n    error stop 1\n  end select\n  seen = -1\n  select type (val => holder%val)\n  type is (child_t)\n    seen = val%x\n  class default\n    error stop 2\n  end select\n  if (seen /= 23) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_type_alloc_poly_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable polymorphic component select type compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "allocatable polymorphic component SELECT TYPE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable polymorphic component SELECT TYPE runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected allocatable polymorphic component SELECT TYPE to bind the concrete guard, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_class_dummy_actual_to_concrete_type_dummy_mutates_real_storage() {
+    let dir = unique_dir("class_dummy_to_concrete_dummy");
+    let type_src = write_program_in(
+        &dir,
+        "type_m.f90",
+        "module type_m\n  implicit none\n  type :: t\n    integer :: x = 0\n  end type\ncontains\n  subroutine init(self)\n    type(t), intent(out) :: self\n    self%x = 42\n  end subroutine\nend module\n",
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_m.f90",
+        "module use_m\n  use type_m, only : t, init\n  implicit none\ncontains\n  subroutine run(arg)\n    class(t), intent(inout) :: arg\n    call init(arg)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use type_m, only : t\n  use use_m, only : run\n  implicit none\n  type(t) :: value\n  call run(value)\n  if (value%x /= 42) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let type_obj = dir.join("type_m.o");
+    let use_obj = dir.join("use_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("class_dummy_to_concrete_dummy.bin");
+
+    for (src, obj, needs_i) in [
+        (&type_src, &type_obj, false),
+        (&use_src, &use_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "class dummy to concrete dummy compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            type_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "class dummy to concrete dummy link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "class dummy to concrete dummy runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected class dummy to concrete dummy output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bound_pointer_dummy_prefers_unique_link_name_over_duplicate_scope_name() {
+    let dir = unique_dir("bound_pointer_dummy_abi");
+    let other_src = write_program_in(
+        &dir,
+        "other_get_m.f90",
+        "module other_get_m\n  implicit none\ncontains\n  subroutine get(x)\n    integer, intent(out) :: x\n    x = 7\n  end subroutine\nend module\n",
+    );
+    let store_src = write_program_in(
+        &dir,
+        "store_m.f90",
+        "module store_m\n  implicit none\n  type :: base_t\n    integer :: x = 42\n  end type\n  type(base_t), target :: global_value\n  type :: box_t\n  contains\n    procedure :: get\n  end type\ncontains\n  subroutine get(self, ptr)\n    class(box_t), intent(inout) :: self\n    class(base_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    ptr => global_value\n  end subroutine\nend module\n",
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_m.f90",
+        "module use_m\n  use other_get_m, only : get\n  use store_m, only : box_t, base_t\n  implicit none\ncontains\n  subroutine run(ok)\n    logical, intent(out) :: ok\n    type(box_t) :: box\n    class(base_t), pointer :: ptr\n    integer :: scratch\n    call get(scratch)\n    call box%get(ptr)\n    ok = associated(ptr) .and. ptr%x == 42 .and. scratch == 7\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use use_m, only : run\n  implicit none\n  logical :: ok\n  call run(ok)\n  if (.not.ok) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let other_obj = dir.join("other_get_m.o");
+    let store_obj = dir.join("store_m.o");
+    let use_obj = dir.join("use_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("bound_pointer_dummy_abi.bin");
+
+    for (src, obj, needs_i) in [
+        (&other_src, &other_obj, false),
+        (&store_src, &store_obj, false),
+        (&use_src, &use_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "bound pointer dummy ABI compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            other_obj.to_str().unwrap(),
+            store_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "bound pointer dummy ABI link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "bound pointer dummy ABI runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected bound pointer dummy ABI output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pointer_dummy_select_type_assignment_updates_caller_slot() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: base_t\n    integer :: x = 0\n  end type\n  type, extends(base_t) :: child_t\n  end type\n  type(child_t), target, save :: global_child\ncontains\n  subroutine get_poly(tmp)\n    class(base_t), pointer, intent(out) :: tmp\n    global_child%x = 42\n    tmp => global_child\n  end subroutine\n\n  subroutine narrow(ptr)\n    type(child_t), pointer, intent(out) :: ptr\n    class(base_t), pointer :: tmp\n    nullify(ptr)\n    call get_poly(tmp)\n    if (.not.associated(tmp)) error stop 10\n    select type(tmp)\n    type is(child_t)\n      ptr => tmp\n    class default\n      error stop 11\n    end select\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: ptr\n  call narrow(ptr)\n  if (.not.associated(ptr)) error stop 1\n  if (ptr%x /= 42) error stop 2\n  print *, 'ok'\nend program\n",
+        "pointer_dummy_select_type_assignment_updates_caller_slot",
+    );
+    let out = src.with_extension("out");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointer dummy select type compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointer dummy select type should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("pointer dummy select type run failed to spawn");
+    assert!(
+        run.status.success(),
+        "pointer dummy select type should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected pointer dummy select type output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn select_type_class_default_is_lowered_as_fallback() {
+    let src = write_program(
+        "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: val\n  end type\n  type(holder_t) :: holder\n  integer :: seen\n  allocate(child_t :: holder%val)\n  select type (val => holder%val)\n  class default\n    error stop 1\n  type is (child_t)\n    val%x = 23\n  end select\n  seen = -1\n  select type (val => holder%val)\n  class default\n    error stop 2\n  type is (child_t)\n    seen = val%x\n  end select\n  if (seen /= 23) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_type_default_fallback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("default-first select type compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "default-first SELECT TYPE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "default-first SELECT TYPE runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "expected default-first SELECT TYPE to reach the matching TYPE IS arm, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_amod_type_tags_stay_stable_across_tus() {
     let dir = unique_dir("amod_type_tags_cross_tu");
     let types_src = write_program_in(
@@ -12171,7 +14081,7 @@ fn imported_amod_type_tags_stay_stable_across_tus() {
 #[test]
 fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice() {
     let src = write_program(
-        "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  q%x = 11\n  if (q%x /= 11) error stop 2\n  if (q%y /= 9) error stop 3\n  print *, 'ok'\nend program\n",
+        "module m\n  implicit none\n  type, abstract :: base_t\n    integer :: origin = 0\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%origin = 5\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  if (q%origin /= 5) error stop 2\n  if (q%x /= 7) error stop 3\n  if (q%y /= 9) error stop 4\n  q%origin = 1\n  q%x = 11\n  if (q%origin /= 1) error stop 5\n  if (q%x /= 11) error stop 6\n  if (q%y /= 9) error stop 7\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let out = unique_path("class_ptr_func_result_descriptor", "bin");
@@ -12183,6 +14093,90 @@ fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verif
         compile.status.success(),
         "descriptor-backed class pointer function result should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "descriptor-backed class pointer function result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected descriptor-backed class pointer function result output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn descriptor_backed_class_cast_preserves_object_base_with_unallocated_parent_allocatable() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n    character(len=:), allocatable :: key\n    integer :: origin = 0\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%origin = 5\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  if (q%origin /= 5) error stop 2\n  if (q%x /= 7) error stop 3\n  if (q%y /= 9) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_cast_parent_allocatable_base", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("descriptor-backed class cast compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "descriptor-backed class cast should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "descriptor-backed class cast should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected descriptor-backed class cast output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_allocate_source_uses_concrete_dynamic_layout() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: extra = 0\n  end type\nend module m\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  type(child_t), target :: child\n  child%x = 7\n  child%extra = 9\n  src => child\n  allocate(tmp, source=src)\n  select type (tmp)\n  type is (child_t)\n    tmp%extra = 11\n    if (tmp%x /= 7) error stop 1\n    if (tmp%extra /= 11) error stop 2\n  class default\n    error stop 3\n  end select\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_allocate_source_dynamic_layout", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic allocate source compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "polymorphic allocate source should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic allocate source should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected polymorphic allocate source output: {}",
+        stdout
     );
 
     let _ = std::fs::remove_file(&out);
@@ -14158,6 +16152,119 @@ fn allocatable_dummy_realloc_section_assign_returns_with_live_descriptor() {
 }
 
 #[test]
+fn allocatable_integer_unary_section_assignment_reallocates_to_slice_shape() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: vals(:)\n  integer :: ii\n  allocate(vals(4))\n  vals = [1, 3, 5, 7]\n  ii = 3\n  vals = -vals(:ii)\n  if (size(vals) /= 3) error stop 1\n  if (vals(1) /= -1) error stop 2\n  if (vals(2) /= -3) error stop 3\n  if (vals(3) /= -5) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_int_unary_section_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable integer unary section assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable integer unary section assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable integer unary section assign run failed");
+    assert!(
+        run.status.success(),
+        "allocatable integer unary section assign run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable integer unary section assign output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_logical_not_section_assignment_reallocates_to_slice_shape() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: vals(:)\n  integer :: ii\n  allocate(vals(4))\n  vals = [.true., .false., .true., .false.]\n  ii = 3\n  vals = .not. vals(:ii)\n  if (size(vals) /= 3) error stop 1\n  if (vals(1)) error stop 2\n  if (.not. vals(2)) error stop 3\n  if (vals(3)) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_logical_not_section_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable logical not section assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable logical not section assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable logical not section assign run failed");
+    assert!(
+        run.status.success(),
+        "allocatable logical not section assign run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected allocatable logical not section assign output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_subroutine_shadows_unrelated_global_generic_of_same_name() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: token_t\n    integer :: kind = 0\n  end type\n  interface resize\n    module procedure :: resize_token\n  end interface\ncontains\n  pure subroutine resize_token(var, n)\n    type(token_t), allocatable, intent(inout) :: var(:)\n    integer, intent(in), optional :: n\n    integer :: new_size\n    new_size = 1\n    if (present(n)) new_size = n\n    if (.not.allocated(var)) allocate(var(new_size))\n  end subroutine\nend module\nprogram p\n  use m, only : token_t\n  implicit none\n  integer, allocatable :: vals(:)\n  call outer(vals)\n  if (.not.allocated(vals)) error stop 1\n  if (size(vals) /= 2) error stop 2\n  if (any(vals /= 7)) error stop 3\n  print *, 'ok'\ncontains\n  subroutine outer(stack)\n    integer, allocatable, intent(out) :: stack(:)\n    allocate(stack(1))\n    stack = 1\n    call resize(stack)\n  contains\n    subroutine resize(stack, n)\n      integer, allocatable, intent(inout) :: stack(:)\n      integer, intent(in), optional :: n\n      integer, allocatable :: tmp(:)\n      integer :: new_size\n      new_size = 2\n      if (present(n)) new_size = n\n      allocate(tmp(new_size))\n      tmp = 7\n      call move_alloc(tmp, stack)\n    end subroutine\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_resize_shadows_generic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained resize shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained resize shadow compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained resize shadow run failed");
+    assert!(
+        run.status.success(),
+        "contained resize shadow run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected contained resize shadow output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn defined_assignment_generic_does_not_capture_intrinsic_assignment_of_other_derived_arrays() {
     let src = write_program(
         "module m\n  implicit none\n  type :: value_t\n    integer :: x = 0\n  end type\n  type :: token_t\n    integer :: token_type = 0\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type\n  public :: assignment(=)\n  interface assignment(=)\n    module procedure assign_value\n  end interface\ncontains\n  subroutine assign_value(lhs, rhs)\n    type(value_t), intent(out) :: lhs\n    type(value_t), intent(in) :: rhs\n    lhs%x = rhs%x\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: a(:), b(:)\n  allocate(a(2), b(1))\n  a(1)%token_type = 1\n  a(1)%text = '2'\n  a(1)%position = 1\n  b = a(1:1)\n  if (b(1)%token_type /= 1) error stop 1\n  if (trim(b(1)%text) /= '2') error stop 2\n  if (b(1)%position /= 1) error stop 3\n  print *, 'ok'\nend program\n",
@@ -15013,6 +17120,84 @@ fn generic_subroutine_resolution_preserves_skipped_optional_keyword_slots() {
 }
 
 #[test]
+fn generic_subroutine_resolution_rejects_keyword_overwrite_candidates() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: t\n    integer :: which = 0\n  end type\n  interface set_value\n    module procedure :: set_elem_value_float_sp\n    module procedure :: set_array_value_int_i4\n  end interface\ncontains\n  subroutine set_elem_value_float_sp(array, pos, val, stat, origin)\n    type(t), intent(inout) :: array\n    integer, intent(in) :: pos\n    real, intent(in) :: val\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    array%which = pos\n    if (present(stat)) stat = 10\n    if (present(origin)) origin = nint(val)\n  end subroutine\n\n  subroutine set_array_value_int_i4(array, val, stat, origin)\n    type(t), intent(inout) :: array\n    integer, intent(in) :: val(:)\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    array%which = -99\n    if (present(stat)) stat = 20\n    if (present(origin)) origin = size(val)\n  end subroutine\nend module\nprogram p\n  use m, only : t, set_value\n  implicit none\n  type(t) :: array\n  integer :: stat\n  call set_value(array, 7, 3.5, stat=stat)\n  if (array%which /= 7) error stop 1\n  if (stat /= 10) error stop 2\n  print *, array%which, stat\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_keyword_overwrite_candidate", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic keyword overwrite candidate compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic keyword overwrite candidate compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("generic keyword overwrite candidate run failed");
+    assert!(
+        run.status.success(),
+        "generic keyword overwrite candidate run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(
+        fields,
+        vec!["7", "10"],
+        "unexpected generic keyword overwrite candidate output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_constructor_keywords_preserve_parameter_component_defaults() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: merge_policy_t\n    integer :: overwrite = 11\n    integer :: preserve = 22\n    integer :: append = 33\n  end type\n  type(merge_policy_t), parameter :: policy = merge_policy_t()\n  type :: cfg_t\n    integer :: table = policy%append\n    integer :: array = policy%preserve\n    integer :: keyval = policy%preserve\n  end type\n  interface cfg_t\n    module procedure :: new_cfg\n  end interface\ncontains\n  function new_cfg(table, array, keyval) result(cfg)\n    integer, intent(in), optional :: table, array, keyval\n    type(cfg_t) :: cfg\n    if (present(table)) cfg%table = table\n    if (present(array)) cfg%array = array\n    if (present(keyval)) cfg%keyval = keyval\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(cfg_t) :: cfg\n  cfg = cfg_t(keyval=policy%overwrite)\n  if (cfg%table /= 33) error stop 1\n  if (cfg%array /= 22) error stop 2\n  if (cfg%keyval /= 11) error stop 3\n  print *, cfg%table, cfg%array, cfg%keyval\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_ctor_keyword_defaults", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived constructor keyword/default compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived constructor keyword/default compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived constructor keyword/default run failed");
+    assert!(
+        run.status.success(),
+        "derived constructor keyword/default run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(
+        fields,
+        vec!["33", "22", "11"],
+        "unexpected derived constructor keyword/default output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
     let dir = unique_dir("generic_keyword_specific_slots");
     let mod_src = write_program_in(
@@ -15211,6 +17396,227 @@ fn imported_generic_subroutine_resolution_matches_int_intrinsic_kind_actuals() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_subroutine_prefers_character_intrinsic_actual_specific() {
+    let dir = unique_dir("generic_character_intrinsic_actual");
+    let provider_src = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider\n  implicit none\n  type :: keyval_t\n    integer :: type_code = 0\n    character(:), allocatable :: str\n  contains\n    procedure :: get_type\n  end type\n  interface set_value\n    module procedure :: set_value_i1\n    module procedure :: set_value_string\n  end interface\ncontains\n  pure function get_type(self) result(code)\n    class(keyval_t), intent(in) :: self\n    integer :: code\n    code = self%type_code\n  end function\n\n  subroutine set_value_i1(self, val, stat)\n    type(keyval_t), intent(inout) :: self\n    integer(1), intent(in) :: val\n    integer, intent(out), optional :: stat\n    self%type_code = 103\n    if (allocated(self%str)) deallocate(self%str)\n    if (present(stat)) stat = int(val)\n  end subroutine\n\n  subroutine set_value_string(self, val, stat)\n    type(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: val\n    integer, intent(out), optional :: stat\n    self%type_code = 101\n    self%str = val\n    if (present(stat)) stat = 0\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use provider, only : keyval_t, set_value\n  implicit none\n  type(keyval_t) :: kv\n  integer :: stat\n  call set_value(kv, repeat('a', 3), stat=stat)\n  if (stat /= 0) error stop 1\n  if (kv%get_type() /= 101) error stop 2\n  if (.not.allocated(kv%str)) error stop 3\n  if (len(kv%str) /= 3) error stop 4\n  if (kv%str /= 'aaa') error stop 5\n  print *, 'ok'\nend program\n",
+    );
+
+    let provider_obj = dir.join("provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider_src.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "provider module should compile: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "consumer compile should resolve character intrinsic actuals: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let out = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            provider_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "linked binary should build: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn generic_subroutine_accepts_descriptor_backed_character_dummy_actuals() {
+    let src = "module m\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure :: check_complex_dp\n    module procedure :: check_complex_exceptional_dp\n    module procedure :: check_string\n    module procedure :: check_int_i1\n  end interface\ncontains\n  subroutine check_complex_dp(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    complex(dp), intent(in) :: actual\n    complex(dp), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    call check(error, actual, message, more)\n    if (allocated(error)) error stop 1\n  end subroutine\n\n  subroutine check_complex_exceptional_dp(error, actual, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    complex(dp), intent(in) :: actual\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    if (present(message)) then\n      if (message /= 'msg') error stop 2\n    end if\n    if (present(more)) then\n      if (more /= 'more') error stop 3\n    end if\n  end subroutine\n\n  subroutine check_string(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    character(len=*), intent(in) :: actual\n    character(len=*), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    error stop 4\n  end subroutine\n\n  subroutine check_int_i1(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    integer(1), intent(in) :: actual\n    integer(1), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    error stop 5\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(error_type), allocatable :: error\n  call check_complex_dp(error, (1.0_dp, 2.0_dp), (1.0_dp, 2.0_dp), 'msg', 'more')\n  if (allocated(error)) error stop 6\n  print *, 'ok'\nend program\n";
+    let src = write_program(src, "f90");
+    let out = unique_path("generic_char_dummy_actuals", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "compile should accept descriptor-backed character dummy actuals: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_function_resolution_uses_local_scope_for_intrinsic_result_kinds() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: sp = selected_real_kind(6)\n  integer, parameter :: dp = selected_real_kind(15)\n  interface is_nan\n    module procedure :: is_nan_sp\n    module procedure :: is_nan_dp\n  end interface\ncontains\n  subroutine earlier(actual)\n    complex(dp), intent(in) :: actual\n    if (is_nan(real(actual)) .or. is_nan(aimag(actual))) error stop 1\n  end subroutine\n\n  subroutine later(actual)\n    complex(sp), intent(in) :: actual\n    logical :: x\n    x = is_nan(real(actual)) .or. is_nan(aimag(actual))\n    if (x) error stop 2\n  end subroutine\n\n  elemental function is_nan_sp(val) result(is_nan)\n    real(sp), intent(in) :: val\n    logical :: is_nan\n    is_nan = val /= val\n  end function\n\n  elemental function is_nan_dp(val) result(is_nan)\n    real(dp), intent(in) :: val\n    logical :: is_nan\n    is_nan = val /= val\n  end function\nend module\nprogram p\n  use m\n  call later((1.0_sp, 2.0_sp))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_intrinsic_scope_kinds", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "compile should use local complex kinds for intrinsic generic actuals: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_subroutine_accepts_generic_function_character_actuals() {
+    let src = write_program(
+        "module m\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n    module procedure :: to_string_i8\n  end interface\n  interface accept\n    module procedure :: accept_string\n    module procedure :: accept_i8\n  end interface\ncontains\n  function to_string_i4(val) result(string)\n    integer(4), intent(in) :: val\n    character(len=:), allocatable :: string\n    if (val == 7) then\n      string = 'i4'\n    else\n      string = 'bad'\n    end if\n  end function\n\n  function to_string_i8(val) result(string)\n    integer(8), intent(in) :: val\n    character(len=:), allocatable :: string\n    if (val == 7_8) then\n      string = 'i8'\n    else\n      string = 'bad'\n    end if\n  end function\n\n  subroutine accept_string(val)\n    character(*), intent(in) :: val\n    if (val /= 'i4') error stop 2\n  end subroutine\n\n  subroutine accept_i8(val)\n    integer(8), intent(in) :: val\n    if (val /= 0_8) error stop 3\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: ii\n  ii = 7\n  call accept(to_string(ii))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_function_character_actual", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "compile should accept generic function character actuals: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_subroutine_accepts_non_boz_int_kind_actuals() {
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: i8 = selected_int_kind(18)\n  interface check\n    module procedure :: check_i4\n    module procedure :: check_i8\n  end interface\ncontains\n  subroutine check_i4(val)\n    integer(4), intent(in) :: val\n    if (val /= 0) error stop 1\n  end subroutine\n\n  subroutine check_i8(val)\n    integer(8), intent(in) :: val\n    if (val /= 7_i8) error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: ii\n  ii = 7\n  call check(int(ii, i8))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_non_boz_int_kind_actual", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "compile should accept non-BOZ int(..., kind) actuals: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -17389,6 +19795,243 @@ fn module_global_component_overloaded_concat_preserves_nested_character_actual_l
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected module global component overloaded concat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: datetime_t\n    integer :: year = 0\n    integer :: month = 0\n    integer :: day = 0\n  end type\n  type :: keyval_t\n    real :: as_float = -1.0\n    type(datetime_t) :: as_datetime\n  contains\n    procedure :: set_float\n    procedure :: set_datetime\n    procedure :: get_float\n    procedure :: get_datetime\n    generic :: set => set_float, set_datetime\n    generic :: get => get_float, get_datetime\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    self%as_float = x\n  end subroutine\n  subroutine set_datetime(self, x)\n    class(keyval_t), intent(inout) :: self\n    type(datetime_t), intent(in) :: x\n    self%as_datetime = x\n  end subroutine\n  subroutine get_float(self, x)\n    class(keyval_t), intent(in) :: self\n    real, intent(out) :: x\n    x = self%as_float\n  end subroutine\n  subroutine get_datetime(self, x)\n    class(keyval_t), intent(in) :: self\n    type(datetime_t), intent(out) :: x\n    x = self%as_datetime\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  type(datetime_t) :: in_dt, out_dt\n  real :: out_float\n  in_dt = datetime_t(2022, 7, 31)\n  call kv%set(in_dt)\n  call kv%get(out_dt)\n  if (out_dt%year /= 2022) error stop 1\n  if (out_dt%month /= 7) error stop 2\n  if (out_dt%day /= 31) error stop 3\n  call kv%set(3.5)\n  call kv%get(out_float)\n  if (abs(out_float - 3.5) > 1.0e-6) error stop 4\n  print *, out_dt%year, out_dt%month, out_dt%day, out_float\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_type_bound_subroutine_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic type-bound dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic type-bound dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("generic type-bound dispatch run failed");
+    assert!(
+        run.status.success(),
+        "generic type-bound dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(&fields[..3], ["2022", "7", "31"]);
+    let parsed_real: f32 = fields[3]
+        .parse()
+        .expect("expected final real field to parse as f32");
+    assert!(
+        (parsed_real - 3.5).abs() < 1.0e-6,
+        "unexpected generic type-bound dispatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_type_bound_dispatch_uses_character_intrinsic_actual_specific() {
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type :: datetime_t\n    integer :: year = 0\n  end type\n  type, extends(generic_value) :: datetime_value\n    type(datetime_t) :: raw\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_datetime\n    procedure :: set_string\n    procedure :: get_datetime\n    procedure :: get_string\n    procedure :: get_type\n    generic :: set => set_datetime, set_string\n    generic :: get => get_datetime, get_string\n  end type\ncontains\n  subroutine set_datetime(self, x)\n    class(keyval_t), intent(inout) :: self\n    type(datetime_t), intent(in) :: x\n    type(datetime_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n\n  subroutine set_string(self, x)\n    class(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: x\n    type(string_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n\n  subroutine get_datetime(self, x)\n    class(keyval_t), intent(in) :: self\n    type(datetime_t), pointer, intent(out) :: x\n    nullify(x)\n    select type(v => self%val)\n    type is(datetime_value)\n      x => v%raw\n    end select\n  end subroutine\n\n  subroutine get_string(self, x)\n    class(keyval_t), intent(in) :: self\n    character(:), pointer, intent(out) :: x\n    nullify(x)\n    select type(v => self%val)\n    type is(string_value)\n      x => v%raw\n    end select\n  end subroutine\n\n  pure function get_type(self) result(code)\n    class(keyval_t), intent(in) :: self\n    integer :: code\n    select type(v => self%val)\n    class default\n      code = 0\n    type is(datetime_value)\n      code = 105\n    type is(string_value)\n      code = 101\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  character(:), pointer :: sp\n  call kv%set(repeat('a', 3))\n  if (kv%get_type() /= 101) error stop 1\n  call kv%get(sp)\n  if (.not.associated(sp)) error stop 2\n  if (len(sp) /= 3) error stop 3\n  if (sp /= 'aaa') error stop 4\n  print *, kv%get_type(), len(sp), sp\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_type_bound_character_intrinsic_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic type-bound character intrinsic dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic type-bound character intrinsic dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("generic type-bound character intrinsic dispatch run failed");
+    assert!(
+        run.status.success(),
+        "generic type-bound character intrinsic dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("101") && stdout.contains("3") && stdout.contains("aaa"),
+        "unexpected generic type-bound character intrinsic dispatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_derived_parameter_constructor_defaults_preserve_component_values() {
+    let src = write_program(
+        "module constants_m\n  implicit none\n  private\n  public :: enum_type, toml_type\n  type :: enum_type\n    integer :: invalid = 100\n    integer :: string = 101\n    integer :: boolean = 102\n  end type\n  type(enum_type), parameter :: toml_type = enum_type()\nend module\nmodule use_m\n  use constants_m, only : toml_type\n  implicit none\ncontains\n  integer function string_tag() result(v)\n    v = toml_type%string\n  end function\n  integer function invalid_tag() result(v)\n    v = toml_type%invalid\n  end function\nend module\nprogram p\n  use use_m\n  implicit none\n  if (string_tag() /= 101) error stop 1\n  if (invalid_tag() /= 100) error stop 2\n  print *, string_tag(), invalid_tag()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("imported_derived_parameter_ctor_defaults", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("imported derived parameter constructor defaults compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "imported derived parameter constructor defaults should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported derived parameter constructor defaults run failed");
+    assert!(
+        run.status.success(),
+        "imported derived parameter constructor defaults should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("101") && stdout.contains("100"),
+        "unexpected imported derived parameter constructor defaults output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn select_type_branch_keeps_imported_derived_parameter_component_constants() {
+    let dir = unique_dir("select_type_imported_derived_param");
+    let constants_src = write_program_in(
+        &dir,
+        "constants_m.f90",
+        "module constants_m\n  implicit none\n  private\n  public :: enum_type, tags\n  type :: enum_type\n    integer :: invalid = 100\n    integer :: string = 101\n  end type\n  type(enum_type), parameter :: tags = enum_type()\nend module\n",
+    );
+    let kv_src = write_program_in(
+        &dir,
+        "kv_m.f90",
+        "module kv_m\n  use constants_m, only : tags\n  implicit none\n  private\n  public :: keyval, new_keyval\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n  type :: keyval\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_string\n    procedure :: get_type\n  end type\ncontains\n  subroutine new_keyval(self)\n    type(keyval), intent(out) :: self\n  end subroutine\n  subroutine set_string(self, val)\n    class(keyval), intent(inout) :: self\n    character(*), intent(in) :: val\n    type(string_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = val\n    call move_alloc(tmp, self%val)\n  end subroutine\n  pure function get_type(self) result(value_type)\n    class(keyval), intent(in) :: self\n    integer :: value_type\n    select type(val => self%val)\n    class default\n      value_type = tags%invalid\n    type is(string_value)\n      value_type = tags%string\n    end select\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use kv_m, only : keyval, new_keyval\n  implicit none\n  type(keyval) :: kv\n  call new_keyval(kv)\n  call kv%set_string('aaa')\n  if (kv%get_type() /= 101) error stop 1\n  print *, kv%get_type()\nend program\n",
+    );
+
+    let constants_obj = dir.join("constants_m.o");
+    let kv_obj = dir.join("kv_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("select_type_imported_derived_param.bin");
+
+    for (src, obj, needs_i) in [
+        (&constants_src, &constants_obj, false),
+        (&kv_src, &kv_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "select type imported derived param compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            constants_obj.to_str().unwrap(),
+            kv_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "select type imported derived param link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "select type imported derived param run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("101"),
+        "unexpected select type imported derived param output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: token_t\n    integer :: x = 0\n  end type token_t\n  type :: base_t\n    integer :: pos = 0\n  contains\n    procedure :: noop\n  end type base_t\n  type, extends(base_t) :: child_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next\n  end type child_t\ncontains\n  subroutine noop(self)\n    class(base_t), intent(inout) :: self\n    self%pos = self%pos\n  end subroutine noop\n  subroutine next(self, token)\n    class(child_t), intent(inout) :: self\n    type(token_t), intent(out) :: token\n    self%pos = self%pos + 1\n    token = self%token(self%pos)\n  end subroutine next\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t) :: child\n  type(token_t) :: tok\n  allocate(child%token(1))\n  child%token(1)%x = 7\n  call child%next(tok)\n  if (tok%x /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_component_array_indexing", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic component array indexing compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic component array indexing compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic component array indexing run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic component array indexing run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected polymorphic component array indexing output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
