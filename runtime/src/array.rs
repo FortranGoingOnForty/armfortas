@@ -1105,6 +1105,43 @@ pub extern "C" fn afs_copy_array_data(
     source: *const ArrayDescriptor,
     stat: *mut i32,
 ) {
+    afs_prepare_array_copy(dest, source, stat);
+    if !stat.is_null() {
+        let status = unsafe { *stat };
+        if status != 0 {
+            return;
+        }
+    }
+
+    let dest = unsafe { &mut *dest };
+    let source = unsafe { &*source };
+    let bytes = source.total_bytes();
+    if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
+        unsafe {
+            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        }
+    }
+    dest.set_scalar_type_tag(source.scalar_type_tag());
+    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
+
+/// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
+/// has already been allocated with its final shape.
+///
+/// On mismatch, the fresh destination allocation is rolled back so the overall
+/// statement still fails loudly instead of silently changing shape.
+#[no_mangle]
+pub extern "C" fn afs_prepare_array_copy(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    stat: *mut i32,
+) {
     if dest.is_null() || source.is_null() {
         if !stat.is_null() {
             unsafe {
@@ -1142,15 +1179,6 @@ pub extern "C" fn afs_copy_array_data(
         eprintln!("ALLOCATE SOURCE=: destination shape does not conform to source");
         std::process::exit(1);
     }
-
-    let bytes = source.total_bytes();
-    if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        unsafe {
-            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
-        }
-    }
-    dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 
     if !stat.is_null() {
         unsafe {

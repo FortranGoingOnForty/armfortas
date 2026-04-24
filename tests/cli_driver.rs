@@ -21801,6 +21801,43 @@ fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
 }
 
 #[test]
+fn allocate_source_derived_array_deep_copies_allocatable_character_fields() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: key_t\n    character(:), allocatable :: key\n  end type key_t\n  type(key_t), allocatable :: list(:)\n  type(key_t), allocatable :: sorted(:)\n  integer :: i\n  allocate(list(0))\n  list = [key_t('0'), key_t('1'), key_t('2'), key_t('3')]\n  allocate(sorted, source=list)\n  do i = 1, size(sorted)\n    if (.not. allocated(sorted(i)%key)) error stop 1\n    if (sorted(i)%key /= achar(iachar('0') + i - 1)) error stop 2\n  end do\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_source_derived_array_deep_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc source derived-array deep-copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc source derived-array deep-copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc source derived-array deep-copy run failed");
+    assert!(
+        run.status.success(),
+        "alloc source derived-array deep-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected alloc source derived-array deep-copy output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
     let src = write_program(
         "module repro\n  implicit none\n  type :: lexer_t\n    character(len=:), allocatable :: filename\n    integer, allocatable :: stack(:)\n  end type lexer_t\ncontains\n  subroutine init_all(lexer, string)\n    type(lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    if (allocated(lexer%filename)) print *, 'STALE_NAME'\n    if (allocated(lexer%stack)) print *, 'STALE_STACK', size(lexer%stack)\n    lexer%filename = string\n    allocate(lexer%stack(8))\n    print *, 'OK'\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  call init_all(lexer, 'first')\n  call init_all(lexer, 'second')\n  call init_all(lexer, 'third')\n  if (.not. allocated(lexer%filename)) error stop 1\n  if (.not. allocated(lexer%stack)) error stop 2\n  if (lexer%filename /= 'third') error stop 3\n  if (size(lexer%stack) /= 8) error stop 4\nend program p\n",

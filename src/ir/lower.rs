@@ -19606,7 +19606,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 {
+                            let scalar_source_copy_plan =
+                                if rank == 0 && source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -19614,6 +19615,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         ctx.st,
                                         ctx.type_layouts,
                                     )
+                                })
+                            } else {
+                                None
+                            };
+                            let array_source_copy_layout = if source_desc.is_some() {
+                                dynamic_layout.filter(|layout| {
+                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
                                 })
                             } else {
                                 None
@@ -19690,6 +19698,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     field_ptr,
                                     source_desc,
                                     rank > 0,
+                                    array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
@@ -19702,6 +19711,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         field_ptr,
                                         source_desc,
                                         false,
+                                        None,
                                         scalar_source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
@@ -19950,7 +19960,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 {
+                            let scalar_source_copy_plan =
+                                if rank == 0 && source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -19958,6 +19969,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         ctx.st,
                                         ctx.type_layouts,
                                     )
+                                })
+                            } else {
+                                None
+                            };
+                            let array_source_copy_layout = if source_desc.is_some() {
+                                dynamic_layout.filter(|layout| {
+                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
                                 })
                             } else {
                                 None
@@ -20041,6 +20059,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     desc,
                                     source_desc,
                                     rank > 0,
+                                    array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
@@ -20053,6 +20072,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         desc,
                                         source_desc,
                                         false,
+                                        None,
                                         scalar_source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
@@ -32328,12 +32348,74 @@ fn allocate_scalar_source_descriptor(
     }
 }
 
+fn emit_derived_array_desc_copy(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+) {
+    let elem_bytes = layout.size as i64;
+    let elem_bytes_val = b.const_i64(elem_bytes);
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let src_stride = load_array_desc_i64_field(b, source_desc, 24 + 16);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let src_base = b.load_typed(source_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+    if derived_layout_needs_runtime_initialization(layout, type_layouts) {
+        initialize_derived_array_storage_dynamic(b, dest_base, layout, dest_n, type_layouts);
+    }
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("derived_alloc_source_copy_check");
+    let bb_body = b.create_block("derived_alloc_source_copy_body");
+    let bb_exit = b.create_block("derived_alloc_source_copy_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, dest_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, elem_bytes_val);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+
+    let src_index = b.imul(i_val, src_stride);
+    let src_off = b.imul(src_index, elem_bytes_val);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+
+    emit_derived_value_copy(b, type_layouts, &layout.name, dest_ptr, src_ptr);
+
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    let tag = load_array_desc_type_tag(b, source_desc);
+    let lookup = load_array_desc_tbp_lookup_ptr(b, source_desc);
+    store_array_desc_type_tag(b, dest_desc, tag);
+    store_array_desc_tbp_lookup_ptr(b, dest_desc, lookup);
+}
+
 fn emit_allocatable_source_copy_on_success(
     b: &mut FuncBuilder,
     stat_addr: ValueId,
     dest_desc: ValueId,
     source_desc: ValueId,
     preserve_shape: bool,
+    array_copy_layout: Option<&crate::sema::type_layout::TypeLayout>,
     scalar_copy_plan: Option<&ScalarAllocSourceCopyPlan>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     errmsg_target: Option<&RuntimeErrmsgTarget>,
@@ -32346,7 +32428,25 @@ fn emit_allocatable_source_copy_on_success(
     b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
 
     b.set_block(copy_bb);
-    if preserve_shape {
+    if let Some(layout) = array_copy_layout {
+        b.call(
+            FuncRef::External("afs_prepare_array_copy".into()),
+            vec![dest_desc, source_desc, stat_addr],
+            IrType::Void,
+        );
+        emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
+        let prep_stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+        let prep_ok = b.icmp(CmpOp::Eq, prep_stat, zero);
+        let deep_bb = b.create_block("alloc_source_array_deep_copy");
+        let deep_done_bb = b.create_block("alloc_source_array_deep_copy_done");
+        b.cond_branch(prep_ok, deep_bb, vec![], deep_done_bb, vec![]);
+
+        b.set_block(deep_bb);
+        emit_derived_array_desc_copy(b, type_layouts, layout, dest_desc, source_desc);
+        b.branch(deep_done_bb, vec![]);
+
+        b.set_block(deep_done_bb);
+    } else if preserve_shape {
         b.call(
             FuncRef::External("afs_copy_array_data".into()),
             vec![dest_desc, source_desc, stat_addr],
