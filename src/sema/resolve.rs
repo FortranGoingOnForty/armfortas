@@ -878,7 +878,7 @@ fn load_external_module(
             SymbolKind::Variable
         };
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: var.access,
             allocatable: var.allocatable,
             save: var.save,
             pointer: var.pointer,

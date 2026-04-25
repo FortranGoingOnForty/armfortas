@@ -173,7 +173,8 @@ pub fn write_amod(
         writeln!(out).unwrap();
     }
 
-    // Collect and sort public symbols.
+    // Collect and sort public symbols (used for procedures /
+    // interfaces / derived types — those still go out public-only).
     let mut syms: Vec<(&String, &Symbol)> = scope
         .symbols
         .iter()
@@ -181,8 +182,15 @@ pub fn write_amod(
         .collect();
     syms.sort_by_key(|(k, _)| k.to_lowercase());
 
+    // Per F2008 §11.2.3, submodules see ALL parent entities including
+    // private ones.  Variables and parameters are emitted regardless
+    // of access; private ones carry a `private` attribute and are
+    // filtered out at ordinary USE-association time.
+    let mut all_syms: Vec<(&String, &Symbol)> = scope.symbols.iter().collect();
+    all_syms.sort_by_key(|(k, _)| k.to_lowercase());
+
     // ---- Variables ----
-    let vars: Vec<_> = syms
+    let vars: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(
@@ -199,7 +207,7 @@ pub fn write_amod(
     }
 
     // ---- Parameters ----
-    let params: Vec<_> = syms
+    let params: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| sym.attrs.parameter || matches!(sym.kind, SymbolKind::Parameter))
         .collect();
@@ -397,6 +405,9 @@ fn emit_variable(
     if sym.attrs.target {
         attrs.push("target");
     }
+    if sym.attrs.access == Access::Private {
+        attrs.push("private");
+    }
     if !attrs.is_empty() {
         write!(out, ", {}", attrs.join(", ")).unwrap();
     }
@@ -437,16 +448,29 @@ fn emit_parameter(
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
+    let is_private = sym.attrs.access == Access::Private;
     if let Some(cv) = sym.const_value {
-        writeln!(out, "@param {} : {} = {}", name, type_str, cv).unwrap();
-    } else {
-        // Parameter without a folded const_value — emit with @ir
-        // so the reader can at least reference the global.
-        if let Some(info) = global_info {
-            writeln!(out, "@param {} : {} @ir {}", name, type_str, info.symbol).unwrap();
+        // Place `, private` after the value so parse_var's
+        // rfind(" = ") inside type_str continues to work.
+        let suf = if is_private { ", private" } else { "" };
+        writeln!(out, "@param {} : {} = {}{}", name, type_str, cv, suf).unwrap();
+    } else if let Some(info) = global_info {
+        // For @ir-backed params, attach `, private` to the type so
+        // the parser sees it in attr_str rather than after @ir.
+        let type_with_attr = if is_private {
+            format!("{}, private", type_str)
         } else {
-            writeln!(out, "@param {} : {}", name, type_str).unwrap();
-        }
+            type_str
+        };
+        writeln!(
+            out,
+            "@param {} : {} @ir {}",
+            name, type_with_attr, info.symbol
+        )
+        .unwrap();
+    } else {
+        let suf = if is_private { ", private" } else { "" };
+        writeln!(out, "@param {} : {}{}", name, type_str, suf).unwrap();
     }
 }
 
@@ -961,6 +985,11 @@ pub struct AmodVar {
     pub deferred_char: bool,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
+    /// Access level. F2008 §11.2.3 requires private parent symbols to
+    /// be visible in submodules, so the writer emits private entries
+    /// with a `private` attribute and the loader honors them via
+    /// host association without exposing them to ordinary USE.
+    pub access: Access,
 }
 
 /// A generic named interface parsed from an .amod file. Each entry
@@ -1138,6 +1167,11 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let pointer = attr_str.contains("pointer");
     let proc_pointer = attr_str.contains("procptr");
     let target = attr_str.contains("target");
+    let access = if attr_str.contains("private") {
+        Access::Private
+    } else {
+        Access::Public
+    };
 
     let mut ir_symbol = None;
     let mut deferred_char = false;
@@ -1184,6 +1218,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         deferred_char,
         dims,
         const_value,
+        access,
     }
 }
 
@@ -1569,6 +1604,13 @@ pub fn extract_module_globals(
     let mod_key = iface.module_name.to_lowercase();
     let mut out = HashMap::new();
     for var in &iface.variables {
+        // Private vars/params aren't visible to ordinary USE.  They're
+        // only emitted into the .amod so submodules can host-associate
+        // them; downstream globals tracking (which drives the
+        // "filtered out by USE ONLY" diagnostic) must not surface them.
+        if var.access == Access::Private {
+            continue;
+        }
         if var.is_parameter && var.ir_symbol.is_none() {
             continue;
         } // PARAMETERs with folded values inline; others still need storage
