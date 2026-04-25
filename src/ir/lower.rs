@@ -18136,6 +18136,48 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
                             let is_scalar_fixed_alloc_char =
                                 local_fixed_char_allocatable_scalar_len(&info).is_some();
+                            // Vector subscript: a([i1, i2, ...]) = scalar
+                            // Expand to scalar assignments a(i1) = scalar, etc.
+                            if local_is_array_like(&info)
+                                && !is_scalar_fixed_alloc_char
+                                && args.len() == 1
+                            {
+                                if let crate::ast::expr::SectionSubscript::Element(idx_expr) =
+                                    &args[0].value
+                                {
+                                    if let Expr::ArrayConstructor { values: idx_values, .. } =
+                                        &idx_expr.node
+                                    {
+                                        for v in idx_values {
+                                            let crate::ast::expr::AcValue::Expr(scalar_idx) = v
+                                            else {
+                                                continue;
+                                            };
+                                            let scalar_target = crate::ast::Spanned::new(
+                                                Expr::FunctionCall {
+                                                    callee: callee.clone(),
+                                                    args: vec![crate::ast::expr::Argument {
+                                                        keyword: None,
+                                                        value: crate::ast::expr::SectionSubscript::Element(
+                                                            scalar_idx.clone(),
+                                                        ),
+                                                    }],
+                                                },
+                                                target.span,
+                                            );
+                                            let scalar_stmt = crate::ast::Spanned::new(
+                                                Stmt::Assignment {
+                                                    target: scalar_target,
+                                                    value: value.clone(),
+                                                },
+                                                stmt.span,
+                                            );
+                                            lower_stmt(b, ctx, &scalar_stmt);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
                             if local_is_array_like(&info)
                                 && !is_scalar_fixed_alloc_char
                                 && is_full_rank1_whole_slice(args)
