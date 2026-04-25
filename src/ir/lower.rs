@@ -28799,10 +28799,12 @@ fn lower_rank1_numeric_array_binary_descriptor(
             | (IrType::Int(_), BinaryOp::Sub)
             | (IrType::Int(_), BinaryOp::Mul)
             | (IrType::Int(_), BinaryOp::Div)
+            | (IrType::Int(_), BinaryOp::Pow)
             | (IrType::Float(_), BinaryOp::Add)
             | (IrType::Float(_), BinaryOp::Sub)
             | (IrType::Float(_), BinaryOp::Mul)
             | (IrType::Float(_), BinaryOp::Div)
+            | (IrType::Float(_), BinaryOp::Pow)
     );
     if !op_supported {
         return None;
@@ -28871,10 +28873,30 @@ fn lower_rank1_numeric_array_binary_descriptor(
         (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs_val, rhs_val),
         (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs_val, rhs_val),
         (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Pow) => {
+            // Integer power: lower via float pow then truncate. Matches the
+            // scalar lowering in lower_expr_full's BinaryOp::Pow / Int arm.
+            let fl = b.int_to_float(lhs_val, FloatWidth::F64);
+            let fr = b.int_to_float(rhs_val, FloatWidth::F64);
+            let res = b.fpow(fl, fr);
+            let iw = match &elem_ty {
+                IrType::Int(w) => *w,
+                _ => IntWidth::I32,
+            };
+            b.float_to_int(res, iw)
+        }
         (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs_val, rhs_val),
         (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs_val, rhs_val),
         (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs_val, rhs_val),
         (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Pow) => {
+            // Real exponent of an integer is folded to f64 and back; here
+            // both are already float, so call fpow directly. For integer
+            // exponents (the common `x**2` case), coerce_to_type below
+            // would have promoted them to float to match the LHS.
+            let r = coerce_to_type(b, rhs_val, &elem_ty);
+            b.fpow(lhs_val, r)
+        }
         _ => unreachable!("unsupported array op should have returned before block creation"),
     };
     store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
