@@ -259,16 +259,19 @@ impl Preprocessor {
                 while has_trailing_continuation(&logical_line) {
                     if i < raw_lines.len() {
                         let next = raw_lines[i].trim_start();
-                        // A directive between free-form continued lines must
-                        // remain its own logical line so conditional blocks
-                        // can be evaluated before later Fortran continuation.
                         if next.starts_with('#') {
                             break;
                         }
-                        // Remove the trailing & from the code portion.
+                        // F2018 6.3.2.4: comment lines and blank lines
+                        // may appear between a continuation line and
+                        // its successor. Skip them without breaking
+                        // the continuation.
+                        if next.starts_with('!') || next.is_empty() {
+                            i += 1;
+                            continue;
+                        }
                         let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
                         logical_line.truncate(amp_pos);
-                        // Consume the next line, skipping leading & if present.
                         let next = next.strip_prefix('&').unwrap_or(next);
                         logical_line.push_str(next);
                         i += 1;
