@@ -1773,8 +1773,38 @@ fn collect_host_refs_stmt(
                 }
             }
         }
-        Stmt::DoLoop { body, .. }
-        | Stmt::DoWhile { body, .. }
+        Stmt::DoLoop {
+            var,
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            // The DO loop variable, bounds, and step expressions can
+            // reference host vars too — not just the body. Walk all of
+            // them so a host-associated `i` used as `do i = ...` gets
+            // forwarded as a closure arg.
+            if let Some(var_name) = var {
+                let key = var_name.to_lowercase();
+                if host_names.contains(&key) && !sub_locals.contains(&key) {
+                    refs.insert(key);
+                }
+            }
+            if let Some(e) = start {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+            if let Some(e) = end {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+            if let Some(e) = step {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::DoWhile { body, .. }
         | Stmt::DoConcurrent { body, .. }
         | Stmt::Block { body, .. } => {
             for s in body {
@@ -15619,6 +15649,32 @@ struct HostRefParamInfo {
     string_descriptor_arg: bool,
     allocatable: bool,
     is_pointer: bool,
+    /// SSA value id of an extra hidden i64 length parameter when the
+    /// host var is a `character(*)` (assumed-length) variable that needs
+    /// its runtime length forwarded alongside the pointer.
+    assumed_len_id: Option<ValueId>,
+}
+
+fn arg_is_assumed_len_char(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &decl.node
+        {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    if let TypeSpec::Character(Some(sel)) = type_spec {
+                        return matches!(sel.len, Some(crate::ast::decl::LenSpec::Star));
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Build the ordered list of host-association hidden parameters for
@@ -15646,7 +15702,8 @@ fn build_host_ref_params(
     }
     let host_visible = collect_decl_param_consts_with_host(host_decls, host_param_consts);
     let mut infos = Vec::with_capacity(refs.len());
-    for (idx, hname) in refs.iter().enumerate() {
+    let mut next_id = starting_id;
+    for hname in refs.iter() {
         let elem_ty = arg_type_from_decls(hname, host_decls, Some(st));
         let uses_desc = arg_uses_descriptor_from_decls(hname, host_decls);
         let uses_string_descriptor = arg_uses_string_descriptor_from_decls(hname, host_decls);
@@ -15660,13 +15717,31 @@ fn build_host_ref_params(
             uses_string_descriptor,
             derived_type.is_some(),
         );
-        let pid = ValueId(starting_id + idx as u32);
+        let pid = ValueId(next_id);
+        next_id += 1;
         out_params.push(Param {
             name: format!("__host_{}", hname),
             ty: ptr_ty,
             id: pid,
             fortran_noalias: false,
         });
+        // For character(*) host vars, also reserve a hidden i64 length
+        // parameter so the contained proc can recover the length the
+        // outer scope received. Without this, substring access on
+        // host-associated assumed-len characters has no length info.
+        let assumed_len_id = if arg_is_assumed_len_char(hname, host_decls) {
+            let lid = ValueId(next_id);
+            next_id += 1;
+            out_params.push(Param {
+                name: format!("__host_{}__len", hname),
+                ty: IrType::Int(IntWidth::I64),
+                id: lid,
+                fortran_noalias: false,
+            });
+            Some(lid)
+        } else {
+            None
+        };
         infos.push(HostRefParamInfo {
             name: hname.clone(),
             id: pid,
@@ -15678,6 +15753,7 @@ fn build_host_ref_params(
             string_descriptor_arg: uses_string_descriptor,
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
+            assumed_len_id,
         });
     }
     infos
@@ -15733,6 +15809,7 @@ fn append_host_closure_args_raw(
         // a sibling forwarding), load the spill slot to get the host
         // address. For normal allocas (we are the host), the alloca
         // id IS the address.
+        let mut forwarded_len: Option<ValueId> = None;
         let addr = if info.by_ref {
             b.load(info.addr)
         } else if info.dims.is_empty()
@@ -15749,8 +15826,13 @@ fn append_host_closure_args_raw(
             // fixed/assumed/runtime-length character scalars need the
             // same shape; passing the raw data pointer here makes the
             // callee treat the first bytes of the string as a pointer.
-            let (ptr, _) = local_char_ptr_and_len(b, &info)
+            let (ptr, len) = local_char_ptr_and_len(b, &info)
                 .expect("host-owned scalar character closure local should lower");
+            // For character(*) host refs, also forward the length so
+            // the contained proc can recover it.
+            if matches!(info.char_kind, CharKind::AssumedLen { .. }) {
+                forwarded_len = Some(len);
+            }
             let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             b.store(ptr, slot);
             slot
@@ -15758,6 +15840,9 @@ fn append_host_closure_args_raw(
             info.addr
         };
         arg_vals.push(addr);
+        if let Some(len) = forwarded_len {
+            arg_vals.push(len);
+        }
     }
 }
 
@@ -15779,6 +15864,16 @@ fn install_host_ref_locals(
         );
         let slot = b.alloca(slot_ty);
         b.store(info.id, slot);
+        // For character(*) host refs, store the forwarded length into a
+        // dedicated slot and set CharKind::AssumedLen so substring access
+        // can recover the runtime length.
+        let char_kind = if let Some(lid) = info.assumed_len_id {
+            let len_slot = b.alloca(IrType::Int(IntWidth::I64));
+            b.store(lid, len_slot);
+            CharKind::AssumedLen { len_addr: len_slot }
+        } else {
+            info.char_kind.clone()
+        };
         locals.insert(
             info.name.clone(),
             LocalInfo {
@@ -15788,7 +15883,7 @@ fn install_host_ref_locals(
                 allocatable: info.allocatable,
                 descriptor_arg: info.descriptor_arg,
                 by_ref: true,
-                char_kind: info.char_kind.clone(),
+                char_kind,
                 derived_type: info.derived_type.clone(),
                 inline_const: None,
                 is_pointer: info.is_pointer,
@@ -22922,11 +23017,14 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
             .get(&key)
             .map(|info| info.ty.clone())
             .unwrap_or(IrType::Int(IntWidth::I32));
-        let var_addr = ctx
-            .locals
-            .get(&key)
-            .map(|info| info.addr)
-            .unwrap_or_else(|| {
+        // For by_ref locals (dummy args, host-associated vars), info.addr
+        // is a slot holding a pointer to the actual storage. Dereference
+        // it once so reads/writes hit the real variable, not the slot.
+        let var_info = ctx.locals.get(&key).cloned();
+        let var_addr = match &var_info {
+            Some(info) if info.by_ref => b.load(info.addr),
+            Some(info) => info.addr,
+            None => {
                 let addr = b.alloca(var_ty.clone());
                 ctx.locals.insert(
                     key.clone(),
@@ -22946,7 +23044,8 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
                     },
                 );
                 addr
-            });
+            }
+        };
 
         // Initialize loop variable.
         let init_raw = lower_expr_ctx(b, ctx, start_expr);
