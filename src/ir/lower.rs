@@ -17823,8 +17823,18 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         return;
                     }
                     if let Some(info) = ctx.locals.get(&key).cloned() {
+                        // Route fixed-size (non-descriptor) array assignments
+                        // to lower_array_assign when the RHS is an array
+                        // expression — array+scalar broadcasts and array
+                        // constructors need element-wise lowering, not the
+                        // scalar store fallback below. Skip derived/character
+                        // arrays so their specialized paths run instead.
                         if local_is_array_like(&info)
                             && !local_uses_array_descriptor(&info)
+                            && info.derived_type.is_none()
+                            && info.char_kind == CharKind::None
+                            && (matches!(value.node, Expr::ArrayConstructor { .. })
+                                || expr_contains_array_constructor(value))
                         {
                             lower_array_assign(b, ctx, name, &info, value);
                             return;
@@ -28777,23 +28787,10 @@ fn lower_array_expr_descriptor(
             contained_host_refs,
             descriptor_params,
         ),
-        Expr::ArrayConstructor { values, .. } => {
-            let first = values.iter().find_map(|v| match v {
-                crate::ast::expr::AcValue::Expr(e) => Some(e),
-                _ => None,
-            });
-            let elem_ty = first
-                .and_then(|e| {
-                    operator_expr_type_info(e, Some(locals), st, type_layouts)
-                        .map(|ti| type_info_to_ir_type(&ti))
-                })
-                .unwrap_or(IrType::Int(IntWidth::I32));
-            let desc = lower_runtime_array_constructor_descriptor(
-                b, locals, &elem_ty, None, values, st,
-                type_layouts, internal_funcs, contained_host_refs, descriptor_params,
-            )?;
-            Some((desc, elem_ty))
-        }
+        // Note: Expr::ArrayConstructor is handled by lower_array_assign's
+        // specialized paths, NOT routed here. Returning None lets simpler
+        // bulk plans (Fill, ArrayBinary, etc.) and the explicit constructor
+        // assignment branches handle it instead.
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             if local_is_array_like(info) {
@@ -30004,37 +30001,47 @@ fn lower_array_assign(
             return;
         }
 
-        if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
-            b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts),
-            Some(ctx.internal_funcs), Some(ctx.contained_host_refs), Some(ctx.descriptor_params),
-        ) {
-            let dest_base = array_base_addr(b, dest_info);
-            let n = array_total_elems_value(b, dest_info);
-            let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
-            let zero = b.const_i64(0);
-            b.store(zero, i_addr);
-            let bb_chk = b.create_block("desc_copy_check");
-            let bb_bdy = b.create_block("desc_copy_body");
-            let bb_ext = b.create_block("desc_copy_exit");
-            b.branch(bb_chk, vec![]);
-            b.set_block(bb_chk);
-            let i = b.load(i_addr);
-            let done = b.icmp(CmpOp::Ge, i, n);
-            b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
-            b.set_block(bb_bdy);
-            let iv = b.load(i_addr);
-            let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
-            let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
-            let doff = b.imul(iv, elem_bytes);
-            let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
-            b.store(coerced, dp);
-            let one = b.const_i64(1);
-            let ni = b.iadd(iv, one);
-            b.store(ni, i_addr);
-            b.branch(bb_chk, vec![]);
-            b.set_block(bb_ext);
-            return;
+        // For non-allocatable fixed-size arrays whose RHS is an array
+        // expression that produces a descriptor (eg `[10,20]+5`), copy
+        // element-by-element. Skip when the dest is descriptor-backed
+        // (allocatable / assumed-shape) — those follow the descriptor
+        // assignment paths above.
+        if !local_uses_array_descriptor(dest_info)
+            && dest_info.derived_type.is_none()
+            && dest_info.char_kind == CharKind::None
+        {
+            if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
+                b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts),
+                Some(ctx.internal_funcs), Some(ctx.contained_host_refs), Some(ctx.descriptor_params),
+            ) {
+                let dest_base = array_base_addr(b, dest_info);
+                let n = array_total_elems_value(b, dest_info);
+                let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+                let zero = b.const_i64(0);
+                b.store(zero, i_addr);
+                let bb_chk = b.create_block("desc_copy_check");
+                let bb_bdy = b.create_block("desc_copy_body");
+                let bb_ext = b.create_block("desc_copy_exit");
+                b.branch(bb_chk, vec![]);
+                b.set_block(bb_chk);
+                let i = b.load(i_addr);
+                let done = b.icmp(CmpOp::Ge, i, n);
+                b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
+                b.set_block(bb_bdy);
+                let iv = b.load(i_addr);
+                let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+                let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
+                let doff = b.imul(iv, elem_bytes);
+                let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
+                b.store(coerced, dp);
+                let one = b.const_i64(1);
+                let ni = b.iadd(iv, one);
+                b.store(ni, i_addr);
+                b.branch(bb_chk, vec![]);
+                b.set_block(bb_ext);
+                return;
+            }
         }
 
         // a = scalar: broadcast scalar to all elements.
