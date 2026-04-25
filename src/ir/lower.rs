@@ -10052,6 +10052,52 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 None
             }
         }
+        "shiftl" => {
+            // F2008 §13.7.150: logical left shift, shift>=0.
+            if args.len() >= 2 {
+                let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
+                let shift = coerce_int_like_to_width(b, args[1], value_width);
+                Some(b.shl(args[0], shift))
+            } else {
+                None
+            }
+        }
+        "shiftr" => {
+            // F2008 §13.7.151: logical right shift (zero fill).
+            if args.len() >= 2 {
+                let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
+                let shift = coerce_int_like_to_width(b, args[1], value_width);
+                Some(b.lshr(args[0], shift))
+            } else {
+                None
+            }
+        }
+        "shifta" => {
+            // F2008 §13.7.149: arithmetic right shift (sign-extending).
+            // No native ashr in the IR yet — synthesize as
+            //   shifta(x, n) = lshr(x, n) | (sign_mask << (width - n))
+            // where sign_mask is all-ones if MSB(x) is set, else 0.
+            if args.len() >= 2 {
+                let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
+                let shift = coerce_int_like_to_width(b, args[1], value_width);
+                let logical = b.lshr(args[0], shift);
+                let bits = int_const_for_width(b, value_width, value_width.bits() as i64);
+                let pos_top = b.isub(bits, shift);
+                // Pre-fill: -1 if top bit of x is 1, else 0.
+                let one = int_const_for_width(b, value_width, 1);
+                let top_bit_pos = int_const_for_width(b, value_width, (value_width.bits() - 1) as i64);
+                let top_bit = b.lshr(args[0], top_bit_pos);
+                let sign = b.bit_and(top_bit, one);
+                let neg_one = int_const_for_width(b, value_width, -1);
+                let zero = int_const_for_width(b, value_width, 0);
+                let is_neg = b.icmp(CmpOp::Ne, sign, zero);
+                let mask_full = b.select(is_neg, neg_one, zero);
+                let high_mask = b.shl(mask_full, pos_top);
+                Some(b.bit_or(logical, high_mask))
+            } else {
+                None
+            }
+        }
         "btest" => {
             // btest(a, pos) = (a >> pos) & 1 /= 0
             if args.len() >= 2 {

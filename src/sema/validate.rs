@@ -2840,7 +2840,10 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
         "gamma" | "log_gamma" | "erf" | "erfc" |
         "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
-        "ishft" | "ishftc" | "mvbits" | "transfer" |
+        "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta" |
+        "popcnt" | "poppar" | "leadz" | "trailz" |
+        "mvbits" | "transfer" | "bge" | "bgt" | "ble" | "blt" |
+        "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" |
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
