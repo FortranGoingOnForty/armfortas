@@ -11805,6 +11805,23 @@ fn generic_dispatch_probe_value(
             return b.int_to_ptr(zero, elem_ty);
         }
     }
+    // A null-pointer probe value carries enough information for
+    // generic dispatch to pick the right specific procedure.  When
+    // the expression is an array section over a known local we can
+    // skip materializing a descriptor — the element type alone
+    // suffices.  Without this fast path, going through
+    // `lower_array_expr_descriptor` emits alloca/memset/
+    // afs_create_section once *per* probe; with a generic call site
+    // that probes N candidates, the same section expression got
+    // lowered N+1 times, blowing IR size up multiplicatively when
+    // nested in larger expressions (e.g. stdlib_hash_32bit_water.f90
+    // water_hash inner loop).  Anything we can't classify cheaply
+    // (reshape, complex array intrinsics, …) still falls through to
+    // the general `lower_array_expr_descriptor` path.
+    if let Some(elem_ty) = array_expr_elem_type_only(locals, expr, st, type_layouts) {
+        let zero = b.const_i64(0);
+        return b.int_to_ptr(zero, elem_ty);
+    }
     if let Some((_desc, elem_ty)) =
         lower_array_expr_descriptor(b, locals, expr, st, type_layouts, None, None, None)
     {
@@ -11824,6 +11841,59 @@ fn generic_dispatch_probe_value(
             contained_host_refs,
             descriptor_params,
         )
+    }
+}
+
+/// Side-effect-free counterpart of `lower_array_expr_descriptor`:
+/// returns just the element IR type when `expr` denotes an
+/// array-shaped value, without emitting any IR.  Used by generic
+/// dispatch probes which only need a typed null pointer.  Mirrors
+/// the cases `lower_array_expr_descriptor` cares about; any case it
+/// can't classify falls back to None and the caller can still drop
+/// to `lower_expr_full` for the rare miss.
+fn array_expr_elem_type_only(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<IrType> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => array_expr_elem_type_only(locals, inner, st, type_layouts),
+        Expr::UnaryOp { operand, .. } => {
+            array_expr_elem_type_only(locals, operand, st, type_layouts)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            array_expr_elem_type_only(locals, left, st, type_layouts)
+                .or_else(|| array_expr_elem_type_only(locals, right, st, type_layouts))
+        }
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if local_is_array_like(info) {
+                Some(info.ty.clone())
+            } else {
+                None
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            // Section subscript on an array name (`a(i:)`, `a(:)`,
+            // `a(1:n:2)`) — the section result's element type is the
+            // local's stored elem type.  Plain element access
+            // (`a(i)`) is scalar and must NOT take this path: the
+            // probe expects a typed pointer to an *array element*,
+            // and a scalar element access has no descriptor at all.
+            if let Expr::Name { name } = &callee.node {
+                if let Some(info) = locals.get(&name.to_lowercase()) {
+                    let has_range = args.iter().any(|a| {
+                        matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
+                    });
+                    if local_is_array_like(info) && has_range {
+                        return Some(info.ty.clone());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
