@@ -956,8 +956,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            if ctx.in_elemental {
+            let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
+            // F2008 §12.6.2.2: ELEMENTAL implies PURE unless IMPURE
+            // is also given.  `impure elemental function f(...)` is
+            // explicitly allowed to call non-pure callees.
+            if ctx.in_elemental && !is_impure {
                 ctx.in_pure = true;
+            }
+            if is_impure {
+                ctx.in_pure = false;
             }
 
             if ctx.in_elemental {
@@ -1017,8 +1024,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            if ctx.in_elemental {
+            let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
+            // F2008 §12.6.2.2: see comment above for Subroutine.
+            if ctx.in_elemental && !is_impure {
                 ctx.in_pure = true;
+            }
+            if is_impure {
+                ctx.in_pure = false;
             }
 
             if ctx.in_elemental {
@@ -2823,6 +2835,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
     matches!(
         name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
+        "hypot" | "anint" | "dnint" | "aint" | "dint" | "norm2" |
         "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" |
         "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
