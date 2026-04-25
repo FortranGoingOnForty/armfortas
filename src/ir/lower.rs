@@ -16366,6 +16366,13 @@ fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<Hidde
             }
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
+        // Non-allocatable array result (automatic or fixed-shape, e.g.
+        // `real, dimension(size(x)) :: w`): caller still allocates the
+        // result descriptor and passes it as a hidden first argument
+        // — same ABI as ALLOCATABLE results.  Required so callers can
+        // iterate the returned array element-wise (binary expressions,
+        // assignments, vector-subscripts).
+        _ if sym.attrs.result_rank > 0 => Some(HiddenResultAbi::ArrayDescriptor),
         TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
         _ => None,
     }
@@ -18360,6 +18367,40 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             lower_stmt(b, ctx, &scalar_stmt);
                                         }
                                         return;
+                                    }
+                                }
+                            }
+                            // Vector subscript with array-returning expression
+                            // index: `a(falseloc(mask)) = scalar` etc.  The
+                            // subscript is a single Element whose value is an
+                            // expression whose result is an integer array.
+                            // Materialize that array as a descriptor, then
+                            // loop over its elements as scalar indices.
+                            if local_is_array_like(&info)
+                                && !is_scalar_fixed_alloc_char
+                                && args.len() == 1
+                                && info.derived_type.is_none()
+                                && info.char_kind == CharKind::None
+                            {
+                                if let crate::ast::expr::SectionSubscript::Element(idx_expr) =
+                                    &args[0].value
+                                {
+                                    if !matches!(idx_expr.node, Expr::ArrayConstructor { .. })
+                                        && expr_returns_array(
+                                            idx_expr,
+                                            &ctx.locals,
+                                            ctx.st,
+                                        )
+                                    {
+                                        if lower_dynamic_vector_subscript_assign(
+                                            b,
+                                            ctx,
+                                            &info,
+                                            idx_expr,
+                                            value,
+                                        ) {
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -29331,6 +29372,156 @@ fn lower_array_expr_descriptor(
         }
         _ => None,
     }
+}
+
+/// True when `expr` evaluates to an array (rank ≥ 1) — used by the
+/// vector-subscript assignment path to detect `a(f(...)) = …` where
+/// `f` is an array-returning function call (e.g. stdlib's `falseloc`,
+/// `trueloc`).  Conservative: returns false for cases we can't
+/// classify cheaply, leaving the existing scalar-subscript path
+/// unchanged.
+fn expr_returns_array(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> bool {
+    match &expr.node {
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .map(local_is_array_like)
+            .unwrap_or(false),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                // Subscripted local array with at least one Range
+                // arg → section result, which is array-valued.
+                if let Some(info) = locals.get(&key) {
+                    if local_is_array_like(info)
+                        && args.iter().any(|a| {
+                            matches!(
+                                a.value,
+                                crate::ast::expr::SectionSubscript::Range { .. }
+                            )
+                        })
+                    {
+                        return true;
+                    }
+                }
+                // Function whose declared return type carries a rank.
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::Function)
+                        && sym.attrs.result_rank > 0
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Expr::ParenExpr { inner } => expr_returns_array(inner, locals, st),
+        _ => false,
+    }
+}
+
+/// Lower `dest(idx_expr) = value` where `idx_expr` evaluates to a
+/// rank-1 integer array (a "vector subscript" whose index expression
+/// is computed at runtime — not a literal `[i, j, k]` constructor).
+/// Materializes the index array as a descriptor, then loops over its
+/// elements scattering `value` into `dest` at each index.  Returns
+/// true if the form was recognized and lowered.
+fn lower_dynamic_vector_subscript_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    idx_expr: &crate::ast::expr::SpannedExpr,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    // Materialize the index expression as an array descriptor.  The
+    // result has integer element type; we'll widen to i64 as we load.
+    let idx_desc = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        idx_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+    let Some((idx_desc, idx_elem_ty)) = idx_desc else {
+        return false;
+    };
+    if !matches!(idx_elem_ty, IrType::Int(_)) {
+        return false;
+    }
+
+    // RHS is treated as a scalar broadcast.  Expressions that yield an
+    // array-valued RHS aren't supported here yet; the caller checks
+    // call-site context, so this is safe for the common
+    // `dest(f(mask)) = scalar` pattern.
+    let rhs_raw = lower_expr_ctx_tl(b, ctx, value);
+    let rhs_val = coerce_to_type(b, rhs_raw, &dest_info.ty);
+
+    let dest_base = if local_uses_array_descriptor(dest_info) {
+        let desc = array_descriptor_addr(b, dest_info);
+        b.load_typed(desc, IrType::Ptr(Box::new(dest_info.ty.clone())))
+    } else {
+        // Static array storage: take address of first element.
+        let zero = b.const_i64(0);
+        b.gep(dest_info.addr, vec![zero], dest_info.ty.clone())
+    };
+    let dest_lower = if local_uses_array_descriptor(dest_info) {
+        let desc = array_descriptor_addr(b, dest_info);
+        let dim = b.const_i32(1);
+        b.call(
+            FuncRef::External("afs_array_lbound".into()),
+            vec![desc, dim],
+            IrType::Int(IntWidth::I64),
+        )
+    } else {
+        let lb = dest_info.dims.first().map(|(lo, _)| *lo).unwrap_or(1);
+        b.const_i64(lb)
+    };
+
+    // Iterate over the index-array's elements.
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![idx_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("vec_subscript_check");
+    let bb_body = b.create_block("vec_subscript_body");
+    let bb_exit = b.create_block("vec_subscript_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    // idx = idx_array[i] (load logical index, widen to i64)
+    let raw_idx = load_rank1_array_desc_elem(b, idx_desc, &idx_elem_ty, i);
+    let idx_val = coerce_to_type(b, raw_idx, &IrType::Int(IntWidth::I64));
+    // Convert from Fortran 1-based (or array's lower bound) to a
+    // 0-based linear offset.
+    let zero_off = b.isub(idx_val, dest_lower);
+    let elem_size = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+    let byte_off = b.imul(zero_off, elem_size);
+    let dst_ptr = b.gep(dest_base, vec![byte_off], IrType::Int(IntWidth::I8));
+    b.store(rhs_val, dst_ptr);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(i, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
 }
 
 /// Multi-dim section assignment: `dest(s_0, s_1, ..., s_{N-1}) = value`
