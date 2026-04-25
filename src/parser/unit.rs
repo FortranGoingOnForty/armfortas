@@ -377,15 +377,42 @@ impl<'a> Parser<'a> {
         };
         self.advance(); // consume 'interface'
 
-        // Optional name or operator/assignment interface.
-        // Check operator/assignment BEFORE generic identifier — they lex as identifiers.
-        let name = if self.peek_text().eq_ignore_ascii_case("operator")
-            || self.peek_text().eq_ignore_ascii_case("assignment")
-        {
+        // Optional name or generic spec.
+        // Check generic specs BEFORE generic identifier — they lex as identifiers.
+        let kw_lc = self.peek_text().to_lowercase();
+        let is_generic_spec = matches!(
+            kw_lc.as_str(),
+            "operator" | "assignment" | "read" | "write"
+        ) && self.pos + 1 < self.tokens.len()
+            && self.tokens[self.pos + 1].kind == TokenKind::LParen;
+        let name = if is_generic_spec {
             let op_kw = self.advance().clone().text;
             self.expect(&TokenKind::LParen)?;
-            let op = self.advance().clone().text;
-            self.expect(&TokenKind::RParen)?;
+            // Consume balanced contents — operators can span multiple
+            // tokens (==, /=, //, .lt., etc.) and defined I/O uses
+            // `formatted` / `unformatted` identifiers.
+            let mut op = String::new();
+            let mut depth = 1;
+            while depth > 0 && self.peek() != &TokenKind::Eof {
+                match self.peek() {
+                    TokenKind::LParen => {
+                        op.push_str(self.advance().clone().text.as_str());
+                        depth += 1;
+                    }
+                    TokenKind::RParen => {
+                        if depth == 1 {
+                            self.advance();
+                            depth = 0;
+                        } else {
+                            op.push_str(self.advance().clone().text.as_str());
+                            depth -= 1;
+                        }
+                    }
+                    _ => {
+                        op.push_str(self.advance().clone().text.as_str());
+                    }
+                }
+            }
             Some(format!("{}({})", op_kw, op))
         } else if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
@@ -787,9 +814,11 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let is_generic_spec = (self.peek_text().eq_ignore_ascii_case("operator")
-            || self.peek_text().eq_ignore_ascii_case("assignment"))
-            && self.pos + 1 < self.tokens.len()
+        let kw = self.peek_text().to_lowercase();
+        let is_generic_spec = matches!(
+            kw.as_str(),
+            "operator" | "assignment" | "read" | "write"
+        ) && self.pos + 1 < self.tokens.len()
             && self.tokens[self.pos + 1].kind == TokenKind::LParen;
 
         if !is_generic_spec {
@@ -798,8 +827,31 @@ impl<'a> Parser<'a> {
 
         let generic_kw = self.advance().clone().text;
         self.expect(&TokenKind::LParen)?;
-        let op = self.advance().clone().text;
-        self.expect(&TokenKind::RParen)?;
+        // Consume the parenthesized contents until the matching ).
+        // Operators can be `==`, `/=`, `//`, etc. — multi-token. Defined
+        // I/O uses `formatted` / `unformatted` identifiers.
+        let mut op = String::new();
+        let mut depth = 1;
+        while depth > 0 && self.peek() != &TokenKind::Eof {
+            match self.peek() {
+                TokenKind::LParen => {
+                    op.push_str(self.advance().clone().text.as_str());
+                    depth += 1;
+                }
+                TokenKind::RParen => {
+                    if depth == 1 {
+                        self.advance();
+                        depth = 0;
+                    } else {
+                        op.push_str(self.advance().clone().text.as_str());
+                        depth -= 1;
+                    }
+                }
+                _ => {
+                    op.push_str(self.advance().clone().text.as_str());
+                }
+            }
+        }
         Ok(Some(format!("{}({})", generic_kw, op)))
     }
 
