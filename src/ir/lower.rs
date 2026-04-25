@@ -6799,15 +6799,10 @@ fn alloc_decls(
                         || parameter_inits.contains_key(&key);
 
                     if is_parameter {
-                        // Audit MAJOR-4: pure compile-time parameter.
-                        // Try to fold; if we can, store the value in
-                        // inline_const and skip the global+alloca.
-                        // Use a one-byte sentinel alloca for `addr`
-                        // so other code paths that touch info.addr
-                        // still work, but never load through it.
                         let folded = init_expr
                             .and_then(|e| {
-                                eval_const_scalar(e, &param_consts)
+                                eval_const_scalar_with_decl_scope(e, decls, &param_consts, st)
+                                    .or_else(|| param_consts.get(&key).copied())
                                     .or_else(|| symbol_table_parameter_const(st, &key))
                             })
                             .map(|raw| clamp_const_to_type(raw, &elem_ty));
