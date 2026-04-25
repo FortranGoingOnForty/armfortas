@@ -4921,6 +4921,18 @@ fn eval_const_scalar(
                             ConstScalar::Float(f) => Some(ConstScalar::Int(f.trunc() as i128)),
                         }
                     }
+                    "ichar" | "iachar" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        if let Expr::StringLiteral { value, .. } = &e.node {
+                            let ch = value.as_bytes().first().copied().unwrap_or(0);
+                            Some(ConstScalar::Int(ch as i128))
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 }
             } else {
