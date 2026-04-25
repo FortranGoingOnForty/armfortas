@@ -34944,6 +34944,18 @@ fn lower_expr_full(
         ),
 
         Expr::FunctionCall { callee, args } => {
+            // Special-case TRANSFER intrinsic — needs source bits, not the
+            // probe-value pointers used by the generic dispatch path.
+            if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("transfer") && args.len() >= 2 {
+                    if let Some(result) = lower_transfer_intrinsic(
+                        b, locals, args, st, type_layouts,
+                        internal_funcs, contained_host_refs, descriptor_params,
+                    ) {
+                        return result;
+                    }
+                }
+            }
             if args.len() == 1
                 && expr_is_character_expr(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts)
@@ -36415,6 +36427,128 @@ fn lower_expr_full(
 
 /// Approximate the IR type of a constant-or-near-constant
 /// expression by inspecting the AST. Used by ArrayConstructor
+/// Lower the TRANSFER intrinsic when called as a scalar expression.
+/// TRANSFER(source, mold[, size]) reinterprets the bits of `source`
+/// as if they were the bits of `mold`. We materialize a stack temp,
+/// store the source's bits into it, then reload at the mold type.
+///
+/// This bypasses the generic-dispatch probe path which produces
+/// null-pointer probe values that can't be loaded from.
+#[allow(clippy::too_many_arguments)]
+fn lower_transfer_intrinsic(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    use crate::ast::expr::SectionSubscript;
+
+    let crate::ast::expr::Argument {
+        value: SectionSubscript::Element(source_expr),
+        ..
+    } = &args[0]
+    else {
+        return None;
+    };
+    let crate::ast::expr::Argument {
+        value: SectionSubscript::Element(mold_expr),
+        ..
+    } = &args[1]
+    else {
+        return None;
+    };
+
+    // Determine the mold's IR type from its semantic type.
+    let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
+    let mold_ty = match &mold_ti {
+        crate::sema::symtab::TypeInfo::Integer { kind } => {
+            IrType::int_from_kind(kind.unwrap_or(4))
+        }
+        crate::sema::symtab::TypeInfo::Real { kind } => {
+            IrType::float_from_kind(kind.unwrap_or(4))
+        }
+        crate::sema::symtab::TypeInfo::Logical { kind } => {
+            IrType::int_from_kind(kind.unwrap_or(4))
+        }
+        _ => return None,
+    };
+
+    // Materialize a temp wide enough to hold the mold and the source.
+    // Using mold size is sufficient when source ≥ mold (only mold-sized
+    // bytes are read). For source < mold, F2018 says undefined trailing
+    // bits — we zero-init for safety.
+    let buf_bytes = ir_scalar_byte_size(&mold_ty);
+    let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), buf_bytes as u64);
+    let buf = b.alloca(buf_ty);
+    let zero_byte = b.const_i32(0);
+    let buf_size = b.const_i64(buf_bytes);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![buf, zero_byte, buf_size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    // Lower the source expression. For array constructors and array
+    // names, get the data buffer; for scalars, we'll need a stack
+    // alloca to hold the value.
+    if let Expr::ArrayConstructor { values, .. } = &source_expr.node {
+        // Materialize the values into the temp directly.
+        // Use the mold type as the storage element type — store one
+        // mold-sized chunk's worth of source elements.
+        // Simplest: store each constructor element at consecutive offsets
+        // until we fill the buffer or run out of values.
+        let mut byte_off: i64 = 0;
+        for v in values {
+            if byte_off >= buf_bytes {
+                break;
+            }
+            let crate::ast::expr::AcValue::Expr(e) = v else {
+                return None;
+            };
+            let elem_val = lower_expr_full(
+                b, locals, e, st, type_layouts,
+                internal_funcs, contained_host_refs, descriptor_params,
+            );
+            let elem_ty = b.func().value_type(elem_val).unwrap_or(IrType::Int(IntWidth::I32));
+            let elem_size = ir_scalar_byte_size(&elem_ty) as i64;
+            let off_val = b.const_i64(byte_off);
+            let dst = b.gep(buf, vec![off_val], IrType::Int(IntWidth::I8));
+            b.store(elem_val, dst);
+            byte_off += elem_size;
+        }
+        return Some(b.load_typed(buf, mold_ty));
+    }
+
+    // Scalar source: lower it, store to temp, reload as mold type.
+    let src_val = lower_expr_full(
+        b, locals, source_expr, st, type_layouts,
+        internal_funcs, contained_host_refs, descriptor_params,
+    );
+    let src_ty = b.func().value_type(src_val).unwrap_or(IrType::Int(IntWidth::I32));
+    if matches!(src_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool) {
+        let zero_off = b.const_i64(0);
+        let dst = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
+        b.store(src_val, dst);
+        return Some(b.load_typed(buf, mold_ty));
+    }
+    // For pointer sources (named arrays, etc.), copy bytes via memcpy.
+    if let IrType::Ptr(_) = &src_ty {
+        let src_bytes = b.const_i64(buf_bytes);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![buf, src_val, src_bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return Some(b.load_typed(buf, mold_ty));
+    }
+
+    None
+}
+
 /// lowering to pick an element type without actually emitting IR.
 /// Conservative — falls back to i32 for anything it can't
 /// classify.
