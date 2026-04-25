@@ -264,12 +264,19 @@ pub fn write_amod(
     }
 
     // ---- Types ----
+    // Include all derived types, even private ones — submodules need access
+    // to their parent module's private types per F2008 12.2.3.2.
     let mut type_exports: BTreeSet<String> = BTreeSet::new();
     for (name, sym) in &syms {
         if matches!(sym.kind, SymbolKind::DerivedType) {
             collect_exported_type_closure(&mut type_exports, name, type_layouts);
         }
         collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);
+    }
+    for (name, sym) in scope.symbols.iter() {
+        if matches!(sym.kind, SymbolKind::DerivedType) {
+            collect_exported_type_closure(&mut type_exports, name, type_layouts);
+        }
     }
     for (_name, sym) in &procs {
         collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);

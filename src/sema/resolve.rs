@@ -352,15 +352,20 @@ fn resolve_unit(
             contains,
         } => {
             // Find the parent module scope and inherit its symbols.
-            let parent_scope = st.find_module_scope(parent);
+            // If the parent isn't compiled in this TU, load it from .amod.
+            let parent_scope = st
+                .find_module_scope(parent)
+                .or_else(|| load_external_module(st, parent, module_search_paths, layouts));
             st.push_scope(ScopeKind::Submodule(name.clone()));
             // Import all parent module symbols into the submodule scope.
+            // Per F2008 12.2.3.2: submodules see ALL parent entities,
+            // including private ones — that's the whole point of the
+            // submodule mechanism (host association).
             if let Some(pid) = parent_scope {
                 let parent_syms: Vec<(String, String)> = st
                     .scope(pid)
                     .symbols
                     .iter()
-                    .filter(|(_, sym)| sym.attrs.access != Access::Private)
                     .map(|(key, sym)| (sym.name.clone(), key.clone()))
                     .collect();
                 for (sym_name, _key) in &parent_syms {
