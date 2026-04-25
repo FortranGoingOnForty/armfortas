@@ -30,8 +30,17 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let start = self.current_span();
 
-        // Collect prefixes (pure, elemental, recursive, etc.).
-        let mut prefixes = Vec::new();
+        // Prefixes and a single optional return-type spec may appear in
+        // any order before `function` / `subroutine` / `procedure`.
+        // Fortran 2008 R1226: prefix-spec ::= type-spec | declaration-prefix
+        // where declaration-prefix is one of pure/impure/elemental/
+        // recursive/non_recursive/module.  Stdlib uses every order:
+        //   pure module function foo
+        //   elemental module logical function bar
+        //   logical pure module function baz
+        //   pure real(sp) module function qux
+        let mut prefixes: Vec<Prefix> = Vec::new();
+        let mut return_type: Option<crate::ast::decl::TypeSpec> = None;
         loop {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
@@ -56,44 +65,58 @@ impl<'a> Parser<'a> {
                     prefixes.push(Prefix::NonRecursive);
                 }
                 "module" => {
-                    // "module" could be prefix or the MODULE keyword itself.
+                    // `module` is a prefix iff the *eventual* keyword
+                    // afterward is subroutine/function/procedure.  The
+                    // intervening tokens may be other prefixes or a
+                    // type-spec; check the next token cheaply and treat
+                    // it as a prefix when it can lead to those keywords.
                     let next = if self.pos + 1 < self.tokens.len() {
                         self.tokens[self.pos + 1].text.to_lowercase()
                     } else {
                         String::new()
                     };
-                    if matches!(next.as_str(), "subroutine" | "function" | "procedure") {
+                    let is_simple_prefix = matches!(
+                        next.as_str(),
+                        "subroutine" | "function" | "procedure"
+                    );
+                    let is_followed_by_decl_prefix = matches!(
+                        next.as_str(),
+                        "pure"
+                            | "impure"
+                            | "elemental"
+                            | "recursive"
+                            | "non_recursive"
+                    );
+                    let is_type_then_function = matches!(
+                        next.as_str(),
+                        "integer"
+                            | "real"
+                            | "double"
+                            | "complex"
+                            | "logical"
+                            | "character"
+                            | "type"
+                            | "class"
+                    );
+                    if is_simple_prefix
+                        || is_followed_by_decl_prefix
+                        || is_type_then_function
+                    {
                         self.advance();
                         prefixes.push(Prefix::Module);
                     } else {
                         break;
                     }
                 }
-                _ => break,
-            }
-        }
-
-        // Check for return type before function keyword.
-        let mut return_type = None;
-        if let Some(ts_result) = self.try_parse_type_spec() {
-            return_type = Some(ts_result?);
-            // This must be followed by "function".
-        }
-
-        // The `module` prefix is also allowed *after* the return-type
-        // specifier (e.g. `pure real(sp) module function foo(...)`).
-        // The earlier prefix loop only sees `module` before the type
-        // spec; pick it up here too if next token is `function` or
-        // `subroutine`.
-        if self.peek_text().eq_ignore_ascii_case("module") {
-            let next = if self.pos + 1 < self.tokens.len() {
-                self.tokens[self.pos + 1].text.to_lowercase()
-            } else {
-                String::new()
-            };
-            if matches!(next.as_str(), "subroutine" | "function" | "procedure") {
-                self.advance();
-                prefixes.push(Prefix::Module);
+                _ => {
+                    if return_type.is_none() {
+                        if let Some(ts_result) = self.try_parse_type_spec() {
+                            return_type = Some(ts_result?);
+                            continue;
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -511,6 +534,40 @@ impl<'a> Parser<'a> {
                 };
                 if next == "procedure" {
                     self.advance(); // module
+                    self.advance(); // procedure
+                    self.eat(&TokenKind::ColonColon);
+                    let mut names = Vec::new();
+                    loop {
+                        names.push(self.advance().clone().text);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    bodies.push(InterfaceBody::ModuleProcedure(names));
+                    self.skip_newlines();
+                    continue;
+                }
+            }
+
+            // F2003 R1207: bare `procedure :: NAME [, NAME...]` inside a
+            // generic interface dispatches to the named specifics with
+            // the same semantics as `module procedure NAME` here.
+            // Several stdlib generic interfaces (e.g. `interface arg`,
+            // `interface deg2rad`) use this form.
+            if text == "procedure" {
+                let next_kind = if self.pos + 1 < self.tokens.len() {
+                    self.tokens[self.pos + 1].kind.clone()
+                } else {
+                    TokenKind::Eof
+                };
+                // Disambiguate from `procedure(iface), attr :: name`
+                // (procedure-pointer / abstract-iface declaration) which
+                // takes a parenthesized interface name; that form is a
+                // subprogram declaration the regular path handles.
+                if next_kind == TokenKind::ColonColon
+                    || next_kind == TokenKind::Identifier
+                    || next_kind == TokenKind::Comma
+                {
                     self.advance(); // procedure
                     self.eat(&TokenKind::ColonColon);
                     let mut names = Vec::new();
