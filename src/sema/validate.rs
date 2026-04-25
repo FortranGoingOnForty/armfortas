@@ -631,6 +631,10 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             selector: condition,
             ..
         }
+        | Stmt::SelectRank {
+            selector: condition,
+            ..
+        }
         | Stmt::ComputedGoto {
             selector: condition,
             ..
@@ -1342,9 +1346,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.error(stmt.span, "STOP not allowed in pure procedure");
         }
         Stmt::ErrorStop { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "ERROR STOP not allowed in pure procedure");
-            }
+            // F2018 allows ERROR STOP in pure procedures (relaxed from F2008).
             ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
         }
 

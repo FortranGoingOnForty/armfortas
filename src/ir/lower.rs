@@ -5272,6 +5272,20 @@ fn check_filtered_in_stmt(stmt: &crate::ast::stmt::SpannedStmt, filtered: &HashS
                 check_no_filtered_refs(body, filtered);
             }
         }
+        Stmt::SelectRank {
+            selector, guards, ..
+        } => {
+            check_filtered_in_expr(selector, filtered);
+            for guard in guards {
+                use crate::ast::stmt::RankGuard;
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                check_no_filtered_refs(body, filtered);
+            }
+        }
 
         // ---- WHERE / FORALL ----
         Stmt::WhereConstruct {
@@ -22358,6 +22372,86 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 );
             } else {
                 store_scalar_pointer_slot_value(b, &tgt_info, addr);
+            }
+        }
+
+        Stmt::SelectRank {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            // Read rank from selector's descriptor (offset 16, i32 field).
+            // For non-descriptor-backed selectors, fall back to the static
+            // declared rank.
+            let bb_end = b.create_block("select_rank_end");
+            let selector_info = associate_alias_local_info(b, ctx, selector);
+            let runtime_rank: ValueId = if let Some(info) = selector_info.as_ref() {
+                if local_uses_array_descriptor(info) {
+                    let desc = array_descriptor_addr(b, info);
+                    let rank32 = load_array_desc_i32_field(b, desc, 16);
+                    b.int_extend(rank32, IntWidth::I64, true)
+                } else {
+                    b.const_i64(local_declared_rank(info) as i64)
+                }
+            } else {
+                b.const_i64(0)
+            };
+
+            // Install `v` as an alias for the selector inside each guard.
+            let saved_alias = assoc_name.as_ref().and_then(|name| {
+                let key = name.to_lowercase();
+                ctx.locals.remove(&key)
+            });
+            if let (Some(name), Some(info)) = (assoc_name.as_ref(), selector_info.as_ref()) {
+                ctx.locals.insert(name.to_lowercase(), info.clone());
+            }
+
+            let default_body = guards.iter().find_map(|guard| {
+                if let crate::ast::stmt::RankGuard::RankDefault { body } = guard {
+                    Some(body)
+                } else {
+                    None
+                }
+            });
+
+            for guard in guards {
+                use crate::ast::stmt::RankGuard;
+                match guard {
+                    RankGuard::Rank { rank, body } => {
+                        let want = b.const_i64(*rank);
+                        let matches = b.icmp(CmpOp::Eq, runtime_rank, want);
+                        let bb_match = b.create_block("rank_match");
+                        let bb_next = b.create_block("rank_next");
+                        b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
+                        b.set_block(bb_match);
+                        lower_stmts(b, ctx, body);
+                        if b.func().block(b.current_block()).terminator.is_none() {
+                            b.branch(bb_end, vec![]);
+                        }
+                        b.set_block(bb_next);
+                    }
+                    RankGuard::RankStar { .. } | RankGuard::RankDefault { .. } => {
+                        // Defaults handled after specific ranks.
+                    }
+                }
+            }
+            if let Some(body) = default_body {
+                lower_stmts(b, ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_end, vec![]);
+                }
+            } else if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_end, vec![]);
+            }
+            b.set_block(bb_end);
+
+            if let Some(name) = assoc_name.as_ref() {
+                let key = name.to_lowercase();
+                ctx.locals.remove(&key);
+                if let Some(saved) = saved_alias {
+                    ctx.locals.insert(key, saved);
+                }
             }
         }
 
