@@ -921,6 +921,7 @@ fn load_external_module(
             pure: proc.pure,
             elemental: proc.elemental,
             binding_label: proc.binding_label.clone(),
+            result_rank: proc.result_rank,
             ..Default::default()
         };
         let arg_names: Vec<String> = proc
@@ -1928,6 +1929,7 @@ fn process_contains(
                     pure: fn_pure,
                     elemental: fn_elemental,
                     binding_label: normalized_bind_name(bind.as_ref(), name),
+                    result_rank: result_attrs.result_rank,
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -2223,11 +2225,24 @@ fn function_result_attrs(
         else {
             continue;
         };
-        if entities
+        let matching_entity = entities
             .iter()
-            .any(|entity| entity.name.eq_ignore_ascii_case(&result_key))
-        {
-            return attrs_to_symbol_attrs(attrs, Access::Default);
+            .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
+        if let Some(entity) = matching_entity {
+            let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
+            // Capture result rank: prefer the entity-local array_spec
+            // (e.g. `real :: w(:)`), falling back to a `dimension(...)`
+            // attribute on the type-decl statement.
+            let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
+            let rank_from_attrs = attrs.iter().find_map(|a| match a {
+                crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
+                _ => None,
+            });
+            sym_attrs.result_rank = rank_from_entity
+                .or(rank_from_attrs)
+                .unwrap_or(0)
+                .min(u8::MAX as usize) as u8;
+            return sym_attrs;
         }
     }
     SymbolAttrs::default()

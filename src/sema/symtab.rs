@@ -474,6 +474,12 @@ pub struct SymbolAttrs {
     pub pure: bool,
     /// Procedure declared with the ELEMENTAL prefix.
     pub elemental: bool,
+    /// For Function symbols whose result is an array (allocatable,
+    /// automatic, or fixed-shape): rank of the result.  0 for scalar
+    /// results.  Used by lowering to route array-returning calls
+    /// through the descriptor-return ABI even when the result isn't
+    /// ALLOCATABLE — e.g. `real(sp), dimension(size(x)) :: w` is rank 1.
+    pub result_rank: u8,
 }
 
 impl Default for SymbolAttrs {
@@ -494,6 +500,7 @@ impl Default for SymbolAttrs {
             intrinsic: false,
             pure: false,
             elemental: false,
+            result_rank: 0,
         }
     }
 }

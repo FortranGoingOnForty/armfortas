@@ -496,6 +496,9 @@ fn emit_procedure(
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
         }
+        if sym.attrs.result_rank > 0 {
+            write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
+        }
     } else {
         write!(out, "@subroutine {}", sym.name).unwrap();
     }
@@ -963,6 +966,7 @@ pub struct AmodProc {
     pub return_type: Option<TypeInfo>,
     pub result_allocatable: bool,
     pub result_pointer: bool,
+    pub result_rank: u8,
     pub pure: bool,
     pub elemental: bool,
     pub access: Access,
@@ -1248,6 +1252,11 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let elemental = attrs_str.contains("elemental");
     let result_allocatable = attrs_str.contains("result_allocatable");
     let result_pointer = attrs_str.contains("result_pointer");
+    let result_rank = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("result_rank="))
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
     let access = if attrs_str.split(", ").any(|attr| attr == "private") {
         Access::Private
     } else {
@@ -1284,6 +1293,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         return_type,
         result_allocatable,
         result_pointer,
+        result_rank,
         pure,
         elemental,
         access,
