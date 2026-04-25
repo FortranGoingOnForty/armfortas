@@ -87,6 +87,19 @@ impl<'a> Parser<'a> {
             "submodule" => self.parse_submodule(start),
             "subroutine" => self.parse_subroutine(start, prefixes),
             "function" => self.parse_function(start, prefixes, return_type),
+            // F2008 §12.6.2.5: separate module procedure body
+            // (module procedure NAME ... end procedure [NAME])
+            // — the procedure's signature is inherited from the
+            // parent module's interface block, so args/return type
+            // are not repeated here.  Only valid when the `module`
+            // prefix was consumed above.
+            "procedure"
+                if prefixes
+                    .iter()
+                    .any(|p| matches!(p, Prefix::Module)) =>
+            {
+                self.parse_separate_module_procedure(start, prefixes)
+            }
             "blockdata" | "block" => {
                 if text == "block"
                     && self.pos + 1 < self.tokens.len()
@@ -323,6 +336,50 @@ impl<'a> Parser<'a> {
                 result,
                 return_type,
                 bind,
+                prefix,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains,
+            },
+            span,
+        ))
+    }
+
+    /// Parse the F2008 separate module procedure body form:
+    ///   `module procedure NAME` [ body ] `end [procedure [NAME]]`
+    /// The signature (args, return type, etc.) is inherited from the
+    /// matching `module subroutine`/`module function` interface in the
+    /// parent module — sema fills it in once both files are processed.
+    /// We always emit a Subroutine here; if the parent's interface was
+    /// actually a function, sema rewrites it (sema/resolve.rs).
+    fn parse_separate_module_procedure(
+        &mut self,
+        start: crate::lexer::Span,
+        prefix: Vec<Prefix>,
+    ) -> Result<SpannedUnit, ParseError> {
+        self.advance(); // consume 'procedure'
+        let name = self.advance().clone().text;
+        self.skip_newlines();
+
+        // Body is parsed normally; declarations may appear (e.g. local
+        // vars).  The dummy arguments themselves are *not* redeclared
+        // here per F2008 §12.6.2.5 — sema injects them from the
+        // parent module's interface.
+        let (uses, imports, implicit, decls, body, ifaces) =
+            self.parse_unit_body(&["procedure"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces);
+        self.consume_end("procedure")?;
+
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            ProgramUnit::Subroutine {
+                name,
+                args: Vec::new(),
+                bind: None,
                 prefix,
                 uses,
                 imports,

@@ -227,7 +227,7 @@ fn resolve_unit(
         ProgramUnit::Subroutine {
             name,
             args,
-            prefix: _,
+            prefix,
             bind: _,
             uses,
             imports: _,
@@ -237,30 +237,47 @@ fn resolve_unit(
             contains,
         } => {
             let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
-            // Store ordered arg names for VALUE lookup by callers.
-            st.scope_mut(scope_id).arg_order = args
-                .iter()
-                .filter_map(|a| {
-                    if let DummyArg::Name(n) = a {
-                        Some(n.to_lowercase())
-                    } else {
-                        None
+
+            // F2008 §12.6.2.5: separate module procedure body — args
+            // are inherited from the parent module's interface block.
+            // The parser emits args=[] and prefix=[Module]; sema
+            // injects the args from the parent module's procedure
+            // scope (populated during interface resolution / .amod
+            // load).
+            let is_separate_body = args.is_empty()
+                && prefix.iter().any(|p| matches!(p, Prefix::Module))
+                && matches!(
+                    st.scope(st.scope(scope_id).parent.unwrap_or(0)).kind,
+                    ScopeKind::Submodule(_)
+                );
+            if is_separate_body {
+                inject_separate_module_procedure_args(st, name, scope_id, unit.span);
+            } else {
+                // Store ordered arg names for VALUE lookup by callers.
+                st.scope_mut(scope_id).arg_order = args
+                    .iter()
+                    .filter_map(|a| {
+                        if let DummyArg::Name(n) = a {
+                            Some(n.to_lowercase())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // Define dummy arguments as symbols.
+                for arg in args {
+                    if let DummyArg::Name(arg_name) = arg {
+                        st.define(Symbol {
+                            name: arg_name.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: None,
+                            attrs: SymbolAttrs::default(),
+                            defined_at: unit.span,
+                            scope: st.current_scope(),
+                            arg_names: vec![],
+                            const_value: None,
+                        })?;
                     }
-                })
-                .collect();
-            // Define dummy arguments as symbols.
-            for arg in args {
-                if let DummyArg::Name(arg_name) = arg {
-                    st.define(Symbol {
-                        name: arg_name.clone(),
-                        kind: SymbolKind::Variable,
-                        type_info: None,
-                        attrs: SymbolAttrs::default(),
-                        defined_at: unit.span,
-                        scope: st.current_scope(),
-                        arg_names: vec![],
-                        const_value: None,
-                    })?;
                 }
             }
             process_uses(st, uses, module_search_paths, layouts)?;
@@ -1067,6 +1084,80 @@ fn find_unit_scope(st: &SymbolTable, parent_scope: ScopeId, unit: &ProgramUnit) 
             None
         }
     })
+}
+
+/// Inject dummy-argument symbols into a separate-module-procedure body
+/// scope (F2008 §12.6.2.5).  The body's parent submodule was already
+/// linked to its parent module via UseAssociation; we walk that link
+/// to find the parent module's scope, locate the matching
+/// `Subroutine(name)` / `Function(name)` child scope (created either
+/// by the parent module's interface block resolution or by .amod
+/// loading), and clone its argument symbols into the body scope.
+fn inject_separate_module_procedure_args(
+    st: &mut SymbolTable,
+    proc_name: &str,
+    body_scope: ScopeId,
+    span: crate::lexer::Span,
+) {
+    let submodule_id = match st.scope(body_scope).parent {
+        Some(p) => p,
+        None => return,
+    };
+    let parent_module_scope = st
+        .scope(submodule_id)
+        .use_associations
+        .iter()
+        .find(|u| u.is_submodule_access)
+        .map(|u| u.source_scope);
+    let Some(parent_module_scope) = parent_module_scope else {
+        return;
+    };
+
+    // Find the matching procedure scope inside the parent module.
+    let proc_lc = proc_name.to_lowercase();
+    let iface_scope = st.all_scopes().iter().find_map(|scope| {
+        if scope.parent != Some(parent_module_scope) {
+            return None;
+        }
+        match &scope.kind {
+            ScopeKind::Subroutine(n) | ScopeKind::Function(n)
+                if n.eq_ignore_ascii_case(&proc_lc) =>
+            {
+                Some(scope.id)
+            }
+            _ => None,
+        }
+    });
+    let Some(iface_scope) = iface_scope else {
+        return;
+    };
+
+    // Snapshot arg_order and dummy-arg symbols from the interface
+    // scope before mutating the body scope.
+    let arg_order = st.scope(iface_scope).arg_order.clone();
+    let arg_symbols: Vec<Symbol> = arg_order
+        .iter()
+        .filter_map(|n| {
+            st.scope(iface_scope)
+                .symbols
+                .get(n)
+                .cloned()
+                .or_else(|| {
+                    st.scope(iface_scope)
+                        .symbols
+                        .iter()
+                        .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
+                        .map(|(_, s)| s.clone())
+                })
+        })
+        .collect();
+
+    st.scope_mut(body_scope).arg_order = arg_order;
+    for mut sym in arg_symbols {
+        sym.scope = body_scope;
+        sym.defined_at = span;
+        let _ = st.define(sym);
+    }
 }
 
 fn exported_const_int_params(
