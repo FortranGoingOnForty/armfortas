@@ -699,6 +699,31 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // INTRINSIC / EXTERNAL :: name-list — informational
+            // declarations that mark functions as intrinsic or external.
+            // We consume and discard them; sema already knows which names
+            // are intrinsic.
+            if (text == "intrinsic" || text == "external")
+                && (next_tok.as_ref() == Some(&TokenKind::ColonColon)
+                    || next_tok.as_ref() == Some(&TokenKind::Identifier))
+            {
+                self.advance(); // consume keyword
+                let _ = self.eat(&TokenKind::ColonColon);
+                // Eat the name list.
+                loop {
+                    if self.peek() == &TokenKind::Identifier {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.skip_newlines();
+                continue;
+            }
+
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
                 let start = self.current_span();

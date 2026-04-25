@@ -58,6 +58,38 @@ impl<'a> Parser<'a> {
 
         let text = self.peek_text().to_lowercase();
 
+        // FORMAT statement: skip over the (...) format spec. Format
+        // strings as labeled FORMAT are largely informational — modern
+        // Fortran uses character format strings inline. We swallow the
+        // whole statement and emit a Continue placeholder so labels
+        // can still target it.
+        if text == "format" {
+            self.advance(); // consume 'format'
+            if self.peek() == &TokenKind::LParen {
+                let mut depth = 0;
+                while self.peek() != &TokenKind::Eof {
+                    match self.peek() {
+                        TokenKind::LParen => {
+                            self.advance();
+                            depth += 1;
+                        }
+                        TokenKind::RParen => {
+                            self.advance();
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+            }
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::Continue { label: None }, span));
+        }
+
         match text.as_str() {
             "if" => self.parse_if(start),
             "do" => self.parse_do(start),
