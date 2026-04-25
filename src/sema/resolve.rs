@@ -172,6 +172,8 @@ type InterfaceOuterRef = (
     Option<TypeInfo>,
     Vec<String>,
     Option<String>,
+    bool, // pure
+    bool, // elemental
 );
 
 fn resolve_unit(
@@ -406,6 +408,7 @@ fn resolve_unit(
                             decls,
                             args,
                             bind,
+                            prefix,
                             ..
                         } => {
                             let arg_names = args
@@ -440,18 +443,28 @@ fn resolve_unit(
                                     }
                                     None
                                 });
+                            let elemental = prefix
+                                .iter()
+                                .any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                            let pure = elemental
+                                || prefix
+                                    .iter()
+                                    .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
                                 ti,
                                 arg_names,
                                 normalized_bind_name(bind.as_ref(), fn_name),
+                                pure,
+                                elemental,
                             ));
                         }
                         ProgramUnit::Subroutine {
                             name: fn_name,
                             args,
                             bind,
+                            prefix,
                             ..
                         } => {
                             let arg_names = args
@@ -464,12 +477,21 @@ fn resolve_unit(
                                     }
                                 })
                                 .collect();
+                            let elemental = prefix
+                                .iter()
+                                .any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                            let pure = elemental
+                                || prefix
+                                    .iter()
+                                    .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Subroutine,
                                 None,
                                 arg_names,
                                 normalized_bind_name(bind.as_ref(), fn_name),
+                                pure,
+                                elemental,
                             ));
                         }
                         _ => {}
@@ -503,7 +525,7 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label) in outer_refs {
+            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental) in outer_refs {
                 let span = unit.span;
                 let _ = st.define(Symbol {
                     name: fn_name,
@@ -512,6 +534,8 @@ fn resolve_unit(
                     attrs: SymbolAttrs {
                         external: true,
                         binding_label,
+                        pure,
+                        elemental,
                         ..Default::default()
                     },
                     defined_at: span,
