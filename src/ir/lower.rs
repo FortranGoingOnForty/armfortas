@@ -1617,6 +1617,12 @@ pub struct ModuleGlobalInfo {
     /// External modules (from .amod files) — skip emitting Global
     /// data entries since the storage lives in the other .o file.
     pub external: bool,
+    /// True for symbols with PRIVATE access in the parent module —
+    /// included so submodules can host-associate them, but invisible
+    /// to ordinary USE statements.  The "filtered out by USE ONLY"
+    /// diagnostic must skip these so it doesn't report local names
+    /// that happen to collide with a private parent symbol.
+    pub private: bool,
 }
 
 fn pointer_slot_type(value_ty: &IrType) -> IrType {
@@ -2424,6 +2430,7 @@ fn collect_module_globals(
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
                             external: false,
+                            private: false,
                         },
                     );
                     continue;
@@ -2453,6 +2460,7 @@ fn collect_module_globals(
                             derived_type: None,
                             char_kind: CharKind::Deferred,
                             external: false,
+                            private: false,
                         },
                     );
                     continue;
@@ -2558,6 +2566,7 @@ fn collect_module_globals(
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
                             external: false,
+                            private: false,
                         },
                     );
                 } else {
@@ -2581,6 +2590,7 @@ fn collect_module_globals(
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
                                 external: false,
+                            private: false,
                             },
                         );
                         continue;
@@ -2608,6 +2618,7 @@ fn collect_module_globals(
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
                                     external: false,
+                            private: false,
                                 },
                             );
                             continue;
@@ -2654,6 +2665,7 @@ fn collect_module_globals(
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
                                     external: false,
+                            private: false,
                                 },
                             );
                             continue;
@@ -2688,6 +2700,7 @@ fn collect_module_globals(
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
                             external: false,
+                            private: false,
                         },
                     );
                 }
@@ -5588,8 +5601,8 @@ fn compute_filtered_names(
                 }
             }
         } else {
-            for (mk, var) in globals.keys() {
-                if *mk == mod_key {
+            for ((mk, var), info) in globals.iter() {
+                if *mk == mod_key && !info.private {
                     visible_local_names.insert(var.clone());
                 }
             }
@@ -5612,9 +5625,12 @@ fn compute_filtered_names(
         // The set of names this module exports (limited to what
         // collect_module_globals registered — module functions and
         // derived types are tracked elsewhere and remain visible).
+        // Private vars are stored in `globals` for submodule access
+        // but never visible to USE; skip them so a name shadow on the
+        // local side doesn't trip the filter.
         let mut exports: HashSet<String> = HashSet::new();
-        for (mk, var) in globals.keys() {
-            if *mk == mod_key {
+        for ((mk, var), info) in globals.iter() {
+            if *mk == mod_key && !info.private {
                 exports.insert(var.clone());
             }
         }

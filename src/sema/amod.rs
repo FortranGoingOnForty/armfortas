@@ -1604,13 +1604,10 @@ pub fn extract_module_globals(
     let mod_key = iface.module_name.to_lowercase();
     let mut out = HashMap::new();
     for var in &iface.variables {
-        // Private vars/params aren't visible to ordinary USE.  They're
-        // only emitted into the .amod so submodules can host-associate
-        // them; downstream globals tracking (which drives the
-        // "filtered out by USE ONLY" diagnostic) must not surface them.
-        if var.access == Access::Private {
-            continue;
-        }
+        // Private vars/params get included so submodules can resolve
+        // host-associated references through the same globals map.
+        // The `private` flag lets the "filtered out by USE ONLY"
+        // diagnostic skip them — ordinary USE would never see them.
         if var.is_parameter && var.ir_symbol.is_none() {
             continue;
         } // PARAMETERs with folded values inline; others still need storage
@@ -1684,6 +1681,7 @@ pub fn extract_module_globals(
                         _ => crate::ir::lower::CharKind::None,
                     },
                     external: true,
+                    private: var.access == Access::Private,
                 },
             );
         }
