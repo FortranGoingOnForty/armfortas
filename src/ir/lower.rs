@@ -28252,8 +28252,18 @@ fn array_function_result_elem_type(
                     resolved_symbol_call_target(st, &resolved_key, &resolved_name)
                 }
             };
-            let abi_lookup_keys =
+            let mut abi_lookup_keys =
                 procedure_abi_lookup_keys(st, &[call_name.as_str(), &callee_key, &key]);
+            // If the callee is a generic interface and dispatch
+            // didn't pick a specific (e.g. arg type info wasn't
+            // available at probe time), expand the lookup to every
+            // listed specific so we can still recognize an
+            // array-returning specific by ABI.
+            if let Some(generic_sym) = find_named_interface_symbol(st, &key) {
+                for specific in &generic_sym.arg_names {
+                    abi_lookup_keys.push(specific.to_lowercase());
+                }
+            }
             let hidden_abi =
                 first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k));
             if !matches!(hidden_abi, Some(HiddenResultAbi::ArrayDescriptor)) {
@@ -29149,26 +29159,33 @@ fn lower_array_expr_descriptor(
                 }
                 _ => None,
             };
-            if let Some(info) = info {
-                if !local_is_array_like(&info) {
+            if let Some(info) = &info {
+                if local_is_array_like(info) {
+                    if args.is_empty() {
+                        let desc = if local_uses_array_descriptor(info) {
+                            array_descriptor_addr(b, info)
+                        } else {
+                            materialize_array_descriptor_for_info(b, info)
+                        };
+                        return Some((desc, info.ty.clone()));
+                    }
+                    if args.iter().any(|arg| {
+                        matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+                    }) {
+                        return Some((
+                            lower_array_section(b, locals, info, args, st, type_layouts),
+                            info.ty.clone(),
+                        ));
+                    }
+                    // Element access on an array local — scalar result,
+                    // not an array.  Fall through (returns None below).
                     return None;
                 }
-                if args.is_empty() {
-                    let desc = if local_uses_array_descriptor(&info) {
-                        array_descriptor_addr(b, &info)
-                    } else {
-                        materialize_array_descriptor_for_info(b, &info)
-                    };
-                    return Some((desc, info.ty.clone()));
-                }
-                if args.iter().any(|arg| {
-                    matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
-                }) {
-                    return Some((
-                        lower_array_section(b, locals, &info, args, st, type_layouts),
-                        info.ty.clone(),
-                    ));
-                }
+                // Local exists but isn't an array.  It might be a
+                // function name shadowed by a same-name local
+                // (uncommon) — fall through to the function-result
+                // descriptor path so array-returning callees still
+                // work.
             }
             lower_array_function_result_descriptor(
                 b,

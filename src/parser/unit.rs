@@ -266,9 +266,15 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body, _ifaces) =
+        let (uses, _imports, _implicit, decls, _body, ifaces) =
             self.parse_unit_body(&["submodule"])?;
-        let contains = self.parse_contains_section()?;
+        let mut contains = self.parse_contains_section()?;
+        // Carry interface blocks declared at the submodule's
+        // specification section into `contains` so sema sees them
+        // (without this, generic interfaces declared inside the
+        // submodule — e.g. stdlib_quadrature_simps's
+        // `interface simps38_weights` — are silently dropped).
+        contains.extend(ifaces);
         self.consume_end("submodule")?;
 
         let span = span_from_to(start, self.prev_span());
