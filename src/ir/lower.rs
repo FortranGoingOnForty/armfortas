@@ -29333,6 +29333,155 @@ fn lower_array_expr_descriptor(
     }
 }
 
+/// Multi-dim section assignment: `dest(s_0, s_1, ..., s_{N-1}) = value`
+/// where one or more `s_k` is a Range subscript.  Builds a section
+/// descriptor for the LHS via `afs_create_section`, then iterates
+/// over the section element-by-element using per-dim extents and
+/// strides loaded from the descriptor.  RHS is lowered as a value
+/// (scalar broadcast) or as an array descriptor (elem-wise copy).
+///
+/// Currently restricted to non-derived, non-character element types.
+/// 1D sections still go through `lower_1d_section_assign`; only N>=2
+/// hits this path.
+#[allow(clippy::too_many_arguments)]
+fn lower_multi_d_section_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    dest_args: &[crate::ast::expr::Argument],
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_info.derived_type.is_some() || dest_info.char_kind != CharKind::None {
+        return false;
+    }
+
+    let n_dims = dest_args.len();
+    let dest_desc = lower_array_section(
+        b,
+        &ctx.locals,
+        dest_info,
+        dest_args,
+        ctx.st,
+        Some(ctx.type_layouts),
+    );
+
+    // Try to lower RHS as an array descriptor (e.g. `beta * b(1:n,1:m)`
+    // is a binary descriptor expression with element type elem_ty).
+    let src_desc = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+
+    let elem_ty = dest_info.ty.clone();
+    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+
+    // Snapshot per-dim extent and stride from dest descriptor.
+    let mut extents: Vec<ValueId> = Vec::with_capacity(n_dims);
+    let mut strides: Vec<ValueId> = Vec::with_capacity(n_dims);
+    for k in 0..n_dims {
+        let dim_off = 24 + (k as i64) * 24;
+        let lo = load_array_desc_i64_field(b, dest_desc, dim_off);
+        let up = load_array_desc_i64_field(b, dest_desc, dim_off + 8);
+        let st_k = load_array_desc_i64_field(b, dest_desc, dim_off + 16);
+        let one = b.const_i64(1);
+        let span = b.isub(up, lo);
+        let ext = b.iadd(span, one);
+        extents.push(ext);
+        strides.push(st_k);
+    }
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(elem_ty.clone())));
+
+    // Total element count = product of extents.
+    let mut total = extents[0];
+    for &ext in extents.iter().skip(1) {
+        total = b.imul(total, ext);
+    }
+
+    let scalar_value = if src_desc.is_none() {
+        let raw = lower_expr_ctx_tl(b, ctx, value);
+        Some(coerce_to_type(b, raw, &elem_ty))
+    } else {
+        None
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("md_section_check");
+    let bb_body = b.create_block("md_section_body");
+    let bb_exit = b.create_block("md_section_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, total);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let elem_size_v = b.const_i64(elem_bytes);
+    // Decompose flat i into per-dim coords; accumulate stride-weighted
+    // byte offset into dest_off.  For dim k, coord_k = (i / prod_{j<k} ext_j) mod ext_k.
+    let mut rem = b.load(i_addr);
+    let mut dest_off = b.const_i64(0);
+    for k in 0..n_dims {
+        let coord = if k + 1 < n_dims {
+            let c = b.imod(rem, extents[k]);
+            rem = b.idiv(rem, extents[k]);
+            c
+        } else {
+            rem
+        };
+        let stride_elems = b.imul(coord, strides[k]);
+        let stride_bytes = b.imul(stride_elems, elem_size_v);
+        dest_off = b.iadd(dest_off, stride_bytes);
+    }
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+
+    let stored = if let Some((sd, src_ty)) = src_desc.as_ref() {
+        let src_base = b.load_typed(*sd, IrType::Ptr(Box::new(src_ty.clone())));
+        // Re-decompose the same flat i for the source descriptor (its
+        // strides may differ from the destination's).
+        let mut src_rem = b.load(i_addr);
+        let mut src_off = b.const_i64(0);
+        let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty));
+        for k in 0..n_dims {
+            let src_dim_off = 24 + (k as i64) * 24;
+            let src_stride = load_array_desc_i64_field(b, *sd, src_dim_off + 16);
+            let coord = if k + 1 < n_dims {
+                let c = b.imod(src_rem, extents[k]);
+                src_rem = b.idiv(src_rem, extents[k]);
+                c
+            } else {
+                src_rem
+            };
+            let stride_elems = b.imul(coord, src_stride);
+            let stride_bytes = b.imul(stride_elems, src_elem_size);
+            src_off = b.iadd(src_off, stride_bytes);
+        }
+        let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+        let raw = b.load_typed(src_ptr, src_ty.clone());
+        coerce_to_type(b, raw, &elem_ty)
+    } else {
+        scalar_value.expect("multi-d section assign: scalar value for non-array RHS")
+    };
+    b.store(stored, dest_ptr);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(i, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
 fn lower_1d_section_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -29340,13 +29489,18 @@ fn lower_1d_section_assign(
     dest_args: &[crate::ast::expr::Argument],
     value: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    if dest_args.len() != 1
-        || !matches!(
-            dest_args[0].value,
-            crate::ast::expr::SectionSubscript::Range { .. }
-        )
-    {
+    let any_range = dest_args.iter().any(|a| {
+        matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
+    });
+    if !any_range {
         return false;
+    }
+    // Multi-dim sections (e.g. `b(1:n, 1:nrhs)` on `b(ldb,*)`) need a
+    // per-dim coord decomposition; the flat-stride 1D path below is
+    // wrong when there's more than one dim.  Route those out through
+    // the generalized helper.
+    if dest_args.len() != 1 {
+        return lower_multi_d_section_assign(b, ctx, dest_info, dest_args, value);
     }
 
     let dest_desc = lower_array_section(
