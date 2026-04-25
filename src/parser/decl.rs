@@ -972,7 +972,35 @@ impl<'a> Parser<'a> {
         while self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
-                "pass" | "nopass" | "deferred" | "non_overridable" => {
+                "pass" => {
+                    proc_attrs.push(self.advance().clone().text);
+                    // Optional argument: pass(arg). Consume balanced parens
+                    // — we don't track which arg the pass is on; F2018 says
+                    // it defaults to the first dummy if not specified.
+                    if self.peek() == &TokenKind::LParen {
+                        let mut depth = 0;
+                        loop {
+                            match self.peek() {
+                                TokenKind::LParen => {
+                                    self.advance();
+                                    depth += 1;
+                                }
+                                TokenKind::RParen => {
+                                    self.advance();
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                TokenKind::Eof => break,
+                                _ => {
+                                    self.advance();
+                                }
+                            }
+                        }
+                    }
+                }
+                "nopass" | "deferred" | "non_overridable" | "public" | "private" => {
                     proc_attrs.push(self.advance().clone().text);
                 }
                 _ => break,

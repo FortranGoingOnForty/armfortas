@@ -11394,7 +11394,11 @@ fn local_semantic_type_info(
         });
     }
 
-    if info.dims.is_empty() {
+    // Detect complex element type. Complex values are stored as
+    // [Float x 2] aggregates whether the local is a scalar or an
+    // array — for an array, info.ty IS the element type, so checking
+    // it directly is correct for both ranks.
+    {
         let mut complex_probe = info.ty.clone();
         while let IrType::Ptr(inner) = complex_probe {
             complex_probe = *inner;
