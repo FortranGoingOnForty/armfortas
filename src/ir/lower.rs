@@ -30146,14 +30146,14 @@ fn lower_array_assign(
             return;
         }
 
-        // For non-allocatable fixed-size arrays whose RHS is an array
-        // expression that produces a descriptor (eg `[10,20]+5`), copy
-        // element-by-element. Skip when the dest is descriptor-backed
-        // (allocatable / assumed-shape) — those follow the descriptor
-        // assignment paths above.
-        if !local_uses_array_descriptor(dest_info)
-            && dest_info.derived_type.is_none()
+        // For arrays whose RHS is an array expression that produces a
+        // descriptor (eg `x = a*x + b`), copy element-by-element. Handles
+        // both fixed-size dest arrays AND descriptor-backed non-allocatable
+        // dests (assumed-shape, intent(out) :: x(:)). Allocatables are
+        // handled by the explicit allocatable paths above.
+        if dest_info.derived_type.is_none()
             && dest_info.char_kind == CharKind::None
+            && !dest_info.allocatable
         {
             if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
                 b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts),
@@ -30161,7 +30161,15 @@ fn lower_array_assign(
             ) {
                 let dest_base = array_base_addr(b, dest_info);
                 let n = array_total_elems_value(b, dest_info);
-                let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                // For descriptor-backed dests, use the destination's stride;
+                // for fixed-size dests, just use elem_bytes.
+                let dest_stride = if local_uses_array_descriptor(dest_info) {
+                    let dest_desc = array_descriptor_addr(b, dest_info);
+                    load_array_desc_i64_field(b, dest_desc, 24 + 16)
+                } else {
+                    b.const_i64(1)
+                };
                 let i_addr = b.alloca(IrType::Int(IntWidth::I64));
                 let zero = b.const_i64(0);
                 b.store(zero, i_addr);
@@ -30177,7 +30185,8 @@ fn lower_array_assign(
                 let iv = b.load(i_addr);
                 let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
                 let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
-                let doff = b.imul(iv, elem_bytes);
+                let logical_idx = b.imul(iv, dest_stride);
+                let doff = b.imul(logical_idx, dest_elem_bytes);
                 let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
                 b.store(coerced, dp);
                 let one = b.const_i64(1);
