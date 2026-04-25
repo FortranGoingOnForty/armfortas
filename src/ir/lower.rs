@@ -8918,6 +8918,72 @@ fn expand_vector_subscript_designator(
     Some(expanded)
 }
 
+/// Distribute an arithmetic BinaryOp over an ArrayConstructor operand.
+/// `[a,b,c] + x` becomes `[a+x, b+x, c+x]`. Returns None if neither operand
+/// of a BinaryOp is an ArrayConstructor, or if the op isn't arithmetic.
+fn unfold_array_ctor_binop(
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<crate::ast::expr::SpannedExpr> {
+    use crate::ast::expr::{AcValue, BinaryOp, Expr};
+    let Expr::BinaryOp { op, left, right } = &expr.node else {
+        return None;
+    };
+    if !matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+    ) {
+        return None;
+    }
+    let make_ctor = |values: Vec<crate::ast::expr::AcValue>| {
+        crate::ast::Spanned::new(
+            Expr::ArrayConstructor {
+                values,
+                type_spec: None,
+            },
+            expr.span,
+        )
+    };
+    if let Expr::ArrayConstructor { values, .. } = &left.node {
+        let mapped: Option<Vec<_>> = values
+            .iter()
+            .map(|v| {
+                let AcValue::Expr(elem) = v else {
+                    return None;
+                };
+                Some(AcValue::Expr(crate::ast::Spanned::new(
+                    Expr::BinaryOp {
+                        op: op.clone(),
+                        left: Box::new(elem.clone()),
+                        right: right.clone(),
+                    },
+                    expr.span,
+                )))
+            })
+            .collect();
+        return mapped.map(make_ctor);
+    }
+    if let Expr::ArrayConstructor { values, .. } = &right.node {
+        let mapped: Option<Vec<_>> = values
+            .iter()
+            .map(|v| {
+                let AcValue::Expr(elem) = v else {
+                    return None;
+                };
+                Some(AcValue::Expr(crate::ast::Spanned::new(
+                    Expr::BinaryOp {
+                        op: op.clone(),
+                        left: left.clone(),
+                        right: Box::new(elem.clone()),
+                    },
+                    expr.span,
+                )))
+            })
+            .collect();
+        return mapped.map(make_ctor);
+    }
+    None
+}
+
 fn init_logical_reduction_acc(b: &mut FuncBuilder, name: &str) -> ValueId {
     match name {
         "any" => b.const_bool(false),
@@ -9109,9 +9175,14 @@ fn lower_logical_reduction_intrinsic_ast(
                 }
                 return Some(acc);
             }
-            match (&left.node, &right.node) {
+            let unfolded_left = unfold_array_ctor_binop(left);
+            let unfolded_right = unfold_array_ctor_binop(right);
+            let left_node = unfolded_left.as_ref().map(|e| &e.node).unwrap_or(&left.node);
+            let right_node = unfolded_right.as_ref().map(|e| &e.node).unwrap_or(&right.node);
+            match (left_node, right_node) {
                 (Expr::ArrayConstructor { values, .. }, _) => {
                     let mut acc = init_logical_reduction_acc(b, name);
+                    let right_e = unfolded_right.as_ref().unwrap_or(right);
                     for value in values {
                         let AcValue::Expr(lhs) = value else {
                             return None;
@@ -9120,7 +9191,7 @@ fn lower_logical_reduction_intrinsic_ast(
                             Expr::BinaryOp {
                                 op: op.clone(),
                                 left: Box::new(lhs.clone()),
-                                right: Box::new(right.as_ref().clone()),
+                                right: Box::new(right_e.clone()),
                             },
                             left.span,
                         );
@@ -9140,6 +9211,7 @@ fn lower_logical_reduction_intrinsic_ast(
                 }
                 (_, Expr::ArrayConstructor { values, .. }) => {
                     let mut acc = init_logical_reduction_acc(b, name);
+                    let left_e = unfolded_left.as_ref().unwrap_or(left);
                     for value in values {
                         let AcValue::Expr(rhs) = value else {
                             return None;
@@ -9147,7 +9219,7 @@ fn lower_logical_reduction_intrinsic_ast(
                         let cmp = crate::ast::Spanned::new(
                             Expr::BinaryOp {
                                 op: op.clone(),
-                                left: Box::new(left.as_ref().clone()),
+                                left: Box::new(left_e.clone()),
                                 right: Box::new(rhs.clone()),
                             },
                             left.span,
@@ -17737,6 +17809,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         return;
                     }
                     if let Some(info) = ctx.locals.get(&key).cloned() {
+                        if local_is_array_like(&info)
+                            && !local_uses_array_descriptor(&info)
+                        {
+                            lower_array_assign(b, ctx, name, &info, value);
+                            return;
+                        }
                         if local_is_array_like(&info)
                             && (info.char_kind != CharKind::None
                                 || descriptor_backed_runtime_char_array(&info))
@@ -26844,6 +26922,18 @@ fn expr_contains_array_refs(
     !arrays.is_empty()
 }
 
+fn expr_contains_array_constructor(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::ArrayConstructor { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_array_constructor(left) || expr_contains_array_constructor(right)
+        }
+        Expr::UnaryOp { operand, .. } => expr_contains_array_constructor(operand),
+        Expr::ParenExpr { inner } => expr_contains_array_constructor(inner),
+        _ => false,
+    }
+}
+
 fn expr_mentions_name(expr: &crate::ast::expr::SpannedExpr, needle: &str) -> bool {
     match &expr.node {
         Expr::Name { name } => name.eq_ignore_ascii_case(needle),
@@ -27570,7 +27660,7 @@ fn build_whole_array_bulk_plan(
         }
     }
 
-    if !expr_contains_array_refs(value, locals) {
+    if !expr_contains_array_refs(value, locals) && !expr_contains_array_constructor(value) {
         if let Some(kernel) = bulk_fill_runtime_name(&dest_info.ty) {
             return Some(BulkArrayPlan::Fill {
                 kernel,
@@ -28593,6 +28683,23 @@ fn lower_array_expr_descriptor(
             contained_host_refs,
             descriptor_params,
         ),
+        Expr::ArrayConstructor { values, .. } => {
+            let first = values.iter().find_map(|v| match v {
+                crate::ast::expr::AcValue::Expr(e) => Some(e),
+                _ => None,
+            });
+            let elem_ty = first
+                .and_then(|e| {
+                    operator_expr_type_info(e, Some(locals), st, type_layouts)
+                        .map(|ti| type_info_to_ir_type(&ti))
+                })
+                .unwrap_or(IrType::Int(IntWidth::I32));
+            let desc = lower_runtime_array_constructor_descriptor(
+                b, locals, &elem_ty, None, values, st,
+                type_layouts, internal_funcs, contained_host_refs, descriptor_params,
+            )?;
+            Some((desc, elem_ty))
+        }
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
             if local_is_array_like(info) {
@@ -29803,8 +29910,40 @@ fn lower_array_assign(
             return;
         }
 
+        if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
+            b, &ctx.locals, value, ctx.st, Some(ctx.type_layouts),
+            Some(ctx.internal_funcs), Some(ctx.contained_host_refs), Some(ctx.descriptor_params),
+        ) {
+            let dest_base = array_base_addr(b, dest_info);
+            let n = array_total_elems_value(b, dest_info);
+            let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let zero = b.const_i64(0);
+            b.store(zero, i_addr);
+            let bb_chk = b.create_block("desc_copy_check");
+            let bb_bdy = b.create_block("desc_copy_body");
+            let bb_ext = b.create_block("desc_copy_exit");
+            b.branch(bb_chk, vec![]);
+            b.set_block(bb_chk);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
+            b.set_block(bb_bdy);
+            let iv = b.load(i_addr);
+            let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+            let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
+            let doff = b.imul(iv, elem_bytes);
+            let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
+            b.store(coerced, dp);
+            let one = b.const_i64(1);
+            let ni = b.iadd(iv, one);
+            b.store(ni, i_addr);
+            b.branch(bb_chk, vec![]);
+            b.set_block(bb_ext);
+            return;
+        }
+
         // a = scalar: broadcast scalar to all elements.
-        // Generate a loop with stack-allocated counter.
         let scalar = lower_expr_ctx_tl(b, ctx, value);
         let dest_base = array_base_addr(b, dest_info);
         let n = array_total_elems_value(b, dest_info);
