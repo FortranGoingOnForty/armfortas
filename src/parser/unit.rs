@@ -80,6 +80,23 @@ impl<'a> Parser<'a> {
             // This must be followed by "function".
         }
 
+        // The `module` prefix is also allowed *after* the return-type
+        // specifier (e.g. `pure real(sp) module function foo(...)`).
+        // The earlier prefix loop only sees `module` before the type
+        // spec; pick it up here too if next token is `function` or
+        // `subroutine`.
+        if self.peek_text().eq_ignore_ascii_case("module") {
+            let next = if self.pos + 1 < self.tokens.len() {
+                self.tokens[self.pos + 1].text.to_lowercase()
+            } else {
+                String::new()
+            };
+            if matches!(next.as_str(), "subroutine" | "function" | "procedure") {
+                self.advance();
+                prefixes.push(Prefix::Module);
+            }
+        }
+
         let text = self.peek_text().to_lowercase();
         match text.as_str() {
             "program" => self.parse_program(start),
