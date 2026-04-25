@@ -174,6 +174,7 @@ type InterfaceOuterRef = (
     Option<String>,
     bool, // pure
     bool, // elemental
+    u8,   // result_rank
 );
 
 fn resolve_unit(
@@ -467,6 +468,11 @@ fn resolve_unit(
                                 || prefix
                                     .iter()
                                     .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                            // Capture result rank from the function's
+                            // own decls (interface-block bodies declare
+                            // the result variable here).
+                            let result_attrs_for_iface =
+                                function_result_attrs(fn_name, result, decls);
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
@@ -475,6 +481,7 @@ fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
+                                result_attrs_for_iface.result_rank,
                             ));
                         }
                         ProgramUnit::Subroutine {
@@ -509,6 +516,7 @@ fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
+                                0,
                             ));
                         }
                         _ => {}
@@ -542,7 +550,17 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental) in outer_refs {
+            for (
+                fn_name,
+                kind,
+                ti,
+                arg_names,
+                binding_label,
+                pure,
+                elemental,
+                result_rank,
+            ) in outer_refs
+            {
                 let span = unit.span;
                 let _ = st.define(Symbol {
                     name: fn_name,
@@ -553,6 +571,7 @@ fn resolve_unit(
                         binding_label,
                         pure,
                         elemental,
+                        result_rank,
                         ..Default::default()
                     },
                     defined_at: span,
