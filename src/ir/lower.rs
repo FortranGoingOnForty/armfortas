@@ -34314,6 +34314,23 @@ fn lower_array_intrinsic(
             let zero = b.const_i32(0);
             Some(b.icmp(CmpOp::Ne, raw, zero))
         }
+        "norm2" => {
+            // F2018 §16.9.158: NORM2(X[, DIM]) for real arrays.
+            // We currently support the whole-array form; result kind
+            // matches the input element kind.
+            match &elem_ty {
+                IrType::Float(FloatWidth::F32) => Some(b.call(
+                    FuncRef::External("afs_array_norm2_real4".into()),
+                    vec![desc],
+                    IrType::Float(FloatWidth::F32),
+                )),
+                _ => Some(b.call(
+                    FuncRef::External("afs_array_norm2_real8".into()),
+                    vec![desc],
+                    IrType::Float(FloatWidth::F64),
+                )),
+            }
+        }
         "sum" => {
             let is_real = elem_ty.is_float();
             if is_real {
