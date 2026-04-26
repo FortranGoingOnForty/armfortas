@@ -1810,14 +1810,218 @@ fn collect_host_refs_stmt(
                 collect_host_refs_stmt(s, host_names, sub_locals, refs);
             }
         }
-        Stmt::DoWhile { body, .. }
-        | Stmt::DoConcurrent { body, .. }
-        | Stmt::Block { body, .. } => {
+        Stmt::DoWhile {
+            condition, body, ..
+        } => {
+            collect_host_refs_expr(condition, host_names, sub_locals, refs);
             for s in body {
                 collect_host_refs_stmt(s, host_names, sub_locals, refs);
             }
         }
-        Stmt::Call { args, .. } => {
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            body,
+            ..
+        } => {
+            for c in controls {
+                collect_host_refs_expr(&c.start, host_names, sub_locals, refs);
+                collect_host_refs_expr(&c.end, host_names, sub_locals, refs);
+                if let Some(s) = &c.step {
+                    collect_host_refs_expr(s, host_names, sub_locals, refs);
+                }
+            }
+            if let Some(m) = mask {
+                collect_host_refs_expr(m, host_names, sub_locals, refs);
+            }
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Block { body, .. } => {
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
+            collect_host_refs_expr(selector, host_names, sub_locals, refs);
+            for case in cases {
+                for sel in &case.selectors {
+                    use crate::ast::stmt::CaseSelector;
+                    match sel {
+                        CaseSelector::Value(e) => {
+                            collect_host_refs_expr(e, host_names, sub_locals, refs);
+                        }
+                        CaseSelector::Range { low, high } => {
+                            if let Some(e) = low {
+                                collect_host_refs_expr(e, host_names, sub_locals, refs);
+                            }
+                            if let Some(e) = high {
+                                collect_host_refs_expr(e, host_names, sub_locals, refs);
+                            }
+                        }
+                        CaseSelector::Default => {}
+                    }
+                }
+                for s in &case.body {
+                    collect_host_refs_stmt(s, host_names, sub_locals, refs);
+                }
+            }
+        }
+        Stmt::SelectType {
+            selector, guards, ..
+        } => {
+            collect_host_refs_expr(selector, host_names, sub_locals, refs);
+            use crate::ast::stmt::TypeGuard;
+            for g in guards {
+                let body = match g {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                for s in body {
+                    collect_host_refs_stmt(s, host_names, sub_locals, refs);
+                }
+            }
+        }
+        Stmt::SelectRank {
+            selector, guards, ..
+        } => {
+            collect_host_refs_expr(selector, host_names, sub_locals, refs);
+            use crate::ast::stmt::RankGuard;
+            for g in guards {
+                let body = match g {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                for s in body {
+                    collect_host_refs_stmt(s, host_names, sub_locals, refs);
+                }
+            }
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_host_refs_expr(mask, host_names, sub_locals, refs);
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+            for (m, b) in elsewhere {
+                if let Some(m) = m {
+                    collect_host_refs_expr(m, host_names, sub_locals, refs);
+                }
+                for s in b {
+                    collect_host_refs_stmt(s, host_names, sub_locals, refs);
+                }
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_host_refs_expr(mask, host_names, sub_locals, refs);
+            collect_host_refs_stmt(stmt, host_names, sub_locals, refs);
+        }
+        Stmt::ForallConstruct {
+            specs, mask, body, ..
+        } => {
+            for sp in specs {
+                collect_host_refs_expr(&sp.start, host_names, sub_locals, refs);
+                collect_host_refs_expr(&sp.end, host_names, sub_locals, refs);
+                if let Some(s) = &sp.step {
+                    collect_host_refs_expr(s, host_names, sub_locals, refs);
+                }
+            }
+            if let Some(m) = mask {
+                collect_host_refs_expr(m, host_names, sub_locals, refs);
+            }
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for sp in specs {
+                collect_host_refs_expr(&sp.start, host_names, sub_locals, refs);
+                collect_host_refs_expr(&sp.end, host_names, sub_locals, refs);
+                if let Some(s) = &sp.step {
+                    collect_host_refs_expr(s, host_names, sub_locals, refs);
+                }
+            }
+            if let Some(m) = mask {
+                collect_host_refs_expr(m, host_names, sub_locals, refs);
+            }
+            collect_host_refs_stmt(stmt, host_names, sub_locals, refs);
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, e) in assocs {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+            for s in body {
+                collect_host_refs_stmt(s, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            collect_host_refs_expr(condition, host_names, sub_locals, refs);
+            collect_host_refs_stmt(action, host_names, sub_locals, refs);
+        }
+        Stmt::Labeled { stmt, .. } => {
+            collect_host_refs_stmt(stmt, host_names, sub_locals, refs);
+        }
+        Stmt::Return { value: Some(e) } | Stmt::ComputedGoto { selector: e, .. } => {
+            collect_host_refs_expr(e, host_names, sub_locals, refs);
+        }
+        Stmt::Stop {
+            code: Some(e),
+            ..
+        }
+        | Stmt::ErrorStop {
+            code: Some(e),
+            ..
+        }
+        | Stmt::ArithmeticIf { expr: e, .. } => {
+            collect_host_refs_expr(e, host_names, sub_locals, refs);
+        }
+        Stmt::PointerAssignment { target, value } => {
+            collect_host_refs_expr(target, host_names, sub_locals, refs);
+            collect_host_refs_expr(value, host_names, sub_locals, refs);
+        }
+        Stmt::Allocate { items, opts, .. } | Stmt::Deallocate { items, opts } => {
+            for e in items {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+            for c in opts {
+                collect_host_refs_expr(&c.value, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Nullify { items } => {
+            for e in items {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for c in specs {
+                collect_host_refs_expr(&c.value, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Inquire { specs, items } => {
+            for c in specs {
+                collect_host_refs_expr(&c.value, host_names, sub_locals, refs);
+            }
+            for e in items {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Call { callee, args } => {
+            collect_host_refs_expr(callee, host_names, sub_locals, refs);
             for arg in args {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                     collect_host_refs_expr(e, host_names, sub_locals, refs);
