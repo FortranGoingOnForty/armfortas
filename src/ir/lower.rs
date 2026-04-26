@@ -6492,6 +6492,37 @@ fn install_globals_as_locals(
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
             }
         }
+        // F2018 §11.2.3: a submodule sees every entity its host module
+        // sees, including names brought into the host via USE.  Walk the
+        // host module's UseAssociations and install the source globals
+        // under the local-name the host knows them by.  Without this,
+        // a submodule reference to e.g. `one_sp` (from `use stdlib_constants`
+        // in the parent) misses `locals` entirely, falls into
+        // `find_symbol_any_scope` + the `const_i32(0)` fallback in
+        // `Expr::Name`, and breaks generic dispatch with the wrong IR type.
+        if let Some(host_scope_id) = st.find_module_scope(&mod_key) {
+            for assoc in &st.scope(host_scope_id).use_associations {
+                if assoc.is_submodule_access {
+                    continue;
+                }
+                let src_scope = st.scope(assoc.source_scope);
+                let src_mod_key = match &src_scope.kind {
+                    crate::sema::symtab::ScopeKind::Module(n)
+                    | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
+                    _ => continue,
+                };
+                if src_mod_key == mod_key {
+                    continue;
+                }
+                let var_lc = assoc.original_name.to_lowercase();
+                let local_lc = assoc.local_name.to_lowercase();
+                if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
+                    && !pending.iter().any(|(k, _)| k == &local_lc)
+                {
+                    pending.push((local_lc, (src_mod_key, var_lc)));
+                }
+            }
+        }
     }
 
     for decl in uses {
@@ -12149,11 +12180,13 @@ fn resolve_generic_call_actuals(
             let Some(declared_type) = declared_arg.type_info.as_ref() else {
                 return true;
             };
-            generic_declared_semantic_match(
-                declared_type,
-                semantic_slots.get(idx).and_then(|slot| slot.as_ref()),
-                type_layouts,
-            )
+            let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
+            generic_declared_semantic_match(declared_type, actual, type_layouts)
+        });
+        let rank_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
+            let formal_rank = formal_declared_rank(declared_arg);
+            let actual_rank = rank_slots.get(idx).copied().flatten();
+            formal_rank_matches_actual(formal_rank, actual_rank)
         });
         let ir_match = generic_candidate_matches_slots_with_proc(
             b,
@@ -12163,11 +12196,6 @@ fn resolve_generic_call_actuals(
             0,
             &actual_is_procedure_slots,
         );
-        let rank_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
-            let formal_rank = formal_declared_rank(declared_arg);
-            let actual_rank = rank_slots.get(idx).copied().flatten();
-            formal_rank_matches_actual(formal_rank, actual_rank)
-        });
         if semantic_match && ir_match && rank_match {
             return Some(candidate.clone());
         }
