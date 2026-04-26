@@ -18382,6 +18382,45 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                         );
                                     }
+                                } else if info.is_class
+                                    && info.dims.is_empty()
+                                    && ctx.st
+                                        .find_symbol_any_scope(&key)
+                                        .map(|s| s.attrs.allocatable)
+                                        .unwrap_or(false)
+                                    && matches!(value.node, Expr::ComponentAccess { .. })
+                                {
+                                    // Scalar polymorphic allocatable assign:
+                                    // `class(*), allocatable :: out; out = h%poly_field`
+                                    // — copy the 384-byte descriptor verbatim
+                                    // when the RHS is a polymorphic component
+                                    // access.  Avoids the scalar-store
+                                    // fallback that would truncate the source
+                                    // descriptor's payload to a single i32.
+                                    let dst = array_descriptor_addr(b, &info);
+                                    let src_desc_opt: Option<ValueId> =
+                                        resolve_component_field_access(
+                                            b,
+                                            &ctx.locals,
+                                            value,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                        .map(|(p, _)| p);
+                                    if let Some(src) = src_desc_opt {
+                                        let sz = b.const_i64(384);
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![dst, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        // Fall through if we can't resolve.
+                                        let val = lower_expr_ctx_tl(b, ctx, value);
+                                        let coerced = coerce_to_type(b, val, &info.ty);
+                                        let ptr = b.load(info.addr);
+                                        b.store(coerced, ptr);
+                                    }
                                 } else if info.by_ref {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(b, val, &info.ty);
