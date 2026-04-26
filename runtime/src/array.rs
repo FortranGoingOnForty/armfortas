@@ -2169,56 +2169,134 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     min
 }
 
-/// MAXVAL(array) — maximum element (integer(4) version). Respects strides.
+/// MAXVAL(array) — maximum element (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays read correctly.
+/// Returns i64 so all kinds fit; codegen truncates to result kind.
 #[no_mangle]
-pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
+pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i64 {
     if desc.is_null() {
-        return i32::MIN;
+        return i64::MIN;
     }
     let d = unsafe { &*desc };
     if d.base_addr.is_null() {
-        return i32::MIN;
+        return i64::MIN;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i32::MIN;
+        return i64::MIN;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
-    let mut max = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v > max {
-            max = v;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
         }
     }
-    max
 }
 
-/// MINVAL(array) — minimum element (integer(4) version). Respects strides.
+/// MINVAL(array) — minimum element (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays read correctly.
+/// Returns i64 so all kinds fit; codegen truncates to result kind.
 #[no_mangle]
-pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
+pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i64 {
     if desc.is_null() {
-        return i32::MAX;
+        return i64::MAX;
     }
     let d = unsafe { &*desc };
     if d.base_addr.is_null() {
-        return i32::MAX;
+        return i64::MAX;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i32::MAX;
+        return i64::MAX;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
-    let mut min = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v < min {
-            min = v;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
         }
     }
-    min
 }
 
 /// TRANSPOSE(source, result) — matrix transpose (real(8) version).
