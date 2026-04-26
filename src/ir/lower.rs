@@ -12046,14 +12046,11 @@ fn resolve_generic_call_actuals(
         // doesn't shadow a local variable (a same-named local wins;
         // its value is a normal data argument).
         // A Name actual is a procedure reference only when it
-        // resolves to a procedure symbol AND doesn't shadow a local
-        // variable (a same-named local wins) AND ALSO the
-        // corresponding formal looks proc-like (typeless `procedure
-        // (iface) :: p`). Without the formal-side gate, an array or
-        // scalar actual that happens to share a name with some
-        // module function (rare but real — e.g. inner subroutines
-        // referenced by name) silently disables type matching for
-        // unrelated dispatches.
+        // resolves to a procedure symbol via the current scope
+        // (`st.lookup` only — no any-scope fallback) AND doesn't
+        // shadow a local variable. Any-scope fallback would falsely
+        // flag an actual whose name happens to match an unrelated
+        // procedure elsewhere in the program.
         let actual_is_procedure: Vec<bool> = args
             .iter()
             .map(|arg| match &arg.value {
@@ -12064,7 +12061,6 @@ fn resolve_generic_call_actuals(
                             return false;
                         }
                         st.lookup(&key)
-                            .or_else(|| st.find_symbol_any_scope(&key))
                             .map(|sym| {
                                 matches!(
                                     sym.kind,
