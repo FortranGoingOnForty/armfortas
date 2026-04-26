@@ -743,6 +743,31 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             let dest_is_w = dest.starts_with('w');
             let src_is_w = src.starts_with('w');
             let src_is_x = src.starts_with('x');
+            // Cross-register-class move: AArch64 `mov` only encodes GP↔GP
+            // (and FP↔FP via FmovReg). When register-allocation hands us
+            // a MovReg straddling classes, emit `fmov` which transfers
+            // bits between an integer GPR and an SIMD/FP register.
+            let dest_is_gp = dest_is_x || dest_is_w;
+            let src_is_gp = src_is_x || src_is_w;
+            let dest_is_fp = dest.starts_with('s') || dest.starts_with('d');
+            let src_is_fp = src.starts_with('s') || src.starts_with('d');
+            if dest_is_gp && src_is_fp {
+                // GPR ← FPR: pick GPR width to match FPR (s→w, d→x).
+                let gp = if src.starts_with('d') {
+                    if dest_is_x { dest.clone() } else { format!("x{}", &dest[1..]) }
+                } else {
+                    if dest_is_w { dest.clone() } else { format!("w{}", &dest[1..]) }
+                };
+                return format!("fmov {}, {}", gp, src);
+            }
+            if dest_is_fp && src_is_gp {
+                let gp = if dest.starts_with('d') {
+                    if src_is_x { src.clone() } else { format!("x{}", &src[1..]) }
+                } else {
+                    if src_is_w { src.clone() } else { format!("w{}", &src[1..]) }
+                };
+                return format!("fmov {}, {}", dest, gp);
+            }
             if dest_is_x && src_is_w {
                 // Zero-extend 32→64: use uxtw.
                 format!("uxtw {}, {}", dest, src)
