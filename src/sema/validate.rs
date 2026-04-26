@@ -93,6 +93,13 @@ struct Ctx<'a> {
     /// Array names declared in each scope with allocatable/pointer storage.
     allocatable_array_targets: HashSet<(ScopeId, String)>,
     lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
+    /// Stack of associate-name frames. Each frame is the lowercase set of
+    /// associate-names introduced by an enclosing ASSOCIATE construct. Names
+    /// in any active frame shadow same-named USE-imported or host-scope
+    /// symbols for purposes of validation (an associate-name aliases its
+    /// selector, so parameter/intent attributes of a USE-imported symbol
+    /// with the same name don't apply inside the body).
+    associate_frames: Vec<HashSet<String>>,
     warn_pedantic: bool,
     warn_deprecated: bool,
 }
@@ -116,6 +123,7 @@ impl<'a> Ctx<'a> {
             type_layouts: None,
             allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
+            associate_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
         }
@@ -143,6 +151,17 @@ impl<'a> Ctx<'a> {
                 );
             }
         }
+    }
+
+    /// True if `name` is currently bound by an enclosing ASSOCIATE
+    /// construct. Associate-names alias their selector and shadow any
+    /// USE-imported or host-scope symbol with the same name within the
+    /// construct body.
+    fn is_associate_name(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        self.associate_frames
+            .iter()
+            .any(|frame| frame.contains(&key))
     }
 
     /// Look up a symbol in the current validation scope.
@@ -1629,6 +1648,13 @@ fn validate_select_case_arms(ctx: &mut Ctx<'_>, stmt_span: Span, cases: &[CaseBl
 /// variable's intent/parameter status applies to all parts.
 fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedExpr, span: Span) {
     if let Some(name) = extract_base_name(target) {
+        // F2018 §11.1.3.3: an associate-name aliases its selector and
+        // shadows any same-named outer symbol inside the construct body.
+        // The selector's writability — not the outer symbol's parameter
+        // or intent — governs whether the assignment is legal.
+        if ctx.is_associate_name(&name) {
+            return;
+        }
         let (is_intent_in, is_parameter, is_pointer) = ctx
             .lookup(&name)
             .map(|sym| {
@@ -2318,7 +2344,19 @@ fn validate_associate(
             ctx.error(span, "ASSOCIATE name cannot be empty");
         }
     }
+    let frame: HashSet<String> = assocs
+        .iter()
+        .filter_map(|(n, _)| {
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.to_lowercase())
+            }
+        })
+        .collect();
+    ctx.associate_frames.push(frame);
     validate_stmts(ctx, body);
+    ctx.associate_frames.pop();
 }
 
 /// Extract the base variable name from an expression (handling subscripts and components).
