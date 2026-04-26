@@ -10451,6 +10451,19 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "merge" => {
             if args.len() >= 3 {
+                // F2018 §16.9.135: merge is elemental. When any actual is
+                // an array, lowering must go through the per-element
+                // descriptor path (lower_array_merge_descriptor); the
+                // scalar `select` logic below would treat the array's
+                // base pointer as a scalar value, producing nonsense IR.
+                // Detect by checking for pointer-typed args (arrays
+                // arrive as Ptr<T>) and bail so the caller picks an
+                // array-aware lowering.
+                if args.iter().take(3).any(|a| {
+                    matches!(b.func().value_type(*a), Some(IrType::Ptr(_)))
+                }) {
+                    return None;
+                }
                 let mut ty = b
                     .func()
                     .value_type(args[0])
