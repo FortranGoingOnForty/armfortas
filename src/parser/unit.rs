@@ -888,6 +888,58 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // SAVE statement (F2018 §8.6.14):
+            //   bare `save`            — saves all locals in this scope
+            //   `save :: a, b`         — saves listed entities
+            //   `save a, b`            — same, no `::`
+            //   `save /cb/, x`         — common-block and entity mix
+            // Disambiguate from a variable named `save` by requiring
+            // the next token to start a SAVE list (`::`, identifier,
+            // `/`) or end the statement.
+            if text == "save" {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                let is_save_stmt = self.at_stmt_end_after(1)
+                    || matches!(
+                        next_kind,
+                        Some(TokenKind::ColonColon)
+                            | Some(TokenKind::Identifier)
+                            | Some(TokenKind::Slash)
+                    );
+                if is_save_stmt {
+                    let start = self.current_span();
+                    self.advance(); // consume 'save'
+                    let _ = self.eat(&TokenKind::ColonColon);
+                    let mut entities = Vec::new();
+                    while !self.at_stmt_end() {
+                        if self.peek() == &TokenKind::Slash {
+                            // /common-block-name/ — consume bracketing slashes.
+                            self.advance();
+                            if self.peek() == &TokenKind::Identifier {
+                                entities.push(self.advance().clone().text);
+                            }
+                            let _ = self.eat(&TokenKind::Slash);
+                        } else if self.peek() == &TokenKind::Identifier {
+                            entities.push(self.advance().clone().text);
+                        } else {
+                            break;
+                        }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.skip_newlines();
+                    let span = span_from_to(start, self.prev_span());
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::AttributeStmt {
+                            attr: crate::ast::decl::Attribute::Save,
+                            entities,
+                        },
+                        span,
+                    ));
+                    continue;
+                }
+            }
+
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
                 let start = self.current_span();
