@@ -1986,6 +1986,49 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
     count
 }
 
+/// NORM2(array) — Euclidean norm `sqrt(sum(x**2))` (real(8)).
+/// F2018 §16.9.158. Respects strides for non-contiguous sections.
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        acc += v * v;
+    }
+    acc.sqrt()
+}
+
+/// NORM2(array) — Euclidean norm `sqrt(sum(x**2))` (real(4)).
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
+    if desc.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let v = unsafe { *ptr.add(i * stride) } as f64;
+        acc += v * v;
+    }
+    acc.sqrt() as f32
+}
+
 /// SUM(array) — sum all elements (real(8) version).
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
