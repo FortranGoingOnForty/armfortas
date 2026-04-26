@@ -29312,23 +29312,32 @@ fn lower_rank1_numeric_array_binary_descriptor(
         .as_ref()
         .map(|(_, ty)| ty.clone())
         .or_else(|| rhs.as_ref().map(|(_, ty)| ty.clone()))?;
-    match elem_ty {
+    let is_complex_elem = matches!(&elem_ty, IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
+    match &elem_ty {
         IrType::Int(_) | IrType::Float(_) => {}
+        _ if is_complex_elem => {}
         _ => return None,
     }
-    let op_supported = matches!(
-        (&elem_ty, op),
-        (IrType::Int(_), BinaryOp::Add)
-            | (IrType::Int(_), BinaryOp::Sub)
-            | (IrType::Int(_), BinaryOp::Mul)
-            | (IrType::Int(_), BinaryOp::Div)
-            | (IrType::Int(_), BinaryOp::Pow)
-            | (IrType::Float(_), BinaryOp::Add)
-            | (IrType::Float(_), BinaryOp::Sub)
-            | (IrType::Float(_), BinaryOp::Mul)
-            | (IrType::Float(_), BinaryOp::Div)
-            | (IrType::Float(_), BinaryOp::Pow)
-    );
+    let op_supported = if is_complex_elem {
+        matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+        )
+    } else {
+        matches!(
+            (&elem_ty, op),
+            (IrType::Int(_), BinaryOp::Add)
+                | (IrType::Int(_), BinaryOp::Sub)
+                | (IrType::Int(_), BinaryOp::Mul)
+                | (IrType::Int(_), BinaryOp::Div)
+                | (IrType::Int(_), BinaryOp::Pow)
+                | (IrType::Float(_), BinaryOp::Add)
+                | (IrType::Float(_), BinaryOp::Sub)
+                | (IrType::Float(_), BinaryOp::Mul)
+                | (IrType::Float(_), BinaryOp::Div)
+                | (IrType::Float(_), BinaryOp::Pow)
+        )
+    };
     if !op_supported {
         return None;
     }
@@ -29360,69 +29369,134 @@ fn lower_rank1_numeric_array_binary_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let lhs_val = if let Some((desc, _)) = lhs.as_ref() {
-        load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
-    } else {
-        let scalar = lower_expr_full(
-            b,
-            locals,
-            left,
-            st,
-            type_layouts,
-            internal_funcs,
-            contained_host_refs,
-            descriptor_params,
-        );
-        coerce_to_type(b, scalar, &elem_ty)
-    };
-    let rhs_val = if let Some((desc, _)) = rhs.as_ref() {
-        load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
-    } else {
-        let scalar = lower_expr_full(
-            b,
-            locals,
-            right,
-            st,
-            type_layouts,
-            internal_funcs,
-            contained_host_refs,
-            descriptor_params,
-        );
-        coerce_to_type(b, scalar, &elem_ty)
-    };
 
-    let result = match (&elem_ty, op) {
-        (IrType::Int(_), BinaryOp::Add) => b.iadd(lhs_val, rhs_val),
-        (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs_val, rhs_val),
-        (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs_val, rhs_val),
-        (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs_val, rhs_val),
-        (IrType::Int(_), BinaryOp::Pow) => {
-            // Integer power: lower via float pow then truncate. Matches the
-            // scalar lowering in lower_expr_full's BinaryOp::Pow / Int arm.
-            let fl = b.int_to_float(lhs_val, FloatWidth::F64);
-            let fr = b.int_to_float(rhs_val, FloatWidth::F64);
-            let res = b.fpow(fl, fr);
-            let iw = match &elem_ty {
-                IrType::Int(w) => *w,
-                _ => IntWidth::I32,
-            };
-            b.float_to_int(res, iw)
-        }
-        (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs_val, rhs_val),
-        (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs_val, rhs_val),
-        (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs_val, rhs_val),
-        (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
-        (IrType::Float(_), BinaryOp::Pow) => {
-            // Real exponent of an integer is folded to f64 and back; here
-            // both are already float, so call fpow directly. For integer
-            // exponents (the common `x**2` case), coerce_to_type below
-            // would have promoted them to float to match the LHS.
-            let r = coerce_to_type(b, rhs_val, &elem_ty);
-            b.fpow(lhs_val, r)
-        }
-        _ => unreachable!("unsupported array op should have returned before block creation"),
-    };
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    if is_complex_elem {
+        let fw = complex_float_width(&elem_ty);
+        let lane_ty = IrType::Float(fw);
+        let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+        let zero = b.const_i64(0);
+
+        let load_lanes = |b: &mut FuncBuilder, side: Option<&(ValueId, IrType)>, side_expr: &crate::ast::expr::SpannedExpr| -> (ValueId, ValueId) {
+            if let Some((desc, _)) = side {
+                let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, &elem_ty, idx);
+                let re_ptr = b.gep(elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
+                let im_ptr = b.gep(elem_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                (
+                    b.load_typed(re_ptr, lane_ty.clone()),
+                    b.load_typed(im_ptr, lane_ty.clone()),
+                )
+            } else {
+                let scalar = lower_expr_full(
+                    b,
+                    locals,
+                    side_expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let buf = materialize_complex_operand(b, scalar, fw);
+                let re_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                (
+                    b.load_typed(re_ptr, lane_ty.clone()),
+                    b.load_typed(im_ptr, lane_ty.clone()),
+                )
+            }
+        };
+
+        let (re_l, im_l) = load_lanes(b, lhs.as_ref(), left);
+        let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
+        let (re_res, im_res) = match op {
+            BinaryOp::Add => (b.fadd(re_l, re_r), b.fadd(im_l, im_r)),
+            BinaryOp::Sub => (b.fsub(re_l, re_r), b.fsub(im_l, im_r)),
+            BinaryOp::Mul => {
+                let ac = b.fmul(re_l, re_r);
+                let bd = b.fmul(im_l, im_r);
+                let ad = b.fmul(re_l, im_r);
+                let bc = b.fmul(im_l, re_r);
+                (b.fsub(ac, bd), b.fadd(ad, bc))
+            }
+            BinaryOp::Div => {
+                let rr = b.fmul(re_r, re_r);
+                let ii = b.fmul(im_r, im_r);
+                let denom = b.fadd(rr, ii);
+                let ac = b.fmul(re_l, re_r);
+                let bd = b.fmul(im_l, im_r);
+                let bc = b.fmul(im_l, re_r);
+                let ad = b.fmul(re_l, im_r);
+                let real_num = b.fadd(ac, bd);
+                let imag_num = b.fsub(bc, ad);
+                (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
+            }
+            _ => unreachable!("unsupported complex array op"),
+        };
+
+        let dst_elem_ptr = rank1_array_desc_elem_ptr(b, result_desc, &elem_ty, idx);
+        let dst_re = b.gep(dst_elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
+        let dst_im = b.gep(dst_elem_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
+        b.store(re_res, dst_re);
+        b.store(im_res, dst_im);
+    } else {
+        let lhs_val = if let Some((desc, _)) = lhs.as_ref() {
+            load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+        } else {
+            let scalar = lower_expr_full(
+                b,
+                locals,
+                left,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_to_type(b, scalar, &elem_ty)
+        };
+        let rhs_val = if let Some((desc, _)) = rhs.as_ref() {
+            load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+        } else {
+            let scalar = lower_expr_full(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_to_type(b, scalar, &elem_ty)
+        };
+
+        let result = match (&elem_ty, op) {
+            (IrType::Int(_), BinaryOp::Add) => b.iadd(lhs_val, rhs_val),
+            (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs_val, rhs_val),
+            (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs_val, rhs_val),
+            (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs_val, rhs_val),
+            (IrType::Int(_), BinaryOp::Pow) => {
+                let fl = b.int_to_float(lhs_val, FloatWidth::F64);
+                let fr = b.int_to_float(rhs_val, FloatWidth::F64);
+                let res = b.fpow(fl, fr);
+                let iw = match &elem_ty {
+                    IrType::Int(w) => *w,
+                    _ => IntWidth::I32,
+                };
+                b.float_to_int(res, iw)
+            }
+            (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs_val, rhs_val),
+            (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs_val, rhs_val),
+            (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs_val, rhs_val),
+            (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
+            (IrType::Float(_), BinaryOp::Pow) => {
+                let r = coerce_to_type(b, rhs_val, &elem_ty);
+                b.fpow(lhs_val, r)
+            }
+            _ => unreachable!("unsupported array op should have returned before block creation"),
+        };
+        store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    }
 
     let one = b.const_i64(1);
     let next = b.iadd(idx, one);
@@ -29431,6 +29505,24 @@ fn lower_rank1_numeric_array_binary_descriptor(
 
     b.set_block(bb_exit);
     Some((result_desc, elem_ty))
+}
+
+/// Pointer to the i'th element in a rank-1 array descriptor — same
+/// stride/byte-offset math as `load_rank1_array_desc_elem` but stops
+/// before the final load. Used by the complex element path so callers
+/// can issue per-lane loads/stores against the element location.
+fn rank1_array_desc_elem_ptr(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+) -> ValueId {
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    let stride = load_array_desc_i64_field(b, desc, 24 + 16);
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let logical_index = b.imul(index, stride);
+    let byte_off = b.imul(logical_index, elem_size);
+    b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
 }
 
 fn lower_array_expr_descriptor(
