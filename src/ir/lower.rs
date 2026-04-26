@@ -11742,17 +11742,16 @@ fn generic_candidate_matches_slots_with_proc(
         }
         match arg_slots.get(idx) {
             Some(Some(arg_val)) => {
-                if actual_is_procedure.get(idx).copied().unwrap_or(false) {
-                    continue;
-                }
-                if decl_sym.attrs.external
+                let actual_is_proc =
+                    actual_is_procedure.get(idx).copied().unwrap_or(false);
+                let formal_is_proc = decl_sym.attrs.external
                     || matches!(
                         decl_sym.kind,
                         crate::sema::symtab::SymbolKind::Function
                             | crate::sema::symtab::SymbolKind::Subroutine
                             | crate::sema::symtab::SymbolKind::ProcedurePointer
-                    )
-                {
+                    );
+                if actual_is_proc && formal_is_proc {
                     continue;
                 }
                 let Some(ti) = decl_sym.type_info.as_ref() else {
@@ -12046,6 +12045,15 @@ fn resolve_generic_call_actuals(
         // a procedure when it resolves to a procedure symbol AND
         // doesn't shadow a local variable (a same-named local wins;
         // its value is a normal data argument).
+        // A Name actual is a procedure reference only when it
+        // resolves to a procedure symbol AND doesn't shadow a local
+        // variable (a same-named local wins) AND ALSO the
+        // corresponding formal looks proc-like (typeless `procedure
+        // (iface) :: p`). Without the formal-side gate, an array or
+        // scalar actual that happens to share a name with some
+        // module function (rare but real — e.g. inner subroutines
+        // referenced by name) silently disables type matching for
+        // unrelated dispatches.
         let actual_is_procedure: Vec<bool> = args
             .iter()
             .map(|arg| match &arg.value {
@@ -12063,7 +12071,7 @@ fn resolve_generic_call_actuals(
                                     crate::sema::symtab::SymbolKind::Function
                                         | crate::sema::symtab::SymbolKind::Subroutine
                                         | crate::sema::symtab::SymbolKind::ProcedurePointer
-                                )
+                                ) || sym.attrs.external
                             })
                             .unwrap_or(false)
                     } else {
@@ -12080,23 +12088,24 @@ fn resolve_generic_call_actuals(
             0,
         );
         let semantic_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
-            // Procedure dummies / EXTERNAL formals: skip semantic check
-            // when the actual is itself a procedure.
             let actual_is_proc = actual_is_procedure_slots
                 .get(idx)
                 .copied()
                 .unwrap_or(false);
-            if actual_is_proc {
-                return true;
-            }
-            if declared_arg.attrs.external
+            let formal_is_proc = declared_arg.attrs.external
                 || matches!(
                     declared_arg.kind,
                     crate::sema::symtab::SymbolKind::Function
                         | crate::sema::symtab::SymbolKind::Subroutine
                         | crate::sema::symtab::SymbolKind::ProcedurePointer
-                )
-            {
+                );
+            // Both sides procedural — skip type matching. The .amod
+            // writer normalizes `procedure(iface) :: p` formals to the
+            // interface's return type, so semantic checks would
+            // mis-reject. Require BOTH sides to look proc-like to
+            // avoid silently disabling matching when an actual happens
+            // to share a name with some unrelated function.
+            if actual_is_proc && formal_is_proc {
                 return true;
             }
             let Some(declared_type) = declared_arg.type_info.as_ref() else {
