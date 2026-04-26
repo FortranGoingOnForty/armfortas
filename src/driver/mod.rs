@@ -1021,8 +1021,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" reading: {}", opts.input.display());
     }
     let phase = phases.start("read");
-    let source = fs::read_to_string(&opts.input)
+    // Fortran source files in the wild are not always valid UTF-8 — Latin-1
+    // and stray bytes appear in comments or string literals.  gfortran/flang
+    // both accept non-UTF-8 sources; mirror that by reading raw bytes and
+    // decoding lossily so invalid sequences become U+FFFD instead of an I/O
+    // failure.
+    let raw = fs::read(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
+    let source = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
     phase.end(&mut phases);
     let file_str = opts.input.display().to_string();
 
