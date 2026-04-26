@@ -4,6 +4,7 @@
 //! mechanisms: local declaration, USE association, host association, and
 //! IMPORT. Handles implicit typing and case-insensitive lookup.
 
+use crate::ast::decl::ArraySpec;
 use crate::lexer::Span;
 use std::collections::HashMap;
 
@@ -480,6 +481,12 @@ pub struct SymbolAttrs {
     /// through the descriptor-return ABI even when the result isn't
     /// ALLOCATABLE — e.g. `real(sp), dimension(size(x)) :: w` is rank 1.
     pub result_rank: u8,
+    /// Per-entity array specification — the same value the AST carries
+    /// on `EntityDecl::array_spec` (or, when missing, derived from the
+    /// `dimension(...)` attribute). Empty when the symbol is scalar.
+    /// Sema populates this so consumers (notably SMP-body lowering)
+    /// can recover full shape metadata without re-walking the AST decls.
+    pub array_spec: Vec<ArraySpec>,
 }
 
 impl Default for SymbolAttrs {
@@ -501,6 +508,7 @@ impl Default for SymbolAttrs {
             pure: false,
             elemental: false,
             result_rank: 0,
+            array_spec: Vec::new(),
         }
     }
 }
