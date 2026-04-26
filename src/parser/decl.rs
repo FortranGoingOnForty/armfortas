@@ -1043,8 +1043,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_bound_proc_generic(&mut self) -> Result<TypeBoundProc, ParseError> {
-        // generic :: operator(+) => specific_name
-        // or generic :: name => specific_name
+        // generic [, attrs] :: name => specific_name [, specific_name ...]
+        // or generic [, attrs] :: operator(+) => specific_name
+        // F2018 §4.5.5: access-spec (PUBLIC/PRIVATE) may appear after the
+        // GENERIC keyword as a comma-separated attribute. The non-generic
+        // parser already handles this for ordinary procedure bindings; the
+        // generic parser was skipping it, so `generic, public :: name => ...`
+        // mis-parsed name as `,` and dropped every binding.
+        let mut proc_attrs = Vec::new();
+        while self.eat(&TokenKind::Comma) {
+            let text = self.peek_text().to_lowercase();
+            match text.as_str() {
+                "public" | "private" => {
+                    proc_attrs.push(self.advance().clone().text);
+                }
+                _ => break,
+            }
+        }
         self.eat(&TokenKind::ColonColon);
         let mut name = self.advance().clone().text;
         // Handle operator(...) form.
@@ -1067,7 +1082,7 @@ impl<'a> Parser<'a> {
             interface: None,
             binding,
             bindings,
-            attrs: Vec::new(),
+            attrs: proc_attrs,
             is_generic: true,
         })
     }
