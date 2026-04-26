@@ -31692,33 +31692,42 @@ fn lower_array_intrinsic(
         "sum" => {
             let is_real = elem_ty.is_float();
             if is_real {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_sum_real8".into()),
                     vec![desc],
                     IrType::Float(FloatWidth::F64),
-                ))
+                );
+                Some(coerce_to_type(b, raw, &elem_ty))
             } else {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_sum_int".into()),
                     vec![desc],
                     IrType::Int(IntWidth::I64),
-                ))
+                );
+                // F2018 §16.9.231: result kind matches input element kind.
+                Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "product" => {
             let is_real = elem_ty.is_float();
             if is_real {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_product_real8".into()),
                     vec![desc],
                     IrType::Float(FloatWidth::F64),
-                ))
+                );
+                Some(coerce_to_type(b, raw, &elem_ty))
             } else {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_product_int".into()),
                     vec![desc],
                     IrType::Int(IntWidth::I64),
-                ))
+                );
+                // F2018 §16.9.196: result kind matches input element
+                // kind.  The runtime helper returns i64 for any
+                // integer array; truncate to the element kind so
+                // generic dispatch sees the right IR width.
+                Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "maxval" => {
