@@ -4755,6 +4755,38 @@ fn lower_unit(
 /// the appropriate width) directly instead of going through a
 /// global address + load.
 fn materialize_const_scalar(b: &mut FuncBuilder, c: ConstScalar, target: &IrType) -> ValueId {
+    // Complex target — materialize a 2-lane buffer with the const as
+    // the real part and 0 as the imaginary part. Without this case
+    // `complex(sp), parameter :: alpha = 1.0_sp` would fall through
+    // to `const_i32(0)`, mis-typing the parameter at every reference
+    // and breaking generic dispatch on alpha against complex formals.
+    if let IrType::Array(elem, 2) = target {
+        if let IrType::Float(fw) = elem.as_ref() {
+            let fw = *fw;
+            let re = match c {
+                ConstScalar::Float(f) => match fw {
+                    FloatWidth::F32 => b.const_f32(f as f32),
+                    FloatWidth::F64 => b.const_f64(f),
+                },
+                ConstScalar::Int(i) => match fw {
+                    FloatWidth::F32 => b.const_f32(i as f32),
+                    FloatWidth::F64 => b.const_f64(i as f64),
+                },
+            };
+            let zero = match fw {
+                FloatWidth::F32 => b.const_f32(0.0),
+                FloatWidth::F64 => b.const_f64(0.0),
+            };
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Float(fw)), 2));
+            let zero_off = b.const_i64(0);
+            let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+            let re_ptr = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
+            let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
+            b.store(re, re_ptr);
+            b.store(zero, im_ptr);
+            return b.load_typed(buf, IrType::Array(Box::new(IrType::Float(fw)), 2));
+        }
+    }
     match (c, target) {
         (ConstScalar::Int(i), IrType::Int(IntWidth::I128)) => b.const_i128(i),
         (ConstScalar::Int(i), IrType::Int(IntWidth::I64)) => b.const_i64(i as i64),
