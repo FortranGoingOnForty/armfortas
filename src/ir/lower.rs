@@ -4701,6 +4701,7 @@ fn lower_unit(
         }
         ProgramUnit::Submodule {
             parent,
+            name: submodule_name,
             decls,
             uses,
             contains,
@@ -4715,12 +4716,32 @@ fn lower_unit(
             // module's contains — emit them as top-level functions whose
             // host scope is the parent module — so the linker sees the
             // implementations the program later calls into.
+            //
+            // Caveat: only separate-module-procedure bodies (those with
+            // a `module` prefix or matching a parent interface) link as
+            // `afs_modproc_<parent>_<name>`; plain contained helpers
+            // (`pure function anycolor(...)` declared only inside the
+            // submodule) live in the submodule's own scope, and the call
+            // site resolves them through the `Submodule(name)` scope —
+            // so their definition must use the submodule name to match.
             let visible_param_consts =
                 collect_decl_param_consts_with_host(decls, host_param_consts);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
             for sub in contains {
+                let sub_is_smp_body = match &sub.node {
+                    ProgramUnit::Function { prefix, .. }
+                    | ProgramUnit::Subroutine { prefix, .. } => prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
+                    _ => false,
+                };
+                let host_module_name = if sub_is_smp_body {
+                    parent.as_str()
+                } else {
+                    submodule_name.as_str()
+                };
                 lower_unit(
                     module,
                     sub,
@@ -4731,7 +4752,7 @@ fn lower_unit(
                     &visible_param_consts,
                     &no_host_decls,
                     None,
-                    Some(parent.as_str()),
+                    Some(host_module_name),
                     alloc_return_funcs,
                     optional_params,
                     descriptor_params,
