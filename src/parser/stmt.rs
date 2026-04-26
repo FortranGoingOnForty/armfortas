@@ -93,7 +93,23 @@ impl<'a> Parser<'a> {
         match text.as_str() {
             "if" => self.parse_if(start),
             "do" => self.parse_do(start),
-            "select" => self.parse_select(start),
+            // SELECT is not a reserved word — F2008 §3.2.5. LAPACK
+            // routines use `select` as a logical-array dummy
+            // argument, then assign `select(k) = .false.`. Disambiguate
+            // by requiring `case`, `type`, or `rank` to follow; else
+            // treat as an identifier.
+            "select" => {
+                let next_text = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|t| t.text.to_lowercase())
+                    .unwrap_or_default();
+                if matches!(next_text.as_str(), "case" | "type" | "rank") {
+                    self.parse_select(start)
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
+            }
             "where" => self.parse_where_construct(start),
             "forall" => self.parse_forall_construct(start),
             "block" => {
