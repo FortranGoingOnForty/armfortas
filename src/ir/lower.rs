@@ -11891,6 +11891,15 @@ fn resolve_generic_call_actuals(
             _ => None,
         })
         .collect();
+    let actual_ranks: Vec<Option<usize>> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                locals.and_then(|locals| actual_expr_rank(expr, locals, st))
+            }
+            _ => None,
+        })
+        .collect();
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -11910,6 +11919,12 @@ fn resolve_generic_call_actuals(
         ) else {
             continue;
         };
+        let rank_slots: Vec<Option<usize>> = reorder_actual_ranks_by_formal_skip(
+            args,
+            &actual_ranks,
+            &scope.arg_order,
+            0,
+        );
         let supplied = arg_slots.iter().filter(|slot| slot.is_some()).count();
         let semantic_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
             declared_arg.type_info.as_ref().is_some_and(|declared_type| {
@@ -11921,12 +11936,143 @@ fn resolve_generic_call_actuals(
             })
         });
         let ir_match = generic_candidate_matches_slots(b, &declared_args, &arg_slots, supplied);
-        if semantic_match && ir_match {
+        let rank_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
+            let formal_rank = formal_declared_rank(declared_arg);
+            let actual_rank = rank_slots.get(idx).copied().flatten();
+            formal_rank_matches_actual(formal_rank, actual_rank)
+        });
+        if semantic_match && ir_match && rank_match {
             return Some(candidate.clone());
         }
     }
 
     None
+}
+
+/// Compute the declared rank of a formal argument from its array-spec
+/// attribute. Returns `Some(rank)` for a known explicit/assumed-shape
+/// rank, or `None` for assumed-rank `dimension(..)` formals (which
+/// accept any actual rank).
+fn formal_declared_rank(decl_sym: &crate::sema::symtab::Symbol) -> Option<usize> {
+    use crate::ast::decl::ArraySpec;
+    use crate::sema::symtab::TypeInfo;
+    let spec = &decl_sym.attrs.array_spec;
+    // CLASS(*)/TYPE(*) formals are commonly assumed-rank in practice
+    // (e.g. variadic `class(*), dimension(..)` arg lists). The .amod
+    // writer normalizes assumed-rank to AssumedShape with a placeholder
+    // rank, losing the assumed-rank wildcard. Restore the wildcard
+    // semantics here so dispatch on a class(*) formal accepts any
+    // actual rank, including scalar actuals.
+    if matches!(
+        decl_sym.type_info,
+        Some(TypeInfo::ClassStar) | Some(TypeInfo::TypeStar)
+    ) {
+        return None;
+    }
+    if spec.is_empty() {
+        return Some(0);
+    }
+    if spec.iter().any(|s| matches!(s, ArraySpec::AssumedRank)) {
+        return None;
+    }
+    Some(spec.len())
+}
+
+fn formal_rank_matches_actual(formal: Option<usize>, actual: Option<usize>) -> bool {
+    match (formal, actual) {
+        (None, _) => true,           // assumed-rank — accepts anything
+        (Some(_), None) => true,     // unknown actual rank — don't penalize
+        (Some(f), Some(a)) => f == a,
+    }
+}
+
+/// Best-effort rank inference for an actual expression. Used by the
+/// generic dispatcher to disambiguate specifics that differ only by
+/// formal rank (e.g. `mnorm`'s rank-2 vs rank-3 entries).
+fn actual_expr_rank(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                if local_is_array_like(info) {
+                    return Some(local_declared_rank(info));
+                }
+                return Some(0);
+            }
+            st.find_symbol_any_scope(&key).map(|sym| {
+                if sym.attrs.array_spec.is_empty() {
+                    0
+                } else {
+                    sym.attrs.array_spec.len()
+                }
+            })
+        }
+        Expr::ParenExpr { inner } => actual_expr_rank(inner, locals, st),
+        Expr::FunctionCall { callee, args } => {
+            // Section result: rank = number of Range subscripts in args.
+            if let Expr::Name { name } = &callee.node {
+                if let Some(info) = locals.get(&name.to_lowercase()) {
+                    if local_is_array_like(info) {
+                        let n_ranges = args
+                            .iter()
+                            .filter(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+                            .count();
+                        if n_ranges == 0 && !args.is_empty() {
+                            return Some(0); // scalar element access
+                        }
+                        if n_ranges > 0 {
+                            return Some(n_ranges);
+                        }
+                        return Some(local_declared_rank(info));
+                    }
+                }
+            }
+            None
+        }
+        Expr::ArrayConstructor { .. } => Some(1),
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::StringLiteral { .. } => Some(0),
+        _ => None,
+    }
+}
+
+fn reorder_actual_ranks_by_formal_skip(
+    args: &[crate::ast::expr::Argument],
+    actual_ranks: &[Option<usize>],
+    formal_order: &[String],
+    formal_skip: usize,
+) -> Vec<Option<usize>> {
+    if args.len() != actual_ranks.len() {
+        return actual_ranks.to_vec();
+    }
+    let mut slots: Vec<Option<usize>> = vec![None; formal_order.len()];
+    let mut last_positional = formal_skip.min(slots.len());
+    for (arg, actual_rank) in args.iter().zip(actual_ranks.iter()) {
+        if let Some(kw) = &arg.keyword {
+            let key = kw.to_ascii_lowercase();
+            if let Some(idx) = formal_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&key))
+            {
+                slots[idx] = *actual_rank;
+            }
+            continue;
+        }
+        if last_positional < slots.len() {
+            slots[last_positional] = *actual_rank;
+            last_positional += 1;
+        } else {
+            slots.push(*actual_rank);
+        }
+    }
+    slots
 }
 
 fn bound_proc_scope<'a>(
