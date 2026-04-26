@@ -11831,14 +11831,7 @@ fn generic_candidate_matches_slots_with_proc_elemental(
             Some(Some(arg_val)) => {
                 let actual_is_proc =
                     actual_is_procedure.get(idx).copied().unwrap_or(false);
-                let formal_is_proc = decl_sym.attrs.external
-                    || matches!(
-                        decl_sym.kind,
-                        crate::sema::symtab::SymbolKind::Function
-                            | crate::sema::symtab::SymbolKind::Subroutine
-                            | crate::sema::symtab::SymbolKind::ProcedurePointer
-                    );
-                if actual_is_proc && formal_is_proc {
+                if actual_is_proc {
                     continue;
                 }
                 let Some(ti) = decl_sym.type_info.as_ref() else {
@@ -12137,13 +12130,12 @@ fn resolve_generic_call_actuals(
         // matching on those slots is unsound. We only flag a Name as
         // a procedure when it resolves to a procedure symbol AND
         // doesn't shadow a local variable (a same-named local wins;
-        // its value is a normal data argument).
-        // A Name actual is a procedure reference only when it
-        // resolves to a procedure symbol via the current scope
-        // (`st.lookup` only — no any-scope fallback) AND doesn't
-        // shadow a local variable. Any-scope fallback would falsely
-        // flag an actual whose name happens to match an unrelated
-        // procedure elsewhere in the program.
+        // its value is a normal data argument). The current-scope
+        // `st.lookup` chain misses contained-function references made
+        // from a sibling subprogram during IR lowering — sema's
+        // st.current is stale by then — so fall back to any-scope
+        // search. The local-shadow guard protects unrelated globals
+        // that share a procedure's name.
         let actual_is_procedure: Vec<bool> = args
             .iter()
             .map(|arg| match &arg.value {
@@ -12154,6 +12146,7 @@ fn resolve_generic_call_actuals(
                             return false;
                         }
                         st.lookup(&key)
+                            .or_else(|| st.find_symbol_any_scope(&key))
                             .map(|sym| {
                                 matches!(
                                     sym.kind,
@@ -12181,20 +12174,15 @@ fn resolve_generic_call_actuals(
                 .get(idx)
                 .copied()
                 .unwrap_or(false);
-            let formal_is_proc = declared_arg.attrs.external
-                || matches!(
-                    declared_arg.kind,
-                    crate::sema::symtab::SymbolKind::Function
-                        | crate::sema::symtab::SymbolKind::Subroutine
-                        | crate::sema::symtab::SymbolKind::ProcedurePointer
-                );
-            // Both sides procedural — skip type matching. The .amod
-            // writer normalizes `procedure(iface) :: p` formals to the
-            // interface's return type, so semantic checks would
-            // mis-reject. Require BOTH sides to look proc-like to
-            // avoid silently disabling matching when an actual happens
-            // to share a name with some unrelated function.
-            if actual_is_proc && formal_is_proc {
+            // A procedure-name actual binds only to a procedure formal;
+            // sema rejects any other use, so by the time we reach
+            // dispatch we can trust that pairing and skip type matching.
+            // The .amod writer normalizes `procedure(iface) :: p` to the
+            // interface's return type, so without this skip dispatch
+            // would mis-reject e.g. passing `do_not_select` into LAPACK
+            // `gees`. The local-shadow guard upstream prevents a
+            // same-named local variable from being misclassified.
+            if actual_is_proc {
                 return true;
             }
             let Some(declared_type) = declared_arg.type_info.as_ref() else {
