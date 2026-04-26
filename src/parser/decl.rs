@@ -213,6 +213,24 @@ impl<'a> Parser<'a> {
             self.advance();
             return Ok(LenSpec::Colon);
         }
+        // F77 entity-decl character-length form: `name*(*)`, `name*(:)`,
+        // `name*(N)`. The leading `*` is consumed by the caller; here we
+        // see the parenthesized inner form. Per F2018 §C.6.1 these are
+        // the type-param-value alternatives `*`, `:`, and a scalar
+        // int-expr. The plain `parse_expr` can't accept the bare `*` or
+        // `:` form, so unwrap one level of parens before delegating.
+        if self.peek() == &TokenKind::LParen {
+            self.advance();
+            let inner = if self.eat(&TokenKind::Star) {
+                LenSpec::Star
+            } else if self.eat(&TokenKind::Colon) {
+                LenSpec::Colon
+            } else {
+                LenSpec::Expr(self.parse_expr()?)
+            };
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
         let expr = self.parse_expr()?;
         Ok(LenSpec::Expr(expr))
     }
