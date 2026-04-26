@@ -33444,12 +33444,56 @@ fn associate_alias_local_info(
             component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
         }
         Expr::FunctionCall { callee, args } => {
-            if args
-                .iter()
-                .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
-            {
-                return None;
+            let any_range = args.iter().any(|arg| {
+                matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+            });
+            if any_range {
+                // Array section: bind associate-name to a section descriptor so
+                // the alias behaves as a rank-N array view of the source storage.
+                let info = match &callee.node {
+                    Expr::Name { name } => ctx.locals.get(&name.to_lowercase())?.clone(),
+                    Expr::ComponentAccess { .. } => component_array_local_info(
+                        b,
+                        &ctx.locals,
+                        callee,
+                        ctx.st,
+                        ctx.type_layouts,
+                    )?,
+                    _ => return None,
+                };
+                if !local_is_array_like(&info) {
+                    return None;
+                }
+                let result_rank = args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+                    })
+                    .count();
+                let section_desc = lower_array_section(
+                    b,
+                    &ctx.locals,
+                    &info,
+                    args,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                return Some(LocalInfo {
+                    addr: section_desc,
+                    ty: info.ty.clone(),
+                    dims: vec![(1, 1); result_rank],
+                    allocatable: false,
+                    descriptor_arg: true,
+                    by_ref: false,
+                    char_kind: info.char_kind.clone(),
+                    derived_type: info.derived_type.clone(),
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                });
             }
+            // All Element subscripts — bind associate-name to a single element.
             if let Expr::Name { name } = &callee.node {
                 let info = ctx.locals.get(&name.to_lowercase())?;
                 if !local_is_array_like(info) {
