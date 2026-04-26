@@ -34332,11 +34332,13 @@ fn lower_array_intrinsic(
                     IrType::Float(FloatWidth::F64),
                 ))
             } else {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_maxval_int".into()),
                     vec![desc],
-                    IrType::Int(IntWidth::I32),
-                ))
+                    IrType::Int(IntWidth::I64),
+                );
+                // F2018 §16.9.146: result kind matches input element kind.
+                Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "minval" => {
@@ -34348,11 +34350,13 @@ fn lower_array_intrinsic(
                     IrType::Float(FloatWidth::F64),
                 ))
             } else {
-                Some(b.call(
+                let raw = b.call(
                     FuncRef::External("afs_array_minval_int".into()),
                     vec![desc],
-                    IrType::Int(IntWidth::I32),
-                ))
+                    IrType::Int(IntWidth::I64),
+                );
+                // F2018 §16.9.151: result kind matches input element kind.
+                Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "dot_product" => {
