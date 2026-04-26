@@ -12042,23 +12042,28 @@ fn resolve_generic_call_actuals(
         // Detect actuals that are procedure references. Such actuals
         // bind to `procedure(iface) :: p` formals which the .amod
         // writer normalizes to the interface return type — so type
-        // matching on those slots is unsound. The actual side is
-        // identifiable: a Name resolving to a Function/Subroutine
-        // symbol, or one with the EXTERNAL attribute.
+        // matching on those slots is unsound. We only flag a Name as
+        // a procedure when it resolves to a procedure symbol AND
+        // doesn't shadow a local variable (a same-named local wins;
+        // its value is a normal data argument).
         let actual_is_procedure: Vec<bool> = args
             .iter()
             .map(|arg| match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(expr) => {
                     if let Expr::Name { name } = &expr.node {
-                        st.find_symbol_any_scope(&name.to_lowercase())
+                        let key = name.to_lowercase();
+                        if locals.is_some_and(|l| l.contains_key(&key)) {
+                            return false;
+                        }
+                        st.lookup(&key)
+                            .or_else(|| st.find_symbol_any_scope(&key))
                             .map(|sym| {
-                                sym.attrs.external
-                                    || matches!(
-                                        sym.kind,
-                                        crate::sema::symtab::SymbolKind::Function
-                                            | crate::sema::symtab::SymbolKind::Subroutine
-                                            | crate::sema::symtab::SymbolKind::ProcedurePointer
-                                    )
+                                matches!(
+                                    sym.kind,
+                                    crate::sema::symtab::SymbolKind::Function
+                                        | crate::sema::symtab::SymbolKind::Subroutine
+                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                )
                             })
                             .unwrap_or(false)
                     } else {
