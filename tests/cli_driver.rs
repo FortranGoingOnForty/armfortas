@@ -18141,6 +18141,41 @@ fn sum_of_array_section_times_constructor_runs() {
 }
 
 #[test]
+fn dispatch_optional_logical_int8_array_through_descriptor() {
+    // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
+    // optional, dimension(:)` formal must accept a `logical(int8)`
+    // array actual carried via a 384-byte descriptor.  The IR matcher
+    // previously bailed when the actual rendered as `[i8 x 384]` and
+    // the formal lowered to `Int(I8)` because the array peel only
+    // fired in the elemental path.
+    let src = write_program(
+        "module test_pcg\n  use iso_fortran_env, only: int8, dp => real64\n  implicit none\n  interface stdlib_solve_pcg\n    module subroutine pcg_dense(A, b, x, di, rtol)\n      use iso_fortran_env, only: int8, real64\n      real(real64), intent(in) :: A(:,:)\n      real(real64), intent(in) :: b(:)\n      real(real64), intent(inout) :: x(:)\n      logical(int8), intent(in), optional :: di(:)\n      real(real64), intent(in), optional :: rtol\n    end subroutine\n  end interface\nend module test_pcg\nsubmodule (test_pcg) test_pcg_sub\ncontains\n  module subroutine pcg_dense(A, b, x, di, rtol)\n    use iso_fortran_env, only: int8, real64\n    real(real64), intent(in) :: A(:,:)\n    real(real64), intent(in) :: b(:)\n    real(real64), intent(inout) :: x(:)\n    logical(int8), intent(in), optional :: di(:)\n    real(real64), intent(in), optional :: rtol\n    if (present(rtol)) x = b\n    if (present(di)) x = 0.0_real64\n  end subroutine\nend submodule\nprogram p\n  use test_pcg\n  use iso_fortran_env, only: int8, dp => real64\n  implicit none\n  real(dp) :: A(5,5), b(5), x(5)\n  logical(int8) :: di(5)\n  A = 0.0_dp\n  b = 1.0_dp\n  x = 0.0_dp\n  di = .false._int8\n  call stdlib_solve_pcg(A, b, x, rtol=1.0e-6_dp, di=di)\n  if (any(x /= 0.0_dp)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("dispatch_optional_logical_int8_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "logical(int8) array dispatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "logical(int8) array dispatch should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn norm2_handles_binary_array_expression() {
     // F2018 §16.9.158: NORM2 is a transformational intrinsic that
     // accepts any array-shaped argument, including binary expressions
