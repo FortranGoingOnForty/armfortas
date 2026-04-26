@@ -687,6 +687,15 @@ fn emit_procedure(
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
                 }
+                // F2018 §15.4.3.6: a `procedure(iface) :: name` dummy is
+                // a procedure formal. The producer side stores this as a
+                // Variable with EXTERNAL set; without preserving the flag
+                // the consumer-side dispatch can't tell it apart from a
+                // data dummy and rejects valid procedure-actual binding
+                // (e.g. passing `do_not_select` into LAPACK `gees`).
+                if arg_sym.attrs.external {
+                    arg_attrs.push("external");
+                }
                 // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
                 // synthesis on the consumer side can rebuild a same-rank
                 // array_spec without re-walking the AST decls (which only
@@ -1006,6 +1015,13 @@ pub struct AmodArg {
     pub allocatable: bool,
     pub pointer: bool,
     pub hidden: bool,
+    /// True for `procedure(iface) :: name` dummies. The producer side
+    /// stores these as Variable + EXTERNAL; the consumer-side dispatch
+    /// uses this flag to identify procedure formals and skip the data
+    /// type-matching that would otherwise reject procedure-actual
+    /// binding (the .amod writer normalizes the type to the interface's
+    /// return type).
+    pub external: bool,
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
@@ -1409,6 +1425,9 @@ fn parse_arg(line: &str) -> AmodArg {
     let descriptor = attr_str.contains("descriptor");
     let allocatable = attr_str.contains("allocatable");
     let pointer = attr_str.contains("pointer");
+    let external = attr_str
+        .split(", ")
+        .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
     let rank = attr_str
@@ -1427,6 +1446,7 @@ fn parse_arg(line: &str) -> AmodArg {
         allocatable,
         pointer,
         hidden,
+        external,
         rank,
     }
 }
