@@ -218,16 +218,41 @@ impl SymbolTable {
     /// Prefers parameter symbols (for kind resolution) but returns any match.
     pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
         let key = name.to_ascii_lowercase();
+        // Track the best fallback seen so far. A typed
+        // Function/Subroutine carries the most useful information
+        // (return type, kind, ABI) for callers that use this helper to
+        // resolve a procedure reference. A NamedInterface with the same
+        // name (common when a stdlib module re-exports a function via a
+        // generic interface block) shadows the typed entry on the first
+        // scope-iteration hit but provides only a list of specifics —
+        // not enough for return-type or character-ABI lookup. Prefer
+        // typed callable kinds over NamedInterface so callers don't
+        // have to walk every scope themselves.
         let mut fallback: Option<&Symbol> = None;
+        let mut typed_callable: Option<&Symbol> = None;
         for scope in &self.scopes {
             if let Some(sym) = scope.symbols.get(&key) {
                 if sym.attrs.parameter {
                     return Some(sym);
                 }
+                if matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                ) && typed_callable.is_none()
+                {
+                    typed_callable = Some(sym);
+                }
                 if fallback.is_none() {
                     fallback = Some(sym);
                 }
             }
+        }
+        if let Some(sym) = typed_callable {
+            return Some(sym);
         }
         if fallback.is_some() {
             return fallback;
