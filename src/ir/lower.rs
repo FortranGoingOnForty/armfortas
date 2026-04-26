@@ -15847,11 +15847,26 @@ fn ir_types_dispatch_equal(decl: &IrType, actual: &IrType) -> bool {
         (IrType::Int(a), IrType::Int(c)) => a == c,
         (IrType::Float(a), IrType::Float(c)) => a == c,
         (IrType::Bool, IrType::Bool) => true,
+        // logical(1) lowers to Int(I8); accept the cross-pair so a
+        // `logical(int8)` formal matches a `logical(int8)` actual whose
+        // IR type happens to render as I8 (or vice versa for the
+        // reverse pairing where the actual carries the Bool tag).
+        (IrType::Bool, IrType::Int(IntWidth::I8))
+        | (IrType::Int(IntWidth::I8), IrType::Bool) => true,
         // Callers pass by-reference for non-VALUE dummies, so the
         // actual IR type is often Ptr(T) while the declared is T.
         (decl, IrType::Ptr(p)) => ir_types_dispatch_equal(decl, p),
         (IrType::Ptr(p), actual) => ir_types_dispatch_equal(p, actual),
         (IrType::Array(e1, _), IrType::Array(e2, _)) => ir_types_dispatch_equal(e1, e2),
+        // Array actuals routed through a 384-byte descriptor arrive as
+        // `[i8 x N]`; rank checking elsewhere already enforces that an
+        // array formal received an array actual, so peel the outer
+        // Array layer here so e.g. a logical(int8) array formal
+        // accepts a logical(int8) array actual carried by descriptor.
+        // This mirrors the elemental peel for the non-elemental path.
+        (decl, IrType::Array(e, _)) if !matches!(decl, IrType::Array(_, _)) => {
+            ir_types_dispatch_equal(decl, e)
+        }
         _ => false,
     }
 }
