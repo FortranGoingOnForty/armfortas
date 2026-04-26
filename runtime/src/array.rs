@@ -2007,7 +2007,8 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     sum
 }
 
-/// SUM(array) — sum all elements (integer(4) version).
+/// SUM(array) — sum all elements (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays all sum correctly.
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
@@ -2020,10 +2021,32 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
     let mut sum: i64 = 0;
-    for i in 0..n {
-        sum += unsafe { *ptr.add(i * stride) } as i64;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) });
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
     }
     sum
 }
@@ -2048,7 +2071,8 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     prod
 }
 
-/// PRODUCT(array) — product of all elements (integer(4) version).
+/// PRODUCT(array) — product of all elements (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays multiply correctly.
 #[no_mangle]
 pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     if desc.is_null() {
@@ -2063,10 +2087,32 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
         return 1;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
     let mut prod: i64 = 1;
-    for i in 0..n {
-        prod *= unsafe { *ptr.add(i * stride) } as i64;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) });
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
     }
     prod
 }
