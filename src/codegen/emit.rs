@@ -371,6 +371,13 @@ fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> S
     format!("{}\n    {} {}, {}, {}", imm, op, dest, base, scratch)
 }
 
+/// Emit a single machine instruction as assembly text. Public so the
+/// branch-relaxation pass can count emit-time instruction bytes
+/// directly rather than re-deriving each opcode's expansion rules.
+pub fn emit_inst_text(inst: &MachineInst, mf: &MachineFunction) -> String {
+    emit_inst(inst, mf)
+}
+
 /// Emit a single machine instruction as assembly text.
 fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
     match inst.opcode {
