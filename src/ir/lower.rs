@@ -3578,7 +3578,7 @@ fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
@@ -3972,7 +3972,7 @@ fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Subroutine(name));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
@@ -4560,7 +4560,7 @@ fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses);
+                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
@@ -6270,10 +6270,24 @@ fn check_filtered_in_acvalue(v: &crate::ast::expr::AcValue, filtered: &HashSet<S
 fn compute_filtered_names(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
+    local_decls: &[crate::ast::decl::SpannedDecl],
 ) -> HashSet<String> {
     use crate::ast::decl::OnlyItem;
     let mut filtered: HashSet<String> = HashSet::new();
     let mut visible_local_names: HashSet<String> = HashSet::new();
+
+    // Per Fortran scoping: a local declaration shadows a same-named
+    // global. Even if a USE-only-imported module would have filtered
+    // the name out, a local entity by that name is the visible binding
+    // — never flag it as filtered. Walk the procedure's TypeDecl
+    // entities and add every entity name to the visibility set.
+    for decl in local_decls {
+        if let Decl::TypeDecl { entities, .. } = &decl.node {
+            for entity in entities {
+                visible_local_names.insert(entity.name.to_lowercase());
+            }
+        }
+    }
 
     for decl in uses {
         let Decl::UseStmt {
@@ -36783,7 +36797,10 @@ fn lower_expr_full(
             }
 
             // Complex arithmetic: both operands are ptr<[f32/f64 x 2]>.
-            // Add/Sub operate component-wise; Mul uses (ac-bd, ad+bc).
+            // Add/Sub operate component-wise; Mul uses (ac-bd, ad+bc);
+            // Eq/Ne reduce to a scalar bool over the two lanes
+            // (F2018 §10.1.10.4: a == b iff re(a) == re(b) and im(a)
+            // == im(b)).
             if is_complex_ty(&lty) || is_complex_ty(&rty) {
                 let fw = if matches!(lty, IrType::Float(FloatWidth::F64))
                     || matches!(rty, IrType::Float(FloatWidth::F64))
@@ -36809,6 +36826,17 @@ fn lower_expr_full(
                 let im_r_ptr = b.gep(rhs_buf, vec![esz], IrType::Int(IntWidth::I8));
                 let re_r = b.load_typed(re_r_ptr, elem.clone());
                 let im_r = b.load_typed(im_r_ptr, elem.clone());
+                // Equality / inequality: scalar bool result, not a complex.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+                    let re_eq = b.fcmp(CmpOp::Eq, re_l, re_r);
+                    let im_eq = b.fcmp(CmpOp::Eq, im_l, im_r);
+                    let both_eq = b.and(re_eq, im_eq);
+                    return if matches!(op, BinaryOp::Eq) {
+                        both_eq
+                    } else {
+                        b.not(both_eq)
+                    };
+                }
                 let arr_ty = IrType::Array(Box::new(elem.clone()), 2);
                 let buf = b.alloca(arr_ty);
                 let (re_res, im_res) = match op {
