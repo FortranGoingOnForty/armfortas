@@ -9486,6 +9486,57 @@ fn first_array_constructor_expr(
     None
 }
 
+/// F2018 §7.8: a type-spec on an array constructor (`[real(dp) :: 1, 2, 3]`)
+/// declares the element type — the constructor coerces every element to it.
+/// Without resolving the spec, downstream consumers fall back to the first
+/// element's literal type and emit the wrong storage type (e.g. `Int(I32)`
+/// for an integer-literal first value when the spec was `real(dp)`), which
+/// then breaks generic dispatch on the constructor's array result.
+fn array_constructor_type_spec_info(
+    type_spec: Option<&str>,
+    st: &SymbolTable,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    use crate::sema::symtab::TypeInfo;
+    let raw = type_spec?.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    let kind_inside = raw
+        .find('(')
+        .and_then(|lp| raw.rfind(')').map(|rp| (lp, rp)))
+        .filter(|(lp, rp)| rp > lp)
+        .map(|(lp, rp)| raw[lp + 1..rp].trim().to_string());
+    let prefix = raw.split('(').next().unwrap_or(&raw).trim();
+    let normalized_kind = kind_inside.as_deref().map(|k| {
+        k.strip_prefix("kind=")
+            .or_else(|| k.strip_prefix("kind ="))
+            .unwrap_or(k)
+            .trim()
+    });
+    if prefix == "double" {
+        return Some(TypeInfo::DoublePrecision);
+    }
+    match prefix {
+        "integer" => Some(TypeInfo::Integer {
+            kind: normalized_kind.map(|k| int_kind_to_width(k, st)),
+        }),
+        "real" => Some(TypeInfo::Real {
+            kind: normalized_kind.map(|k| real_kind_to_width(k, st)),
+        }),
+        "complex" => Some(TypeInfo::Complex {
+            kind: normalized_kind.map(|k| real_kind_to_width(k, st)),
+        }),
+        "logical" => Some(TypeInfo::Logical {
+            kind: normalized_kind.map(|k| int_kind_to_width(k, st)),
+        }),
+        "character" => Some(TypeInfo::Character {
+            kind: Some(1),
+            len: None,
+        }),
+        _ => None,
+    }
+}
+
 fn first_array_constructor_type_info(
     values: &[crate::ast::expr::AcValue],
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -31781,9 +31832,12 @@ fn lower_array_expr_descriptor(
                 descriptor_params,
             )
         }
-        Expr::ArrayConstructor { values, .. } => {
+        Expr::ArrayConstructor { values, type_spec } => {
             let first = first_array_constructor_expr(values)?;
-            let first_ti = first_array_constructor_type_info(values, Some(locals), st, type_layouts);
+            let spec_ti = array_constructor_type_spec_info(type_spec.as_deref(), st);
+            let first_ti = spec_ti
+                .clone()
+                .or_else(|| first_array_constructor_type_info(values, Some(locals), st, type_layouts));
 
             if expr_is_character_expr(b, locals, first, st, type_layouts) {
                 if let Some(elem_len_const) =
