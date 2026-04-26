@@ -637,6 +637,18 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::RParen)?;
                 name = format!("{}({})", name, op);
                 is_generic_spec = true;
+            } else if (name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("write"))
+                && self.peek() == &TokenKind::LParen
+            {
+                // F2018 §12.6.4.8: defined-IO generic-spec — `read (formatted)`,
+                // `read (unformatted)`, `write (formatted)`, `write (unformatted)`.
+                // Stored as a single OnlyItem::Generic so module resolution can
+                // import the corresponding INTERFACE READ/WRITE binding.
+                self.advance();
+                let kind = self.advance().clone().text;
+                self.expect(&TokenKind::RParen)?;
+                name = format!("{}({})", name.to_ascii_lowercase(), kind.to_ascii_lowercase());
+                is_generic_spec = true;
             }
             if self.eat(&TokenKind::Arrow) {
                 let remote = self.advance().clone().text;
