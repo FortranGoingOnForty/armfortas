@@ -21264,17 +21264,129 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
         }
 
         Stmt::WhereStmt { mask, stmt } => {
-            // Single-line WHERE: where (cond) assignment
+            // Single-line WHERE: where (cond) assignment.
+            // F2018 §10.2.3.2: when the mask is an array-valued logical
+            // expression, the assignment runs element-wise under the
+            // mask. Reuse the WhereConstruct array-iteration shape: set
+            // up per-element bindings for every array referenced in the
+            // mask or assignment, evaluate the scalar mask, and run the
+            // assignment under it.
+            let mut array_names: Vec<String> = Vec::new();
+            collect_array_names(mask, &ctx.locals, &mut array_names);
+            collect_array_names_stmt(stmt, &ctx.locals, &mut array_names);
+
+            if array_names.is_empty() {
+                let cond = lower_expr_ctx_tl(b, ctx, mask);
+                let bb_then = b.create_block("where_stmt");
+                let bb_end = b.create_block("where_stmt_end");
+                b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
+                b.set_block(bb_then);
+                lower_stmt(b, ctx, stmt);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_end, vec![]);
+                }
+                b.set_block(bb_end);
+                return;
+            }
+
+            let first_arr_name = &array_names[0];
+            let first_arr = ctx
+                .locals
+                .get(first_arr_name)
+                .cloned()
+                .expect("array must exist");
+            let n = array_total_elems_value(b, &first_arr);
+
+            let mut array_bases: HashMap<String, ValueId> = HashMap::new();
+            for arr_name in &array_names {
+                if let Some(info) = ctx.locals.get(arr_name) {
+                    let base = if info.allocatable {
+                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+                    } else {
+                        info.addr
+                    };
+                    array_bases.insert(arr_name.clone(), base);
+                }
+            }
+
+            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+            let i_zero = b.const_i64(0);
+            b.store(i_zero, i_addr);
+
+            let bb_check = b.create_block("where_stmt_check");
+            let bb_body = b.create_block("where_stmt_body");
+            let bb_exit = b.create_block("where_stmt_exit");
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_check);
+            let i = b.load(i_addr);
+            let done = b.icmp(CmpOp::Ge, i, n);
+            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+            b.set_block(bb_body);
+            let i_val = b.load(i_addr);
+
+            let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+            for arr_name in &array_names {
+                saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+                if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+                    let base = *array_bases.get(arr_name).unwrap();
+                    let elem_bytes_val = match &orig_info.ty {
+                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => {
+                            b.const_i64(8)
+                        }
+                        IrType::Int(IntWidth::I16) => b.const_i64(2),
+                        IrType::Int(IntWidth::I8) => b.const_i64(1),
+                        _ => b.const_i64(4),
+                    };
+                    let byte_off = b.imul(i_val, elem_bytes_val);
+                    let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+                    ctx.locals.insert(
+                        arr_name.clone(),
+                        LocalInfo {
+                            addr: elem_ptr,
+                            ty: orig_info.ty.clone(),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: None,
+                            inline_const: None,
+                            is_pointer: false,
+                            runtime_dim_upper: vec![],
+                            is_class: false,
+                        },
+                    );
+                }
+            }
+
             let cond = lower_expr_ctx_tl(b, ctx, mask);
-            let bb_then = b.create_block("where_stmt");
-            let bb_end = b.create_block("where_stmt_end");
-            b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
+            let bb_then = b.create_block("where_stmt_then");
+            let bb_incr = b.create_block("where_stmt_incr");
+            b.cond_branch(cond, bb_then, vec![], bb_incr, vec![]);
+
             b.set_block(bb_then);
             lower_stmt(b, ctx, stmt);
             if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_end, vec![]);
+                b.branch(bb_incr, vec![]);
             }
-            b.set_block(bb_end);
+
+            b.set_block(bb_incr);
+            for (name, orig) in saved_locals {
+                if let Some(info) = orig {
+                    ctx.locals.insert(name, info);
+                } else {
+                    ctx.locals.remove(&name);
+                }
+            }
+            let i_cur = b.load(i_addr);
+            let one = b.const_i64(1);
+            let next = b.iadd(i_cur, one);
+            b.store(next, i_addr);
+            b.branch(bb_check, vec![]);
+
+            b.set_block(bb_exit);
         }
 
         Stmt::ForallConstruct {
