@@ -12384,6 +12384,21 @@ fn actual_expr_rank(
             })
         }
         Expr::ParenExpr { inner } => actual_expr_rank(inner, locals, st),
+        Expr::UnaryOp { operand, .. } => actual_expr_rank(operand, locals, st),
+        // F2018 §10.1.5/§10.1.7: relational and logical operators on
+        // array operands yield an array result of the same shape; pick
+        // the higher of the two operand ranks so dispatch can
+        // distinguish e.g. `mean(y, 1, mask: scalar logical)` from
+        // `mean(y, 1, mask: rank-2 logical)`.
+        Expr::BinaryOp { left, right, .. } => {
+            let l = actual_expr_rank(left, locals, st);
+            let r = actual_expr_rank(right, locals, st);
+            match (l, r) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
         Expr::FunctionCall { callee, args } => {
             // Section result: rank = number of Range subscripts in args.
             if let Expr::Name { name } = &callee.node {
