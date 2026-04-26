@@ -18141,6 +18141,42 @@ fn sum_of_array_section_times_constructor_runs() {
 }
 
 #[test]
+fn submodule_helper_reads_parent_module_char_parameter() {
+    // F2018 §11.2.3: a plain helper procedure contained in a submodule
+    // has host-association access to the parent module's globals,
+    // including character(*) parameter constants.  Previously the IR
+    // lowering only installed globals matching the submodule's own
+    // scope, so a helper referencing the parent's `character(*),
+    // parameter :: this = '...'` fell through to a const-zero fallback
+    // and emitted `store i32 0 → ptr<ptr<i8>>` for the actual arg.
+    let src = write_program(
+        "module state_mod\n  implicit none\n  type :: my_state_type\n    integer :: state = 0\n  end type\n  interface my_state_type\n    module procedure new_state\n  end interface\ncontains\n  pure type(my_state_type) function new_state(where_at, flag, a1, a2) result(self)\n    character(len=*), intent(in) :: where_at\n    integer, intent(in) :: flag\n    class(*), optional, intent(in), dimension(..) :: a1, a2\n    self%state = flag + len(where_at)\n  end function new_state\nend module state_mod\nmodule lsq_mod\n  use state_mod\n  implicit none\n  character(*), parameter :: this = 'lstsq'\nend module lsq_mod\nsubmodule (lsq_mod) lsq_sub\n  use state_mod\ncontains\n  pure subroutine check(ma, err)\n    integer, intent(in) :: ma\n    type(my_state_type), intent(out) :: err\n    if (ma < 1) then\n      err = my_state_type(this, -1, 'Invalid sizes:', [ma])\n      return\n    end if\n    err%state = 0\n  end subroutine check\nend submodule\nprogram p\n  use state_mod\n  use lsq_mod\n  implicit none\n  type(my_state_type) :: err\n  interface\n    pure subroutine check(ma, err)\n      import :: my_state_type\n      integer, intent(in) :: ma\n      type(my_state_type), intent(out) :: err\n    end subroutine\n  end interface\n  call check(0, err)\n  if (err%state /= 4) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("submodule_helper_parent_char_param", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "submodule helper referencing parent module char parameter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "submodule helper char-parameter repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn sum_and_product_dispatch_on_integer_kind() {
     let src = write_program(
         "program p\n  implicit none\n  integer(8) :: a8(5) = [10_8, 200_8, 5_8, 99_8, 33_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8, lo8, hi8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product([1_8, 2_8, 3_8, 4_8, 5_8])\n  hi8 = maxval(a8)\n  lo8 = minval(a8)\n  if (r8 /= 347_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  if (hi8 /= 200_8) error stop 4\n  if (lo8 /= 5_8) error stop 5\n  print *, 'ok'\nend program\n",
