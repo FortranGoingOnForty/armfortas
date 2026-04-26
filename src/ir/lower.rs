@@ -31009,7 +31009,7 @@ fn lower_rank1_numeric_array_binary_descriptor(
     let op_supported = if is_complex_elem {
         matches!(
             op,
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
         )
     } else {
         matches!(
@@ -31099,30 +31099,110 @@ fn lower_rank1_numeric_array_binary_descriptor(
         };
 
         let (re_l, im_l) = load_lanes(b, lhs.as_ref(), left);
-        let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
-        let (re_res, im_res) = match op {
-            BinaryOp::Add => (b.fadd(re_l, re_r), b.fadd(im_l, im_r)),
-            BinaryOp::Sub => (b.fsub(re_l, re_r), b.fsub(im_l, im_r)),
-            BinaryOp::Mul => {
-                let ac = b.fmul(re_l, re_r);
-                let bd = b.fmul(im_l, im_r);
-                let ad = b.fmul(re_l, im_r);
-                let bc = b.fmul(im_l, re_r);
-                (b.fsub(ac, bd), b.fadd(ad, bc))
+        let (re_res, im_res) = if matches!(op, BinaryOp::Pow) {
+            // F2018 §10.1.3: complex**integer is well-defined for any integer
+            // exponent. Lower per-element as an integer-driven multiplication
+            // loop — the exponent is a scalar, so no element-rank lookup is
+            // needed.  Negative exponents are handled by inverting the base
+            // before the loop (z^-n = (1/z)^n).
+            let order_raw = lower_expr_full(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let order_i32 = match b.func().value_type(order_raw) {
+                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
+                _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
+            };
+            let zero_i32 = b.const_i32(0);
+            let one_f = match fw {
+                FloatWidth::F64 => b.const_f64(1.0),
+                FloatWidth::F32 => b.const_f32(1.0),
+            };
+            let zero_f = match fw {
+                FloatWidth::F64 => b.const_f64(0.0),
+                FloatWidth::F32 => b.const_f32(0.0),
+            };
+            // base_re/im starts as the element value; if order < 0, replace
+            // with reciprocal so the body of the loop uses |order| iterations.
+            let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
+            let neg_order = b.isub(zero_i32, order_i32);
+            let abs_order = b.select(neg, neg_order, order_i32);
+            let re_sq = b.fmul(re_l, re_l);
+            let im_sq = b.fmul(im_l, im_l);
+            let denom = b.fadd(re_sq, im_sq);
+            let inv_re = b.fdiv(re_l, denom);
+            let neg_im = b.fsub(zero_f, im_l);
+            let inv_im = b.fdiv(neg_im, denom);
+            let base_re = b.select(neg, inv_re, re_l);
+            let base_im = b.select(neg, inv_im, im_l);
+
+            let res_re_addr = b.alloca(lane_ty.clone());
+            let res_im_addr = b.alloca(lane_ty.clone());
+            b.store(one_f, res_re_addr);
+            b.store(zero_f, res_im_addr);
+            let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
+            b.store(abs_order, counter_addr);
+
+            let bb_pow_check = b.create_block("complex_pow_check");
+            let bb_pow_body = b.create_block("complex_pow_body");
+            let bb_pow_exit = b.create_block("complex_pow_exit");
+            b.branch(bb_pow_check, vec![]);
+
+            b.set_block(bb_pow_check);
+            let counter = b.load(counter_addr);
+            let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
+            b.cond_branch(still_pos, bb_pow_body, vec![], bb_pow_exit, vec![]);
+
+            b.set_block(bb_pow_body);
+            let cur_re = b.load(res_re_addr);
+            let cur_im = b.load(res_im_addr);
+            let ac = b.fmul(cur_re, base_re);
+            let bd = b.fmul(cur_im, base_im);
+            let ad = b.fmul(cur_re, base_im);
+            let bc = b.fmul(cur_im, base_re);
+            let new_re = b.fsub(ac, bd);
+            let new_im = b.fadd(ad, bc);
+            b.store(new_re, res_re_addr);
+            b.store(new_im, res_im_addr);
+            let one_i32 = b.const_i32(1);
+            let dec = b.isub(counter, one_i32);
+            b.store(dec, counter_addr);
+            b.branch(bb_pow_check, vec![]);
+
+            b.set_block(bb_pow_exit);
+            (b.load(res_re_addr), b.load(res_im_addr))
+        } else {
+            let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
+            match op {
+                BinaryOp::Add => (b.fadd(re_l, re_r), b.fadd(im_l, im_r)),
+                BinaryOp::Sub => (b.fsub(re_l, re_r), b.fsub(im_l, im_r)),
+                BinaryOp::Mul => {
+                    let ac = b.fmul(re_l, re_r);
+                    let bd = b.fmul(im_l, im_r);
+                    let ad = b.fmul(re_l, im_r);
+                    let bc = b.fmul(im_l, re_r);
+                    (b.fsub(ac, bd), b.fadd(ad, bc))
+                }
+                BinaryOp::Div => {
+                    let rr = b.fmul(re_r, re_r);
+                    let ii = b.fmul(im_r, im_r);
+                    let denom = b.fadd(rr, ii);
+                    let ac = b.fmul(re_l, re_r);
+                    let bd = b.fmul(im_l, im_r);
+                    let bc = b.fmul(im_l, re_r);
+                    let ad = b.fmul(re_l, im_r);
+                    let real_num = b.fadd(ac, bd);
+                    let imag_num = b.fsub(bc, ad);
+                    (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
+                }
+                _ => unreachable!("unsupported complex array op"),
             }
-            BinaryOp::Div => {
-                let rr = b.fmul(re_r, re_r);
-                let ii = b.fmul(im_r, im_r);
-                let denom = b.fadd(rr, ii);
-                let ac = b.fmul(re_l, re_r);
-                let bd = b.fmul(im_l, im_r);
-                let bc = b.fmul(im_l, re_r);
-                let ad = b.fmul(re_l, im_r);
-                let real_num = b.fadd(ac, bd);
-                let imag_num = b.fsub(bc, ad);
-                (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
-            }
-            _ => unreachable!("unsupported complex array op"),
         };
 
         let dst_elem_ptr = rank1_array_desc_elem_ptr(b, result_desc, &elem_ty, idx);
