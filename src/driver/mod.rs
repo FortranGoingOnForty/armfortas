@@ -1350,6 +1350,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if opts.opt_level >= OptLevel::O1 {
                 crate::codegen::tailcall::tail_call_opt(mf);
             }
+            // 8.6. Branch relaxation: any B.cond whose target lies
+            // outside the ±1MB conditional-branch window is expanded
+            // to a `B.{!cond} skip; B far_target; skip:` trampoline
+            // so the assembler doesn't choke on the encoding.
+            crate::codegen::relax_branches::relax_branches(mf);
         }
     }
 
