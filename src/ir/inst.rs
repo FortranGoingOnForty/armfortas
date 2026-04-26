@@ -610,8 +610,16 @@ fn direct_call_i128_backend_o0_supported(
     args: &[ValueId],
     result_ty: &IrType,
 ) -> bool {
-    matches!(callee, FuncRef::Internal(_) | FuncRef::External(_))
-        && abi_type_i128_backend_o0_supported(module, result_ty, true)
+    // Indirect calls share the same arg-passing path as direct calls at
+    // the codegen level — the only difference is how the callee address
+    // is materialised. Accept all three variants for the i128 stack-slot
+    // surface so an i128-typed actual passed through a procedure-pointer
+    // component (e.g. process_type's `payload : class(*), pointer` slot
+    // in stdlib_system_subprocess) doesn't trip the support gate.
+    matches!(
+        callee,
+        FuncRef::Internal(_) | FuncRef::External(_) | FuncRef::Indirect(_)
+    ) && abi_type_i128_backend_o0_supported(module, result_ty, true)
         && args
             .iter()
             .filter_map(|arg| func.value_type(*arg))
