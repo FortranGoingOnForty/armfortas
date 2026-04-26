@@ -10451,19 +10451,6 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
         }
         "merge" => {
             if args.len() >= 3 {
-                // F2018 §16.9.135: merge is elemental. When any actual is
-                // an array, lowering must go through the per-element
-                // descriptor path (lower_array_merge_descriptor); the
-                // scalar `select` logic below would treat the array's
-                // base pointer as a scalar value, producing nonsense IR.
-                // Detect by checking for pointer-typed args (arrays
-                // arrive as Ptr<T>) and bail so the caller picks an
-                // array-aware lowering.
-                if args.iter().take(3).any(|a| {
-                    matches!(b.func().value_type(*a), Some(IrType::Ptr(_)))
-                }) {
-                    return None;
-                }
                 let mut ty = b
                     .func()
                     .value_type(args[0])
@@ -29969,7 +29956,7 @@ fn array_function_result_elem_type(
                 })
                 .collect();
 
-            let (call_name, callee_key) = match resolve_generic_call_actuals(
+            let dispatched_specific = resolve_generic_call_actuals(
                 st,
                 b,
                 Some(locals),
@@ -29977,7 +29964,9 @@ fn array_function_result_elem_type(
                 &present_args,
                 &intrinsic_arg_vals,
                 type_layouts,
-            ) {
+            );
+            let dispatch_picked_specific = dispatched_specific.is_some();
+            let (call_name, callee_key) = match dispatched_specific {
                 Some(candidate) => resolved_symbol_call_target_for_candidate(st, &candidate),
                 None => {
                     let resolved_name = name.clone();
@@ -29991,10 +29980,21 @@ fn array_function_result_elem_type(
             // didn't pick a specific (e.g. arg type info wasn't
             // available at probe time), expand the lookup to every
             // listed specific so we can still recognize an
-            // array-returning specific by ABI.
-            if let Some(generic_sym) = find_named_interface_symbol(st, &key) {
-                for specific in &generic_sym.arg_names {
-                    abi_lookup_keys.push(specific.to_lowercase());
+            // array-returning specific by ABI.  Only do this when
+            // dispatch *failed* — when it succeeded, the specific
+            // name above is authoritative and walking every other
+            // specific would let an unrelated array-returning
+            // overload override the scalar result we actually
+            // resolved (e.g. `mean(rank-1)` resolves to
+            // mean_all_1_rsp_rsp returning scalar f32, but
+            // mean_2_rsp_rsp returning rank-1 array would win the
+            // unconditional walk and have us treat the scalar f32
+            // as if it were a rank-1 array descriptor).
+            if !dispatch_picked_specific {
+                if let Some(generic_sym) = find_named_interface_symbol(st, &key) {
+                    for specific in &generic_sym.arg_names {
+                        abi_lookup_keys.push(specific.to_lowercase());
+                    }
                 }
             }
             let hidden_abi =
