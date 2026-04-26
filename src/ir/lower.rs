@@ -28521,6 +28521,176 @@ fn reshape_shape_extents(
     }
 }
 
+/// F2018 §16.9.135: MERGE(TSOURCE, FSOURCE, MASK) is elemental — when any
+/// actual is an array, the result is an array of the same shape, and each
+/// element is `select(mask[i], tsource[i], fsource[i])`. The default
+/// `lower_intrinsic("merge", ...)` path receives all args as null-pointer
+/// probes from `generic_dispatch_probe_value` and silently produces a
+/// scalar select that the surrounding section-assignment then mis-broadcasts
+/// (`iadd descriptor_ptr, scalar_offset` — IR verify rejects). This helper
+/// runs ahead of the scalar path: it materializes a result descriptor of
+/// the tsource element type, loops over the controlling array's elements,
+/// and emits a per-element select.
+///
+/// Returns `Some((result_desc, elem_ty))` only when at least one of tsource,
+/// fsource, or mask is an array; scalar merge falls through to the existing
+/// scalar handler.
+fn lower_array_merge_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    if args.len() < 3 {
+        return None;
+    }
+    let crate::ast::expr::SectionSubscript::Element(t_expr) = &args[0].value else {
+        return None;
+    };
+    let crate::ast::expr::SectionSubscript::Element(f_expr) = &args[1].value else {
+        return None;
+    };
+    let crate::ast::expr::SectionSubscript::Element(m_expr) = &args[2].value else {
+        return None;
+    };
+
+    let t_desc = lower_array_expr_descriptor(
+        b,
+        locals,
+        t_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let f_desc = lower_array_expr_descriptor(
+        b,
+        locals,
+        f_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let m_desc = lower_array_expr_descriptor(
+        b,
+        locals,
+        m_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+
+    // Pick the result element type from the first array tsource/fsource.
+    let elem_ty = t_desc
+        .as_ref()
+        .map(|(_, t)| t.clone())
+        .or_else(|| f_desc.as_ref().map(|(_, t)| t.clone()))?;
+    if !matches!(&elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool) {
+        return None;
+    }
+
+    // Pick a control descriptor: any of the three array operands. F2018 says
+    // the conformable shapes are required, so any of them gives the size.
+    let control_desc = t_desc
+        .as_ref()
+        .map(|(d, _)| *d)
+        .or_else(|| f_desc.as_ref().map(|(d, _)| *d))
+        .or_else(|| m_desc.as_ref().map(|(d, _)| *d))?;
+
+    let result_desc = allocate_like_array_temp_descriptor(b, control_desc);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![control_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("array_merge_check");
+    let bb_body = b.create_block("array_merge_body");
+    let bb_exit = b.create_block("array_merge_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let cur_idx = b.load(i_addr);
+
+    let t_val = if let Some((desc, ty)) = t_desc.as_ref() {
+        load_rank1_array_desc_elem(b, *desc, ty, cur_idx)
+    } else {
+        let scalar = lower_expr_full(
+            b,
+            locals,
+            t_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        coerce_to_type(b, scalar, &elem_ty)
+    };
+    let f_val = if let Some((desc, ty)) = f_desc.as_ref() {
+        load_rank1_array_desc_elem(b, *desc, ty, cur_idx)
+    } else {
+        let scalar = lower_expr_full(
+            b,
+            locals,
+            f_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        coerce_to_type(b, scalar, &elem_ty)
+    };
+    let mask_val = if let Some((desc, mask_ty)) = m_desc.as_ref() {
+        let raw = load_rank1_array_desc_elem(b, *desc, mask_ty, cur_idx);
+        coerce_to_type(b, raw, &IrType::Bool)
+    } else {
+        let scalar = lower_expr_full(
+            b,
+            locals,
+            m_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        coerce_to_type(b, scalar, &IrType::Bool)
+    };
+
+    let t_coerced = coerce_to_type(b, t_val, &elem_ty);
+    let f_coerced = coerce_to_type(b, f_val, &elem_ty);
+    let result = b.select(mask_val, t_coerced, f_coerced);
+    store_rank1_array_desc_elem(b, result_desc, &elem_ty, cur_idx, result);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(cur_idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some((result_desc, elem_ty))
+}
+
 fn lower_reshape_array_expr_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -29544,12 +29714,14 @@ fn lower_rank1_numeric_array_binary_descriptor(
     if lhs.is_none() && rhs.is_none() {
         return None;
     }
-    if lhs.is_none() && expr_contains_array_refs(left, locals) {
-        return None;
-    }
-    if rhs.is_none() && expr_contains_array_refs(right, locals) {
-        return None;
-    }
+    // The previous guard rejected the binary expression whenever a
+    // scalar-evaluated side merely *referenced* an array (e.g. the
+    // `A(m1, n1)` element access in `A(m1, n1) * B(:,:)`), which is
+    // false-positive: scalar element access of an array produces a
+    // scalar and is safe to evaluate via lower_expr_full. Trust the
+    // descriptor lowering result instead — `is_some` means array-shaped
+    // and we load element-by-element; `is_none` means scalar-shaped
+    // and we broadcast.
 
     let elem_ty = lhs
         .as_ref()
@@ -29856,6 +30028,24 @@ fn lower_array_expr_descriptor(
                         contained_host_refs,
                         descriptor_params,
                     );
+                }
+                // F2018 §16.9.135: MERGE is elemental. When at least one of the
+                // first two actuals (or the mask) is an array, the result is
+                // an array; we materialize it via per-element select, leaving
+                // scalar merges to the standard intrinsic path.
+                if name.eq_ignore_ascii_case("merge") {
+                    if let Some(result) = lower_array_merge_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
+                    }
                 }
             }
             if let Some(result) = lower_rank1_elemental_call_descriptor(
