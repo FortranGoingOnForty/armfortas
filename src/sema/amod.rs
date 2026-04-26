@@ -645,6 +645,14 @@ fn emit_procedure(
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
                 }
+                // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
+                // synthesis on the consumer side can rebuild a same-rank
+                // array_spec without re-walking the AST decls (which only
+                // exist on the producer side at .amod write time).
+                let rank_attr = format!("rank={}", arg_sym.attrs.array_spec.len());
+                if !arg_sym.attrs.array_spec.is_empty() {
+                    arg_attrs.push(rank_attr.as_str());
+                }
                 if !arg_attrs.is_empty() {
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
                 }
@@ -956,6 +964,13 @@ pub struct AmodArg {
     pub allocatable: bool,
     pub pointer: bool,
     pub hidden: bool,
+    /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
+    /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
+    /// `array_spec` of this rank, deriving each dim's kind from the
+    /// `descriptor` / `allocatable` / `pointer` flags. Bound expressions
+    /// (Explicit lower:upper) are not preserved across .amod boundaries —
+    /// SMP-body synthesis only needs the shape kind and rank for Phase 2.
+    pub rank: u8,
 }
 
 /// A procedure parsed from an .amod file.
@@ -1337,6 +1352,13 @@ fn parse_arg(line: &str) -> AmodArg {
     let descriptor = attr_str.contains("descriptor");
     let allocatable = attr_str.contains("allocatable");
     let pointer = attr_str.contains("pointer");
+    // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
+    // the dummy is array-shaped; absence means rank 0 (scalar).
+    let rank = attr_str
+        .split(", ")
+        .find_map(|tok| tok.strip_prefix("rank="))
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(0);
 
     AmodArg {
         name,
@@ -1348,6 +1370,7 @@ fn parse_arg(line: &str) -> AmodArg {
         allocatable,
         pointer,
         hidden,
+        rank,
     }
 }
 
@@ -1936,5 +1959,52 @@ mod tests {
                 crate::ir::types::IntWidth::I8
             )))
         );
+    }
+
+    #[test]
+    fn arg_rank_round_trips_for_array_dummies() {
+        // Sprint35-SMP Phase 1: the rank=N attribute on @arg lines must
+        // round-trip so the consumer can rebuild a SymbolAttrs::array_spec
+        // of the right rank for SMP-body synthesis. Scalar args (no
+        // rank=) parse as rank 0; descriptor-passed assumed-shape arrays
+        // carry their rank.
+        let amod_text = r#"#!amod 2
+# module: shapes
+# source: shapes.f90
+# checksum: sha256:abc
+
+@subroutine takes_assumed_shape
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg a : real, intent(in), descriptor, rank=1
+    @abi pass=x0 width=8
+  @arg b : real, intent(in), descriptor, rank=2
+    @abi pass=x1 width=8
+  @arg n : integer, intent(in)
+    @abi pass=x2 width=8
+@end subroutine
+
+@subroutine takes_alloc_array
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg buf : real, intent(out), descriptor, allocatable, rank=1
+    @abi pass=x0 width=8
+@end subroutine
+"#;
+        let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
+        let assumed = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_assumed_shape")
+            .unwrap();
+        assert_eq!(assumed.args[0].rank, 1);
+        assert_eq!(assumed.args[1].rank, 2);
+        assert_eq!(assumed.args[2].rank, 0); // scalar n: no rank= attribute
+
+        let alloc = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_alloc_array")
+            .unwrap();
+        assert_eq!(alloc.args[0].rank, 1);
+        assert!(alloc.args[0].allocatable);
     }
 }
