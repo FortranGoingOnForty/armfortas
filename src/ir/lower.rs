@@ -12195,6 +12195,16 @@ fn resolve_generic_call_actuals(
             .map(|sym| sym.attrs.elemental)
             .unwrap_or(false);
         let declared_args = declared_args_for_scope(scope);
+        // F2018 §15.5.2: actual arity must lie within the formal range
+        // — at least the count of required (non-optional) formals, at
+        // most the total formal count.  Without this guard a 3-actual
+        // call binds to a 2-formal candidate via the slot reorder's
+        // overflow push, so e.g. `mean(y, 1, mask)` resolves to
+        // `mean_2_rsp_rsp(x, dim)` ignoring the mask.
+        let required = declared_args.iter().filter(|sym| !sym.attrs.optional).count();
+        if args.len() < required || args.len() > declared_args.len() {
+            continue;
+        }
         let Some(arg_slots) =
             reorder_value_slots_by_formal_skip(args, actual_vals, &scope.arg_order, 0)
         else {
