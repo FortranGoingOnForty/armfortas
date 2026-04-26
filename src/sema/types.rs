@@ -915,6 +915,11 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "merge" => args.first().cloned(),
         "pack" | "unpack" | "spread" | "reshape" => args.first().cloned(),
 
+        // Transformational matrix intrinsics — element type of result
+        // equals element type of the first argument (F2018 §16.9.114
+        // MATMUL, §16.9.198 TRANSPOSE).
+        "matmul" | "transpose" => args.first().cloned(),
+
         // Inquiry intrinsics.
         "huge" | "tiny" | "epsilon" => args.first().cloned(),
         "precision" | "range" | "digits" | "radix" | "exponent" => {
