@@ -18143,7 +18143,7 @@ fn sum_of_array_section_times_constructor_runs() {
 #[test]
 fn sum_and_product_dispatch_on_integer_kind() {
     let src = write_program(
-        "program p\n  implicit none\n  integer(8) :: a8(5) = [1_8, 2_8, 3_8, 4_8, 5_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product(a8)\n  if (r8 /= 15_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "program p\n  implicit none\n  integer(8) :: a8(5) = [10_8, 200_8, 5_8, 99_8, 33_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8, lo8, hi8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product([1_8, 2_8, 3_8, 4_8, 5_8])\n  hi8 = maxval(a8)\n  lo8 = minval(a8)\n  if (r8 /= 347_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  if (hi8 /= 200_8) error stop 4\n  if (lo8 /= 5_8) error stop 5\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let out = unique_path("sum_product_kind_dispatch", "bin");
