@@ -1143,6 +1143,422 @@ fn procedure_scope_for_dummy_args(
         })
 }
 
+/// Sprint35-SMP Phase 2: detect a separate-module-procedure body that
+/// inherits its dummies from the parent module's interface block. The
+/// AST has `args: []` and `prefix: [Module]`; sema's
+/// `inject_separate_module_procedure_args` placed the actual dummy
+/// symbols into the body scope. Return that scope so the synthesizer
+/// can read `arg_order` + symbols.
+fn smp_body_proc_scope(
+    st: &SymbolTable,
+    proc_name: &str,
+    args: &[crate::ast::unit::DummyArg],
+    prefix: &[crate::ast::unit::Prefix],
+) -> Option<crate::sema::symtab::ScopeId> {
+    if !args.is_empty() {
+        return None;
+    }
+    if !prefix
+        .iter()
+        .any(|p| matches!(p, crate::ast::unit::Prefix::Module))
+    {
+        return None;
+    }
+    st.all_scopes()
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, scope)| {
+            if !scope_matches_procedure_name(scope, proc_name) {
+                return None;
+            }
+            let parent_id = scope.parent?;
+            let parent_kind = &st.scope(parent_id).kind;
+            if !matches!(parent_kind, crate::sema::symtab::ScopeKind::Submodule(_)) {
+                return None;
+            }
+            // Sema injects arg_order + symbols into the body scope. If
+            // arg_order is empty, this isn't an SMP body that needs
+            // synthesis (e.g. a no-arg procedure body) — fall through
+            // and let the regular lowering handle the empty-args case.
+            if scope.arg_order.is_empty() {
+                return None;
+            }
+            Some(idx)
+        })
+}
+
+/// Sprint35-SMP Phase 2: locate the parent module's interface scope
+/// for an SMP body. The parser emits every SMP body as
+/// `ProgramUnit::Subroutine`, but the parent module's interface may
+/// declare it as a Function. The function-vs-subroutine decision and
+/// the result variable's name+type both live in this parent scope.
+///
+/// Walks the SMP body scope's submodule parent up to the parent module
+/// (via the submodule's USE-association recorded by sema), then searches
+/// for a Function/Subroutine scope with the matching name underneath.
+/// The interface block introduces an intermediate `Interface` scope so
+/// we tolerate one extra hop.
+fn smp_parent_interface_scope(
+    st: &SymbolTable,
+    smp_body_scope: crate::sema::symtab::ScopeId,
+    proc_name: &str,
+) -> Option<crate::sema::symtab::ScopeId> {
+    use crate::sema::symtab::ScopeKind;
+    let submod_id = st.scope(smp_body_scope).parent?;
+    let parent_module_scope = st
+        .scope(submod_id)
+        .use_associations
+        .iter()
+        .find(|u| u.is_submodule_access)
+        .map(|u| u.source_scope)?;
+    let proc_lc = proc_name.to_lowercase();
+    st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+        let matches_name = match &scope.kind {
+            ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                n.eq_ignore_ascii_case(&proc_lc)
+            }
+            _ => return None,
+        };
+        if !matches_name {
+            return None;
+        }
+        let parent_id = scope.parent?;
+        if parent_id == parent_module_scope {
+            return Some(idx);
+        }
+        // Allow one Interface hop between the proc scope and the
+        // parent module — sema lifts interface bodies into a child
+        // Interface scope on some paths.
+        if matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+            && st.scope(parent_id).parent == Some(parent_module_scope)
+        {
+            return Some(idx);
+        }
+        None
+    })
+}
+
+/// Sprint35-SMP Phase 2: convert a sema TypeInfo back to an AST TypeSpec
+/// so the synthesizer can build a Decl::TypeDecl that matches what the
+/// parser would have produced from the original interface body. Kind
+/// selectors are emitted as integer literals when known, otherwise the
+/// type-spec carries no selector (default kind).
+fn type_info_to_type_spec(
+    type_info: Option<&crate::sema::symtab::TypeInfo>,
+) -> crate::ast::decl::TypeSpec {
+    use crate::ast::decl::{CharSelector, KindSelector, LenSpec, TypeSpec};
+    use crate::sema::symtab::TypeInfo;
+
+    let make_kind = |kind: Option<u8>| -> Option<KindSelector> {
+        kind.map(|k| KindSelector::Expr(synth_int_literal_expr(k as i64)))
+    };
+
+    match type_info {
+        Some(TypeInfo::Integer { kind }) => TypeSpec::Integer(make_kind(*kind)),
+        Some(TypeInfo::Real { kind }) => TypeSpec::Real(make_kind(*kind)),
+        Some(TypeInfo::DoublePrecision) => TypeSpec::DoublePrecision,
+        Some(TypeInfo::Complex { kind }) => TypeSpec::Complex(make_kind(*kind)),
+        Some(TypeInfo::Logical { kind }) => TypeSpec::Logical(make_kind(*kind)),
+        Some(TypeInfo::Character { len, kind }) => {
+            let len_spec = match len {
+                Some(n) => Some(LenSpec::Expr(synth_int_literal_expr(*n))),
+                None => Some(LenSpec::Star),
+            };
+            TypeSpec::Character(Some(CharSelector {
+                len: len_spec,
+                kind: kind.map(|k| synth_int_literal_expr(k as i64)),
+            }))
+        }
+        Some(TypeInfo::Derived(name)) => TypeSpec::Type(name.clone()),
+        Some(TypeInfo::Class(name)) => TypeSpec::Class(name.clone()),
+        Some(TypeInfo::ClassStar) => TypeSpec::ClassStar,
+        Some(TypeInfo::TypeStar) => TypeSpec::TypeStar,
+        // Unknown / unset — fall back to default integer; this should
+        // never fire for a properly-typed interface dummy.
+        None => TypeSpec::Integer(None),
+    }
+}
+
+/// Synthesize an AST integer-literal expression for a known length.
+/// Used by `type_info_to_type_spec` to recover `character(len=N)` /
+/// `integer(N)` / `real(N)` kind selectors.
+fn synth_int_literal_expr(n: i64) -> crate::ast::expr::SpannedExpr {
+    use crate::ast::expr::Expr;
+    use crate::lexer::{Position, Span};
+    let dummy_pos = Position { line: 0, col: 0 };
+    let dummy_span = Span {
+        file_id: 0,
+        start: dummy_pos,
+        end: dummy_pos,
+    };
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: n.to_string(),
+            kind: None,
+        },
+        dummy_span,
+    )
+}
+
+/// Sprint35-SMP Phase 2: convert a sema SymbolAttrs back to an AST
+/// Vec<Attribute> so the synthesizer's TypeDecl looks the same as one
+/// the parser would have emitted. Skips procedure-only flags (pure,
+/// elemental, result_rank, binding_label, procedure_iface) and the
+/// access flag (Public/Private rarely matter for dummies and the
+/// existing decl-attr converter sets a default).
+fn sym_attrs_to_decl_attrs(
+    attrs: &crate::sema::symtab::SymbolAttrs,
+) -> Vec<crate::ast::decl::Attribute> {
+    use crate::ast::decl::{Attribute, Intent as AstIntent};
+    use crate::sema::symtab::Intent as SemaIntent;
+
+    let mut out = Vec::new();
+    if let Some(intent) = &attrs.intent {
+        out.push(Attribute::Intent(match intent {
+            SemaIntent::In => AstIntent::In,
+            SemaIntent::Out => AstIntent::Out,
+            SemaIntent::InOut => AstIntent::InOut,
+        }));
+    }
+    if attrs.optional {
+        out.push(Attribute::Optional);
+    }
+    if attrs.allocatable {
+        out.push(Attribute::Allocatable);
+    }
+    if attrs.pointer {
+        out.push(Attribute::Pointer);
+    }
+    if attrs.target {
+        out.push(Attribute::Target);
+    }
+    if attrs.value {
+        out.push(Attribute::Value);
+    }
+    if attrs.save {
+        out.push(Attribute::Save);
+    }
+    if attrs.parameter {
+        out.push(Attribute::Parameter);
+    }
+    out
+}
+
+/// Sprint35-SMP Phase 2: lookup the parent function scope's result
+/// variable name. Per F2008, a `module function NAME(...) result(R)`
+/// interface body declares both R and the function symbol. The body
+/// scope's `arg_order` lists only the dummies, so the result variable
+/// is the one Variable symbol in the scope whose name is NOT in
+/// arg_order. When no `result()` clause was used, the result name is
+/// the same as the function name. Returns `(result_name, type_info)`.
+fn smp_function_result_info(
+    st: &SymbolTable,
+    parent_scope_id: crate::sema::symtab::ScopeId,
+    function_name: &str,
+) -> Option<(String, crate::sema::symtab::Symbol)> {
+    let scope = st.scope(parent_scope_id);
+    let arg_set: std::collections::HashSet<String> =
+        scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
+    // First look for a Variable symbol whose name isn't in arg_order
+    // (the result variable from sema's Function processing). If absent
+    // (e.g. .amod-loaded interface where only dummies are stored), fall
+    // back to a synthetic Symbol from the function symbol's type_info.
+    for (key, sym) in &scope.symbols {
+        if arg_set.contains(key) {
+            continue;
+        }
+        if matches!(
+            sym.kind,
+            crate::sema::symtab::SymbolKind::Variable
+                | crate::sema::symtab::SymbolKind::Parameter
+        ) {
+            return Some((sym.name.clone(), sym.clone()));
+        }
+    }
+    // No result variable in the scope — synthesize one from the
+    // function symbol itself (parent module level has the Function
+    // symbol with its return-type type_info and result_rank).
+    let parent_module_id = st.scope(parent_scope_id).parent?;
+    let fn_sym = st
+        .scope(parent_module_id)
+        .symbols
+        .get(&function_name.to_lowercase())?;
+    if !matches!(fn_sym.kind, crate::sema::symtab::SymbolKind::Function) {
+        return None;
+    }
+    Some((function_name.to_string(), fn_sym.clone()))
+}
+
+/// Sprint35-SMP Phase 2: when the parent module's interface declares
+/// the procedure as a Function, build a synthetic
+/// `ProgramUnit::Function` so the existing Function lowering arm
+/// handles result-variable allocation, sret ABI, etc. Returns Some only
+/// for function-form SMP bodies; subroutine-form bodies fall through
+/// to the regular Subroutine arm with synthesized args+decls.
+fn try_synth_smp_function_unit(
+    st: &SymbolTable,
+    body_scope_id: crate::sema::symtab::ScopeId,
+    name: &str,
+    bind: &Option<crate::ast::unit::BindInfo>,
+    prefix: &[crate::ast::unit::Prefix],
+    uses: &[crate::ast::decl::SpannedDecl],
+    decls: &[crate::ast::decl::SpannedDecl],
+    body: &[crate::ast::stmt::SpannedStmt],
+    contains: &[SpannedUnit],
+    span: crate::lexer::Span,
+) -> Option<ProgramUnit> {
+    use crate::ast::decl::{Decl, EntityDecl};
+    use crate::sema::symtab::ScopeKind;
+
+    let parent_scope_id = smp_parent_interface_scope(st, body_scope_id, name)?;
+    let parent_scope = st.scope(parent_scope_id);
+    if !matches!(parent_scope.kind, ScopeKind::Function(_)) {
+        return None;
+    }
+
+    let (synth_args, mut synth_decls) =
+        synthesize_smp_body_args_decls(st, body_scope_id, span, decls);
+
+    // Add the result variable as a synthesized local decl so the
+    // Function lowering's alloc_decls + result-variable plumbing can
+    // find it. Pull type + array_spec from the parent function scope's
+    // result variable symbol.
+    let return_type = if let Some((result_name, result_sym)) =
+        smp_function_result_info(st, parent_scope_id, name)
+    {
+        let result_type_spec = type_info_to_type_spec(result_sym.type_info.as_ref());
+        let result_attrs = sym_attrs_to_decl_attrs(&result_sym.attrs);
+        let result_array_spec = if result_sym.attrs.array_spec.is_empty() {
+            None
+        } else {
+            Some(result_sym.attrs.array_spec.clone())
+        };
+        let result_char_len = match result_sym.type_info.as_ref() {
+            Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => Some(
+                crate::ast::decl::LenSpec::Expr(synth_int_literal_expr(*n)),
+            ),
+            Some(crate::sema::symtab::TypeInfo::Character { len: None, .. }) => {
+                Some(crate::ast::decl::LenSpec::Star)
+            }
+            _ => None,
+        };
+        // Insert the result decl right before the body's local decls
+        // (after the dummy decls) so name resolution sees it as a local.
+        let insert_pos = synth_args.len();
+        synth_decls.insert(
+            insert_pos,
+            crate::ast::Spanned::new(
+                Decl::TypeDecl {
+                    type_spec: result_type_spec.clone(),
+                    attrs: result_attrs,
+                    entities: vec![EntityDecl {
+                        name: result_name,
+                        array_spec: result_array_spec,
+                        char_len: result_char_len,
+                        init: None,
+                        ptr_init: None,
+                    }],
+                },
+                span,
+            ),
+        );
+        Some(result_type_spec)
+    } else {
+        None
+    };
+
+    Some(ProgramUnit::Function {
+        name: name.to_string(),
+        args: synth_args,
+        result: smp_function_result_info(st, parent_scope_id, name).map(|(n, _)| n),
+        return_type,
+        bind: bind.clone(),
+        prefix: prefix.to_vec(),
+        uses: uses.to_vec(),
+        imports: Vec::new(),
+        implicit: Vec::new(),
+        decls: synth_decls,
+        body: body.to_vec(),
+        contains: contains.to_vec(),
+    })
+}
+
+/// Sprint35-SMP Phase 2: synthesize the AST args + decls a normal
+/// procedure body would have, recovering from the parent module's
+/// interface block via the sema-injected body scope. Returns
+/// `(synth_args, synth_decls)` where `synth_decls` already includes the
+/// body's own local declarations after the synthesized dummy decls,
+/// so all existing helpers (`arg_type_from_decls`, `install_common_locals`,
+/// `alloc_decls`, etc.) see one unified list and need no other changes.
+fn synthesize_smp_body_args_decls(
+    st: &SymbolTable,
+    proc_scope_id: crate::sema::symtab::ScopeId,
+    span: crate::lexer::Span,
+    body_local_decls: &[crate::ast::decl::SpannedDecl],
+) -> (
+    Vec<crate::ast::unit::DummyArg>,
+    Vec<crate::ast::decl::SpannedDecl>,
+) {
+    use crate::ast::decl::{Decl, EntityDecl};
+    use crate::ast::unit::DummyArg;
+
+    let scope = st.scope(proc_scope_id);
+    let mut synth_args: Vec<DummyArg> = Vec::with_capacity(scope.arg_order.len());
+    let mut synth_decls: Vec<crate::ast::decl::SpannedDecl> =
+        Vec::with_capacity(scope.arg_order.len() + body_local_decls.len());
+
+    for arg_name in &scope.arg_order {
+        synth_args.push(DummyArg::Name(arg_name.clone()));
+
+        // Look up the arg's symbol; tolerate missing sym (would only
+        // happen if sema injection skipped a name) by emitting a bare
+        // DummyArg with no synthesized decl — better to fall through
+        // to whatever default lowering did before than to crash.
+        let Some(sym) = scope.symbols.get(arg_name) else {
+            continue;
+        };
+
+        let type_spec = type_info_to_type_spec(sym.type_info.as_ref());
+        let attrs = sym_attrs_to_decl_attrs(&sym.attrs);
+        let array_spec_for_entity = if sym.attrs.array_spec.is_empty() {
+            None
+        } else {
+            Some(sym.attrs.array_spec.clone())
+        };
+        let char_len = match sym.type_info.as_ref() {
+            Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => Some(
+                crate::ast::decl::LenSpec::Expr(synth_int_literal_expr(*n)),
+            ),
+            Some(crate::sema::symtab::TypeInfo::Character { len: None, .. }) => {
+                Some(crate::ast::decl::LenSpec::Star)
+            }
+            _ => None,
+        };
+        let entity = EntityDecl {
+            name: arg_name.clone(),
+            array_spec: array_spec_for_entity,
+            char_len,
+            init: None,
+            ptr_init: None,
+        };
+        synth_decls.push(crate::ast::Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities: vec![entity],
+            },
+            span,
+        ));
+    }
+
+    // Append the body's own local declarations after the synthesized
+    // dummy decls so look-up order matches a normal procedure (dummies
+    // appear first; locals shadow nothing).
+    synth_decls.extend(body_local_decls.iter().cloned());
+    (synth_args, synth_decls)
+}
+
 fn arg_uses_descriptor_for_lowering(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
@@ -3230,6 +3646,65 @@ fn lower_unit(
             prefix,
             ..
         } => {
+            // Sprint35-SMP Phase 2: separate-module-procedure body form.
+            // Parser emits args=[] and prefix=[Module]; sema injected the
+            // inherited dummies into the body scope. Two cases:
+            //
+            //   1. Parent interface declares a Function — build a
+            //      synthetic ProgramUnit::Function and recurse into
+            //      lower_unit so the Function arm handles result-var
+            //      allocation, sret ABI, etc.
+            //   2. Parent declares a Subroutine — synthesize args+decls
+            //      and continue down this Subroutine arm, which then
+            //      walks them like a normal procedure.
+            if let Some(body_scope_id) = smp_body_proc_scope(st, name, args, prefix) {
+                if let Some(synth_unit) = try_synth_smp_function_unit(
+                    st,
+                    body_scope_id,
+                    name,
+                    bind,
+                    prefix,
+                    uses,
+                    decls,
+                    body,
+                    contains,
+                    unit.span,
+                ) {
+                    let synth_spanned = crate::ast::Spanned::new(synth_unit, unit.span);
+                    lower_unit(
+                        module,
+                        &synth_spanned,
+                        st,
+                        globals,
+                        type_layouts,
+                        host_uses,
+                        host_param_consts,
+                        host_decls,
+                        host_link_name,
+                        host_module,
+                        alloc_return_funcs,
+                        optional_params,
+                        descriptor_params,
+                        internal_funcs,
+                        elemental_funcs,
+                        char_len_star_params,
+                        contained_host_refs,
+                        ambiguous_use_warnings,
+                        internal_only,
+                    );
+                    return;
+                }
+            }
+            let smp_synth = smp_body_proc_scope(st, name, args, prefix)
+                .map(|sid| synthesize_smp_body_args_decls(st, sid, unit.span, decls));
+            let args: &[crate::ast::unit::DummyArg] = match &smp_synth {
+                Some((sa, _)) => sa.as_slice(),
+                None => args.as_slice(),
+            };
+            let decls: &[crate::ast::decl::SpannedDecl] = match &smp_synth {
+                Some((_, sd)) => sd.as_slice(),
+                None => decls.as_slice(),
+            };
             let func_name = lowered_procedure_symbol_name(
                 name,
                 bind.as_ref(),
