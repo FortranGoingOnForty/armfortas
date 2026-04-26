@@ -30525,6 +30525,13 @@ fn is_elemental_math_intrinsic(name: &str) -> bool {
         | "logical" | "conjg" | "aimag" | "dimag"
         | "mod" | "modulo" | "sign" | "dim" | "max" | "min"
         | "ichar" | "iachar" | "achar" | "char"
+        // F2018 §16.9 bit-manipulation elementals.
+        | "popcnt" | "popcount" | "poppar" | "leadz" | "trailz"
+        | "btest" | "iand" | "ior" | "ieor" | "ishft" | "ishftc"
+        | "ibits" | "ibset" | "ibclr" | "not"
+        | "shifta" | "shiftl" | "shiftr" | "dshiftl" | "dshiftr"
+        | "bge" | "bgt" | "ble" | "blt"
+        | "merge_bits" | "maskl" | "maskr"
     )
 }
 

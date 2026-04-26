@@ -857,7 +857,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "size" | "lbound" | "ubound" | "shape" => Some(FortranType::default_integer()),
         "kind" | "selected_int_kind" | "selected_real_kind" => Some(FortranType::default_integer()),
         "iand" | "ior" | "ieor" | "ishft" | "ibits" => args.first().cloned(),
-        "bit_size" | "leadz" | "trailz" | "popcount" => Some(FortranType::default_integer()),
+        "bit_size" | "leadz" | "trailz" | "popcount" | "popcnt" | "poppar" => {
+            Some(FortranType::default_integer())
+        }
 
         // Real-valued conversions.
         "real" | "float" => match args.first()? {
