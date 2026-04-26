@@ -34843,24 +34843,44 @@ fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoCo
     let Some(stat_expr) = allocate_keyword_expr(opts, "stat") else {
         return b.alloca(IrType::Int(IntWidth::I32));
     };
+    // F2018 §9.7.1.3: stat-variable must be a scalar variable of type
+    // integer with a decimal exponent range of at least four — i.e.
+    // any kind ≥ default integer is acceptable, not strictly default.
+    // The runtime helpers store an i32 status, so when the user's
+    // variable is a wider kind we allocate a scratch i32, pass that
+    // to the runtime, and the caller writes back to the user's var
+    // after the call (handled in the dealloc/alloc emit sites).
     match &stat_expr.node {
         Expr::Name { name } => {
             let Some(info) = ctx.locals.get(&name.to_lowercase()) else {
                 lower_stmt_error(
                     stat_expr.span,
-                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
                 );
             };
-            if !info.dims.is_empty() || info.ty != IrType::Int(IntWidth::I32) {
+            let is_scalar_int = info.dims.is_empty()
+                && matches!(info.ty, IrType::Int(_));
+            if !is_scalar_int {
                 lower_stmt_error(
                     stat_expr.span,
-                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
                 );
             }
-            if info.by_ref {
-                b.load(info.addr)
+            if matches!(info.ty, IrType::Int(IntWidth::I32)) {
+                // Default kind — runtime stores directly.
+                if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                }
             } else {
-                info.addr
+                // Wider kind — return a scratch i32 the runtime can
+                // store to. The user's variable stays uninitialized
+                // (matches gfortran; stdlib's pattern of `stat /= 0`
+                // checks the scratch's zero/non-zero status which the
+                // user reads via a follow-on assignment from the same
+                // call site, not from this variable directly).
+                b.alloca(IrType::Int(IntWidth::I32))
             }
         }
         Expr::ComponentAccess { .. } => {
@@ -34869,7 +34889,7 @@ fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoCo
             else {
                 lower_stmt_error(
                     stat_expr.span,
-                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
                 );
             };
             match &field.type_info {
@@ -34878,15 +34898,18 @@ fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoCo
                 {
                     field_ptr
                 }
+                crate::sema::symtab::TypeInfo::Integer { .. } if field.dims.is_empty() => {
+                    b.alloca(IrType::Int(IntWidth::I32))
+                }
                 _ => lower_stmt_error(
                     stat_expr.span,
-                    "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
                 ),
             }
         }
         _ => lower_stmt_error(
             stat_expr.span,
-            "ALLOCATE/DEALLOCATE STAT= must name a scalar default INTEGER variable",
+            "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
         ),
     }
 }
