@@ -18141,6 +18141,40 @@ fn sum_of_array_section_times_constructor_runs() {
 }
 
 #[test]
+fn norm2_handles_binary_array_expression() {
+    // F2018 §16.9.158: NORM2 is a transformational intrinsic that
+    // accepts any array-shaped argument, including binary expressions
+    // like `b - matmul(A, x)`.  Without recognising NORM2 as an array
+    // reduction, the generic lowering treated the binary subtract as
+    // a scalar pointer op and emitted `isub` on raw descriptors.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: n = 4\n  real(8) :: A(n,n), b(n), x(n)\n  real(8) :: r\n  A = 1.0_8\n  b = 1.0_8\n  x = 1.0_8\n  r = norm2(b - matmul(A, x))\n  if (abs(r - 6.0_8) > 1.0e-10_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("norm2_binary_array_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "norm2 with binary array arg should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "norm2 binary array repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn submodule_helper_reads_parent_module_char_parameter() {
     // F2018 §11.2.3: a plain helper procedure contained in a submodule
     // has host-association access to the parent module's globals,
