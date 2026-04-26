@@ -8045,6 +8045,31 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
                 b.float_trunc(re, *target_fw)
             }
         }
+        // Int → Complex (F2018 §10.1.10.1, F2018 §16.9.43): cmplx(i)
+        // semantics — integer becomes the real part, imaginary part 0.
+        // Common via `zero_value_for_ir_type` for missing optional
+        // complex args returning a scalar zero, or coerce_value_call_arg
+        // when an integer literal flows into a complex VALUE parameter.
+        (IrType::Int(_), IrType::Array(elem, 2)) if matches!(elem.as_ref(), IrType::Float(_)) => {
+            let fw = match elem.as_ref() {
+                IrType::Float(fw) => *fw,
+                _ => unreachable!(),
+            };
+            let re = b.int_to_float(val, fw);
+            let zero = match fw {
+                FloatWidth::F32 => b.const_f32(0.0),
+                FloatWidth::F64 => b.const_f64(0.0),
+            };
+            let buf = b.alloca(IrType::Array(Box::new(IrType::Float(fw)), 2));
+            let zero_off = b.const_i64(0);
+            let lane_bytes =
+                b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+            let re_ptr = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
+            let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
+            b.store(re, re_ptr);
+            b.store(zero, im_ptr);
+            b.load_typed(buf, IrType::Array(Box::new(IrType::Float(fw)), 2))
+        }
         // Int → Float
         (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
         // Float → Int
