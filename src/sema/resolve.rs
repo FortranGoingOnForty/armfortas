@@ -1770,6 +1770,26 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
 
                 for entity in entities {
                     let key = entity.name.to_lowercase();
+                    // For `character(*), parameter :: name = init`, F2008
+                    // §5.3.2 says the parameter's length is taken from
+                    // `init`.  type_spec_to_info loses that info because
+                    // LenSpec::Star → len=None; recover it here when the
+                    // init is a string literal or another character
+                    // parameter whose length we already know.
+                    let mut entity_type_info = type_info.clone();
+                    if sym_attrs.parameter
+                        && matches!(&entity_type_info, TypeInfo::Character { len: None, .. })
+                    {
+                        if let Some(init) = entity.init.as_ref() {
+                            let derived_len =
+                                derived_char_init_len(&init.node, st).map(|n| n as i64);
+                            if let Some(n) = derived_len {
+                                if let TypeInfo::Character { len, .. } = &mut entity_type_info {
+                                    *len = Some(n);
+                                }
+                            }
+                        }
+                    }
                     if st.scope(st.current_scope()).symbols.contains_key(&key) {
                         // Symbol already exists (e.g., dummy argument) — update type info.
                         let sym = st
@@ -1778,7 +1798,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             .get_mut(&key)
                             .unwrap();
                         sym.kind = kind.clone();
-                        sym.type_info = Some(type_info.clone());
+                        sym.type_info = Some(entity_type_info.clone());
                         sym.attrs = sym_attrs.clone();
                         sym.arg_names = arg_names.clone();
                     } else {
@@ -1796,7 +1816,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         st.define(Symbol {
                             name: entity.name.clone(),
                             kind: kind.clone(),
-                            type_info: Some(type_info.clone()),
+                            type_info: Some(entity_type_info.clone()),
                             attrs: sym_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
@@ -2158,6 +2178,37 @@ fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8
 }
 
 /// Extract character length from a CharSelector.
+/// Compute the byte length of a string-valued PARAMETER initializer
+/// for `character(*)` length inference (F2008 §5.3.2).  Handles
+/// string literals, references to other character parameters whose
+/// length is already known, and `lit // lit` / `lit // name` concat
+/// chains.  Returns None when we can't classify the init.
+fn derived_char_init_len(
+    e: &crate::ast::expr::Expr,
+    st: &SymbolTable,
+) -> Option<usize> {
+    use crate::ast::expr::Expr;
+    match e {
+        Expr::StringLiteral { value, .. } => Some(value.len()),
+        Expr::Name { name } => {
+            let sym = st.find_symbol_any_scope(&name.to_lowercase())?;
+            if let Some(TypeInfo::Character { len: Some(n), .. }) = &sym.type_info {
+                usize::try_from(*n).ok()
+            } else {
+                None
+            }
+        }
+        Expr::ParenExpr { inner } => derived_char_init_len(&inner.node, st),
+        Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Concat,
+            left,
+            right,
+        } => Some(derived_char_init_len(&left.node, st)?
+            + derived_char_init_len(&right.node, st)?),
+        _ => None,
+    }
+}
+
 fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
     match sel {
         Some(cs) => match &cs.len {

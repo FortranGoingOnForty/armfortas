@@ -4327,6 +4327,27 @@ fn declared_char_len(
                                         .unwrap_or(0)
                                 })
                         })
+                        .or_else(|| {
+                            // Fallback: when the init is a Name that
+                            // refers to another character parameter
+                            // visible via host/use association (e.g.
+                            // `character(*), parameter :: vtype = type_rsp`
+                            // where type_rsp lives in the parent module),
+                            // extract the length from the symbol table.
+                            if let crate::ast::expr::Expr::Name { name } = &expr.node {
+                                let key = name.to_lowercase();
+                                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                                    if let Some(crate::sema::symtab::TypeInfo::Character {
+                                        len: Some(n),
+                                        ..
+                                    }) = &sym.type_info
+                                    {
+                                        return Some(*n);
+                                    }
+                                }
+                            }
+                            None
+                        })
                 }),
             Some(crate::ast::decl::LenSpec::Colon) => None,
             None => Some(1),
