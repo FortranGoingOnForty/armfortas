@@ -25552,7 +25552,20 @@ fn int_width_of_value(b: &FuncBuilder, value: ValueId) -> Option<IntWidth> {
 fn coerce_int_like_to_width(b: &mut FuncBuilder, value: ValueId, target: IntWidth) -> ValueId {
     match b.func().value_type(value) {
         Some(IrType::Int(width)) if width == target => value,
-        Some(IrType::Int(_)) | Some(IrType::Bool) => b.int_extend(value, target, true),
+        Some(IrType::Int(width)) => {
+            if width.bits() < target.bits() {
+                b.int_extend(value, target, true)
+            } else {
+                b.int_trunc(value, target)
+            }
+        }
+        Some(IrType::Bool) => {
+            if target == IntWidth::I8 {
+                value
+            } else {
+                b.int_extend(value, target, true)
+            }
+        }
         _ => value,
     }
 }
@@ -25560,7 +25573,13 @@ fn coerce_int_like_to_width(b: &mut FuncBuilder, value: ValueId, target: IntWidt
 fn int_const_for_width(b: &mut FuncBuilder, width: IntWidth, value: i64) -> ValueId {
     match width {
         IntWidth::I64 => b.const_i64(value),
-        _ => b.const_i32(value as i32),
+        IntWidth::I32 => b.const_i32(value as i32),
+        // I8/I16: lower as a sized int constant via the typed alloca path.
+        // Builder lacks const_i8/const_i16; emit i32 then narrow.
+        _ => {
+            let raw = b.const_i32(value as i32);
+            b.int_trunc(raw, width)
+        }
     }
 }
 
