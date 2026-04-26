@@ -11725,14 +11725,38 @@ fn generic_candidate_matches_slots_with_formal_skip(
         return false;
     }
 
+    generic_candidate_matches_slots_with_proc(b, declared_args, arg_slots, supplied, formal_skip, &[])
+}
+
+fn generic_candidate_matches_slots_with_proc(
+    b: &FuncBuilder,
+    declared_args: &[&crate::sema::symtab::Symbol],
+    arg_slots: &[Option<ValueId>],
+    _supplied: usize,
+    formal_skip: usize,
+    actual_is_procedure: &[bool],
+) -> bool {
     for (idx, decl_sym) in declared_args.iter().enumerate() {
         if idx < formal_skip {
             continue;
         }
         match arg_slots.get(idx) {
             Some(Some(arg_val)) => {
+                if actual_is_procedure.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                if decl_sym.attrs.external
+                    || matches!(
+                        decl_sym.kind,
+                        crate::sema::symtab::SymbolKind::Function
+                            | crate::sema::symtab::SymbolKind::Subroutine
+                            | crate::sema::symtab::SymbolKind::ProcedurePointer
+                    )
+                {
+                    continue;
+                }
                 let Some(ti) = decl_sym.type_info.as_ref() else {
-                    return false;
+                    continue;
                 };
                 let Some(at) = b.func().value_type(*arg_val) else {
                     return false;
@@ -11750,6 +11774,38 @@ fn generic_candidate_matches_slots_with_formal_skip(
     }
 
     true
+}
+
+fn reorder_actual_bool_slots_by_formal_skip(
+    args: &[crate::ast::expr::Argument],
+    actual_bools: &[bool],
+    formal_order: &[String],
+    formal_skip: usize,
+) -> Vec<bool> {
+    if args.len() != actual_bools.len() {
+        return actual_bools.to_vec();
+    }
+    let mut slots: Vec<bool> = vec![false; formal_order.len()];
+    let mut last_positional = formal_skip.min(slots.len());
+    for (arg, actual) in args.iter().zip(actual_bools.iter()) {
+        if let Some(kw) = &arg.keyword {
+            let key = kw.to_ascii_lowercase();
+            if let Some(idx) = formal_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&key))
+            {
+                slots[idx] = *actual;
+            }
+            continue;
+        }
+        if last_positional < slots.len() {
+            slots[last_positional] = *actual;
+            last_positional += 1;
+        } else {
+            slots.push(*actual);
+        }
+    }
+    slots
 }
 
 fn reorder_value_slots_by_formal_skip(
@@ -11983,16 +12039,78 @@ fn resolve_generic_call_actuals(
             0,
         );
         let supplied = arg_slots.iter().filter(|slot| slot.is_some()).count();
-        let semantic_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
-            declared_arg.type_info.as_ref().is_some_and(|declared_type| {
-                generic_declared_semantic_match(
-                    declared_type,
-                    semantic_slots.get(idx).and_then(|slot| slot.as_ref()),
-                    type_layouts,
-                )
+        // Detect actuals that are procedure references. Such actuals
+        // bind to `procedure(iface) :: p` formals which the .amod
+        // writer normalizes to the interface return type — so type
+        // matching on those slots is unsound. The actual side is
+        // identifiable: a Name resolving to a Function/Subroutine
+        // symbol, or one with the EXTERNAL attribute.
+        let actual_is_procedure: Vec<bool> = args
+            .iter()
+            .map(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(expr) => {
+                    if let Expr::Name { name } = &expr.node {
+                        st.find_symbol_any_scope(&name.to_lowercase())
+                            .map(|sym| {
+                                sym.attrs.external
+                                    || matches!(
+                                        sym.kind,
+                                        crate::sema::symtab::SymbolKind::Function
+                                            | crate::sema::symtab::SymbolKind::Subroutine
+                                            | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                    )
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
             })
+            .collect();
+        let actual_is_procedure_slots = reorder_actual_bool_slots_by_formal_skip(
+            args,
+            &actual_is_procedure,
+            &scope.arg_order,
+            0,
+        );
+        let semantic_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
+            // Procedure dummies / EXTERNAL formals: skip semantic check
+            // when the actual is itself a procedure.
+            let actual_is_proc = actual_is_procedure_slots
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
+            if actual_is_proc {
+                return true;
+            }
+            if declared_arg.attrs.external
+                || matches!(
+                    declared_arg.kind,
+                    crate::sema::symtab::SymbolKind::Function
+                        | crate::sema::symtab::SymbolKind::Subroutine
+                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                )
+            {
+                return true;
+            }
+            let Some(declared_type) = declared_arg.type_info.as_ref() else {
+                return true;
+            };
+            generic_declared_semantic_match(
+                declared_type,
+                semantic_slots.get(idx).and_then(|slot| slot.as_ref()),
+                type_layouts,
+            )
         });
-        let ir_match = generic_candidate_matches_slots(b, &declared_args, &arg_slots, supplied);
+        let ir_match = generic_candidate_matches_slots_with_proc(
+            b,
+            &declared_args,
+            &arg_slots,
+            supplied,
+            0,
+            &actual_is_procedure_slots,
+        );
         let rank_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
             let formal_rank = formal_declared_rank(declared_arg);
             let actual_rank = rank_slots.get(idx).copied().flatten();
