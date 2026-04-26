@@ -839,6 +839,15 @@ fn find_scope_for_unit(
                 Some(name.clone()),
             )
         }
+        ProgramUnit::Submodule { name, .. } => {
+            let n = name.clone();
+            (
+                Box::new(
+                    move |k| matches!(k, ScopeKind::Submodule(ref m) if m.eq_ignore_ascii_case(&n)),
+                ),
+                Some(name.clone()),
+            )
+        }
         ProgramUnit::Subroutine { name, .. } => {
             let n = name.clone();
             (
