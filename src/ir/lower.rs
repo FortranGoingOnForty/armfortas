@@ -15185,14 +15185,14 @@ fn arg_matches_declared(
         );
     }
     if matches!(decl_ti, TypeInfo::ClassStar | TypeInfo::TypeStar) {
-        let mut peeled = actual_ir.clone();
-        while let IrType::Ptr(inner) = peeled {
-            peeled = *inner;
-        }
-        return matches!(
-            peeled,
-            IrType::Array(_, _) | IrType::Int(IntWidth::I8) | IrType::Struct(_)
-        );
+        // F2018 §7.3.2.3: CLASS(*) and TYPE(*) accept any actual type —
+        // `class(*)` is unlimited polymorphic and `type(*)` is assumed
+        // type. Any scalar/array/derived/character actual is valid.
+        // Earlier this restricted to Array/I8/Struct, which rejected
+        // legitimate integer/real actuals to optional class(*) dummies
+        // (e.g. linalg_state_type's `a1..a20` accept arbitrary scalars
+        // and arrays).
+        return true;
     }
     let decl_ir = type_info_to_ir_type(decl_ti);
     let _ = arg_val;
