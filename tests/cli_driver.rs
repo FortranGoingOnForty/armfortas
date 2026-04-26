@@ -18141,6 +18141,40 @@ fn sum_of_array_section_times_constructor_runs() {
 }
 
 #[test]
+fn bit_manipulation_intrinsics_lower_inline() {
+    // F2018 §16.9: BGE/BGT/BLE/BLT/POPPAR/MERGE_BITS/MASKL/MASKR/
+    // DSHIFTL/DSHIFTR were recognised as elementals but not lowered as
+    // expressions — they fell through to undefined external symbols at
+    // link time.  MVBITS is the subroutine form; previously emitted an
+    // external `mvbits` call.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int64\n  implicit none\n  integer(int64) :: i\n  if (.not. bge(-1_int64, 1_int64)) error stop 1\n  if (.not. bgt(-1_int64, 1_int64)) error stop 2\n  if (ble(-1_int64, 1_int64)) error stop 3\n  if (blt(-1_int64, 1_int64)) error stop 4\n  if (poppar(5_int64) /= 0) error stop 5\n  if (poppar(7_int64) /= 1) error stop 6\n  if (merge_bits(10_int64, 176_int64, 15_int64) /= 186_int64) error stop 7\n  if (maskl(4_int64) /= -1152921504606846976_int64) error stop 8\n  if (maskr(4_int64) /= 15_int64) error stop 9\n  i = 165_int64\n  call mvbits(4660_int64, 0_int64, 4_int64, i, 4_int64)\n  if (iand(i, 255_int64) /= 69_int64) error stop 10\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("bit_manipulation_intrinsics", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "bit intrinsics should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "bit intrinsics should run cleanly:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dispatch_optional_logical_int8_array_through_descriptor() {
     // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
     // optional, dimension(:)` formal must accept a `logical(int8)`
