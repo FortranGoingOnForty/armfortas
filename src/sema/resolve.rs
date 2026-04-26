@@ -5,7 +5,7 @@
 
 use super::symtab::*;
 use crate::ast::decl;
-use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
+use crate::ast::decl::{ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -972,12 +972,36 @@ fn load_external_module(
             if arg.hidden {
                 continue;
             }
+            // Sprint35-SMP Phase 1: rebuild a same-rank array_spec from
+            // the encoded rank + descriptor/allocatable/pointer flags.
+            // Bound expressions are not preserved across .amod boundaries;
+            // assumed-shape / deferred-shape kinds are sufficient for the
+            // synthesizer's uses in Phase 2 (the bound expressions are
+            // unused for descriptor-passed dummies anyway — extents come
+            // from the caller's runtime descriptor).
+            let array_spec: Vec<ArraySpec> = if arg.rank == 0 {
+                Vec::new()
+            } else {
+                let template = if arg.allocatable || arg.pointer {
+                    ArraySpec::Deferred
+                } else if arg.descriptor {
+                    ArraySpec::AssumedShape { lower: None }
+                } else {
+                    // Non-descriptor array dummy: explicit-shape with
+                    // unknown bounds. The Phase-2 synthesizer treats
+                    // this as a placeholder and the lowering helpers
+                    // pull actual bounds from the caller's array.
+                    ArraySpec::AssumedShape { lower: None }
+                };
+                vec![template; arg.rank as usize]
+            };
             let arg_attrs = SymbolAttrs {
                 intent: arg.intent,
                 optional: arg.optional,
                 value: arg.value,
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
+                array_spec,
                 ..Default::default()
             };
             let _ = st.define(Symbol {
@@ -1752,6 +1776,18 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     SymbolKind::Variable
                 };
                 let mut arg_names = Vec::new();
+                // Sprint35-SMP Phase 1: snapshot the per-decl `dimension(...)`
+                // attribute as an array-spec fallback. Per-entity specs override
+                // it (e.g. `real, dimension(10) :: a, b(:,:)` declares a as
+                // rank-1 size 10 and b as assumed-shape rank-2).
+                let attr_dimension: Option<&Vec<crate::ast::decl::ArraySpec>> =
+                    attrs.iter().find_map(|a| {
+                        if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                            Some(specs)
+                        } else {
+                            None
+                        }
+                    });
 
                 if sym_attrs.external {
                     if let TypeSpec::Type(iface_name) = type_spec {
@@ -1793,6 +1829,18 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             }
                         }
                     }
+                    // Sprint35-SMP Phase 1: per-entity attrs clone so each
+                    // entity carries its own array_spec (entity-local spec
+                    // wins; otherwise fall back to the decl-level dimension
+                    // attribute).
+                    let mut entity_attrs = sym_attrs.clone();
+                    let entity_array_spec = entity
+                        .array_spec
+                        .as_ref()
+                        .map(|specs| specs.clone())
+                        .or_else(|| attr_dimension.map(|specs| specs.clone()))
+                        .unwrap_or_default();
+                    entity_attrs.array_spec = entity_array_spec;
                     if st.scope(st.current_scope()).symbols.contains_key(&key) {
                         // Symbol already exists (e.g., dummy argument) — update type info.
                         let sym = st
@@ -1802,7 +1850,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             .unwrap();
                         sym.kind = kind.clone();
                         sym.type_info = Some(entity_type_info.clone());
-                        sym.attrs = sym_attrs.clone();
+                        sym.attrs = entity_attrs.clone();
                         sym.arg_names = arg_names.clone();
                     } else {
                         // Try to fold PARAMETER initializers to a
@@ -1820,7 +1868,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             name: entity.name.clone(),
                             kind: kind.clone(),
                             type_info: Some(entity_type_info.clone()),
-                            attrs: sym_attrs.clone(),
+                            attrs: entity_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
                             arg_names: arg_names.clone(),
