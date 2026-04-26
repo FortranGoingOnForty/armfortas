@@ -499,6 +499,48 @@ fn emit_procedure(
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
         }
+        // Sprint35-SMP Phase 2: emit the result variable's user-declared
+        // name when it differs from the function name (i.e. the source
+        // had a `result(X)` clause). Submodule bodies that reference the
+        // result by its declared name need this preserved across the
+        // .amod boundary so sema can register the right symbol.
+        let result_var_name: Option<String> = st
+            .scopes
+            .iter()
+            .find(|s| {
+                let matches_name = match &s.kind {
+                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                        n.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                };
+                if !matches_name {
+                    return false;
+                }
+                let Some(parent_id) = s.parent else {
+                    return false;
+                };
+                parent_id == mod_scope_id
+                    || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                        && st.scope(parent_id).parent == Some(mod_scope_id)
+            })
+            .and_then(|pscope| {
+                let arg_set: std::collections::HashSet<String> =
+                    pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
+                pscope
+                    .symbols
+                    .iter()
+                    .find(|(key, sym)| {
+                        !arg_set.contains(*key)
+                            && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    })
+                    .map(|(_, sym)| sym.name.clone())
+            });
+        if let Some(result_var_name) = result_var_name {
+            if !result_var_name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={}", result_var_name).unwrap();
+            }
+        }
     } else {
         write!(out, "@subroutine {}", sym.name).unwrap();
     }
@@ -982,6 +1024,13 @@ pub struct AmodProc {
     pub result_allocatable: bool,
     pub result_pointer: bool,
     pub result_rank: u8,
+    /// Sprint35-SMP Phase 2: the result variable's user-declared name
+    /// (from `result(X)` clause). None when the result name matches
+    /// the function name. The submodule body lowering needs this to
+    /// resolve `X = ...` assignments inside an SMP body when the body
+    /// references the result by its declared name rather than by the
+    /// function name.
+    pub result_name: Option<String>,
     pub pure: bool,
     pub elemental: bool,
     pub access: Access,
@@ -1272,6 +1321,13 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         .find_map(|attr| attr.strip_prefix("result_rank="))
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
+    // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
+    // source used a `result(NAME)` clause that differs from the
+    // function name. Otherwise the result variable shares the name.
+    let result_name = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("result_name="))
+        .map(|s| s.trim().to_string());
     let access = if attrs_str.split(", ").any(|attr| attr == "private") {
         Access::Private
     } else {
@@ -1309,6 +1365,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_allocatable,
         result_pointer,
         result_rank,
+        result_name,
         pure,
         elemental,
         access,
