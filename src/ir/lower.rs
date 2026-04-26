@@ -12287,9 +12287,21 @@ fn name_expr_type_info(
 
     let local_ti = descriptor_backed_class.or_else(|| info.and_then(local_semantic_type_info));
 
+    // Honor the symbol-table CLASS(*)/TYPE(*) classification only when
+    // the LocalInfo also reports class-like storage. Without this
+    // guard, a wrong-scope match in `find_symbol_any_scope` (which
+    // matches by name across the entire program) can falsely override
+    // a concrete local's type with ClassStar — e.g. when an
+    // automatic-shape array `A2` shares its name with a CLASS(*) dummy
+    // declared elsewhere in the same compilation unit.
+    let is_polymorphic_local = info.is_some_and(|i| i.is_class);
     match (local_ti, symbol_ti) {
-        (Some(_), Some(TypeInfo::ClassStar)) => Some(TypeInfo::ClassStar),
-        (Some(_), Some(TypeInfo::TypeStar)) => Some(TypeInfo::TypeStar),
+        (Some(_), Some(TypeInfo::ClassStar)) if is_polymorphic_local => {
+            Some(TypeInfo::ClassStar)
+        }
+        (Some(_), Some(TypeInfo::TypeStar)) if is_polymorphic_local => {
+            Some(TypeInfo::TypeStar)
+        }
         (Some(local), _) => Some(local),
         (None, Some(ti)) => Some(ti.clone()),
         (None, None) => None,
