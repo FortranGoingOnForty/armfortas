@@ -18279,7 +18279,16 @@ fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let mask_raw = lower_expr(b, locals, mask_expr, st);
+                            let mask_raw = lower_expr_full(
+                                b,
+                                locals,
+                                mask_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let mask = coerce_to_type(b, mask_raw, &IrType::Bool);
                             let ptr = b.select(mask, t_ptr, f_ptr);
                             let len = b.select(mask, t_len, f_len);
