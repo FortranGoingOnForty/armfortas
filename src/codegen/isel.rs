@@ -2897,11 +2897,15 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
                         {
                             // Confirmed: fuse this ICmp into the Select.
                             ctx.select_fused.insert(*cond);
+                            pending = None;
+                        } else {
+                            // The Select isel for an unfused cond emits
+                            // its own `cmp cond_reg, #0` to set NZCV,
+                            // which clobbers any pending fused ICmp's
+                            // flags.  Drop the pending so a later Select
+                            // doesn't try to read stale flags.
+                            pending = None;
                         }
-                    }
-                    // Whether fused or not, the Select consumes the flag slot.
-                    if pending == Some(*cond) {
-                        pending = None;
                     }
                 }
                 // Calls may clobber NZCV (per AAPCS64, flags are not preserved).
