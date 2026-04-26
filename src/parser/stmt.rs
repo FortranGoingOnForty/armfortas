@@ -160,47 +160,51 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_read(start)
             }
-            "open" => {
+            // I/O and memory keywords double as legal identifiers. The
+            // statement form always opens with `(`; anything else (`=`,
+            // `==`, end of line, etc.) means the lexeme is being used as
+            // a variable name and we redirect to assignment/call.
+            "open" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "open")
             }
-            "close" => {
+            "close" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "close")
             }
-            "inquire" => {
+            "inquire" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_inquire(start)
             }
-            "rewind" => {
+            "rewind" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "rewind")
             }
-            "backspace" => {
+            "backspace" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "backspace")
             }
-            "endfile" => {
+            "endfile" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "endfile")
             }
-            "flush" => {
+            "flush" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "flush")
             }
-            "wait" => {
+            "wait" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "wait")
             }
-            "allocate" => {
+            "allocate" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_allocate(start, false)
             }
-            "deallocate" => {
+            "deallocate" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_allocate(start, true)
             }
-            "nullify" => {
+            "nullify" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_nullify(start)
             }
