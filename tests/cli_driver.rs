@@ -18141,6 +18141,35 @@ fn sum_of_array_section_times_constructor_runs() {
 }
 
 #[test]
+fn sum_and_product_dispatch_on_integer_kind() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer(8) :: a8(5) = [1_8, 2_8, 3_8, 4_8, 5_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product(a8)\n  if (r8 /= 15_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_product_kind_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "kind-dispatched SUM/PRODUCT should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "kind-dispatched SUM/PRODUCT should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn is_iostat_intrinsics_compile_and_run_under_implicit_none() {
     let src = write_program(
         "program p\n  use iso_fortran_env, only : iostat_end, iostat_eor\n  implicit none\n  logical :: a, b\n  a = is_iostat_end(iostat_end)\n  b = is_iostat_eor(iostat_eor)\n  if (.not. a) error stop 1\n  if (.not. b) error stop 2\n  print *, 'ok'\nend program\n",
