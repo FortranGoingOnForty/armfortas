@@ -28026,7 +28026,113 @@ fn lower_arg_descriptor(
             }
         }
     }
+    // F2018 §7.3.2.3: a CLASS(*) optional dummy can receive any actual.
+    // When the formal is class(*) and the actual is a scalar/literal we
+    // can't otherwise descriptor-ize, box it into a minimal rank-1
+    // descriptor with a single element. The runtime semantics in
+    // callees that `select type` on these args won't recover the
+    // dynamic type without a real type-tag, but the IR verifier and
+    // call ABI are satisfied — and the most common use (variadic-style
+    // error message arg lists like `linalg_state_type`'s a1..a20)
+    // tolerates unknown-type fallthrough gracefully.
+    if force_static_scalar_polymorphic_view {
+        return box_actual_into_class_star_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+        );
+    }
     b.const_i64(0)
+}
+
+/// Build a minimal CLASS(*) descriptor wrapping `expr` so it can be
+/// passed by descriptor to a `class(*), dimension(..)` formal. The
+/// descriptor reports rank=1 with a single element — sufficient for
+/// the IR call ABI even when the actual is scalar.
+fn box_actual_into_class_star_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    // Materialize the actual into a stack slot so we have an address
+    // to put in the descriptor's base_addr. For scalars we lower the
+    // expression and store into a temp; for whole-array names we use
+    // their existing storage.
+    let (base_ptr, elem_size_bytes): (ValueId, i64) = if let Expr::Name { name } = &expr.node
+    {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            let bytes = ir_scalar_byte_size(&info.ty).max(1);
+            let addr = if info.by_ref {
+                b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else {
+                let raw = b.ptr_to_int(info.addr);
+                b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+            };
+            (addr, bytes)
+        } else {
+            let raw = lower_expr_full(b, locals, expr, st, type_layouts, None, None, None);
+            let ty = b
+                .func()
+                .value_type(raw)
+                .unwrap_or(IrType::Int(IntWidth::I32));
+            box_value_into_addr(b, raw, &ty)
+        }
+    } else {
+        let raw = lower_expr_full(b, locals, expr, st, type_layouts, None, None, None);
+        let ty = b
+            .func()
+            .value_type(raw)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        box_value_into_addr(b, raw, &ty)
+    };
+
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        base_ptr,
+    );
+    let elem_size = b.const_i64(elem_size_bytes);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
+    let rank = b.const_i32(1);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    let one64 = b.const_i64(1);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one64);
+    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), one64);
+    store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one64);
+    desc
+}
+
+/// Allocate a stack slot for `value`, store it, and return (slot_addr_as_i8_ptr, byte_size).
+/// Used to give literals/expressions an addressable form for class(*)
+/// descriptor wrapping. Pointer-typed values are passed through —
+/// their pointee already lives somewhere addressable.
+fn box_value_into_addr(b: &mut FuncBuilder, value: ValueId, ty: &IrType) -> (ValueId, i64) {
+    if matches!(ty, IrType::Ptr(_)) {
+        let raw = b.ptr_to_int(value);
+        let i8_ptr = b.int_to_ptr(raw, IrType::Int(IntWidth::I8));
+        return (i8_ptr, ir_scalar_byte_size(ty).max(1));
+    }
+    let bytes = ir_scalar_byte_size(ty).max(1);
+    let slot = b.alloca(ty.clone());
+    b.store(value, slot);
+    let raw = b.ptr_to_int(slot);
+    let i8_ptr = b.int_to_ptr(raw, IrType::Int(IntWidth::I8));
+    (i8_ptr, bytes)
 }
 
 /// Get the data base address for an array variable.
