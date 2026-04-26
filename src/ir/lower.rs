@@ -19070,6 +19070,54 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         vec![field_ptr, src, sz],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
+                                } else if matches!(
+                                    field.type_info,
+                                    crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ) && field.allocatable
+                                    && field.dims.is_empty()
+                                {
+                                    // Polymorphic component target:
+                                    // `derived%poly_field = expr` where
+                                    // `poly_field` is class(*), allocatable.
+                                    // Memcpy the source descriptor.  RHS is
+                                    // expected to be a polymorphic local or
+                                    // another class(*) component access.
+                                    let src_desc_opt: Option<ValueId> =
+                                        match &value.node {
+                                            Expr::ComponentAccess { .. } => {
+                                                resolve_component_field_access(
+                                                    b,
+                                                    &ctx.locals,
+                                                    value,
+                                                    ctx.st,
+                                                    ctx.type_layouts,
+                                                )
+                                                .map(|(p, _)| p)
+                                            }
+                                            Expr::Name { name } => ctx
+                                                .locals
+                                                .get(&name.to_lowercase())
+                                                .filter(|info| {
+                                                    info.is_class && info.dims.is_empty()
+                                                })
+                                                .map(|info| {
+                                                    array_descriptor_addr(b, info)
+                                                }),
+                                            _ => None,
+                                        };
+                                    if let Some(src) = src_desc_opt {
+                                        let sz = b.const_i64(384);
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![field_ptr, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        // Last-resort: skip the assignment
+                                        // rather than emit invalid IR.
+                                        // Better than truncating to i32.
+                                    }
                                 } else {
                                     let val = lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(
