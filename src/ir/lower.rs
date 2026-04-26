@@ -13187,9 +13187,31 @@ fn array_expr_elem_type_only(
         Expr::UnaryOp { operand, .. } => {
             array_expr_elem_type_only(locals, operand, st, type_layouts)
         }
-        Expr::BinaryOp { left, right, .. } => {
-            array_expr_elem_type_only(locals, left, st, type_layouts)
-                .or_else(|| array_expr_elem_type_only(locals, right, st, type_layouts))
+        Expr::BinaryOp { op, left, right } => {
+            // F2018 §10.1.5: relational and logical operators yield a
+            // logical result regardless of operand types — `y > 3.` over
+            // a real array is a logical array, not a real array.  The
+            // dispatcher uses this elem type to construct a typed null
+            // pointer, so a wrong probe (real instead of logical) makes
+            // every logical-mask formal reject the actual.  Only
+            // override when at least one operand is itself array-shaped;
+            // a scalar `code%fg >= 0` must still report None so dispatch
+            // falls back to `lower_expr_full` for the boolean value.
+            let left_arr = array_expr_elem_type_only(locals, left, st, type_layouts);
+            let right_arr = array_expr_elem_type_only(locals, right, st, type_layouts);
+            if (left_arr.is_some() || right_arr.is_some())
+                && matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Ne
+                        | BinaryOp::Lt | BinaryOp::Le
+                        | BinaryOp::Gt | BinaryOp::Ge
+                        | BinaryOp::And | BinaryOp::Or
+                        | BinaryOp::Eqv | BinaryOp::Neqv
+                )
+            {
+                return Some(IrType::Bool);
+            }
+            left_arr.or(right_arr)
         }
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
