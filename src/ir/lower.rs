@@ -19018,7 +19018,30 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             } else {
                                                 false
                                             };
-                                        if callee_is_local_array {
+                                        // F2018 §16.9: elemental intrinsic applied
+                                        // to an array actual returns an array. The
+                                        // direct `lower_expr_ctx_tl` path treats
+                                        // the call as scalar and emits e.g.
+                                        // `b.fsqrt(array_descriptor)` — wrong.
+                                        // Route to lower_array_assign so the
+                                        // scalarization path expands the elemental
+                                        // call element-wise.
+                                        let callee_is_elemental_array_intrinsic =
+                                            if let Expr::Name { name: cname } = &callee.node {
+                                                is_elemental_math_intrinsic(cname)
+                                                    && call_args.iter().any(|arg| {
+                                                        matches!(
+                                                            &arg.value,
+                                                            crate::ast::expr::SectionSubscript::Element(e)
+                                                                if expr_contains_array_refs(e, &ctx.locals)
+                                                        )
+                                                    })
+                                            } else {
+                                                false
+                                            };
+                                        if callee_is_local_array
+                                            || callee_is_elemental_array_intrinsic
+                                        {
                                             lower_array_assign(b, ctx, name, &info, value);
                                             return;
                                         }
@@ -29505,9 +29528,34 @@ fn resolved_named_callee_is_elemental(
     )
     .map(|candidate| candidate.name)
     .unwrap_or_else(|| callee_name.to_string());
-    st.find_symbol_any_scope(&resolved_name.to_lowercase())
-        .map(|sym| sym.attrs.elemental)
-        .unwrap_or(false)
+    if let Some(sym) = st.find_symbol_any_scope(&resolved_name.to_lowercase()) {
+        if sym.attrs.elemental {
+            return true;
+        }
+    }
+    is_elemental_math_intrinsic(&resolved_name)
+}
+
+/// Standard elemental math/conversion intrinsics (F2018 §16.9). When
+/// such an intrinsic is applied to an array actual, the result is
+/// element-wise. The runtime entry point treats the actual as scalar,
+/// so without elemental dispatch a `sqrt(w)` for array `w` would emit
+/// a single scalar FSqrt over the descriptor pointer (wrong).
+fn is_elemental_math_intrinsic(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "abs" | "iabs" | "dabs" | "cabs" | "cdabs" | "zabs"
+        | "acos" | "asin" | "atan" | "atan2"
+        | "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh"
+        | "asinh" | "acosh" | "atanh"
+        | "exp" | "log" | "log10"
+        | "sqrt" | "dsqrt" | "csqrt" | "zsqrt" | "cdsqrt"
+        | "hypot" | "anint" | "dnint" | "aint" | "dint"
+        | "ceiling" | "floor" | "nint" | "int" | "real" | "dble"
+        | "logical" | "conjg" | "aimag" | "dimag"
+        | "mod" | "modulo" | "sign" | "dim" | "max" | "min"
+        | "ichar" | "iachar" | "achar" | "char"
+    )
 }
 
 /// F2018 §15.8.3 elemental subroutine call expansion.
