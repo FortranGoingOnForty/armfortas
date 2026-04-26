@@ -1017,6 +1017,7 @@ fn load_external_module(
                 value: arg.value,
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
+                external: arg.external,
                 array_spec,
                 ..Default::default()
             };
