@@ -11809,6 +11809,20 @@ fn generic_candidate_matches_slots_with_proc(
     formal_skip: usize,
     actual_is_procedure: &[bool],
 ) -> bool {
+    generic_candidate_matches_slots_with_proc_elemental(
+        b, declared_args, arg_slots, _supplied, formal_skip, actual_is_procedure, false,
+    )
+}
+
+fn generic_candidate_matches_slots_with_proc_elemental(
+    b: &FuncBuilder,
+    declared_args: &[&crate::sema::symtab::Symbol],
+    arg_slots: &[Option<ValueId>],
+    _supplied: usize,
+    formal_skip: usize,
+    actual_is_procedure: &[bool],
+    elemental: bool,
+) -> bool {
     for (idx, decl_sym) in declared_args.iter().enumerate() {
         if idx < formal_skip {
             continue;
@@ -11833,7 +11847,7 @@ fn generic_candidate_matches_slots_with_proc(
                 let Some(at) = b.func().value_type(*arg_val) else {
                     return false;
                 };
-                if !arg_matches_declared(ti, &at, *arg_val, b) {
+                if !arg_matches_declared_elemental(ti, &at, *arg_val, b, elemental) {
                     return false;
                 }
             }
@@ -12090,6 +12104,12 @@ fn resolve_generic_call_actuals(
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
+        let candidate_is_elemental = st
+            .scope(candidate.owner_scope)
+            .symbols
+            .get(&candidate.name.to_lowercase())
+            .map(|sym| sym.attrs.elemental)
+            .unwrap_or(false);
         let declared_args = declared_args_for_scope(scope);
         let Some(arg_slots) =
             reorder_value_slots_by_formal_skip(args, actual_vals, &scope.arg_order, 0)
@@ -12183,18 +12203,25 @@ fn resolve_generic_call_actuals(
             let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
             generic_declared_semantic_match(declared_type, actual, type_layouts)
         });
-        let rank_match = declared_args.iter().enumerate().all(|(idx, declared_arg)| {
-            let formal_rank = formal_declared_rank(declared_arg);
-            let actual_rank = rank_slots.get(idx).copied().flatten();
-            formal_rank_matches_actual(formal_rank, actual_rank)
-        });
-        let ir_match = generic_candidate_matches_slots_with_proc(
+        // F2018 §15.8.3: an elemental procedure with scalar formals
+        // accepts conformable array actuals — the procedure is invoked
+        // element-wise. Skip the rank check; the IR matcher peels Array
+        // layers in elemental mode so a Float(F32) formal matches a
+        // Ptr(Array(Float(F32), N)) actual.
+        let rank_match = candidate_is_elemental
+            || declared_args.iter().enumerate().all(|(idx, declared_arg)| {
+                let formal_rank = formal_declared_rank(declared_arg);
+                let actual_rank = rank_slots.get(idx).copied().flatten();
+                formal_rank_matches_actual(formal_rank, actual_rank)
+            });
+        let ir_match = generic_candidate_matches_slots_with_proc_elemental(
             b,
             &declared_args,
             &arg_slots,
             supplied,
             0,
             &actual_is_procedure_slots,
+            candidate_is_elemental,
         );
         if semantic_match && ir_match && rank_match {
             return Some(candidate.clone());
@@ -15543,6 +15570,16 @@ fn arg_matches_declared(
     arg_val: ValueId,
     b: &FuncBuilder,
 ) -> bool {
+    arg_matches_declared_elemental(decl_ti, actual_ir, arg_val, b, false)
+}
+
+fn arg_matches_declared_elemental(
+    decl_ti: &crate::sema::symtab::TypeInfo,
+    actual_ir: &IrType,
+    arg_val: ValueId,
+    b: &FuncBuilder,
+    elemental: bool,
+) -> bool {
     use crate::sema::symtab::TypeInfo;
     if matches!(decl_ti, TypeInfo::Character { .. }) {
         // Character actuals arrive in several ABI shapes depending on
@@ -15598,7 +15635,24 @@ fn arg_matches_declared(
     let decl_ir = type_info_to_ir_type(decl_ti);
     let _ = arg_val;
     let _ = b;
+    if elemental {
+        // F2018 §15.8.3: elemental procedures accept conformable array
+        // actuals where the formal is declared scalar; the procedure
+        // is invoked element-wise. Compare element types by peeling any
+        // Array layers from the actual side.
+        return ir_types_dispatch_equal_elemental(&decl_ir, actual_ir);
+    }
     ir_types_dispatch_equal(&decl_ir, actual_ir)
+}
+
+fn ir_types_dispatch_equal_elemental(decl: &IrType, actual: &IrType) -> bool {
+    match (decl, actual) {
+        (decl, IrType::Ptr(p)) => ir_types_dispatch_equal_elemental(decl, p),
+        (decl, IrType::Array(e, _)) if !matches!(decl, IrType::Array(_, _)) => {
+            ir_types_dispatch_equal_elemental(decl, e)
+        }
+        _ => ir_types_dispatch_equal(decl, actual),
+    }
 }
 
 /// Kind-aware equality for generic dispatch: an IR value matches a
@@ -28920,6 +28974,39 @@ fn expr_contains_array_refs_in_subscripts(
     }
 }
 
+/// Names of intrinsics that reduce an array-valued argument to a scalar
+/// (or to a lower-rank array via the optional `dim=` argument). Their
+/// array operands must NOT be scalarized when the surrounding expression
+/// is being lowered element-wise — the reduction needs the whole array.
+/// Includes the stdlib aliases (`stdlib_sum`, etc.) so generic-dispatched
+/// calls are also recognized before name resolution.
+fn is_array_reducing_intrinsic(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "sum"
+            | "product"
+            | "dot_product"
+            | "count"
+            | "any"
+            | "all"
+            | "maxval"
+            | "minval"
+            | "maxloc"
+            | "minloc"
+            | "norm2"
+            | "iall"
+            | "iany"
+            | "iparity"
+            | "parity"
+            | "findloc"
+            | "stdlib_sum"
+            | "stdlib_sum_kahan"
+            | "stdlib_product"
+            | "stdlib_dot_product"
+            | "stdlib_dot_product_kahan"
+    )
+}
+
 fn rewrite_scalarized_rank1_array_refs(
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
@@ -29003,6 +29090,17 @@ fn rewrite_scalarized_rank1_array_refs(
             ))
         }
         Expr::FunctionCall { callee, args } => {
+            // Reductions like sum(y), product(y), dot_product(a,b) consume
+            // whole arrays and produce a scalar. Scalarizing their args
+            // would replace the array with `y(loop_var)`, breaking generic
+            // dispatch (formal expects rank-1 array, actual becomes
+            // scalar) and intrinsic semantics. Leave the call site alone
+            // so it lowers as a single whole-array reduction.
+            if let Expr::Name { name } = &callee.node {
+                if is_array_reducing_intrinsic(name) {
+                    return Some((expr.clone(), false));
+                }
+            }
             let callee = (**callee).clone();
             let mut changed = false;
             let mut mapped_args = Vec::with_capacity(args.len());
