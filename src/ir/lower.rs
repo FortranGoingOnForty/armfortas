@@ -6508,39 +6508,71 @@ fn install_globals_as_locals(
 
     if let Some(module_name) = host_module {
         let mod_key = module_name.to_lowercase();
-        for (mk, var) in globals.keys() {
-            if *mk == mod_key {
-                pending.push((var.clone(), (mod_key.clone(), var.clone())));
+        // Build the host-scope chain. For a submodule helper, host_module
+        // is the submodule's own name, but the helper still has F2018
+        // §11.2.3 host-association access to the parent module's globals.
+        // Walk the submodule's `is_submodule_access` USE entry to find
+        // the parent module so its globals get imported here too.
+        let mut host_chain: Vec<String> = vec![mod_key.clone()];
+        if st.find_module_scope(&mod_key).is_none() {
+            for scope in st.all_scopes() {
+                if let crate::sema::symtab::ScopeKind::Submodule(n) = &scope.kind {
+                    if n.eq_ignore_ascii_case(&mod_key) {
+                        for assoc in &scope.use_associations {
+                            if !assoc.is_submodule_access {
+                                continue;
+                            }
+                            let src_scope = st.scope(assoc.source_scope);
+                            if let crate::sema::symtab::ScopeKind::Module(parent_name) =
+                                &src_scope.kind
+                            {
+                                let parent_lc = parent_name.to_lowercase();
+                                if !host_chain.contains(&parent_lc) {
+                                    host_chain.push(parent_lc);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
             }
         }
-        // F2018 §11.2.3: a submodule sees every entity its host module
-        // sees, including names brought into the host via USE.  Walk the
-        // host module's UseAssociations and install the source globals
-        // under the local-name the host knows them by.  Without this,
-        // a submodule reference to e.g. `one_sp` (from `use stdlib_constants`
-        // in the parent) misses `locals` entirely, falls into
-        // `find_symbol_any_scope` + the `const_i32(0)` fallback in
-        // `Expr::Name`, and breaks generic dispatch with the wrong IR type.
-        if let Some(host_scope_id) = st.find_module_scope(&mod_key) {
-            for assoc in &st.scope(host_scope_id).use_associations {
-                if assoc.is_submodule_access {
-                    continue;
+        for host_lc in &host_chain {
+            for (mk, var) in globals.keys() {
+                if *mk == *host_lc && !pending.iter().any(|(k, _)| k == var) {
+                    pending.push((var.clone(), (host_lc.clone(), var.clone())));
                 }
-                let src_scope = st.scope(assoc.source_scope);
-                let src_mod_key = match &src_scope.kind {
-                    crate::sema::symtab::ScopeKind::Module(n)
-                    | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
-                    _ => continue,
-                };
-                if src_mod_key == mod_key {
-                    continue;
-                }
-                let var_lc = assoc.original_name.to_lowercase();
-                let local_lc = assoc.local_name.to_lowercase();
-                if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
-                    && !pending.iter().any(|(k, _)| k == &local_lc)
-                {
-                    pending.push((local_lc, (src_mod_key, var_lc)));
+            }
+            // F2018 §11.2.3: a submodule sees every entity its host module
+            // sees, including names brought into the host via USE. Walk
+            // each host scope's UseAssociations and install the source
+            // globals under the local-name the host knows them by.
+            // Without this, a submodule reference to e.g. `one_sp` (from
+            // `use stdlib_constants` in the parent) misses `locals`
+            // entirely, falls into `find_symbol_any_scope` + the
+            // `const_i32(0)` fallback in `Expr::Name`, and breaks generic
+            // dispatch with the wrong IR type.
+            if let Some(host_scope_id) = st.find_module_scope(host_lc) {
+                for assoc in &st.scope(host_scope_id).use_associations {
+                    if assoc.is_submodule_access {
+                        continue;
+                    }
+                    let src_scope = st.scope(assoc.source_scope);
+                    let src_mod_key = match &src_scope.kind {
+                        crate::sema::symtab::ScopeKind::Module(n)
+                        | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
+                        _ => continue,
+                    };
+                    if src_mod_key == *host_lc {
+                        continue;
+                    }
+                    let var_lc = assoc.original_name.to_lowercase();
+                    let local_lc = assoc.local_name.to_lowercase();
+                    if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
+                        && !pending.iter().any(|(k, _)| k == &local_lc)
+                    {
+                        pending.push((local_lc, (src_mod_key, var_lc)));
+                    }
                 }
             }
         }
