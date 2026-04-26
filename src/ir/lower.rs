@@ -31639,6 +31639,51 @@ fn lower_array_expr_descriptor(
                         return Some(result);
                     }
                 }
+                // F2018 §16.9.114 / §16.9.198: MATMUL and TRANSPOSE are
+                // transformational intrinsics that materialize a fresh
+                // array descriptor. Without this hand-off, callers like
+                // `A - matmul(L, transpose(L))` would fall through to
+                // `lower_array_function_result_descriptor`, which only
+                // recognizes user procedures whose ABI table marks the
+                // result as ArrayDescriptor — intrinsics aren't there,
+                // so the rhs would silently scalarize and emit `isub`
+                // against the descriptor pointer.
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "matmul" | "transpose"
+                ) {
+                    if let Some(first_arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
+                            &first_arg.value
+                        {
+                            if let Some((_, elem_ty)) = lower_array_expr_descriptor(
+                                b,
+                                locals,
+                                first_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ) {
+                                let key = name.to_ascii_lowercase();
+                                if let Some(desc) = lower_array_intrinsic(
+                                    b,
+                                    locals,
+                                    &key,
+                                    args,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                ) {
+                                    return Some((desc, elem_ty));
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if let Some(result) = lower_rank1_elemental_call_descriptor(
                 b,
@@ -34228,22 +34273,39 @@ fn lower_array_intrinsic(
         }
         "matmul" => {
             // MATMUL(a, b) → allocate result descriptor, dispatch by type.
+            // The second actual may itself be an array-shaped expression
+            // (e.g. TRANSPOSE(L), a section, or another array intrinsic
+            // result). Lower it through the descriptor path so any array-
+            // returning expression yields a usable descriptor pointer.
             let second_desc = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    if let Expr::Name { name } = &e.node {
-                        locals
-                            .get(&name.to_lowercase())
-                            .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
-                            .map(|i| {
-                                if local_uses_array_descriptor(i) {
-                                    array_descriptor_addr(b, i)
-                                } else {
-                                    materialize_array_descriptor_for_info(b, i)
-                                }
-                            })
-                    } else {
-                        None
-                    }
+                    lower_array_expr_descriptor(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )
+                    .map(|(d, _)| d)
+                    .or_else(|| {
+                        if let Expr::Name { name } = &e.node {
+                            locals
+                                .get(&name.to_lowercase())
+                                .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                                .map(|i| {
+                                    if local_uses_array_descriptor(i) {
+                                        array_descriptor_addr(b, i)
+                                    } else {
+                                        materialize_array_descriptor_for_info(b, i)
+                                    }
+                                })
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 }
