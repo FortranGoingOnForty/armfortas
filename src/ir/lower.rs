@@ -37361,6 +37361,106 @@ fn lower_expr_full(
                     }
                 }
 
+                // sqrt(z) for complex (F2018 §16.9.184): principal-branch
+                // sqrt of a complex number, computed as
+                //     re = sqrt((|z| + a) / 2)
+                //     im = sqrt((|z| - a) / 2) * sign(b)
+                // where sign(b) = +1 when b >= 0, else -1. This matches
+                // libm's `csqrt` on the principal branch and correctly
+                // handles sqrt(-1) = i, sqrt(0) = 0, and z on the real
+                // line. We handle this before the generic intrinsic
+                // dispatch because complex values are pointers to
+                // [f32/f64 x 2] buffers and `b.fsqrt` only knows scalar
+                // float; passing a complex pointer through it would
+                // emit `fsqrt` on a GPR register.
+                if (key == "sqrt" || key == "csqrt" || key == "zsqrt" || key == "cdsqrt")
+                    && args.len() == 1
+                {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let ty = b
+                                .func()
+                                .value_type(val)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let lane_bytes =
+                                    b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero_off = b.const_i64(0);
+                                let arr_ty = IrType::Array(Box::new(elem.clone()), 2);
+
+                                let buf = match &ty {
+                                    IrType::Ptr(_) => val,
+                                    _ => {
+                                        let tmp = b.alloca(arr_ty.clone());
+                                        b.store(val, tmp);
+                                        tmp
+                                    }
+                                };
+                                let re_ptr =
+                                    b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
+                                let im_ptr =
+                                    b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                let re_in = b.load_typed(re_ptr, elem.clone());
+                                let im_in = b.load_typed(im_ptr, elem.clone());
+
+                                let re2 = b.fmul(re_in, re_in);
+                                let im2 = b.fmul(im_in, im_in);
+                                let r2 = b.fadd(re2, im2);
+                                let r = b.fsqrt(r2);
+                                let two = if fw == FloatWidth::F64 {
+                                    b.const_f64(2.0)
+                                } else {
+                                    b.const_f32(2.0)
+                                };
+                                let zero_f = if fw == FloatWidth::F64 {
+                                    b.const_f64(0.0)
+                                } else {
+                                    b.const_f32(0.0)
+                                };
+                                let r_plus_a = b.fadd(r, re_in);
+                                let r_minus_a = b.fsub(r, re_in);
+                                let half_plus = b.fdiv(r_plus_a, two);
+                                let half_minus = b.fdiv(r_minus_a, two);
+                                // Clamp to >=0 to absorb tiny negative values
+                                // from rounding (mathematically these halves
+                                // are non-negative but FP rounding can flip
+                                // them slightly negative).
+                                let half_plus_pos = b.fcmp(CmpOp::Ge, half_plus, zero_f);
+                                let half_plus_safe = b.select(half_plus_pos, half_plus, zero_f);
+                                let half_minus_pos = b.fcmp(CmpOp::Ge, half_minus, zero_f);
+                                let half_minus_safe =
+                                    b.select(half_minus_pos, half_minus, zero_f);
+                                let re_out = b.fsqrt(half_plus_safe);
+                                let im_mag = b.fsqrt(half_minus_safe);
+                                let im_neg = b.fneg(im_mag);
+                                let b_nonneg = b.fcmp(CmpOp::Ge, im_in, zero_f);
+                                let im_out = b.select(b_nonneg, im_mag, im_neg);
+
+                                let out = b.alloca(arr_ty);
+                                let out_re =
+                                    b.gep(out, vec![zero_off], IrType::Int(IntWidth::I8));
+                                let out_im =
+                                    b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                b.store(re_out, out_re);
+                                b.store(im_out, out_im);
+                                return out;
+                            }
+                        }
+                    }
+                }
+
                 // Keyword-argument reordering for function calls
                 // (symmetric with the Stmt::Call path). Binds by name
                 // when the callee's arg_order is resolvable.
