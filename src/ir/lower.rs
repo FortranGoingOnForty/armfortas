@@ -28983,6 +28983,8 @@ fn expr_contains_array_refs_in_subscripts(
 fn is_array_reducing_intrinsic(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
+        // Fortran standard intrinsics that consume an array → scalar
+        // (or lower-rank array via the optional dim= argument).
         "sum"
             | "product"
             | "dot_product"
@@ -28999,11 +29001,20 @@ fn is_array_reducing_intrinsic(name: &str) -> bool {
             | "iparity"
             | "parity"
             | "findloc"
+            // stdlib_intrinsics aliases used by stdlib internally.
             | "stdlib_sum"
             | "stdlib_sum_kahan"
             | "stdlib_product"
             | "stdlib_dot_product"
             | "stdlib_dot_product_kahan"
+            // stdlib_stats reductions — also array → scalar.
+            | "mean"
+            | "var"
+            | "std"
+            | "moment"
+            | "median"
+            | "corr"
+            | "cov"
     )
 }
 
