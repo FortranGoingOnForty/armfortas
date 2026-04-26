@@ -11641,10 +11641,29 @@ fn named_interface_specific_candidates(
         return (!specifics.is_empty()).then_some(specifics);
     }
 
+    // When a same-named Function/Subroutine exists anywhere in the
+    // compilation database, treat the call as a direct call and skip
+    // generic dispatch. This avoids picking up an unrelated module's
+    // generic interface (e.g. stdlib_string_type's `reverse`) when the
+    // current unit only USE-imported the function form (e.g.
+    // stdlib_ascii's `reverse`). Without this guard, the IR-level
+    // lookup ignores USE filtering and a global generic interface
+    // contaminates the dispatch.
+    let mut function_exists = false;
     for scope in st.all_scopes() {
         if let Some(sym) = scope.symbols.get(&key) {
+            if matches!(
+                sym.kind,
+                crate::sema::symtab::SymbolKind::Function
+                    | crate::sema::symtab::SymbolKind::Subroutine
+            ) {
+                function_exists = true;
+            }
             append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
         }
+    }
+    if function_exists {
+        return None;
     }
 
     if specifics.is_empty() {
