@@ -20550,13 +20550,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         }
                     }
                 }
-                reject_unsupported_polymorphic_component_method_base(
-                    callee.span,
-                    base,
-                    &ctx.locals,
-                    ctx.st,
-                    ctx.type_layouts,
-                );
                 if let Some((target, signature_key)) = procedure_pointer_component_call_target(
                     b,
                     &ctx.locals,
