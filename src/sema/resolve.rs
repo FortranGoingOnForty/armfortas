@@ -933,6 +933,21 @@ fn load_external_module(
     // call sites — without it, cross-TU generic dispatch sees no
     // candidates and fails.
     for proc in &iface.procedures {
+        // Sprint35-SMP Phase 2: rebuild the function result's array_spec
+        // from result_rank + result_allocatable/pointer flags so the
+        // SMP-body synthesizer can recover the result's shape from a
+        // pure .amod load (where the result variable isn't otherwise
+        // present as a separate symbol).
+        let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
+            Vec::new()
+        } else {
+            let template = if proc.result_allocatable || proc.result_pointer {
+                ArraySpec::Deferred
+            } else {
+                ArraySpec::AssumedShape { lower: None }
+            };
+            vec![template; proc.result_rank as usize]
+        };
         let attrs = SymbolAttrs {
             access: proc.access,
             allocatable: proc.result_allocatable,
@@ -941,6 +956,7 @@ fn load_external_module(
             elemental: proc.elemental,
             binding_label: proc.binding_label.clone(),
             result_rank: proc.result_rank,
+            array_spec: result_array_spec,
             ..Default::default()
         };
         let arg_names: Vec<String> = proc
@@ -1009,6 +1025,49 @@ fn load_external_module(
                 kind: crate::sema::symtab::SymbolKind::Variable,
                 type_info: arg.type_info.clone(),
                 attrs: arg_attrs,
+                defined_at: dummy_span,
+                scope: proc_scope,
+                arg_names: vec![],
+                const_value: None,
+            });
+        }
+        // Sprint35-SMP Phase 2: also define the function's result
+        // variable in the proc scope under a name that won't collide
+        // with the user's own local declarations. Same-name SMP-body
+        // procedures push their own Function scope on top, so the
+        // duplicate name `result` would otherwise shadow the local
+        // and the validator's lookup would walk to this stale symbol
+        // and reject `allocate(result(...))`. Use a doubly-underscored
+        // synth name so SMP-body synthesis can find it (via the body
+        // scope after sema injection) but no user code can collide.
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function)
+            && proc.result_rank > 0
+        {
+            let synth_name = format!(
+                "__amod_result_{}",
+                proc.result_name.as_deref().unwrap_or(&proc.name)
+            );
+            let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
+                Vec::new()
+            } else {
+                let template = if proc.result_allocatable || proc.result_pointer {
+                    ArraySpec::Deferred
+                } else {
+                    ArraySpec::AssumedShape { lower: None }
+                };
+                vec![template; proc.result_rank as usize]
+            };
+            let result_attrs = SymbolAttrs {
+                allocatable: proc.result_allocatable,
+                pointer: proc.result_pointer,
+                array_spec: result_array_spec,
+                ..Default::default()
+            };
+            let _ = st.define(Symbol {
+                name: synth_name,
+                kind: crate::sema::symtab::SymbolKind::Variable,
+                type_info: proc.return_type.clone(),
+                attrs: result_attrs,
                 defined_at: dummy_span,
                 scope: proc_scope,
                 arg_names: vec![],
@@ -1196,10 +1255,48 @@ fn inject_separate_module_procedure_args(
         })
         .collect();
 
+    // Sprint35-SMP Phase 2: also clone the result variable (function
+    // case) so the body's `res = ...` references resolve to a
+    // properly-typed Variable rather than implicit-typing as a scalar.
+    // The result variable is the non-arg Variable in the iface scope:
+    //   - For interface bodies parsed from source: sema's Function arm
+    //     defined a Symbol with the user's `result(NAME)` clause.
+    //   - For .amod-loaded modules: load_external_module synthesized
+    //     a `__amod_result_NAME` Variable that we strip the prefix off.
+    let result_sym: Option<Symbol> = {
+        let arg_set: std::collections::HashSet<String> = st
+            .scope(iface_scope)
+            .arg_order
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+        st.scope(iface_scope)
+            .symbols
+            .iter()
+            .find(|(key, sym)| {
+                !arg_set.contains(*key)
+                    && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+            })
+            .map(|(_, sym)| sym.clone())
+    };
+
     st.scope_mut(body_scope).arg_order = arg_order;
     for mut sym in arg_symbols {
         sym.scope = body_scope;
         sym.defined_at = span;
+        let _ = st.define(sym);
+    }
+    if let Some(mut sym) = result_sym {
+        sym.scope = body_scope;
+        sym.defined_at = span;
+        // For .amod-loaded result vars the name carries the
+        // `__amod_result_` prefix to avoid shadowing user locals in
+        // the parent module's procedure scope. Strip it for the body
+        // scope so user code referencing the result by its declared
+        // name resolves correctly.
+        if let Some(stripped) = sym.name.strip_prefix("__amod_result_") {
+            sym.name = stripped.to_string();
+        }
         let _ = st.define(sym);
     }
 }
