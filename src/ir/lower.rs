@@ -36495,7 +36495,7 @@ fn lower_expr_full(
                         resolve_component_base_for_method(b, locals, base, st, tl)
                     {
                         if let Some(layout) = tl.get(&type_name) {
-                            let bp = resolved_bound_proc_for_call(
+                            let bp_opt = resolved_bound_proc_for_call(
                                 b,
                                 locals,
                                 st,
@@ -36507,8 +36507,51 @@ fn lower_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             )
-                            .or_else(|| layout.bound_proc(component))
-                            .unwrap_or_else(|| {
+                            .or_else(|| layout.bound_proc(component));
+                            // Procedure-pointer component (not a TBP):
+                            // lower as an indirect call.  Common in
+                            // stdlib_hashmaps where `map % hasher(key)`
+                            // dispatches through a proc-pointer field.
+                            if bp_opt.is_none() {
+                                if let Some((target_ptr, signature_key)) =
+                                    procedure_pointer_component_call_target(
+                                        b, locals, callee, st, tl,
+                                    )
+                                {
+                                    let abi_lookup_keys =
+                                        procedure_abi_lookup_keys(st, &[&signature_key]);
+                                    let ret_ty = first_procedure_lookup(
+                                        &abi_lookup_keys,
+                                        |k| callee_return_ir_type(st, k),
+                                    )
+                                    .unwrap_or(IrType::Int(IntWidth::I32));
+                                    let mut arg_vals: Vec<ValueId> =
+                                        Vec::with_capacity(args.len());
+                                    for arg in args {
+                                        if let crate::ast::expr::SectionSubscript::Element(
+                                            e,
+                                        ) = &arg.value
+                                        {
+                                            arg_vals.push(lower_arg_by_ref_full(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
+                                            ));
+                                        }
+                                    }
+                                    return b.call(
+                                        FuncRef::Indirect(target_ptr),
+                                        arg_vals,
+                                        ret_ty,
+                                    );
+                                }
+                            }
+                            let bp = bp_opt.unwrap_or_else(|| {
                                 fail_unmatched_bound_proc_resolution(callee.span, layout, component)
                             });
                                 let target = bp.target_name.clone();
