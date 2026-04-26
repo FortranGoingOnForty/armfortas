@@ -1320,6 +1320,9 @@ fn collect_derived_type_layouts(
         | ProgramUnit::Module {
             decls, contains, ..
         }
+        | ProgramUnit::Submodule {
+            decls, contains, ..
+        }
         | ProgramUnit::Subroutine {
             decls, contains, ..
         }
