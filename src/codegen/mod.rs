@@ -10,4 +10,5 @@ pub mod liveness;
 pub mod mir;
 pub mod peephole;
 pub mod regalloc;
+pub mod relax_branches;
 pub mod tailcall;
