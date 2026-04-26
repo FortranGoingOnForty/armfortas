@@ -19005,6 +19005,23 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         args: call_args,
                                     } = &value.node
                                     {
+                                        // F2018 §9.5.3.3 vector subscript: when the
+                                        // callee resolves to a local array (not a
+                                        // function), `x(col)` is gather, not a call.
+                                        // Route through lower_array_assign so the
+                                        // scalarization path picks it up.
+                                        let callee_is_local_array =
+                                            if let Expr::Name { name: cname } = &callee.node {
+                                                ctx.locals
+                                                    .get(&cname.to_lowercase())
+                                                    .is_some_and(local_is_array_like)
+                                            } else {
+                                                false
+                                            };
+                                        if callee_is_local_array {
+                                            lower_array_assign(b, ctx, name, &info, value);
+                                            return;
+                                        }
                                         if let Expr::Name { name: callee_name } = &callee.node {
                                             let callee_key = callee_name.to_lowercase();
                                             if ctx.alloc_return_funcs.contains(&callee_key) {
@@ -30039,6 +30056,103 @@ fn lower_rank1_elemental_call_descriptor(
     Some((result_desc, result_elem_ty))
 }
 
+/// F2018 §9.5.3.3: vector-subscript gather. Lower `base(idx)` where
+/// `base` is a rank-1 array local and `idx` is a runtime rank-1
+/// integer array (not a literal `[i,j,k]` constructor — that path
+/// goes through `expand_vector_subscript_designator`). Materializes
+/// `idx` as a descriptor, allocates a fresh rank-1 result of the
+/// same length with `base`'s element type, and emits a loop that
+/// gathers `base[idx[k]-1]` into `result[k]` (Fortran 1-based).
+fn lower_vector_subscript_gather_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base_info: &LocalInfo,
+    idx_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    let (idx_desc, idx_elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        idx_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    if !matches!(idx_elem_ty, IrType::Int(_)) {
+        return None;
+    }
+
+    let elem_ty = base_info.ty.clone();
+    let base_desc = if local_uses_array_descriptor(base_info) {
+        array_descriptor_addr(b, base_info)
+    } else {
+        materialize_array_descriptor_for_info(b, base_info)
+    };
+
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![idx_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    // Build a fresh rank-1 descriptor sized n with elem_ty.
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let elem_bytes_v = b.const_i64(ir_scalar_byte_size(&elem_ty));
+    b.call(
+        FuncRef::External("afs_allocate_1d".into()),
+        vec![result_desc, elem_bytes_v, n],
+        IrType::Void,
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("vsubs_gather_check");
+    let bb_body = b.create_block("vsubs_gather_body");
+    let bb_exit = b.create_block("vsubs_gather_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let raw_index = load_rank1_array_desc_elem(b, idx_desc, &idx_elem_ty, idx);
+    // Widen the raw index to i64 (idx may be i32) and convert to 0-based.
+    let idx_i64 = match idx_elem_ty {
+        IrType::Int(IntWidth::I64) => raw_index,
+        IrType::Int(_) => b.int_extend(raw_index, IntWidth::I64, true),
+        _ => return None,
+    };
+    let one = b.const_i64(1);
+    let zero_based = b.isub(idx_i64, one);
+    let val = load_rank1_array_desc_elem(b, base_desc, &elem_ty, zero_based);
+    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, val);
+
+    let next = b.iadd(idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some((result_desc, elem_ty))
+}
+
 fn allocate_like_array_temp_descriptor(b: &mut FuncBuilder, source_desc: ValueId) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
@@ -30595,6 +30709,30 @@ fn lower_array_expr_descriptor(
                             lower_array_section(b, locals, info, args, st, type_layouts),
                             info.ty.clone(),
                         ));
+                    }
+                    // F2018 §9.5.3.3: vector subscript — a single
+                    // Element subscript whose expression evaluates to a
+                    // rank-1 integer array. Gather base[idx[k]-1] into
+                    // a fresh rank-1 result. Only handle rank-1 base
+                    // here; multi-dim vector subscripts are deferred.
+                    if args.len() == 1 && info.dims.len() <= 1 {
+                        if let crate::ast::expr::SectionSubscript::Element(idx_expr) =
+                            &args[0].value
+                        {
+                            if let Some(result) = lower_vector_subscript_gather_descriptor(
+                                b,
+                                locals,
+                                info,
+                                idx_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ) {
+                                return Some(result);
+                            }
+                        }
                     }
                     // Element access on an array local — scalar result,
                     // not an array.  Fall through (returns None below).
