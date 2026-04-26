@@ -30218,7 +30218,7 @@ fn lower_rank1_numeric_array_binary_descriptor(
         .or_else(|| rhs.as_ref().map(|(_, ty)| ty.clone()))?;
     let is_complex_elem = matches!(&elem_ty, IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
     match &elem_ty {
-        IrType::Int(_) | IrType::Float(_) => {}
+        IrType::Int(_) | IrType::Float(_) | IrType::Bool => {}
         _ if is_complex_elem => {}
         _ => return None,
     }
@@ -30240,6 +30240,10 @@ fn lower_rank1_numeric_array_binary_descriptor(
                 | (IrType::Float(_), BinaryOp::Mul)
                 | (IrType::Float(_), BinaryOp::Div)
                 | (IrType::Float(_), BinaryOp::Pow)
+                | (IrType::Bool, BinaryOp::And)
+                | (IrType::Bool, BinaryOp::Or)
+                | (IrType::Bool, BinaryOp::Eqv)
+                | (IrType::Bool, BinaryOp::Neqv)
         )
     };
     if !op_supported {
@@ -30396,6 +30400,21 @@ fn lower_rank1_numeric_array_binary_descriptor(
             (IrType::Float(_), BinaryOp::Pow) => {
                 let r = coerce_to_type(b, rhs_val, &elem_ty);
                 b.fpow(lhs_val, r)
+            }
+            (IrType::Bool, BinaryOp::And) => b.and(lhs_val, rhs_val),
+            (IrType::Bool, BinaryOp::Or) => b.or(lhs_val, rhs_val),
+            (IrType::Bool, BinaryOp::Eqv) => {
+                let both = b.and(lhs_val, rhs_val);
+                let either = b.or(lhs_val, rhs_val);
+                let not_both = b.not(both);
+                let xor = b.and(either, not_both);
+                b.not(xor)
+            }
+            (IrType::Bool, BinaryOp::Neqv) => {
+                let both = b.and(lhs_val, rhs_val);
+                let either = b.or(lhs_val, rhs_val);
+                let not_both = b.not(both);
+                b.and(either, not_both)
             }
             _ => unreachable!("unsupported array op should have returned before block creation"),
         };
