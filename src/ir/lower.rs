@@ -7303,6 +7303,34 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
         {
             b.load_typed(val, target.clone())
         }
+        // Complex → real coercion (F2018 §10.2.1.3): assigning a
+        // complex value to a real variable extracts its real
+        // component.  Common in BLAS code like `rtemp = rtemp +
+        // conjg(z)*z` where the RHS is mathematically real but
+        // typed complex.
+        (IrType::Ptr(inner), IrType::Float(target_fw))
+            if matches!(inner.as_ref(),
+                IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_))) =>
+        {
+            let elem_fw = match inner.as_ref() {
+                IrType::Array(elem, _) => match elem.as_ref() {
+                    IrType::Float(fw) => *fw,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            let zero = b.const_i64(0);
+            let re_ptr = b.gep(val, vec![zero], IrType::Int(IntWidth::I8));
+            let re = b.load_typed(re_ptr, IrType::Float(elem_fw));
+            // Width adjust if target precision differs from element.
+            if elem_fw == *target_fw {
+                re
+            } else if elem_fw == FloatWidth::F32 && *target_fw == FloatWidth::F64 {
+                b.float_extend(re, FloatWidth::F64)
+            } else {
+                b.float_trunc(re, *target_fw)
+            }
+        }
         // Int → Float
         (IrType::Int(_), IrType::Float(fw)) => b.int_to_float(val, *fw),
         // Float → Int
