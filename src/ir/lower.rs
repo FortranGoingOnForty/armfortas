@@ -29150,6 +29150,10 @@ fn is_array_reducing_intrinsic(name: &str) -> bool {
             | "median"
             | "corr"
             | "cov"
+            // stdlib_strings array → scalar string aggregators.
+            | "join"
+            | "join_char"
+            | "join_string"
     )
 }
 
