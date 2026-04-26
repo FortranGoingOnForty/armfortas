@@ -11129,6 +11129,127 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 None
             }
         }
+        // F2018 §16.9.21-24 — unsigned bitwise comparisons.  Implemented
+        // via the "flip the sign bit, then signed compare" trick so the
+        // existing signed icmp ops produce unsigned ordering.
+        "bge" | "bgt" | "ble" | "blt" => {
+            if args.len() >= 2 {
+                let (l, r) = unify_int_widths(b, args[0], args[1]);
+                let value_width = int_width_of_value(b, l).unwrap_or(IntWidth::I32);
+                let sign_bit_pos =
+                    int_const_for_width(b, value_width, (value_width.bits() - 1) as i64);
+                let one = int_const_for_width(b, value_width, 1);
+                let sign_mask = b.shl(one, sign_bit_pos);
+                let l_flipped = b.bit_xor(l, sign_mask);
+                let r_flipped = b.bit_xor(r, sign_mask);
+                let op = match name {
+                    "bge" => CmpOp::Ge,
+                    "bgt" => CmpOp::Gt,
+                    "ble" => CmpOp::Le,
+                    "blt" => CmpOp::Lt,
+                    _ => unreachable!(),
+                };
+                Some(b.icmp(op, l_flipped, r_flipped))
+            } else {
+                None
+            }
+        }
+        "poppar" => {
+            // F2018 §16.9.179: 1 if popcount(i) is odd, 0 otherwise.
+            args.first().map(|a| {
+                let widened = b.int_extend(*a, IntWidth::I64, false);
+                let cnt = b.call(
+                    FuncRef::External("afs_popcount".into()),
+                    vec![widened],
+                    IrType::Int(IntWidth::I32),
+                );
+                let one = b.const_i32(1);
+                b.bit_and(cnt, one)
+            })
+        }
+        "merge_bits" => {
+            // F2018 §16.9.150: (i AND mask) IOR (j AND NOT mask)
+            if args.len() >= 3 {
+                let (i, j) = unify_int_widths(b, args[0], args[1]);
+                let value_width = int_width_of_value(b, i).unwrap_or(IntWidth::I32);
+                let mask = coerce_int_like_to_width(b, args[2], value_width);
+                let lhs = b.bit_and(i, mask);
+                let inv_mask = b.bit_not(mask);
+                let rhs = b.bit_and(j, inv_mask);
+                Some(b.bit_or(lhs, rhs))
+            } else {
+                None
+            }
+        }
+        "maskl" => {
+            // F2018 §16.9.139: i leftmost bits set; rest cleared.
+            // maskl(i) = (-1) << (bits - i) if i > 0, else 0.
+            args.first().map(|a| {
+                let value_width = int_width_of_value(b, *a).unwrap_or(IntWidth::I32);
+                let bits = int_const_for_width(b, value_width, value_width.bits() as i64);
+                let i_in_w = coerce_int_like_to_width(b, *a, value_width);
+                let shift = b.isub(bits, i_in_w);
+                let neg_one = int_const_for_width(b, value_width, -1);
+                let zero = int_const_for_width(b, value_width, 0);
+                let shifted = b.shl(neg_one, shift);
+                let is_zero = b.icmp(CmpOp::Le, i_in_w, zero);
+                b.select(is_zero, zero, shifted)
+            })
+        }
+        "maskr" => {
+            // F2018 §16.9.140: i rightmost bits set; rest cleared.
+            // maskr(i) = (1 << i) - 1 for 0 < i < bits; 0 for i==0; -1 for i>=bits.
+            args.first().map(|a| {
+                let value_width = int_width_of_value(b, *a).unwrap_or(IntWidth::I32);
+                let one = int_const_for_width(b, value_width, 1);
+                let i_in_w = coerce_int_like_to_width(b, *a, value_width);
+                let shifted = b.shl(one, i_in_w);
+                let one_again = int_const_for_width(b, value_width, 1);
+                let computed = b.isub(shifted, one_again);
+                let zero = int_const_for_width(b, value_width, 0);
+                let bits = int_const_for_width(b, value_width, value_width.bits() as i64);
+                let neg_one = int_const_for_width(b, value_width, -1);
+                let too_big = b.icmp(CmpOp::Ge, i_in_w, bits);
+                let is_zero = b.icmp(CmpOp::Le, i_in_w, zero);
+                let big_or_normal = b.select(too_big, neg_one, computed);
+                b.select(is_zero, zero, big_or_normal)
+            })
+        }
+        "dshiftl" => {
+            // F2018 §16.9.59: combine i and j as a 2*bits value with
+            // i on the left, then logical-shift left by `shift` and
+            // return the leftmost `bits` bits.
+            //   dshiftl(i, j, s) = (i << s) | (j >> (bits - s))
+            if args.len() >= 3 {
+                let (i, j) = unify_int_widths(b, args[0], args[1]);
+                let value_width = int_width_of_value(b, i).unwrap_or(IntWidth::I32);
+                let shift = coerce_int_like_to_width(b, args[2], value_width);
+                let bits = int_const_for_width(b, value_width, value_width.bits() as i64);
+                let comp = b.isub(bits, shift);
+                let left = b.shl(i, shift);
+                let right = b.lshr(j, comp);
+                Some(b.bit_or(left, right))
+            } else {
+                None
+            }
+        }
+        "dshiftr" => {
+            // F2018 §16.9.60: combine i and j and shift right by `shift`,
+            // returning the rightmost `bits` bits.
+            //   dshiftr(i, j, s) = (j >> s) | (i << (bits - s))
+            if args.len() >= 3 {
+                let (i, j) = unify_int_widths(b, args[0], args[1]);
+                let value_width = int_width_of_value(b, i).unwrap_or(IntWidth::I32);
+                let shift = coerce_int_like_to_width(b, args[2], value_width);
+                let bits = int_const_for_width(b, value_width, value_width.bits() as i64);
+                let comp = b.isub(bits, shift);
+                let right = b.lshr(j, shift);
+                let left = b.shl(i, comp);
+                Some(b.bit_or(left, right))
+            } else {
+                None
+            }
+        }
         // ---- Math intrinsics → libm calls ----
         // Dispatch to sinf/sin based on argument type for F32/F64 correctness.
         "sin" | "dsin" | "cos" | "dcos" | "tan" | "dtan" | "asin" | "dasin" | "acos" | "dacos"
@@ -16462,6 +16583,57 @@ fn lower_intrinsic_subroutine(
                 .unwrap_or(IrType::Int(IntWidth::I8));
             let ptr_val = b.int_to_ptr(cptr, inner_pointee);
             b.store(ptr_val, fptr);
+            true
+        }
+
+        "mvbits" => {
+            // F2018 §16.9.155: call mvbits(from, frompos, len, to, topos)
+            // Copies len bits starting at bit `frompos` of `from` into
+            // `to` starting at bit `topos`.  Other bits of `to` are
+            // unchanged.  Both `from` and `to` must be the same integer
+            // kind; we pick the destination's width as authoritative
+            // since we have to write back through that pointer.
+            let to_arg = match args.get(3) {
+                Some(Some(arg)) => arg,
+                _ => return true,
+            };
+            let crate::ast::expr::SectionSubscript::Element(to_expr) = &to_arg.value else {
+                return true;
+            };
+            let to_ptr = lower_arg_by_ref_ctx(b, ctx, to_expr);
+            let to_width = match b.func().value_type(to_ptr) {
+                Some(IrType::Ptr(inner)) => match inner.as_ref() {
+                    IrType::Int(w) => *w,
+                    _ => IntWidth::I32,
+                },
+                _ => IntWidth::I32,
+            };
+            let from_val = nth_arg_val(b, ctx, args, 0, 0);
+            let from = coerce_int_like_to_width(b, from_val, to_width);
+            let frompos_val = nth_arg_val(b, ctx, args, 1, 0);
+            let frompos = coerce_int_like_to_width(b, frompos_val, to_width);
+            let len_val = nth_arg_val(b, ctx, args, 2, 0);
+            let len = coerce_int_like_to_width(b, len_val, to_width);
+            let topos_val = nth_arg_val(b, ctx, args, 4, 0);
+            let topos = coerce_int_like_to_width(b, topos_val, to_width);
+
+            let one = int_const_for_width(b, to_width, 1);
+            // (1 << len) - 1
+            let one_shl = b.shl(one, len);
+            let one_again = int_const_for_width(b, to_width, 1);
+            let len_mask = b.isub(one_shl, one_again);
+            // extracted = (from >> frompos) & len_mask
+            let shifted = b.lshr(from, frompos);
+            let extracted = b.bit_and(shifted, len_mask);
+            // shifted_dest = extracted << topos
+            let shifted_dest = b.shl(extracted, topos);
+            // dest_mask = len_mask << topos
+            let dest_mask = b.shl(len_mask, topos);
+            let inv_mask = b.bit_not(dest_mask);
+            let to_loaded = b.load_typed(to_ptr, IrType::Int(to_width));
+            let cleared = b.bit_and(to_loaded, inv_mask);
+            let updated = b.bit_or(cleared, shifted_dest);
+            b.store(updated, to_ptr);
             true
         }
 
