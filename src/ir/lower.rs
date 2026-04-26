@@ -26209,6 +26209,68 @@ fn lower_write_items_adv(
                 IrType::Void,
             );
         } else {
+            // Array-shaped expression items (e.g. `print *, A - B` with
+            // rank-N operands) must be iterated element-wise. The scalar
+            // BinaryOp fallback below would otherwise widen array
+            // descriptors to integer pointers and emit ISub on them,
+            // tripping IR verify. Try the descriptor lowering first; on
+            // success, walk the result and write each element with the
+            // appropriate scalar writer.
+            if matches!(
+                item.node,
+                Expr::BinaryOp { .. } | Expr::UnaryOp { .. } | Expr::ParenExpr { .. }
+            ) {
+                if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    item,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) {
+                    let writer = match &elem_ty {
+                        IrType::Int(IntWidth::I128) => "afs_write_int128",
+                        IrType::Int(IntWidth::I64) => "afs_write_int64",
+                        IrType::Int(_) => "afs_write_int",
+                        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+                        IrType::Float(_) => "afs_write_real",
+                        IrType::Bool => "afs_write_logical",
+                        _ => "afs_write_int",
+                    };
+                    let n = b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+                    let zero = b.const_i64(0);
+                    b.store(zero, i_addr);
+                    let bb_check = b.create_block("write_arr_expr_check");
+                    let bb_body = b.create_block("write_arr_expr_body");
+                    let bb_exit = b.create_block("write_arr_expr_exit");
+                    b.branch(bb_check, vec![]);
+                    b.set_block(bb_check);
+                    let i = b.load(i_addr);
+                    let done = b.icmp(CmpOp::Ge, i, n);
+                    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+                    b.set_block(bb_body);
+                    let i_val = b.load(i_addr);
+                    let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                    let one = b.const_i64(1);
+                    let next = b.iadd(i_val, one);
+                    b.store(next, i_addr);
+                    b.branch(bb_check, vec![]);
+                    b.set_block(bb_exit);
+                    continue;
+                }
+            }
             let val = lower_expr_ctx_tl(b, ctx, item);
             let ty = b
                 .func()
