@@ -19747,6 +19747,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
+                // Elemental subroutine call with array actuals: F2018 §15.8.3
+                // requires the call to be evaluated element-wise. Emit a loop
+                // that drives one scalar call per element, with copy-in/copy-out
+                // through per-iteration scalar temps for each array actual.
+                if try_lower_elemental_subroutine_call(b, ctx, name, &key, args, callee.span) {
+                    return;
+                }
                 // Try intrinsic subroutine lowering first.
                 if !lower_intrinsic_subroutine(b, ctx, &key, args) {
                     let procptr_target =
@@ -28825,6 +28832,242 @@ fn resolved_named_callee_is_elemental(
     st.find_symbol_any_scope(&resolved_name.to_lowercase())
         .map(|sym| sym.attrs.elemental)
         .unwrap_or(false)
+}
+
+/// F2018 §15.8.3 elemental subroutine call expansion.
+///
+/// When an elemental subroutine is called with one or more array actuals, the
+/// call is repeated element-wise. We emit a runtime loop, allocate a scalar
+/// temp for each array actual (per-iteration storage for the scalar dummy),
+/// pre-load each temp from the i'th element on entry to the body, recursively
+/// re-emit the call as a regular Stmt::Call against synthetic Name args
+/// pointing at the temps, and copy each temp back to the i'th element after
+/// the call to handle intent(out)/intent(inout) dummies. This is wasteful but
+/// correct for intent(in) too, since the writeback into the temp is a no-op
+/// the callee's read can't observe.
+///
+/// Returns `true` if the call was handled (caller should `return`), `false` to
+/// fall through to the regular non-elemental dispatch.
+fn try_lower_elemental_subroutine_call(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    callee_name: &str,
+    callee_key: &str,
+    args: &[crate::ast::expr::Argument],
+    span: crate::lexer::Span,
+) -> bool {
+    // Resolve generic dispatch to the specific being called.
+    let actual_vals: Vec<ValueId> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => generic_dispatch_probe_value(
+                b,
+                &ctx.locals,
+                e,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ),
+            _ => b.const_i32(0),
+        })
+        .collect();
+    let resolved_name = resolve_generic_call_actuals(
+        ctx.st,
+        b,
+        Some(&ctx.locals),
+        callee_name,
+        args,
+        &actual_vals,
+        Some(ctx.type_layouts),
+    )
+    .map(|c| c.name)
+    .unwrap_or_else(|| callee_name.to_string());
+    let resolved_key = resolved_name.to_lowercase();
+
+    // Check elemental.
+    let is_elemental = ctx
+        .st
+        .find_symbol_any_scope(&resolved_key)
+        .map(|s| s.attrs.elemental)
+        .unwrap_or(false)
+        || ctx.elemental_funcs.contains(&resolved_key)
+        || ctx.elemental_funcs.contains(callee_key);
+    if !is_elemental {
+        return false;
+    }
+
+    // Classify each arg. An array actual contributes a (descriptor, elem_ty)
+    // pair; a scalar actual is left to the regular call dispatch.
+    enum Class {
+        Scalar,
+        Array { desc: ValueId, elem_ty: IrType },
+    }
+    let mut classes: Vec<Class> = Vec::with_capacity(args.len());
+    let mut control_desc: Option<ValueId> = None;
+    for arg in args {
+        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+            return false;
+        };
+        if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            e,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        ) {
+            // Limit to numeric scalar element types we know how to load/store
+            // through the rank1_array_desc_elem helpers — no character or
+            // derived elemental dispatch yet.
+            let supported = matches!(&elem_ty, IrType::Int(_) | IrType::Float(_))
+                || matches!(&elem_ty,
+                    IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
+            if !supported {
+                return false;
+            }
+            if control_desc.is_none() {
+                control_desc = Some(desc);
+            }
+            classes.push(Class::Array { desc, elem_ty });
+        } else {
+            classes.push(Class::Scalar);
+        }
+    }
+    let Some(control_desc) = control_desc else {
+        // No array actuals — let the regular non-elemental dispatch handle it
+        // since the call is already scalar-shape conformant.
+        return false;
+    };
+
+    // Allocate per-iteration scalar temps for array actuals and register them
+    // as locals so the recursive Stmt::Call dispatch can resolve the synthetic
+    // Name(temp) arguments through ordinary by-ref passing.
+    let mut temps: Vec<Option<(String, ValueId, IrType)>> = Vec::with_capacity(classes.len());
+    let mut temp_names_to_clean: Vec<String> = Vec::new();
+    for (i, class) in classes.iter().enumerate() {
+        if let Class::Array { elem_ty, .. } = class {
+            let temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_elem_sub_arg", i);
+            let temp_addr = b.alloca(elem_ty.clone());
+            ctx.locals.insert(
+                temp_name.clone(),
+                LocalInfo {
+                    addr: temp_addr,
+                    ty: elem_ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                },
+            );
+            temp_names_to_clean.push(temp_name.clone());
+            temps.push(Some((temp_name, temp_addr, elem_ty.clone())));
+        } else {
+            temps.push(None);
+        }
+    }
+
+    // Mapped arg list: array actuals replaced by Name(temp); scalar actuals as-is.
+    let mapped_args: Vec<crate::ast::expr::Argument> = args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            if let Some((tname, _, _)) = &temps[i] {
+                crate::ast::expr::Argument {
+                    keyword: arg.keyword.clone(),
+                    value: crate::ast::expr::SectionSubscript::Element(synth_name_expr(
+                        tname, span,
+                    )),
+                }
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+
+    // Per-element loop.
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![control_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("elem_sub_check");
+    let bb_body = b.create_block("elem_sub_body");
+    let bb_exit = b.create_block("elem_sub_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let cur_idx = b.load(i_addr);
+
+    // Copy-in: load element[i] of each array actual into its scalar temp.
+    for (class, slot) in classes.iter().zip(temps.iter()) {
+        if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
+            let val = load_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx);
+            b.store(val, *addr);
+        }
+    }
+
+    // Re-enter Stmt::Call dispatch on a synthetic call against the temp Names.
+    // The synthetic stmt has only scalar actuals so the elemental check at the
+    // top of Stmt::Call falls through to ordinary dispatch and reuses every
+    // existing arg-passing rule (intent, hidden lengths, host closure, etc.).
+    let synthetic_callee = crate::ast::Spanned::new(
+        Expr::Name {
+            name: callee_name.to_string(),
+        },
+        span,
+    );
+    let synthetic_stmt = crate::ast::Spanned::new(
+        Stmt::Call {
+            callee: synthetic_callee,
+            args: mapped_args,
+        },
+        span,
+    );
+    lower_stmt(b, ctx, &synthetic_stmt);
+
+    // Copy-out: write the (possibly callee-modified) temp back to element[i].
+    // For intent(in) the writeback is a no-op redundancy; for intent(out)/
+    // intent(inout) it propagates the per-iteration update.
+    for (class, slot) in classes.iter().zip(temps.iter()) {
+        if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
+            let val = b.load_typed(*addr, elem_ty.clone());
+            store_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx, val);
+        }
+    }
+
+    // i++
+    let one = b.const_i64(1);
+    let next = b.iadd(cur_idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+
+    // Drop the synthetic temp locals so they don't leak into surrounding code.
+    for n in temp_names_to_clean {
+        ctx.locals.remove(&n);
+    }
+
+    true
 }
 
 fn lower_rank1_elemental_call_descriptor(
