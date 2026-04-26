@@ -12847,11 +12847,34 @@ fn operator_expr_type_info(
                 }
             }
             if let Expr::Name { name } = &callee.node {
-                st.lookup(&name.to_lowercase())
+                let key = name.to_lowercase();
+                st.lookup(&key)
                     .and_then(|sym| sym.type_info.clone())
                     .or_else(|| {
-                        st.find_symbol_any_scope(&name.to_lowercase())
+                        st.find_symbol_any_scope(&key)
                             .and_then(|sym| sym.type_info.clone())
+                    })
+                    // find_symbol_any_scope can latch onto a same-named
+                    // NamedInterface (type_info=None) before reaching the
+                    // Function — happens with cross-module generics like
+                    // stdlib_string_type's `reverse` masking
+                    // stdlib_ascii's `reverse` function. Walk every scope
+                    // explicitly to recover the Function's return type.
+                    .or_else(|| {
+                        for scope in st.all_scopes() {
+                            if let Some(sym) = scope.symbols.get(&key) {
+                                if matches!(
+                                    sym.kind,
+                                    crate::sema::symtab::SymbolKind::Function
+                                        | crate::sema::symtab::SymbolKind::Subroutine
+                                ) {
+                                    if let Some(ti) = sym.type_info.clone() {
+                                        return Some(ti);
+                                    }
+                                }
+                            }
+                        }
+                        None
                     })
                     .or_else(|| generic_function_call_type_info(expr, locals, st, type_layouts))
                     .or_else(|| local_intrinsic_call_type_info(expr, locals, st, type_layouts))
