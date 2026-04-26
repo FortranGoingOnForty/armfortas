@@ -162,6 +162,30 @@ pub enum ArmCond {
     Le, // signed >, <=
 }
 
+impl ArmCond {
+    /// The condition that takes the opposite branch — used by the
+    /// branch-relaxation pass when expanding a far `B.cond` into a
+    /// short `B.{!cond}` over an unconditional `B`. The pairs are
+    /// EQ/NE, HS/LO, MI/PL, HI/LS, GE/LT, GT/LE; involution is
+    /// guaranteed (`c.inverse().inverse() == c`).
+    pub fn inverse(self) -> ArmCond {
+        match self {
+            ArmCond::Eq => ArmCond::Ne,
+            ArmCond::Ne => ArmCond::Eq,
+            ArmCond::Hs => ArmCond::Lo,
+            ArmCond::Lo => ArmCond::Hs,
+            ArmCond::Mi => ArmCond::Pl,
+            ArmCond::Pl => ArmCond::Mi,
+            ArmCond::Hi => ArmCond::Ls,
+            ArmCond::Ls => ArmCond::Hi,
+            ArmCond::Ge => ArmCond::Lt,
+            ArmCond::Lt => ArmCond::Ge,
+            ArmCond::Gt => ArmCond::Le,
+            ArmCond::Le => ArmCond::Gt,
+        }
+    }
+}
+
 /// A machine operand.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MachineOperand {
@@ -378,6 +402,17 @@ impl MachineFunction {
         let id = MBlockId(self.next_block);
         self.next_block += 1;
         self.blocks.push(MachineBlock::new(id, label.into()));
+        id
+    }
+
+    /// Allocate a fresh block-id without inserting a block. The
+    /// caller is responsible for placing the block at the right
+    /// position in `self.blocks`. Used by passes that need physical
+    /// block adjacency (e.g. branch relaxation, which inserts a
+    /// skip block immediately after the source block).
+    pub fn next_block_id(&mut self) -> u32 {
+        let id = self.next_block;
+        self.next_block += 1;
         id
     }
 
