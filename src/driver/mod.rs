@@ -1270,6 +1270,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
+        if std::env::var_os("AFS_DUMP_BAD_IR").is_some() {
+            let path = std::env::temp_dir().join("afs_failed.ir");
+            let _ = std::fs::write(&path, crate::ir::printer::print_module(&ir_module));
+            eprintln!("afs: dumped failing IR to {}", path.display());
+        }
         let msg = ir_errors
             .iter()
             .map(|e| e.to_string())
