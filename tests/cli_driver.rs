@@ -22264,3 +22264,125 @@ fn allocatable_array_result_append_preserves_declared_rank() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn f77_statement_function_inlines_without_emitting_external_call() {
+    // F77 §15.4 statement function: `f(x) = x**2 + 1` defined in the
+    // declaration prologue. The call site `f(3.0)` must inline the
+    // body rather than emit an external `_f` reference (which the
+    // linker would reject because there is no `f` definition).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: f, x\n  f(x) = x**2 + 1.0\n  if (abs(f(3.0) - 10.0) > 1.0e-5) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("stmt_fn_basic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("statement function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "statement function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("statement function run failed");
+    assert!(
+        run.status.success(),
+        "statement function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected statement function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn f77_complex_statement_function_matches_blas_abssq_semantics() {
+    // BLAS-style statement function from stdlib_blas_level1.f90:
+    //   abssq(t) = real(t)**2 + aimag(t)**2
+    // For t=(3.0, 4.0) the result is 9 + 16 = 25.
+    let src = write_program(
+        "program p\n  implicit none\n  complex :: t\n  real :: abssq\n  abssq(t) = real(t)**2 + aimag(t)**2\n  if (abs(abssq(cmplx(3.0, 4.0)) - 25.0) > 1.0e-5) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("stmt_fn_complex_abssq", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex statement function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex statement function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex statement function run failed");
+    assert!(
+        run.status.success(),
+        "complex statement function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected complex statement function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn f77_statement_function_in_subroutine_inlines_per_scope() {
+    // Statement function defined inside a CONTAINS subroutine. The
+    // sub-scope's `cabs1` must not escape into a homonymous
+    // statement function in another scope, and the call site must
+    // inline against the local body.
+    let src = write_program(
+        "program p\n  implicit none\n  call go()\ncontains\n  subroutine go()\n    real :: cabs1\n    complex :: z\n    cabs1(z) = abs(real(z)) + abs(aimag(z))\n    if (abs(cabs1(cmplx(3.0, -4.0)) - 7.0) > 1.0e-5) error stop 1\n    print *, 'ok'\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("stmt_fn_subroutine", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("subroutine statement function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "subroutine statement function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("subroutine statement function run failed");
+    assert!(
+        run.status.success(),
+        "subroutine statement function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected subroutine statement function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
