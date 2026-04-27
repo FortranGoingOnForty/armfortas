@@ -512,6 +512,12 @@ pub struct SymbolAttrs {
     /// Sema populates this so consumers (notably SMP-body lowering)
     /// can recover full shape metadata without re-walking the AST decls.
     pub array_spec: Vec<ArraySpec>,
+    /// Subroutine/Function declared with `module` prefix inside a
+    /// submodule — the body of a separate module procedure declared
+    /// in the parent module's interface block. Codegen links these
+    /// under the parent module's name, not the submodule's, so call
+    /// sites match `_afs_modproc_<parent>_<proc>`.
+    pub is_separate_module_procedure: bool,
 }
 
 impl Default for SymbolAttrs {
@@ -534,6 +540,7 @@ impl Default for SymbolAttrs {
             elemental: false,
             result_rank: 0,
             array_spec: Vec::new(),
+            is_separate_module_procedure: false,
         }
     }
 }
