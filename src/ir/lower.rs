@@ -13456,11 +13456,19 @@ fn array_expr_elem_type_only(
         }
         Expr::ArrayConstructor { values, type_spec } => {
             // F2018 §7.4.4.2: array constructor element type comes from
-            // the optional type-spec, otherwise the first value.
+            // the optional type-spec, otherwise the first value. Bail
+            // out for character arrays — the probe uses elem_ty to build
+            // a typed null pointer for dispatch ranking, but character
+            // arrays carry a hidden length parameter that the standard
+            // type_info_to_ir_type mapping (which collapses to Int(I32))
+            // strips, breaking string-vs-char matching.
             let spec_ti = array_constructor_type_spec_info(type_spec.as_deref(), st);
             let ti = spec_ti.or_else(|| {
                 first_array_constructor_type_info(values, Some(locals), st, type_layouts)
             })?;
+            if matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }) {
+                return None;
+            }
             Some(type_info_to_ir_type(&ti))
         }
         Expr::FunctionCall { callee, args } => {
