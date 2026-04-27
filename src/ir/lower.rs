@@ -9826,8 +9826,15 @@ fn lower_char_intrinsic(
 
     match name {
         "len" => {
+            // F2018 §16.9.108: LEN returns default integer. Descriptor
+            // length is stored as I64; truncate to I32 so generic
+            // dispatch can match `integer` formals (kind=4).
             let (_, len) = lower_string_arg(b, arg_spanned(0)?);
-            Some(len)
+            let truncated = match b.func().value_type(len) {
+                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
+                _ => len,
+            };
+            Some(truncated)
         }
         "len_trim" => {
             let (ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
