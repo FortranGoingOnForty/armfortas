@@ -3732,7 +3732,7 @@ fn lower_unit(
                     &fname,
                     st,
                 );
-                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts, st);
                 install_globals_as_locals(
                     &mut b,
                     &mut ctx.locals,
@@ -4129,7 +4129,7 @@ fn lower_unit(
                     &func_name,
                     st,
                 );
-                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts, st);
                 install_globals_as_locals(
                     &mut b,
                     &mut ctx.locals,
@@ -4720,7 +4720,7 @@ fn lower_unit(
                         st,
                     );
                 }
-                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts);
+                install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts, st);
                 install_globals_as_locals(
                     &mut b,
                     &mut ctx.locals,
@@ -6036,12 +6036,37 @@ fn install_host_param_consts(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     host_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
 ) {
     for (name, value) in host_param_consts {
         if locals.contains_key(name) {
             continue;
         }
-        let ty = const_scalar_ir_type(*value);
+        // Prefer the declared type (e.g. `integer(int32), parameter`) over
+        // value-derived inference. Without this, a 0xdeadbeef PARAMETER
+        // declared kind=4 lands here as I64 because const_scalar_ir_type
+        // sees the unsigned bit pattern doesn't fit i32; later `kind()`
+        // and generic dispatch then both report the wrong width.
+        let declared_ty = st
+            .find_symbol_any_scope(name)
+            .and_then(|sym| sym.type_info.clone())
+            .and_then(|ti| match ti {
+                crate::sema::symtab::TypeInfo::Integer { kind: Some(k) } => match k {
+                    1 => Some(IrType::Int(IntWidth::I8)),
+                    2 => Some(IrType::Int(IntWidth::I16)),
+                    4 => Some(IrType::Int(IntWidth::I32)),
+                    8 => Some(IrType::Int(IntWidth::I64)),
+                    16 => Some(IrType::Int(IntWidth::I128)),
+                    _ => None,
+                },
+                crate::sema::symtab::TypeInfo::Real { kind: Some(k) } => match k {
+                    4 => Some(IrType::Float(FloatWidth::F32)),
+                    8 => Some(IrType::Float(FloatWidth::F64)),
+                    _ => None,
+                },
+                _ => None,
+            });
+        let ty = declared_ty.unwrap_or_else(|| const_scalar_ir_type(*value));
         let addr = b.alloca(ty.clone());
         locals.insert(
             name.clone(),
