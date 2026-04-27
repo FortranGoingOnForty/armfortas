@@ -9605,7 +9605,20 @@ fn first_array_constructor_expr(
 ) -> Option<&crate::ast::expr::SpannedExpr> {
     for value in values {
         match value {
-            crate::ast::expr::AcValue::Expr(expr) => return Some(expr),
+            crate::ast::expr::AcValue::Expr(expr) => {
+                // F2018 §7.8: nested array constructors `[[1,2,3], [4,5,6]]`
+                // flatten into the parent's element list. Descend into the
+                // inner constructor to find a leaf — without this, type
+                // inference reads the inner ArrayConstructor itself as the
+                // first element and falls back to the f32 default.
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    if let Some(leaf) = first_array_constructor_expr(inner) {
+                        return Some(leaf);
+                    }
+                    continue;
+                }
+                return Some(expr);
+            }
             crate::ast::expr::AcValue::ImpliedDo(ido) => {
                 if let Some(expr) = first_array_constructor_expr(&ido.values) {
                     return Some(expr);
@@ -26065,7 +26078,23 @@ fn lower_runtime_array_constructor_len(
     for value in values {
         let item_len = match value {
             crate::ast::expr::AcValue::Expr(expr) => {
-                if let Some((desc, _)) =
+                // F2018 §7.8: nested array constructors flatten into the
+                // parent. `[[1,2,3], [4,5,6]]` is a 6-element rank-1
+                // constructor, not a 2-element one. Recurse for the
+                // inner length so allocation sizes match the actual
+                // element count.
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    lower_runtime_array_constructor_len(
+                        b,
+                        locals,
+                        inner,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )?
+                } else if let Some((desc, _)) =
                     whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
                 {
                     b.call(
@@ -26211,18 +26240,71 @@ fn store_ac_values_into(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) {
-    let elem_bytes = ir_scalar_byte_size(elem_ty);
-    // Runtime byte offset. Starts at 0 and is bumped by elem_bytes
-    // after each store. Using an alloca (not a ValueId) lets the
-    // implied-do loop body update the offset across iterations.
+    // Runtime byte offset. Starts at 0 and is bumped after each store.
+    // Using an alloca (not a ValueId) lets the implied-do loop body
+    // update the offset across iterations, and lets nested
+    // ArrayConstructor recursions share contiguous offset state.
     let off_slot = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
     b.store(zero64, off_slot);
+    store_ac_values_at_off(
+        b,
+        locals,
+        dest_base,
+        elem_ty,
+        derived_type,
+        off_slot,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_ac_values_at_off(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_ty: &IrType,
+    derived_type: Option<&str>,
+    off_slot: ValueId,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) {
+    let elem_bytes = ir_scalar_byte_size(elem_ty);
+    let zero64 = b.const_i64(0);
     let step_bytes = b.const_i64(elem_bytes);
 
     for v in values {
         match v {
             crate::ast::expr::AcValue::Expr(e) => {
+                // F2018 §7.8: nested ArrayConstructor flattens — descend
+                // with the same dest_base/elem_ty/off_slot so contiguous
+                // storage continues across the recursion.
+                if let Expr::ArrayConstructor { values: inner, .. } = &e.node {
+                    store_ac_values_at_off(
+                        b,
+                        locals,
+                        dest_base,
+                        elem_ty,
+                        derived_type,
+                        off_slot,
+                        inner,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    continue;
+                }
                 if let Some((src_desc, _)) =
                     whole_array_expr_descriptor(b, locals, e, st, type_layouts)
                 {
@@ -26500,6 +26582,25 @@ fn store_ac_implied_do(
     for iv in inner {
         match iv {
             crate::ast::expr::AcValue::Expr(e) => {
+                // Nested ArrayConstructor inside an implied-do flattens
+                // per-iteration into the parent's contiguous storage.
+                if let Expr::ArrayConstructor { values: nested, .. } = &e.node {
+                    store_ac_values_at_off(
+                        b,
+                        &scratch_locals,
+                        dest_base,
+                        elem_ty,
+                        derived_type,
+                        off_slot,
+                        nested,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    continue;
+                }
                 let raw = lower_expr_full(
                     b,
                     &scratch_locals,
@@ -29603,6 +29704,14 @@ fn expr_contains_array_constructor(expr: &crate::ast::expr::SpannedExpr) -> bool
         }
         Expr::UnaryOp { operand, .. } => expr_contains_array_constructor(operand),
         Expr::ParenExpr { inner } => expr_contains_array_constructor(inner),
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| match &a.value {
+            crate::ast::expr::SectionSubscript::Element(e) => expr_contains_array_constructor(e),
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                start.as_ref().is_some_and(expr_contains_array_constructor)
+                    || end.as_ref().is_some_and(expr_contains_array_constructor)
+                    || stride.as_ref().is_some_and(expr_contains_array_constructor)
+            }
+        }),
         _ => false,
     }
 }
