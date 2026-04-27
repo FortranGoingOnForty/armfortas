@@ -1887,6 +1887,60 @@ pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> 
     }
 }
 
+/// SHAPE(array) → fresh rank-1 default-integer (i32) array of length
+/// `rank`, holding each dimension's extent. Allocates the destination
+/// via `afs_allocate_array`. F2018 §16.9.207.
+#[no_mangle]
+pub extern "C" fn afs_array_shape_int4(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+) {
+    if dst.is_null() || src.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let n = s.rank as i64;
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n,
+        stride: 1,
+    };
+    afs_allocate_array(dst, 4, 1, &dim as *const DimDescriptor, ptr::null_mut());
+    let d = unsafe { &mut *dst };
+    let base = d.base_addr as *mut i32;
+    for i in 0..s.rank as usize {
+        unsafe {
+            base.add(i).write(s.dims[i].extent() as i32);
+        }
+    }
+}
+
+/// SHAPE(array, kind=int64) → rank-1 i64 array of extents.
+#[no_mangle]
+pub extern "C" fn afs_array_shape_int8(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+) {
+    if dst.is_null() || src.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let n = s.rank as i64;
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n,
+        stride: 1,
+    };
+    afs_allocate_array(dst, 8, 1, &dim as *const DimDescriptor, ptr::null_mut());
+    let d = unsafe { &mut *dst };
+    let base = d.base_addr as *mut i64;
+    for i in 0..s.rank as usize {
+        unsafe {
+            base.add(i).write(s.dims[i].extent());
+        }
+    }
+}
+
 /// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
 #[no_mangle]
 pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
