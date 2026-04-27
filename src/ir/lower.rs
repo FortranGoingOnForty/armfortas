@@ -463,13 +463,16 @@ pub fn lower_file(
 }
 
 fn collect_local_owner_modules(units: &[SpannedUnit]) -> HashSet<String> {
+    // Only the parent module's TU should emit TBP-lookup thunks for
+    // types it owns. Submodule TUs see the same `owner_module` on
+    // shared layouts but must NOT re-emit the thunk, otherwise the
+    // linker reports duplicate symbols when both objects end up in
+    // the same archive (e.g. `_afs_tbplookup_stdlib_bitsets_bitset_64`
+    // appearing in both stdlib_bitsets.o and stdlib_bitsets_64.o).
     let mut out = HashSet::new();
     for unit in units {
-        match &unit.node {
-            ProgramUnit::Module { name, .. } | ProgramUnit::Submodule { parent: name, .. } => {
-                out.insert(name.to_lowercase());
-            }
-            _ => {}
+        if let ProgramUnit::Module { name, .. } = &unit.node {
+            out.insert(name.to_lowercase());
         }
     }
     out
