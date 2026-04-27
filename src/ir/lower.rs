@@ -30008,6 +30008,19 @@ fn try_lower_scalarized_subscript_array_assign(
     if dest_name.is_empty() || !expr_contains_array_refs_in_subscripts(value, &ctx.locals) {
         return false;
     }
+    // Scalarization synthesizes a single rank-1 DO loop, so a rank>1
+    // destination cannot be served by this path even when the dest is
+    // allocatable. Without this guard, a rank-2 LHS like
+    // `ah = conjg(transpose(a))` would be mis-rewritten to scalar
+    // form and the array intrinsics fall through to undefined externals.
+    let dest_rank = if dest_info.dims.is_empty() && local_uses_array_descriptor(dest_info) {
+        1
+    } else {
+        dest_info.dims.len()
+    };
+    if dest_rank != 1 {
+        return false;
+    }
     if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
         return false;
     }
@@ -32107,6 +32120,52 @@ fn lower_array_expr_descriptor(
                                     descriptor_params,
                                 ) {
                                     return Some((desc, elem_ty));
+                                }
+                            }
+                        }
+                    }
+                }
+                // F2018 §16.9.42: CONJG over a complex array. Without
+                // an explicit array path the elemental fallback emits
+                // an external `_conjg` for the whole-array call, which
+                // the linker can't resolve.
+                if name.eq_ignore_ascii_case("conjg") {
+                    if let Some(first_arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
+                            &first_arg.value
+                        {
+                            if let Some((src_desc, elem_ty)) = lower_array_expr_descriptor(
+                                b,
+                                locals,
+                                first_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ) {
+                                let is_complex = matches!(
+                                    &elem_ty,
+                                    IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+                                );
+                                if is_complex {
+                                    let result_desc = b.alloca(IrType::Array(
+                                        Box::new(IrType::Int(IntWidth::I8)),
+                                        384,
+                                    ));
+                                    let zero = b.const_i32(0);
+                                    let sz384 = b.const_i64(384);
+                                    b.call(
+                                        FuncRef::External("memset".into()),
+                                        vec![result_desc, zero, sz384],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    b.call(
+                                        FuncRef::External("afs_array_conjg".into()),
+                                        vec![src_desc, result_desc],
+                                        IrType::Void,
+                                    );
+                                    return Some((result_desc, elem_ty));
                                 }
                             }
                         }
