@@ -2121,10 +2121,26 @@ fn collect_host_references(
     host_decls: &[crate::ast::decl::SpannedDecl],
     refs: &mut std::collections::HashSet<String>,
 ) {
-    // Collect host-declared names.
+    // Collect host-declared names — but skip PARAMETERs. Parameters
+    // are compile-time constants that get inlined directly when
+    // referenced; they have no host alloca/global to thread through
+    // a closure. Threading them as host-association args sends a
+    // wild pointer that the contained sub then dereferences, which
+    // is exactly the realworld_seed_overwrite failure mode (host's
+    // `n` parameter constant got forwarded as the loop upper bound,
+    // pulling in the host's `i` slot via stale ABI offset).
     let mut host_names = std::collections::HashSet::new();
     for d in host_decls {
-        if let Decl::TypeDecl { entities, .. } = &d.node {
+        if let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &d.node
+        {
+            let is_parameter = attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Parameter));
+            if is_parameter {
+                continue;
+            }
             for e in entities {
                 host_names.insert(e.name.to_lowercase());
             }
