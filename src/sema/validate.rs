@@ -2893,7 +2893,8 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "kind" | "selected_int_kind" | "selected_real_kind" |
         "size" | "shape" | "lbound" | "ubound" | "allocated" | "associated" |
         "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
-        "sum" | "product" | "maxval" | "minval" | "count" | "any" | "all" |
+        "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
+        "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "matmul" | "dot_product" | "transpose" |
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
         "maxexponent" | "minexponent" | "digits" | "bit_size" |

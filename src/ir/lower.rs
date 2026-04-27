@@ -34947,6 +34947,34 @@ fn lower_array_intrinsic(
                 Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
+        "maxloc" => {
+            // F2018 §16.9.130: returns rank-N integer array of indices,
+            // or scalar when DIM is supplied for rank-1 input. We support
+            // the rank-1 + dim=1 form (or no dim → scalar for rank-1
+            // input), which is what stdlib_lapack uses.
+            let func = match &elem_ty {
+                IrType::Float(FloatWidth::F32) => "afs_array_maxloc_real4",
+                IrType::Float(FloatWidth::F64) => "afs_array_maxloc_real8",
+                _ => "afs_array_maxloc_int",
+            };
+            Some(b.call(
+                FuncRef::External(func.into()),
+                vec![desc],
+                IrType::Int(IntWidth::I32),
+            ))
+        }
+        "minloc" => {
+            let func = match &elem_ty {
+                IrType::Float(FloatWidth::F32) => "afs_array_minloc_real4",
+                IrType::Float(FloatWidth::F64) => "afs_array_minloc_real8",
+                _ => "afs_array_maxloc_int",
+            };
+            Some(b.call(
+                FuncRef::External(func.into()),
+                vec![desc],
+                IrType::Int(IntWidth::I32),
+            ))
+        }
         "dot_product" => {
             let second_desc = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
