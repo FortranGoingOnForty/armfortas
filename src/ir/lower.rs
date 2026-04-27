@@ -32112,6 +32112,75 @@ fn lower_array_expr_descriptor(
                         }
                     }
                 }
+                // F2018 §16.9.207: SHAPE returns a fresh rank-1 integer
+                // array of the input's extents. Routes through
+                // lower_array_intrinsic which allocates and fills it,
+                // so callers like `minval(shape(A))` get a descriptor
+                // instead of an unresolved external `_shape` call.
+                if name.eq_ignore_ascii_case("shape") {
+                    if let Some(first_arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
+                            &first_arg.value
+                        {
+                            if lower_array_expr_descriptor(
+                                b,
+                                locals,
+                                first_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                            .is_some()
+                                || locals
+                                    .get(
+                                        &if let Expr::Name { name } = &first_expr.node {
+                                            name.to_lowercase()
+                                        } else {
+                                            String::new()
+                                        },
+                                    )
+                                    .map(|i| local_is_array_like(i))
+                                    .unwrap_or(false)
+                            {
+                                if let Some(desc) = lower_array_intrinsic(
+                                    b,
+                                    locals,
+                                    "shape",
+                                    args,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                ) {
+                                    let kind_is_i64 = args.get(1).and_then(|a| {
+                                        if let crate::ast::expr::SectionSubscript::Element(e) =
+                                            &a.value
+                                        {
+                                            if let Expr::IntegerLiteral { text, .. } = &e.node {
+                                                text.split('_')
+                                                    .next()
+                                                    .and_then(|s| s.parse::<i64>().ok())
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }) == Some(8);
+                                    let elem_ty = if kind_is_i64 {
+                                        IrType::Int(IntWidth::I64)
+                                    } else {
+                                        IrType::Int(IntWidth::I32)
+                                    };
+                                    return Some((desc, elem_ty));
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if let Some(result) = lower_rank1_elemental_call_descriptor(
                 b,
@@ -34802,6 +34871,41 @@ fn lower_array_intrinsic(
             b.call(
                 FuncRef::External(func.into()),
                 vec![desc, result_desc],
+                IrType::Void,
+            );
+            Some(result_desc)
+        }
+        "shape" => {
+            // SHAPE(array [, kind]) → fresh rank-1 default-integer (or
+            // KIND-specified) array of extents.  F2018 §16.9.207.
+            // Optional KIND= argument selects i32 (kind 4) vs i64 (kind 8).
+            let kind = args.get(1).and_then(|a| {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                    if let Expr::IntegerLiteral { text, .. } = &e.node {
+                        text.split('_').next().and_then(|s| s.parse::<i64>().ok())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let zero = b.const_i32(0);
+            let sz384 = b.const_i64(384);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![result_desc, zero, sz384],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            let func = if matches!(kind, Some(8)) {
+                "afs_array_shape_int8"
+            } else {
+                "afs_array_shape_int4"
+            };
+            b.call(
+                FuncRef::External(func.into()),
+                vec![result_desc, desc],
                 IrType::Void,
             );
             Some(result_desc)
