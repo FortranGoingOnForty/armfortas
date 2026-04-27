@@ -16335,12 +16335,14 @@ fn ir_types_dispatch_equal(decl: &IrType, actual: &IrType) -> bool {
         (IrType::Int(a), IrType::Int(c)) => a == c,
         (IrType::Float(a), IrType::Float(c)) => a == c,
         (IrType::Bool, IrType::Bool) => true,
-        // logical(1) lowers to Int(I8); accept the cross-pair so a
-        // `logical(int8)` formal matches a `logical(int8)` actual whose
-        // IR type happens to render as I8 (or vice versa for the
-        // reverse pairing where the actual carries the Bool tag).
-        (IrType::Bool, IrType::Int(IntWidth::I8))
-        | (IrType::Int(IntWidth::I8), IrType::Bool) => true,
+        // F2018 §7.4.4: a `logical` value may be carried by the IR as
+        // Bool, I8 (kind=1), I16 (kind=2), I32 (kind=4 / default), or I64
+        // (kind=8) depending on context — comparison ops produce I32 when
+        // the comparison was over int32 actuals, while the formal is
+        // typically `logical` (Bool). Accept any Bool↔Int cross-pair so
+        // dispatch matches `logical` formals against logical actuals
+        // whatever their carrier width.
+        (IrType::Bool, IrType::Int(_)) | (IrType::Int(_), IrType::Bool) => true,
         // Callers pass by-reference for non-VALUE dummies, so the
         // actual IR type is often Ptr(T) while the declared is T.
         (decl, IrType::Ptr(p)) => ir_types_dispatch_equal(decl, p),
