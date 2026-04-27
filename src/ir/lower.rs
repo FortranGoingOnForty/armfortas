@@ -19938,8 +19938,25 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             } else {
                                                 false
                                             };
+                                        // F2018 §16.9: transformational intrinsics that
+                                        // synthesize a fresh array result (RESHAPE, MATMUL,
+                                        // TRANSPOSE, SHAPE).  Routing through
+                                        // lower_array_assign lets lower_array_expr_descriptor's
+                                        // dedicated arms allocate and fill the descriptor
+                                        // instead of the generic call path emitting
+                                        // unresolved `_reshape`/`_transpose` externals.
+                                        let callee_is_transformational_intrinsic =
+                                            if let Expr::Name { name: cname } = &callee.node {
+                                                matches!(
+                                                    cname.to_ascii_lowercase().as_str(),
+                                                    "reshape" | "matmul" | "transpose" | "shape"
+                                                )
+                                            } else {
+                                                false
+                                            };
                                         if callee_is_local_array
                                             || callee_is_elemental_array_intrinsic
+                                            || callee_is_transformational_intrinsic
                                         {
                                             lower_array_assign(b, ctx, name, &info, value);
                                             return;
@@ -30532,16 +30549,40 @@ fn lower_reshape_array_expr_descriptor(
         return None;
     };
 
-    let (source_desc, elem_ty) = lower_array_expr_descriptor(
-        b,
-        locals,
-        source_expr,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    )?;
+    // ArrayConstructor sources need explicit materialization: the
+    // standard `lower_array_expr_descriptor` path skips them so bulk
+    // assignment plans handle them, but RESHAPE consumes the descriptor
+    // directly. Try materialization first; fall back to the regular
+    // descriptor path for Names, intrinsic calls, etc.
+    let (source_desc, elem_ty) = if let Expr::ArrayConstructor { values, .. } = &source_expr.node {
+        let elem_ty = first_array_constructor_type_info(values, Some(locals), st, type_layouts)
+            .map(|ti| type_info_to_ir_type(&ti))
+            .unwrap_or(IrType::Float(FloatWidth::F32));
+        let desc = lower_runtime_array_constructor_descriptor(
+            b,
+            locals,
+            &elem_ty,
+            None,
+            values,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?;
+        (desc, elem_ty)
+    } else {
+        lower_array_expr_descriptor(
+            b,
+            locals,
+            source_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?
+    };
     let extents = reshape_shape_extents(shape_expr, st)?;
     if extents.is_empty() {
         return None;
