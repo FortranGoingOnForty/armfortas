@@ -22347,6 +22347,49 @@ fn f77_complex_statement_function_matches_blas_abssq_semantics() {
 }
 
 #[test]
+fn nested_array_constructor_reshape_lowers_through_descriptor_path() {
+    // F2018 §7.8: nested array constructors flatten into the parent.
+    // Stdlib's `example_cholesky` writes `reshape([[6,15,55], [15,55,225],
+    // [55,225,979]], [3,3])` — without nested-AC support the lowering
+    // falls through to a scalar broadcast that emits an undefined
+    // external `_reshape` reference. Verify the matrix populates with
+    // column-major ordering.
+    let src = write_program(
+        "program p\n  implicit none\n  real, dimension(3,3) :: A\n  A = reshape( [ [6.0, 15.0, 55.0], &\n                 [15.0, 55.0, 225.0], &\n                 [55.0, 225.0, 979.0] ], [3,3] )\n  if (abs(A(1,1) -   6.0) > 1.0e-3) error stop 1\n  if (abs(A(2,2) -  55.0) > 1.0e-3) error stop 2\n  if (abs(A(3,3) - 979.0) > 1.0e-3) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_ac_reshape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested AC reshape compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested AC reshape compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nested AC reshape run failed");
+    assert!(
+        run.status.success(),
+        "nested AC reshape run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected nested AC reshape output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn f77_statement_function_in_subroutine_inlines_per_scope() {
     // Statement function defined inside a CONTAINS subroutine. The
     // sub-scope's `cabs1` must not escape into a homonymous
