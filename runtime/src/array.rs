@@ -2396,6 +2396,181 @@ pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i64 {
     }
 }
 
+/// MAXLOC(array, dim=1) for rank-1 input — returns 1-based index of the
+/// maximum element (real(4)). F2018 §16.9.130. Dispatches on elem_size.
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real4(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
+    let mut max = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v > max {
+            max = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real8(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut max = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v > max {
+            max = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let mut idx = 0usize;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+    }
+    (idx as i32) + 1
+}
+
+/// MINLOC(array) for rank-1 input — analogous to MAXLOC.
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real4(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
+    let mut min = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v < min {
+            min = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real8(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut min = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v < min {
+            min = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
+}
+
 /// TRANSPOSE(source, result) — matrix transpose (real(8) version).
 /// source is (m x n), result is (n x m). Both descriptors must be allocated.
 #[no_mangle]
