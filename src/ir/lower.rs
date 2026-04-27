@@ -9837,12 +9837,14 @@ fn lower_char_intrinsic(
             Some(truncated)
         }
         "len_trim" => {
+            // F2018 §16.9.109: LEN_TRIM returns default integer.
             let (ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
-            Some(b.call(
+            let raw = b.call(
                 FuncRef::External("afs_len_trim".into()),
                 vec![ptr, len_val],
                 IrType::Int(IntWidth::I64),
-            ))
+            );
+            Some(b.int_trunc(raw, IntWidth::I32))
         }
         "ichar" | "iachar" => {
             let (ptr, _) = lower_string_arg(b, arg_spanned(0)?);
@@ -9879,40 +9881,46 @@ fn lower_char_intrinsic(
         }
         "new_line" => Some(b.const_string(b"\n")),
         "index" => {
+            // F2018 §16.9.93: INDEX returns default integer.
             let (hay_ptr, hay_len_val) = lower_string_arg(b, arg_spanned(0)?);
             let (needle_ptr, needle_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
-            Some(b.call(
+            let raw = b.call(
                 FuncRef::External("afs_index".into()),
                 vec![hay_ptr, hay_len_val, needle_ptr, needle_len_val, back_val],
                 IrType::Int(IntWidth::I64),
-            ))
+            );
+            Some(b.int_trunc(raw, IntWidth::I32))
         }
         "scan" => {
+            // F2018 §16.9.169: SCAN returns default integer.
             let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
             let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
-            Some(b.call(
+            let raw = b.call(
                 FuncRef::External("afs_scan".into()),
                 vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
                 IrType::Int(IntWidth::I64),
-            ))
+            );
+            Some(b.int_trunc(raw, IntWidth::I32))
         }
         "verify" => {
+            // F2018 §16.9.213: VERIFY returns default integer.
             let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
             let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
             let back_val = arg_spanned(2)
                 .map(|e| lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
-            Some(b.call(
+            let raw = b.call(
                 FuncRef::External("afs_verify".into()),
                 vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
                 IrType::Int(IntWidth::I64),
-            ))
+            );
+            Some(b.int_trunc(raw, IntWidth::I32))
         }
         "lge" | "lgt" | "lle" | "llt" => {
             let (lhs_ptr, lhs_len) = lower_string_arg(b, arg_spanned(0)?);
