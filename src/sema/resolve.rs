@@ -939,11 +939,19 @@ fn detect_statement_functions(
         }
 
         // All checks passed: convert the symbol kind, record the body.
+        // F77 §15.4 statement functions evaluate a single expression
+        // with no side effects, so they're pure by construction. Mark
+        // `pure` (and `elemental` — statement functions broadcast
+        // naturally over array actuals though stdlib only uses scalar
+        // calls) so PURE-procedure callers like the BLAS rotation
+        // routines validate cleanly.
         {
             let scope = st.scope_mut(scope_id);
             if let Some(sym) = scope.symbols.get_mut(&key) {
                 sym.kind = SymbolKind::Function;
                 sym.arg_names = params.clone();
+                sym.attrs.pure = true;
+                sym.attrs.elemental = true;
             }
         }
         st.statement_functions.insert(
