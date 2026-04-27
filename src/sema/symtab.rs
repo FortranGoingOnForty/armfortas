@@ -5,17 +5,36 @@
 //! IMPORT. Handles implicit typing and case-insensitive lookup.
 
 use crate::ast::decl::ArraySpec;
+use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
 use std::collections::HashMap;
 
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
 
+/// F77 §15.4 statement function: a single-line function defined inside
+/// the host procedure's declaration prologue, scoped to that procedure
+/// only. Stored on the SymbolTable as a side table so lowering can skip
+/// the recognized definition statement and inline-substitute call sites.
+#[derive(Debug, Clone)]
+pub struct StatementFunctionDef {
+    /// Dummy parameter names (lowercase), in declaration order.
+    pub params: Vec<String>,
+    /// Body expression, exactly as written on the RHS of `name(...) = expr`.
+    pub body: SpannedExpr,
+    /// Declared result type (from the `type :: name` declaration).
+    pub result_type: TypeInfo,
+}
+
 /// The symbol table — manages all scopes in a compilation.
 #[derive(Debug)]
 pub struct SymbolTable {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) current: ScopeId,
+    /// (scope_id, lowercase fname) → statement function definition.
+    /// Populated by sema's `detect_statement_functions` pass during
+    /// `resolve_unit` for Subroutine/Function/Program arms.
+    pub statement_functions: HashMap<(ScopeId, String), StatementFunctionDef>,
 }
 
 impl SymbolTable {
@@ -35,7 +54,37 @@ impl SymbolTable {
         Self {
             scopes: vec![global],
             current: 0,
+            statement_functions: HashMap::new(),
         }
+    }
+
+    /// Lookup a statement function by (scope, name). Caller passes
+    /// the scope where the call site appears; we walk up the parent
+    /// chain so a statement function defined in the host is visible
+    /// to nested constructs (DO/IF/SELECT bodies don't get their own
+    /// procedure scope, so this typically resolves at the same scope).
+    pub fn lookup_statement_function(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<&StatementFunctionDef> {
+        let key = name.to_lowercase();
+        let mut cur = Some(scope_id);
+        while let Some(sid) = cur {
+            if let Some(def) = self.statement_functions.get(&(sid, key.clone())) {
+                return Some(def);
+            }
+            // Statement functions are scope-local to the containing
+            // procedure (Subroutine/Function/Program). Stop walking
+            // when we leave a procedure scope.
+            match self.scopes[sid].kind {
+                ScopeKind::Subroutine(_)
+                | ScopeKind::Function(_)
+                | ScopeKind::Program(_) => return None,
+                _ => cur = self.scopes[sid].parent,
+            }
+        }
+        None
     }
 }
 
