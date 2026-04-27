@@ -13454,6 +13454,15 @@ fn array_expr_elem_type_only(
                 None
             }
         }
+        Expr::ArrayConstructor { values, type_spec } => {
+            // F2018 §7.4.4.2: array constructor element type comes from
+            // the optional type-spec, otherwise the first value.
+            let spec_ti = array_constructor_type_spec_info(type_spec.as_deref(), st);
+            let ti = spec_ti.or_else(|| {
+                first_array_constructor_type_info(values, Some(locals), st, type_layouts)
+            })?;
+            Some(type_info_to_ir_type(&ti))
+        }
         Expr::FunctionCall { callee, args } => {
             // Section subscript on an array name (`a(i:)`, `a(:)`,
             // `a(1:n:2)`) — the section result's element type is the
@@ -13469,6 +13478,39 @@ fn array_expr_elem_type_only(
                     if local_is_array_like(info) && has_range {
                         return Some(info.ty.clone());
                     }
+                }
+                // F2018 §16.9: transformational intrinsics that
+                // synthesize a fresh array result.  Recognize them
+                // so generic dispatch can probe their element type
+                // without lowering the full expression (which would
+                // emit IR side-effects per probe).
+                let lname = name.to_ascii_lowercase();
+                match lname.as_str() {
+                    "reshape" | "transpose" => {
+                        if let Some(arg) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                return array_expr_elem_type_only(locals, e, st, type_layouts);
+                            }
+                        }
+                    }
+                    "matmul" => {
+                        if let Some(arg) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                return array_expr_elem_type_only(locals, e, st, type_layouts);
+                            }
+                        }
+                    }
+                    "shape" => {
+                        return Some(IrType::Int(IntWidth::I32));
+                    }
+                    "conjg" => {
+                        if let Some(arg) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                return array_expr_elem_type_only(locals, e, st, type_layouts);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             None
