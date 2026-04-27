@@ -2043,6 +2043,7 @@ fn process_contains(
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
+        let host_is_submodule = matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
                 name, prefix, bind, ..
@@ -2054,10 +2055,15 @@ fn process_contains(
                     || prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                let is_smp = host_is_submodule
+                    && prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
                     binding_label: normalized_bind_name(bind.as_ref(), name),
+                    is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -2111,6 +2117,10 @@ fn process_contains(
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                 let result_attrs = function_result_attrs(name, result, decls);
+                let fn_is_smp = host_is_submodule
+                    && prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
                 let fn_attrs = SymbolAttrs {
                     allocatable: result_attrs.allocatable,
                     pointer: result_attrs.pointer,
@@ -2118,6 +2128,7 @@ fn process_contains(
                     elemental: fn_elemental,
                     binding_label: normalized_bind_name(bind.as_ref(), name),
                     result_rank: result_attrs.result_rank,
+                    is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
