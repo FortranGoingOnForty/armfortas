@@ -251,7 +251,10 @@ fn generic_interface_transitive_use() {
 
 #[test]
 fn module_private_default() {
-    // priv_val should not be accessible; only pub_val.
+    // F2008 §12.2.3.2: submodules of a module see *all* parent entities,
+    // including the privates. The .amod must therefore round-trip private
+    // module variables — but tagged `private` so module-level USE
+    // associations reject them while submodule host association accepts.
     let compiler = find_compiler();
     let dir = unique_dir();
     let mod_f90 = dir.join("mod.f90");
@@ -262,12 +265,22 @@ fn module_private_default() {
     ).unwrap();
     compile_file(&compiler, &mod_f90, &mod_o, None);
 
-    // Check .amod only has pub_val.
     let amod = std::fs::read_to_string(dir.join("priv_mod.amod")).unwrap();
-    assert!(amod.contains("pub_val"), "pub_val should be in .amod");
+    let pub_line = amod
+        .lines()
+        .find(|l| l.contains("pub_val"))
+        .expect("pub_val should appear in .amod");
     assert!(
-        !amod.contains("priv_val"),
-        "priv_val should NOT be in .amod"
+        !pub_line.contains("private"),
+        "pub_val should not carry the `private` annotation: {pub_line}"
+    );
+    let priv_line = amod
+        .lines()
+        .find(|l| l.contains("priv_val"))
+        .expect("priv_val should appear in .amod (with `private` annotation) so submodule host association can resolve it");
+    assert!(
+        priv_line.contains("private"),
+        "priv_val must be tagged `private` in the .amod: {priv_line}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
