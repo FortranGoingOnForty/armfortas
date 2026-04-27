@@ -29928,6 +29928,16 @@ fn is_array_reducing_intrinsic(name: &str) -> bool {
             | "iparity"
             | "parity"
             | "findloc"
+            // Whole-array inquiry intrinsics: their first arg is the
+            // array itself, not an elementwise operand. Scalarizing
+            // them rewrites `size(x, dim)` to `size(x(i,j), dim)`,
+            // which then falls through to a generic external `_size`
+            // call that the linker can't resolve.
+            | "size"
+            | "lbound"
+            | "ubound"
+            | "shape"
+            | "rank"
             // stdlib_intrinsics aliases used by stdlib internally.
             | "stdlib_sum"
             | "stdlib_sum_kahan"
