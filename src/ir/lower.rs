@@ -14401,9 +14401,41 @@ fn lowered_scope_symbol_name(
                         internal_funcs,
                     ))
                 }
-                crate::sema::symtab::ScopeKind::Module(module_name)
-                | crate::sema::symtab::ScopeKind::Submodule(module_name) => {
+                crate::sema::symtab::ScopeKind::Module(module_name) => {
                     Some(module_procedure_symbol_name(module_name, name))
+                }
+                crate::sema::symtab::ScopeKind::Submodule(submod_name) => {
+                    // F2018 §11.2.3: a separate-module-procedure body
+                    // declared in the parent module's interface block
+                    // links under the parent module's name, while plain
+                    // helpers contained in the submodule keep the
+                    // submodule prefix. Sema flags SMP bodies on the
+                    // procedure symbol's attrs at definition time;
+                    // consult that flag here.
+                    let lower_name = name.to_lowercase();
+                    let is_smp = parent_scope
+                        .symbols
+                        .get(&lower_name)
+                        .map(|sym| sym.attrs.is_separate_module_procedure)
+                        .unwrap_or(false);
+                    if is_smp {
+                        // Walk the submodule's `is_submodule_access`
+                        // USE entry to find the parent module's name.
+                        let parent_lc = parent_scope
+                            .use_associations
+                            .iter()
+                            .find(|u| u.is_submodule_access)
+                            .and_then(|u| match &st.scope(u.source_scope).kind {
+                                crate::sema::symtab::ScopeKind::Module(n) => {
+                                    Some(n.to_lowercase())
+                                }
+                                _ => None,
+                            });
+                        if let Some(parent_lc) = parent_lc {
+                            return Some(module_procedure_symbol_name(&parent_lc, name));
+                        }
+                    }
+                    Some(module_procedure_symbol_name(submod_name, name))
                 }
                 _ => None,
             }
@@ -14446,10 +14478,30 @@ fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> Stri
         sym.kind,
         crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine
     ) {
-        match &st.scope(sym.scope).kind {
-            crate::sema::symtab::ScopeKind::Module(module_name)
-            | crate::sema::symtab::ScopeKind::Submodule(module_name) => {
+        let scope = st.scope(sym.scope);
+        match &scope.kind {
+            crate::sema::symtab::ScopeKind::Module(module_name) => {
                 return module_procedure_symbol_name(module_name, &sym.name);
+            }
+            crate::sema::symtab::ScopeKind::Submodule(submod_name) => {
+                // F2018 §11.2.3: separate module procedure bodies link
+                // under the parent module's name, not the submodule's.
+                if sym.attrs.is_separate_module_procedure {
+                    if let Some(parent_lc) = scope
+                        .use_associations
+                        .iter()
+                        .find(|u| u.is_submodule_access)
+                        .and_then(|u| match &st.scope(u.source_scope).kind {
+                            crate::sema::symtab::ScopeKind::Module(n) => {
+                                Some(n.to_lowercase())
+                            }
+                            _ => None,
+                        })
+                    {
+                        return module_procedure_symbol_name(&parent_lc, &sym.name);
+                    }
+                }
+                return module_procedure_symbol_name(submod_name, &sym.name);
             }
             _ => {}
         }
