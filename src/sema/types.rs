@@ -474,6 +474,95 @@ fn resolve_intrinsic_kind_call_arg(
     }
 }
 
+/// Resolve a typed-array-constructor type spec rendered as a string
+/// (e.g. `"real(dp)"`, `"integer"`, `"complex(8)"`) into a
+/// `FortranType`. Returns None when the head word isn't recognised.
+///
+/// The parser stores AC type specs as the rendered token slice, not
+/// as an AST `TypeSpec`, so we handle the few canonical forms here
+/// rather than re-running the parser. Kind names are looked up in
+/// the symbol table for parameter-named kinds like `dp`/`sp`.
+pub fn type_spec_to_fortran_type(
+    spec: &str,
+    symtab: &super::symtab::SymbolTable,
+) -> Option<FortranType> {
+    let s = spec.trim().to_ascii_lowercase();
+
+    // Pull a parenthesised kind expression off the tail, if any.
+    // Returns (head_without_parens, kind_inside_parens).
+    let split_kind = |head: &str| -> (String, Option<String>) {
+        if let Some(open) = head.find('(') {
+            if head.ends_with(')') {
+                let body = &head[open + 1..head.len() - 1];
+                let pre = head[..open].trim().to_string();
+                return (pre, Some(body.trim().to_string()));
+            }
+        }
+        (head.to_string(), None)
+    };
+
+    let resolve_kind = |inside: &str| -> Option<u8> {
+        // Strip an optional `kind=` prefix; tolerate whitespace.
+        let trimmed = inside.trim();
+        let body = if let Some(rest) = trimmed.strip_prefix("kind") {
+            rest.trim_start().strip_prefix('=')?.trim_start()
+        } else {
+            trimmed
+        };
+        // Numeric literal first, otherwise look up as a parameter name.
+        if let Ok(k) = body.parse::<u8>() {
+            return Some(k);
+        }
+        symtab
+            .find_symbol_any_scope(body)
+            .and_then(|sym| sym.const_value)
+            .and_then(|v| u8::try_from(v).ok())
+    };
+
+    // Multi-word forms first.
+    if s == "double precision" {
+        return Some(FortranType::Real { kind: 8 });
+    }
+    if s == "double complex" {
+        return Some(FortranType::Complex { kind: 8 });
+    }
+    if s == "class(*)" {
+        return Some(FortranType::UnlimitedPoly);
+    }
+    if s == "type(*)" {
+        return Some(FortranType::AssumedType);
+    }
+
+    let (head, inside) = split_kind(&s);
+    let kind = inside.as_deref().and_then(resolve_kind);
+
+    match head.as_str() {
+        "integer" => Some(FortranType::Integer {
+            kind: kind.unwrap_or(4),
+        }),
+        "real" => Some(FortranType::Real {
+            kind: kind.unwrap_or(4),
+        }),
+        "complex" => Some(FortranType::Complex {
+            kind: kind.unwrap_or(4),
+        }),
+        "logical" => Some(FortranType::Logical {
+            kind: kind.unwrap_or(4),
+        }),
+        "character" => Some(FortranType::Character {
+            kind: 1,
+            len: CharLen::Unknown,
+        }),
+        "type" => inside.map(|name| FortranType::Derived {
+            name: name.trim().to_lowercase(),
+        }),
+        "class" => inside.map(|name| FortranType::ClassOf {
+            base: name.trim().to_lowercase(),
+        }),
+        _ => None,
+    }
+}
+
 /// Compute the type of an expression given a symbol table context.
 /// Returns Unknown for expressions that can't be resolved without more context.
 pub fn expr_type(
@@ -662,10 +751,18 @@ pub fn expr_type(
 
         // Array constructor — type of first element (all elements should match)
         Expr::ArrayConstructor { values, type_spec } => {
-            if type_spec.is_some() {
-                // Typed array constructor — would need to resolve type_spec
-                FortranType::Unknown
-            } else if let Some(crate::ast::expr::AcValue::Expr(first)) = values.first() {
+            // F2018 §7.8: a typed array constructor `[T :: ...]` has element
+            // type T regardless of the element expressions' types; without
+            // resolving it here, downstream callers (intrinsic dispatch in
+            // particular) see Unknown and can't pick the right specific —
+            // e.g. `.det.reshape([real(dp)::1,2,3,4],[2,2])` would dispatch
+            // to the complex specific.
+            if let Some(ts) = type_spec {
+                if let Some(fty) = type_spec_to_fortran_type(ts, symtab) {
+                    return fty;
+                }
+            }
+            if let Some(crate::ast::expr::AcValue::Expr(first)) = values.first() {
                 expr_type(first, symtab)
             } else {
                 FortranType::Unknown
