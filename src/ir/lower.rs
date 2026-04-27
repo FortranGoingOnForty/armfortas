@@ -39384,7 +39384,6 @@ fn lower_expr_full(
                                     })
                                     .unwrap_or(false)
                             })
-                            .or_else(|| sym.arg_names.first())
                             .cloned();
                         if let Some(specific) = chosen {
                             let synth = crate::ast::Spanned::new(
