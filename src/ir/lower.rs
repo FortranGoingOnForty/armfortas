@@ -22,6 +22,41 @@ use std::rc::Rc;
 
 type AmbiguousUseWarnings = Rc<RefCell<HashSet<(String, String, String)>>>;
 
+thread_local! {
+    /// Sema scope id of the procedure currently being lowered. Set by
+    /// `LowerCtx::with_proc_scope` around `lower_stmts` so the
+    /// stateless `lower_expr_full` recursion can intercept F77
+    /// statement-function call sites without threading an extra
+    /// parameter through 60-plus call sites. `None` when lowering
+    /// outside any procedure body (e.g. expression evaluation during
+    /// `init_decls`).
+    static CURRENT_PROC_SCOPE: RefCell<Option<crate::sema::symtab::ScopeId>> =
+        const { RefCell::new(None) };
+}
+
+fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
+    CURRENT_PROC_SCOPE.with(|c| *c.borrow())
+}
+
+/// RAII guard: install `scope` as the current procedure scope until
+/// the guard is dropped, then restore the previous value. Lets nested
+/// contained-subprogram lowering recover its outer scope cleanly.
+struct ProcScopeGuard(Option<crate::sema::symtab::ScopeId>);
+
+impl ProcScopeGuard {
+    fn enter(scope: Option<crate::sema::symtab::ScopeId>) -> Self {
+        let prev = CURRENT_PROC_SCOPE.with(|c| c.replace(scope));
+        ProcScopeGuard(prev)
+    }
+}
+
+impl Drop for ProcScopeGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        CURRENT_PROC_SCOPE.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
 /// Maximum array rank (Fortran allows up to 15).
 const MAX_RANK: usize = 15;
 
@@ -176,6 +211,12 @@ struct LowerCtx<'a> {
     /// exact same ambiguity hundreds or thousands of times while lowering each
     /// contained procedure separately.
     ambiguous_use_warnings: AmbiguousUseWarnings,
+    /// Sema's `ScopeId` for the procedure currently being lowered.
+    /// Set in the Program/Subroutine/Function arms of `lower_unit`.
+    /// Statement-function lookup keys off this — without it we can't
+    /// distinguish `cabs1` defined in one stdlib BLAS routine from a
+    /// homonymous statement function in another.
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -213,6 +254,7 @@ impl<'a> LowerCtx<'a> {
             contained_host_refs,
             label_blocks: HashMap::new(),
             ambiguous_use_warnings,
+            proc_scope_id: None,
         }
     }
 
@@ -262,6 +304,17 @@ impl<'a> LowerCtx<'a> {
 
     fn pop_loop(&mut self) {
         self.loops.pop();
+    }
+
+    /// Look up an F77 statement function by name in the current
+    /// procedure scope. Returns `None` when the name doesn't refer to
+    /// a statement function (or no procedure scope is set).
+    fn lookup_statement_function(
+        &self,
+        name: &str,
+    ) -> Option<&'a crate::sema::symtab::StatementFunctionDef> {
+        let scope_id = self.proc_scope_id?;
+        self.st.lookup_statement_function(scope_id, name)
     }
 
     /// Find loop by construct name (or innermost if None).
@@ -3550,6 +3603,19 @@ fn lower_unit(
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
             );
+            ctx.proc_scope_id = {
+                let raw_name = name.as_deref();
+                st.all_scopes()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, scope)| match (&scope.kind, raw_name) {
+                        (crate::sema::symtab::ScopeKind::Program(scope_name), Some(n)) => {
+                            scope_name.eq_ignore_ascii_case(n).then_some(idx)
+                        }
+                        (crate::sema::symtab::ScopeKind::Program(_), None) => Some(idx),
+                        _ => None,
+                    })
+            };
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -3586,7 +3652,9 @@ fn lower_unit(
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
+                let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 lower_stmts(&mut b, &mut ctx, body);
+                drop(_proc_scope_guard);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(
                         &mut b,
@@ -3811,6 +3879,7 @@ fn lower_unit(
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
             );
+            ctx.proc_scope_id = proc_scope_id;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -3981,7 +4050,9 @@ fn lower_unit(
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
+                let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 lower_stmts(&mut b, &mut ctx, body);
+                drop(_proc_scope_guard);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(
                         &mut b,
@@ -4247,6 +4318,7 @@ fn lower_unit(
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
             );
+            ctx.proc_scope_id = proc_scope_id;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
@@ -4568,7 +4640,9 @@ fn lower_unit(
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
+                let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 lower_stmts(&mut b, &mut ctx, body);
+                drop(_proc_scope_guard);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
                     if hidden_result_abi == HiddenResultAbi::StringDescriptor {
@@ -19770,6 +19844,18 @@ fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
 fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } => {
+            // F77 statement-function definitions look like
+            // `name(p1, p2, ...) = expr` — sema records the body in a
+            // side table and flips the symbol kind to Function. There
+            // is no IR to emit for the definition itself; call sites
+            // inline-substitute the body in `lower_expr_full`.
+            if let Expr::FunctionCall { callee, .. } = &target.node {
+                if let Expr::Name { name } = &callee.node {
+                    if ctx.lookup_statement_function(name).is_some() {
+                        return;
+                    }
+                }
+            }
             match &target.node {
                 Expr::Name { name } => {
                     let key = name.to_lowercase();
@@ -38501,6 +38587,97 @@ fn lower_short_circuit_logical_expr(
     }
 }
 
+/// Walk `expr` and clone it, replacing any `Expr::Name { name: p }`
+/// where `p` is in `subst` with a fresh clone of the mapped expression.
+/// Used by the F77 statement-function inline-substitution path so each
+/// reference to a dummy parameter in the body becomes the actual
+/// argument expression — and each reference is an independent clone
+/// (so downstream walkers don't see shared node identity).
+fn substitute_names_in_expr(
+    expr: &SpannedExpr,
+    subst: &HashMap<String, &SpannedExpr>,
+) -> SpannedExpr {
+    use crate::ast::expr::{AcValue, ImpliedDoLoop, SectionSubscript};
+
+    fn rewrite_section(
+        s: &SectionSubscript,
+        subst: &HashMap<String, &SpannedExpr>,
+    ) -> SectionSubscript {
+        match s {
+            SectionSubscript::Element(e) => {
+                SectionSubscript::Element(substitute_names_in_expr(e, subst))
+            }
+            SectionSubscript::Range { start, end, stride } => SectionSubscript::Range {
+                start: start.as_ref().map(|e| substitute_names_in_expr(e, subst)),
+                end: end.as_ref().map(|e| substitute_names_in_expr(e, subst)),
+                stride: stride.as_ref().map(|e| substitute_names_in_expr(e, subst)),
+            },
+        }
+    }
+
+    fn rewrite_acvalue(v: &AcValue, subst: &HashMap<String, &SpannedExpr>) -> AcValue {
+        match v {
+            AcValue::Expr(e) => AcValue::Expr(substitute_names_in_expr(e, subst)),
+            AcValue::ImpliedDo(ido) => AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
+                values: ido.values.iter().map(|v| rewrite_acvalue(v, subst)).collect(),
+                var: ido.var.clone(),
+                start: substitute_names_in_expr(&ido.start, subst),
+                end: substitute_names_in_expr(&ido.end, subst),
+                step: ido.step.as_ref().map(|e| substitute_names_in_expr(e, subst)),
+            })),
+        }
+    }
+
+    let new_node = match &expr.node {
+        Expr::Name { name } => {
+            if let Some(repl) = subst.get(&name.to_ascii_lowercase()) {
+                return (*repl).clone();
+            }
+            Expr::Name { name: name.clone() }
+        }
+        Expr::ComponentAccess { base, component } => Expr::ComponentAccess {
+            base: Box::new(substitute_names_in_expr(base, subst)),
+            component: component.clone(),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op: op.clone(),
+            operand: Box::new(substitute_names_in_expr(operand, subst)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op: op.clone(),
+            left: Box::new(substitute_names_in_expr(left, subst)),
+            right: Box::new(substitute_names_in_expr(right, subst)),
+        },
+        Expr::FunctionCall { callee, args } => Expr::FunctionCall {
+            callee: Box::new(substitute_names_in_expr(callee, subst)),
+            args: args
+                .iter()
+                .map(|a| crate::ast::expr::Argument {
+                    keyword: a.keyword.clone(),
+                    value: rewrite_section(&a.value, subst),
+                })
+                .collect(),
+        },
+        Expr::ArrayConstructor { type_spec, values } => Expr::ArrayConstructor {
+            type_spec: type_spec.clone(),
+            values: values.iter().map(|v| rewrite_acvalue(v, subst)).collect(),
+        },
+        Expr::ParenExpr { inner } => Expr::ParenExpr {
+            inner: Box::new(substitute_names_in_expr(inner, subst)),
+        },
+        Expr::ComplexLiteral { real, imag } => Expr::ComplexLiteral {
+            real: Box::new(substitute_names_in_expr(real, subst)),
+            imag: Box::new(substitute_names_in_expr(imag, subst)),
+        },
+        // Literals (Integer, Real, String, Logical, Boz) — copy as-is.
+        other => other.clone(),
+    };
+    SpannedExpr {
+        node: new_node,
+        span: expr.span,
+    }
+}
+
 fn lower_expr_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -39040,6 +39217,45 @@ fn lower_expr_full(
         ),
 
         Expr::FunctionCall { callee, args } => {
+            // F77 §15.4 statement-function call: sema parked the body in
+            // a side table on the symbol table. Substitute the dummy
+            // parameters for the actual argument exprs and lower the
+            // resulting expression in place. No external symbol is
+            // emitted — that's the whole point of the intercept.
+            if let Expr::Name { name } = &callee.node {
+                if let Some(scope_id) = current_proc_scope() {
+                    if let Some(def) = st.lookup_statement_function(scope_id, name) {
+                        if def.params.len() == args.len()
+                            && args.iter().all(|a| {
+                                a.keyword.is_none()
+                                    && matches!(
+                                        a.value,
+                                        crate::ast::expr::SectionSubscript::Element(_)
+                                    )
+                            })
+                        {
+                            let mut subst: HashMap<String, &SpannedExpr> =
+                                HashMap::with_capacity(def.params.len());
+                            for (p, a) in def.params.iter().zip(args.iter()) {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                    subst.insert(p.clone(), e);
+                                }
+                            }
+                            let inlined = substitute_names_in_expr(&def.body, &subst);
+                            return lower_expr_full(
+                                b,
+                                locals,
+                                &inlined,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                        }
+                    }
+                }
+            }
             // Special-case TRANSFER intrinsic — needs source bits, not the
             // probe-value pointers used by the generic dispatch path.
             if let Expr::Name { name } = &callee.node {
