@@ -11750,9 +11750,40 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                 None
             }
         }
-        "ieee_support_datatype" | "ieee_support_denormal" => {
-            // These return .TRUE. for supported types on ARM64.
+        "ieee_support_datatype"
+        | "ieee_support_denormal"
+        | "ieee_support_inf"
+        | "ieee_support_nan"
+        | "ieee_support_subnormal" => {
+            // ARM64 + Apple Silicon supports the full IEEE 754 model.
             Some(b.const_bool(true))
+        }
+        "maxexponent" => {
+            // F2018 §16.9.124: returns the maximum exponent in the model
+            // for the same kind as the argument. For IEEE binary32 = 128,
+            // binary64 = 1024.
+            let arg_ty = args
+                .first()
+                .and_then(|a| b.func().value_type(*a))
+                .unwrap_or(IrType::Float(FloatWidth::F32));
+            let val = match arg_ty {
+                IrType::Float(FloatWidth::F64) => 1024_i32,
+                _ => 128_i32,
+            };
+            Some(b.const_i32(val))
+        }
+        "minexponent" => {
+            // F2018 §16.9.146: minimum exponent in the model. binary32 = -125,
+            // binary64 = -1021.
+            let arg_ty = args
+                .first()
+                .and_then(|a| b.func().value_type(*a))
+                .unwrap_or(IrType::Float(FloatWidth::F32));
+            let val = match arg_ty {
+                IrType::Float(FloatWidth::F64) => -1021_i32,
+                _ => -125_i32,
+            };
+            Some(b.const_i32(val))
         }
         "ieee_value" => {
             if args.len() < 2 {
