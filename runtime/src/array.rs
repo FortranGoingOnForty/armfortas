@@ -2579,27 +2579,96 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
-    let sp = src.base_addr as *const i32;
+    let elem_size = src.elem_size.max(1) as usize;
+    let sp = src.base_addr as *const u8;
 
-    afs_allocate_1d(result, 4, (n * m) as i64);
-    let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
+    // Allocate result with same per-element width so callers using
+    // complex (8/16-byte), integer(8) (8-byte), integer(2)/(1) etc. all
+    // round-trip without truncation. The previous always-i32 path silently
+    // dropped the upper bytes of every element for non-32-bit types.
+    let dim0 = DimDescriptor {
         lower_bound: 1,
         upper_bound: n as i64,
         stride: 1,
     };
-    res.dims[1] = DimDescriptor {
+    let dim1 = DimDescriptor {
         lower_bound: 1,
         upper_bound: m as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut i32;
+    let dims = [dim0, dim1];
+    afs_allocate_array(
+        result,
+        elem_size as i64,
+        2,
+        dims.as_ptr(),
+        ptr::null_mut(),
+    );
+    let res = unsafe { &mut *result };
+    let rp = res.base_addr as *mut u8;
 
     for i in 0..m {
         for j in 0..n {
+            let src_off = (i * n + j) * elem_size;
+            let dst_off = (j * m + i) * elem_size;
             unsafe {
-                *rp.add(j * m + i) = *sp.add(i * n + j);
+                core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), elem_size);
+            }
+        }
+    }
+}
+
+/// CONJG over a complex array: allocate result with the same shape and
+/// element size, copy the real lane verbatim and negate the imag lane.
+/// Handles complex(sp) (8-byte) and complex(dp) (16-byte) by reading the
+/// per-element width from the descriptor.
+#[no_mangle]
+pub extern "C" fn afs_array_conjg(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    afs_allocate_like(result, source, ptr::null_mut());
+    let res = unsafe { &mut *result };
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let total = src.total_elements() as usize;
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr as *mut u8;
+    if elem_size == 8 {
+        // complex(sp): two f32 lanes per element
+        for i in 0..total {
+            let off = i * 8;
+            unsafe {
+                let re = *(sp.add(off) as *const f32);
+                let im = *(sp.add(off + lane) as *const f32);
+                *(rp.add(off) as *mut f32) = re;
+                *(rp.add(off + lane) as *mut f32) = -im;
+            }
+        }
+    } else if elem_size == 16 {
+        // complex(dp): two f64 lanes per element
+        for i in 0..total {
+            let off = i * 16;
+            unsafe {
+                let re = *(sp.add(off) as *const f64);
+                let im = *(sp.add(off + lane) as *const f64);
+                *(rp.add(off) as *mut f64) = re;
+                *(rp.add(off + lane) as *mut f64) = -im;
+            }
+        }
+    } else {
+        // Non-complex element width: byte-copy (degenerates to identity).
+        for i in 0..total {
+            let off = i * elem_size;
+            unsafe {
+                core::ptr::copy_nonoverlapping(sp.add(off), rp.add(off), elem_size);
             }
         }
     }
