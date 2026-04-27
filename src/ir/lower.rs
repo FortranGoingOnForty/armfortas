@@ -13069,7 +13069,38 @@ fn operator_arg_semantic_match(
         ),
         TypeInfo::ClassStar => matches!(actual, Some(TypeInfo::ClassStar)),
         TypeInfo::TypeStar => matches!(actual, Some(TypeInfo::TypeStar)),
-        _ => true,
+        // Numeric / logical: when the actual type is known, require both
+        // category (Integer/Real/Complex/Logical) and kind to agree.
+        // Unknown actuals (None, e.g. an unresolved expression like
+        // `reshape(...)` that didn't type-check upstream) accept anything
+        // — but the dispatcher then has nothing to discriminate on, so
+        // we can't fall back to wildcard-true here without picking the
+        // first specific in declaration order. F2018 §10.1.5: a defined
+        // operator must have an exact specific match.
+        TypeInfo::Integer { kind: dk } => match actual {
+            Some(TypeInfo::Integer { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::Real { kind: dk } => match actual {
+            Some(TypeInfo::Real { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::DoublePrecision => matches!(
+            actual,
+            Some(TypeInfo::DoublePrecision) | Some(TypeInfo::Real { kind: Some(8) }) | None
+        ),
+        TypeInfo::Complex { kind: dk } => match actual {
+            Some(TypeInfo::Complex { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::Logical { kind: dk } => match actual {
+            Some(TypeInfo::Logical { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
     }
 }
 
