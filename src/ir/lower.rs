@@ -382,45 +382,104 @@ pub fn lower_file(
     // `(stdlib_ascii, digits)` global with a duplicate (A, digits) and
     // trip "ambiguous USE import" warnings during host-scope install.
     for unit in units {
-        if let ProgramUnit::Module { name, .. } = &unit.node {
+        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
             let mod_key = name.to_lowercase();
             let Some(mod_scope_id) = st.find_module_scope(&mod_key) else {
                 continue;
             };
-            let mut to_add = Vec::new();
-            for assoc in &st.scope(mod_scope_id).use_associations {
-                if assoc.is_submodule_access {
-                    continue;
+            let default_public = !matches!(
+                st.default_access(mod_scope_id),
+                crate::sema::symtab::Access::Private
+            );
+            let access_for = |local_name: &str| -> bool {
+                // F2018 §11.2.2: USE-imported names inherit the importing
+                // module's default access unless explicitly listed in
+                // `public ::` / `private ::`. A symbol absent from the
+                // importing scope's symbol table is governed by the
+                // module-level default.
+                match st.scope(mod_scope_id).symbols.get(local_name) {
+                    Some(sym) => !matches!(sym.attrs.access, crate::sema::symtab::Access::Private),
+                    None => default_public,
                 }
-                let src_scope = st.scope(assoc.source_scope);
-                let src_mod_key = match &src_scope.kind {
-                    crate::sema::symtab::ScopeKind::Module(n)
-                    | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
-                    _ => continue,
+            };
+            let mut to_add: Vec<((String, String), ModuleGlobalInfo)> = Vec::new();
+            for use_decl in uses {
+                let Decl::UseStmt {
+                    module: src_module,
+                    only,
+                    renames,
+                    ..
+                } = &use_decl.node
+                else {
+                    continue;
                 };
+                let src_mod_key = src_module.to_lowercase();
                 if src_mod_key == mod_key {
                     continue;
                 }
-                let var_lc = assoc.original_name.to_lowercase();
-                let local_lc = assoc.local_name.to_lowercase();
-                // Only re-export if the importing module marks the local
-                // name PUBLIC (explicit or via default-public).
-                let local_sym = st.scope(mod_scope_id).symbols.get(&local_lc);
-                let is_public = match local_sym {
-                    Some(sym) => !matches!(
-                        sym.attrs.access,
-                        crate::sema::symtab::Access::Private
-                    ),
-                    None => false,
-                };
-                if !is_public {
-                    continue;
-                }
-                let src_key = (src_mod_key, var_lc);
-                let new_key = (mod_key.clone(), local_lc);
-                if let Some(info) = globals.get(&src_key) {
-                    if !globals.contains_key(&new_key) {
-                        to_add.push((new_key, info.clone()));
+                if let Some(only_list) = only {
+                    use crate::ast::decl::OnlyItem;
+                    for item in only_list {
+                        let (local_lc, var_lc) = match item {
+                            OnlyItem::Name(n) | OnlyItem::Generic(n) => {
+                                let lc = n.to_lowercase();
+                                (lc.clone(), lc)
+                            }
+                            OnlyItem::Rename(rn) => {
+                                (rn.local.to_lowercase(), rn.remote.to_lowercase())
+                            }
+                        };
+                        if !access_for(&local_lc) {
+                            continue;
+                        }
+                        let src_key = (src_mod_key.clone(), var_lc);
+                        let new_key = (mod_key.clone(), local_lc);
+                        if let Some(info) = globals.get(&src_key) {
+                            if !globals.contains_key(&new_key) {
+                                to_add.push((new_key, info.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    // USE without ONLY: import everything currently visible
+                    // through the source module — including names the source
+                    // module re-exports via its own USE associations (Pass
+                    // 1.1 already populated those entries when iterating the
+                    // source module earlier in unit order).
+                    let rename_targets: std::collections::HashSet<String> =
+                        renames.iter().map(|r| r.remote.to_lowercase()).collect();
+                    let candidates: Vec<(String, ModuleGlobalInfo)> = globals
+                        .iter()
+                        .filter_map(|((mk, var), info)| {
+                            if *mk == src_mod_key && !rename_targets.contains(var) {
+                                Some((var.clone(), info.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for (var, info) in candidates {
+                        if !access_for(&var) {
+                            continue;
+                        }
+                        let new_key = (mod_key.clone(), var);
+                        if !globals.contains_key(&new_key) {
+                            to_add.push((new_key, info));
+                        }
+                    }
+                    for rn in renames {
+                        let local_lc = rn.local.to_lowercase();
+                        let var_lc = rn.remote.to_lowercase();
+                        if !access_for(&local_lc) {
+                            continue;
+                        }
+                        let src_key = (src_mod_key.clone(), var_lc);
+                        let new_key = (mod_key.clone(), local_lc);
+                        if let Some(info) = globals.get(&src_key) {
+                            if !globals.contains_key(&new_key) {
+                                to_add.push((new_key, info.clone()));
+                            }
+                        }
                     }
                 }
             }
