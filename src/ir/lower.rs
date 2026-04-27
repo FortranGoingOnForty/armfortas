@@ -31586,12 +31586,17 @@ fn lower_rank1_elemental_call_descriptor(
                     );
                     ptr_slot
                 }
-                Some(
-                    crate::sema::symtab::TypeInfo::Derived(_)
-                    | crate::sema::symtab::TypeInfo::Class(_),
-                ) => return None,
                 _ => b.alloca(actual_elem_ty.clone()),
             };
+            let temp_derived_type = match &actual_type {
+                Some(crate::sema::symtab::TypeInfo::Derived(name)) => Some(name.clone()),
+                Some(crate::sema::symtab::TypeInfo::Class(name)) => Some(name.clone()),
+                _ => None,
+            };
+            let is_class_actual = matches!(
+                actual_type,
+                Some(crate::sema::symtab::TypeInfo::Class(_))
+            );
             loop_locals.insert(
                 temp_name.clone(),
                 LocalInfo {
@@ -31602,14 +31607,23 @@ fn lower_rank1_elemental_call_descriptor(
                     descriptor_arg: false,
                     by_ref: false,
                     char_kind: char_kind.clone(),
-                    derived_type: None,
+                    derived_type: temp_derived_type.clone(),
                     inline_const: None,
                     is_pointer: false,
                     runtime_dim_upper: vec![],
-                    is_class: false,
+                    is_class: is_class_actual,
                 },
             );
-            array_actuals.push((temp_name.clone(), actual_desc, actual_elem_ty, (char_kind != CharKind::None).then_some(char_kind)));
+            array_actuals.push((
+                temp_name.clone(),
+                actual_desc,
+                actual_elem_ty,
+                (char_kind != CharKind::None).then_some(char_kind),
+            ));
+            // Track the derived-type name for the loop-body copy step.
+            // (No ABI change: kept in a sibling vec keyed by index.)
+            // See loop body below for how this is consumed.
+            let _ = temp_derived_type;
             mapped_args.push(crate::ast::expr::Argument {
                 keyword: arg.keyword.clone(),
                 value: crate::ast::expr::SectionSubscript::Element(synth_name_expr(
@@ -31675,7 +31689,20 @@ fn lower_rank1_elemental_call_descriptor(
         let temp_info = loop_locals
             .get(temp_name)
             .expect("elemental temp local must exist");
-        if let Some(char_kind) = char_kind {
+        if temp_info.derived_type.is_some() {
+            // Derived/class actual: memcpy elem_size bytes from the
+            // i-th array element into the per-iteration temp slot.
+            // Loading and re-storing as a value would emit a `[i8 x N]`
+            // load that codegen can't materialize cleanly.
+            let src_ptr =
+                rank1_array_desc_elem_ptr(b, *actual_desc, actual_elem_ty, cur_idx);
+            let elem_bytes = b.const_i64(ir_scalar_byte_size(actual_elem_ty));
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![temp_info.addr, src_ptr, elem_bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        } else if let Some(char_kind) = char_kind {
             let source_info = LocalInfo {
                 addr: *actual_desc,
                 ty: actual_elem_ty.clone(),
