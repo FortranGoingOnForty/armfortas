@@ -1382,14 +1382,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- STOP / ERROR STOP in pure ----
-        // F2018 §11.4: a STOP statement or an ERROR STOP statement
-        // shall not appear in a procedure that has either the PURE
-        // prefix or the ELEMENTAL prefix (without the IMPURE prefix).
+        // F2018 §11.4 forbids STOP in pure procedures; F2023 §11.4 explicitly
+        // permits ERROR STOP in pure procedures, which stdlib relies on.
         Stmt::Stop { .. } if ctx.in_pure => {
             ctx.error(stmt.span, "STOP not allowed in pure procedure");
-        }
-        Stmt::ErrorStop { .. } if ctx.in_pure => {
-            ctx.error(stmt.span, "ERROR STOP not allowed in pure procedure");
         }
         Stmt::ErrorStop { .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
