@@ -13123,10 +13123,18 @@ fn name_expr_type_info(
 ) -> Option<crate::sema::symtab::TypeInfo> {
     use crate::sema::symtab::TypeInfo;
 
+    // F2018 §7.3.2: a `class(T)` dummy is polymorphic; a `type(T)` dummy
+    // is not, even when allocatable (which makes it descriptor-backed).
+    // Use the symbol's `is_class` flag rather than treating every
+    // descriptor-backed derived dummy as polymorphic — otherwise generic
+    // dispatch can't match a `type(error_type), allocatable` actual to a
+    // `type(error_type), allocatable` formal because the actual is being
+    // mis-classified as `Class(error_type)`.
     let descriptor_backed_class = info.and_then(|info| {
         if info.descriptor_arg
             && info.dims.is_empty()
             && info.char_kind == CharKind::None
+            && info.is_class
         {
             if let Some(derived_type) = &info.derived_type {
                 return Some(TypeInfo::Class(derived_type.clone()));
