@@ -31192,6 +31192,12 @@ fn is_elemental_math_intrinsic(name: &str) -> bool {
         | "logical" | "conjg" | "aimag" | "dimag"
         | "mod" | "modulo" | "sign" | "dim" | "max" | "min"
         | "ichar" | "iachar" | "achar" | "char"
+        // F2018 §16.9 character elementals — scalar form is already
+        // wired in lower_intrinsic; flagging them here lets reductions
+        // like `sum(len_trim(strs))` materialize the per-element
+        // result array via `lower_rank1_elemental_call_descriptor`.
+        | "len" | "len_trim" | "index" | "scan" | "verify"
+        | "adjustl" | "adjustr" | "lge" | "lgt" | "lle" | "llt"
         // F2018 §16.9 bit-manipulation elementals.
         | "popcnt" | "popcount" | "poppar" | "leadz" | "trailz"
         | "btest" | "iand" | "ior" | "ieor" | "ishft" | "ishftc"
