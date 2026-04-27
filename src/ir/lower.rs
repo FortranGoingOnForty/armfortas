@@ -373,33 +373,54 @@ pub fn lower_file(
     }
 
     // Pass 1.1: propagate transitively-visible globals through USE chains.
-    // When module A USEs module B, all of B's public globals should
-    // also be accessible as (A, var_name) in the globals map. Without
-    // this, `program p; use A` can't see B's variables even though A
-    // re-exports them via USE association.
+    // When module A USEs module B and re-exports B's symbols (PUBLIC), make
+    // them accessible as (A, var) in the globals map so a `program p; use A`
+    // compiled against A's .amod alone can resolve them. Pollution-free
+    // version: only propagate if the importing module actually re-exports
+    // the symbol — otherwise `use stdlib_ascii, only : digits` in a
+    // PRIVATE-default test module would shadow stdlib_ascii's own
+    // `(stdlib_ascii, digits)` global with a duplicate (A, digits) and
+    // trip "ambiguous USE import" warnings during host-scope install.
     for unit in units {
-        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
+        if let ProgramUnit::Module { name, .. } = &unit.node {
             let mod_key = name.to_lowercase();
-            // Collect USE'd module names.
-            let used_modules: Vec<String> = uses
-                .iter()
-                .filter_map(|u| {
-                    if let Decl::UseStmt { module, .. } = &u.node {
-                        Some(module.to_lowercase())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            // For each USE'd module, copy its globals into this module's namespace.
+            let Some(mod_scope_id) = st.find_module_scope(&mod_key) else {
+                continue;
+            };
             let mut to_add = Vec::new();
-            for used_mod in &used_modules {
-                for ((mk, var), info) in globals.iter() {
-                    if mk == used_mod {
-                        let new_key = (mod_key.clone(), var.clone());
-                        if !globals.contains_key(&new_key) {
-                            to_add.push((new_key, info.clone()));
-                        }
+            for assoc in &st.scope(mod_scope_id).use_associations {
+                if assoc.is_submodule_access {
+                    continue;
+                }
+                let src_scope = st.scope(assoc.source_scope);
+                let src_mod_key = match &src_scope.kind {
+                    crate::sema::symtab::ScopeKind::Module(n)
+                    | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
+                    _ => continue,
+                };
+                if src_mod_key == mod_key {
+                    continue;
+                }
+                let var_lc = assoc.original_name.to_lowercase();
+                let local_lc = assoc.local_name.to_lowercase();
+                // Only re-export if the importing module marks the local
+                // name PUBLIC (explicit or via default-public).
+                let local_sym = st.scope(mod_scope_id).symbols.get(&local_lc);
+                let is_public = match local_sym {
+                    Some(sym) => !matches!(
+                        sym.attrs.access,
+                        crate::sema::symtab::Access::Private
+                    ),
+                    None => false,
+                };
+                if !is_public {
+                    continue;
+                }
+                let src_key = (src_mod_key, var_lc);
+                let new_key = (mod_key.clone(), local_lc);
+                if let Some(info) = globals.get(&src_key) {
+                    if !globals.contains_key(&new_key) {
+                        to_add.push((new_key, info.clone()));
                     }
                 }
             }
