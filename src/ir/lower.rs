@@ -35395,7 +35395,21 @@ fn lower_array_intrinsic(
                     }
                 })
                 .unwrap_or(IrType::Float(FloatWidth::F64));
-            match &elem_ty {
+            // The local's `ty` for an array can arrive in several shapes
+            // depending on storage class — bare element type, Array(elem, N),
+            // Ptr(Array(elem, N)), or descriptor-backed Ptr(Int(I8))). Peel
+            // pointer/array wrappers until we see a scalar element type so a
+            // `real(sp) :: a(N)` automatic-shape array dispatches to the real
+            // dot_product specific instead of falling into the int fallback.
+            let mut probe = elem_ty.clone();
+            loop {
+                match probe {
+                    IrType::Ptr(inner) => probe = *inner,
+                    IrType::Array(inner, _) => probe = *inner,
+                    _ => break,
+                }
+            }
+            match &probe {
                 IrType::Float(FloatWidth::F64) => Some(b.call(
                     FuncRef::External("afs_dot_product_real8".into()),
                     vec![desc, second_desc],
