@@ -18280,6 +18280,43 @@ fn submodule_helper_reads_parent_module_char_parameter() {
 }
 
 #[test]
+fn smp_body_with_internal_procedure_links_under_parent_module() {
+    // F2018 §11.2.3: a separate-module-procedure body declared in the
+    // parent module's interface block links under the parent module's
+    // name (`_afs_modproc_<parent>_<proc>`), not the submodule's. When
+    // the body itself contains an internal procedure, the contained
+    // procedure's `_afs_internal_<host>_<idx>` symbol must derive its
+    // host link name from the SMP body's parent-prefixed link name —
+    // both definition and call site must agree, otherwise the linker
+    // reports an undefined `_afs_internal_<submod-prefix>_<idx>`.
+    let src = write_program(
+        "module bs_mod\n  implicit none\n  type :: bs_t\n    integer :: n\n  end type\n  interface\n    module subroutine write_bs(b, ec)\n      import :: bs_t\n      class(bs_t), intent(in) :: b\n      integer, intent(out) :: ec\n    end subroutine\n  end interface\nend module bs_mod\nsubmodule (bs_mod) bs_64_impl\ncontains\n  module subroutine write_bs(b, ec)\n    class(bs_t), intent(in) :: b\n    integer, intent(out) :: ec\n    integer :: dc\n    call digit_count(b%n, dc)\n    ec = dc\n  contains\n    subroutine digit_count(n, d)\n      integer, intent(in) :: n\n      integer, intent(out) :: d\n      d = n * 2\n    end subroutine\n  end subroutine\nend submodule\nprogram p\n  use bs_mod\n  implicit none\n  type(bs_t) :: b\n  integer :: ec\n  b%n = 7\n  call write_bs(b, ec)\n  if (ec /= 14) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("smp_body_internal_proc_link", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "SMP body with contained procedure should compile and link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "SMP body with contained procedure should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn sum_and_product_dispatch_on_integer_kind() {
     let src = write_program(
         "program p\n  implicit none\n  integer(8) :: a8(5) = [10_8, 200_8, 5_8, 99_8, 33_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8, lo8, hi8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product([1_8, 2_8, 3_8, 4_8, 5_8])\n  hi8 = maxval(a8)\n  lo8 = minval(a8)\n  if (r8 /= 347_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  if (hi8 /= 200_8) error stop 4\n  if (lo8 /= 5_8) error stop 5\n  print *, 'ok'\nend program\n",
