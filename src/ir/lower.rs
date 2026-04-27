@@ -29640,6 +29640,38 @@ fn is_array_reducing_intrinsic(name: &str) -> bool {
     )
 }
 
+fn expr_contains_whole_array_intrinsic(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "transpose" | "matmul" | "reshape" | "shape"
+                ) {
+                    return true;
+                }
+            }
+            args.iter().any(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    expr_contains_whole_array_intrinsic(e)
+                }
+                crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                    start.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
+                        || end.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
+                        || stride.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
+                }
+            })
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_whole_array_intrinsic(left)
+                || expr_contains_whole_array_intrinsic(right)
+        }
+        Expr::UnaryOp { operand, .. } => expr_contains_whole_array_intrinsic(operand),
+        Expr::ParenExpr { inner } => expr_contains_whole_array_intrinsic(inner),
+        _ => false,
+    }
+}
+
 fn rewrite_scalarized_rank1_array_refs(
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
@@ -30008,20 +30040,16 @@ fn try_lower_scalarized_subscript_array_assign(
     if dest_name.is_empty() || !expr_contains_array_refs_in_subscripts(value, &ctx.locals) {
         return false;
     }
-    // Scalarization synthesizes a single rank-1 DO loop, so a rank>1
-    // destination cannot be served by this path even when the dest is
-    // allocatable. Without this guard, a rank-2 LHS like
-    // `ah = conjg(transpose(a))` would be mis-rewritten to scalar
-    // form and the array intrinsics fall through to undefined externals.
-    let dest_rank = if dest_info.dims.is_empty() && local_uses_array_descriptor(dest_info) {
-        1
-    } else {
-        dest_info.dims.len()
-    };
-    if dest_rank != 1 {
+    if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
         return false;
     }
-    if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
+    // Skip scalarization when the RHS contains a transformational
+    // intrinsic that consumes a whole array (transpose, matmul,
+    // reshape, shape). Their argument lowering needs the descriptor
+    // intact; scalarizing the inner array reference to `a(loop_var)`
+    // would feed a scalar to a function expecting rank-N input and
+    // fall through to an undefined external call.
+    if expr_contains_whole_array_intrinsic(value) {
         return false;
     }
 
