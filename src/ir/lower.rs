@@ -39350,6 +39350,72 @@ fn lower_expr_full(
         }
 
         Expr::UnaryOp { op, operand } => {
+            // F2018 §10.1.5: a defined unary operator `.op.X` is sugar
+            // for a single-arg call to the matching specific procedure
+            // declared in `INTERFACE OPERATOR(.op.)`. Without this
+            // dispatch, `.det.matrix` falls through to the catch-all
+            // below and silently returns the operand value, so callers
+            // see the raw matrix instead of its determinant.
+            if let UnaryOp::Defined(name) = op {
+                let iface = format!("operator(.{}.)", name.to_lowercase());
+                if let Some(sym) = st.find_symbol_any_scope(&iface) {
+                    if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface
+                        && !sym.arg_names.is_empty()
+                    {
+                        let operand_ti =
+                            operator_expr_type_info(operand, Some(locals), st, type_layouts);
+                        let chosen = sym
+                            .arg_names
+                            .iter()
+                            .find(|specific| {
+                                procedure_scope_by_name(st, specific)
+                                    .map(|scope| {
+                                        let declared = declared_args_for_scope(scope);
+                                        declared.len() == 1
+                                            && declared
+                                                .first()
+                                                .and_then(|f| f.type_info.as_ref())
+                                                .is_some_and(|decl| {
+                                                    operator_arg_semantic_match(
+                                                        decl,
+                                                        operand_ti.as_ref(),
+                                                    )
+                                                })
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .or_else(|| sym.arg_names.first())
+                            .cloned();
+                        if let Some(specific) = chosen {
+                            let synth = crate::ast::Spanned::new(
+                                Expr::FunctionCall {
+                                    callee: Box::new(crate::ast::Spanned::new(
+                                        Expr::Name { name: specific },
+                                        operand.span,
+                                    )),
+                                    args: vec![crate::ast::expr::Argument {
+                                        keyword: None,
+                                        value: crate::ast::expr::SectionSubscript::Element(
+                                            (**operand).clone(),
+                                        ),
+                                    }],
+                                },
+                                expr.span,
+                            );
+                            return lower_expr_full(
+                                b,
+                                locals,
+                                &synth,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                        }
+                    }
+                }
+            }
             let val = lower_expr_full(
                 b,
                 locals,
