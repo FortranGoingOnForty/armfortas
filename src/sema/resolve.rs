@@ -1168,6 +1168,7 @@ fn load_external_module(
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
                 external: arg.external,
+                procedure_iface: arg.procedure_iface.clone(),
                 array_spec,
                 ..Default::default()
             };
