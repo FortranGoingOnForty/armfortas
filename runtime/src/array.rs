@@ -2633,10 +2633,12 @@ pub extern "C" fn afs_transpose_real8(
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
-    let sp = src.base_addr as *const f64;
+    let elem_size = src.elem_size.max(1) as i64;
 
-    // Allocate result as (n x m).
-    afs_allocate_1d(result, 8, (n * m) as i64);
+    // Allocate result as (n x m) using the source's element width so
+    // real(4) and real(8) (and complex(4)/(8) when routed here) all
+    // get the right buffer size and stride.
+    afs_allocate_1d(result, elem_size, (n * m) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
     res.dims[0] = DimDescriptor {
@@ -2649,12 +2651,40 @@ pub extern "C" fn afs_transpose_real8(
         upper_bound: m as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut f64;
 
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                *rp.add(j * m + i) = *sp.add(i * n + j);
+    if elem_size == 4 {
+        let sp = src.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                }
+            }
+        }
+    } else if elem_size == 8 {
+        let sp = src.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                }
+            }
+        }
+    } else {
+        // Generic byte-level copy for other widths (complex(4)=8 already
+        // handled above as f64 lanes; complex(8)=16 falls here).
+        let sb = elem_size as usize;
+        let sp = src.base_addr;
+        let rp = res.base_addr;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    let src_off = (i * n + j) * sb;
+                    let dst_off = (j * m + i) * sb;
+                    core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), sb);
+                }
             }
         }
     }
@@ -2688,13 +2718,11 @@ pub extern "C" fn afs_matmul_real8(
     } else {
         db.dims[0].extent() as usize
     };
+    let elem_size = da.elem_size.max(1) as i64;
 
-    // For vector * matrix or matrix * vector, adjust dimensions.
-    let ap = da.base_addr as *const f64;
-    let bp = db.base_addr as *const f64;
-
-    // Allocate result.
-    afs_allocate_1d(result, 8, (m * n) as i64);
+    // Allocate result using the source element width so real(4) and
+    // real(8) inputs both produce correctly-sized output buffers.
+    afs_allocate_1d(result, elem_size, (m * n) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
     res.dims[0] = DimDescriptor {
@@ -2707,19 +2735,41 @@ pub extern "C" fn afs_matmul_real8(
         upper_bound: n as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut f64;
 
-    // Triple loop: C(i,j) = sum_l A(i,l) * B(l,j)
-    for i in 0..m {
+    // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
+    // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
+    if elem_size == 4 {
+        let ap = da.base_addr as *const f32;
+        let bp = db.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
         for j in 0..n {
-            let mut sum = 0.0;
-            for l in 0..k {
-                let a_val = unsafe { *ap.add(i * k + l) };
-                let b_val = unsafe { *bp.add(l * n + j) };
-                sum += a_val * b_val;
+            for i in 0..m {
+                let mut sum: f64 = 0.0;
+                for l in 0..k {
+                    let a_val = unsafe { *ap.add(l * m + i) } as f64;
+                    let b_val = unsafe { *bp.add(j * k + l) } as f64;
+                    sum += a_val * b_val;
+                }
+                unsafe {
+                    *rp.add(j * m + i) = sum as f32;
+                }
             }
-            unsafe {
-                *rp.add(i * n + j) = sum;
+        }
+    } else {
+        let ap = da.base_addr as *const f64;
+        let bp = db.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum: f64 = 0.0;
+                for l in 0..k {
+                    let a_val = unsafe { *ap.add(l * m + i) };
+                    let b_val = unsafe { *bp.add(j * k + l) };
+                    sum += a_val * b_val;
+                }
+                unsafe {
+                    *rp.add(j * m + i) = sum;
+                }
             }
         }
     }
