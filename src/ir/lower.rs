@@ -32918,6 +32918,13 @@ fn lower_rank1_numeric_array_binary_descriptor(
     // logical array of the same shape. Take a separate path for those
     // since the result element type (Bool) differs from the operand
     // element type, and dispatch through `lower_rank1_array_compare_descriptor`.
+    //
+    // Gate via sema FortranType so we don't fire on Character operands —
+    // characters are represented as Int(I8) in IR but compare via runtime
+    // string helpers (afs_compare_char), and the existing reduction path
+    // (lower_logical_reduction_intrinsic_ast) handles char vector subscript
+    // ANY by iterating a different way. Only apply when both sides are
+    // Integer or Real semantic types.
     let is_compare_op = matches!(
         op,
         BinaryOp::Eq
@@ -32928,21 +32935,29 @@ fn lower_rank1_numeric_array_binary_descriptor(
             | BinaryOp::Ge
     );
     if is_compare_op && !is_complex_elem {
-        return lower_rank1_array_compare_descriptor(
-            b,
-            locals,
-            op,
-            left,
-            right,
-            lhs.as_ref().map(|(d, _)| *d),
-            rhs.as_ref().map(|(d, _)| *d),
-            &elem_ty,
-            st,
-            type_layouts,
-            internal_funcs,
-            contained_host_refs,
-            descriptor_params,
-        );
+        use crate::sema::types::FortranType;
+        let lt = crate::sema::types::expr_type(left, st);
+        let rt = crate::sema::types::expr_type(right, st);
+        let is_numeric =
+            |t: &FortranType| matches!(t, FortranType::Integer { .. } | FortranType::Real { .. });
+        if is_numeric(&lt) && is_numeric(&rt) {
+            return lower_rank1_array_compare_descriptor(
+                b,
+                locals,
+                op,
+                left,
+                right,
+                lhs.as_ref().map(|(d, _)| *d),
+                rhs.as_ref().map(|(d, _)| *d),
+                &elem_ty,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+        }
+        return None;
     }
     let op_supported = if is_complex_elem {
         matches!(
