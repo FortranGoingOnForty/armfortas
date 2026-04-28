@@ -17784,17 +17784,6 @@ fn allocate_runtime_shape_array_result(
     if specs.is_empty() {
         return;
     }
-    // Rank-1 array-returning callees in our codebase have a fast-path
-    // where the caller passes the destination buffer (e.g. `[f32 x 10]`)
-    // as the sret slot rather than a 384-byte descriptor. Calling
-    // afs_allocate_array on that buffer would write descriptor fields
-    // into the caller's stack and corrupt unrelated locals. Limit
-    // auto-allocation to rank ≥ 2 where the caller path consistently
-    // hands us a real descriptor (the diag/eye-style result that drove
-    // this fix in stdlib_linalg).
-    if specs.len() < 2 {
-        return;
-    }
 
     let mut any_runtime = false;
     for spec in &specs {
@@ -20868,18 +20857,67 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         if let Expr::Name { name: callee_name } = &callee.node {
                                             let callee_key = callee_name.to_lowercase();
                                             if ctx.alloc_return_funcs.contains(&callee_key) {
-                                                // Audit6 BLOCKING-1: sret call — pass info.addr as
-                                                // the hidden first arg so the function writes its
-                                                // result directly into the destination descriptor.
-                                                // No temp descriptor or afs_assign_allocatable needed.
-                                                let dest_desc = array_descriptor_addr(b, &info);
-                                                lower_alloc_return_call_into_desc(
-                                                    b,
-                                                    ctx,
-                                                    dest_desc,
-                                                    callee_name,
-                                                    call_args,
-                                                );
+                                                // sret call. When dest is descriptor-backed we
+                                                // can let the callee write straight in. When
+                                                // dest is a fixed-shape stack buffer (e.g.
+                                                // `real :: r(10)`) `array_descriptor_addr`
+                                                // returns the buffer itself, but the callee
+                                                // expects a 384-byte descriptor — handing it
+                                                // the buffer corrupts the caller frame the
+                                                // moment the callee touches dims/flags. Allocate
+                                                // a real descriptor temp, call into it, copy
+                                                // the bytes back, and deallocate the heap
+                                                // result.
+                                                if local_uses_array_descriptor(&info) {
+                                                    let dest_desc = array_descriptor_addr(b, &info);
+                                                    lower_alloc_return_call_into_desc(
+                                                        b,
+                                                        ctx,
+                                                        dest_desc,
+                                                        callee_name,
+                                                        call_args,
+                                                    );
+                                                } else {
+                                                    let tmp_desc = b.alloca(IrType::Array(
+                                                        Box::new(IrType::Int(IntWidth::I8)),
+                                                        384,
+                                                    ));
+                                                    let zero32 = b.const_i32(0);
+                                                    let sz384 = b.const_i64(384);
+                                                    b.call(
+                                                        FuncRef::External("memset".into()),
+                                                        vec![tmp_desc, zero32, sz384],
+                                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                    );
+                                                    lower_alloc_return_call_into_desc(
+                                                        b,
+                                                        ctx,
+                                                        tmp_desc,
+                                                        callee_name,
+                                                        call_args,
+                                                    );
+                                                    let n = array_total_elems_value(b, &info);
+                                                    let elem_bytes = b.const_i64(
+                                                        ir_scalar_byte_size(&info.ty),
+                                                    );
+                                                    let byte_count = b.imul(n, elem_bytes);
+                                                    let src_base = b.load_typed(
+                                                        tmp_desc,
+                                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                    );
+                                                    b.call(
+                                                        FuncRef::External("memcpy".into()),
+                                                        vec![info.addr, src_base, byte_count],
+                                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                    );
+                                                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                                    b.store(zero32, stat);
+                                                    b.call(
+                                                        FuncRef::External("afs_deallocate_array".into()),
+                                                        vec![tmp_desc, stat],
+                                                        IrType::Void,
+                                                    );
+                                                }
                                             } else {
                                                 // Non-sret: function returns a temp descriptor.
                                                 let src_desc = lower_expr_ctx_tl(b, ctx, value);
