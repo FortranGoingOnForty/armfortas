@@ -181,7 +181,7 @@ cargo run -p afs-tests -- run --suite runtime     # bencch runtime suite
 cargo run -p afs-tests -- run --suite consistency # reproducibility checks
 ```
 
-<<<<<<< HEAD
+
 The root `armfortas` harness is the fast, armfortas-first runner. It compiles
 each `.f90` file in `test_programs/`, runs the binary, and evaluates
 source-embedded assertions such as:
