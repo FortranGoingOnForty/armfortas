@@ -10559,6 +10559,52 @@ fn any_on_vector_subscripted_char_array_compare_runs() {
 }
 
 #[test]
+fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
+    // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
+    // stdlib's example_eye2. Reproduces three issues at once: generic-
+    // interface-call expr_type returns Unknown (gating used to reject),
+    // the two specifics return rank-2 allocatable arrays of *different*
+    // numeric kinds (real(sp) vs integer(int32) — needed mixed-kind
+    // promotion in the array compare descriptor), and the all-reduction
+    // had to walk a Bool array result rather than fall through to an
+    // external `_all` over a scalar pointer compare of two descriptors.
+    let src = write_program(
+        "module mm\n  integer, parameter :: sp = kind(0.0)\n  interface eye\n    module procedure eye_rsp\n  end interface\n  interface diag\n    module procedure diag_iint32\n  end interface\ncontains\n  pure function eye_rsp(n) result(r)\n    integer, intent(in) :: n\n    real(sp), allocatable :: r(:,:)\n    integer :: i\n    allocate(r(n,n))\n    r = 0.0_sp\n    do i = 1, n; r(i,i) = 1.0_sp; end do\n  end function\n  pure function diag_iint32(v) result(r)\n    integer, intent(in) :: v(:)\n    integer, allocatable :: r(:,:)\n    integer :: i, n\n    n = size(v)\n    allocate(r(n,n))\n    r = 0\n    do i = 1, n; r(i,i) = v(i); end do\n  end function\nend module\n\nprogram t\n  use mm, only: eye, diag\n  implicit none\n  if (.not. all(eye(4) == diag([1,1,1,1]))) error stop 1\n  print *, all(eye(4) == diag([1,1,1,1]))\nend program\n",
+        "f90",
+    );
+    let out = unique_path("all_compare_mixed_kind_generic_rank2", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("eye2 mixed-kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "eye2 mixed-kind compare should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("eye2 mixed-kind run failed");
+    assert!(
+        run.status.success(),
+        "eye2 mixed-kind compare should evaluate true: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout).to_lowercase();
+    assert!(
+        stdout.contains('t'),
+        "expected eye2 mixed-kind compare to be .true., got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_dummy_component_subscript_uses_updated_component_value() {
     let src = write_program(
         "program p\n  implicit none\n  type :: control_block_t\n    integer :: block_type = 0\n    logical :: should_execute = .true.\n  end type control_block_t\n  type :: shell_state_t\n    type(control_block_t) :: control_stack(20)\n    integer :: control_depth = 0\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  call push(shell)\n  if (shell%control_depth /= 1) error stop 1\n  if (shell%control_stack(1)%block_type /= 7) error stop 2\n  if (.not. shell%control_stack(1)%should_execute) error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%block_type\ncontains\n  subroutine push(shell)\n    type(shell_state_t), intent(inout) :: shell\n    shell%control_depth = shell%control_depth + 1\n    shell%control_stack(shell%control_depth)%block_type = 7\n  end subroutine push\nend program\n",
