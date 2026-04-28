@@ -10605,6 +10605,48 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
+    // The real array reductions (`afs_array_sum_real8`,
+    // `afs_array_maxval_real8`, `afs_array_minval_real8`,
+    // `afs_array_product_real8`) used to read `*const f64` regardless
+    // of the descriptor's `elem_size`, so a `sum(r)` over a `real(sp) ::
+    // r(:)` would read two adjacent f32 lanes per stride and produce
+    // garbage (e.g. `sum([1,1,1,1]) = 0.015625`). The runtime now
+    // dispatches on `elem_size` and reads f32 vs f64 accordingly. The
+    // function name is unchanged for ABI compatibility — callers still
+    // route real-of-any-kind reductions through `*_real8`.
+    let src = write_program(
+        "program t\n  use, intrinsic :: iso_fortran_env, only: sp => real32\n  implicit none\n  real(sp) :: r(5)\n  r = [1.0_sp, 2.0_sp, 3.0_sp, 4.0_sp, 5.0_sp]\n  if (abs(sum(r) - 15.0_sp) > 1.0e-5_sp) error stop 1\n  if (abs(maxval(r) - 5.0_sp) > 1.0e-5_sp) error stop 2\n  if (abs(minval(r) - 1.0_sp) > 1.0e-5_sp) error stop 3\n  if (abs(product(r) - 120.0_sp) > 1.0e-3_sp) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real_sp_array_reductions", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real-sp reductions compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "real-sp reductions should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("real-sp reductions run failed");
+    assert!(
+        run.status.success(),
+        "real-sp reductions should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn parameter_const_with_math_intrinsic_initializer_folds_in_smp_body() {
     // F2018 §16.9: math intrinsics (sqrt, exp, log, sin/cos/...) are
     // permitted in initialization expressions for PARAMETERs.  Without
