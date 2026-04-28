@@ -10810,6 +10810,53 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
+    // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
+    // inside another procedure) link under a host-prefixed mangled
+    // symbol, not their bare Fortran name. Two of `generic_dispatch_
+    // probe_value`'s helper paths — `array_function_result_elem_type`
+    // and the `lower_array_expr_descriptor` fallback at the bottom of
+    // the probe — were being called with `internal_funcs=None`, so any
+    // internal subprogram call evaluated as a side effect of probing
+    // emitted an un-mangled `bl _r08` instead of `bl _afs_internal_..._N`.
+    // The link succeeded as long as the user-call path emitted the
+    // mangled definition AND no probe paths ran on internal calls
+    // simultaneously. As soon as a user-defined function (`mum`) wrapped
+    // an intrinsic (`ieor`) wrapping an internal call (`r08`), probing
+    // ran and emitted the un-mangled `bl _r08` references. Surfaced in
+    // stdlib_hash_32bit_water.f90 — the build linked thousands of
+    // un-mangled calls into libstdlib.a, breaking every example that
+    // pulled hashmaps in.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int32, int64\n  implicit none\ncontains\n  pure function outer(x) result(y)\n    integer(int32), intent(in) :: x\n    integer(int64) :: y\n    y = mum(ieor(r08(x), 1_int64), ieor(r08(x*2), 2_int64))\n    contains\n      pure function mum(a, b) result(r)\n        integer(int64), intent(in) :: a, b\n        integer(int64) :: r\n        r = a * b\n      end function mum\n      pure function r08(z) result(v)\n        integer(int32), intent(in) :: z\n        integer(int64) :: v\n        v = int(z, int64)\n      end function r08\n  end function outer\nend module\n\nprogram t\n  use m\n  if (outer(2) /= 18) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_mangle", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal mangle compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile + link cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("internal mangle run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
     // F2018 §16.9.193: TRANSFER(SRC, MOLD, SIZE) returns a rank-1
     // array of SIZE mold-typed elements, byte-equal to the SRC bytes.
