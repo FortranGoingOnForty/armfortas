@@ -10351,6 +10351,157 @@ fn lower_logical_reduction_intrinsic_ast(
         return Some(b.icmp(CmpOp::Ne, raw, zero));
     }
 
+    // F2018 §16.9.5/§16.9.6: ANY/ALL of an array-vs-scalar comparison
+    // (e.g. `any(shape(v) < n)` or `any(aimag(c) > atol)`) — the
+    // sub-expression doesn't materialize as a logical-array descriptor
+    // (`lower_rank1_numeric_array_binary_descriptor` only handles
+    // arithmetic ops), so iterate the descriptor-bearing side directly
+    // and accumulate the reduction without a temporary bool array.
+    //
+    // Gate via sema's `expr_type` first — `lower_array_expr_descriptor`
+    // has IR side effects (allocas, runtime calls), so we must not
+    // probe speculatively. Only enter when at least one side is a
+    // numeric array (Integer/Real of any kind, not Character/Bool/Complex —
+    // those have their own paths).
+    if let Expr::BinaryOp { op, left, right } = &arg0.node {
+        let cmp_op = match op {
+            BinaryOp::Eq => Some(CmpOp::Eq),
+            BinaryOp::Ne => Some(CmpOp::Ne),
+            BinaryOp::Lt => Some(CmpOp::Lt),
+            BinaryOp::Le => Some(CmpOp::Le),
+            BinaryOp::Gt => Some(CmpOp::Gt),
+            BinaryOp::Ge => Some(CmpOp::Ge),
+            _ => None,
+        };
+        if let Some(cmp) = cmp_op {
+            // Sema-side type peek so we don't speculatively run
+            // `lower_array_expr_descriptor` (which has IR side effects
+            // like allocas + runtime calls) against expressions whose
+            // element type we'd reject anyway. We only proceed when
+            // both sides have an Integer or Real Fortran type.
+            use crate::sema::types::FortranType;
+            let is_int_or_real = |t: &FortranType| {
+                matches!(t, FortranType::Integer { .. } | FortranType::Real { .. })
+            };
+            let lt = crate::sema::types::expr_type(left, st);
+            let rt = crate::sema::types::expr_type(right, st);
+            if !is_int_or_real(&lt) || !is_int_or_real(&rt) {
+                // Fall through to the existing match arms.
+            } else {
+            let lhs = lower_array_expr_descriptor(
+                b,
+                locals,
+                left,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let rhs = lower_array_expr_descriptor(
+                b,
+                locals,
+                right,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            if lhs.is_some() || rhs.is_some() {
+                let (source_desc, elem_ty) = lhs
+                    .as_ref()
+                    .map(|(d, t)| (*d, t.clone()))
+                    .or_else(|| rhs.as_ref().map(|(d, t)| (*d, t.clone())))?;
+                // Only handle wider numeric element types here. Skip I8
+                // because that's how character(1) arrays present, where
+                // a comparison like `s([5,8]) /= '-'` has character-string
+                // semantics and the existing vector-subscript expansion
+                // path handles it correctly. Complex and non-scalar shapes
+                // also need richer handling than this loop.
+                let scalar_numeric = match elem_ty {
+                    IrType::Int(IntWidth::I8) => false,
+                    IrType::Int(_) | IrType::Float(_) | IrType::Bool => true,
+                    _ => false,
+                };
+                if !scalar_numeric {
+                    return None;
+                }
+
+                let n = b.call(
+                    FuncRef::External("afs_array_size".into()),
+                    vec![source_desc],
+                    IrType::Int(IntWidth::I64),
+                );
+                let acc_ty = if name == "count" {
+                    IrType::Int(IntWidth::I32)
+                } else {
+                    IrType::Bool
+                };
+                let acc_addr = b.alloca(acc_ty);
+                let acc_init = init_logical_reduction_acc(b, name);
+                b.store(acc_init, acc_addr);
+                let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+                let zero64 = b.const_i64(0);
+                b.store(zero64, i_addr);
+
+                let bb_check = b.create_block("any_cmp_check");
+                let bb_body = b.create_block("any_cmp_body");
+                let bb_exit = b.create_block("any_cmp_exit");
+                b.branch(bb_check, vec![]);
+
+                b.set_block(bb_check);
+                let i = b.load(i_addr);
+                let done = b.icmp(CmpOp::Ge, i, n);
+                b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+                b.set_block(bb_body);
+                let idx = b.load(i_addr);
+
+                let load_side = |b: &mut FuncBuilder,
+                                 side: &Option<(ValueId, IrType)>,
+                                 side_expr: &crate::ast::expr::SpannedExpr|
+                 -> ValueId {
+                    if let Some((desc, _)) = side {
+                        let elem_ptr =
+                            rank1_array_desc_elem_ptr(b, *desc, &elem_ty, idx);
+                        b.load_typed(elem_ptr, elem_ty.clone())
+                    } else {
+                        let raw = lower_expr_full(
+                            b,
+                            locals,
+                            side_expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        coerce_to_type(b, raw, &elem_ty)
+                    }
+                };
+                let lv = load_side(b, &lhs, left);
+                let rv = load_side(b, &rhs, right);
+                let pred = match &elem_ty {
+                    IrType::Float(_) => b.fcmp(cmp, lv, rv),
+                    _ => b.icmp(cmp, lv, rv),
+                };
+                let acc = b.load(acc_addr);
+                let new_acc = step_logical_reduction_acc(b, name, acc, pred);
+                b.store(new_acc, acc_addr);
+
+                let one = b.const_i64(1);
+                let next = b.iadd(idx, one);
+                b.store(next, i_addr);
+                b.branch(bb_check, vec![]);
+
+                b.set_block(bb_exit);
+                return Some(b.load(acc_addr));
+            }
+            }
+        }
+    }
+
     match &arg0.node {
         Expr::ArrayConstructor { values, .. } => {
             let mut acc = init_logical_reduction_acc(b, name);
