@@ -10452,9 +10452,32 @@ fn lower_logical_reduction_intrinsic_ast(
             let is_int_or_real = |t: &FortranType| {
                 matches!(t, FortranType::Integer { .. } | FortranType::Real { .. })
             };
+            // Walk the expression tree to detect ArrayConstructor anywhere.
+            // The existing scalarized comparison path (via
+            // `unfold_array_ctor_binop` + `expand_vector_subscript_designator`)
+            // handles AC operands correctly without materializing them, while
+            // `lower_array_expr_descriptor` on an AC has IR side effects that
+            // can leave invalid types behind even when we bail out (verified
+            // by str2num: `any([le,BE,ld,BD]+digit_0 == iachar(s(p:p)))`).
+            fn contains_array_constructor(e: &crate::ast::expr::SpannedExpr) -> bool {
+                match &e.node {
+                    Expr::ArrayConstructor { .. } => true,
+                    Expr::BinaryOp { left, right, .. } => {
+                        contains_array_constructor(left)
+                            || contains_array_constructor(right)
+                    }
+                    Expr::UnaryOp { operand, .. } => contains_array_constructor(operand),
+                    Expr::ParenExpr { inner } => contains_array_constructor(inner),
+                    _ => false,
+                }
+            }
             let lt = crate::sema::types::expr_type(left, st);
             let rt = crate::sema::types::expr_type(right, st);
-            if !is_int_or_real(&lt) || !is_int_or_real(&rt) {
+            if !is_int_or_real(&lt)
+                || !is_int_or_real(&rt)
+                || contains_array_constructor(left)
+                || contains_array_constructor(right)
+            {
                 // Fall through to the existing match arms.
             } else {
             let lhs = lower_array_expr_descriptor(
