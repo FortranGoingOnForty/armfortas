@@ -10944,6 +10944,30 @@ fn lower_logical_reduction_intrinsic_ast(
     }
 }
 
+/// Storage size in bits (F2018 §16.9.196 STORAGE_SIZE) for a value of
+/// the given IR type. Walks pointer/array wrappers so callers passing
+/// the *address* of a value still get the value's storage size.
+fn storage_size_bits_for_ir_type(ty: &IrType) -> i32 {
+    match ty {
+        IrType::Int(IntWidth::I8) => 8,
+        IrType::Int(IntWidth::I16) => 16,
+        IrType::Int(IntWidth::I32) => 32,
+        IrType::Int(IntWidth::I64) => 64,
+        IrType::Int(IntWidth::I128) => 128,
+        IrType::Float(FloatWidth::F32) => 32,
+        IrType::Float(FloatWidth::F64) => 64,
+        IrType::Bool => 32,
+        IrType::Array(elem, n) => {
+            let elem_bits = storage_size_bits_for_ir_type(elem);
+            elem_bits.saturating_mul(*n as i32)
+        }
+        // Pointer to a value — return the storage size of the pointee
+        // (this is the form taken by descriptor-passed actuals).
+        IrType::Ptr(inner) => storage_size_bits_for_ir_type(inner),
+        _ => 0,
+    }
+}
+
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
 fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<ValueId> {
@@ -12027,6 +12051,24 @@ fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<
                     IrType::Int(IntWidth::I128) => 128,
                     _ => 0,
                 };
+                Some(b.const_i32(bits))
+            } else {
+                None
+            }
+        }
+        // F2018 §16.9.196: STORAGE_SIZE(A [, KIND]) returns the size in
+        // bits a value of the same type as A occupies. For non-polymorphic
+        // arguments this is determined entirely by the argument's IR type
+        // and can be folded at compile time (8 * sizeof). The optional
+        // KIND argument names the kind of the result; we always return I32
+        // and let downstream coerce.
+        "storage_size" => {
+            if let Some(arg) = args.first() {
+                let ty = b
+                    .func()
+                    .value_type(*arg)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                let bits = storage_size_bits_for_ir_type(&ty);
                 Some(b.const_i32(bits))
             } else {
                 None
@@ -26359,6 +26401,51 @@ fn local_storage_size_bytes(
     descriptor_element_size_bytes(info)
 }
 
+/// Recognize a transformational intrinsic call (PACK/RESHAPE/TRANSPOSE/
+/// MATMUL/SPREAD) whose result is a fresh array descriptor, and return
+/// the descriptor by routing through `lower_array_expr_descriptor`.
+/// Returns None for non-call expressions or unsupported intrinsics.
+///
+/// Used by the array-constructor builder to flatten array-returning
+/// sub-expressions inline (F2018 §7.8) — without this, a constructor
+/// like `[dim, pack(...)]` would lower the pack call as a scalar
+/// External and emit an unresolvable symbol.
+#[allow(clippy::too_many_arguments)]
+fn transformational_intrinsic_call_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let Expr::FunctionCall { callee, .. } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pack" | "reshape" | "transpose" | "matmul" | "spread"
+    ) {
+        return None;
+    }
+    lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )
+    .map(|(desc, _)| desc)
+}
+
 fn whole_array_expr_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -26514,6 +26601,21 @@ fn lower_runtime_array_constructor_len(
                         contained_host_refs,
                         descriptor_params,
                     )?
+                } else if let Some(desc) = transformational_intrinsic_call_descriptor(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    )
                 } else if let Some((desc, _)) =
                     whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
                 {
@@ -26725,9 +26827,44 @@ fn store_ac_values_at_off(
                     );
                     continue;
                 }
-                if let Some((src_desc, _)) =
-                    whole_array_expr_descriptor(b, locals, e, st, type_layouts)
-                {
+                // Check for transformational intrinsics like PACK/RESHAPE
+                // that materialize a fresh array descriptor. These are
+                // *whole-array sub-expressions* that flatten into the
+                // constructor (F2018 §7.8) but `whole_array_expr_descriptor`
+                // only recognizes Names/ComponentAccess. Route them through
+                // the array expression descriptor path explicitly.
+                let intrinsic_desc = if let Expr::FunctionCall { callee, .. } = &e.node {
+                    if let Expr::Name { name } = &callee.node {
+                        if matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "pack" | "reshape" | "transpose" | "matmul" | "spread"
+                        ) {
+                            lower_array_expr_descriptor(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                            .map(|(d, _)| d)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let src_desc_opt = intrinsic_desc.or_else(|| {
+                    whole_array_expr_descriptor(b, locals, e, st, type_layouts).map(|(d, _)| d)
+                });
+
+                if let Some(src_desc) = src_desc_opt {
                     let src_n = b.call(
                         FuncRef::External("afs_array_size".into()),
                         vec![src_desc],
@@ -31248,10 +31385,18 @@ fn lower_reshape_array_expr_descriptor(
         return None;
     }
 
-    let crate::ast::expr::SectionSubscript::Element(source_expr) = &args[0].value else {
+    // F2018 §16.9.163 args: source, shape, [pad, order]. Resolve by
+    // keyword or position so callers can write `reshape(a, shape=s, order=p)`.
+    let arg_slots = reorder_args_by_keyword_slots(args, "reshape", st);
+    let source_arg = arg_slots.first().and_then(|x| x.as_ref())?;
+    let shape_arg = arg_slots.get(1).and_then(|x| x.as_ref())?;
+    let pad_arg = arg_slots.get(2).and_then(|x| x.as_ref());
+    let order_arg = arg_slots.get(3).and_then(|x| x.as_ref());
+
+    let crate::ast::expr::SectionSubscript::Element(source_expr) = &source_arg.value else {
         return None;
     };
-    let crate::ast::expr::SectionSubscript::Element(shape_expr) = &args[1].value else {
+    let crate::ast::expr::SectionSubscript::Element(shape_expr) = &shape_arg.value else {
         return None;
     };
 
@@ -31289,46 +31434,220 @@ fn lower_reshape_array_expr_descriptor(
             descriptor_params,
         )?
     };
-    let extents = reshape_shape_extents(shape_expr, st)?;
-    if extents.is_empty() {
-        return None;
+
+    // Fast path: when shape is a literal `[k1, k2, ...]` and there's no
+    // pad/order, build the result descriptor inline. The bytes of the
+    // source are reinterpreted in column-major order — no copy needed.
+    if pad_arg.is_none() && order_arg.is_none() {
+        if let Some(extents) = reshape_shape_extents(shape_expr, st) {
+            if !extents.is_empty() {
+                let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                let zero32 = b.const_i32(0);
+                let sz384 = b.const_i64(384);
+                b.call(
+                    FuncRef::External("memset".into()),
+                    vec![desc, zero32, sz384],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+                let base_ptr =
+                    b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty.clone())));
+                store_byte_aggregate_field(
+                    b,
+                    desc,
+                    0,
+                    IrType::Ptr(Box::new(elem_ty.clone())),
+                    base_ptr,
+                );
+                let elem_size = descriptor_elem_size(b, source_desc);
+                store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
+                let rank = b.const_i32(extents.len() as i32);
+                store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+                let flags = b.const_i32(2);
+                store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+                for (i, extent) in extents.iter().copied().enumerate() {
+                    let base_offset = 24 + (i as i64) * 24;
+                    let lower = b.const_i64(1);
+                    let upper = b.const_i64(extent);
+                    let stride = b.const_i64(1);
+                    store_byte_aggregate_field(b, desc, base_offset, IrType::Int(IntWidth::I64), lower);
+                    store_byte_aggregate_field(b, desc, base_offset + 8, IrType::Int(IntWidth::I64), upper);
+                    store_byte_aggregate_field(b, desc, base_offset + 16, IrType::Int(IntWidth::I64), stride);
+                }
+                return Some((desc, elem_ty));
+            }
+        }
     }
 
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    // General path: dispatch through the runtime helper that builds a
+    // fresh result descriptor with appropriate extents/order/padding.
+    // The runtime knows how to permute element traversal, so the result
+    // is a copy of the source bytes in the correct destination layout
+    // (not a view).
+    let shape_desc = lower_array_expr_descriptor(
+        b,
+        locals,
+        shape_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?
+    .0;
+    let null_i64 = b.const_i64(0);
+    let null_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
+    let order_desc = if let Some(arg) = order_arg {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                e,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .map(|(d, _)| d)
+            .unwrap_or(null_ptr)
+        } else {
+            null_ptr
+        }
+    } else {
+        null_ptr
+    };
+    let pad_desc = if let Some(arg) = pad_arg {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                e,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .map(|(d, _)| d)
+            .unwrap_or(null_ptr)
+        } else {
+            null_ptr
+        }
+    } else {
+        null_ptr
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
     let sz384 = b.const_i64(384);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![result_desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.call(
+        FuncRef::External("afs_array_reshape".into()),
+        vec![source_desc, shape_desc, order_desc, pad_desc, result_desc],
+        IrType::Void,
+    );
+
+    Some((result_desc, elem_ty))
+}
+
+/// F2018 §16.9.144: lower PACK(ARRAY, MASK [, VECTOR]) to an
+/// `afs_array_pack` runtime call producing a fresh rank-1 descriptor.
+/// Returns the result descriptor address and the element IR type
+/// (taken from the source array). The caller is responsible for
+/// freeing/owning the descriptor as appropriate.
+fn lower_pack_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    if args.len() < 2 {
+        return None;
+    }
+
+    // PACK accepts keyword args (mask=, vector=). Reorder to canonical
+    // positional order before extracting.
+    let arg_slots = reorder_args_by_keyword_slots(args, "pack", st);
+    let array_arg = arg_slots.first().and_then(|x| x.as_ref())?;
+    let mask_arg = arg_slots.get(1).and_then(|x| x.as_ref())?;
+    let vector_arg = arg_slots.get(2).and_then(|x| x.as_ref());
+
+    let crate::ast::expr::SectionSubscript::Element(array_expr) = &array_arg.value else {
+        return None;
+    };
+    let crate::ast::expr::SectionSubscript::Element(mask_expr) = &mask_arg.value else {
+        return None;
+    };
+
+    let (src_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let (mask_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        mask_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let vector_desc = if let Some(vec_arg) = vector_arg {
+        if let crate::ast::expr::SectionSubscript::Element(vec_expr) = &vec_arg.value {
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                vec_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .map(|(d, _)| d)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let null_desc = b.const_i64(0);
+    let null_desc_ptr = b.int_to_ptr(null_desc, IrType::Int(IntWidth::I8));
+    let vector_desc = vector_desc.unwrap_or(null_desc_ptr);
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero32, sz384],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let base_ptr = b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty.clone())));
-    store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(elem_ty.clone())), base_ptr);
-    let elem_size = descriptor_elem_size(b, source_desc);
-    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
-    let rank = b.const_i32(extents.len() as i32);
-    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
-    let flags = b.const_i32(2);
-    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+    b.call(
+        FuncRef::External("afs_array_pack".into()),
+        vec![src_desc, mask_desc, vector_desc, result_desc],
+        IrType::Void,
+    );
 
-    for (i, extent) in extents.iter().copied().enumerate() {
-        let base_offset = 24 + (i as i64) * 24;
-        let lower = b.const_i64(1);
-        let upper = b.const_i64(extent);
-        let stride = b.const_i64(1);
-        store_byte_aggregate_field(b, desc, base_offset, IrType::Int(IntWidth::I64), lower);
-        store_byte_aggregate_field(b, desc, base_offset + 8, IrType::Int(IntWidth::I64), upper);
-        store_byte_aggregate_field(
-            b,
-            desc,
-            base_offset + 16,
-            IrType::Int(IntWidth::I64),
-            stride,
-        );
-    }
-
-    Some((desc, elem_ty))
+    Some((result_desc, elem_ty))
 }
 
 fn array_function_result_elem_type(
@@ -32420,6 +32739,126 @@ fn lower_rank1_array_unary_descriptor(
     Some((result_desc, elem_ty))
 }
 
+/// F2018 §10.1.5: relational ops over rank-1 array operands produce a
+/// rank-1 logical array of the same shape. Element type of the comparison
+/// is `operand_ty`; the result is a fresh Bool array descriptor.
+///
+/// Either operand may be scalar (broadcast) or rank-1; at least one side
+/// must be array-shaped (caller has already verified). Used as a sub-path
+/// of `lower_rank1_numeric_array_binary_descriptor`.
+#[allow(clippy::too_many_arguments)]
+fn lower_rank1_array_compare_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    op: &BinaryOp,
+    left: &crate::ast::expr::SpannedExpr,
+    right: &crate::ast::expr::SpannedExpr,
+    lhs_desc: Option<ValueId>,
+    rhs_desc: Option<ValueId>,
+    operand_ty: &IrType,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    let source_desc = lhs_desc.or(rhs_desc)?;
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    // Allocate the result descriptor with elem_size matching Bool (i32 = 4).
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
+    let zero64 = b.const_i64(0);
+    let one64 = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let eight = b.const_i64(8);
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let sixteen = b.const_i64(16);
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(one64, lower_ptr);
+    b.store(n, upper_ptr);
+    b.store(one64, stride_ptr);
+
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
+    let rank = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![result_desc, elem_size, rank, bounds, stat],
+        IrType::Void,
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("array_cmp_check");
+    let bb_body = b.create_block("array_cmp_body");
+    let bb_exit = b.create_block("array_cmp_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let lhs_val = if let Some(d) = lhs_desc {
+        load_rank1_array_desc_elem(b, d, operand_ty, idx)
+    } else {
+        let scalar = lower_expr_full(
+            b, locals, left, st, type_layouts,
+            internal_funcs, contained_host_refs, descriptor_params,
+        );
+        coerce_to_type(b, scalar, operand_ty)
+    };
+    let rhs_val = if let Some(d) = rhs_desc {
+        load_rank1_array_desc_elem(b, d, operand_ty, idx)
+    } else {
+        let scalar = lower_expr_full(
+            b, locals, right, st, type_layouts,
+            internal_funcs, contained_host_refs, descriptor_params,
+        );
+        coerce_to_type(b, scalar, operand_ty)
+    };
+
+    let cmp = match (operand_ty, op) {
+        (IrType::Int(_) | IrType::Bool, BinaryOp::Eq) => b.icmp(CmpOp::Eq, lhs_val, rhs_val),
+        (IrType::Int(_) | IrType::Bool, BinaryOp::Ne) => b.icmp(CmpOp::Ne, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Lt) => b.icmp(CmpOp::Lt, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Le) => b.icmp(CmpOp::Le, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Gt) => b.icmp(CmpOp::Gt, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Ge) => b.icmp(CmpOp::Ge, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Eq) => b.fcmp(CmpOp::Eq, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Ne) => b.fcmp(CmpOp::Ne, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Lt) => b.fcmp(CmpOp::Lt, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Le) => b.fcmp(CmpOp::Le, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Gt) => b.fcmp(CmpOp::Gt, lhs_val, rhs_val),
+        (IrType::Float(_), BinaryOp::Ge) => b.fcmp(CmpOp::Ge, lhs_val, rhs_val),
+        _ => return None,
+    };
+    store_rank1_array_desc_elem(b, result_desc, &IrType::Bool, idx, cmp);
+
+    let next = b.iadd(idx, one64);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some((result_desc, IrType::Bool))
+}
+
 fn lower_rank1_numeric_array_binary_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -32474,6 +32913,36 @@ fn lower_rank1_numeric_array_binary_descriptor(
         IrType::Int(_) | IrType::Float(_) | IrType::Bool => {}
         _ if is_complex_elem => {}
         _ => return None,
+    }
+    // F2018 §10.1.5: relational operators on array operands produce a
+    // logical array of the same shape. Take a separate path for those
+    // since the result element type (Bool) differs from the operand
+    // element type, and dispatch through `lower_rank1_array_compare_descriptor`.
+    let is_compare_op = matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+    );
+    if is_compare_op && !is_complex_elem {
+        return lower_rank1_array_compare_descriptor(
+            b,
+            locals,
+            op,
+            left,
+            right,
+            lhs.as_ref().map(|(d, _)| *d),
+            rhs.as_ref().map(|(d, _)| *d),
+            &elem_ty,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
     }
     let op_supported = if is_complex_elem {
         matches!(
@@ -32858,6 +33327,25 @@ fn lower_array_expr_descriptor(
         }
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                // F2018 §16.9.144: PACK(ARRAY, MASK [, VECTOR]) is a
+                // transformational intrinsic that materializes a fresh
+                // rank-1 descriptor. Without an explicit array path the
+                // generic call lowering falls back to External("pack"),
+                // which the linker can't resolve.
+                if name.eq_ignore_ascii_case("pack") {
+                    if let Some(result) = lower_pack_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
+                    }
+                }
                 if name.eq_ignore_ascii_case("reshape") {
                     return lower_reshape_array_expr_descriptor(
                         b,
