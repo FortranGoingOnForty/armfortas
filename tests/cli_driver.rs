@@ -10810,6 +10810,45 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration() {
+    // F2018 §7.8 implied-do array constructor with complex(dp) elements:
+    // the inner-loop body in store_ac_implied_do had the same scalar-store
+    // bug as the flat path — only the real lane was overwritten per
+    // iteration, leaving each imag lane as whatever bytes were already in
+    // the destination. Same fix: take a memcpy path when elem_ty is a
+    // complex aggregate so both lanes land each iteration.
+    let src = write_program(
+        "program t\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  complex(dp) :: b(4)\n  integer :: i\n  b = [(cmplx(real(i,kind=dp), real(2*i,kind=dp), kind=dp), i=1,4)]\n  if (abs(real(b(1),kind=dp) - 1.0_dp) > 1.0e-12_dp) error stop 11\n  if (abs(aimag(b(1)) - 2.0_dp)        > 1.0e-12_dp) error stop 12\n  if (abs(real(b(3),kind=dp) - 3.0_dp) > 1.0e-12_dp) error stop 31\n  if (abs(aimag(b(3)) - 6.0_dp)        > 1.0e-12_dp) error stop 32\n  if (abs(real(b(4),kind=dp) - 4.0_dp) > 1.0e-12_dp) error stop 41\n  if (abs(aimag(b(4)) - 8.0_dp)        > 1.0e-12_dp) error stop 42\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_dp_implied_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex(dp) implied-do compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex(dp) implied-do should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex(dp) implied-do run failed");
+    assert!(
+        run.status.success(),
+        "complex(dp) implied-do should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
     // F2018 §16.9.231 (SUM), §16.9.196 (PRODUCT), §16.9.146 (MAXVAL),
     // §16.9.151 (MINVAL): MASK selects which elements participate.
