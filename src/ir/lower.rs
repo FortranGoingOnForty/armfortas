@@ -4975,18 +4975,17 @@ fn lower_unit(
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
             for sub in contains {
-                let sub_is_smp_body = match &sub.node {
-                    ProgramUnit::Function { prefix, .. }
-                    | ProgramUnit::Subroutine { prefix, .. } => prefix
-                        .iter()
-                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
-                    _ => false,
-                };
-                let host_module_name = if sub_is_smp_body {
-                    parent.as_str()
-                } else {
-                    submodule_name.as_str()
-                };
+                // Both regular submodule procedures and SMP (separate
+                // module procedure) bodies live inside the submodule
+                // scope; pass `submodule_name` as the host. The
+                // install_globals_as_locals helper walks the
+                // submodule's USE associations to additionally pull in
+                // the parent module's globals (F2018 §11.2.3 host
+                // association). Mangling submodule-local declarations
+                // under submodule_name (and looking them up the same
+                // way) keeps SMP bodies seeing both layers without
+                // having to special-case them here.
+                let host_module_name = submodule_name.as_str();
                 lower_unit(
                     module,
                     sub,
