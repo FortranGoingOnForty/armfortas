@@ -10605,6 +10605,90 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
+    // F2018 §16.9.193: SIZE(array [, dim] [, kind]). The KIND keyword
+    // selects the integer kind of the result; it is *not* a DIM
+    // selector. stdlib's `n = size(a, kind=ilp)` was being lowered as
+    // `size(a, dim=ilp)` (8) because the second positional/keyword arg
+    // was treated as `dim` regardless of which keyword it carried —
+    // making `n` come back as 0 (out-of-range dim) and propagating the
+    // bug into stdlib_intrinsics_sum, which then summed a buffer of
+    // zeros for `softmax(x)`. Now `dim_arg_expr` only matches a
+    // positional second arg or `keyword=dim`, ignoring `keyword=kind`
+    // and others.
+    let src = write_program(
+        "program t\n  use, intrinsic :: iso_fortran_env, only: int64\n  implicit none\n  integer, parameter :: ilp = int64\n  integer :: a(7)\n  integer(ilp) :: n\n  a = [1, 2, 3, 4, 5, 6, 7]\n  n = size(a, kind=ilp)\n  if (n /= 7_ilp) error stop 1\n  if (size(a) /= 7) error stop 2\n  if (size(a, dim=1) /= 7) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("size_kind_kwarg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("size kind kwarg compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "size kind kwarg should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("size kind kwarg run failed");
+    assert!(
+        run.status.success(),
+        "size kind kwarg should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn smp_body_parameter_initialized_from_imported_kind_constant() {
+    // F2018 §11.2.3 + §5.5: a submodule's PARAMETER initializer can
+    // reference a constant imported via USE — e.g. `use stdlib_kinds`
+    // followed by `integer, parameter :: ilp = int64`. The host-aware
+    // const folder for SMP bodies used to ignore the symbol table, so
+    // `int64` failed to resolve and `ilp` ended up as a runtime global
+    // initialized to zero. Now the SMP submodule path uses the
+    // scope-aware folder, which falls back to the symbol table for
+    // imported parameters.
+    let src = write_program(
+        "module mp\n  use, intrinsic :: iso_fortran_env, only: int64\n  interface\n    pure module function nelems(a) result(s)\n      import :: int64\n      integer, intent(in) :: a(:)\n      integer(int64) :: s\n    end function\n  end interface\nend module\n\nsubmodule (mp) mb\n  use, intrinsic :: iso_fortran_env, only: int64\n  implicit none\n  integer, parameter :: ilp = int64\ncontains\n  pure module function nelems(a) result(s)\n    integer, intent(in) :: a(:)\n    integer(int64) :: s\n    s = size(a, kind=ilp)\n  end function\nend submodule\n\nprogram t\n  use mp, only: nelems\n  use, intrinsic :: iso_fortran_env, only: int64\n  implicit none\n  integer :: a(7)\n  a = [1, 2, 3, 4, 5, 6, 7]\n  if (nelems(a) /= 7_int64) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("smp_imported_kind_const", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("smp imported kind const compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "smp imported kind const should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("smp imported kind const run failed");
+    assert!(
+        run.status.success(),
+        "smp imported kind const should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,
