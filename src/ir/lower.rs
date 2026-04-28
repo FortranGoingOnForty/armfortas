@@ -36627,79 +36627,205 @@ fn lower_array_intrinsic(
             }
         }
         "sum" => {
+            // F2018 §16.9.231: SUM(ARRAY [, DIM] [, MASK]).
+            // Look for `mask=` keyword arg (or a positional 3rd arg, but
+            // SUM with a positional mask is stylistically rare and DIM
+            // would have to come first).
+            let mask_arg_expr = args.iter().find_map(|a| match a.keyword.as_deref() {
+                Some(k) if k.eq_ignore_ascii_case("mask") => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            let mask_desc = mask_arg_expr.and_then(|e| {
+                lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .map(|(d, _)| d)
+            });
             let is_real = elem_ty.is_float();
             if is_real {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_sum_real8_mask", vec![desc, md]),
+                    None => ("afs_array_sum_real8", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_sum_real8".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
                 Some(coerce_to_type(b, raw, &elem_ty))
             } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_sum_int_mask", vec![desc, md]),
+                    None => ("afs_array_sum_int", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_sum_int".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                // F2018 §16.9.231: result kind matches input element kind.
                 Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "product" => {
+            // F2018 §16.9.196: PRODUCT(ARRAY [, DIM] [, MASK]).
+            let mask_arg_expr = args.iter().find_map(|a| match a.keyword.as_deref() {
+                Some(k) if k.eq_ignore_ascii_case("mask") => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            let mask_desc = mask_arg_expr.and_then(|e| {
+                lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .map(|(d, _)| d)
+            });
             let is_real = elem_ty.is_float();
             if is_real {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_product_real8_mask", vec![desc, md]),
+                    None => ("afs_array_product_real8", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_product_real8".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
                 Some(coerce_to_type(b, raw, &elem_ty))
             } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_product_int_mask", vec![desc, md]),
+                    None => ("afs_array_product_int", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_product_int".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                // F2018 §16.9.196: result kind matches input element
-                // kind.  The runtime helper returns i64 for any
-                // integer array; truncate to the element kind so
-                // generic dispatch sees the right IR width.
                 Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "maxval" => {
+            // F2018 §16.9.146: MAXVAL(ARRAY [, DIM] [, MASK]).
+            let mask_arg_expr = args.iter().find_map(|a| match a.keyword.as_deref() {
+                Some(k) if k.eq_ignore_ascii_case("mask") => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            let mask_desc = mask_arg_expr.and_then(|e| {
+                lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .map(|(d, _)| d)
+            });
             let is_real = elem_ty.is_float();
             if is_real {
-                Some(b.call(
-                    FuncRef::External("afs_array_maxval_real8".into()),
-                    vec![desc],
-                    IrType::Float(FloatWidth::F64),
-                ))
-            } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_maxval_real8_mask", vec![desc, md]),
+                    None => ("afs_array_maxval_real8", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_maxval_int".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
+                    IrType::Float(FloatWidth::F64),
+                );
+                Some(coerce_to_type(b, raw, &elem_ty))
+            } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_maxval_int_mask", vec![desc, md]),
+                    None => ("afs_array_maxval_int", vec![desc]),
+                };
+                let raw = b.call(
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                // F2018 §16.9.146: result kind matches input element kind.
                 Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
         "minval" => {
+            // F2018 §16.9.151: MINVAL(ARRAY [, DIM] [, MASK]).
+            let mask_arg_expr = args.iter().find_map(|a| match a.keyword.as_deref() {
+                Some(k) if k.eq_ignore_ascii_case("mask") => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            let mask_desc = mask_arg_expr.and_then(|e| {
+                lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .map(|(d, _)| d)
+            });
             let is_real = elem_ty.is_float();
             if is_real {
-                Some(b.call(
-                    FuncRef::External("afs_array_minval_real8".into()),
-                    vec![desc],
-                    IrType::Float(FloatWidth::F64),
-                ))
-            } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_minval_real8_mask", vec![desc, md]),
+                    None => ("afs_array_minval_real8", vec![desc]),
+                };
                 let raw = b.call(
-                    FuncRef::External("afs_array_minval_int".into()),
-                    vec![desc],
+                    FuncRef::External(func.into()),
+                    args_vec,
+                    IrType::Float(FloatWidth::F64),
+                );
+                Some(coerce_to_type(b, raw, &elem_ty))
+            } else {
+                let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
+                    Some(md) => ("afs_array_minval_int_mask", vec![desc, md]),
+                    None => ("afs_array_minval_int", vec![desc]),
+                };
+                let raw = b.call(
+                    FuncRef::External(func.into()),
+                    args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                // F2018 §16.9.151: result kind matches input element kind.
                 Some(coerce_to_type(b, raw, &elem_ty))
             }
         }
