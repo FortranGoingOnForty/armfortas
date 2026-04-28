@@ -4834,6 +4834,24 @@ fn lower_unit(
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
+                if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
+                    if let Some(info) = ctx.locals.get(&result_name).cloned() {
+                        if !info.allocatable || info.is_pointer {
+                            // Already handled above by attribute exclusion.
+                        }
+                        allocate_runtime_shape_array_result(
+                            &mut b,
+                            &ctx.locals,
+                            &result_name,
+                            ValueId(0),
+                            &info.ty,
+                            decls,
+                            &visible_param_consts,
+                            ctx.st,
+                            type_layouts,
+                        );
+                    }
+                }
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 lower_stmts(&mut b, &mut ctx, body);
@@ -17695,6 +17713,148 @@ fn install_runtime_dim_bounds(
             }
         }
     }
+}
+
+/// F2018 §15.5.2.4: a function whose result is an explicit-shape array
+/// with bounds that depend on dummies (e.g. `integer :: res(size(v),size(v))`)
+/// must auto-allocate the result on procedure entry so the body can write
+/// `res(i,j)` legally. Without this the caller-supplied descriptor stays
+/// memset-zeroed and the first element write trips a bounds check.
+///
+/// Run after dummy locals + their `runtime_dim_upper` are installed so we
+/// can lower bound expressions like `size(v)` against real dummy slots.
+/// Skips:
+///   - non-array results;
+///   - results whose every upper bound is compile-time constant (the caller
+///     can size those itself);
+///   - allocatable / pointer results (the body's `allocate(...)` populates
+///     them — pre-allocating would leak).
+///
+/// `result_desc` is the descriptor address: ValueId(0) for the standard
+/// HiddenResultAbi::ArrayDescriptor sret.
+#[allow(clippy::too_many_arguments)]
+fn allocate_runtime_shape_array_result(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    result_name: &str,
+    result_desc: ValueId,
+    elem_ty: &IrType,
+    decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    use crate::ast::decl::{ArraySpec, Attribute};
+
+    let key = result_name.to_lowercase();
+    let mut chosen_specs: Option<Vec<ArraySpec>> = None;
+    for decl in decls {
+        let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a {
+                Some(specs)
+            } else {
+                None
+            }
+        });
+        // Skip allocatable / pointer — body owns the lifetime there.
+        if attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Allocatable | Attribute::Pointer))
+        {
+            continue;
+        }
+        for entity in entities {
+            if entity.name.to_lowercase() != key {
+                continue;
+            }
+            if let Some(specs) = entity.array_spec.as_ref().or(attr_dims) {
+                chosen_specs = Some(specs.clone());
+            }
+        }
+    }
+    let Some(specs) = chosen_specs else {
+        return;
+    };
+    if specs.is_empty() {
+        return;
+    }
+
+    let mut any_runtime = false;
+    for spec in &specs {
+        let ArraySpec::Explicit { upper, .. } = spec else {
+            return;
+        };
+        if matches!(upper.node, Expr::IntegerLiteral { .. }) {
+            continue;
+        }
+        if eval_const_scalar(upper, visible_param_consts).is_some() {
+            continue;
+        }
+        any_runtime = true;
+    }
+    if !any_runtime {
+        return;
+    }
+
+    let mut lowers: Vec<ValueId> = Vec::with_capacity(specs.len());
+    let mut uppers: Vec<ValueId> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let ArraySpec::Explicit { lower, upper } = spec else {
+            unreachable!();
+        };
+        let lo_val = match lower {
+            Some(expr) => {
+                let v = lower_expr_with_optional_layouts(b, locals, expr, st, Some(type_layouts));
+                match b.func().value_type(v) {
+                    Some(IrType::Int(IntWidth::I64)) => v,
+                    Some(IrType::Int(_)) => b.int_extend(v, IntWidth::I64, true),
+                    _ => v,
+                }
+            }
+            None => b.const_i64(1),
+        };
+        let hi_v = lower_expr_with_optional_layouts(b, locals, upper, st, Some(type_layouts));
+        let hi_val = match b.func().value_type(hi_v) {
+            Some(IrType::Int(IntWidth::I64)) => hi_v,
+            Some(IrType::Int(_)) => b.int_extend(hi_v, IntWidth::I64, true),
+            _ => hi_v,
+        };
+        lowers.push(lo_val);
+        uppers.push(hi_val);
+    }
+
+    let rank = specs.len() as u64;
+    let bounds_bytes = (rank * 24) as u64;
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bounds_bytes));
+    let one64 = b.const_i64(1);
+    for (i, (lo, hi)) in lowers.iter().zip(uppers.iter()).enumerate() {
+        let off_lo = b.const_i64((i as i64) * 24);
+        let off_hi = b.const_i64((i as i64) * 24 + 8);
+        let off_st = b.const_i64((i as i64) * 24 + 16);
+        let p_lo = b.gep(bounds, vec![off_lo], IrType::Int(IntWidth::I8));
+        let p_hi = b.gep(bounds, vec![off_hi], IrType::Int(IntWidth::I8));
+        let p_st = b.gep(bounds, vec![off_st], IrType::Int(IntWidth::I8));
+        b.store(*lo, p_lo);
+        b.store(*hi, p_hi);
+        b.store(one64, p_st);
+    }
+
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let rank_v = b.const_i32(rank as i32);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![result_desc, elem_size, rank_v, bounds, stat],
+        IrType::Void,
+    );
 }
 
 /// Check if a dummy argument is a derived type, returning the type name if so.
