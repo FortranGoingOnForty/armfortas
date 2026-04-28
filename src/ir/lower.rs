@@ -5014,8 +5014,13 @@ fn lower_unit(
             // submodule) live in the submodule's own scope, and the call
             // site resolves them through the `Submodule(name)` scope —
             // so their definition must use the submodule name to match.
+            // Use the scope-aware folder so initializers like
+            // `integer, parameter :: ilp = int64` (where int64 is
+            // imported from another module) can resolve via the
+            // symbol table; otherwise the param falls through to a
+            // zero-initialized module global.
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
@@ -36416,9 +36421,34 @@ fn lower_array_intrinsic(
 
     match name {
         "size" => {
-            if args.len() >= 2 {
+            // F2018 §16.9.193: SIZE(array [, dim] [, kind]). The optional
+            // `dim=` selects which extent to return; the optional `kind=`
+            // selects the integer kind of the result. Only `dim=` should
+            // pick the size_dim runtime entry — a `kind=` keyword arg
+            // alone (e.g. `size(a, kind=ilp)`) means total size, not
+            // size-along-dim. Treat positional second arg as dim.
+            let dim_arg_expr = args.iter().enumerate().find_map(|(i, a)| match a.keyword.as_deref()
+            {
+                Some(k) if k.eq_ignore_ascii_case("dim") => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                Some(_) => None, // kind= or other — not a dim arg
+                None if i == 1 => {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            });
+            if let Some(e) = dim_arg_expr {
                 // SIZE(array, dim)
-                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
+                {
                     let dim = lower_expr(b, locals, e, st);
                     let result64 = if let Some(info) = first_arg_info.as_ref() {
                         if !desc_from_expr && !local_uses_array_descriptor(info) {
@@ -36452,8 +36482,6 @@ fn lower_array_intrinsic(
                         )
                     };
                     Some(b.int_trunc(result64, IntWidth::I32))
-                } else {
-                    None
                 }
             } else {
                 // SIZE(array)
