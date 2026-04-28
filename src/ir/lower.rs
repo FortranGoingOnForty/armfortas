@@ -27665,6 +27665,26 @@ fn store_ac_implied_do(
                 let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
                 if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
                     emit_derived_value_copy(b, tl, type_name, p, raw);
+                } else if is_complex_ty(elem_ty) {
+                    // Same memcpy path as the non-implied-do arm — a single
+                    // scalar store of an Array(F,2) value drops the imag lane.
+                    let bytes = complex_byte_size(elem_ty);
+                    let sz = b.const_i64(bytes);
+                    let src_ptr = if matches!(
+                        b.func().value_type(raw),
+                        Some(IrType::Ptr(_))
+                    ) {
+                        raw
+                    } else {
+                        let buf = b.alloca(elem_ty.clone());
+                        b.store(raw, buf);
+                        buf
+                    };
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![p, src_ptr, sz],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
                 } else {
                     let coerced = coerce_to_type(b, raw, elem_ty);
                     b.store(coerced, p);
