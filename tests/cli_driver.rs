@@ -10605,6 +10605,51 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual() {
+    // F2018 §16.2.7: an elemental procedure applied to an array actual
+    // produces a conformable array result via element-wise scalarization.
+    // stdlib's `gelu(x)` (rank-1 array x) dispatches through a generic
+    // interface to `gelu_sp` (`elemental module function ...`). The
+    // assignment `y = gelu(x)` (y fixed-shape `real :: y(n)`) was
+    // hitting `array_descriptor_addr(&info)` returning the bare buffer,
+    // then handing it to `afs_assign_allocatable` and
+    // `afs_deallocate_array` — misaligned-pointer panic at runtime.
+    // Fix: detect user-defined elementals (including those reachable
+    // only through a generic interface's specifics) and route to
+    // `lower_array_assign` for scalarization instead of the
+    // descriptor-allocate / assign / deallocate path.
+    let src = write_program(
+        "module em\n  use, intrinsic :: iso_fortran_env, only: sp => real32\n  interface myop\n    module procedure myop_sp\n  end interface\ncontains\n  pure elemental function myop_sp(x) result(y)\n    real(sp), intent(in) :: x\n    real(sp) :: y\n    y = 2.0_sp * x + 1.0_sp\n  end function\nend module\n\nprogram t\n  use em, only: myop\n  use, intrinsic :: iso_fortran_env, only: sp => real32\n  implicit none\n  integer, parameter :: n = 5\n  real(sp) :: x(n), y(n)\n  integer :: i\n  do i = 1, n; x(i) = real(i, sp); end do\n  y = myop(x)\n  if (abs(y(1) - 3.0_sp) > 1.0e-5_sp) error stop 1\n  if (abs(y(2) - 5.0_sp) > 1.0e-5_sp) error stop 2\n  if (abs(y(5) - 11.0_sp) > 1.0e-5_sp) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cross_module_elemental_generic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cross-module elemental compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "cross-module elemental should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("cross-module elemental run failed");
+    assert!(
+        run.status.success(),
+        "cross-module elemental should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn runtime_shape_array_function_result_auto_allocates_on_entry() {
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with bounds depending on dummies (e.g.
