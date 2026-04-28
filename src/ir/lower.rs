@@ -17784,6 +17784,17 @@ fn allocate_runtime_shape_array_result(
     if specs.is_empty() {
         return;
     }
+    // Rank-1 array-returning callees in our codebase have a fast-path
+    // where the caller passes the destination buffer (e.g. `[f32 x 10]`)
+    // as the sret slot rather than a 384-byte descriptor. Calling
+    // afs_allocate_array on that buffer would write descriptor fields
+    // into the caller's stack and corrupt unrelated locals. Limit
+    // auto-allocation to rank ≥ 2 where the caller path consistently
+    // hands us a real descriptor (the diag/eye-style result that drove
+    // this fix in stdlib_linalg).
+    if specs.len() < 2 {
+        return;
+    }
 
     let mut any_runtime = false;
     for spec in &specs {
