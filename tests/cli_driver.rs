@@ -10689,6 +10689,43 @@ fn smp_body_parameter_initialized_from_imported_kind_constant() {
 }
 
 #[test]
+fn matmul_over_integer_matrices_uses_column_major_indexing() {
+    // afs_matmul_int had the same row-major indexing bug as the real
+    // version: A(i,l) was looked up at `i*k + l` and result(i,j) stored
+    // at `i*n + j`. Fortran is column-major so A(i,l) lives at `l*m + i`
+    // and result(i,j) at `j*m + i`. This test guards the integer arm.
+    let src = write_program(
+        "program t\n  implicit none\n  integer :: A(3,3), B(3,3)\n  A = reshape([1, 2, 3, 4, 5, 6, 7, 8, 9], [3,3])\n  B = matmul(A, A)\n  if (B(1,1) /= 30) error stop 11\n  if (B(2,1) /= 36) error stop 12\n  if (B(3,1) /= 42) error stop 13\n  if (B(1,2) /= 66) error stop 21\n  if (B(2,2) /= 81) error stop 22\n  if (B(3,3) /= 150) error stop 33\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("matmul_int_colmajor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("matmul int compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "matmul int should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul int run failed");
+    assert!(
+        run.status.success(),
+        "matmul int should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
     // Two pre-existing runtime bugs in afs_matmul_real8 / afs_transpose_real8:
     // (a) both read `*const f64` regardless of descriptor `elem_size`, so
