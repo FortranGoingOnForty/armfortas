@@ -10605,6 +10605,50 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn parameter_const_with_math_intrinsic_initializer_folds_in_smp_body() {
+    // F2018 §16.9: math intrinsics (sqrt, exp, log, sin/cos/...) are
+    // permitted in initialization expressions for PARAMETERs.  Without
+    // compile-time folding, an SMP body that references such a parameter
+    // (e.g. `real, parameter :: isqrt2 = 1.0/sqrt(2.0)` followed by
+    // `y = ... * (1 + erf(x*isqrt2))`) reads zero — there is no module-
+    // level evaluator that emits the value into runtime storage for
+    // non-trivial initializers, so the lookup falls through to its
+    // zero-initialized slot.  Stdlib's `gelu_sp` triggered this through
+    // `stdlib_specialfunctions_activations.f90`.  Now eval_const_scalar
+    // folds the common math intrinsics and the parameter is registered
+    // as a real compile-time constant.
+    let src = write_program(
+        "module mp\n  use, intrinsic :: iso_fortran_env, only: sp => real32\n  interface\n    elemental module function selu(x) result(y)\n      import :: sp\n      real(sp), intent(in) :: x\n      real(sp) :: y\n    end function\n  end interface\nend module\n\nsubmodule (mp) mb\n  implicit none\n  real(sp), parameter :: isqrt2 = 1._sp / sqrt(2._sp)\ncontains\n  elemental module function selu(x) result(y)\n    real(sp), intent(in) :: x\n    real(sp) :: y\n    y = 0.5_sp * x * (1._sp + erf(x * isqrt2))\n  end function\nend submodule\n\nprogram t\n  use mp, only: selu\n  use, intrinsic :: iso_fortran_env, only: sp => real32\n  implicit none\n  real(sp) :: x(4), y(4)\n  x = [-2._sp, -1._sp, 1._sp, 2._sp]\n  y = selu(x)\n  if (abs(y(1) - (-0.0455_sp)) > 1.0e-3_sp) error stop 1\n  if (abs(y(2) - (-0.1587_sp)) > 1.0e-3_sp) error stop 2\n  if (abs(y(3) - 0.8413_sp) > 1.0e-3_sp) error stop 3\n  if (abs(y(4) - 1.9545_sp) > 1.0e-3_sp) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("smp_param_math_const_fold", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("smp param const fold compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "smp param const fold should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("smp param const fold run failed");
+    assert!(
+        run.status.success(),
+        "smp param const fold should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual() {
     // F2018 §16.2.7: an elemental procedure applied to an array actual
     // produces a conformable array result via element-wise scalarization.
