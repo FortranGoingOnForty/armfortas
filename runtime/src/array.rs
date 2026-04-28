@@ -2821,16 +2821,18 @@ pub extern "C" fn afs_matmul_int(
     };
     let rp = res.base_addr as *mut i32;
 
-    for i in 0..m {
-        for j in 0..n {
+    // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
+    // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
+    for j in 0..n {
+        for i in 0..m {
             let mut sum: i64 = 0;
             for l in 0..k {
-                let a_val = unsafe { *ap.add(i * k + l) as i64 };
-                let b_val = unsafe { *bp.add(l * n + j) as i64 };
+                let a_val = unsafe { *ap.add(l * m + i) as i64 };
+                let b_val = unsafe { *bp.add(j * k + l) as i64 };
                 sum += a_val * b_val;
             }
             unsafe {
-                *rp.add(i * n + j) = sum as i32;
+                *rp.add(j * m + i) = sum as i32;
             }
         }
     }
