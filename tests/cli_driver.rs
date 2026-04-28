@@ -10689,6 +10689,48 @@ fn smp_body_parameter_initialized_from_imported_kind_constant() {
 }
 
 #[test]
+fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
+    // Two pre-existing runtime bugs in afs_matmul_real8 / afs_transpose_real8:
+    // (a) both read `*const f64` regardless of descriptor `elem_size`, so
+    //     real(4) inputs were misread two-lanes-at-a-time.
+    // (b) afs_matmul_real8 indexed A[i,l] as `i*k + l` (row-major) and
+    //     C[i,j] as `i*n + j`, but Fortran arrays are column-major, so
+    //     A(i,l) lives at `l*m + i` and C(i,j) at `j*m + i`.
+    // Both fixed: matmul now branches on elem_size==4 vs 8 and uses
+    // column-major offsets; transpose dispatches on elem_size with f32/f64
+    // arms plus a generic byte-copy fallback.
+    let src = write_program(
+        "program t\n  implicit none\n  real :: A(3,3), B(3,3), T(3,3)\n  A = reshape([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], [3,3])\n  B = matmul(A, A)\n  if (abs(B(1,1) - 30.0) > 1.0e-3) error stop 11\n  if (abs(B(2,1) - 36.0) > 1.0e-3) error stop 12\n  if (abs(B(3,1) - 42.0) > 1.0e-3) error stop 13\n  if (abs(B(1,2) - 66.0) > 1.0e-3) error stop 21\n  if (abs(B(2,2) - 81.0) > 1.0e-3) error stop 22\n  if (abs(B(3,3) - 150.0) > 1.0e-3) error stop 33\n  T = transpose(A)\n  if (abs(T(1,1) - 1.0) > 1.0e-5) error stop 41\n  if (abs(T(1,2) - 2.0) > 1.0e-5) error stop 42\n  if (abs(T(2,1) - 4.0) > 1.0e-5) error stop 43\n  if (abs(T(3,1) - 7.0) > 1.0e-5) error stop 44\n  if (abs(T(3,3) - 9.0) > 1.0e-5) error stop 45\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("matmul_transpose_real4", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("matmul/transpose real4 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "matmul/transpose real4 should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul/transpose real4 run failed");
+    assert!(
+        run.status.success(),
+        "matmul/transpose real4 should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,
