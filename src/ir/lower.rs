@@ -2061,6 +2061,8 @@ fn install_equivalence_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Decl;
     use crate::ast::expr::Expr;
@@ -2069,31 +2071,96 @@ fn install_equivalence_locals(
     for decl in decls {
         if let Decl::EquivalenceStmt { groups } = &decl.node {
             for group in groups {
-                // Resolve each member to (var_name, elem_ty, within_var_byte_offset).
+                // Resolve each member to (var_name, elem_ty, dims, within_var_byte_offset).
+                // dims is the variable's full array shape (empty for scalars).
                 // within_var_byte_offset: for `name` → 0; for `name(i)` → (i-1)*elem_size.
-                let mut members: Vec<(String, IrType, i64)> = Vec::new();
+                // For subscripted array members (e.g. `ci(1,1)`) we still install
+                // the *full* array as a local — Fortran EQUIVALENCE shares storage
+                // but the names continue to refer to their declared shapes —
+                // so the only role of the subscript is to anchor the overlap.
+                struct Member {
+                    name: String,
+                    elem_ty: IrType,
+                    dims: Vec<(i64, i64)>,
+                    byte_off: i64, // anchor offset within this variable
+                    byte_size: i64, // full byte span of this variable
+                }
+                let mut members: Vec<Member> = Vec::new();
                 for expr in group {
                     match &expr.node {
                         Expr::Name { name } => {
                             let key = name.to_lowercase();
-                            let ty = arg_type_from_decls(&key, decls, None);
-                            members.push((key, ty, 0));
+                            let ty = arg_type_from_decls(&key, decls, Some(st));
+                            let dims = arg_dims_from_decls(&key, decls, visible_param_consts, st);
+                            let elem_size = ir_scalar_byte_size(&ty);
+                            let nelems: i64 =
+                                if dims.is_empty() {
+                                    1
+                                } else {
+                                    dims.iter().map(|(_, ext)| (*ext).max(0)).product()
+                                };
+                            let byte_size = elem_size * nelems.max(1);
+                            members.push(Member {
+                                name: key,
+                                elem_ty: ty,
+                                dims,
+                                byte_off: 0,
+                                byte_size,
+                            });
                         }
                         Expr::FunctionCall { callee, args } => {
                             if let Expr::Name { name } = &callee.node {
                                 let key = name.to_lowercase();
-                                let ty = arg_type_from_decls(&key, decls, None);
-                                let idx = if let Some(sub) = args.first() {
-                                    if let SectionSubscript::Element(e) = &sub.value {
-                                        eval_const_int(e).unwrap_or(1)
+                                let ty = arg_type_from_decls(&key, decls, Some(st));
+                                let dims =
+                                    arg_dims_from_decls(&key, decls, visible_param_consts, st);
+                                // Column-major linear offset for the subscript.
+                                // For dims [(lo1, ext1), (lo2, ext2), ...] and
+                                // subscripts [s1, s2, ...]:
+                                //   linear = (s1 - lo1) + (s2 - lo2) * ext1 + ...
+                                let elem_size = ir_scalar_byte_size(&ty);
+                                let mut linear: i64 = 0;
+                                let mut stride: i64 = 1;
+                                let mut all_const = true;
+                                for (i, sub) in args.iter().enumerate() {
+                                    let s = if let SectionSubscript::Element(e) = &sub.value {
+                                        eval_const_int(e)
                                     } else {
-                                        1
+                                        None
+                                    };
+                                    match s {
+                                        Some(v) => {
+                                            let (lo, ext) = dims
+                                                .get(i)
+                                                .copied()
+                                                .unwrap_or((1, 1));
+                                            linear += (v - lo) * stride;
+                                            stride *= ext.max(1);
+                                        }
+                                        None => {
+                                            all_const = false;
+                                            break;
+                                        }
                                     }
-                                } else {
+                                }
+                                if !all_const {
+                                    // Non-const subscript — bail on this member.
+                                    continue;
+                                }
+                                let byte_off = linear * elem_size;
+                                let nelems: i64 = if dims.is_empty() {
                                     1
+                                } else {
+                                    dims.iter().map(|(_, ext)| (*ext).max(0)).product()
                                 };
-                                let byte_off = (idx.max(1) - 1) * ir_scalar_byte_size(&ty);
-                                members.push((key, ty, byte_off));
+                                let byte_size = elem_size * nelems.max(1);
+                                members.push(Member {
+                                    name: key,
+                                    elem_ty: ty,
+                                    dims,
+                                    byte_off,
+                                    byte_size,
+                                });
                             }
                         }
                         _ => {} // skip complex expressions
@@ -2103,38 +2170,40 @@ fn install_equivalence_locals(
                     continue;
                 }
 
-                // Find the smallest within_var offset — this becomes the "origin".
-                let min_off = members.iter().map(|(_, _, o)| *o).min().unwrap_or(0);
-
-                // Compute total backing store size (bytes).
+                // Pick the equivalence anchor in backing as max(byte_off) so
+                // every member's first element lives at a non-negative offset.
+                // Each member's first element is then at `anchor - byte_off`
+                // in backing, and the member's storage spans `byte_size`
+                // bytes from there.
+                let anchor = members.iter().map(|m| m.byte_off).max().unwrap_or(0);
                 let total = members
                     .iter()
-                    .map(|(_, ty, o)| (o - min_off) + ir_scalar_byte_size(ty))
+                    .map(|m| (anchor - m.byte_off) + m.byte_size)
                     .max()
                     .unwrap_or(8);
 
-                // Allocate the byte-array backing store.
                 let backing_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), total as u64);
                 let backing = b.alloca(backing_ty);
 
-                for (var_name, elem_ty, within_off) in &members {
-                    if locals.contains_key(var_name) {
+                for m in &members {
+                    if locals.contains_key(&m.name) {
                         continue;
                     }
-                    let rel = within_off - min_off; // byte offset into backing
-                                                    // GEP with element type = elem_ty so the result is Ptr<elem_ty>.
-                                                    // For I32 at rel=0: gep(backing, [0], I32) → Ptr<I32> (backing itself).
-                                                    // For I32 at rel=4: gep(backing, [1], I32) → Ptr<I32> (backing + 4).
-                    let elem_size = ir_scalar_byte_size(elem_ty);
-                    let gep_idx = if elem_size > 0 { rel / elem_size } else { 0 };
+                    let first_elem_byte = anchor - m.byte_off;
+                    let elem_size = ir_scalar_byte_size(&m.elem_ty);
+                    let gep_idx = if elem_size > 0 {
+                        first_elem_byte / elem_size
+                    } else {
+                        0
+                    };
                     let idx_val = b.const_i64(gep_idx);
-                    let addr = b.gep(backing, vec![idx_val], elem_ty.clone());
+                    let addr = b.gep(backing, vec![idx_val], m.elem_ty.clone());
                     locals.insert(
-                        var_name.clone(),
+                        m.name.clone(),
                         LocalInfo {
                             addr,
-                            ty: elem_ty.clone(),
-                            dims: vec![],
+                            ty: m.elem_ty.clone(),
+                            dims: m.dims.clone(),
                             allocatable: false,
                             descriptor_arg: false,
                             by_ref: false,
@@ -2142,7 +2211,7 @@ fn install_equivalence_locals(
                             derived_type: None,
                             inline_const: None,
                             is_pointer: false,
-                            runtime_dim_upper: vec![],
+                            runtime_dim_upper: vec![None; m.dims.len()],
                             is_class: false,
                         },
                     );
@@ -3721,7 +3790,7 @@ fn lower_unit(
             {
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
                 alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -4112,7 +4181,7 @@ fn lower_unit(
                 );
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
                 // Install host-association by_ref locals before alloc_decls
                 // so any same-named callee local (shouldn't occur per F
                 // scoping rules) is short-circuited, and so init_decls has
@@ -4698,7 +4767,7 @@ fn lower_unit(
                 }
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls);
+                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
                 alloc_decls(
                     &mut b,
