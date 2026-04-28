@@ -74,6 +74,14 @@ pub enum Stmt {
         guards: Vec<TypeGuard>,
     },
 
+    // ---- SELECT RANK (F2018) ----
+    SelectRank {
+        name: Option<String>,
+        selector: SpannedExpr,
+        assoc_name: Option<String>, // SELECT RANK (assoc => expr)
+        guards: Vec<RankGuard>,
+    },
+
     // ---- WHERE / FORALL ----
     WhereConstruct {
         name: Option<String>,
@@ -254,6 +262,17 @@ pub enum TypeGuard {
     },
     /// CLASS DEFAULT — fallback.
     ClassDefault { body: Vec<SpannedStmt> },
+}
+
+/// SELECT RANK guard (F2018).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RankGuard {
+    /// RANK (N) — match a specific rank.
+    Rank { rank: i64, body: Vec<SpannedStmt> },
+    /// RANK (*) — match assumed-size.
+    RankStar { body: Vec<SpannedStmt> },
+    /// RANK DEFAULT — fallback.
+    RankDefault { body: Vec<SpannedStmt> },
 }
 
 /// A CASE block: case selector + body.

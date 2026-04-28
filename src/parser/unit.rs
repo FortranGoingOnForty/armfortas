@@ -30,8 +30,17 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let start = self.current_span();
 
-        // Collect prefixes (pure, elemental, recursive, etc.).
-        let mut prefixes = Vec::new();
+        // Prefixes and a single optional return-type spec may appear in
+        // any order before `function` / `subroutine` / `procedure`.
+        // Fortran 2008 R1226: prefix-spec ::= type-spec | declaration-prefix
+        // where declaration-prefix is one of pure/impure/elemental/
+        // recursive/non_recursive/module.  Stdlib uses every order:
+        //   pure module function foo
+        //   elemental module logical function bar
+        //   logical pure module function baz
+        //   pure real(sp) module function qux
+        let mut prefixes: Vec<Prefix> = Vec::new();
+        let mut return_type: Option<crate::ast::decl::TypeSpec> = None;
         loop {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
@@ -56,28 +65,59 @@ impl<'a> Parser<'a> {
                     prefixes.push(Prefix::NonRecursive);
                 }
                 "module" => {
-                    // "module" could be prefix or the MODULE keyword itself.
+                    // `module` is a prefix iff the *eventual* keyword
+                    // afterward is subroutine/function/procedure.  The
+                    // intervening tokens may be other prefixes or a
+                    // type-spec; check the next token cheaply and treat
+                    // it as a prefix when it can lead to those keywords.
                     let next = if self.pos + 1 < self.tokens.len() {
                         self.tokens[self.pos + 1].text.to_lowercase()
                     } else {
                         String::new()
                     };
-                    if matches!(next.as_str(), "subroutine" | "function" | "procedure") {
+                    let is_simple_prefix = matches!(
+                        next.as_str(),
+                        "subroutine" | "function" | "procedure"
+                    );
+                    let is_followed_by_decl_prefix = matches!(
+                        next.as_str(),
+                        "pure"
+                            | "impure"
+                            | "elemental"
+                            | "recursive"
+                            | "non_recursive"
+                    );
+                    let is_type_then_function = matches!(
+                        next.as_str(),
+                        "integer"
+                            | "real"
+                            | "double"
+                            | "complex"
+                            | "logical"
+                            | "character"
+                            | "type"
+                            | "class"
+                    );
+                    if is_simple_prefix
+                        || is_followed_by_decl_prefix
+                        || is_type_then_function
+                    {
                         self.advance();
                         prefixes.push(Prefix::Module);
                     } else {
                         break;
                     }
                 }
-                _ => break,
+                _ => {
+                    if return_type.is_none() {
+                        if let Some(ts_result) = self.try_parse_type_spec() {
+                            return_type = Some(ts_result?);
+                            continue;
+                        }
+                    }
+                    break;
+                }
             }
-        }
-
-        // Check for return type before function keyword.
-        let mut return_type = None;
-        if let Some(ts_result) = self.try_parse_type_spec() {
-            return_type = Some(ts_result?);
-            // This must be followed by "function".
         }
 
         let text = self.peek_text().to_lowercase();
@@ -87,6 +127,19 @@ impl<'a> Parser<'a> {
             "submodule" => self.parse_submodule(start),
             "subroutine" => self.parse_subroutine(start, prefixes),
             "function" => self.parse_function(start, prefixes, return_type),
+            // F2008 §12.6.2.5: separate module procedure body
+            // (module procedure NAME ... end procedure [NAME])
+            // — the procedure's signature is inherited from the
+            // parent module's interface block, so args/return type
+            // are not repeated here.  Only valid when the `module`
+            // prefix was consumed above.
+            "procedure"
+                if prefixes
+                    .iter()
+                    .any(|p| matches!(p, Prefix::Module)) =>
+            {
+                self.parse_separate_module_procedure(start, prefixes)
+            }
             "blockdata" | "block" => {
                 if text == "block"
                     && self.pos + 1 < self.tokens.len()
@@ -213,9 +266,15 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, _imports, _implicit, decls, _body, _ifaces) =
+        let (uses, _imports, _implicit, decls, _body, ifaces) =
             self.parse_unit_body(&["submodule"])?;
-        let contains = self.parse_contains_section()?;
+        let mut contains = self.parse_contains_section()?;
+        // Carry interface blocks declared at the submodule's
+        // specification section into `contains` so sema sees them
+        // (without this, generic interfaces declared inside the
+        // submodule — e.g. stdlib_quadrature_simps's
+        // `interface simps38_weights` — are silently dropped).
+        contains.extend(ifaces);
         self.consume_end("submodule")?;
 
         let span = span_from_to(start, self.prev_span());
@@ -335,6 +394,50 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// Parse the F2008 separate module procedure body form:
+    ///   `module procedure NAME` [ body ] `end [procedure [NAME]]`
+    /// The signature (args, return type, etc.) is inherited from the
+    /// matching `module subroutine`/`module function` interface in the
+    /// parent module — sema fills it in once both files are processed.
+    /// We always emit a Subroutine here; if the parent's interface was
+    /// actually a function, sema rewrites it (sema/resolve.rs).
+    fn parse_separate_module_procedure(
+        &mut self,
+        start: crate::lexer::Span,
+        prefix: Vec<Prefix>,
+    ) -> Result<SpannedUnit, ParseError> {
+        self.advance(); // consume 'procedure'
+        let name = self.advance().clone().text;
+        self.skip_newlines();
+
+        // Body is parsed normally; declarations may appear (e.g. local
+        // vars).  The dummy arguments themselves are *not* redeclared
+        // here per F2008 §12.6.2.5 — sema injects them from the
+        // parent module's interface.
+        let (uses, imports, implicit, decls, body, ifaces) =
+            self.parse_unit_body(&["procedure"])?;
+        let mut contains = self.parse_contains_section()?;
+        contains.extend(ifaces);
+        self.consume_end("procedure")?;
+
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            ProgramUnit::Subroutine {
+                name,
+                args: Vec::new(),
+                bind: None,
+                prefix,
+                uses,
+                imports,
+                implicit,
+                decls,
+                body,
+                contains,
+            },
+            span,
+        ))
+    }
+
     fn parse_block_data(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'block'
         self.advance(); // consume 'data'
@@ -377,15 +480,42 @@ impl<'a> Parser<'a> {
         };
         self.advance(); // consume 'interface'
 
-        // Optional name or operator/assignment interface.
-        // Check operator/assignment BEFORE generic identifier — they lex as identifiers.
-        let name = if self.peek_text().eq_ignore_ascii_case("operator")
-            || self.peek_text().eq_ignore_ascii_case("assignment")
-        {
+        // Optional name or generic spec.
+        // Check generic specs BEFORE generic identifier — they lex as identifiers.
+        let kw_lc = self.peek_text().to_lowercase();
+        let is_generic_spec = matches!(
+            kw_lc.as_str(),
+            "operator" | "assignment" | "read" | "write"
+        ) && self.pos + 1 < self.tokens.len()
+            && self.tokens[self.pos + 1].kind == TokenKind::LParen;
+        let name = if is_generic_spec {
             let op_kw = self.advance().clone().text;
             self.expect(&TokenKind::LParen)?;
-            let op = self.advance().clone().text;
-            self.expect(&TokenKind::RParen)?;
+            // Consume balanced contents — operators can span multiple
+            // tokens (==, /=, //, .lt., etc.) and defined I/O uses
+            // `formatted` / `unformatted` identifiers.
+            let mut op = String::new();
+            let mut depth = 1;
+            while depth > 0 && self.peek() != &TokenKind::Eof {
+                match self.peek() {
+                    TokenKind::LParen => {
+                        op.push_str(self.advance().clone().text.as_str());
+                        depth += 1;
+                    }
+                    TokenKind::RParen => {
+                        if depth == 1 {
+                            self.advance();
+                            depth = 0;
+                        } else {
+                            op.push_str(self.advance().clone().text.as_str());
+                            depth -= 1;
+                        }
+                    }
+                    _ => {
+                        op.push_str(self.advance().clone().text.as_str());
+                    }
+                }
+            }
             Some(format!("{}({})", op_kw, op))
         } else if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
@@ -410,6 +540,40 @@ impl<'a> Parser<'a> {
                 };
                 if next == "procedure" {
                     self.advance(); // module
+                    self.advance(); // procedure
+                    self.eat(&TokenKind::ColonColon);
+                    let mut names = Vec::new();
+                    loop {
+                        names.push(self.advance().clone().text);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    bodies.push(InterfaceBody::ModuleProcedure(names));
+                    self.skip_newlines();
+                    continue;
+                }
+            }
+
+            // F2003 R1207: bare `procedure :: NAME [, NAME...]` inside a
+            // generic interface dispatches to the named specifics with
+            // the same semantics as `module procedure NAME` here.
+            // Several stdlib generic interfaces (e.g. `interface arg`,
+            // `interface deg2rad`) use this form.
+            if text == "procedure" {
+                let next_kind = if self.pos + 1 < self.tokens.len() {
+                    self.tokens[self.pos + 1].kind.clone()
+                } else {
+                    TokenKind::Eof
+                };
+                // Disambiguate from `procedure(iface), attr :: name`
+                // (procedure-pointer / abstract-iface declaration) which
+                // takes a parenthesized interface name; that form is a
+                // subprogram declaration the regular path handles.
+                if next_kind == TokenKind::ColonColon
+                    || next_kind == TokenKind::Identifier
+                    || next_kind == TokenKind::Comma
+                {
                     self.advance(); // procedure
                     self.eat(&TokenKind::ColonColon);
                     let mut names = Vec::new();
@@ -699,6 +863,83 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // INTRINSIC / EXTERNAL :: name-list — informational
+            // declarations that mark functions as intrinsic or external.
+            // We consume and discard them; sema already knows which names
+            // are intrinsic.
+            if (text == "intrinsic" || text == "external")
+                && (next_tok.as_ref() == Some(&TokenKind::ColonColon)
+                    || next_tok.as_ref() == Some(&TokenKind::Identifier))
+            {
+                self.advance(); // consume keyword
+                let _ = self.eat(&TokenKind::ColonColon);
+                // Eat the name list.
+                loop {
+                    if self.peek() == &TokenKind::Identifier {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.skip_newlines();
+                continue;
+            }
+
+            // SAVE statement (F2018 §8.6.14):
+            //   bare `save`            — saves all locals in this scope
+            //   `save :: a, b`         — saves listed entities
+            //   `save a, b`            — same, no `::`
+            //   `save /cb/, x`         — common-block and entity mix
+            // Disambiguate from a variable named `save` by requiring
+            // the next token to start a SAVE list (`::`, identifier,
+            // `/`) or end the statement.
+            if text == "save" {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                let is_save_stmt = self.at_stmt_end_after(1)
+                    || matches!(
+                        next_kind,
+                        Some(TokenKind::ColonColon)
+                            | Some(TokenKind::Identifier)
+                            | Some(TokenKind::Slash)
+                    );
+                if is_save_stmt {
+                    let start = self.current_span();
+                    self.advance(); // consume 'save'
+                    let _ = self.eat(&TokenKind::ColonColon);
+                    let mut entities = Vec::new();
+                    while !self.at_stmt_end() {
+                        if self.peek() == &TokenKind::Slash {
+                            // /common-block-name/ — consume bracketing slashes.
+                            self.advance();
+                            if self.peek() == &TokenKind::Identifier {
+                                entities.push(self.advance().clone().text);
+                            }
+                            let _ = self.eat(&TokenKind::Slash);
+                        } else if self.peek() == &TokenKind::Identifier {
+                            entities.push(self.advance().clone().text);
+                        } else {
+                            break;
+                        }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.skip_newlines();
+                    let span = span_from_to(start, self.prev_span());
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::AttributeStmt {
+                            attr: crate::ast::decl::Attribute::Save,
+                            entities,
+                        },
+                        span,
+                    ));
+                    continue;
+                }
+            }
+
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
                 let start = self.current_span();
@@ -762,9 +1003,11 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let is_generic_spec = (self.peek_text().eq_ignore_ascii_case("operator")
-            || self.peek_text().eq_ignore_ascii_case("assignment"))
-            && self.pos + 1 < self.tokens.len()
+        let kw = self.peek_text().to_lowercase();
+        let is_generic_spec = matches!(
+            kw.as_str(),
+            "operator" | "assignment" | "read" | "write"
+        ) && self.pos + 1 < self.tokens.len()
             && self.tokens[self.pos + 1].kind == TokenKind::LParen;
 
         if !is_generic_spec {
@@ -773,8 +1016,31 @@ impl<'a> Parser<'a> {
 
         let generic_kw = self.advance().clone().text;
         self.expect(&TokenKind::LParen)?;
-        let op = self.advance().clone().text;
-        self.expect(&TokenKind::RParen)?;
+        // Consume the parenthesized contents until the matching ).
+        // Operators can be `==`, `/=`, `//`, etc. — multi-token. Defined
+        // I/O uses `formatted` / `unformatted` identifiers.
+        let mut op = String::new();
+        let mut depth = 1;
+        while depth > 0 && self.peek() != &TokenKind::Eof {
+            match self.peek() {
+                TokenKind::LParen => {
+                    op.push_str(self.advance().clone().text.as_str());
+                    depth += 1;
+                }
+                TokenKind::RParen => {
+                    if depth == 1 {
+                        self.advance();
+                        depth = 0;
+                    } else {
+                        op.push_str(self.advance().clone().text.as_str());
+                        depth -= 1;
+                    }
+                }
+                _ => {
+                    op.push_str(self.advance().clone().text.as_str());
+                }
+            }
+        }
         Ok(Some(format!("{}({})", generic_kw, op)))
     }
 

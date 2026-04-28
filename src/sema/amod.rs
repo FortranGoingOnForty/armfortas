@@ -173,7 +173,8 @@ pub fn write_amod(
         writeln!(out).unwrap();
     }
 
-    // Collect and sort public symbols.
+    // Collect and sort public symbols (used for procedures /
+    // interfaces / derived types — those still go out public-only).
     let mut syms: Vec<(&String, &Symbol)> = scope
         .symbols
         .iter()
@@ -181,8 +182,15 @@ pub fn write_amod(
         .collect();
     syms.sort_by_key(|(k, _)| k.to_lowercase());
 
+    // Per F2008 §11.2.3, submodules see ALL parent entities including
+    // private ones.  Variables and parameters are emitted regardless
+    // of access; private ones carry a `private` attribute and are
+    // filtered out at ordinary USE-association time.
+    let mut all_syms: Vec<(&String, &Symbol)> = scope.symbols.iter().collect();
+    all_syms.sort_by_key(|(k, _)| k.to_lowercase());
+
     // ---- Variables ----
-    let vars: Vec<_> = syms
+    let vars: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(
@@ -199,7 +207,7 @@ pub fn write_amod(
     }
 
     // ---- Parameters ----
-    let params: Vec<_> = syms
+    let params: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| sym.attrs.parameter || matches!(sym.kind, SymbolKind::Parameter))
         .collect();
@@ -264,12 +272,19 @@ pub fn write_amod(
     }
 
     // ---- Types ----
+    // Include all derived types, even private ones — submodules need access
+    // to their parent module's private types per F2008 12.2.3.2.
     let mut type_exports: BTreeSet<String> = BTreeSet::new();
     for (name, sym) in &syms {
         if matches!(sym.kind, SymbolKind::DerivedType) {
             collect_exported_type_closure(&mut type_exports, name, type_layouts);
         }
         collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);
+    }
+    for (name, sym) in scope.symbols.iter() {
+        if matches!(sym.kind, SymbolKind::DerivedType) {
+            collect_exported_type_closure(&mut type_exports, name, type_layouts);
+        }
     }
     for (_name, sym) in &procs {
         collect_exported_type_info_closure(&mut type_exports, sym.type_info.as_ref(), type_layouts);
@@ -390,6 +405,9 @@ fn emit_variable(
     if sym.attrs.target {
         attrs.push("target");
     }
+    if sym.attrs.access == Access::Private {
+        attrs.push("private");
+    }
     if !attrs.is_empty() {
         write!(out, ", {}", attrs.join(", ")).unwrap();
     }
@@ -430,16 +448,29 @@ fn emit_parameter(
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
+    let is_private = sym.attrs.access == Access::Private;
     if let Some(cv) = sym.const_value {
-        writeln!(out, "@param {} : {} = {}", name, type_str, cv).unwrap();
-    } else {
-        // Parameter without a folded const_value — emit with @ir
-        // so the reader can at least reference the global.
-        if let Some(info) = global_info {
-            writeln!(out, "@param {} : {} @ir {}", name, type_str, info.symbol).unwrap();
+        // Place `, private` after the value so parse_var's
+        // rfind(" = ") inside type_str continues to work.
+        let suf = if is_private { ", private" } else { "" };
+        writeln!(out, "@param {} : {} = {}{}", name, type_str, cv, suf).unwrap();
+    } else if let Some(info) = global_info {
+        // For @ir-backed params, attach `, private` to the type so
+        // the parser sees it in attr_str rather than after @ir.
+        let type_with_attr = if is_private {
+            format!("{}, private", type_str)
         } else {
-            writeln!(out, "@param {} : {}", name, type_str).unwrap();
-        }
+            type_str
+        };
+        writeln!(
+            out,
+            "@param {} : {} @ir {}",
+            name, type_with_attr, info.symbol
+        )
+        .unwrap();
+    } else {
+        let suf = if is_private { ", private" } else { "" };
+        writeln!(out, "@param {} : {}{}", name, type_str, suf).unwrap();
     }
 }
 
@@ -464,6 +495,51 @@ fn emit_procedure(
         }
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
+        }
+        if sym.attrs.result_rank > 0 {
+            write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
+        }
+        // Sprint35-SMP Phase 2: emit the result variable's user-declared
+        // name when it differs from the function name (i.e. the source
+        // had a `result(X)` clause). Submodule bodies that reference the
+        // result by its declared name need this preserved across the
+        // .amod boundary so sema can register the right symbol.
+        let result_var_name: Option<String> = st
+            .scopes
+            .iter()
+            .find(|s| {
+                let matches_name = match &s.kind {
+                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                        n.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                };
+                if !matches_name {
+                    return false;
+                }
+                let Some(parent_id) = s.parent else {
+                    return false;
+                };
+                parent_id == mod_scope_id
+                    || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                        && st.scope(parent_id).parent == Some(mod_scope_id)
+            })
+            .and_then(|pscope| {
+                let arg_set: std::collections::HashSet<String> =
+                    pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
+                pscope
+                    .symbols
+                    .iter()
+                    .find(|(key, sym)| {
+                        !arg_set.contains(*key)
+                            && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    })
+                    .map(|(_, sym)| sym.name.clone())
+            });
+        if let Some(result_var_name) = result_var_name {
+            if !result_var_name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={}", result_var_name).unwrap();
+            }
         }
     } else {
         write!(out, "@subroutine {}", sym.name).unwrap();
@@ -610,6 +686,31 @@ fn emit_procedure(
                 }
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
+                }
+                // F2018 §15.4.3.6: a `procedure(iface) :: name` dummy is
+                // a procedure formal. The producer side stores this as a
+                // Variable with EXTERNAL set; without preserving the flag
+                // the consumer-side dispatch can't tell it apart from a
+                // data dummy and rejects valid procedure-actual binding
+                // (e.g. passing `do_not_select` into LAPACK `gees`).
+                if arg_sym.attrs.external {
+                    arg_attrs.push("external");
+                }
+                let proc_iface_attr = arg_sym
+                    .attrs
+                    .procedure_iface
+                    .as_ref()
+                    .map(|n| format!("procedure({})", n));
+                if let Some(s) = proc_iface_attr.as_ref() {
+                    arg_attrs.push(s.as_str());
+                }
+                // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
+                // synthesis on the consumer side can rebuild a same-rank
+                // array_spec without re-walking the AST decls (which only
+                // exist on the producer side at .amod write time).
+                let rank_attr = format!("rank={}", arg_sym.attrs.array_spec.len());
+                if !arg_sym.attrs.array_spec.is_empty() {
+                    arg_attrs.push(rank_attr.as_str());
                 }
                 if !arg_attrs.is_empty() {
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
@@ -922,6 +1023,26 @@ pub struct AmodArg {
     pub allocatable: bool,
     pub pointer: bool,
     pub hidden: bool,
+    /// True for `procedure(iface) :: name` dummies. The producer side
+    /// stores these as Variable + EXTERNAL; the consumer-side dispatch
+    /// uses this flag to identify procedure formals and skip the data
+    /// type-matching that would otherwise reject procedure-actual
+    /// binding (the .amod writer normalizes the type to the interface's
+    /// return type).
+    pub external: bool,
+    /// For procedure dummy args (`procedure(iface) :: name`), the
+    /// interface name. Without this the consumer side can't resolve
+    /// the dummy to its abstract interface and falls back to emitting
+    /// the dummy name as an external symbol — see the SGGES3 / selctg
+    /// failure in stdlib_lapack_eigv_gen.
+    pub procedure_iface: Option<String>,
+    /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
+    /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
+    /// `array_spec` of this rank, deriving each dim's kind from the
+    /// `descriptor` / `allocatable` / `pointer` flags. Bound expressions
+    /// (Explicit lower:upper) are not preserved across .amod boundaries —
+    /// SMP-body synthesis only needs the shape kind and rank for Phase 2.
+    pub rank: u8,
 }
 
 /// A procedure parsed from an .amod file.
@@ -932,6 +1053,14 @@ pub struct AmodProc {
     pub return_type: Option<TypeInfo>,
     pub result_allocatable: bool,
     pub result_pointer: bool,
+    pub result_rank: u8,
+    /// Sprint35-SMP Phase 2: the result variable's user-declared name
+    /// (from `result(X)` clause). None when the result name matches
+    /// the function name. The submodule body lowering needs this to
+    /// resolve `X = ...` assignments inside an SMP body when the body
+    /// references the result by its declared name rather than by the
+    /// function name.
+    pub result_name: Option<String>,
     pub pure: bool,
     pub elemental: bool,
     pub access: Access,
@@ -954,6 +1083,11 @@ pub struct AmodVar {
     pub deferred_char: bool,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
+    /// Access level. F2008 §11.2.3 requires private parent symbols to
+    /// be visible in submodules, so the writer emits private entries
+    /// with a `private` attribute and the loader honors them via
+    /// host association without exposing them to ordinary USE.
+    pub access: Access,
 }
 
 /// A generic named interface parsed from an .amod file. Each entry
@@ -1131,6 +1265,11 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let pointer = attr_str.contains("pointer");
     let proc_pointer = attr_str.contains("procptr");
     let target = attr_str.contains("target");
+    let access = if attr_str.contains("private") {
+        Access::Private
+    } else {
+        Access::Public
+    };
 
     let mut ir_symbol = None;
     let mut deferred_char = false;
@@ -1177,6 +1316,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         deferred_char,
         dims,
         const_value,
+        access,
     }
 }
 
@@ -1206,6 +1346,18 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let elemental = attrs_str.contains("elemental");
     let result_allocatable = attrs_str.contains("result_allocatable");
     let result_pointer = attrs_str.contains("result_pointer");
+    let result_rank = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("result_rank="))
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
+    // source used a `result(NAME)` clause that differs from the
+    // function name. Otherwise the result variable shares the name.
+    let result_name = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("result_name="))
+        .map(|s| s.trim().to_string());
     let access = if attrs_str.split(", ").any(|attr| attr == "private") {
         Access::Private
     } else {
@@ -1242,6 +1394,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         return_type,
         result_allocatable,
         result_pointer,
+        result_rank,
+        result_name,
         pure,
         elemental,
         access,
@@ -1285,6 +1439,21 @@ fn parse_arg(line: &str) -> AmodArg {
     let descriptor = attr_str.contains("descriptor");
     let allocatable = attr_str.contains("allocatable");
     let pointer = attr_str.contains("pointer");
+    let external = attr_str
+        .split(", ")
+        .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
+    // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
+    // the dummy is array-shaped; absence means rank 0 (scalar).
+    let rank = attr_str
+        .split(", ")
+        .find_map(|tok| tok.strip_prefix("rank="))
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(0);
+    let procedure_iface = attr_str.split(", ").find_map(|tok| {
+        let t = tok.trim();
+        let inner = t.strip_prefix("procedure(")?;
+        inner.strip_suffix(')').map(|s| s.trim().to_string())
+    });
 
     AmodArg {
         name,
@@ -1296,6 +1465,9 @@ fn parse_arg(line: &str) -> AmodArg {
         allocatable,
         pointer,
         hidden,
+        external,
+        procedure_iface,
+        rank,
     }
 }
 
@@ -1562,6 +1734,10 @@ pub fn extract_module_globals(
     let mod_key = iface.module_name.to_lowercase();
     let mut out = HashMap::new();
     for var in &iface.variables {
+        // Private vars/params get included so submodules can resolve
+        // host-associated references through the same globals map.
+        // The `private` flag lets the "filtered out by USE ONLY"
+        // diagnostic skip them — ordinary USE would never see them.
         if var.is_parameter && var.ir_symbol.is_none() {
             continue;
         } // PARAMETERs with folded values inline; others still need storage
@@ -1635,6 +1811,7 @@ pub fn extract_module_globals(
                         _ => crate::ir::lower::CharKind::None,
                     },
                     external: true,
+                    private: var.access == Access::Private,
                 },
             );
         }
@@ -1879,5 +2056,52 @@ mod tests {
                 crate::ir::types::IntWidth::I8
             )))
         );
+    }
+
+    #[test]
+    fn arg_rank_round_trips_for_array_dummies() {
+        // Sprint35-SMP Phase 1: the rank=N attribute on @arg lines must
+        // round-trip so the consumer can rebuild a SymbolAttrs::array_spec
+        // of the right rank for SMP-body synthesis. Scalar args (no
+        // rank=) parse as rank 0; descriptor-passed assumed-shape arrays
+        // carry their rank.
+        let amod_text = r#"#!amod 2
+# module: shapes
+# source: shapes.f90
+# checksum: sha256:abc
+
+@subroutine takes_assumed_shape
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg a : real, intent(in), descriptor, rank=1
+    @abi pass=x0 width=8
+  @arg b : real, intent(in), descriptor, rank=2
+    @abi pass=x1 width=8
+  @arg n : integer, intent(in)
+    @abi pass=x2 width=8
+@end subroutine
+
+@subroutine takes_alloc_array
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg buf : real, intent(out), descriptor, allocatable, rank=1
+    @abi pass=x0 width=8
+@end subroutine
+"#;
+        let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
+        let assumed = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_assumed_shape")
+            .unwrap();
+        assert_eq!(assumed.args[0].rank, 1);
+        assert_eq!(assumed.args[1].rank, 2);
+        assert_eq!(assumed.args[2].rank, 0); // scalar n: no rank= attribute
+
+        let alloc = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_alloc_array")
+            .unwrap();
+        assert_eq!(alloc.args[0].rank, 1);
+        assert!(alloc.args[0].allocatable);
     }
 }

@@ -5,7 +5,7 @@
 
 use super::symtab::*;
 use crate::ast::decl;
-use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
+use crate::ast::decl::{ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -172,6 +172,9 @@ type InterfaceOuterRef = (
     Option<TypeInfo>,
     Vec<String>,
     Option<String>,
+    bool, // pure
+    bool, // elemental
+    u8,   // result_rank
 );
 
 fn resolve_unit(
@@ -196,6 +199,7 @@ fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
@@ -225,7 +229,7 @@ fn resolve_unit(
         ProgramUnit::Subroutine {
             name,
             args,
-            prefix: _,
+            prefix,
             bind: _,
             uses,
             imports: _,
@@ -235,35 +239,53 @@ fn resolve_unit(
             contains,
         } => {
             let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
-            // Store ordered arg names for VALUE lookup by callers.
-            st.scope_mut(scope_id).arg_order = args
-                .iter()
-                .filter_map(|a| {
-                    if let DummyArg::Name(n) = a {
-                        Some(n.to_lowercase())
-                    } else {
-                        None
+
+            // F2008 §12.6.2.5: separate module procedure body — args
+            // are inherited from the parent module's interface block.
+            // The parser emits args=[] and prefix=[Module]; sema
+            // injects the args from the parent module's procedure
+            // scope (populated during interface resolution / .amod
+            // load).
+            let is_separate_body = args.is_empty()
+                && prefix.iter().any(|p| matches!(p, Prefix::Module))
+                && matches!(
+                    st.scope(st.scope(scope_id).parent.unwrap_or(0)).kind,
+                    ScopeKind::Submodule(_)
+                );
+            if is_separate_body {
+                inject_separate_module_procedure_args(st, name, scope_id, unit.span);
+            } else {
+                // Store ordered arg names for VALUE lookup by callers.
+                st.scope_mut(scope_id).arg_order = args
+                    .iter()
+                    .filter_map(|a| {
+                        if let DummyArg::Name(n) = a {
+                            Some(n.to_lowercase())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // Define dummy arguments as symbols.
+                for arg in args {
+                    if let DummyArg::Name(arg_name) = arg {
+                        st.define(Symbol {
+                            name: arg_name.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: None,
+                            attrs: SymbolAttrs::default(),
+                            defined_at: unit.span,
+                            scope: st.current_scope(),
+                            arg_names: vec![],
+                            const_value: None,
+                        })?;
                     }
-                })
-                .collect();
-            // Define dummy arguments as symbols.
-            for arg in args {
-                if let DummyArg::Name(arg_name) = arg {
-                    st.define(Symbol {
-                        name: arg_name.clone(),
-                        kind: SymbolKind::Variable,
-                        type_info: None,
-                        attrs: SymbolAttrs::default(),
-                        defined_at: unit.span,
-                        scope: st.current_scope(),
-                        arg_names: vec![],
-                        const_value: None,
-                    })?;
                 }
             }
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
@@ -331,6 +353,7 @@ fn resolve_unit(
                 name,
                 result.as_deref().unwrap_or(name.as_str()),
             );
+            detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
@@ -352,15 +375,20 @@ fn resolve_unit(
             contains,
         } => {
             // Find the parent module scope and inherit its symbols.
-            let parent_scope = st.find_module_scope(parent);
+            // If the parent isn't compiled in this TU, load it from .amod.
+            let parent_scope = st
+                .find_module_scope(parent)
+                .or_else(|| load_external_module(st, parent, module_search_paths, layouts));
             st.push_scope(ScopeKind::Submodule(name.clone()));
             // Import all parent module symbols into the submodule scope.
+            // Per F2008 12.2.3.2: submodules see ALL parent entities,
+            // including private ones — that's the whole point of the
+            // submodule mechanism (host association).
             if let Some(pid) = parent_scope {
                 let parent_syms: Vec<(String, String)> = st
                     .scope(pid)
                     .symbols
                     .iter()
-                    .filter(|(_, sym)| sym.attrs.access != Access::Private)
                     .map(|(key, sym)| (sym.name.clone(), key.clone()))
                     .collect();
                 for (sym_name, _key) in &parent_syms {
@@ -401,6 +429,7 @@ fn resolve_unit(
                             decls,
                             args,
                             bind,
+                            prefix,
                             ..
                         } => {
                             let arg_names = args
@@ -435,18 +464,34 @@ fn resolve_unit(
                                     }
                                     None
                                 });
+                            let elemental = prefix
+                                .iter()
+                                .any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                            let pure = elemental
+                                || prefix
+                                    .iter()
+                                    .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                            // Capture result rank from the function's
+                            // own decls (interface-block bodies declare
+                            // the result variable here).
+                            let result_attrs_for_iface =
+                                function_result_attrs(fn_name, result, decls);
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
                                 ti,
                                 arg_names,
                                 normalized_bind_name(bind.as_ref(), fn_name),
+                                pure,
+                                elemental,
+                                result_attrs_for_iface.result_rank,
                             ));
                         }
                         ProgramUnit::Subroutine {
                             name: fn_name,
                             args,
                             bind,
+                            prefix,
                             ..
                         } => {
                             let arg_names = args
@@ -459,12 +504,22 @@ fn resolve_unit(
                                     }
                                 })
                                 .collect();
+                            let elemental = prefix
+                                .iter()
+                                .any(|p| matches!(p, crate::ast::unit::Prefix::Elemental));
+                            let pure = elemental
+                                || prefix
+                                    .iter()
+                                    .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Subroutine,
                                 None,
                                 arg_names,
                                 normalized_bind_name(bind.as_ref(), fn_name),
+                                pure,
+                                elemental,
+                                0,
                             ));
                         }
                         _ => {}
@@ -498,7 +553,17 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label) in outer_refs {
+            for (
+                fn_name,
+                kind,
+                ti,
+                arg_names,
+                binding_label,
+                pure,
+                elemental,
+                result_rank,
+            ) in outer_refs
+            {
                 let span = unit.span;
                 let _ = st.define(Symbol {
                     name: fn_name,
@@ -507,6 +572,9 @@ fn resolve_unit(
                     attrs: SymbolAttrs {
                         external: true,
                         binding_label,
+                        pure,
+                        elemental,
+                        result_rank,
                         ..Default::default()
                     },
                     defined_at: span,
@@ -750,6 +818,153 @@ fn preload_stmt_uses(
     }
 }
 
+/// F77 §15.4 statement-function detection.
+///
+/// Walks the leading prologue of a procedure body looking for definitions
+/// of the form `Name(p1, p2, ...) = expr` where `Name` is a previously
+/// declared scalar variable in the current scope. When found, the symbol
+/// is converted from `Variable` to `Function`, its dummy parameter names
+/// are recorded, and the body expression is parked in
+/// `SymbolTable::statement_functions` keyed by `(scope_id, name)`.
+///
+/// Detection stops at the first statement that does not match the
+/// statement-function shape, so true executable code following the
+/// definitions is not misclassified.
+fn detect_statement_functions(
+    st: &mut SymbolTable,
+    scope_id: ScopeId,
+    body: &[crate::ast::stmt::SpannedStmt],
+) {
+    use crate::ast::expr::{Expr, SectionSubscript};
+    use crate::ast::stmt::Stmt;
+
+    for stmt in body {
+        let (target, value) = match &stmt.node {
+            Stmt::Assignment { target, value } => (target, value),
+            // Skip blank/comment-only labelled wrappers if they ever
+            // appear; otherwise the prologue ended.
+            _ => break,
+        };
+
+        // Target must be `Name(args...)` — i.e. the LHS looks like a
+        // function call or array element reference.
+        let (fname, args) = match &target.node {
+            Expr::FunctionCall { callee, args } => match &callee.node {
+                Expr::Name { name } => (name.clone(), args),
+                _ => break,
+            },
+            _ => break,
+        };
+
+        // Resolve fname in the current scope. Statement-function
+        // declarations declare the result type as if it were a scalar
+        // variable, so the symbol must already exist as a Variable
+        // with a known scalar TypeInfo and no array_spec.
+        let key = fname.to_ascii_lowercase();
+        let result_type = {
+            let scope = st.scope(scope_id);
+            let Some(sym) = scope.symbols.get(&key) else {
+                break;
+            };
+            if !matches!(sym.kind, SymbolKind::Variable) {
+                break;
+            }
+            if !sym.attrs.array_spec.is_empty() {
+                break;
+            }
+            // Must have a concrete scalar numeric / character / logical
+            // type. Derived/Class targets are not statement functions.
+            let Some(ti) = sym.type_info.clone() else {
+                break;
+            };
+            match ti {
+                TypeInfo::Integer { .. }
+                | TypeInfo::Real { .. }
+                | TypeInfo::DoublePrecision
+                | TypeInfo::Complex { .. }
+                | TypeInfo::Logical { .. }
+                | TypeInfo::Character { .. } => ti,
+                _ => break,
+            }
+        };
+
+        // Each argument must be a positional `Element(Name(p))` where
+        // `p` is a scalar variable in the current scope. Keyword args
+        // and ranges are not allowed in a statement-function header.
+        let mut params: Vec<String> = Vec::with_capacity(args.len());
+        let mut all_params_ok = true;
+        for a in args {
+            if a.keyword.is_some() {
+                all_params_ok = false;
+                break;
+            }
+            let pname = match &a.value {
+                SectionSubscript::Element(e) => match &e.node {
+                    Expr::Name { name } => name.clone(),
+                    _ => {
+                        all_params_ok = false;
+                        break;
+                    }
+                },
+                _ => {
+                    all_params_ok = false;
+                    break;
+                }
+            };
+            // The dummy parameter must already be a scalar Variable.
+            // F77 §15.4: the dummy arguments of a statement function
+            // are local to it and must agree in type with names of the
+            // same spelling in the host's declaration scope. armfortas
+            // already requires the names to be declared (no implicit
+            // typing leaks here under IMPLICIT NONE), so insist on a
+            // proper Variable.
+            let pkey = pname.to_ascii_lowercase();
+            let scope = st.scope(scope_id);
+            let Some(psym) = scope.symbols.get(&pkey) else {
+                all_params_ok = false;
+                break;
+            };
+            if !matches!(psym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+                all_params_ok = false;
+                break;
+            }
+            if !psym.attrs.array_spec.is_empty() {
+                all_params_ok = false;
+                break;
+            }
+            params.push(pkey);
+        }
+        if !all_params_ok {
+            break;
+        }
+
+        // All checks passed: convert the symbol kind, record the body.
+        // F77 §15.4 statement functions evaluate a single expression
+        // with no side effects, so they're pure by construction. Mark
+        // `pure` (and `elemental` — statement functions broadcast
+        // naturally over array actuals though stdlib only uses scalar
+        // calls) so PURE-procedure callers like the BLAS rotation
+        // routines validate cleanly.
+        {
+            let scope = st.scope_mut(scope_id);
+            if let Some(sym) = scope.symbols.get_mut(&key) {
+                sym.kind = SymbolKind::Function;
+                sym.arg_names = params.clone();
+                sym.attrs.pure = true;
+                sym.attrs.elemental = true;
+            }
+        }
+        st.statement_functions.insert(
+            (scope_id, key),
+            StatementFunctionDef {
+                params,
+                body: value.clone(),
+                result_type,
+            },
+        );
+    }
+}
+
 /// Try to load a module interface from an .amod file on the search path.
 /// Creates a synthetic module scope in the symbol table and returns its ID.
 fn load_external_module(
@@ -832,7 +1047,7 @@ fn load_external_module(
             SymbolKind::Variable
         };
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: var.access,
             allocatable: var.allocatable,
             save: var.save,
             pointer: var.pointer,
@@ -868,6 +1083,21 @@ fn load_external_module(
     // call sites — without it, cross-TU generic dispatch sees no
     // candidates and fails.
     for proc in &iface.procedures {
+        // Sprint35-SMP Phase 2: rebuild the function result's array_spec
+        // from result_rank + result_allocatable/pointer flags so the
+        // SMP-body synthesizer can recover the result's shape from a
+        // pure .amod load (where the result variable isn't otherwise
+        // present as a separate symbol).
+        let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
+            Vec::new()
+        } else {
+            let template = if proc.result_allocatable || proc.result_pointer {
+                ArraySpec::Deferred
+            } else {
+                ArraySpec::AssumedShape { lower: None }
+            };
+            vec![template; proc.result_rank as usize]
+        };
         let attrs = SymbolAttrs {
             access: proc.access,
             allocatable: proc.result_allocatable,
@@ -875,6 +1105,8 @@ fn load_external_module(
             pure: proc.pure,
             elemental: proc.elemental,
             binding_label: proc.binding_label.clone(),
+            result_rank: proc.result_rank,
+            array_spec: result_array_spec,
             ..Default::default()
         };
         let arg_names: Vec<String> = proc
@@ -906,12 +1138,38 @@ fn load_external_module(
             if arg.hidden {
                 continue;
             }
+            // Sprint35-SMP Phase 1: rebuild a same-rank array_spec from
+            // the encoded rank + descriptor/allocatable/pointer flags.
+            // Bound expressions are not preserved across .amod boundaries;
+            // assumed-shape / deferred-shape kinds are sufficient for the
+            // synthesizer's uses in Phase 2 (the bound expressions are
+            // unused for descriptor-passed dummies anyway — extents come
+            // from the caller's runtime descriptor).
+            let array_spec: Vec<ArraySpec> = if arg.rank == 0 {
+                Vec::new()
+            } else {
+                let template = if arg.allocatable || arg.pointer {
+                    ArraySpec::Deferred
+                } else if arg.descriptor {
+                    ArraySpec::AssumedShape { lower: None }
+                } else {
+                    // Non-descriptor array dummy: explicit-shape with
+                    // unknown bounds. The Phase-2 synthesizer treats
+                    // this as a placeholder and the lowering helpers
+                    // pull actual bounds from the caller's array.
+                    ArraySpec::AssumedShape { lower: None }
+                };
+                vec![template; arg.rank as usize]
+            };
             let arg_attrs = SymbolAttrs {
                 intent: arg.intent,
                 optional: arg.optional,
                 value: arg.value,
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
+                external: arg.external,
+                procedure_iface: arg.procedure_iface.clone(),
+                array_spec,
                 ..Default::default()
             };
             let _ = st.define(Symbol {
@@ -919,6 +1177,49 @@ fn load_external_module(
                 kind: crate::sema::symtab::SymbolKind::Variable,
                 type_info: arg.type_info.clone(),
                 attrs: arg_attrs,
+                defined_at: dummy_span,
+                scope: proc_scope,
+                arg_names: vec![],
+                const_value: None,
+            });
+        }
+        // Sprint35-SMP Phase 2: also define the function's result
+        // variable in the proc scope under a name that won't collide
+        // with the user's own local declarations. Same-name SMP-body
+        // procedures push their own Function scope on top, so the
+        // duplicate name `result` would otherwise shadow the local
+        // and the validator's lookup would walk to this stale symbol
+        // and reject `allocate(result(...))`. Use a doubly-underscored
+        // synth name so SMP-body synthesis can find it (via the body
+        // scope after sema injection) but no user code can collide.
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function)
+            && proc.result_rank > 0
+        {
+            let synth_name = format!(
+                "__amod_result_{}",
+                proc.result_name.as_deref().unwrap_or(&proc.name)
+            );
+            let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
+                Vec::new()
+            } else {
+                let template = if proc.result_allocatable || proc.result_pointer {
+                    ArraySpec::Deferred
+                } else {
+                    ArraySpec::AssumedShape { lower: None }
+                };
+                vec![template; proc.result_rank as usize]
+            };
+            let result_attrs = SymbolAttrs {
+                allocatable: proc.result_allocatable,
+                pointer: proc.result_pointer,
+                array_spec: result_array_spec,
+                ..Default::default()
+            };
+            let _ = st.define(Symbol {
+                name: synth_name,
+                kind: crate::sema::symtab::SymbolKind::Variable,
+                type_info: proc.return_type.clone(),
+                attrs: result_attrs,
                 defined_at: dummy_span,
                 scope: proc_scope,
                 arg_names: vec![],
@@ -1038,6 +1339,118 @@ fn find_unit_scope(st: &SymbolTable, parent_scope: ScopeId, unit: &ProgramUnit) 
             None
         }
     })
+}
+
+/// Inject dummy-argument symbols into a separate-module-procedure body
+/// scope (F2008 §12.6.2.5).  The body's parent submodule was already
+/// linked to its parent module via UseAssociation; we walk that link
+/// to find the parent module's scope, locate the matching
+/// `Subroutine(name)` / `Function(name)` child scope (created either
+/// by the parent module's interface block resolution or by .amod
+/// loading), and clone its argument symbols into the body scope.
+fn inject_separate_module_procedure_args(
+    st: &mut SymbolTable,
+    proc_name: &str,
+    body_scope: ScopeId,
+    span: crate::lexer::Span,
+) {
+    let submodule_id = match st.scope(body_scope).parent {
+        Some(p) => p,
+        None => return,
+    };
+    let parent_module_scope = st
+        .scope(submodule_id)
+        .use_associations
+        .iter()
+        .find(|u| u.is_submodule_access)
+        .map(|u| u.source_scope);
+    let Some(parent_module_scope) = parent_module_scope else {
+        return;
+    };
+
+    // Find the matching procedure scope inside the parent module.
+    let proc_lc = proc_name.to_lowercase();
+    let iface_scope = st.all_scopes().iter().find_map(|scope| {
+        if scope.parent != Some(parent_module_scope) {
+            return None;
+        }
+        match &scope.kind {
+            ScopeKind::Subroutine(n) | ScopeKind::Function(n)
+                if n.eq_ignore_ascii_case(&proc_lc) =>
+            {
+                Some(scope.id)
+            }
+            _ => None,
+        }
+    });
+    let Some(iface_scope) = iface_scope else {
+        return;
+    };
+
+    // Snapshot arg_order and dummy-arg symbols from the interface
+    // scope before mutating the body scope.
+    let arg_order = st.scope(iface_scope).arg_order.clone();
+    let arg_symbols: Vec<Symbol> = arg_order
+        .iter()
+        .filter_map(|n| {
+            st.scope(iface_scope)
+                .symbols
+                .get(n)
+                .cloned()
+                .or_else(|| {
+                    st.scope(iface_scope)
+                        .symbols
+                        .iter()
+                        .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
+                        .map(|(_, s)| s.clone())
+                })
+        })
+        .collect();
+
+    // Sprint35-SMP Phase 2: also clone the result variable (function
+    // case) so the body's `res = ...` references resolve to a
+    // properly-typed Variable rather than implicit-typing as a scalar.
+    // The result variable is the non-arg Variable in the iface scope:
+    //   - For interface bodies parsed from source: sema's Function arm
+    //     defined a Symbol with the user's `result(NAME)` clause.
+    //   - For .amod-loaded modules: load_external_module synthesized
+    //     a `__amod_result_NAME` Variable that we strip the prefix off.
+    let result_sym: Option<Symbol> = {
+        let arg_set: std::collections::HashSet<String> = st
+            .scope(iface_scope)
+            .arg_order
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+        st.scope(iface_scope)
+            .symbols
+            .iter()
+            .find(|(key, sym)| {
+                !arg_set.contains(*key)
+                    && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+            })
+            .map(|(_, sym)| sym.clone())
+    };
+
+    st.scope_mut(body_scope).arg_order = arg_order;
+    for mut sym in arg_symbols {
+        sym.scope = body_scope;
+        sym.defined_at = span;
+        let _ = st.define(sym);
+    }
+    if let Some(mut sym) = result_sym {
+        sym.scope = body_scope;
+        sym.defined_at = span;
+        // For .amod-loaded result vars the name carries the
+        // `__amod_result_` prefix to avoid shadowing user locals in
+        // the parent module's procedure scope. Strip it for the body
+        // scope so user code referencing the result by its declared
+        // name resolves correctly.
+        if let Some(stripped) = sym.name.strip_prefix("__amod_result_") {
+            sym.name = stripped.to_string();
+        }
+        let _ = st.define(sym);
+    }
 }
 
 fn exported_const_int_params(
@@ -1178,6 +1591,9 @@ fn collect_derived_type_layouts(
             decls, contains, ..
         }
         | ProgramUnit::Module {
+            decls, contains, ..
+        }
+        | ProgramUnit::Submodule {
             decls, contains, ..
         }
         | ProgramUnit::Subroutine {
@@ -1609,6 +2025,18 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     SymbolKind::Variable
                 };
                 let mut arg_names = Vec::new();
+                // Sprint35-SMP Phase 1: snapshot the per-decl `dimension(...)`
+                // attribute as an array-spec fallback. Per-entity specs override
+                // it (e.g. `real, dimension(10) :: a, b(:,:)` declares a as
+                // rank-1 size 10 and b as assumed-shape rank-2).
+                let attr_dimension: Option<&Vec<crate::ast::decl::ArraySpec>> =
+                    attrs.iter().find_map(|a| {
+                        if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                            Some(specs)
+                        } else {
+                            None
+                        }
+                    });
 
                 if sym_attrs.external {
                     if let TypeSpec::Type(iface_name) = type_spec {
@@ -1630,6 +2058,37 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
 
                 for entity in entities {
                     let key = entity.name.to_lowercase();
+                    // For `character(*), parameter :: name = init`, F2008
+                    // §5.3.2 says the parameter's length is taken from
+                    // `init`.  type_spec_to_info loses that info because
+                    // LenSpec::Star → len=None; recover it here when the
+                    // init is a string literal or another character
+                    // parameter whose length we already know.
+                    let mut entity_type_info = type_info.clone();
+                    if sym_attrs.parameter
+                        && matches!(&entity_type_info, TypeInfo::Character { len: None, .. })
+                    {
+                        if let Some(init) = entity.init.as_ref() {
+                            let derived_len =
+                                derived_char_init_len(&init.node, st).map(|n| n as i64);
+                            if let Some(n) = derived_len {
+                                if let TypeInfo::Character { len, .. } = &mut entity_type_info {
+                                    *len = Some(n);
+                                }
+                            }
+                        }
+                    }
+                    // Sprint35-SMP Phase 1: per-entity attrs clone so each
+                    // entity carries its own array_spec (entity-local spec
+                    // wins; otherwise fall back to the decl-level dimension
+                    // attribute).
+                    let mut entity_attrs = sym_attrs.clone();
+                    let entity_array_spec = entity
+                        .array_spec
+                        .clone()
+                        .or_else(|| attr_dimension.cloned())
+                        .unwrap_or_default();
+                    entity_attrs.array_spec = entity_array_spec;
                     if st.scope(st.current_scope()).symbols.contains_key(&key) {
                         // Symbol already exists (e.g., dummy argument) — update type info.
                         let sym = st
@@ -1638,8 +2097,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             .get_mut(&key)
                             .unwrap();
                         sym.kind = kind.clone();
-                        sym.type_info = Some(type_info.clone());
-                        sym.attrs = sym_attrs.clone();
+                        sym.type_info = Some(entity_type_info.clone());
+                        sym.attrs = entity_attrs.clone();
                         sym.arg_names = arg_names.clone();
                     } else {
                         // Try to fold PARAMETER initializers to a
@@ -1656,8 +2115,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         st.define(Symbol {
                             name: entity.name.clone(),
                             kind: kind.clone(),
-                            type_info: Some(type_info.clone()),
-                            attrs: sym_attrs.clone(),
+                            type_info: Some(entity_type_info.clone()),
+                            attrs: entity_attrs.clone(),
                             defined_at: decl.span,
                             scope: st.current_scope(),
                             arg_names: arg_names.clone(),
@@ -1734,6 +2193,7 @@ fn process_contains(
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
+        let host_is_submodule = matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
                 name, prefix, bind, ..
@@ -1745,10 +2205,15 @@ fn process_contains(
                     || prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                let is_smp = host_is_submodule
+                    && prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
                     binding_label: normalized_bind_name(bind.as_ref(), name),
+                    is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -1802,12 +2267,18 @@ fn process_contains(
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
                 let result_attrs = function_result_attrs(name, result, decls);
+                let fn_is_smp = host_is_submodule
+                    && prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
                 let fn_attrs = SymbolAttrs {
                     allocatable: result_attrs.allocatable,
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
                     binding_label: normalized_bind_name(bind.as_ref(), name),
+                    result_rank: result_attrs.result_rank,
+                    is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
                 };
                 let _ignore_dup = st.define(Symbol {
@@ -2017,6 +2488,37 @@ fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8
 }
 
 /// Extract character length from a CharSelector.
+/// Compute the byte length of a string-valued PARAMETER initializer
+/// for `character(*)` length inference (F2008 §5.3.2).  Handles
+/// string literals, references to other character parameters whose
+/// length is already known, and `lit // lit` / `lit // name` concat
+/// chains.  Returns None when we can't classify the init.
+fn derived_char_init_len(
+    e: &crate::ast::expr::Expr,
+    st: &SymbolTable,
+) -> Option<usize> {
+    use crate::ast::expr::Expr;
+    match e {
+        Expr::StringLiteral { value, .. } => Some(value.len()),
+        Expr::Name { name } => {
+            let sym = st.find_symbol_any_scope(&name.to_lowercase())?;
+            if let Some(TypeInfo::Character { len: Some(n), .. }) = &sym.type_info {
+                usize::try_from(*n).ok()
+            } else {
+                None
+            }
+        }
+        Expr::ParenExpr { inner } => derived_char_init_len(&inner.node, st),
+        Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Concat,
+            left,
+            right,
+        } => Some(derived_char_init_len(&left.node, st)?
+            + derived_char_init_len(&right.node, st)?),
+        _ => None,
+    }
+}
+
 fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
     match sel {
         Some(cs) => match &cs.len {
@@ -2103,11 +2605,24 @@ fn function_result_attrs(
         else {
             continue;
         };
-        if entities
+        let matching_entity = entities
             .iter()
-            .any(|entity| entity.name.eq_ignore_ascii_case(&result_key))
-        {
-            return attrs_to_symbol_attrs(attrs, Access::Default);
+            .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
+        if let Some(entity) = matching_entity {
+            let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
+            // Capture result rank: prefer the entity-local array_spec
+            // (e.g. `real :: w(:)`), falling back to a `dimension(...)`
+            // attribute on the type-decl statement.
+            let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
+            let rank_from_attrs = attrs.iter().find_map(|a| match a {
+                crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
+                _ => None,
+            });
+            sym_attrs.result_rank = rank_from_entity
+                .or(rank_from_attrs)
+                .unwrap_or(0)
+                .min(u8::MAX as usize) as u8;
+            return sym_attrs;
         }
     }
     SymbolAttrs::default()

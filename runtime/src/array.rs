@@ -1105,6 +1105,43 @@ pub extern "C" fn afs_copy_array_data(
     source: *const ArrayDescriptor,
     stat: *mut i32,
 ) {
+    afs_prepare_array_copy(dest, source, stat);
+    if !stat.is_null() {
+        let status = unsafe { *stat };
+        if status != 0 {
+            return;
+        }
+    }
+
+    let dest = unsafe { &mut *dest };
+    let source = unsafe { &*source };
+    let bytes = source.total_bytes();
+    if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
+        unsafe {
+            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        }
+    }
+    dest.set_scalar_type_tag(source.scalar_type_tag());
+    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
+
+/// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
+/// has already been allocated with its final shape.
+///
+/// On mismatch, the fresh destination allocation is rolled back so the overall
+/// statement still fails loudly instead of silently changing shape.
+#[no_mangle]
+pub extern "C" fn afs_prepare_array_copy(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    stat: *mut i32,
+) {
     if dest.is_null() || source.is_null() {
         if !stat.is_null() {
             unsafe {
@@ -1142,15 +1179,6 @@ pub extern "C" fn afs_copy_array_data(
         eprintln!("ALLOCATE SOURCE=: destination shape does not conform to source");
         std::process::exit(1);
     }
-
-    let bytes = source.total_bytes();
-    if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        unsafe {
-            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
-        }
-    }
-    dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 
     if !stat.is_null() {
         unsafe {
@@ -1859,6 +1887,60 @@ pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> 
     }
 }
 
+/// SHAPE(array) → fresh rank-1 default-integer (i32) array of length
+/// `rank`, holding each dimension's extent. Allocates the destination
+/// via `afs_allocate_array`. F2018 §16.9.207.
+#[no_mangle]
+pub extern "C" fn afs_array_shape_int4(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+) {
+    if dst.is_null() || src.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let n = s.rank as i64;
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n,
+        stride: 1,
+    };
+    afs_allocate_array(dst, 4, 1, &dim as *const DimDescriptor, ptr::null_mut());
+    let d = unsafe { &mut *dst };
+    let base = d.base_addr as *mut i32;
+    for i in 0..s.rank as usize {
+        unsafe {
+            base.add(i).write(s.dims[i].extent() as i32);
+        }
+    }
+}
+
+/// SHAPE(array, kind=int64) → rank-1 i64 array of extents.
+#[no_mangle]
+pub extern "C" fn afs_array_shape_int8(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+) {
+    if dst.is_null() || src.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let n = s.rank as i64;
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n,
+        stride: 1,
+    };
+    afs_allocate_array(dst, 8, 1, &dim as *const DimDescriptor, ptr::null_mut());
+    let d = unsafe { &mut *dst };
+    let base = d.base_addr as *mut i64;
+    for i in 0..s.rank as usize {
+        unsafe {
+            base.add(i).write(s.dims[i].extent());
+        }
+    }
+}
+
 /// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
 #[no_mangle]
 pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i64 {
@@ -1958,6 +2040,49 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
     count
 }
 
+/// NORM2(array) — Euclidean norm `sqrt(sum(x**2))` (real(8)).
+/// F2018 §16.9.158. Respects strides for non-contiguous sections.
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real8(desc: *const ArrayDescriptor) -> f64 {
+    if desc.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        acc += v * v;
+    }
+    acc.sqrt()
+}
+
+/// NORM2(array) — Euclidean norm `sqrt(sum(x**2))` (real(4)).
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
+    if desc.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let v = unsafe { *ptr.add(i * stride) } as f64;
+        acc += v * v;
+    }
+    acc.sqrt() as f32
+}
+
 /// SUM(array) — sum all elements (real(8) version).
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
@@ -1979,7 +2104,8 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     sum
 }
 
-/// SUM(array) — sum all elements (integer(4) version).
+/// SUM(array) — sum all elements (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays all sum correctly.
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
@@ -1992,10 +2118,32 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
     let mut sum: i64 = 0;
-    for i in 0..n {
-        sum += unsafe { *ptr.add(i * stride) } as i64;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) });
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            for i in 0..n {
+                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
     }
     sum
 }
@@ -2020,7 +2168,8 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     prod
 }
 
-/// PRODUCT(array) — product of all elements (integer(4) version).
+/// PRODUCT(array) — product of all elements (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays multiply correctly.
 #[no_mangle]
 pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     if desc.is_null() {
@@ -2035,10 +2184,32 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
         return 1;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
     let mut prod: i64 = 1;
-    for i in 0..n {
-        prod *= unsafe { *ptr.add(i * stride) } as i64;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) });
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            for i in 0..n {
+                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
+            }
+        }
     }
     prod
 }
@@ -2095,56 +2266,309 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     min
 }
 
-/// MAXVAL(array) — maximum element (integer(4) version). Respects strides.
+/// MAXVAL(array) — maximum element (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays read correctly.
+/// Returns i64 so all kinds fit; codegen truncates to result kind.
 #[no_mangle]
-pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i32 {
+pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i64 {
     if desc.is_null() {
-        return i32::MIN;
+        return i64::MIN;
     }
     let d = unsafe { &*desc };
     if d.base_addr.is_null() {
-        return i32::MIN;
+        return i64::MIN;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i32::MIN;
+        return i64::MIN;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut max = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v > max {
+                    max = v;
+                }
+            }
+            max
+        }
+    }
+}
+
+/// MINVAL(array) — minimum element (integer version).
+/// Dispatches on `elem_size` so integer(1/2/4/8) arrays read correctly.
+/// Returns i64 so all kinds fit; codegen truncates to result kind.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i64 {
+    if desc.is_null() {
+        return i64::MAX;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return i64::MAX;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return i64::MAX;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut min = unsafe { *ptr } as i64;
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) } as i64;
+                if v < min {
+                    min = v;
+                }
+            }
+            min
+        }
+    }
+}
+
+/// MAXLOC(array, dim=1) for rank-1 input — returns 1-based index of the
+/// maximum element (real(4)). F2018 §16.9.130. Dispatches on elem_size.
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real4(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
     let mut max = unsafe { *ptr };
+    let mut idx = 0usize;
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
         if v > max {
             max = v;
+            idx = i;
         }
     }
-    max
+    (idx as i32) + 1
 }
 
-/// MINVAL(array) — minimum element (integer(4) version). Respects strides.
 #[no_mangle]
-pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i32 {
+pub extern "C" fn afs_array_maxloc_real8(desc: *const ArrayDescriptor) -> i32 {
     if desc.is_null() {
-        return i32::MAX;
+        return 0;
     }
     let d = unsafe { &*desc };
     if d.base_addr.is_null() {
-        return i32::MAX;
+        return 0;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i32::MAX;
+        return 0;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const i32;
+    let ptr = d.base_addr as *const f64;
+    let mut max = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v > max {
+            max = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let mut idx = 0usize;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut max = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v > max {
+                    max = v;
+                    idx = i;
+                }
+            }
+        }
+    }
+    (idx as i32) + 1
+}
+
+/// MINLOC(array) for rank-1 input — analogous to MAXLOC.
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real4(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f32;
     let mut min = unsafe { *ptr };
+    let mut idx = 0usize;
     for i in 1..n {
         let v = unsafe { *ptr.add(i * stride) };
         if v < min {
             min = v;
+            idx = i;
         }
     }
-    min
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real8(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let ptr = d.base_addr as *const f64;
+    let mut min = unsafe { *ptr };
+    let mut idx = 0usize;
+    for i in 1..n {
+        let v = unsafe { *ptr.add(i * stride) };
+        if v < min {
+            min = v;
+            idx = i;
+        }
+    }
+    (idx as i32) + 1
 }
 
 /// TRANSPOSE(source, result) — matrix transpose (real(8) version).
@@ -2330,28 +2754,462 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
-    let sp = src.base_addr as *const i32;
+    let elem_size = src.elem_size.max(1) as usize;
+    let sp = src.base_addr as *const u8;
 
-    afs_allocate_1d(result, 4, (n * m) as i64);
-    let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
+    // Allocate result with same per-element width so callers using
+    // complex (8/16-byte), integer(8) (8-byte), integer(2)/(1) etc. all
+    // round-trip without truncation. The previous always-i32 path silently
+    // dropped the upper bytes of every element for non-32-bit types.
+    let dim0 = DimDescriptor {
         lower_bound: 1,
         upper_bound: n as i64,
         stride: 1,
     };
-    res.dims[1] = DimDescriptor {
+    let dim1 = DimDescriptor {
         lower_bound: 1,
         upper_bound: m as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut i32;
+    let dims = [dim0, dim1];
+    afs_allocate_array(
+        result,
+        elem_size as i64,
+        2,
+        dims.as_ptr(),
+        ptr::null_mut(),
+    );
+    let res = unsafe { &mut *result };
+    let rp = res.base_addr;
 
     for i in 0..m {
         for j in 0..n {
+            let src_off = (i * n + j) * elem_size;
+            let dst_off = (j * m + i) * elem_size;
             unsafe {
-                *rp.add(j * m + i) = *sp.add(i * n + j);
+                core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), elem_size);
             }
+        }
+    }
+}
+
+/// CONJG over a complex array: allocate result with the same shape and
+/// element size, copy the real lane verbatim and negate the imag lane.
+/// Handles complex(sp) (8-byte) and complex(dp) (16-byte) by reading the
+/// per-element width from the descriptor.
+#[no_mangle]
+pub extern "C" fn afs_array_conjg(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    afs_allocate_like(result, source, ptr::null_mut());
+    let res = unsafe { &mut *result };
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let total = src.total_elements() as usize;
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr;
+    if elem_size == 8 {
+        // complex(sp): two f32 lanes per element
+        for i in 0..total {
+            let off = i * 8;
+            unsafe {
+                let re = *(sp.add(off) as *const f32);
+                let im = *(sp.add(off + lane) as *const f32);
+                *(rp.add(off) as *mut f32) = re;
+                *(rp.add(off + lane) as *mut f32) = -im;
+            }
+        }
+    } else if elem_size == 16 {
+        // complex(dp): two f64 lanes per element
+        for i in 0..total {
+            let off = i * 16;
+            unsafe {
+                let re = *(sp.add(off) as *const f64);
+                let im = *(sp.add(off + lane) as *const f64);
+                *(rp.add(off) as *mut f64) = re;
+                *(rp.add(off + lane) as *mut f64) = -im;
+            }
+        }
+    } else {
+        // Non-complex element width: byte-copy (degenerates to identity).
+        for i in 0..total {
+            let off = i * elem_size;
+            unsafe {
+                core::ptr::copy_nonoverlapping(sp.add(off), rp.add(off), elem_size);
+            }
+        }
+    }
+}
+
+/// AIMAG over a complex array: produce a real array of the same shape
+/// whose elements are the imaginary lanes of the source. Result has
+/// HALF the source elem_size (complex(sp) 8B → real(sp) 4B; complex(dp)
+/// 16B → real(dp) 8B), so we allocate fresh dims rather than using
+/// `afs_allocate_like`.
+#[no_mangle]
+pub extern "C" fn afs_array_aimag(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(src.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: src.dims[i].lower_bound,
+            upper_bound: src.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = src.total_elements() as usize;
+    let sp_buf = src.base_addr as *const u8;
+    let rp_buf = res.base_addr;
+    if elem_size == 8 {
+        for i in 0..total {
+            unsafe {
+                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
+                *(rp_buf.add(i * 4) as *mut f32) = im;
+            }
+        }
+    } else if elem_size == 16 {
+        for i in 0..total {
+            unsafe {
+                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
+                *(rp_buf.add(i * 8) as *mut f64) = im;
+            }
+        }
+    }
+}
+
+/// ABS over a complex array: produce a real array of the same shape
+/// whose elements are |z| = sqrt(re*re + im*im). Result has HALF the
+/// source elem_size; mirror the allocation strategy from `afs_array_aimag`.
+#[no_mangle]
+pub extern "C" fn afs_array_abs_complex(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(src.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: src.dims[i].lower_bound,
+            upper_bound: src.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = src.total_elements() as usize;
+    let sp_buf = src.base_addr as *const u8;
+    let rp_buf = res.base_addr;
+    if elem_size == 8 {
+        for i in 0..total {
+            unsafe {
+                let re = *(sp_buf.add(i * 8) as *const f32);
+                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
+                *(rp_buf.add(i * 4) as *mut f32) = (re * re + im * im).sqrt();
+            }
+        }
+    } else if elem_size == 16 {
+        for i in 0..total {
+            unsafe {
+                let re = *(sp_buf.add(i * 16) as *const f64);
+                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
+                *(rp_buf.add(i * 8) as *mut f64) = (re * re + im * im).sqrt();
+            }
+        }
+    }
+}
+
+/// F2018 §16.9.144 PACK(ARRAY, MASK [, VECTOR]).
+///
+/// Walks `source` and `mask` element-by-element (mask is interpreted
+/// element-wise, regardless of source rank, since shapes must conform
+/// per the standard). Each source element whose mask element is true
+/// is copied into a fresh rank-1 result descriptor.
+///
+/// `vector` is optional; when non-null, the result inherits its size
+/// (element count) and elements past the masked-true count are filled
+/// from `vector`. Otherwise the result size is the count of true
+/// values in the mask.
+///
+/// `mask` is a Fortran logical, stored as i32 in our descriptor: zero
+/// means false, anything else means true.
+///
+/// The element copy is byte-level via `elem_size` so this works for
+/// any non-derived element type (integer/real/complex/logical/character
+/// of any kind).
+#[no_mangle]
+pub extern "C" fn afs_array_pack(
+    source: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    vector: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || mask.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    let msk = unsafe { &*mask };
+    if src.base_addr.is_null() || msk.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let total = src.total_elements() as usize;
+    let mask_total = msk.total_elements() as usize;
+    let pairs = total.min(mask_total);
+    let mask_elem = msk.elem_size.max(1) as usize;
+
+    // First pass: count true values in the mask.
+    let mut true_count: i64 = 0;
+    let msk_buf = msk.base_addr as *const u8;
+    for i in 0..pairs {
+        let off = i * mask_elem;
+        let v = unsafe { *(msk_buf.add(off) as *const i32) };
+        if v != 0 {
+            true_count += 1;
+        }
+    }
+
+    // Result size: vector's size if provided, else count of trues.
+    let result_n = if !vector.is_null() {
+        let vec = unsafe { &*vector };
+        vec.total_elements()
+    } else {
+        true_count
+    };
+
+    // Allocate rank-1 result descriptor.
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: result_n,
+        stride: 1,
+    };
+    let dim_ptr = &dim as *const DimDescriptor;
+    afs_allocate_array(result, elem_size as i64, 1, dim_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr;
+
+    // Second pass: emit masked-true source elements into result.
+    let mut out_idx: usize = 0;
+    for i in 0..pairs {
+        let m = unsafe { *(msk_buf.add(i * mask_elem) as *const i32) };
+        if m != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    sp.add(i * elem_size),
+                    rp.add(out_idx * elem_size),
+                    elem_size,
+                );
+            }
+            out_idx += 1;
+        }
+    }
+
+    // Pad the tail from `vector` (if provided and result_n > true_count).
+    if !vector.is_null() {
+        let vec = unsafe { &*vector };
+        if !vec.base_addr.is_null() {
+            let vp = vec.base_addr as *const u8;
+            let tail_start = out_idx;
+            let tail_end = result_n as usize;
+            for j in tail_start..tail_end {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        vp.add(j * elem_size),
+                        rp.add(j * elem_size),
+                        elem_size,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F2018 §16.9.163: RESHAPE(SOURCE, SHAPE [, PAD, ORDER]).
+///
+/// Allocates a fresh result descriptor of rank = size(shape) and
+/// element-fills it from `source` in array-element order. When
+/// `order` is supplied (a permutation of 1..rank), the *target*
+/// dimension traversal is permuted: result element index `(j1,...,jN)`
+/// corresponds to a logical "natural" position whose subscripts are
+/// `(j[order(1)],...,j[order(N)])`. When the result has more elements
+/// than the source, the tail is filled cyclically from `pad`.
+///
+/// Shape and order arrays are i32 or i64 — read both via the same
+/// 64-bit-extended path keyed off the descriptor's elem_size.
+#[no_mangle]
+pub extern "C" fn afs_array_reshape(
+    source: *const ArrayDescriptor,
+    shape: *const ArrayDescriptor,
+    order: *const ArrayDescriptor,
+    pad: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || shape.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    let shp = unsafe { &*shape };
+    if src.base_addr.is_null() || shp.base_addr.is_null() {
+        return;
+    }
+    let rank = shp.total_elements() as usize;
+    if rank == 0 || rank > MAX_RANK {
+        return;
+    }
+
+    // Read shape extents into a fixed-size array.
+    let read_int_at = |buf: *const u8, idx: usize, elem_size: usize| -> i64 {
+        unsafe {
+            match elem_size {
+                4 => *(buf.add(idx * 4) as *const i32) as i64,
+                8 => *(buf.add(idx * 8) as *const i64),
+                _ => 0,
+            }
+        }
+    };
+    let shape_buf = shp.base_addr as *const u8;
+    let shape_elem = shp.elem_size.max(1) as usize;
+    let mut extents: [i64; MAX_RANK] = [0; MAX_RANK];
+    for (i, slot) in extents.iter_mut().enumerate().take(rank) {
+        *slot = read_int_at(shape_buf, i, shape_elem).max(0);
+    }
+
+    // Build dim descriptors and allocate result.
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for i in 0..rank {
+        dims[i] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: extents[i],
+            stride: 1,
+        };
+    }
+    let elem_size = src.elem_size.max(1);
+    afs_allocate_array(
+        result,
+        elem_size,
+        rank as i32,
+        dims.as_ptr(),
+        ptr::null_mut(),
+    );
+    let res = unsafe { &mut *result };
+    if res.base_addr.is_null() {
+        return;
+    }
+
+    let total: i64 = extents.iter().take(rank).copied().product();
+    let total_usize = total as usize;
+    let src_total = src.total_elements() as usize;
+    let elem_size_usize = elem_size as usize;
+
+    // Read order (identity if absent).
+    let mut order_perm: [usize; MAX_RANK] = [0; MAX_RANK];
+    let order_present = !order.is_null() && unsafe { (*order).rank > 0 };
+    if order_present {
+        let ord = unsafe { &*order };
+        let ord_buf = ord.base_addr as *const u8;
+        let ord_elem = ord.elem_size.max(1) as usize;
+        let ord_count = ord.total_elements() as usize;
+        for (i, slot) in order_perm.iter_mut().enumerate().take(rank.min(ord_count)) {
+            // Convert from 1-based Fortran to 0-based.
+            *slot = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
+        }
+    } else {
+        for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
+            *slot = i;
+        }
+    }
+
+    let pad_present = !pad.is_null() && unsafe { (*pad).total_elements() > 0 };
+    let (pad_buf, pad_total) = if pad_present {
+        let p = unsafe { &*pad };
+        (p.base_addr as *const u8, p.total_elements() as usize)
+    } else {
+        (ptr::null(), 0)
+    };
+
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr;
+
+    // Linear iteration over the result in element order. For each
+    // result linear index, compute the multi-dim subscript in the
+    // *natural* (un-permuted) order, then look up the target slot
+    // by applying `order_perm` to translate logical → result subscript.
+    for linear in 0..total_usize {
+        // Natural multi-dim subscript: column-major over extents in
+        // logical order, where logical extents follow the permutation
+        // (logical_dim k = extents[order_perm[k]]).
+        let mut idx = linear;
+        let mut logical_subs: [i64; MAX_RANK] = [0; MAX_RANK];
+        for k in 0..rank {
+            let logical_extent = extents[order_perm[k]].max(1) as usize;
+            logical_subs[k] = (idx % logical_extent) as i64;
+            idx /= logical_extent;
+        }
+        // Translate into result subscript: result_subs[order_perm[k]] = logical_subs[k]
+        let mut result_subs: [i64; MAX_RANK] = [0; MAX_RANK];
+        for k in 0..rank {
+            result_subs[order_perm[k]] = logical_subs[k];
+        }
+        // Compute result linear (column-major over result extents).
+        let mut result_linear: usize = 0;
+        let mut multiplier: usize = 1;
+        for k in 0..rank {
+            result_linear += (result_subs[k] as usize) * multiplier;
+            multiplier *= extents[k].max(1) as usize;
+        }
+        // Source element: linear (column-major as if rank-1 flat).
+        let src_off = if linear < src_total {
+            linear * elem_size_usize
+        } else if pad_total > 0 {
+            ((linear - src_total) % pad_total) * elem_size_usize
+        } else {
+            0
+        };
+        let from = if linear < src_total || pad_total == 0 {
+            sp
+        } else {
+            pad_buf
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                from.add(src_off),
+                rp.add(result_linear * elem_size_usize),
+                elem_size_usize,
+            );
         }
     }
 }

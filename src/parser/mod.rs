@@ -57,6 +57,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Peek at the kind of the token `n` positions ahead of the cursor.
+    /// Returns `None` past the end of the stream.
+    pub fn peek_kind_at(&self, n: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + n).map(|t| &t.kind)
+    }
+
     /// Peek at the current token (with span info).
     pub fn current(&self) -> &Token {
         if self.pos < self.tokens.len() {

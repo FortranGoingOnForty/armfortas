@@ -267,10 +267,35 @@ fn register_ieee_stubs(st: &mut SymbolTable) {
                 }
                 insert_proc(st, m, "ieee_is_nan");
                 insert_proc(st, m, "ieee_is_finite");
+                insert_proc(st, m, "ieee_is_normal");
                 insert_proc(st, m, "ieee_value");
+                insert_proc(st, m, "ieee_class");
                 insert_proc(st, m, "ieee_selected_real_kind");
                 insert_proc(st, m, "ieee_support_datatype");
                 insert_proc(st, m, "ieee_support_denormal");
+                insert_proc(st, m, "ieee_support_inf");
+                insert_proc(st, m, "ieee_support_nan");
+                insert_proc(st, m, "ieee_support_subnormal");
+                insert_proc(st, m, "ieee_support_underflow_control");
+                insert_proc(st, m, "ieee_support_halting");
+                insert_proc(st, m, "ieee_support_flag");
+                insert_proc(st, m, "ieee_support_standard");
+                insert_proc(st, m, "ieee_support_rounding");
+                insert_proc(st, m, "ieee_support_io");
+                insert_proc(st, m, "ieee_support_divide");
+                insert_proc(st, m, "ieee_support_sqrt");
+                insert_proc(st, m, "ieee_get_rounding_mode");
+                insert_proc(st, m, "ieee_set_rounding_mode");
+                insert_proc(st, m, "ieee_get_underflow_mode");
+                insert_proc(st, m, "ieee_set_underflow_mode");
+                insert_proc(st, m, "ieee_copy_sign");
+                insert_proc(st, m, "ieee_logb");
+                insert_proc(st, m, "ieee_next_after");
+                insert_proc(st, m, "ieee_rem");
+                insert_proc(st, m, "ieee_rint");
+                insert_proc(st, m, "ieee_scalb");
+                insert_proc(st, m, "ieee_unordered");
+                insert_proc(st, m, "ieee_fma");
             }
             "ieee_exceptions" => {
                 insert_type(st, m, "ieee_flag_type");

@@ -447,7 +447,11 @@ impl<'a> Parser<'a> {
         let expr = self.parse_expr()?;
 
         // If followed by colon, it's a range: start:end[:stride]
-        if self.peek() == &TokenKind::Colon {
+        if matches!(self.peek(), TokenKind::Colon | TokenKind::ColonColon) {
+            // Both `start:end[:stride]` and `start::stride` (empty
+            // end, common in `a(1::7)`) need to enter the range
+            // parser; without this, `::` after `start` was leaking
+            // through and tripping the closing-paren check.
             let sub = self.parse_range(Some(expr))?;
             return Ok(Argument {
                 keyword: None,

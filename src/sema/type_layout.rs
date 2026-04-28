@@ -95,6 +95,26 @@ pub struct TypeLayoutRegistry {
     next_tag: u64,
 }
 
+fn stable_type_tag_key(layout: &TypeLayout) -> String {
+    match &layout.owner_module {
+        Some(owner_module) => format!(
+            "{}::{}",
+            owner_module.to_lowercase(),
+            layout.name.to_lowercase()
+        ),
+        None => layout.name.to_lowercase(),
+    }
+}
+
+fn stable_type_tag(layout: &TypeLayout) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in stable_type_tag_key(layout).bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 impl TypeLayoutRegistry {
     pub fn new() -> Self {
         Self {
@@ -115,7 +135,7 @@ impl TypeLayoutRegistry {
 
     pub fn insert(&mut self, mut layout: TypeLayout) {
         if layout.type_tag == 0 {
-            layout.type_tag = self.alloc_tag();
+            layout.type_tag = stable_type_tag(&layout);
         } else if layout.type_tag >= self.next_tag {
             self.next_tag = layout.type_tag + 1;
         }
@@ -1008,6 +1028,36 @@ mod tests {
         assert!(reg.get("mytype").is_some()); // case insensitive
         assert!(reg.get("MYTYPE").is_some());
         assert!(reg.get("other").is_none());
+    }
+
+    #[test]
+    fn registry_assigns_distinct_stable_tags_to_module_siblings() {
+        let alpha = TypeLayout {
+            name: "child_t".into(),
+            owner_module: Some("alpha_m".into()),
+            size: 8,
+            align: 8,
+            fields: vec![],
+            bound_procs: vec![],
+            final_procs: vec![],
+            type_tag: 0,
+            parent: Some("base_t".into()),
+            is_abstract: false,
+        };
+        let beta = TypeLayout {
+            name: "child_t".into(),
+            owner_module: Some("beta_m".into()),
+            size: 8,
+            align: 8,
+            fields: vec![],
+            bound_procs: vec![],
+            final_procs: vec![],
+            type_tag: 0,
+            parent: Some("base_t".into()),
+            is_abstract: false,
+        };
+
+        assert_ne!(stable_type_tag(&alpha), stable_type_tag(&beta));
     }
 
     /// Helper: build a component declaration for testing compute_layout.

@@ -1021,8 +1021,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" reading: {}", opts.input.display());
     }
     let phase = phases.start("read");
-    let source = fs::read_to_string(&opts.input)
+    // Fortran source files in the wild are not always valid UTF-8 — Latin-1
+    // and stray bytes appear in comments or string literals.  gfortran/flang
+    // both accept non-UTF-8 sources; mirror that by reading raw bytes and
+    // decoding lossily so invalid sequences become U+FFFD instead of an I/O
+    // failure.
+    let raw = fs::read(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
+    let source = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
     phase.end(&mut phases);
     let file_str = opts.input.display().to_string();
 
@@ -1051,6 +1060,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
+        // Share `-I` paths with the preprocessor so `#include "foo.inc"`
+        // can find headers (e.g. stdlib's `include/macros.inc`).  The
+        // resolver searches relative-to-current-file first, then this
+        // list — both gfortran and flang do the same.
+        include_paths: opts.module_search_paths.clone(),
         ..crate::preprocess::PreprocConfig::default()
     };
     for (name, value) in &opts.preprocessor_defines {
@@ -1256,6 +1270,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
+        if std::env::var_os("AFS_DUMP_BAD_IR").is_some() {
+            let path = std::env::temp_dir().join("afs_failed.ir");
+            let _ = std::fs::write(&path, crate::ir::printer::print_module(&ir_module));
+            eprintln!("afs: dumped failing IR to {}", path.display());
+        }
         let msg = ir_errors
             .iter()
             .map(|e| e.to_string())
@@ -1345,6 +1364,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if opts.opt_level >= OptLevel::O1 {
                 crate::codegen::tailcall::tail_call_opt(mf);
             }
+            // 8.6. Branch relaxation: any B.cond whose target lies
+            // outside the ±1MB conditional-branch window is expanded
+            // to a `B.{!cond} skip; B far_target; skip:` trampoline
+            // so the assembler doesn't choke on the encoding.
+            crate::codegen::relax_branches::relax_branches(mf);
         }
     }
 

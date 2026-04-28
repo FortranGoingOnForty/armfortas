@@ -4,17 +4,37 @@
 //! mechanisms: local declaration, USE association, host association, and
 //! IMPORT. Handles implicit typing and case-insensitive lookup.
 
+use crate::ast::decl::ArraySpec;
+use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
 use std::collections::HashMap;
 
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
 
+/// F77 §15.4 statement function: a single-line function defined inside
+/// the host procedure's declaration prologue, scoped to that procedure
+/// only. Stored on the SymbolTable as a side table so lowering can skip
+/// the recognized definition statement and inline-substitute call sites.
+#[derive(Debug, Clone)]
+pub struct StatementFunctionDef {
+    /// Dummy parameter names (lowercase), in declaration order.
+    pub params: Vec<String>,
+    /// Body expression, exactly as written on the RHS of `name(...) = expr`.
+    pub body: SpannedExpr,
+    /// Declared result type (from the `type :: name` declaration).
+    pub result_type: TypeInfo,
+}
+
 /// The symbol table — manages all scopes in a compilation.
 #[derive(Debug)]
 pub struct SymbolTable {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) current: ScopeId,
+    /// (scope_id, lowercase fname) → statement function definition.
+    /// Populated by sema's `detect_statement_functions` pass during
+    /// `resolve_unit` for Subroutine/Function/Program arms.
+    pub statement_functions: HashMap<(ScopeId, String), StatementFunctionDef>,
 }
 
 impl SymbolTable {
@@ -34,7 +54,37 @@ impl SymbolTable {
         Self {
             scopes: vec![global],
             current: 0,
+            statement_functions: HashMap::new(),
         }
+    }
+
+    /// Lookup a statement function by (scope, name). Caller passes
+    /// the scope where the call site appears; we walk up the parent
+    /// chain so a statement function defined in the host is visible
+    /// to nested constructs (DO/IF/SELECT bodies don't get their own
+    /// procedure scope, so this typically resolves at the same scope).
+    pub fn lookup_statement_function(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<&StatementFunctionDef> {
+        let key = name.to_lowercase();
+        let mut cur = Some(scope_id);
+        while let Some(sid) = cur {
+            if let Some(def) = self.statement_functions.get(&(sid, key.clone())) {
+                return Some(def);
+            }
+            // Statement functions are scope-local to the containing
+            // procedure (Subroutine/Function/Program). Stop walking
+            // when we leave a procedure scope.
+            match self.scopes[sid].kind {
+                ScopeKind::Subroutine(_)
+                | ScopeKind::Function(_)
+                | ScopeKind::Program(_) => return None,
+                _ => cur = self.scopes[sid].parent,
+            }
+        }
+        None
     }
 }
 
@@ -217,16 +267,41 @@ impl SymbolTable {
     /// Prefers parameter symbols (for kind resolution) but returns any match.
     pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
         let key = name.to_ascii_lowercase();
+        // Track the best fallback seen so far. A typed
+        // Function/Subroutine carries the most useful information
+        // (return type, kind, ABI) for callers that use this helper to
+        // resolve a procedure reference. A NamedInterface with the same
+        // name (common when a stdlib module re-exports a function via a
+        // generic interface block) shadows the typed entry on the first
+        // scope-iteration hit but provides only a list of specifics —
+        // not enough for return-type or character-ABI lookup. Prefer
+        // typed callable kinds over NamedInterface so callers don't
+        // have to walk every scope themselves.
         let mut fallback: Option<&Symbol> = None;
+        let mut typed_callable: Option<&Symbol> = None;
         for scope in &self.scopes {
             if let Some(sym) = scope.symbols.get(&key) {
                 if sym.attrs.parameter {
                     return Some(sym);
                 }
+                if matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                ) && typed_callable.is_none()
+                {
+                    typed_callable = Some(sym);
+                }
                 if fallback.is_none() {
                     fallback = Some(sym);
                 }
             }
+        }
+        if let Some(sym) = typed_callable {
+            return Some(sym);
         }
         if fallback.is_some() {
             return fallback;
@@ -474,6 +549,24 @@ pub struct SymbolAttrs {
     pub pure: bool,
     /// Procedure declared with the ELEMENTAL prefix.
     pub elemental: bool,
+    /// For Function symbols whose result is an array (allocatable,
+    /// automatic, or fixed-shape): rank of the result.  0 for scalar
+    /// results.  Used by lowering to route array-returning calls
+    /// through the descriptor-return ABI even when the result isn't
+    /// ALLOCATABLE — e.g. `real(sp), dimension(size(x)) :: w` is rank 1.
+    pub result_rank: u8,
+    /// Per-entity array specification — the same value the AST carries
+    /// on `EntityDecl::array_spec` (or, when missing, derived from the
+    /// `dimension(...)` attribute). Empty when the symbol is scalar.
+    /// Sema populates this so consumers (notably SMP-body lowering)
+    /// can recover full shape metadata without re-walking the AST decls.
+    pub array_spec: Vec<ArraySpec>,
+    /// Subroutine/Function declared with `module` prefix inside a
+    /// submodule — the body of a separate module procedure declared
+    /// in the parent module's interface block. Codegen links these
+    /// under the parent module's name, not the submodule's, so call
+    /// sites match `_afs_modproc_<parent>_<proc>`.
+    pub is_separate_module_procedure: bool,
 }
 
 impl Default for SymbolAttrs {
@@ -494,6 +587,9 @@ impl Default for SymbolAttrs {
             intrinsic: false,
             pure: false,
             elemental: false,
+            result_rank: 0,
+            array_spec: Vec::new(),
+            is_separate_module_procedure: false,
         }
     }
 }

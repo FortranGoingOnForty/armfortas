@@ -58,10 +58,58 @@ impl<'a> Parser<'a> {
 
         let text = self.peek_text().to_lowercase();
 
+        // FORMAT statement: skip over the (...) format spec. Format
+        // strings as labeled FORMAT are largely informational — modern
+        // Fortran uses character format strings inline. We swallow the
+        // whole statement and emit a Continue placeholder so labels
+        // can still target it.
+        if text == "format" {
+            self.advance(); // consume 'format'
+            if self.peek() == &TokenKind::LParen {
+                let mut depth = 0;
+                while self.peek() != &TokenKind::Eof {
+                    match self.peek() {
+                        TokenKind::LParen => {
+                            self.advance();
+                            depth += 1;
+                        }
+                        TokenKind::RParen => {
+                            self.advance();
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+            }
+            let span = span_from_to(start, self.prev_span());
+            return Ok(Spanned::new(Stmt::Continue { label: None }, span));
+        }
+
         match text.as_str() {
             "if" => self.parse_if(start),
             "do" => self.parse_do(start),
-            "select" => self.parse_select(start),
+            // SELECT is not a reserved word — F2008 §3.2.5. LAPACK
+            // routines use `select` as a logical-array dummy
+            // argument, then assign `select(k) = .false.`. Disambiguate
+            // by requiring `case`, `type`, or `rank` to follow; else
+            // treat as an identifier.
+            "select" => {
+                let next_text = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|t| t.text.to_lowercase())
+                    .unwrap_or_default();
+                if matches!(next_text.as_str(), "case" | "type" | "rank") {
+                    self.parse_select(start)
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
+            }
             "where" => self.parse_where_construct(start),
             "forall" => self.parse_forall_construct(start),
             "block" => {
@@ -128,47 +176,51 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_read(start)
             }
-            "open" => {
+            // I/O and memory keywords double as legal identifiers. The
+            // statement form always opens with `(`; anything else (`=`,
+            // `==`, end of line, etc.) means the lexeme is being used as
+            // a variable name and we redirect to assignment/call.
+            "open" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "open")
             }
-            "close" => {
+            "close" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "close")
             }
-            "inquire" => {
+            "inquire" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_inquire(start)
             }
-            "rewind" => {
+            "rewind" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "rewind")
             }
-            "backspace" => {
+            "backspace" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "backspace")
             }
-            "endfile" => {
+            "endfile" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "endfile")
             }
-            "flush" => {
+            "flush" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "flush")
             }
-            "wait" => {
+            "wait" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "wait")
             }
-            "allocate" => {
+            "allocate" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_allocate(start, false)
             }
-            "deallocate" => {
+            "deallocate" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_allocate(start, true)
             }
-            "nullify" => {
+            "nullify" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_nullify(start)
             }
@@ -369,6 +421,9 @@ impl<'a> Parser<'a> {
         if keyword == "type" {
             return self.parse_select_type(start);
         }
+        if keyword == "rank" {
+            return self.parse_select_rank(start);
+        }
         self.eat_ident("case");
         self.expect(&TokenKind::LParen)?;
         let selector = self.parse_expr()?;
@@ -429,7 +484,7 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume 'type'
                 self.eat_ident("is");
                 self.expect(&TokenKind::LParen)?;
-                let type_name = self.advance().clone().text;
+                let type_name = self.parse_select_type_spec()?;
                 self.expect(&TokenKind::RParen)?;
                 let body = self.parse_select_type_body()?;
                 guards.push(TypeGuard::TypeIs { type_name, body });
@@ -439,7 +494,7 @@ impl<'a> Parser<'a> {
                 if next == "is" {
                     self.advance(); // consume 'is'
                     self.expect(&TokenKind::LParen)?;
-                    let type_name = self.advance().clone().text;
+                    let type_name = self.parse_select_type_spec()?;
                     self.expect(&TokenKind::RParen)?;
                     let body = self.parse_select_type_body()?;
                     guards.push(TypeGuard::ClassIs { type_name, body });
@@ -468,6 +523,40 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the body of a SELECT TYPE guard — stops at TYPE IS, CLASS IS, CLASS DEFAULT, or END SELECT.
+    /// Parse a type spec inside SELECT TYPE / CLASS IS guards.
+    /// Accepts derived names like `foo`, intrinsic types with optional
+    /// kind/length like `real(sp)`, `integer(int8)`, `character(len=*)`.
+    fn parse_select_type_spec(&mut self) -> Result<String, ParseError> {
+        let base = self.advance().clone().text;
+        let base_lc = base.to_lowercase();
+        let is_intrinsic = matches!(
+            base_lc.as_str(),
+            "integer" | "real" | "double" | "complex" | "logical" | "character"
+        );
+        if is_intrinsic && self.peek() == &TokenKind::LParen {
+            // Skip over the kind/length spec without storing it.
+            // We just need to consume balanced parens.
+            self.advance(); // consume '('
+            let mut depth = 1;
+            while depth > 0 && self.peek() != &TokenKind::Eof {
+                match self.peek() {
+                    TokenKind::LParen => {
+                        self.advance();
+                        depth += 1;
+                    }
+                    TokenKind::RParen => {
+                        self.advance();
+                        depth -= 1;
+                    }
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+        }
+        Ok(base)
+    }
+
     fn parse_select_type_body(&mut self) -> Result<Vec<SpannedStmt>, ParseError> {
         let mut stmts = Vec::new();
         loop {
@@ -478,6 +567,104 @@ impl<'a> Parser<'a> {
             let text = self.peek_text().to_lowercase();
             // Break on guard keywords or end.
             if text == "type" || text == "class" || text == "endselect" {
+                break;
+            }
+            if text == "end" {
+                let next = if self.pos + 1 < self.tokens.len() {
+                    self.tokens[self.pos + 1].text.to_lowercase()
+                } else {
+                    String::new()
+                };
+                if next == "select" || next.is_empty() {
+                    break;
+                }
+            }
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
+    }
+
+    fn parse_select_rank(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.advance(); // consume 'rank'
+        self.expect(&TokenKind::LParen)?;
+
+        let (assoc_name, selector) = {
+            let expr = self.parse_expr()?;
+            if self.eat(&TokenKind::Arrow) {
+                let assoc = if let Expr::Name { name } = &expr.node {
+                    Some(name.clone())
+                } else {
+                    None
+                };
+                let sel = self.parse_expr()?;
+                (assoc, sel)
+            } else {
+                (None, expr)
+            }
+        };
+        self.expect(&TokenKind::RParen)?;
+
+        let mut guards = Vec::new();
+        loop {
+            self.skip_newlines();
+            let text = self.peek_text().to_lowercase();
+            if text != "rank" {
+                break;
+            }
+            self.advance(); // consume 'rank'
+            let next_text = self.peek_text().to_lowercase();
+            if next_text == "default" {
+                self.advance(); // consume 'default'
+                let body = self.parse_select_rank_body()?;
+                guards.push(RankGuard::RankDefault { body });
+            } else {
+                self.expect(&TokenKind::LParen)?;
+                if self.peek_text() == "*" {
+                    self.advance(); // consume '*'
+                    self.expect(&TokenKind::RParen)?;
+                    let body = self.parse_select_rank_body()?;
+                    guards.push(RankGuard::RankStar { body });
+                } else {
+                    let rank_expr = self.parse_expr()?;
+                    let rank_val = match &rank_expr.node {
+                        Expr::IntegerLiteral { text, .. } => text.parse::<i64>().unwrap_or(0),
+                        Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Minus, operand } => {
+                            if let Expr::IntegerLiteral { text, .. } = &operand.node {
+                                -text.parse::<i64>().unwrap_or(0)
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    };
+                    self.expect(&TokenKind::RParen)?;
+                    let body = self.parse_select_rank_body()?;
+                    guards.push(RankGuard::Rank { rank: rank_val, body });
+                }
+            }
+        }
+        self.consume_end("select")?;
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            Stmt::SelectRank {
+                name: None,
+                selector,
+                assoc_name,
+                guards,
+            },
+            span,
+        ))
+    }
+
+    fn parse_select_rank_body(&mut self) -> Result<Vec<SpannedStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek() == &TokenKind::Eof {
+                break;
+            }
+            let text = self.peek_text().to_lowercase();
+            if text == "rank" || text == "endselect" {
                 break;
             }
             if text == "end" {

@@ -213,6 +213,24 @@ impl<'a> Parser<'a> {
             self.advance();
             return Ok(LenSpec::Colon);
         }
+        // F77 entity-decl character-length form: `name*(*)`, `name*(:)`,
+        // `name*(N)`. The leading `*` is consumed by the caller; here we
+        // see the parenthesized inner form. Per F2018 §C.6.1 these are
+        // the type-param-value alternatives `*`, `:`, and a scalar
+        // int-expr. The plain `parse_expr` can't accept the bare `*` or
+        // `:` form, so unwrap one level of parens before delegating.
+        if self.peek() == &TokenKind::LParen {
+            self.advance();
+            let inner = if self.eat(&TokenKind::Star) {
+                LenSpec::Star
+            } else if self.eat(&TokenKind::Colon) {
+                LenSpec::Colon
+            } else {
+                LenSpec::Expr(self.parse_expr()?)
+            };
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
         let expr = self.parse_expr()?;
         Ok(LenSpec::Expr(expr))
     }
@@ -619,6 +637,18 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::RParen)?;
                 name = format!("{}({})", name, op);
                 is_generic_spec = true;
+            } else if (name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("write"))
+                && self.peek() == &TokenKind::LParen
+            {
+                // F2018 §12.6.4.8: defined-IO generic-spec — `read (formatted)`,
+                // `read (unformatted)`, `write (formatted)`, `write (unformatted)`.
+                // Stored as a single OnlyItem::Generic so module resolution can
+                // import the corresponding INTERFACE READ/WRITE binding.
+                self.advance();
+                let kind = self.advance().clone().text;
+                self.expect(&TokenKind::RParen)?;
+                name = format!("{}({})", name.to_ascii_lowercase(), kind.to_ascii_lowercase());
+                is_generic_spec = true;
             }
             if self.eat(&TokenKind::Arrow) {
                 let remote = self.advance().clone().text;
@@ -972,7 +1002,35 @@ impl<'a> Parser<'a> {
         while self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
-                "pass" | "nopass" | "deferred" | "non_overridable" => {
+                "pass" => {
+                    proc_attrs.push(self.advance().clone().text);
+                    // Optional argument: pass(arg). Consume balanced parens
+                    // — we don't track which arg the pass is on; F2018 says
+                    // it defaults to the first dummy if not specified.
+                    if self.peek() == &TokenKind::LParen {
+                        let mut depth = 0;
+                        loop {
+                            match self.peek() {
+                                TokenKind::LParen => {
+                                    self.advance();
+                                    depth += 1;
+                                }
+                                TokenKind::RParen => {
+                                    self.advance();
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                TokenKind::Eof => break,
+                                _ => {
+                                    self.advance();
+                                }
+                            }
+                        }
+                    }
+                }
+                "nopass" | "deferred" | "non_overridable" | "public" | "private" => {
                     proc_attrs.push(self.advance().clone().text);
                 }
                 _ => break,
@@ -997,8 +1055,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_bound_proc_generic(&mut self) -> Result<TypeBoundProc, ParseError> {
-        // generic :: operator(+) => specific_name
-        // or generic :: name => specific_name
+        // generic [, attrs] :: name => specific_name [, specific_name ...]
+        // or generic [, attrs] :: operator(+) => specific_name
+        // F2018 §4.5.5: access-spec (PUBLIC/PRIVATE) may appear after the
+        // GENERIC keyword as a comma-separated attribute. The non-generic
+        // parser already handles this for ordinary procedure bindings; the
+        // generic parser was skipping it, so `generic, public :: name => ...`
+        // mis-parsed name as `,` and dropped every binding.
+        let mut proc_attrs = Vec::new();
+        while self.eat(&TokenKind::Comma) {
+            let text = self.peek_text().to_lowercase();
+            match text.as_str() {
+                "public" | "private" => {
+                    proc_attrs.push(self.advance().clone().text);
+                }
+                _ => break,
+            }
+        }
         self.eat(&TokenKind::ColonColon);
         let mut name = self.advance().clone().text;
         // Handle operator(...) form.
@@ -1021,7 +1094,7 @@ impl<'a> Parser<'a> {
             interface: None,
             binding,
             bindings,
-            attrs: Vec::new(),
+            attrs: proc_attrs,
             is_generic: true,
         })
     }

@@ -93,6 +93,13 @@ struct Ctx<'a> {
     /// Array names declared in each scope with allocatable/pointer storage.
     allocatable_array_targets: HashSet<(ScopeId, String)>,
     lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
+    /// Stack of associate-name frames. Each frame is the lowercase set of
+    /// associate-names introduced by an enclosing ASSOCIATE construct. Names
+    /// in any active frame shadow same-named USE-imported or host-scope
+    /// symbols for purposes of validation (an associate-name aliases its
+    /// selector, so parameter/intent attributes of a USE-imported symbol
+    /// with the same name don't apply inside the body).
+    associate_frames: Vec<HashSet<String>>,
     warn_pedantic: bool,
     warn_deprecated: bool,
 }
@@ -116,6 +123,7 @@ impl<'a> Ctx<'a> {
             type_layouts: None,
             allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
+            associate_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
         }
@@ -143,6 +151,17 @@ impl<'a> Ctx<'a> {
                 );
             }
         }
+    }
+
+    /// True if `name` is currently bound by an enclosing ASSOCIATE
+    /// construct. Associate-names alias their selector and shadow any
+    /// USE-imported or host-scope symbol with the same name within the
+    /// construct body.
+    fn is_associate_name(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        self.associate_frames
+            .iter()
+            .any(|frame| frame.contains(&key))
     }
 
     /// Look up a symbol in the current validation scope.
@@ -631,6 +650,10 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             selector: condition,
             ..
         }
+        | Stmt::SelectRank {
+            selector: condition,
+            ..
+        }
         | Stmt::ComputedGoto {
             selector: condition,
             ..
@@ -835,6 +858,15 @@ fn find_scope_for_unit(
                 Some(name.clone()),
             )
         }
+        ProgramUnit::Submodule { name, .. } => {
+            let n = name.clone();
+            (
+                Box::new(
+                    move |k| matches!(k, ScopeKind::Submodule(ref m) if m.eq_ignore_ascii_case(&n)),
+                ),
+                Some(name.clone()),
+            )
+        }
         ProgramUnit::Subroutine { name, .. } => {
             let n = name.clone();
             (
@@ -952,8 +984,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            if ctx.in_elemental {
+            let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
+            // F2008 §12.6.2.2: ELEMENTAL implies PURE unless IMPURE
+            // is also given.  `impure elemental function f(...)` is
+            // explicitly allowed to call non-pure callees.
+            if ctx.in_elemental && !is_impure {
                 ctx.in_pure = true;
+            }
+            if is_impure {
+                ctx.in_pure = false;
             }
 
             if ctx.in_elemental {
@@ -1013,8 +1052,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             let saved_elemental = ctx.in_elemental;
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
-            if ctx.in_elemental {
+            let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
+            // F2008 §12.6.2.2: see comment above for Subroutine.
+            if ctx.in_elemental && !is_impure {
                 ctx.in_pure = true;
+            }
+            if is_impure {
+                ctx.in_pure = false;
             }
 
             if ctx.in_elemental {
@@ -1337,14 +1381,13 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
         }
 
-        // ---- STOP in pure ----
+        // ---- STOP / ERROR STOP in pure ----
+        // F2018 §11.4 forbids STOP in pure procedures; F2023 §11.4 explicitly
+        // permits ERROR STOP in pure procedures, which stdlib relies on.
         Stmt::Stop { .. } if ctx.in_pure => {
             ctx.error(stmt.span, "STOP not allowed in pure procedure");
         }
         Stmt::ErrorStop { .. } => {
-            if ctx.in_pure {
-                ctx.error(stmt.span, "ERROR STOP not allowed in pure procedure");
-            }
             ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
         }
 
@@ -1606,6 +1649,13 @@ fn validate_select_case_arms(ctx: &mut Ctx<'_>, stmt_span: Span, cases: &[CaseBl
 /// variable's intent/parameter status applies to all parts.
 fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedExpr, span: Span) {
     if let Some(name) = extract_base_name(target) {
+        // F2018 §11.1.3.3: an associate-name aliases its selector and
+        // shadows any same-named outer symbol inside the construct body.
+        // The selector's writability — not the outer symbol's parameter
+        // or intent — governs whether the assignment is legal.
+        if ctx.is_associate_name(&name) {
+            return;
+        }
         let (is_intent_in, is_parameter, is_pointer) = ctx
             .lookup(&name)
             .map(|sym| {
@@ -2295,7 +2345,19 @@ fn validate_associate(
             ctx.error(span, "ASSOCIATE name cannot be empty");
         }
     }
+    let frame: HashSet<String> = assocs
+        .iter()
+        .filter_map(|(n, _)| {
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.to_lowercase())
+            }
+        })
+        .collect();
+    ctx.associate_frames.push(frame);
     validate_stmts(ctx, body);
+    ctx.associate_frames.pop();
 }
 
 /// Extract the base variable name from an expression (handling subscripts and components).
@@ -2821,6 +2883,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
     matches!(
         name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
+        "hypot" | "anint" | "dnint" | "aint" | "dint" | "norm2" |
         "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" |
         "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
@@ -2831,14 +2894,18 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "kind" | "selected_int_kind" | "selected_real_kind" |
         "size" | "shape" | "lbound" | "ubound" | "allocated" | "associated" |
         "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
-        "sum" | "product" | "maxval" | "minval" | "count" | "any" | "all" |
+        "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
+        "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "matmul" | "dot_product" | "transpose" |
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
-        "maxexponent" | "minexponent" | "digits" | "bit_size" |
+        "maxexponent" | "minexponent" | "digits" | "bit_size" | "storage_size" |
         "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
         "gamma" | "log_gamma" | "erf" | "erfc" |
         "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
-        "ishft" | "ishftc" | "mvbits" | "transfer" |
+        "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta" |
+        "popcnt" | "poppar" | "leadz" | "trailz" |
+        "mvbits" | "transfer" | "bge" | "bgt" | "ble" | "blt" |
+        "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" |
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
