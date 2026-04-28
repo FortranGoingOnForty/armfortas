@@ -14110,9 +14110,17 @@ fn generic_dispatch_probe_value(
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> ValueId {
     if let Expr::FunctionCall { callee, args } = &expr.node {
-        if let Some(elem_ty) =
-            array_function_result_elem_type(b, locals, callee, args, st, type_layouts)
-        {
+        if let Some(elem_ty) = array_function_result_elem_type(
+            b,
+            locals,
+            callee,
+            args,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
             let zero = b.const_i64(0);
             return b.int_to_ptr(zero, elem_ty);
         }
@@ -14134,9 +14142,16 @@ fn generic_dispatch_probe_value(
         let zero = b.const_i64(0);
         return b.int_to_ptr(zero, elem_ty);
     }
-    if let Some((_desc, elem_ty)) =
-        lower_array_expr_descriptor(b, locals, expr, st, type_layouts, None, None, None)
-    {
+    if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
         let zero = b.const_i64(0);
         return b.int_to_ptr(zero, elem_ty);
     }
@@ -32171,6 +32186,9 @@ fn array_function_result_elem_type(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<IrType> {
     match &callee.node {
         Expr::Name { name } => {
@@ -32191,9 +32209,9 @@ fn array_function_result_elem_type(
                         e,
                         st,
                         type_layouts,
-                        None,
-                        None,
-                        None,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
                     ),
                     _ => b.const_i32(0),
                 })
@@ -32297,7 +32315,17 @@ fn lower_array_function_result_descriptor(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
-    let elem_ty = array_function_result_elem_type(b, locals, callee, args, st, type_layouts)?;
+    let elem_ty = array_function_result_elem_type(
+        b,
+        locals,
+        callee,
+        args,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
     let desc = lower_expr_full(
         b,
         locals,
@@ -32384,6 +32412,9 @@ fn resolved_named_callee_is_elemental(
     args: &[crate::ast::expr::Argument],
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> bool {
     let actual_vals: Vec<ValueId> = args
         .iter()
@@ -32394,9 +32425,9 @@ fn resolved_named_callee_is_elemental(
                 expr,
                 st,
                 type_layouts,
-                None,
-                None,
-                None,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
             ),
             _ => b.const_i32(0),
         })
@@ -32706,7 +32737,17 @@ fn lower_rank1_elemental_call_descriptor(
     let Expr::Name { name } = &callee.node else {
         return None;
     };
-    if !resolved_named_callee_is_elemental(b, locals, name, args, st, type_layouts) {
+    if !resolved_named_callee_is_elemental(
+        b,
+        locals,
+        name,
+        args,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
         return None;
     }
 
