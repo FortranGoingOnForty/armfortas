@@ -356,17 +356,20 @@ pub fn lower_file(
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
     let ambiguous_use_warnings: AmbiguousUseWarnings = Rc::new(RefCell::new(HashSet::new()));
 
-    // Pass 1: collect module-level variables.  Submodule decls are
-    // installed under their parent module's name so the submodule's
-    // contained procedures can resolve them through the same global
-    // lookup the parent uses.
+    // Pass 1: collect module-level variables. Submodules get their own
+    // mangling prefix (the submodule's name), not the parent's — F2018
+    // §11.2.3 says submodule-local entities are private to that submodule
+    // and must not collide across siblings of the same parent. Two
+    // submodules of the same parent can declare unrelated parameters
+    // with the same identifier; mangling under `parent` would emit
+    // duplicate global symbols.
     for unit in units {
         match &unit.node {
             ProgramUnit::Module { name, decls, .. } => {
                 collect_module_globals(&mut module, &mut globals, name, decls, st, type_layouts);
             }
-            ProgramUnit::Submodule { parent, decls, .. } => {
-                collect_module_globals(&mut module, &mut globals, parent, decls, st, type_layouts);
+            ProgramUnit::Submodule { name, decls, .. } => {
+                collect_module_globals(&mut module, &mut globals, name, decls, st, type_layouts);
             }
             _ => {}
         }
