@@ -2780,7 +2780,7 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
         ptr::null_mut(),
     );
     let res = unsafe { &mut *result };
-    let rp = res.base_addr as *mut u8;
+    let rp = res.base_addr;
 
     for i in 0..m {
         for j in 0..n {
@@ -2815,7 +2815,7 @@ pub extern "C" fn afs_array_conjg(
     let lane = elem_size / 2;
     let total = src.total_elements() as usize;
     let sp = src.base_addr as *const u8;
-    let rp = res.base_addr as *mut u8;
+    let rp = res.base_addr;
     if elem_size == 8 {
         // complex(sp): two f32 lanes per element
         for i in 0..total {
@@ -2882,7 +2882,7 @@ pub extern "C" fn afs_array_aimag(
     let res = unsafe { &mut *result };
     let total = src.total_elements() as usize;
     let sp_buf = src.base_addr as *const u8;
-    let rp_buf = res.base_addr as *mut u8;
+    let rp_buf = res.base_addr;
     if elem_size == 8 {
         for i in 0..total {
             unsafe {
@@ -2931,7 +2931,7 @@ pub extern "C" fn afs_array_abs_complex(
     let res = unsafe { &mut *result };
     let total = src.total_elements() as usize;
     let sp_buf = src.base_addr as *const u8;
-    let rp_buf = res.base_addr as *mut u8;
+    let rp_buf = res.base_addr;
     if elem_size == 8 {
         for i in 0..total {
             unsafe {
@@ -3020,7 +3020,7 @@ pub extern "C" fn afs_array_pack(
 
     let res = unsafe { &mut *result };
     let sp = src.base_addr as *const u8;
-    let rp = res.base_addr as *mut u8;
+    let rp = res.base_addr;
 
     // Second pass: emit masked-true source elements into result.
     let mut out_idx: usize = 0;
@@ -3104,8 +3104,8 @@ pub extern "C" fn afs_array_reshape(
     let shape_buf = shp.base_addr as *const u8;
     let shape_elem = shp.elem_size.max(1) as usize;
     let mut extents: [i64; MAX_RANK] = [0; MAX_RANK];
-    for i in 0..rank {
-        extents[i] = read_int_at(shape_buf, i, shape_elem).max(0);
+    for (i, slot) in extents.iter_mut().enumerate().take(rank) {
+        *slot = read_int_at(shape_buf, i, shape_elem).max(0);
     }
 
     // Build dim descriptors and allocate result.
@@ -3143,9 +3143,9 @@ pub extern "C" fn afs_array_reshape(
         let ord_buf = ord.base_addr as *const u8;
         let ord_elem = ord.elem_size.max(1) as usize;
         let ord_count = ord.total_elements() as usize;
-        for i in 0..rank.min(ord_count) {
+        for (i, slot) in order_perm.iter_mut().enumerate().take(rank.min(ord_count)) {
             // Convert from 1-based Fortran to 0-based.
-            order_perm[i] = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
+            *slot = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
         }
     } else {
         for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
@@ -3162,7 +3162,7 @@ pub extern "C" fn afs_array_reshape(
     };
 
     let sp = src.base_addr as *const u8;
-    let rp = res.base_addr as *mut u8;
+    let rp = res.base_addr;
 
     // Linear iteration over the result in element order. For each
     // result linear index, compute the multi-dim subscript in the

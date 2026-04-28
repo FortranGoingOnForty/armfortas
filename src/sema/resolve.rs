@@ -2085,9 +2085,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     let mut entity_attrs = sym_attrs.clone();
                     let entity_array_spec = entity
                         .array_spec
-                        .as_ref()
-                        .map(|specs| specs.clone())
-                        .or_else(|| attr_dimension.map(|specs| specs.clone()))
+                        .clone()
+                        .or_else(|| attr_dimension.cloned())
                         .unwrap_or_default();
                     entity_attrs.array_spec = entity_array_spec;
                     if st.scope(st.current_scope()).symbols.contains_key(&key) {

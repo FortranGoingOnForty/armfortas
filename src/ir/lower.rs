@@ -17830,7 +17830,7 @@ fn allocate_runtime_shape_array_result(
     }
 
     let rank = specs.len() as u64;
-    let bounds_bytes = (rank * 24) as u64;
+    let bounds_bytes = rank * 24;
     let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bounds_bytes));
     let one64 = b.const_i64(1);
     for (i, (lo, hi)) in lowers.iter().zip(uppers.iter()).enumerate() {
@@ -20786,7 +20786,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
-                                    return;
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {
@@ -21116,16 +21115,15 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             &ctx.locals,
                                             ctx.st,
                                         )
-                                    {
-                                        if lower_dynamic_vector_subscript_assign(
+                                        && lower_dynamic_vector_subscript_assign(
                                             b,
                                             ctx,
                                             &info,
                                             idx_expr,
                                             value,
-                                        ) {
-                                            return;
-                                        }
+                                        )
+                                    {
+                                        return;
                                     }
                                 }
                             }
@@ -21649,7 +21647,6 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
-                                    return;
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
@@ -30156,7 +30153,7 @@ fn materialize_scalar_element_descriptor_from_info(
 }
 
 fn expr_needs_static_scalar_descriptor_view(
-    expr: &crate::ast::expr::SpannedExpr,
+    _expr: &crate::ast::expr::SpannedExpr,
     info: &LocalInfo,
     _locals: &HashMap<String, LocalInfo>,
     _st: &SymbolTable,
@@ -30816,9 +30813,9 @@ fn expr_contains_whole_array_intrinsic(expr: &crate::ast::expr::SpannedExpr) -> 
                     expr_contains_whole_array_intrinsic(e)
                 }
                 crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
-                    start.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
-                        || end.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
-                        || stride.as_ref().is_some_and(|e| expr_contains_whole_array_intrinsic(e))
+                    start.as_ref().is_some_and(expr_contains_whole_array_intrinsic)
+                        || end.as_ref().is_some_and(expr_contains_whole_array_intrinsic)
+                        || stride.as_ref().is_some_and(expr_contains_whole_array_intrinsic)
                 }
             })
         }
@@ -33920,7 +33917,7 @@ fn lower_array_expr_descriptor(
                                             String::new()
                                         },
                                     )
-                                    .map(|i| local_is_array_like(i))
+                                    .map(local_is_array_like)
                                     .unwrap_or(false)
                             {
                                 if let Some(desc) = lower_array_intrinsic(
@@ -34510,12 +34507,12 @@ fn lower_multi_d_section_assign(
         let mut src_rem = b.load(i_addr);
         let mut src_off = b.const_i64(0);
         let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty));
-        for k in 0..n_dims {
+        for (k, &ext) in extents.iter().enumerate().take(n_dims) {
             let src_dim_off = 24 + (k as i64) * 24;
             let src_stride = load_array_desc_i64_field(b, *sd, src_dim_off + 16);
             let coord = if k + 1 < n_dims {
-                let c = b.imod(src_rem, extents[k]);
-                src_rem = b.idiv(src_rem, extents[k]);
+                let c = b.imod(src_rem, ext);
+                src_rem = b.idiv(src_rem, ext);
                 c
             } else {
                 src_rem
@@ -42532,7 +42529,7 @@ fn lower_transfer_intrinsic(
                 internal_funcs, contained_host_refs, descriptor_params,
             );
             let elem_ty = b.func().value_type(elem_val).unwrap_or(IrType::Int(IntWidth::I32));
-            let elem_size = ir_scalar_byte_size(&elem_ty) as i64;
+            let elem_size = ir_scalar_byte_size(&elem_ty);
             let off_val = b.const_i64(byte_off);
             let dst = b.gep(buf, vec![off_val], IrType::Int(IntWidth::I8));
             b.store(elem_val, dst);
