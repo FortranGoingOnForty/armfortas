@@ -43013,9 +43013,15 @@ fn lower_transfer_intrinsic(
         return None;
     };
 
-    // Determine the mold's IR type from its semantic type.
+    // Determine the mold's IR type from its semantic type. The
+    // value-context lowering only handles the scalar shape — array
+    // shape (when SIZE > 1) is taken care of by
+    // `try_lower_transfer_into_array` at the array-assign site. If a
+    // size>1 transfer reaches this path, fall through to the general
+    // call lowering so we don't return a scalar that the caller will
+    // mishandle.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
-    let scalar_mold_ty = match &mold_ti {
+    let mold_ty = match &mold_ti {
         crate::sema::symtab::TypeInfo::Integer { kind } => {
             IrType::int_from_kind(kind.unwrap_or(4))
         }
@@ -43028,27 +43034,10 @@ fn lower_transfer_intrinsic(
         _ => return None,
     };
 
-    // F2018 §16.9.193: TRANSFER(SOURCE, MOLD [, SIZE]). When SIZE is
-    // present (and a constant > 1), the result is a rank-1 array of
-    // SIZE elements of MOLD's type. Detect that here so we can size
-    // the temp buffer accordingly. For SIZE>1 the result type is
-    // Array<scalar_mold_ty, size>, otherwise scalar mold type.
-    let size_const = args
-        .get(2)
-        .and_then(|a| match &a.value {
-            SectionSubscript::Element(e) => eval_const_int(e),
-            _ => None,
-        })
-        .filter(|n| *n >= 1);
-    let mold_ty = match size_const {
-        Some(n) if n > 1 => IrType::Array(Box::new(scalar_mold_ty.clone()), n as u64),
-        _ => scalar_mold_ty.clone(),
-    };
-
     // Materialize a temp wide enough to hold the mold and the source.
-    // For SIZE>1 the temp covers all elements; otherwise just the
-    // single mold-sized chunk. We zero-init so any tail bytes (when
-    // source < mold_bytes) are deterministic per F2018 §16.9.193.
+    // Using mold size is sufficient when source ≥ mold (only mold-sized
+    // bytes are read). For source < mold, F2018 says undefined trailing
+    // bits — we zero-init for safety.
     let buf_bytes = ir_scalar_byte_size(&mold_ty);
     let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), buf_bytes as u64);
     let buf = b.alloca(buf_ty);
