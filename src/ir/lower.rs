@@ -6036,6 +6036,91 @@ fn eval_const_scalar(
                             None
                         }
                     }
+                    // Pure real-valued math intrinsics. F2018 §16.9 allows
+                    // these in initialization expressions for PARAMETERs;
+                    // without folding here the const ends up at runtime-zero
+                    // because there is no module-level evaluator emitting
+                    // the value into storage for non-trivial initializers.
+                    "sqrt" | "dsqrt"
+                    | "exp" | "dexp"
+                    | "log" | "dlog"
+                    | "log10" | "dlog10"
+                    | "sin" | "dsin"
+                    | "cos" | "dcos"
+                    | "tan" | "dtan"
+                    | "asin" | "dasin"
+                    | "acos" | "dacos"
+                    | "atan" | "datan"
+                    | "sinh" | "dsinh"
+                    | "cosh" | "dcosh"
+                    | "tanh" | "dtanh" => {
+                        let v = first_arg?.to_float();
+                        let r = match key.as_str() {
+                            "sqrt" | "dsqrt" => v.sqrt(),
+                            "exp" | "dexp" => v.exp(),
+                            "log" | "dlog" => v.ln(),
+                            "log10" | "dlog10" => v.log10(),
+                            "sin" | "dsin" => v.sin(),
+                            "cos" | "dcos" => v.cos(),
+                            "tan" | "dtan" => v.tan(),
+                            "asin" | "dasin" => v.asin(),
+                            "acos" | "dacos" => v.acos(),
+                            "atan" | "datan" => v.atan(),
+                            "sinh" | "dsinh" => v.sinh(),
+                            "cosh" | "dcosh" => v.cosh(),
+                            "tanh" | "dtanh" => v.tanh(),
+                            _ => return None,
+                        };
+                        Some(ConstScalar::Float(r))
+                    }
+                    "atan2" | "datan2" => {
+                        let y = first_arg?.to_float();
+                        let x = args.get(1).and_then(|a| {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                eval_const_scalar(e, param_consts).map(|c| c.to_float())
+                            } else {
+                                None
+                            }
+                        })?;
+                        Some(ConstScalar::Float(y.atan2(x)))
+                    }
+                    "abs" | "dabs" => match first_arg? {
+                        ConstScalar::Float(f) => Some(ConstScalar::Float(f.abs())),
+                        ConstScalar::Int(i) => Some(ConstScalar::Int(i.abs())),
+                    },
+                    "real" | "dble" | "dfloat" | "float" => {
+                        // Drop the optional kind arg; just normalize numeric
+                        // operand to a float for further folding.
+                        Some(ConstScalar::Float(first_arg?.to_float()))
+                    }
+                    "max" | "min" => {
+                        // Variadic — fold as long as every arg folds.
+                        let mut acc: Option<ConstScalar> = None;
+                        for a in args {
+                            let crate::ast::expr::SectionSubscript::Element(e) = &a.value else {
+                                return None;
+                            };
+                            let v = eval_const_scalar(e, param_consts)?;
+                            acc = Some(match (acc, v) {
+                                (None, v) => v,
+                                (Some(ConstScalar::Float(af)), v) => {
+                                    let bf = v.to_float();
+                                    let r = if key == "max" { af.max(bf) } else { af.min(bf) };
+                                    ConstScalar::Float(r)
+                                }
+                                (Some(ConstScalar::Int(ai)), ConstScalar::Int(bi)) => {
+                                    let r = if key == "max" { ai.max(bi) } else { ai.min(bi) };
+                                    ConstScalar::Int(r)
+                                }
+                                (Some(ConstScalar::Int(ai)), ConstScalar::Float(bf)) => {
+                                    let af = ai as f64;
+                                    let r = if key == "max" { af.max(bf) } else { af.min(bf) };
+                                    ConstScalar::Float(r)
+                                }
+                            });
+                        }
+                        acc
+                    }
                     _ => None,
                 }
             } else {
