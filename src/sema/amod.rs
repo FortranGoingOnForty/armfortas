@@ -696,6 +696,14 @@ fn emit_procedure(
                 if arg_sym.attrs.external {
                     arg_attrs.push("external");
                 }
+                let proc_iface_attr = arg_sym
+                    .attrs
+                    .procedure_iface
+                    .as_ref()
+                    .map(|n| format!("procedure({})", n));
+                if let Some(s) = proc_iface_attr.as_ref() {
+                    arg_attrs.push(s.as_str());
+                }
                 // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
                 // synthesis on the consumer side can rebuild a same-rank
                 // array_spec without re-walking the AST decls (which only
@@ -1022,6 +1030,12 @@ pub struct AmodArg {
     /// binding (the .amod writer normalizes the type to the interface's
     /// return type).
     pub external: bool,
+    /// For procedure dummy args (`procedure(iface) :: name`), the
+    /// interface name. Without this the consumer side can't resolve
+    /// the dummy to its abstract interface and falls back to emitting
+    /// the dummy name as an external symbol — see the SGGES3 / selctg
+    /// failure in stdlib_lapack_eigv_gen.
+    pub procedure_iface: Option<String>,
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
@@ -1435,6 +1449,11 @@ fn parse_arg(line: &str) -> AmodArg {
         .find_map(|tok| tok.strip_prefix("rank="))
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(0);
+    let procedure_iface = attr_str.split(", ").find_map(|tok| {
+        let t = tok.trim();
+        let inner = t.strip_prefix("procedure(")?;
+        inner.strip_suffix(')').map(|s| s.trim().to_string())
+    });
 
     AmodArg {
         name,
@@ -1447,6 +1466,7 @@ fn parse_arg(line: &str) -> AmodArg {
         pointer,
         hidden,
         external,
+        procedure_iface,
         rank,
     }
 }
