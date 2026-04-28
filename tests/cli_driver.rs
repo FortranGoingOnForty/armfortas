@@ -10559,6 +10559,52 @@ fn any_on_vector_subscripted_char_array_compare_runs() {
 }
 
 #[test]
+fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
+    // Companion to runtime_shape_array_function_result_auto_allocates_on_entry,
+    // exercising the rank-1 caller path. Previously the alloc_return assignment
+    // path passed the destination buffer (`integer :: r(5)` → `[i32 x 5]`)
+    // straight to the callee as the sret slot. The callee, expecting a
+    // 384-byte descriptor, then either left it untouched (silent garbage)
+    // or — once we taught the prologue to auto-allocate — wrote dims onto
+    // the caller's stack and corrupted neighboring locals. Now the caller
+    // alloca's a real descriptor temp, calls into it, memcpy's the result
+    // bytes back, and deallocates the heap result.
+    let src = write_program(
+        "module mm\ncontains\n  function makeit(n) result(res)\n    integer, intent(in) :: n\n    integer :: res(n)\n    integer :: i\n    do i = 1, n; res(i) = i*10; end do\n  end function\nend module\n\nprogram t\n  use mm\n  implicit none\n  integer :: r(5)\n  r = makeit(5)\n  if (sum(r) /= 150) error stop 1\n  if (r(1) /= 10) error stop 2\n  if (r(5) /= 50) error stop 3\n  print *, sum(r)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank1_runtime_shape_into_fixed_dest", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank1 runtime-shape compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank1 runtime-shape result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank1 runtime-shape run failed");
+    assert!(
+        run.status.success(),
+        "rank1 runtime-shape result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("150"),
+        "expected makeit sum 150, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn runtime_shape_array_function_result_auto_allocates_on_entry() {
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with bounds depending on dummies (e.g.
