@@ -10768,6 +10768,48 @@ fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
 }
 
 #[test]
+fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
+    // F2018 §7.8: array-constructor element values for complex(dp)
+    // are 16-byte aggregates (`[f64 x 2]`). The constructor lowering
+    // used `b.store(coerced, p)` after coercing the cmplx() pointer
+    // to an Array(F64,2) value, which only emitted a single 8-byte
+    // scalar store — the imaginary half was never overwritten and
+    // the destination kept whatever bytes were in that slot.
+    // complex(sp) accidentally worked because elem_size==8 matches
+    // the scalar store width. Now elem_ty=Array(F,2) takes a
+    // memcpy path covering both lanes.
+    let src = write_program(
+        "program t\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  integer, parameter :: sp = kind(1.0)\n  complex(dp) :: b(3)\n  complex(sp) :: a(3)\n  ! Pre-fill with sentinel imag values to prove the constructor\n  ! actually overwrites them rather than relying on prior content.\n  b = [(cmplx(0.0_dp, 999.0_dp, kind=dp)), (cmplx(0.0_dp, 999.0_dp, kind=dp)), (cmplx(0.0_dp, 999.0_dp, kind=dp))]\n  b = [cmplx(3.0_dp,4.0_dp,kind=dp), cmplx(1.0_dp,1.0_dp,kind=dp), cmplx(5.0_dp,12.0_dp,kind=dp)]\n  if (abs(real(b(1),kind=dp) - 3.0_dp) > 1.0e-12_dp) error stop 11\n  if (abs(aimag(b(1)) - 4.0_dp)        > 1.0e-12_dp) error stop 12\n  if (abs(real(b(2),kind=dp) - 1.0_dp) > 1.0e-12_dp) error stop 21\n  if (abs(aimag(b(2)) - 1.0_dp)        > 1.0e-12_dp) error stop 22\n  if (abs(real(b(3),kind=dp) - 5.0_dp) > 1.0e-12_dp) error stop 31\n  if (abs(aimag(b(3)) - 12.0_dp)       > 1.0e-12_dp) error stop 32\n  ! sp arm continues to work\n  a = [cmplx(3.0_sp,4.0_sp,kind=sp), cmplx(1.0_sp,1.0_sp,kind=sp), cmplx(5.0_sp,12.0_sp,kind=sp)]\n  if (abs(real(a(3)) - 5.0_sp) > 1.0e-5_sp) error stop 41\n  if (abs(aimag(a(3)) - 12.0_sp) > 1.0e-5_sp) error stop 42\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_dp_ac", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex(dp) AC compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex(dp) AC should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex(dp) AC run failed");
+    assert!(
+        run.status.success(),
+        "complex(dp) AC should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
     // F2018 §16.9.231 (SUM), §16.9.196 (PRODUCT), §16.9.146 (MAXVAL),
     // §16.9.151 (MINVAL): MASK selects which elements participate.
