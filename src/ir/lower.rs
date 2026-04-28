@@ -20819,7 +20819,33 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         // call element-wise.
                                         let callee_is_elemental_array_intrinsic =
                                             if let Expr::Name { name: cname } = &callee.node {
-                                                is_elemental_math_intrinsic(cname)
+                                                let lname = cname.to_lowercase();
+                                                let direct_elemental =
+                                                    is_elemental_math_intrinsic(cname)
+                                                        || ctx.elemental_funcs.contains(&lname)
+                                                        || ctx
+                                                            .st
+                                                            .find_symbol_any_scope(&lname)
+                                                            .is_some_and(|s| s.attrs.elemental);
+                                                let generic_specifics_elemental = !direct_elemental
+                                                    && named_interface_specifics(ctx.st, &lname)
+                                                        .map(|specs| {
+                                                            !specs.is_empty()
+                                                                && specs.iter().all(|s| {
+                                                                    ctx.elemental_funcs
+                                                                        .contains(&s.to_lowercase())
+                                                                        || ctx
+                                                                            .st
+                                                                            .find_symbol_any_scope(s)
+                                                                            .is_some_and(|sym| {
+                                                                                sym.attrs.elemental
+                                                                            })
+                                                                })
+                                                        })
+                                                        .unwrap_or(false);
+                                                let is_elemental = direct_elemental
+                                                    || generic_specifics_elemental;
+                                                is_elemental
                                                     && call_args.iter().any(|arg| {
                                                         matches!(
                                                             &arg.value,
@@ -20918,17 +20944,40 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                     );
                                                 }
                                             } else {
-                                                // Non-sret: function returns a temp descriptor.
+                                                // Function returns a temp descriptor. Mirror
+                                                // the alloc_return path: when dest is a real
+                                                // descriptor, route through afs_assign_allocatable;
+                                                // when dest is a fixed-shape buffer, memcpy the
+                                                // result bytes in.
                                                 let src_desc = lower_expr_ctx_tl(b, ctx, value);
-                                                let dest_desc = array_descriptor_addr(b, &info);
-                                                b.call(
-                                                    FuncRef::External(
-                                                        "afs_assign_allocatable".into(),
-                                                    ),
-                                                    vec![dest_desc, src_desc],
-                                                    IrType::Void,
-                                                );
+                                                if local_uses_array_descriptor(&info) {
+                                                    let dest_desc = array_descriptor_addr(b, &info);
+                                                    b.call(
+                                                        FuncRef::External(
+                                                            "afs_assign_allocatable".into(),
+                                                        ),
+                                                        vec![dest_desc, src_desc],
+                                                        IrType::Void,
+                                                    );
+                                                } else {
+                                                    let n = array_total_elems_value(b, &info);
+                                                    let elem_bytes = b.const_i64(
+                                                        ir_scalar_byte_size(&info.ty),
+                                                    );
+                                                    let byte_count = b.imul(n, elem_bytes);
+                                                    let src_base = b.load_typed(
+                                                        src_desc,
+                                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                    );
+                                                    b.call(
+                                                        FuncRef::External("memcpy".into()),
+                                                        vec![info.addr, src_base, byte_count],
+                                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                    );
+                                                }
                                                 let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                                let zero32 = b.const_i32(0);
+                                                b.store(zero32, stat);
                                                 b.call(
                                                     FuncRef::External(
                                                         "afs_deallocate_array".into(),
@@ -20938,15 +20987,34 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                 );
                                             }
                                         } else {
-                                            // Indirect callee: fall back to assign path.
+                                            // Indirect callee: same dest split as above.
                                             let src_desc = lower_expr_ctx_tl(b, ctx, value);
-                                            let dest_desc = array_descriptor_addr(b, &info);
-                                            b.call(
-                                                FuncRef::External("afs_assign_allocatable".into()),
-                                                vec![dest_desc, src_desc],
-                                                IrType::Void,
-                                            );
+                                            if local_uses_array_descriptor(&info) {
+                                                let dest_desc = array_descriptor_addr(b, &info);
+                                                b.call(
+                                                    FuncRef::External("afs_assign_allocatable".into()),
+                                                    vec![dest_desc, src_desc],
+                                                    IrType::Void,
+                                                );
+                                            } else {
+                                                let n = array_total_elems_value(b, &info);
+                                                let elem_bytes = b.const_i64(
+                                                    ir_scalar_byte_size(&info.ty),
+                                                );
+                                                let byte_count = b.imul(n, elem_bytes);
+                                                let src_base = b.load_typed(
+                                                    src_desc,
+                                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                );
+                                                b.call(
+                                                    FuncRef::External("memcpy".into()),
+                                                    vec![info.addr, src_base, byte_count],
+                                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                                );
+                                            }
                                             let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                            let zero32 = b.const_i32(0);
+                                            b.store(zero32, stat);
                                             b.call(
                                                 FuncRef::External("afs_deallocate_array".into()),
                                                 vec![src_desc, stat],
