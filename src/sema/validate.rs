@@ -2898,7 +2898,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "matmul" | "dot_product" | "transpose" |
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
-        "maxexponent" | "minexponent" | "digits" | "bit_size" |
+        "maxexponent" | "minexponent" | "digits" | "bit_size" | "storage_size" |
         "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
         "gamma" | "log_gamma" | "erf" | "erfc" |
         "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
