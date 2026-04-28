@@ -10810,6 +10810,49 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
+    // F2018 §16.9.193: TRANSFER(SRC, MOLD, SIZE) returns a rank-1
+    // array of SIZE mold-typed elements, byte-equal to the SRC bytes.
+    // Previously `vx16 = transfer(vx32, 0_int16, 2)` lowered the RHS
+    // as a scalar Int(I16) (size arg silently dropped), and the array
+    // assign path then mis-handled the aggregate produced by a
+    // size-aware return type — load-from-non-pointer trip in IR
+    // verify. Fix routes the assignment through a TRANSFER-aware
+    // memcpy that copies `SIZE * sizeof(MOLD)` bytes from SRC into the
+    // destination's data buffer (zero-fill on short SRC). Expected on
+    // little-endian: vx32 = 0x12345678 → vx16(1)=0x5678, vx16(2)=0x1234.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int16, int32\n  implicit none\n  integer(int32) :: vx32 = int(z'12345678', int32)\n  integer(int16) :: vx16(2)\n  vx16 = transfer(vx32, 0_int16, 2)\n  if (vx16(1) /= int(z'5678', int16)) error stop 1\n  if (vx16(2) /= int(z'1234', int16)) error stop 2\n  ! Round-trip: array → scalar (no size arg, scalar mold)\n  block\n    integer(int32) :: rt\n    rt = transfer(vx16, 0_int32)\n    if (rt /= int(z'12345678', int32)) error stop 3\n  end block\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("transfer SIZE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "transfer SIZE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("transfer SIZE run failed");
+    assert!(
+        run.status.success(),
+        "transfer SIZE should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration() {
     // F2018 §7.8 implied-do array constructor with complex(dp) elements:
     // the inner-loop body in store_ac_implied_do had the same scalar-store
