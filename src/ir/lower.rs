@@ -27390,6 +27390,36 @@ fn store_ac_values_at_off(
                 let p = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
                 if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
                     emit_derived_value_copy(b, tl, type_name, p, raw);
+                } else if is_complex_ty(elem_ty) {
+                    // F2018 §7.8: complex elements are 8/16-byte aggregates.
+                    // `cmplx(re,im,kind=K)` returns a Ptr<[f32/f64 x 2]>;
+                    // a plain `b.store` of an Array value only emits a
+                    // single scalar store (8 bytes) and leaves the
+                    // imaginary half un-overwritten. Memcpy the whole
+                    // aggregate from its source buffer so both halves
+                    // land. complex(sp) happens to work without this
+                    // because elem_size==8 matches the scalar store width.
+                    let bytes = complex_byte_size(elem_ty);
+                    let sz = b.const_i64(bytes);
+                    let src_ptr = if matches!(
+                        b.func().value_type(raw),
+                        Some(IrType::Ptr(_))
+                    ) {
+                        raw
+                    } else {
+                        // Value-form complex (e.g. produced by an
+                        // arithmetic expression returning Array(F,2)).
+                        // Spill into a temp slot so memcpy has a source
+                        // address.
+                        let buf = b.alloca(elem_ty.clone());
+                        b.store(raw, buf);
+                        buf
+                    };
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![p, src_ptr, sz],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
                 } else {
                     let coerced = coerce_to_type(b, raw, elem_ty);
                     b.store(coerced, p);
