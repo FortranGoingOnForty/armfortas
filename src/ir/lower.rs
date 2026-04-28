@@ -10529,12 +10529,12 @@ fn lower_logical_reduction_intrinsic_ast(
             // Sema-side type peek so we don't speculatively run
             // `lower_array_expr_descriptor` (which has IR side effects
             // like allocas + runtime calls) against expressions whose
-            // element type we'd reject anyway. We only proceed when
-            // both sides have an Integer or Real Fortran type.
+            // element type we'd reject anyway. We accept Integer / Real
+            // / Unknown — Unknown shows up for generic-interface calls
+            // (e.g. stdlib `eye(4)`) where sema can't resolve the
+            // specific without dispatch but the descriptor lowering
+            // still can via `callee_hidden_result_abi`.
             use crate::sema::types::FortranType;
-            let is_int_or_real = |t: &FortranType| {
-                matches!(t, FortranType::Integer { .. } | FortranType::Real { .. })
-            };
             // Walk the expression tree to detect ArrayConstructor anywhere.
             // The existing scalarized comparison path (via
             // `unfold_array_ctor_binop` + `expand_vector_subscript_designator`)
@@ -10556,8 +10556,16 @@ fn lower_logical_reduction_intrinsic_ast(
             }
             let lt = crate::sema::types::expr_type(left, st);
             let rt = crate::sema::types::expr_type(right, st);
-            if !is_int_or_real(&lt)
-                || !is_int_or_real(&rt)
+            let acceptable_for_compare = |t: &FortranType| {
+                matches!(
+                    t,
+                    FortranType::Integer { .. }
+                        | FortranType::Real { .. }
+                        | FortranType::Unknown
+                )
+            };
+            if !acceptable_for_compare(&lt)
+                || !acceptable_for_compare(&rt)
                 || contains_array_constructor(left)
                 || contains_array_constructor(right)
             {
@@ -32823,8 +32831,11 @@ fn lower_rank1_array_unary_descriptor(
 }
 
 /// F2018 §10.1.5: relational ops over rank-1 array operands produce a
-/// rank-1 logical array of the same shape. Element type of the comparison
-/// is `operand_ty`; the result is a fresh Bool array descriptor.
+/// rank-1 logical array of the same shape. Each side is loaded with its
+/// own element type and promoted to a common compare type so mixed-kind
+/// comparisons (e.g. `eye_rsp(n) == diag_iint32(v)` from stdlib_linalg)
+/// produce semantically correct results instead of bitcasting one side's
+/// bytes through the other side's type.
 ///
 /// Either operand may be scalar (broadcast) or rank-1; at least one side
 /// must be array-shaped (caller has already verified). Used as a sub-path
@@ -32838,7 +32849,8 @@ fn lower_rank1_array_compare_descriptor(
     right: &crate::ast::expr::SpannedExpr,
     lhs_desc: Option<ValueId>,
     rhs_desc: Option<ValueId>,
-    operand_ty: &IrType,
+    lhs_elem_ty: &IrType,
+    rhs_elem_ty: &IrType,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     internal_funcs: Option<&HashMap<String, u32>>,
@@ -32846,6 +32858,22 @@ fn lower_rank1_array_compare_descriptor(
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
     let source_desc = lhs_desc.or(rhs_desc)?;
+    // F2018 §10.1.5.5.2: when operand kinds differ, promote both to a
+    // shared type. Float beats Int; among Floats / Ints, the wider kind
+    // wins. Bool is treated as the common-type fallback when both sides
+    // are bools.
+    let common_ty = match (lhs_elem_ty, rhs_elem_ty) {
+        (IrType::Float(a), IrType::Float(b)) => {
+            IrType::Float(if (*a as u8) >= (*b as u8) { *a } else { *b })
+        }
+        (IrType::Float(_), _) => lhs_elem_ty.clone(),
+        (_, IrType::Float(_)) => rhs_elem_ty.clone(),
+        (IrType::Int(a), IrType::Int(b)) => {
+            IrType::Int(if (*a as u8) >= (*b as u8) { *a } else { *b })
+        }
+        _ => lhs_elem_ty.clone(),
+    };
+    let operand_ty = &common_ty;
     let n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![source_desc],
@@ -32899,7 +32927,8 @@ fn lower_rank1_array_compare_descriptor(
     b.set_block(bb_body);
     let idx = b.load(i_addr);
     let lhs_val = if let Some(d) = lhs_desc {
-        load_rank1_array_desc_elem(b, d, operand_ty, idx)
+        let raw = load_rank1_array_desc_elem(b, d, lhs_elem_ty, idx);
+        coerce_to_type(b, raw, operand_ty)
     } else {
         let scalar = lower_expr_full(
             b, locals, left, st, type_layouts,
@@ -32908,7 +32937,8 @@ fn lower_rank1_array_compare_descriptor(
         coerce_to_type(b, scalar, operand_ty)
     };
     let rhs_val = if let Some(d) = rhs_desc {
-        load_rank1_array_desc_elem(b, d, operand_ty, idx)
+        let raw = load_rank1_array_desc_elem(b, d, rhs_elem_ty, idx);
+        coerce_to_type(b, raw, operand_ty)
     } else {
         let scalar = lower_expr_full(
             b, locals, right, st, type_layouts,
@@ -33021,9 +33051,31 @@ fn lower_rank1_numeric_array_binary_descriptor(
         use crate::sema::types::FortranType;
         let lt = crate::sema::types::expr_type(left, st);
         let rt = crate::sema::types::expr_type(right, st);
-        let is_numeric =
-            |t: &FortranType| matches!(t, FortranType::Integer { .. } | FortranType::Real { .. });
+        // Accept Unknown alongside Integer/Real — generic-interface
+        // function calls (e.g. `eye(4)` from stdlib_linalg) leave
+        // `expr_type` as Unknown, but the elem_ty already extracted
+        // from the descriptor lowering above is authoritative for
+        // the actual numeric kind.
+        let is_numeric = |t: &FortranType| {
+            matches!(
+                t,
+                FortranType::Integer { .. }
+                    | FortranType::Real { .. }
+                    | FortranType::Unknown
+            )
+        };
         if is_numeric(&lt) && is_numeric(&rt) {
+            // Each side may carry its own elem_ty (eye_rsp returns
+            // Float(Sp), diag_iint32 returns Int(I32)); pass both so
+            // the compare path can promote correctly.
+            let lhs_elem = lhs
+                .as_ref()
+                .map(|(_, t)| t.clone())
+                .unwrap_or_else(|| elem_ty.clone());
+            let rhs_elem = rhs
+                .as_ref()
+                .map(|(_, t)| t.clone())
+                .unwrap_or_else(|| elem_ty.clone());
             return lower_rank1_array_compare_descriptor(
                 b,
                 locals,
@@ -33032,7 +33084,8 @@ fn lower_rank1_numeric_array_binary_descriptor(
                 right,
                 lhs.as_ref().map(|(d, _)| *d),
                 rhs.as_ref().map(|(d, _)| *d),
-                &elem_ty,
+                &lhs_elem,
+                &rhs_elem,
                 st,
                 type_layouts,
                 internal_funcs,
