@@ -32887,6 +32887,70 @@ fn lower_array_expr_descriptor(
                         }
                     }
                 }
+                // F2018 §16.9.7 / §16.9.13: AIMAG over a complex array
+                // and ABS over a complex array. Both are elemental and
+                // produce a real array whose element width is HALF the
+                // complex element width. Without an explicit array path
+                // the elemental fallback emits external `_aimag` / `_abs`
+                // for whole-array calls, which the linker can't resolve
+                // (e.g. stdlib_linalg_eigenvalues:
+                // `any(aimag(c) > atol+rtol*abs(abs(c)))`).
+                if name.eq_ignore_ascii_case("aimag")
+                    || name.eq_ignore_ascii_case("dimag")
+                    || name.eq_ignore_ascii_case("abs")
+                {
+                    if let Some(first_arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
+                            &first_arg.value
+                        {
+                            if let Some((src_desc, elem_ty)) = lower_array_expr_descriptor(
+                                b,
+                                locals,
+                                first_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ) {
+                                let real_lane =
+                                    if let IrType::Array(inner, 2) = &elem_ty {
+                                        if let IrType::Float(fw) = inner.as_ref() {
+                                            Some(*fw)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                if let Some(fw) = real_lane {
+                                    let result_desc = b.alloca(IrType::Array(
+                                        Box::new(IrType::Int(IntWidth::I8)),
+                                        384,
+                                    ));
+                                    let zero = b.const_i32(0);
+                                    let sz384 = b.const_i64(384);
+                                    b.call(
+                                        FuncRef::External("memset".into()),
+                                        vec![result_desc, zero, sz384],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    let runtime = if name.eq_ignore_ascii_case("abs") {
+                                        "afs_array_abs_complex"
+                                    } else {
+                                        "afs_array_aimag"
+                                    };
+                                    b.call(
+                                        FuncRef::External(runtime.into()),
+                                        vec![src_desc, result_desc],
+                                        IrType::Void,
+                                    );
+                                    return Some((result_desc, IrType::Float(fw)));
+                                }
+                            }
+                        }
+                    }
+                }
                 // F2018 §16.9.207: SHAPE returns a fresh rank-1 integer
                 // array of the input's extents. Routes through
                 // lower_array_intrinsic which allocates and fills it,

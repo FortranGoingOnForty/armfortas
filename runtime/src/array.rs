@@ -2849,6 +2849,108 @@ pub extern "C" fn afs_array_conjg(
     }
 }
 
+/// AIMAG over a complex array: produce a real array of the same shape
+/// whose elements are the imaginary lanes of the source. Result has
+/// HALF the source elem_size (complex(sp) 8B → real(sp) 4B; complex(dp)
+/// 16B → real(dp) 8B), so we allocate fresh dims rather than using
+/// `afs_allocate_like`.
+#[no_mangle]
+pub extern "C" fn afs_array_aimag(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(src.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: src.dims[i].lower_bound,
+            upper_bound: src.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = src.total_elements() as usize;
+    let sp_buf = src.base_addr as *const u8;
+    let rp_buf = res.base_addr as *mut u8;
+    if elem_size == 8 {
+        for i in 0..total {
+            unsafe {
+                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
+                *(rp_buf.add(i * 4) as *mut f32) = im;
+            }
+        }
+    } else if elem_size == 16 {
+        for i in 0..total {
+            unsafe {
+                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
+                *(rp_buf.add(i * 8) as *mut f64) = im;
+            }
+        }
+    }
+}
+
+/// ABS over a complex array: produce a real array of the same shape
+/// whose elements are |z| = sqrt(re*re + im*im). Result has HALF the
+/// source elem_size; mirror the allocation strategy from `afs_array_aimag`.
+#[no_mangle]
+pub extern "C" fn afs_array_abs_complex(
+    source: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    if src.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let lane = elem_size / 2;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(src.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: src.dims[i].lower_bound,
+            upper_bound: src.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = src.total_elements() as usize;
+    let sp_buf = src.base_addr as *const u8;
+    let rp_buf = res.base_addr as *mut u8;
+    if elem_size == 8 {
+        for i in 0..total {
+            unsafe {
+                let re = *(sp_buf.add(i * 8) as *const f32);
+                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
+                *(rp_buf.add(i * 4) as *mut f32) = (re * re + im * im).sqrt();
+            }
+        }
+    } else if elem_size == 16 {
+        for i in 0..total {
+            unsafe {
+                let re = *(sp_buf.add(i * 16) as *const f64);
+                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
+                *(rp_buf.add(i * 8) as *mut f64) = (re * re + im * im).sqrt();
+            }
+        }
+    }
+}
+
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
 /// Respects strides for non-contiguous array sections.
 #[no_mangle]
