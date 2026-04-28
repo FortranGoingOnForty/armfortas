@@ -8745,6 +8745,14 @@ fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId
             FloatWidth::F32 => b.const_f32(0.0),
             FloatWidth::F64 => b.const_f64(0.0),
         },
+        // Ptr<Bool> → Bool: dereference the pointer. Stdlib's masked
+        // reductions (`stdlib_sum_1d_sp_mask` etc.) hit this when the
+        // mask actual is passed by reference but the inner expression
+        // expects a bool value. A typed load keeps the IR consistent
+        // and the runtime correct.
+        (IrType::Ptr(inner), IrType::Bool) if matches!(**inner, IrType::Bool) => {
+            b.load_typed(val, IrType::Bool)
+        }
         _ => {
             eprintln!(
                 "coerce_to_type: unhandled coercion {:?} → {:?}",
