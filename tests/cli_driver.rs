@@ -10559,6 +10559,52 @@ fn any_on_vector_subscripted_char_array_compare_runs() {
 }
 
 #[test]
+fn runtime_shape_array_function_result_auto_allocates_on_entry() {
+    // F2018 §15.5.2.4: a function whose result is an explicit-shape
+    // array with bounds depending on dummies (e.g.
+    // `integer :: res(size(v),size(v))`) must auto-allocate the
+    // result on procedure entry. Previously the caller-supplied
+    // descriptor stayed memset-zeroed, the body wrote `res(i,i) = ...`,
+    // and the first element write tripped a bounds check
+    // ("index 1 outside [1, 0]"). Reproduces stdlib `diag_iint32`,
+    // `eye_*`, and a host of other transformational helpers.
+    let src = write_program(
+        "module mm\ncontains\n  function diag_int(v) result(res)\n    integer, intent(in) :: v(:)\n    integer :: res(size(v), size(v))\n    integer :: i\n    res = 0\n    do i = 1, size(v); res(i,i) = v(i); end do\n  end function\nend module\n\nprogram t\n  use mm\n  implicit none\n  integer :: m(4,4)\n  m = diag_int([1, 2, 3, 4])\n  if (sum(m) /= 10) error stop 1\n  if (m(1,1) /= 1) error stop 2\n  if (m(4,4) /= 4) error stop 3\n  if (m(1,2) /= 0) error stop 4\n  print *, sum(m)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("runtime_shape_array_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime-shape array result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime-shape array result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime-shape array result run failed");
+    assert!(
+        run.status.success(),
+        "runtime-shape array result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("10"),
+        "expected diag sum 10, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
