@@ -2083,7 +2083,9 @@ pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
     acc.sqrt() as f32
 }
 
-/// SUM(array) — sum all elements (real(8) version).
+/// SUM(array) — sum all elements (real version).
+/// Dispatches on `elem_size` so real(4) and real(8) arrays both sum
+/// correctly. Returns f64 (callers downcast for real(4) destinations).
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
@@ -2096,10 +2098,17 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut sum = 0.0;
-    for i in 0..n {
-        sum += unsafe { *ptr.add(i * stride) };
+    let mut sum: f64 = 0.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            sum += unsafe { *ptr.add(i * stride) } as f64;
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            sum += unsafe { *ptr.add(i * stride) };
+        }
     }
     sum
 }
@@ -2148,7 +2157,8 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     sum
 }
 
-/// PRODUCT(array) — product of all elements (real(8) version).
+/// PRODUCT(array) — product of all elements (real version).
+/// Dispatches on `elem_size`; returns f64 for both real(4) and real(8).
 #[no_mangle]
 pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2160,10 +2170,17 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut prod = 1.0;
-    for i in 0..n {
-        prod *= unsafe { *ptr.add(i * stride) };
+    let mut prod: f64 = 1.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            prod *= unsafe { *ptr.add(i * stride) } as f64;
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            prod *= unsafe { *ptr.add(i * stride) };
+        }
     }
     prod
 }
@@ -2214,7 +2231,9 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     prod
 }
 
-/// MAXVAL(array) — maximum element (real(8) version). Respects strides.
+/// MAXVAL(array) — maximum element (real version). Dispatches on
+/// `elem_size`; returns f64 for both real(4) and real(8).
+/// Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2229,18 +2248,32 @@ pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
         return f64::NEG_INFINITY;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut max = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v > max {
-            max = v;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        let mut max = unsafe { *ptr } as f64;
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) } as f64;
+            if v > max {
+                max = v;
+            }
         }
+        max
+    } else {
+        let ptr = d.base_addr as *const f64;
+        let mut max = unsafe { *ptr };
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) };
+            if v > max {
+                max = v;
+            }
+        }
+        max
     }
-    max
 }
 
-/// MINVAL(array) — minimum element (real(8) version). Respects strides.
+/// MINVAL(array) — minimum element (real version). Dispatches on
+/// `elem_size`; returns f64 for both real(4) and real(8).
+/// Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2255,15 +2288,27 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
         return f64::INFINITY;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut min = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v < min {
-            min = v;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        let mut min = unsafe { *ptr } as f64;
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) } as f64;
+            if v < min {
+                min = v;
+            }
         }
+        min
+    } else {
+        let ptr = d.base_addr as *const f64;
+        let mut min = unsafe { *ptr };
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) };
+            if v < min {
+                min = v;
+            }
+        }
+        min
     }
-    min
 }
 
 /// MAXVAL(array) — maximum element (integer version).
