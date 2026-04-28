@@ -10768,6 +10768,45 @@ fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
 }
 
 #[test]
+fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
+    // F2018 §16.9.231 (SUM), §16.9.196 (PRODUCT), §16.9.146 (MAXVAL),
+    // §16.9.151 (MINVAL): MASK selects which elements participate.
+    // Previously `sum(a, mask=m)` lowered identically to `sum(a)` (mask
+    // arg was silently dropped) so reductions over masked arrays
+    // returned the unmasked total. Now sum/product/maxval/minval detect
+    // the `mask=` keyword and dispatch to the masked runtime entries.
+    let src = write_program(
+        "program t\n  implicit none\n  real(8) :: a(5) = [1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8]\n  integer :: ai(5) = [1, 2, 3, 4, 5]\n  logical :: m(5) = [.true., .false., .true., .false., .true.]\n  if (abs(sum(a, mask=m) - 9.0_8) > 1.0e-9_8) error stop 11\n  if (sum(ai, mask=m) /= 9) error stop 12\n  if (abs(product(a, mask=m) - 15.0_8) > 1.0e-9_8) error stop 21\n  if (product(ai, mask=m) /= 15) error stop 22\n  if (abs(maxval(a, mask=m) - 5.0_8) > 1.0e-9_8) error stop 31\n  if (maxval(ai, mask=m) /= 5) error stop 32\n  if (abs(minval(a, mask=m) - 1.0_8) > 1.0e-9_8) error stop 41\n  if (minval(ai, mask=m) /= 1) error stop 42\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("masked_reductions", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("masked reductions compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "masked reductions should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("masked reductions run failed");
+    assert!(
+        run.status.success(),
+        "masked reductions should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,
