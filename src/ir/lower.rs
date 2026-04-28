@@ -32,10 +32,21 @@ thread_local! {
     /// `init_decls`).
     static CURRENT_PROC_SCOPE: RefCell<Option<crate::sema::symtab::ScopeId>> =
         const { RefCell::new(None) };
+
+    /// For SMP body lowering: the submodule containing the body. The
+    /// procedure's link name lives under the parent module, but the
+    /// install_globals_as_locals path also needs the submodule so it
+    /// can pull in the submodule's locally-declared parameters
+    /// (mangled under the submodule name post-d770b77).
+    static SMP_EXTRA_HOST: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
     CURRENT_PROC_SCOPE.with(|c| *c.borrow())
+}
+
+fn current_smp_extra_host() -> Option<String> {
+    SMP_EXTRA_HOST.with(|c| c.borrow().clone())
 }
 
 /// RAII guard: install `scope` as the current procedure scope until
@@ -54,6 +65,22 @@ impl Drop for ProcScopeGuard {
     fn drop(&mut self) {
         let prev = self.0;
         CURRENT_PROC_SCOPE.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+struct SmpExtraHostGuard(Option<String>);
+
+impl SmpExtraHostGuard {
+    fn set(name: String) -> Self {
+        let prev = SMP_EXTRA_HOST.with(|c| c.replace(Some(name)));
+        SmpExtraHostGuard(prev)
+    }
+}
+
+impl Drop for SmpExtraHostGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        SMP_EXTRA_HOST.with(|c| *c.borrow_mut() = prev);
     }
 }
 
@@ -4975,17 +5002,35 @@ fn lower_unit(
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
             for sub in contains {
-                // Both regular submodule procedures and SMP (separate
-                // module procedure) bodies live inside the submodule
-                // scope; pass `submodule_name` as the host. The
-                // install_globals_as_locals helper walks the
-                // submodule's USE associations to additionally pull in
-                // the parent module's globals (F2018 §11.2.3 host
-                // association). Mangling submodule-local declarations
-                // under submodule_name (and looking them up the same
-                // way) keeps SMP bodies seeing both layers without
-                // having to special-case them here.
-                let host_module_name = submodule_name.as_str();
+                let sub_is_smp_body = match &sub.node {
+                    ProgramUnit::Function { prefix, .. }
+                    | ProgramUnit::Subroutine { prefix, .. } => prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
+                    _ => false,
+                };
+                // SMP bodies link under the parent module's name (per
+                // F2018 §11.2.3 — the implementation slot belongs to
+                // the parent's interface). Plain helpers contained in
+                // the submodule live in the submodule's own scope and
+                // link there. host_module drives the IR procedure link
+                // name AND the install_globals_as_locals lookup; for
+                // SMP bodies these two needs diverge — link name needs
+                // parent, but globals lookup also needs the containing
+                // submodule (since commit d770b77 mangles
+                // submodule-local globals under the submodule name).
+                // Stash that submodule via the extra_host thread-local
+                // so install_globals_as_locals_in can pick it up.
+                let host_module_name = if sub_is_smp_body {
+                    parent.as_str()
+                } else {
+                    submodule_name.as_str()
+                };
+                let _smp_extra_host_guard = if sub_is_smp_body {
+                    Some(SmpExtraHostGuard::set(submodule_name.clone()))
+                } else {
+                    None
+                };
                 lower_unit(
                     module,
                     sub,
@@ -6762,6 +6807,32 @@ fn install_globals_as_locals(
     st: &SymbolTable,
     ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
+    let extra = current_smp_extra_host();
+    install_globals_as_locals_in(
+        b,
+        locals,
+        globals,
+        uses,
+        required_names,
+        host_module,
+        extra.as_deref(),
+        st,
+        ambiguous_use_warnings,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_globals_as_locals_in(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+    required_names: Option<&HashSet<String>>,
+    host_module: Option<&str>,
+    extra_host: Option<&str>,
+    st: &SymbolTable,
+    ambiguous_use_warnings: &AmbiguousUseWarnings,
+) {
     use crate::ast::decl::OnlyItem;
 
     // Sorted per-use iteration so the emitted global_addr
@@ -6783,6 +6854,16 @@ fn install_globals_as_locals(
         // Walk the submodule's `is_submodule_access` USE entry to find
         // the parent module so its globals get imported here too.
         let mut host_chain: Vec<String> = vec![mod_key.clone()];
+        // SMP body extra: link name uses the parent module's prefix, but
+        // the body still needs to see its containing submodule's locals.
+        // Caller passes the submodule name as `extra_host` so we can pull
+        // those globals in alongside the parent's.
+        if let Some(extra) = extra_host {
+            let extra_lc = extra.to_lowercase();
+            if !host_chain.contains(&extra_lc) {
+                host_chain.push(extra_lc);
+            }
+        }
         if st.find_module_scope(&mod_key).is_none() {
             for scope in st.all_scopes() {
                 if let crate::sema::symtab::ScopeKind::Submodule(n) = &scope.kind {
