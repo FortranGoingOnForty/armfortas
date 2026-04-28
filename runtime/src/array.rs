@@ -2951,6 +2951,269 @@ pub extern "C" fn afs_array_abs_complex(
     }
 }
 
+/// F2018 §16.9.144 PACK(ARRAY, MASK [, VECTOR]).
+///
+/// Walks `source` and `mask` element-by-element (mask is interpreted
+/// element-wise, regardless of source rank, since shapes must conform
+/// per the standard). Each source element whose mask element is true
+/// is copied into a fresh rank-1 result descriptor.
+///
+/// `vector` is optional; when non-null, the result inherits its size
+/// (element count) and elements past the masked-true count are filled
+/// from `vector`. Otherwise the result size is the count of true
+/// values in the mask.
+///
+/// `mask` is a Fortran logical, stored as i32 in our descriptor: zero
+/// means false, anything else means true.
+///
+/// The element copy is byte-level via `elem_size` so this works for
+/// any non-derived element type (integer/real/complex/logical/character
+/// of any kind).
+#[no_mangle]
+pub extern "C" fn afs_array_pack(
+    source: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    vector: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || mask.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    let msk = unsafe { &*mask };
+    if src.base_addr.is_null() || msk.base_addr.is_null() {
+        return;
+    }
+    let elem_size = src.elem_size.max(1) as usize;
+    let total = src.total_elements() as usize;
+    let mask_total = msk.total_elements() as usize;
+    let pairs = total.min(mask_total);
+    let mask_elem = msk.elem_size.max(1) as usize;
+
+    // First pass: count true values in the mask.
+    let mut true_count: i64 = 0;
+    let msk_buf = msk.base_addr as *const u8;
+    for i in 0..pairs {
+        let off = i * mask_elem;
+        let v = unsafe { *(msk_buf.add(off) as *const i32) };
+        if v != 0 {
+            true_count += 1;
+        }
+    }
+
+    // Result size: vector's size if provided, else count of trues.
+    let result_n = if !vector.is_null() {
+        let vec = unsafe { &*vector };
+        vec.total_elements()
+    } else {
+        true_count
+    };
+
+    // Allocate rank-1 result descriptor.
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: result_n,
+        stride: 1,
+    };
+    let dim_ptr = &dim as *const DimDescriptor;
+    afs_allocate_array(result, elem_size as i64, 1, dim_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr as *mut u8;
+
+    // Second pass: emit masked-true source elements into result.
+    let mut out_idx: usize = 0;
+    for i in 0..pairs {
+        let m = unsafe { *(msk_buf.add(i * mask_elem) as *const i32) };
+        if m != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    sp.add(i * elem_size),
+                    rp.add(out_idx * elem_size),
+                    elem_size,
+                );
+            }
+            out_idx += 1;
+        }
+    }
+
+    // Pad the tail from `vector` (if provided and result_n > true_count).
+    if !vector.is_null() {
+        let vec = unsafe { &*vector };
+        if !vec.base_addr.is_null() {
+            let vp = vec.base_addr as *const u8;
+            let tail_start = out_idx;
+            let tail_end = result_n as usize;
+            for j in tail_start..tail_end {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        vp.add(j * elem_size),
+                        rp.add(j * elem_size),
+                        elem_size,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F2018 §16.9.163: RESHAPE(SOURCE, SHAPE [, PAD, ORDER]).
+///
+/// Allocates a fresh result descriptor of rank = size(shape) and
+/// element-fills it from `source` in array-element order. When
+/// `order` is supplied (a permutation of 1..rank), the *target*
+/// dimension traversal is permuted: result element index `(j1,...,jN)`
+/// corresponds to a logical "natural" position whose subscripts are
+/// `(j[order(1)],...,j[order(N)])`. When the result has more elements
+/// than the source, the tail is filled cyclically from `pad`.
+///
+/// Shape and order arrays are i32 or i64 — read both via the same
+/// 64-bit-extended path keyed off the descriptor's elem_size.
+#[no_mangle]
+pub extern "C" fn afs_array_reshape(
+    source: *const ArrayDescriptor,
+    shape: *const ArrayDescriptor,
+    order: *const ArrayDescriptor,
+    pad: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || shape.is_null() || result.is_null() {
+        return;
+    }
+    let src = unsafe { &*source };
+    let shp = unsafe { &*shape };
+    if src.base_addr.is_null() || shp.base_addr.is_null() {
+        return;
+    }
+    let rank = shp.total_elements() as usize;
+    if rank == 0 || rank > MAX_RANK {
+        return;
+    }
+
+    // Read shape extents into a fixed-size array.
+    let read_int_at = |buf: *const u8, idx: usize, elem_size: usize| -> i64 {
+        unsafe {
+            match elem_size {
+                4 => *(buf.add(idx * 4) as *const i32) as i64,
+                8 => *(buf.add(idx * 8) as *const i64),
+                _ => 0,
+            }
+        }
+    };
+    let shape_buf = shp.base_addr as *const u8;
+    let shape_elem = shp.elem_size.max(1) as usize;
+    let mut extents: [i64; MAX_RANK] = [0; MAX_RANK];
+    for i in 0..rank {
+        extents[i] = read_int_at(shape_buf, i, shape_elem).max(0);
+    }
+
+    // Build dim descriptors and allocate result.
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for i in 0..rank {
+        dims[i] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: extents[i],
+            stride: 1,
+        };
+    }
+    let elem_size = src.elem_size.max(1);
+    afs_allocate_array(
+        result,
+        elem_size,
+        rank as i32,
+        dims.as_ptr(),
+        ptr::null_mut(),
+    );
+    let res = unsafe { &mut *result };
+    if res.base_addr.is_null() {
+        return;
+    }
+
+    let total: i64 = extents.iter().take(rank).copied().product();
+    let total_usize = total as usize;
+    let src_total = src.total_elements() as usize;
+    let elem_size_usize = elem_size as usize;
+
+    // Read order (identity if absent).
+    let mut order_perm: [usize; MAX_RANK] = [0; MAX_RANK];
+    let order_present = !order.is_null() && unsafe { (*order).rank > 0 };
+    if order_present {
+        let ord = unsafe { &*order };
+        let ord_buf = ord.base_addr as *const u8;
+        let ord_elem = ord.elem_size.max(1) as usize;
+        let ord_count = ord.total_elements() as usize;
+        for i in 0..rank.min(ord_count) {
+            // Convert from 1-based Fortran to 0-based.
+            order_perm[i] = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
+        }
+    } else {
+        for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
+            *slot = i;
+        }
+    }
+
+    let pad_present = !pad.is_null() && unsafe { (*pad).total_elements() > 0 };
+    let (pad_buf, pad_total) = if pad_present {
+        let p = unsafe { &*pad };
+        (p.base_addr as *const u8, p.total_elements() as usize)
+    } else {
+        (ptr::null(), 0)
+    };
+
+    let sp = src.base_addr as *const u8;
+    let rp = res.base_addr as *mut u8;
+
+    // Linear iteration over the result in element order. For each
+    // result linear index, compute the multi-dim subscript in the
+    // *natural* (un-permuted) order, then look up the target slot
+    // by applying `order_perm` to translate logical → result subscript.
+    for linear in 0..total_usize {
+        // Natural multi-dim subscript: column-major over extents in
+        // logical order, where logical extents follow the permutation
+        // (logical_dim k = extents[order_perm[k]]).
+        let mut idx = linear;
+        let mut logical_subs: [i64; MAX_RANK] = [0; MAX_RANK];
+        for k in 0..rank {
+            let logical_extent = extents[order_perm[k]].max(1) as usize;
+            logical_subs[k] = (idx % logical_extent) as i64;
+            idx /= logical_extent;
+        }
+        // Translate into result subscript: result_subs[order_perm[k]] = logical_subs[k]
+        let mut result_subs: [i64; MAX_RANK] = [0; MAX_RANK];
+        for k in 0..rank {
+            result_subs[order_perm[k]] = logical_subs[k];
+        }
+        // Compute result linear (column-major over result extents).
+        let mut result_linear: usize = 0;
+        let mut multiplier: usize = 1;
+        for k in 0..rank {
+            result_linear += (result_subs[k] as usize) * multiplier;
+            multiplier *= extents[k].max(1) as usize;
+        }
+        // Source element: linear (column-major as if rank-1 flat).
+        let src_off = if linear < src_total {
+            linear * elem_size_usize
+        } else if pad_total > 0 {
+            ((linear - src_total) % pad_total) * elem_size_usize
+        } else {
+            0
+        };
+        let from = if linear < src_total || pad_total == 0 {
+            sp
+        } else {
+            pad_buf
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                from.add(src_off),
+                rp.add(result_linear * elem_size_usize),
+                elem_size_usize,
+            );
+        }
+    }
+}
+
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
 /// Respects strides for non-contiguous array sections.
 #[no_mangle]
