@@ -2157,6 +2157,98 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     sum
 }
 
+/// Read one logical element from `mask` at logical index `i` (zero-based)
+/// honoring `mask.elem_size` (kind 1, 4, or any bit-width). Fortran maps
+/// `.true.` to a non-zero stored value; we treat any non-zero byte as true.
+unsafe fn mask_at(mask: &ArrayDescriptor, i: usize, stride: usize) -> bool {
+    let off = i * stride * mask.elem_size.max(1) as usize;
+    let p = mask.base_addr.add(off);
+    let es = mask.elem_size as usize;
+    match es {
+        1 => *p != 0,
+        2 => *(p as *const u16) != 0,
+        4 => *(p as *const u32) != 0,
+        8 => *(p as *const u64) != 0,
+        _ => *p != 0,
+    }
+}
+
+/// SUM(array, mask=mask) — sum elements where `mask(i)` is true (real).
+/// Width-dispatched on the array's elem_size; mask is read with its own
+/// kind from `mask.elem_size`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut sum: f64 = 0.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                sum += unsafe { *ptr.add(i * stride_d) } as f64;
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                sum += unsafe { *ptr.add(i * stride_d) };
+            }
+        }
+    }
+    sum
+}
+
+/// SUM(array, mask=mask) — integer arrays. Dispatches on elem_size like
+/// the unmasked entry; returns i64 for any input kind.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut sum: i64 = 0;
+    macro_rules! sum_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    sum = sum.wrapping_add(unsafe { *ptr.add(i * stride_d) } as i64);
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => sum_kind!(i8),
+        2 => sum_kind!(i16),
+        8 => sum_kind!(i64),
+        _ => sum_kind!(i32),
+    }
+    sum
+}
+
 /// PRODUCT(array) — product of all elements (real version).
 /// Dispatches on `elem_size`; returns f64 for both real(4) and real(8).
 #[no_mangle]
@@ -2229,6 +2321,258 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
         }
     }
     prod
+}
+
+/// PRODUCT(array, mask=mask) — masked product (real). Dispatches on
+/// elem_size and reads mask via `mask_at` for any logical kind.
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return 1.0;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return 1.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut prod: f64 = 1.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                prod *= unsafe { *ptr.add(i * stride_d) } as f64;
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                prod *= unsafe { *ptr.add(i * stride_d) };
+            }
+        }
+    }
+    prod
+}
+
+/// PRODUCT(array, mask=mask) — masked product (integer). Dispatches on
+/// elem_size; returns i64 regardless of input kind.
+#[no_mangle]
+pub extern "C" fn afs_array_product_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return 1;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return 1;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut prod: i64 = 1;
+    macro_rules! prod_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride_d) } as i64);
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => prod_kind!(i8),
+        2 => prod_kind!(i16),
+        8 => prod_kind!(i64),
+        _ => prod_kind!(i32),
+    }
+    prod
+}
+
+/// MAXVAL(array, mask=mask) — masked max (real). Returns -inf when no
+/// element is selected.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return f64::NEG_INFINITY;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return f64::NEG_INFINITY;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut best = f64::NEG_INFINITY;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) } as f64;
+                if v > best {
+                    best = v;
+                }
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) };
+                if v > best {
+                    best = v;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// MINVAL(array, mask=mask) — masked min (real).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return f64::INFINITY;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return f64::INFINITY;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut best = f64::INFINITY;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) } as f64;
+                if v < best {
+                    best = v;
+                }
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) };
+                if v < best {
+                    best = v;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// MAXVAL(array, mask=mask) — masked max (integer).
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return i64::MIN;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return i64::MIN;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return i64::MIN;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut best = i64::MIN;
+    macro_rules! max_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
+                    if v > best {
+                        best = v;
+                    }
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => max_kind!(i8),
+        2 => max_kind!(i16),
+        8 => max_kind!(i64),
+        _ => max_kind!(i32),
+    }
+    best
+}
+
+/// MINVAL(array, mask=mask) — masked min (integer).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return i64::MAX;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return i64::MAX;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return i64::MAX;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut best = i64::MAX;
+    macro_rules! min_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
+                    if v < best {
+                        best = v;
+                    }
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => min_kind!(i8),
+        2 => min_kind!(i16),
+        8 => min_kind!(i64),
+        _ => min_kind!(i32),
+    }
+    best
 }
 
 /// MAXVAL(array) — maximum element (real version). Dispatches on
