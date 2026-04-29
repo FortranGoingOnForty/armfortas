@@ -11009,6 +11009,45 @@ fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
 }
 
 #[test]
+fn ishftc_default_size_full_width_rotate_does_not_zero_result() {
+    // The previous lowering masked the result with `(1 << size) - 1`,
+    // which on AArch64 collapses to mask = 0 when size equals the
+    // operand bit width — `1 << 64` rotates back to 1. ishftc with the
+    // default size argument therefore returned 0 for any nonzero input.
+    // stdlib_random's xoshiro256ss generator multiplies the output
+    // through a chain of shifts; the bug zeroed the entire random
+    // stream. This test covers all four integer kinds at multiple
+    // shift counts including the boundary cases (0, full-width).
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int8, int16, int32, int64\n  if (ishftc(123_int64, 0) /= 123_int64) error stop 1\n  if (ishftc(123_int64, 64) /= 123_int64) error stop 2\n  if (ishftc(1_int64, 1) /= 2_int64) error stop 3\n  if (ishftc(1_int64, 63) /= -9223372036854775807_int64 - 1_int64) error stop 4\n  if (ishftc(2_int64, -1) /= 1_int64) error stop 5\n  if (ishftc(10_int64, 7) /= 1280_int64) error stop 6\n  if (ishftc(10_int32, 7) /= 1280_int32) error stop 7\n  if (ishftc(int(b'1010', int32), 1, 4) /= 5_int32) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ishftc_full_width", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
