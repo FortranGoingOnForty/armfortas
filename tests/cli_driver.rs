@@ -10810,6 +10810,48 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
+    // Fortran identifiers are case-insensitive, but Mach-O linking is
+    // case-sensitive. `module_procedure_symbol_name` only lowercased
+    // the module name, leaving the procedure name in its source
+    // casing. A type-bound procedure whose target was declared with
+    // mixed case (`procedure :: pid => process_get_ID`) emitted the
+    // body as `_afs_modproc_<mod>_process_get_ID` while every call
+    // site went through a lowercased lookup and asked the linker for
+    // `_afs_modproc_<mod>_process_get_id`. Surfaced in stdlib_system
+    // — `example_process_5` linked against an undefined
+    // `_afs_modproc_stdlib_system_process_get_id`. Now the symbol
+    // formatter lowercases both halves.
+    let src = write_program(
+        "module mp\n  implicit none\n  type :: my_type\n    integer :: x = 42\n  contains\n    procedure :: get_x => my_get_X\n  end type my_type\ncontains\n  function my_get_X(self) result(v)\n    class(my_type), intent(in) :: self\n    integer :: v\n    v = self%x\n  end function\nend module\n\nprogram t\n  use mp\n  type(my_type) :: o\n  if (o%get_x() /= 42) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("case_tbp", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("case_tbp compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "TBP target with mixed case must link cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("case_tbp run failed");
+    assert!(
+        run.status.success(),
+        "TBP target with mixed case should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
     // F2018 §10.2.3.2: `where (lambda(1:m) > 0.0) ...` over an
     // allocatable `lambda` is lowered by per-element scalarization —
