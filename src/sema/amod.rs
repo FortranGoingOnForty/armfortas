@@ -338,7 +338,17 @@ pub fn write_amod(
     }
 
     // ---- Interfaces ----
-    let ifaces: Vec<_> = syms
+    // Per F2018 §11.2.3, submodules see their parent module's PRIVATE
+    // generic interfaces. Emit every NamedInterface (and constructor
+    // interfaces represented as DerivedType with non-empty arg_names),
+    // tagging private ones with a `private` marker. Importing scopes
+    // that use the module without submodule access filter the private
+    // entries out via `Symbol::attrs.access == Private` (see
+    // SymbolTable::lookup_in_guarded). Without this, a submodule that
+    // dispatches a private parent generic emits a bare `bl _<name>`,
+    // since the loader-installed scope had no NamedInterface with that
+    // name to resolve against.
+    let ifaces: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(sym.kind, SymbolKind::NamedInterface)
@@ -346,7 +356,7 @@ pub fn write_amod(
         })
         .collect();
     for (name, sym) in &ifaces {
-        emit_interface(&mut out, name, sym);
+        emit_interface(&mut out, name, sym, scope);
     }
 
     out
@@ -944,8 +954,14 @@ fn collect_exported_type_closure(
     }
 }
 
-fn emit_interface(out: &mut String, name: &str, sym: &Symbol) {
-    writeln!(out, "@interface {}", name).unwrap();
+fn emit_interface(out: &mut String, name: &str, sym: &Symbol, scope: &Scope) {
+    let effective_private = match sym.attrs.access {
+        Access::Private => true,
+        Access::Public => false,
+        Access::Default => matches!(scope.default_access, Access::Private),
+    };
+    let suf = if effective_private { ", private" } else { "" };
+    writeln!(out, "@interface {}{}", name, suf).unwrap();
     let mut specifics = sym.arg_names.clone(); // arg_names repurposed for specific list
     specifics.sort();
     for s in &specifics {
@@ -1099,6 +1115,7 @@ pub struct AmodVar {
 pub struct AmodInterface {
     pub name: String,
     pub specifics: Vec<String>,
+    pub access: Access,
 }
 
 /// Complete module interface parsed from an .amod file.
@@ -1189,9 +1206,15 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             let layout = parse_type(trimmed, &mut lines);
             types.push(layout);
         } else if let Some(name) = trimmed.strip_prefix("@interface ") {
-            // Generic interface block: header is `@interface <name>`,
+            // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
-            let iface_name = name.trim().to_string();
+            let header = name.trim();
+            let (iface_name, access) = match header.split_once(", ") {
+                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => {
+                    (n.trim().to_string(), Access::Private)
+                }
+                _ => (header.to_string(), Access::Public),
+            };
             let mut specifics = Vec::new();
             for iline in lines.by_ref() {
                 let t = iline.trim();
@@ -1205,6 +1228,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             interfaces.push(AmodInterface {
                 name: iface_name,
                 specifics,
+                access,
             });
         }
         // Skip unrecognized directives (forward compatibility).

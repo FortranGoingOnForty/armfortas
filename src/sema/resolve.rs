@@ -1253,10 +1253,13 @@ fn load_external_module(
     // Register named generic interfaces. The specifics list rides
     // in `arg_names` to match how intra-file INTERFACE blocks are
     // stored by process_decls — `resolve_generic_call` reads it
-    // when dispatching a call through the generic name.
+    // when dispatching a call through the generic name. The access
+    // attribute is preserved from the .amod so that submodules can
+    // dispatch private parent interfaces via host association while
+    // ordinary `USE` consumers filter them out (F2018 §11.2.3).
     for iface_def in &iface.interfaces {
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: iface_def.access,
             ..Default::default()
         };
         let define_result = st.define(Symbol {
