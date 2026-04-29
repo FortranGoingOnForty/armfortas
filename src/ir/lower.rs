@@ -13880,6 +13880,17 @@ fn defined_assignment_arg_semantic_match(
     // (kind=4) won.  Inside the wrong specific, `logical_vector(i+1)`
     // strode 4 bytes per element across a kind=1 array, dropping
     // every fourth element from the bit_count.
+    //
+    // `kind_eq` resolves missing-kind selectors to the language default
+    // before comparing.  An actual `logical :: x` (no explicit kind)
+    // means kind=4 — *not* a wildcard, so it must NOT match
+    // `logical(int16)` formals.  Without this, `logi = .true.` (default
+    // kind) dispatched to `assign_logint16_large` (the FIRST specific
+    // in declaration order), striding 2 bytes per element across a
+    // 4-byte logical array.
+    fn kind_eq(declared: Option<u8>, actual: Option<u8>, default: u8) -> bool {
+        declared.unwrap_or(default) == actual.unwrap_or(default)
+    }
     match declared {
         TypeInfo::Derived(decl_name) => matches!(
             actual,
@@ -13893,12 +13904,13 @@ fn defined_assignment_arg_semantic_match(
         ),
         TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. }) | None),
         TypeInfo::Integer { kind: dk } => match actual {
-            Some(TypeInfo::Integer { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            Some(TypeInfo::Integer { kind: ak }) => kind_eq(*dk, *ak, 4),
             None => true,
             _ => false,
         },
         TypeInfo::Real { kind: dk } => match actual {
-            Some(TypeInfo::Real { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            Some(TypeInfo::Real { kind: ak }) => kind_eq(*dk, *ak, 4),
+            Some(TypeInfo::DoublePrecision) => kind_eq(*dk, Some(8), 4),
             None => true,
             _ => false,
         },
@@ -13907,12 +13919,12 @@ fn defined_assignment_arg_semantic_match(
             Some(TypeInfo::DoublePrecision) | Some(TypeInfo::Real { kind: Some(8) }) | None
         ),
         TypeInfo::Complex { kind: dk } => match actual {
-            Some(TypeInfo::Complex { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            Some(TypeInfo::Complex { kind: ak }) => kind_eq(*dk, *ak, 4),
             None => true,
             _ => false,
         },
         TypeInfo::Logical { kind: dk } => match actual {
-            Some(TypeInfo::Logical { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            Some(TypeInfo::Logical { kind: ak }) => kind_eq(*dk, *ak, 4),
             None => true,
             _ => false,
         },
@@ -14839,7 +14851,14 @@ fn try_defined_assignment(
     let rhs_for_call = if let Expr::Name { name } = &rhs.node {
         let key = name.to_lowercase();
         if let Some(info) = ctx.locals.get(&key) {
-            if !info.dims.is_empty() {
+            // Allocatable arrays have empty `dims` (deferred shape) but
+            // are still rank > 0. The previous check only inspected
+            // static dims, so `set1 = logi` for `logical, allocatable ::
+            // logi(:)` fell into the scalar path and passed the first
+            // byte of logi's descriptor as a scalar. Fix: also treat
+            // descriptor-backed locals as arrays for the descriptor
+            // materialization path.
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
                 if local_uses_array_descriptor(info) {
                     array_descriptor_addr(b, info)
                 } else {
