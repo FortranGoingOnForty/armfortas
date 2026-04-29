@@ -10840,6 +10840,53 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
 }
 
 #[test]
+fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
+    // `print *, transpose(a)` etc. previously fell through to the
+    // scalar IO path because the array-descriptor dispatch only fired
+    // for BinaryOp/UnaryOp/ParenExpr items. The intrinsic returned a
+    // descriptor pointer which the scalar writer treated as a string
+    // and emitted no output — stdlib_intrinsics' example_matmul saw
+    // empty matrices despite a correct matmul runtime. Now FunctionCall
+    // items also try lower_array_expr_descriptor first, walking each
+    // element through the right scalar writer.
+    let src = write_program(
+        "program t\n  integer :: a(3,3)\n  a = reshape([1,2,3,4,5,6,7,8,9], [3,3])\n  print *, transpose(a)\n  print *, matmul(a, a)\n  print *, shape(a)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("inline_array_intrinsic_print", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("inline array intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "inline array intrinsic should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    // transpose([1..9, [3,3]]) = [1,4,7,2,5,8,3,6,9] in column-major
+    assert!(stdout.contains("1") && stdout.contains("4") && stdout.contains("7"),
+        "transpose row missing: {}", stdout);
+    // matmul self-product diagonal: B(1,1)=30
+    assert!(stdout.contains("30") && stdout.contains("81") && stdout.contains("150"),
+        "matmul values missing: {}", stdout);
+    // shape: "3 3"
+    assert!(stdout.lines().any(|l| l.split_whitespace().eq(["3", "3"])),
+        "shape line missing: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
     // F2018 §7.8: array-constructor element values for complex(dp)
     // are 16-byte aggregates (`[f64 x 2]`). The constructor lowering
