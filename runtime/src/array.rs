@@ -3119,6 +3119,99 @@ pub extern "C" fn afs_matmul_real8(
     }
 }
 
+/// MATMUL(a, b, result) — matrix multiplication (complex version).
+/// elem_size 8 → complex(4) (two f32 lanes); elem_size 16 → complex(8) (two f64 lanes).
+#[no_mangle]
+pub extern "C" fn afs_matmul_complex(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if a.is_null() || b.is_null() || result.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+
+    let m = da.dims[0].extent() as usize;
+    let k = if da.rank >= 2 {
+        da.dims[1].extent() as usize
+    } else {
+        1
+    };
+    let n = if db.rank >= 2 {
+        db.dims[1].extent() as usize
+    } else {
+        db.dims[0].extent() as usize
+    };
+    let elem_size = da.elem_size.max(8) as i64;
+
+    afs_allocate_1d(result, elem_size, (m * n) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
+
+    if elem_size == 8 {
+        // complex(4): pairs of f32 (re, im).
+        let ap = da.base_addr as *const f32;
+        let bp = db.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum_re: f64 = 0.0;
+                let mut sum_im: f64 = 0.0;
+                for l in 0..k {
+                    let a_re = unsafe { *ap.add(2 * (l * m + i)) } as f64;
+                    let a_im = unsafe { *ap.add(2 * (l * m + i) + 1) } as f64;
+                    let b_re = unsafe { *bp.add(2 * (j * k + l)) } as f64;
+                    let b_im = unsafe { *bp.add(2 * (j * k + l) + 1) } as f64;
+                    sum_re += a_re * b_re - a_im * b_im;
+                    sum_im += a_re * b_im + a_im * b_re;
+                }
+                unsafe {
+                    *rp.add(2 * (j * m + i)) = sum_re as f32;
+                    *rp.add(2 * (j * m + i) + 1) = sum_im as f32;
+                }
+            }
+        }
+    } else {
+        // complex(8): pairs of f64 (re, im).
+        let ap = da.base_addr as *const f64;
+        let bp = db.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum_re: f64 = 0.0;
+                let mut sum_im: f64 = 0.0;
+                for l in 0..k {
+                    let a_re = unsafe { *ap.add(2 * (l * m + i)) };
+                    let a_im = unsafe { *ap.add(2 * (l * m + i) + 1) };
+                    let b_re = unsafe { *bp.add(2 * (j * k + l)) };
+                    let b_im = unsafe { *bp.add(2 * (j * k + l) + 1) };
+                    sum_re += a_re * b_re - a_im * b_im;
+                    sum_im += a_re * b_im + a_im * b_re;
+                }
+                unsafe {
+                    *rp.add(2 * (j * m + i)) = sum_re;
+                    *rp.add(2 * (j * m + i) + 1) = sum_im;
+                }
+            }
+        }
+    }
+}
+
 /// MATMUL(a, b, result) — matrix multiplication (integer(4) version).
 #[no_mangle]
 pub extern "C" fn afs_matmul_int(
