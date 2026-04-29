@@ -1037,6 +1037,28 @@ fn load_external_module(
         }
     }
 
+    // Replay use renames recorded by the writer (`@use_rename a = b from m`).
+    // Without this, `use stdlib_kinds, only: block_kind => int64` is lost
+    // when stdlib_bitsets is serialized, and submodule bodies can no
+    // longer resolve `block_kind` for kind selectors — `integer(block_kind)
+    // :: dummy` falls back to default kind=4 and silently truncates a
+    // 64-bit local to 32 bits.
+    for rename in &iface.renames {
+        let src_scope = st
+            .find_module_scope(&rename.source_module)
+            .or_else(|| load_external_module(st, &rename.source_module, search_paths, type_layouts));
+        let Some(src_scope) = src_scope else {
+            continue;
+        };
+        st.enter_scope(scope_id);
+        st.add_use_association(crate::sema::symtab::UseAssociation {
+            local_name: rename.local.clone(),
+            original_name: rename.original.clone(),
+            source_scope: src_scope,
+            is_submodule_access: false,
+        });
+    }
+
     // Populate variables and parameters.
     for var in &iface.variables {
         let kind = if var.is_parameter {
