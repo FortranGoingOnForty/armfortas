@@ -10810,6 +10810,52 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
+    // F2018 §7.4.4: a scalar value initializing an array PARAMETER is
+    // broadcast to every element. Two paths broke this for module-level
+    // parameter arrays: (1) `collect_decl_param_consts_with_*` saw the
+    // entity's init as a scalar and dropped `tab` into the scalar
+    // param_consts map, ignoring its `(0:N)` shape — host_param_consts
+    // then propagated to the contained subprogram and `install_host_
+    // param_consts` allocated a 4-byte alloca for `tab`, shadowing the
+    // module global; (2) `eval_const_array_init` returned None on a
+    // scalar init, so the global was emitted with `zeroinit` instead of
+    // the broadcast value. Both are fixed: the param-consts collectors
+    // skip entities that have an explicit array shape, and the array
+    // initializer evaluator falls back to scalar broadcast when the
+    // expression isn't a constructor. Surfaced in stdlib_hash_32bit_nm
+    // (`nmh_m1_v(0:31) = nmh_m1`) — every cross-procedure use emitted
+    // an un-mangled `bl _nmh_m*_v` against a zeroinit global.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  integer(int32), parameter :: tab(0:3) = 99_int32\n  integer(int32), parameter :: hex(0:3) = int(z'12345678', int32)\ncontains\n  pure subroutine touch(out, i)\n    integer(int32), intent(inout) :: out(0:1)\n    integer(int64), intent(in) :: i\n    out(0) = tab(i)\n    out(1) = hex(i)\n  end subroutine\nend module\n\nprogram t\n  use m\n  use iso_fortran_env, only: int32, int64\n  integer(int32) :: x(0:1) = 0_int32\n  call touch(x, 1_int64)\n  if (x(0) /= 99_int32)                  error stop 1\n  if (x(1) /= int(z'12345678', int32))   error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("param_scalar_bcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar broadcast compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar broadcast should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("scalar broadcast run failed");
+    assert!(
+        run.status.success(),
+        "scalar broadcast should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
     // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
     // inside another procedure) link under a host-prefixed mangled
