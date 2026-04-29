@@ -1478,11 +1478,20 @@ fn exported_const_int_params(
     }
 
     for assoc in &scope.use_associations {
-        if let Some(sym) = st
+        // First try the source scope's own symbols, then chase through
+        // its USE chain.  stdlib_kinds re-exports `int32` from
+        // iso_fortran_env, so `use stdlib_kinds, only: bits_kind => int32`
+        // can't find `int32` in stdlib_kinds's own symbol table — it
+        // lives one hop further up.  Without the chase, kind selectors
+        // resolve to None and downstream layout falls back to default
+        // kind, which silently shrinks `integer(block_kind) :: blk`
+        // from 8 bytes to 4 inside derived types.
+        let sym = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-        {
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
             if sym.attrs.parameter
                 && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
             {
@@ -1537,11 +1546,12 @@ fn visible_const_int_params(
         if out.contains_key(&assoc.local_name) {
             continue;
         }
-        if let Some(sym) = st
+        let sym = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-        {
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
             if sym.attrs.parameter
                 && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
             {
