@@ -10810,6 +10810,52 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
+    // F2018 §16.9.144: PACK(ARRAY, MASK [, VECTOR]) is a transformational
+    // intrinsic that materializes a fresh rank-1 descriptor — `x_tmp =
+    // pack(x, mask)` for an allocatable LHS must route through
+    // `lower_pack_array_expr_descriptor` and `afs_assign_allocatable`.
+    // Two earlier gates in the assignment lowering excluded `pack`:
+    // (1) `callee_is_transformational_intrinsic` only listed reshape /
+    // matmul / transpose / shape, so the descriptor-based assign path
+    // was bypassed, and (2) `expr_contains_whole_array_intrinsic` (the
+    // skip-scalarization filter inside `try_lower_scalarized_subscript_
+    // array_assign`) didn't include `pack`, so the same routine then
+    // synthesized a per-element loop calling scalar `pack(x_i, mask_i)`
+    // and the linker reported `_pack` undefined. Both gates now include
+    // `pack` and `spread`. Surfaced in stdlib `example_median` which
+    // uses `x_tmp = pack(x, mask)` in median_all_mask_*; expect ~31
+    // un-mangled `_pack` BL relocations across stdlib_stats_median.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int8\n  implicit none\n  integer(int8) :: x(5) = [1_int8, 2_int8, 3_int8, 4_int8, 5_int8]\n  logical :: mask(5) = [.true., .false., .true., .false., .true.]\n  integer(int8), allocatable :: x_tmp(:)\n  x_tmp = pack(x, mask)\n  if (size(x_tmp) /= 3)        error stop 1\n  if (x_tmp(1) /= 1_int8)      error stop 2\n  if (x_tmp(2) /= 3_int8)      error stop 3\n  if (x_tmp(3) /= 5_int8)      error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pack_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack_alloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pack into allocatable should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("pack_alloc run failed");
+    assert!(
+        run.status.success(),
+        "pack into allocatable should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     // F2018 §11.2.3: a submodule has full access to its parent module's
     // PRIVATE entities by host association. Previously `write_amod` only
