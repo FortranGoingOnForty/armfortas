@@ -750,11 +750,20 @@ pub fn compute_layout_with_attrs(
     }
 
     fn lowered_bound_proc_target(host_module: Option<&str>, target: &str) -> String {
+        // Body emission via `module_procedure_symbol_name` lowercases
+        // only the module name and preserves the procedure's source
+        // case (see `module_procedure_case_and_bind_label_survive_amod_
+        // import`). The TBP target stored in the type layout drives
+        // the call-site `bl <target>` and must match exactly. Without
+        // matching, `procedure :: pid => process_get_ID` defines
+        // `_afs_modproc_<mod>_process_get_ID` while every TBP dispatch
+        // looked up `_afs_modproc_<mod>_process_get_id` — caught at
+        // stdlib `example_process_5` link.
         if let Some(module_name) = host_module {
             format!(
                 "afs_modproc_{}_{}",
                 module_name.to_lowercase(),
-                target.to_lowercase()
+                target
             )
         } else {
             target.to_string()
