@@ -10840,6 +10840,58 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
 }
 
 #[test]
+fn inline_array_intrinsic_in_print_handles_complex_elements() {
+    // Following on from the FunctionCall descriptor-walk fix: when the
+    // resulting array's element type is complex (`Array(Float, 2)`),
+    // the element-walker previously fell into the integer writer arm
+    // because the match cascaded to the `_ => "afs_write_int"` default.
+    // That treated each 8-byte complex(4) element as an i32 and silently
+    // printed the real lane (often zero) as integer. Now is_complex_ty
+    // detection picks afs_write_complex_f32/f64 and passes the element
+    // pointer (not a loaded aggregate) so both lanes appear.
+    let src = write_program(
+        "program t\n  complex :: x(2,2), y(2,2)\n  x = reshape([(0.0,0.0),(1.0,0.0),(1.0,0.0),(0.0,0.0)], [2,2])\n  y = reshape([(1.0,0.0),(0.0,0.0),(0.0,0.0),(1.0,0.0)], [2,2])\n  print *, matmul(x, y)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("inline_complex_print", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    // swap matrix * identity = swap. Result column-major: (0,0)(1,0)(1,0)(0,0).
+    // Print should include "(   1.0000000E0,   0.0000000E0)" for the off-diag
+    // entries, which only the complex writer can produce — int writer would
+    // show "0" instead.
+    assert!(
+        stdout.contains("1.0000000E0,") || stdout.contains("1.0000000E+0,"),
+        "complex parens with imag lane missing: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains(",   0.0000000E0)") || stdout.contains(",0.0000000E+0)") || stdout.contains(",   0.0000000E+0)"),
+        "complex closing paren missing: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
     // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
     // and an allocatable LHS forces per-element conversion. Without the
