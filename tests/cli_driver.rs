@@ -10810,6 +10810,51 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
+    // F2018 §7.8: nested array constructors flatten in declared
+    // order, so `[[1,2,3],[4,5,6]]` is a 6-element rank-1 constructor.
+    // `const_array_constructor_len` previously counted each
+    // `AcValue::Expr` as 1 regardless of whether its inner expression
+    // was itself an `Expr::ArrayConstructor`, so an allocatable rank-1
+    // LHS got sized to 2 (one slot per inner constructor) and any
+    // index past the first inner's first slot tripped a runtime bounds
+    // check. Surfaced narrowing chol/norm runtime correctness in
+    // stdlib drilling — fixed-shape destinations and rank-1 allocatable
+    // destinations now agree on the flattened length. (A separate
+    // residual gap, integer-literal AC into real(:) destinations
+    // without explicit kind conversion, is tracked in memory.)
+    let src = write_program(
+        "program t\n  implicit none\n  real, allocatable :: A(:)\n  A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n  if (size(A) /= 6) error stop 1\n  if (abs(A(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(A(6) - 6.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_ac_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested_ac_alloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested AC into rank-1 allocatable must compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("nested_ac_alloc run failed");
+    assert!(
+        run.status.success(),
+        "nested AC into rank-1 allocatable should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
     // F2018 §16.9.96: HUGE(X) returns the largest representable value
     // of X's type/kind. The value-driven `lower_intrinsic("huge",
