@@ -10810,6 +10810,48 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
+    // F2018 §10.2.3.2: `where (lambda(1:m) > 0.0) ...` over an
+    // allocatable `lambda` is lowered by per-element scalarization —
+    // each array name in the mask/body is substituted to a per-iter
+    // scalar. The substitution previously left residual `lambda(1:m)`
+    // FunctionCall nodes unchanged, so the body's lookup found a
+    // scalar local for `lambda`, the `(1:m)` looked like a call, and
+    // the lowering fell through to user-call emission of an undefined
+    // `bl _lambda`. Surfaced in stdlib `stdlib_stats_pca` —
+    // `pca_eigh_driver_sp` and `pca_eigh_driver_dp` both have
+    // `where (lambda(1:m) > 0.0) singular_values(1:m) = sqrt(lambda(1:m) * (n-1))`,
+    // which broke `example_pca` link with `_lambda` undefined.
+    // Both `Stmt::WhereStmt` and `Stmt::WhereConstruct` lowering now
+    // pre-rewrite `name(section)` → `name` in the mask and body for
+    // every scalarized name. We assert link cleanliness here; runtime
+    // correctness for WHERE over assumed-shape dummies is tracked
+    // separately in noted_issues.
+    let src = write_program(
+        "subroutine sub(x_local, n)\n  use iso_fortran_env, only: int32, real32\n  implicit none\n  integer(int32), intent(in) :: n\n  real(real32), intent(inout) :: x_local(:)\n  real(real32), allocatable :: lambda(:)\n  integer :: m\n  allocate(lambda(n))\n  lambda = [(real(i, real32), i=1, n)]\n  m = min(size(x_local), n)\n  where (lambda(1:m) > 0.0_real32) x_local(1:m) = sqrt(lambda(1:m))\nend subroutine\n\nprogram t\n  use iso_fortran_env, only: real32\n  implicit none\n  real(real32) :: x(5)\n  call sub(x, 5)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("where_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("where_section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "WHERE with allocatable section ref must link cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&compile.stderr).contains("_lambda"),
+        "stderr should not mention _lambda: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
     // F2018 §16.9.144: PACK(ARRAY, MASK [, VECTOR]) is a transformational
     // intrinsic that materializes a fresh rank-1 descriptor — `x_tmp =
