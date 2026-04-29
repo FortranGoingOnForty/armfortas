@@ -3598,7 +3598,16 @@ fn eval_const_array_init(
     total: i64,
     param_consts: &HashMap<String, ConstScalar>,
 ) -> Option<GlobalInit> {
-    let scalars = collect_const_array_scalars(expr, elem_ty, param_consts)?;
+    // F2018 §7.4.4: a scalar initializer for an array PARAMETER is
+    // broadcast to every element. Try the array-shaped collector
+    // first; if that fails, fall back to scalar broadcast.
+    let scalars = match collect_const_array_scalars(expr, elem_ty, param_consts) {
+        Some(s) => s,
+        None => {
+            let scalar = eval_const_scalar(expr, param_consts)?;
+            vec![scalar; total as usize]
+        }
+    };
     if (scalars.len() as i64) > total {
         // Shape mismatch — too many elements. Return None so the
         // caller falls back to zero-init. A proper diagnostic is
@@ -6152,7 +6161,18 @@ fn collect_decl_param_consts_with_host(
                 if !is_param {
                     continue;
                 }
+                let attr_has_dim = attrs
+                    .iter()
+                    .any(|a| matches!(a, crate::ast::decl::Attribute::Dimension(_)));
                 for entity in entities {
+                    // Skip parameter arrays (entity- or attribute-level dim):
+                    // a scalar-broadcast init like `tab(0:3) = 99` evaluates
+                    // as a scalar, but `tab` is still an array. Letting it
+                    // into the scalar param_consts map shadows the module
+                    // global with a 4-byte alloca in contained scopes.
+                    if entity.array_spec.is_some() || attr_has_dim {
+                        continue;
+                    }
                     if let Some(init) = &entity.init {
                         if let Some(val) = eval_const_scalar(init, &param_consts) {
                             param_consts.insert(entity.name.to_lowercase(), val);
@@ -6190,7 +6210,13 @@ fn collect_decl_param_consts_with_scope(
                 if !is_param {
                     continue;
                 }
+                let attr_has_dim = attrs
+                    .iter()
+                    .any(|a| matches!(a, crate::ast::decl::Attribute::Dimension(_)));
                 for entity in entities {
+                    if entity.array_spec.is_some() || attr_has_dim {
+                        continue;
+                    }
                     if let Some(init) = &entity.init {
                         if let Some(val) = eval_const_scalar_with_decl_scope(
                             init,
