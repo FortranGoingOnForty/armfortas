@@ -10234,7 +10234,20 @@ fn const_array_constructor_len(values: &[crate::ast::expr::AcValue]) -> Option<i
     let mut total = 0_i64;
     for value in values {
         match value {
-            crate::ast::expr::AcValue::Expr(_) => total += 1,
+            crate::ast::expr::AcValue::Expr(e) => {
+                // F2018 §7.8: nested array constructors flatten in
+                // declared order, so `[[1,2,3],[4,5,6]]` is a 6-element
+                // rank-1 constructor. Without this recursion, the outer
+                // length was counted as 2 (one per inner AC) and an
+                // allocatable LHS got sized for 2 — every element past
+                // the first inner constructor's first slot read garbage
+                // or tripped a bounds check.
+                if let Expr::ArrayConstructor { values: inner, .. } = &e.node {
+                    total += const_array_constructor_len(inner)?;
+                } else {
+                    total += 1;
+                }
+            }
             crate::ast::expr::AcValue::ImpliedDo(ido) => {
                 let inner = const_array_constructor_len(&ido.values)?;
                 total += inner * const_implied_do_trip_count(ido)?;
