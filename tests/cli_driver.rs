@@ -10892,6 +10892,48 @@ fn inline_array_intrinsic_in_print_handles_complex_elements() {
 }
 
 #[test]
+fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
+    // F2018 §13.7 named constants: a complex parameter at module
+    // scope must be loaded with its declared value at program start.
+    // Pre-fix: eval_const_global_init only handled scalar Int/Float
+    // (ConstScalar carries no Complex variant); ComplexLiteral fell
+    // through to GlobalInit::Zero, leaving `one_csp = (0.0, 0.0)` in
+    // .data. Every BLAS path that picks alpha/beta from
+    // stdlib_constants then computed `c = 0*a*b + 0*c = 0`, producing
+    // garbage matmul output (e.g. example_matmul printed all zeros for
+    // pauli_x*pauli_y). Now eval_const_complex_global_init emits a
+    // GlobalInit::FloatArray([re, im]) for the Array(Float, 2) target.
+    let src = write_program(
+        "module mod_const\n  complex, parameter :: ones = (1.0, 2.0)\nend module\nprogram t\n  use mod_const, only: ones\n  print *, real(ones), aimag(ones)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_complex_param", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success(), "should pass: {}", run.status);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    let nums: Vec<f32> = line
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f32>().ok())
+        .collect();
+    assert_eq!(nums.len(), 2, "expected [real, imag], got: {}", line);
+    assert!((nums[0] - 1.0).abs() < 1e-5, "real lane wrong: {}", nums[0]);
+    assert!((nums[1] - 2.0).abs() < 1e-5, "imag lane wrong: {}", nums[1]);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
     // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
     // and an allocatable LHS forces per-element conversion. Without the
