@@ -11212,6 +11212,50 @@ fn submodule_local_with_use_renamed_kind_through_re_export_has_correct_width() {
 }
 
 #[test]
+fn defined_assignment_dispatch_resolves_default_kind_actual_against_explicit_kind_specifics() {
+    // F2018 §15.5.5.2: defined-assignment specific selection compares
+    // declared types AND kinds. An actual without an explicit kind means
+    // *default kind*, not "any kind". Previously the dispatcher used
+    // `intrinsic_kind_matches` which collapsed `actual=None` to a
+    // wildcard, so `logi = lhs` for `logical, allocatable :: logi(:)`
+    // matched `logical(int16) :: lv(:)` (the FIRST specific in stdlib
+    // declaration order) instead of the kind=4 specific. The 4-byte
+    // logical array was then strode at 2 bytes per element.
+    //
+    // Combined repro covers the dispatch fix AND the allocatable-RHS
+    // descriptor materialization (allocatable arrays have empty
+    // `info.dims` because they're deferred-shape — the previous check
+    // skipped the descriptor path).
+    let src = write_program(
+        "module mb\n  type :: counter\n    integer :: total = 0\n  end type\n  interface assignment(=)\n    module subroutine assign_log16(self, v)\n      use iso_fortran_env, only: int16\n      import :: counter\n      type(counter), intent(out) :: self\n      logical(int16), intent(in) :: v(:)\n    end subroutine\n    module subroutine assign_log32(self, v)\n      use iso_fortran_env, only: int32\n      import :: counter\n      type(counter), intent(out) :: self\n      logical(int32), intent(in) :: v(:)\n    end subroutine\n  end interface\nend module\nsubmodule(mb) sub\ncontains\n  module subroutine assign_log16(self, v)\n    use iso_fortran_env, only: int16\n    type(counter), intent(out) :: self\n    logical(int16), intent(in) :: v(:)\n    self%total = -1\n  end subroutine\n  module subroutine assign_log32(self, v)\n    use iso_fortran_env, only: int32\n    type(counter), intent(out) :: self\n    logical(int32), intent(in) :: v(:)\n    integer :: i\n    self%total = 0\n    do i = 1, size(v)\n      if (v(i)) self%total = self%total + 1\n    end do\n  end subroutine\nend submodule\nprogram t\n  use mb\n  logical, allocatable :: logi(:)\n  type(counter) :: c\n  allocate(logi(10), source=.false.)\n  logi(1) = .true.\n  logi(5) = .true.\n  logi(10) = .true.\n  c = logi\n  if (c%total /= 3) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_default_kind_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
