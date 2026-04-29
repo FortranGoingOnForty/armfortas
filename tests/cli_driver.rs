@@ -11009,6 +11009,85 @@ fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
 }
 
 #[test]
+fn logical_int8_array_scalar_broadcast_init_fills_every_element() {
+    // F2018 §7.6.6: a scalar initializer in an array declaration is
+    // broadcast to every element. Previously the compiler treated
+    // `TypeSpec::Logical(_)` as `IrType::Bool` regardless of kind,
+    // so `logical(int8) :: a(N) = .true.` allocated 4N bytes on the
+    // stack while the init pass skipped non-array-constructor
+    // initializers entirely. The descriptor walk then read junk
+    // stack bytes and `all(a)` returned F. The kind-aware mapping
+    // now allocates N bytes; the scalar-broadcast init pass writes
+    // .true. at every element offset.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int8\n  logical(int8) :: a4(4) = .true.\n  logical(int8) :: a64(64) = .true.\n  logical :: ad(8) = .true.\n  if (.not. all(a4)) error stop 1\n  if (.not. all(a64)) error stop 2\n  if (.not. all(ad)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("logical_int8_array_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_assignment_passes_array_actual_through_descriptor() {
+    // F2018 §15.5.2: when an overloaded `assignment(=)` resolves to a
+    // procedure whose RHS dummy is an assumed-shape array, the actual
+    // array must be passed as a 384-byte descriptor — not as the raw
+    // data pointer. stdlib_bitsets `set = logical_array` regressed
+    // because `try_defined_assignment` passed `rhs_val` directly,
+    // letting the callee read the array bytes as the descriptor
+    // (rank=77M, base=0x0101010101010101). This regression test
+    // replays the pattern with a tiny derived type.
+    let src = write_program(
+        "module mb\n  use iso_fortran_env, only: int8, int64\n  implicit none\n  type :: bs\n    integer :: n = 0\n    integer(int64) :: blk = 0_int64\n  end type\n  interface assignment(=)\n    module subroutine assign_log(self, v)\n      use iso_fortran_env, only: int8\n      import :: bs\n      type(bs), intent(out) :: self\n      logical(int8), intent(in) :: v(:)\n    end subroutine\n  end interface\nend module\nsubmodule(mb) sub\ncontains\n  module subroutine assign_log(self, v)\n    use iso_fortran_env, only: int8, int64\n    type(bs), intent(out) :: self\n    logical(int8), intent(in) :: v(:)\n    integer :: i\n    self%n = size(v)\n    self%blk = 0_int64\n    do i = 0, self%n - 1\n      if (v(i+1)) self%blk = ibset(self%blk, i)\n    end do\n  end subroutine\nend submodule\nprogram t\n  use mb\n  use iso_fortran_env, only: int8\n  logical(int8) :: lv(8) = .true.\n  type(bs) :: s\n  s = lv\n  if (s%n /= 8) error stop 1\n  if (s%blk /= 255_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assign_array_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ishftc_default_size_full_width_rotate_does_not_zero_result() {
     // The previous lowering masked the result with `(1 << size) - 1`,
     // which on AArch64 collapses to mask = 0 when size equals the
