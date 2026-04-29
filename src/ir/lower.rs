@@ -8501,14 +8501,24 @@ fn init_decls(
                                 None,
                                 None,
                             );
-                        } else if !is_complex_ty(&info.ty) {
-                            // F2018 §7.6.6: scalar initializer broadcast to
-                            // every element of the array. Previously this
+                        } else if matches!(
+                            &init_expr.node,
+                            Expr::IntegerLiteral { .. }
+                                | Expr::RealLiteral { .. }
+                                | Expr::LogicalLiteral { .. }
+                        ) && !is_complex_ty(&info.ty)
+                        {
+                            // F2018 §7.6.6: scalar literal initializer broadcast
+                            // to every element of the array. Previously this
                             // path skipped non-AC initializers and left the
                             // stack array uninitialized — `logical :: a(4)
                             // = .true.` returned all-junk for any array
-                            // size > 0. Lower the scalar once, then store
-                            // it at each element offset.
+                            // size > 0. Lower the literal once, then store
+                            // it at each element offset.  Restricted to
+                            // literal scalars: compound expressions like
+                            // `reshape(...)` return an array descriptor that
+                            // must be element-wise copied via a different
+                            // path.
                             let total: i64 = info.dims.iter().map(|(_, n)| *n).product();
                             if total > 0 {
                                 let raw = lower_expr(b, locals, init_expr, st);
