@@ -11127,6 +11127,47 @@ fn ishftc_default_size_full_width_rotate_does_not_zero_result() {
 }
 
 #[test]
+fn use_rename_kind_selector_through_re_export_resolves_to_correct_size() {
+    // F2018 §11.2.2: a renamed USE association `bits_kind => int32`
+    // pulled through a re-exporting module must resolve to the same
+    // value the original module exports. Previously the layout pass
+    // built `const_params` by indexing `source_scope.symbols` directly,
+    // which only sees a module's *own* declarations — re-exported names
+    // (stdlib_kinds re-exports `int32`/`int64` from iso_fortran_env)
+    // returned None, kind selectors fell back to default (4), and
+    // `integer(block_kind) :: blk` shrank from 8 bytes to 4 inside
+    // derived types. This collapsed `storage_size(bitset_64)/8` from
+    // 16 to 8, so `s%set(32)` flipped both bit 0 and bit 32.
+    let src = write_program(
+        "module reexport\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  public :: int32, int64\nend module\n\nmodule m\n  use reexport, only: bits_kind => int32, block_kind => int64\n  type, abstract :: parent\n    private\n    integer(bits_kind) :: nb = 0_bits_kind\n  end type\n  type, extends(parent) :: child\n    private\n    integer(block_kind) :: blk = 0_block_kind\n  end type\nend module\n\nprogram t\n  use m\n  type(child) :: c\n  if (storage_size(c)/8 /= 16) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("use_rename_kind_reexport", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
