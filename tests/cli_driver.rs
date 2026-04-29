@@ -10840,6 +10840,79 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
 }
 
 #[test]
+fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
+    // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
+    // and an allocatable LHS forces per-element conversion. Without the
+    // converting variant of afs_assign_allocatable, the source descriptor's
+    // i32 bytes were memcpy'd verbatim into a real(:,:) buffer, so
+    // `A = reshape([6, 15, ...], [3,3])` for `real, allocatable :: A(:,:)`
+    // read every element back as a denormal float (e.g. ~8.4e-45 for 6).
+    // stdlib_linalg's example_chol/example_norm depend on this conversion.
+    let src = write_program(
+        "program t\n  implicit none\n  real, allocatable :: A(:,:)\n  A = reshape([6, 15, 55, 15, 55, 225, 55, 225, 979], [3, 3])\n  if (abs(A(1,1) - 6.0) > 1.0e-3) error stop 11\n  if (abs(A(2,1) - 15.0) > 1.0e-3) error stop 21\n  if (abs(A(3,1) - 55.0) > 1.0e-3) error stop 31\n  if (abs(A(3,3) - 979.0) > 1.0e-3) error stop 33\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("int_ac_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
+    // The reverse direction of the int→real fix: float → int allocatable
+    // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
+    // converting helper takes the same path, dispatching on dest_kind=2
+    // and src_kind=4.
+    let src = write_program(
+        "program t\n  integer, allocatable :: A(:)\n  A = [3.7, 2.1, 9.0]\n  if (A(1) /= 3) error stop 1\n  if (A(2) /= 2) error stop 2\n  if (A(3) /= 9) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real_ac_int_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
     // `print *, transpose(a)` etc. previously fell through to the
     // scalar IO path because the array-descriptor dispatch only fired
