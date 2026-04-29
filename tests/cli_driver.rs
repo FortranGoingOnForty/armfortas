@@ -11168,6 +11168,50 @@ fn use_rename_kind_selector_through_re_export_resolves_to_correct_size() {
 }
 
 #[test]
+fn submodule_local_with_use_renamed_kind_through_re_export_has_correct_width() {
+    // Companion to use_rename_kind_selector_through_re_export_resolves_to_correct_size.
+    // The earlier fix corrected the *type-layout* path (offsets of fields
+    // inside derived types). The IR-lowering path for *local* variables
+    // hits a different lookup: `find_symbol_any_scope` follows
+    // UseAssociations one hop and stopped — same single-hop bug, different
+    // call site.  Without the chase, `integer(block_kind) :: dummy` inside
+    // a submodule body fell back to default kind=4 and the local got 4
+    // bytes instead of 8.  In stdlib_bitsets's set_bit_64 that truncated
+    // `dummy = ibset(self%block, 32)` to 32 bits, dropping bit 32 and
+    // making `s%test(32)` return F immediately after `s%set(32)`.
+    //
+    // This regression test exercises both rename hops + a submodule
+    // local that depends on the renamed kind.
+    let src = write_program(
+        "module reexport2\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  public :: int32, int64\nend module\n\nmodule mb\n  use reexport2, only: bits_kind => int32, block_kind => int64\n  type :: ts\n    integer(bits_kind) :: n = 0_bits_kind\n    integer(block_kind) :: blk = 0_block_kind\n  end type\n  interface\n    module subroutine setbit(self, pos)\n      type(ts), intent(inout) :: self\n      integer(bits_kind), intent(in) :: pos\n    end subroutine\n  end interface\nend module\n\nsubmodule(mb) sub\ncontains\n  module subroutine setbit(self, pos)\n    type(ts), intent(inout) :: self\n    integer(bits_kind), intent(in) :: pos\n    integer(block_kind) :: dummy\n    dummy = ibset(self%blk, pos)\n    self%blk = dummy\n  end subroutine\nend submodule\n\nprogram t\n  use mb\n  type(ts) :: s\n  s%n = 33\n  s%blk = 0_8\n  call setbit(s, 32)\n  if (s%blk /= 4294967296_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("submodule_use_rename_kind_local", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
