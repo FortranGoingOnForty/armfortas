@@ -28165,9 +28165,18 @@ fn lower_write_items_adv(
             // tripping IR verify. Try the descriptor lowering first; on
             // success, walk the result and write each element with the
             // appropriate scalar writer.
+            //
+            // FunctionCall covers transformational array intrinsic results
+            // (matmul, transpose, shape, pack, reshape, merge, conjg…)
+            // when used inline in PRINT/WRITE — without this they would
+            // either lower to a scalar value (silently empty) or hit the
+            // generic ptr fallback that mishandles their descriptors.
             if matches!(
                 item.node,
-                Expr::BinaryOp { .. } | Expr::UnaryOp { .. } | Expr::ParenExpr { .. }
+                Expr::BinaryOp { .. }
+                    | Expr::UnaryOp { .. }
+                    | Expr::ParenExpr { .. }
+                    | Expr::FunctionCall { .. }
             ) {
                 if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
                     b,
