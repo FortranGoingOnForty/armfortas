@@ -15241,17 +15241,7 @@ fn resolve_subroutine_call_name(
 }
 
 fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
-    // Fortran identifiers are case-insensitive, but Mach-O linking is
-    // case-sensitive. Lowercase both halves so the definition and every
-    // reference produce the same symbol regardless of source casing —
-    // e.g. `process_get_ID` (TBP target) vs lowercased lookup paths
-    // would otherwise emit `_..._process_get_ID` in the body and
-    // `_..._process_get_id` at the call site.
-    format!(
-        "afs_modproc_{}_{}",
-        module_name.to_lowercase(),
-        proc_name.to_lowercase()
-    )
+    format!("afs_modproc_{}_{}", module_name.to_lowercase(), proc_name)
 }
 
 fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
