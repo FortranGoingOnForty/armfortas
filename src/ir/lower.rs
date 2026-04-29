@@ -21090,7 +21090,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                             if let Expr::Name { name: cname } = &callee.node {
                                                 matches!(
                                                     cname.to_ascii_lowercase().as_str(),
-                                                    "reshape" | "matmul" | "transpose" | "shape"
+                                                    "reshape"
+                                                        | "matmul"
+                                                        | "transpose"
+                                                        | "shape"
+                                                        | "pack"
+                                                        | "spread"
                                                 )
                                             } else {
                                                 false
@@ -31144,7 +31149,7 @@ fn expr_contains_whole_array_intrinsic(expr: &crate::ast::expr::SpannedExpr) -> 
             if let Expr::Name { name } = &callee.node {
                 if matches!(
                     name.to_ascii_lowercase().as_str(),
-                    "transpose" | "matmul" | "reshape" | "shape"
+                    "transpose" | "matmul" | "reshape" | "shape" | "pack" | "spread"
                 ) {
                     return true;
                 }
