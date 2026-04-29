@@ -8904,6 +8904,89 @@ fn eval_const_scalar_with_any_scope(
                 ConstScalar::Float(f) => ConstScalar::Float(-f),
             })
         }
+        Expr::FunctionCall { callee, args } => {
+            // F2018 §16.9.193: SIZE(ARRAY [, DIM] [, KIND]) — when the
+            // ARRAY actual is a Name resolving to a symbol with
+            // explicit-shape `array_spec`, every extent is itself a
+            // const expression so we can fold the whole product (or
+            // a single-dim extent if DIM= is given). Used by array
+            // bound declarations like `accx(0:size(nmh_acc_init)-1)`,
+            // which otherwise lower as an external `_size` call.
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let key = name.to_ascii_lowercase();
+            if key != "size" {
+                return None;
+            }
+            // First arg = ARRAY actual.
+            let arg0 = args.first()?;
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &arg0.value else {
+                return None;
+            };
+            let Expr::Name { name: arr_name } = &arg_expr.node else {
+                return None;
+            };
+            let sym = st.find_symbol_any_scope(&arr_name.to_ascii_lowercase())?;
+            if sym.attrs.array_spec.is_empty() {
+                return None;
+            }
+            // Optional DIM= (positional or keyword).
+            let dim_const = args.iter().enumerate().find_map(|(i, a)| {
+                let dim_expr = match a.keyword.as_deref() {
+                    Some(k) if k.eq_ignore_ascii_case("dim") => {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(_) => None, // kind= or other
+                    None if i == 1 => {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }?;
+                eval_const_scalar(dim_expr, param_consts).and_then(|v| match v {
+                    ConstScalar::Int(i) => Some(i as usize),
+                    _ => None,
+                })
+            });
+            let mut total: i128 = 1;
+            for (i, spec) in sym.attrs.array_spec.iter().enumerate() {
+                let crate::ast::decl::ArraySpec::Explicit { lower, upper } = spec else {
+                    return None;
+                };
+                let lo = match lower {
+                    Some(e) => match eval_const_scalar_with_any_scope(e, param_consts, st)? {
+                        ConstScalar::Int(v) => v,
+                        _ => return None,
+                    },
+                    None => 1,
+                };
+                let up = match eval_const_scalar_with_any_scope(upper, param_consts, st)? {
+                    ConstScalar::Int(v) => v,
+                    _ => return None,
+                };
+                let extent = up - lo + 1;
+                if let Some(d) = dim_const {
+                    if i + 1 == d {
+                        return Some(ConstScalar::Int(extent));
+                    }
+                    continue;
+                }
+                total = total.wrapping_mul(extent);
+            }
+            if dim_const.is_some() {
+                None
+            } else {
+                Some(ConstScalar::Int(total))
+            }
+        }
         Expr::BinaryOp { op, left, right } => {
             let lv = eval_const_scalar_with_any_scope(left, param_consts, st)?;
             let rv = eval_const_scalar_with_any_scope(right, param_consts, st)?;
