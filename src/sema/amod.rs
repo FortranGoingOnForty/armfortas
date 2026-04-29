@@ -173,6 +173,41 @@ pub fn write_amod(
         writeln!(out).unwrap();
     }
 
+    // ---- Use renames ----
+    // Record each `use M, only: a => b` as `@use_rename a = b from m`.
+    // Submodule bodies pulled in by host association need to resolve
+    // names like `block_kind` (renamed from `int64`) for kind selectors
+    // and intrinsic dispatch; without preserving the rename, the .amod
+    // can't reconstruct the kind constant and `integer(block_kind) ::
+    // dummy` falls back to the default kind.
+    let mut renames_out: Vec<(String, String, String)> = scope
+        .use_associations
+        .iter()
+        .filter_map(|ua| {
+            if ua.local_name == ua.original_name {
+                return None;
+            }
+            let src_scope = st.scope(ua.source_scope);
+            if let ScopeKind::Module(ref n) = src_scope.kind {
+                Some((
+                    ua.local_name.clone(),
+                    ua.original_name.clone(),
+                    n.to_lowercase(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    renames_out.sort();
+    renames_out.dedup();
+    for (local, original, src) in &renames_out {
+        writeln!(out, "@use_rename {} = {} from {}", local, original, src).unwrap();
+    }
+    if !renames_out.is_empty() {
+        writeln!(out).unwrap();
+    }
+
     // Collect and sort public symbols (used for procedures /
     // interfaces / derived types — those still go out public-only).
     let mut syms: Vec<(&String, &Symbol)> = scope
@@ -1118,11 +1153,24 @@ pub struct AmodInterface {
     pub access: Access,
 }
 
+/// One renamed USE association from this module's source: `use M, only: A => B`
+/// becomes `UseRename { local: "a", original: "b", source_module: "m" }`. The
+/// rename is recorded so downstream consumers (esp. submodules) can resolve
+/// the local name at .amod-load time. Without this the kind constant
+/// `block_kind => int64` is irrecoverable from a binary-only build.
+#[derive(Debug, Clone)]
+pub struct UseRename {
+    pub local: String,
+    pub original: String,
+    pub source_module: String,
+}
+
 /// Complete module interface parsed from an .amod file.
 #[derive(Debug, Clone)]
 pub struct ModuleInterface {
     pub module_name: String,
     pub dependencies: Vec<String>,
+    pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
     pub types: Vec<crate::sema::type_layout::TypeLayout>,
@@ -1182,6 +1230,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut dependencies = Vec::new();
+    let mut renames: Vec<UseRename> = Vec::new();
     let mut variables = Vec::new();
     let mut procedures = Vec::new();
     let mut types = Vec::new();
@@ -1195,6 +1244,17 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(dep.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@use_rename ") {
+            // `@use_rename <local> = <original> from <module>`
+            if let Some((lhs, mod_part)) = rest.split_once(" from ") {
+                if let Some((local, original)) = lhs.split_once(" = ") {
+                    renames.push(UseRename {
+                        local: local.trim().to_string(),
+                        original: original.trim().to_string(),
+                        source_module: mod_part.trim().to_string(),
+                    });
+                }
+            }
         } else if trimmed.starts_with("@var ") {
             variables.push(parse_var(trimmed, false));
         } else if trimmed.starts_with("@param ") {
@@ -1237,6 +1297,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     Ok(ModuleInterface {
         module_name,
         dependencies,
+        renames,
         variables,
         procedures,
         types,
