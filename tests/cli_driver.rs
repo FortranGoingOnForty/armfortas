@@ -10768,6 +10768,78 @@ fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
 }
 
 #[test]
+fn matmul_over_complex_kind4_matrices_produces_correct_results() {
+    // Pre-fix: matmul intrinsic dispatched on `is_real` only. Complex
+    // arrays (which are neither IrType::Float nor IrType::Int) routed
+    // to `afs_matmul_int` and the f32 lane bytes were multiplied as
+    // i32, producing all zeros. New `afs_matmul_complex` performs
+    // proper (a+bi)(c+di) per element, dispatching on elem_size.
+    // Test: swap matrix * identity = swap matrix.
+    let src = write_program(
+        "program t\n  complex :: x(2,2), y(2,2), z(2,2)\n  x = reshape([(0.0,0.0),(1.0,0.0),(1.0,0.0),(0.0,0.0)], [2,2])\n  y = reshape([(1.0,0.0),(0.0,0.0),(0.0,0.0),(1.0,0.0)], [2,2])\n  z = matmul(x, y)\n  if (abs(real(z(1,1))) > 1.0e-5 .or. abs(aimag(z(1,1))) > 1.0e-5) error stop 11\n  if (abs(real(z(1,2)) - 1.0) > 1.0e-5 .or. abs(aimag(z(1,2))) > 1.0e-5) error stop 12\n  if (abs(real(z(2,1)) - 1.0) > 1.0e-5 .or. abs(aimag(z(2,1))) > 1.0e-5) error stop 21\n  if (abs(real(z(2,2))) > 1.0e-5 .or. abs(aimag(z(2,2))) > 1.0e-5) error stop 22\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("matmul_complex4", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("matmul complex4 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "matmul complex4 should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("matmul complex4 run failed");
+    assert!(
+        run.status.success(),
+        "matmul complex4 should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
+    // complex(dp) matmul → afs_matmul_complex must take elem_size==16
+    // branch and use f64 lanes. We use an allocatable LHS to bypass
+    // the unrelated complex(dp) descriptor→stack-array imag-lane copy
+    // gap, isolating the matmul runtime path.
+    let src = write_program(
+        "program t\n  integer, parameter :: dp = kind(0.0d0)\n  complex(dp) :: x(2,2), y(2,2)\n  complex(dp), allocatable :: z(:,:)\n  x(1,1) = cmplx(2.0_dp, 1.0_dp, dp)\n  x(2,1) = cmplx(0.0_dp, 0.0_dp, dp)\n  x(1,2) = cmplx(0.0_dp, 0.0_dp, dp)\n  x(2,2) = cmplx(3.0_dp, -1.0_dp, dp)\n  y(1,1) = cmplx(1.0_dp, 0.0_dp, dp)\n  y(2,1) = cmplx(0.0_dp, 1.0_dp, dp)\n  y(1,2) = cmplx(1.0_dp, 1.0_dp, dp)\n  y(2,2) = cmplx(1.0_dp, 0.0_dp, dp)\n  z = matmul(x, y)\n  if (abs(real(z(1,1)) - 2.0_dp) > 1.0e-12_dp .or. abs(aimag(z(1,1)) - 1.0_dp) > 1.0e-12_dp) error stop 11\n  if (abs(real(z(1,2)) - 1.0_dp) > 1.0e-12_dp .or. abs(aimag(z(1,2)) - 3.0_dp) > 1.0e-12_dp) error stop 12\n  if (abs(real(z(2,1)) - 1.0_dp) > 1.0e-12_dp .or. abs(aimag(z(2,1)) - 3.0_dp) > 1.0e-12_dp) error stop 21\n  if (abs(real(z(2,2)) - 3.0_dp) > 1.0e-12_dp .or. abs(aimag(z(2,2)) + 1.0_dp) > 1.0e-12_dp) error stop 22\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("matmul_complex8", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("matmul complex8 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "matmul complex8 should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("matmul complex8 run failed");
+    assert!(
+        run.status.success(),
+        "matmul complex8 should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
     // F2018 §7.8: array-constructor element values for complex(dp)
     // are 16-byte aggregates (`[f64 x 2]`). The constructor lowering
