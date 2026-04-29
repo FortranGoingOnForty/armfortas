@@ -1336,6 +1336,115 @@ pub extern "C" fn afs_assign_allocatable(
     dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 }
 
+/// Element-converting allocatable assignment.
+///
+/// F2018 §10.2.1.3: when the LHS and RHS of an array assignment have
+/// different numeric element types, each element is converted to the
+/// LHS type. This entry point performs that conversion when the source
+/// descriptor's element kind differs from the destination's.
+///
+/// kind_tag: 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64
+#[no_mangle]
+pub extern "C" fn afs_assign_allocatable_convert(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    dest_kind_tag: i32,
+    src_kind_tag: i32,
+) {
+    if dest.is_null() || source.is_null() {
+        return;
+    }
+    let dest_ref = unsafe { &mut *dest };
+    let source_ref = unsafe { &*source };
+
+    if !descriptor_looks_sane(dest_ref) {
+        *dest_ref = ArrayDescriptor::zeroed();
+    }
+
+    if !source_ref.is_allocated() && source_ref.base_addr.is_null() {
+        if dest_ref.is_allocated() && !dest_ref.base_addr.is_null() {
+            unsafe {
+                libc_free(dest_ref.base_addr);
+            }
+        }
+        *dest_ref = ArrayDescriptor::zeroed();
+        return;
+    }
+
+    let dest_elem_size: i64 = match dest_kind_tag {
+        0 => 1,
+        1 => 2,
+        2 | 4 => 4,
+        3 | 5 => 8,
+        _ => return,
+    };
+
+    let shapes_match = dest_ref.rank == source_ref.rank
+        && dest_ref.elem_size == dest_elem_size
+        && (0..dest_ref.rank as usize)
+            .all(|i| dest_ref.dims[i].extent() == source_ref.dims[i].extent());
+
+    if !shapes_match || !dest_ref.is_allocated() {
+        if dest_ref.is_allocated() && !dest_ref.base_addr.is_null() {
+            unsafe {
+                libc_free(dest_ref.base_addr);
+            }
+            dest_ref.base_addr = ptr::null_mut();
+            dest_ref.flags &= !DESC_ALLOCATED;
+        }
+        dest_ref.rank = source_ref.rank;
+        dest_ref.elem_size = dest_elem_size;
+        for i in 0..source_ref.rank as usize {
+            dest_ref.dims[i] = source_ref.dims[i];
+            dest_ref.dims[i].stride = 1;
+        }
+        let bytes = dest_ref.total_bytes();
+        if bytes > 0 {
+            let ptr = unsafe { libc_malloc(bytes as usize) };
+            if ptr.is_null() {
+                eprintln!("ALLOCATE (assignment): out of memory ({} bytes)", bytes);
+                std::process::exit(1);
+            }
+            dest_ref.base_addr = ptr;
+        }
+        dest_ref.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
+    }
+
+    let n: usize = (0..source_ref.rank as usize)
+        .map(|i| source_ref.dims[i].extent() as usize)
+        .product();
+    if n == 0 || source_ref.base_addr.is_null() || dest_ref.base_addr.is_null() {
+        return;
+    }
+
+    let src_p = source_ref.base_addr;
+    let dst_p = dest_ref.base_addr;
+    for i in 0..n {
+        let src_val_f64: f64 = unsafe {
+            match src_kind_tag {
+                0 => *(src_p.add(i) as *const i8) as f64,
+                1 => *(src_p.add(2 * i) as *const i16) as f64,
+                2 => *(src_p.add(4 * i) as *const i32) as f64,
+                3 => *(src_p.add(8 * i) as *const i64) as f64,
+                4 => *(src_p.add(4 * i) as *const f32) as f64,
+                5 => *(src_p.add(8 * i) as *const f64),
+                _ => return,
+            }
+        };
+        unsafe {
+            match dest_kind_tag {
+                0 => *(dst_p.add(i) as *mut i8) = src_val_f64 as i8,
+                1 => *(dst_p.add(2 * i) as *mut i16) = src_val_f64 as i16,
+                2 => *(dst_p.add(4 * i) as *mut i32) = src_val_f64 as i32,
+                3 => *(dst_p.add(8 * i) as *mut i64) = src_val_f64 as i64,
+                4 => *(dst_p.add(4 * i) as *mut f32) = src_val_f64 as f32,
+                5 => *(dst_p.add(8 * i) as *mut f64) = src_val_f64,
+                _ => return,
+            }
+        }
+    }
+}
+
 // ---- MOVE_ALLOC ----
 
 /// Transfer allocation from `from` to `to` (F2003 MOVE_ALLOC).
