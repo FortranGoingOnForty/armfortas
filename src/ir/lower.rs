@@ -28188,14 +28188,23 @@ fn lower_write_items_adv(
                     Some(ctx.contained_host_refs),
                     Some(ctx.descriptor_params),
                 ) {
-                    let writer = match &elem_ty {
-                        IrType::Int(IntWidth::I128) => "afs_write_int128",
-                        IrType::Int(IntWidth::I64) => "afs_write_int64",
-                        IrType::Int(_) => "afs_write_int",
-                        IrType::Float(FloatWidth::F64) => "afs_write_real64",
-                        IrType::Float(_) => "afs_write_real",
-                        IrType::Bool => "afs_write_logical",
-                        _ => "afs_write_int",
+                    let is_complex_elem = is_complex_ty(&elem_ty);
+                    let writer = if is_complex_elem {
+                        if complex_float_width(&elem_ty) == FloatWidth::F64 {
+                            "afs_write_complex_f64"
+                        } else {
+                            "afs_write_complex_f32"
+                        }
+                    } else {
+                        match &elem_ty {
+                            IrType::Int(IntWidth::I128) => "afs_write_int128",
+                            IrType::Int(IntWidth::I64) => "afs_write_int64",
+                            IrType::Int(_) => "afs_write_int",
+                            IrType::Float(FloatWidth::F64) => "afs_write_real64",
+                            IrType::Float(_) => "afs_write_real",
+                            IrType::Bool => "afs_write_logical",
+                            _ => "afs_write_int",
+                        }
                     };
                     let n = b.call(
                         FuncRef::External("afs_array_size".into()),
@@ -28215,12 +28224,24 @@ fn lower_write_items_adv(
                     b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
                     b.set_block(bb_body);
                     let i_val = b.load(i_addr);
-                    let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
-                    b.call(
-                        FuncRef::External(writer.into()),
-                        vec![unit, elem],
-                        IrType::Void,
-                    );
+                    if is_complex_elem {
+                        // Complex writers expect a pointer to the
+                        // [f32/f64 x 2] buffer, not a loaded aggregate.
+                        let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+                        let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_size);
+                        b.call(
+                            FuncRef::External(writer.into()),
+                            vec![unit, elem_ptr],
+                            IrType::Void,
+                        );
+                    } else {
+                        let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
+                        b.call(
+                            FuncRef::External(writer.into()),
+                            vec![unit, elem],
+                            IrType::Void,
+                        );
+                    }
                     let one = b.const_i64(1);
                     let next = b.iadd(i_val, one);
                     b.store(next, i_addr);
