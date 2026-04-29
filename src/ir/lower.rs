@@ -37416,6 +37416,98 @@ fn is_type_or_extends(
 }
 
 /// Convert TypeInfo to IR type for field loads.
+/// Resolve a numeric inquiry intrinsic argument (HUGE/TINY/EPSILON/...) to
+/// the IR element type of the actual. Walks Name and ComponentAccess only —
+/// the inquiry result depends solely on the type/kind, so we never need to
+/// evaluate the argument. Returns None when the actual's type can't be
+/// resolved at compile time, in which case the caller falls back to the
+/// value-based handler.
+fn ast_arg_element_ir_type(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    _type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<IrType> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                return Some(info.ty.clone());
+            }
+            let sym = st.find_symbol_any_scope(&key)?;
+            let ti = sym.type_info.as_ref()?;
+            Some(type_info_to_ir_type(ti))
+        }
+        _ => None,
+    }
+}
+
+/// F2018 §16.9.96/130/79/178/176/61: emit the compile-time constant for a
+/// numeric inquiry intrinsic given the argument's IR element type. Mirrors
+/// the value-based arms in `lower_intrinsic` but driven from the AST so it
+/// works for array actuals (which lower to descriptor pointers).
+fn lower_numeric_inquiry_constant(
+    b: &mut FuncBuilder,
+    name: &str,
+    elem_ty: &IrType,
+) -> Option<ValueId> {
+    match name {
+        "huge" => match elem_ty {
+            IrType::Int(IntWidth::I8) => Some(b.const_i32(i8::MAX as i32)),
+            IrType::Int(IntWidth::I16) => Some(b.const_i32(i16::MAX as i32)),
+            IrType::Int(IntWidth::I32) => Some(b.const_i32(i32::MAX)),
+            IrType::Int(IntWidth::I64) => Some(b.const_i64(i64::MAX)),
+            IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::MAX)),
+            IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::MAX)),
+            _ => None,
+        },
+        "tiny" => match elem_ty {
+            IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::MIN_POSITIVE)),
+            IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::MIN_POSITIVE)),
+            _ => None,
+        },
+        "epsilon" => match elem_ty {
+            IrType::Float(FloatWidth::F32) => Some(b.const_f32(f32::EPSILON)),
+            IrType::Float(FloatWidth::F64) => Some(b.const_f64(f64::EPSILON)),
+            _ => None,
+        },
+        "precision" => {
+            let p = match elem_ty {
+                IrType::Float(FloatWidth::F32) => 6,
+                IrType::Float(FloatWidth::F64) => 15,
+                _ => return None,
+            };
+            Some(b.const_i32(p))
+        }
+        "range" => {
+            let r = match elem_ty {
+                IrType::Int(IntWidth::I8) => 2,
+                IrType::Int(IntWidth::I16) => 4,
+                IrType::Int(IntWidth::I32) => 9,
+                IrType::Int(IntWidth::I64) => 18,
+                IrType::Int(IntWidth::I128) => 38,
+                IrType::Float(FloatWidth::F32) => 37,
+                IrType::Float(FloatWidth::F64) => 307,
+                _ => return None,
+            };
+            Some(b.const_i32(r))
+        }
+        "digits" => {
+            let d = match elem_ty {
+                IrType::Int(IntWidth::I8) => 7,
+                IrType::Int(IntWidth::I16) => 15,
+                IrType::Int(IntWidth::I32) => 31,
+                IrType::Int(IntWidth::I64) => 63,
+                IrType::Float(FloatWidth::F32) => 24,
+                IrType::Float(FloatWidth::F64) => 53,
+                _ => return None,
+            };
+            Some(b.const_i32(d))
+        }
+        _ => None,
+    }
+}
+
 fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType {
     use crate::sema::symtab::TypeInfo;
     if let TypeInfo::Derived(name) | TypeInfo::Class(name) = ti {
@@ -41952,6 +42044,39 @@ fn lower_expr_full(
                         descriptor_params,
                     ) {
                         return tmp;
+                    }
+                }
+
+                // F2018 §16.9.96/130/79/178/176/61: HUGE/TINY/EPSILON/PRECISION/
+                // RANGE/DIGITS are numeric inquiry intrinsics whose result depends
+                // ONLY on the type/kind of the argument, not its value. The
+                // standard `lower_intrinsic` path lowers each argument to a
+                // ValueId first; for an array actual that's the descriptor
+                // pointer, which doesn't reveal the element kind, so the match
+                // falls through and a bare `bl _huge` external is emitted.
+                // Resolve from the AST type of the actual instead. Surfaced in
+                // stdlib_sorting `if (array_size > huge(index))` where `index`
+                // is `integer(int_index_low)` declared with shape `(0:)`.
+                if !has_named_interface
+                    && matches!(
+                        key.as_str(),
+                        "huge" | "tiny" | "epsilon" | "precision" | "range" | "digits"
+                    )
+                {
+                    if let Some(arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(arg_expr) = &arg.value {
+                            if let Some(elem_ty) = ast_arg_element_ir_type(
+                                arg_expr,
+                                locals,
+                                st,
+                                type_layouts,
+                            ) {
+                                if let Some(v) = lower_numeric_inquiry_constant(b, &key, &elem_ty)
+                                {
+                                    return v;
+                                }
+                            }
+                        }
                     }
                 }
 
