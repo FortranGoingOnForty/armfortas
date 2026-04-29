@@ -10972,6 +10972,43 @@ fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
 }
 
 #[test]
+fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
+    // `bit_size(1_int64)` in a module parameter declaration must fold to
+    // 64 even when the kind is the iso_fortran_env name `int64` rather
+    // than a literal `8`. Previously eval_const_scalar parsed the suffix
+    // numerically only and fell through, leaving MAX_INT_BIT_SIZE = 0,
+    // which made stdlib_random's dist_rand_iint64 compute k = 0 - 64 = -64
+    // and trigger `error stop "Integer bit size > 64bit"`.
+    let src = write_program(
+        "module mr\n  use iso_fortran_env, only: int64\n  implicit none\n  integer, parameter :: MAX_INT_BIT_SIZE = bit_size(1_int64)\nend module\n\nprogram t\n  use mr, only: MAX_INT_BIT_SIZE\n  if (MAX_INT_BIT_SIZE /= 64) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("bit_size_named_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
