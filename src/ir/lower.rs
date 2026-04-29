@@ -13868,13 +13868,56 @@ fn defined_assignment_arg_semantic_match(
     declared: &crate::sema::symtab::TypeInfo,
     actual: Option<&crate::sema::symtab::TypeInfo>,
 ) -> bool {
+    use crate::sema::symtab::TypeInfo;
+
+    // F2018 §10.2.1.4: a defined assignment specific is selected by
+    // the declared types AND kinds of its dummies.  The previous
+    // `_ => true` wildcard let `assign_logint8_64` lose to
+    // `assign_logint32_64` whenever both sat in the same generic —
+    // stdlib_bitsets has 4 logical-kind variants for bitset_64 and 4
+    // for bitset_large, so a `set = logical(int8) :: lv(:)` actual
+    // matched all of them and the first specific in declaration order
+    // (kind=4) won.  Inside the wrong specific, `logical_vector(i+1)`
+    // strode 4 bytes per element across a kind=1 array, dropping
+    // every fourth element from the bit_count.
     match declared {
-        crate::sema::symtab::TypeInfo::Derived(decl_name) => matches!(
+        TypeInfo::Derived(decl_name) => matches!(
             actual,
-            Some(crate::sema::symtab::TypeInfo::Derived(actual_name))
+            Some(TypeInfo::Derived(actual_name))
                 if actual_name.eq_ignore_ascii_case(decl_name)
         ),
-        _ => true,
+        TypeInfo::Class(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
+        TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. }) | None),
+        TypeInfo::Integer { kind: dk } => match actual {
+            Some(TypeInfo::Integer { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::Real { kind: dk } => match actual {
+            Some(TypeInfo::Real { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::DoublePrecision => matches!(
+            actual,
+            Some(TypeInfo::DoublePrecision) | Some(TypeInfo::Real { kind: Some(8) }) | None
+        ),
+        TypeInfo::Complex { kind: dk } => match actual {
+            Some(TypeInfo::Complex { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::Logical { kind: dk } => match actual {
+            Some(TypeInfo::Logical { kind: ak }) => intrinsic_kind_matches(*dk, *ak),
+            None => true,
+            _ => false,
+        },
+        TypeInfo::ClassStar => matches!(actual, Some(TypeInfo::ClassStar) | None),
+        TypeInfo::TypeStar => matches!(actual, Some(TypeInfo::TypeStar) | None),
     }
 }
 
