@@ -10810,6 +10810,83 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
+    // F2018 §11.2.3: a submodule has full access to its parent module's
+    // PRIVATE entities by host association. Previously `write_amod` only
+    // emitted public NamedInterface symbols, so a submodule compiled in a
+    // separate invocation read the parent's .amod and saw no generic
+    // interface for `priv_gen` — `resolve_subroutine_call_name` then fell
+    // through to `resolved_symbol_call_target`, which emitted a bare
+    // `bl _priv_gen` instead of dispatching to the matching specific.
+    // Surfaced in stdlib `stdlib_intrinsics_matmul.f90`: ~8 BL
+    // relocations to `_stdlib_matmul_sub` (un-mangled) at link time,
+    // breaking every example_matmul build. Now every NamedInterface ships
+    // in the .amod with a `, private` marker for parent-private ones; the
+    // loader (`load_external_module_from_amod` in resolve.rs) restores
+    // `Symbol.attrs.access` so ordinary `USE` consumers still filter the
+    // private interface out via the existing private-access path in
+    // `SymbolTable::lookup_in_guarded`, while a submodule's
+    // `is_submodule_access` USE-association lets it through.
+    let dir = unique_dir("priv_iface");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module mp\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  private\n  public :: pub_call\n\n  interface priv_gen\n    module subroutine priv_a(out, x)\n      integer(int32), intent(out) :: out\n      integer(int32), intent(in)  :: x\n    end subroutine\n    module subroutine priv_b(out, x)\n      integer(int64), intent(out) :: out\n      integer(int64), intent(in)  :: x\n    end subroutine\n  end interface priv_gen\n\n  interface\n    module subroutine pub_call(r32, r64)\n      integer(int32), intent(out) :: r32\n      integer(int64), intent(out) :: r64\n    end subroutine\n  end interface\nend module\n",
+    );
+    let child = write_program_in(
+        &dir,
+        "child.f90",
+        "submodule (mp) mp_imp\ncontains\n  module subroutine priv_a(out, x)\n    integer(int32), intent(out) :: out\n    integer(int32), intent(in)  :: x\n    out = x + 1_int32\n  end subroutine\n  module subroutine priv_b(out, x)\n    integer(int64), intent(out) :: out\n    integer(int64), intent(in)  :: x\n    out = x + 2_int64\n  end subroutine\n  module subroutine pub_call(r32, r64)\n    integer(int32), intent(out) :: r32\n    integer(int64), intent(out) :: r64\n    call priv_gen(r32, 10_int32)\n    call priv_gen(r64, 100_int64)\n  end subroutine\nend submodule\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program t\n  use mp\n  use iso_fortran_env, only: int32, int64\n  integer(int32) :: r32\n  integer(int64) :: r64\n  call pub_call(r32, r64)\n  if (r32 /= 11_int32) error stop 1\n  if (r64 /= 102_int64) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let parent_o = dir.join("parent.o");
+    let child_o = dir.join("child.o");
+    let main_o = dir.join("main.o");
+    let bin = dir.join("priv_iface_bin");
+
+    for (src, obj) in [(&parent, &parent_o), (&child, &child_o), (&main, &main_o)] {
+        let out = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", src.file_name().unwrap().to_str().unwrap()])
+            .args(["-o", obj.file_name().unwrap().to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            out.status.success(),
+            "compiling {} should succeed: {}",
+            src.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["parent.o", "child.o", "main.o", "-o", "priv_iface_bin"])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "private generic dispatch through submodule should link cleanly: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("priv_iface run failed");
+    assert!(
+        run.status.success(),
+        "submodule call through private generic should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
     // F2018 §7.4.4: a scalar value initializing an array PARAMETER is
     // broadcast to every element. Two paths broke this for module-level
