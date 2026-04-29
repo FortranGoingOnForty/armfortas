@@ -22918,8 +22918,31 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             }
 
+            // Pre-rewrite mask and body: any residual `name(section)`
+            // FunctionCall AST node referencing a scalarized array name
+            // would, after substitution, dispatch through the user-call
+            // path on a scalar local and emit an undefined `bl _name` at
+            // link time. Folding it to bare `Name` makes the substituted
+            // per-iter scalar binding pick up at the element index.
+            // Stdlib pattern: `where (lambda(1:m) > 0.0_sp) sv(1:m) =
+            // sqrt(lambda(1:m) * real(n-1, sp))` — both `lambda(1:m)`
+            // and `sv(1:m)` are scalarized to `lambda` / `sv` per iter.
+            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
+            let rewritten_body: Vec<SpannedStmt> = body
+                .iter()
+                .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
+                .collect();
+            let rewritten_else: Vec<SpannedStmt> = elsewhere
+                .first()
+                .map(|(_m, els)| {
+                    els.iter()
+                        .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Evaluate mask with element-level bindings.
-            let cond = lower_expr_ctx_tl(b, ctx, mask);
+            let cond = lower_expr_ctx_tl(b, ctx, &rewritten_mask);
 
             let bb_then = b.create_block("where_then");
             let bb_else = b.create_block("where_else");
@@ -22927,14 +22950,14 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
 
             b.set_block(bb_then);
-            lower_stmts(b, ctx, body);
+            lower_stmts(b, ctx, &rewritten_body);
             if b.func().block(b.current_block()).terminator.is_none() {
                 b.branch(bb_incr, vec![]);
             }
 
             b.set_block(bb_else);
-            if let Some((_else_mask, else_body)) = elsewhere.first() {
-                lower_stmts(b, ctx, else_body);
+            if !rewritten_else.is_empty() {
+                lower_stmts(b, ctx, &rewritten_else);
             }
             if b.func().block(b.current_block()).terminator.is_none() {
                 b.branch(bb_incr, vec![]);
@@ -23057,13 +23080,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 }
             }
 
-            let cond = lower_expr_ctx_tl(b, ctx, mask);
+            // See WhereConstruct: residual `name(section)` calls in the
+            // mask/stmt would emit undefined externals after the
+            // substitution. Fold them to bare `Name` so the per-iter
+            // scalar binding picks up.
+            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
+            let rewritten_stmt = rewrite_scalarized_section_refs_stmt(stmt, &array_names);
+
+            let cond = lower_expr_ctx_tl(b, ctx, &rewritten_mask);
             let bb_then = b.create_block("where_stmt_then");
             let bb_incr = b.create_block("where_stmt_incr");
             b.cond_branch(cond, bb_then, vec![], bb_incr, vec![]);
 
             b.set_block(bb_then);
-            lower_stmt(b, ctx, stmt);
+            lower_stmt(b, ctx, &rewritten_stmt);
             if b.func().block(b.current_block()).terminator.is_none() {
                 b.branch(bb_incr, vec![]);
             }
@@ -35942,6 +35972,103 @@ fn lower_array_assign(
 }
 
 /// Collect all array variable names referenced in an expression.
+/// Rewrite `name(section)` → `name` everywhere in `expr` for any name in
+/// `scalarized`. Used by WHERE-construct lowering: after the array name has
+/// been substituted to a per-iteration scalar local, a residual FunctionCall
+/// AST node (`lambda(1:m)`) would still try to dispatch through the user-call
+/// path and emit an undefined `bl _lambda`. Folding it to bare `Name` makes
+/// the existing scalar-name lookup pick up the per-iter binding instead.
+fn rewrite_scalarized_section_refs(
+    expr: &crate::ast::expr::SpannedExpr,
+    scalarized: &[String],
+) -> crate::ast::expr::SpannedExpr {
+    use crate::ast::Spanned;
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if scalarized.iter().any(|s| s == &key) {
+                    return Spanned::new(Expr::Name { name: name.clone() }, expr.span);
+                }
+            }
+            let new_callee = Box::new(rewrite_scalarized_section_refs(callee, scalarized));
+            let new_args: Vec<crate::ast::expr::Argument> = args
+                .iter()
+                .map(|a| crate::ast::expr::Argument {
+                    keyword: a.keyword.clone(),
+                    value: match &a.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            crate::ast::expr::SectionSubscript::Element(
+                                rewrite_scalarized_section_refs(e, scalarized),
+                            )
+                        }
+                        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                            crate::ast::expr::SectionSubscript::Range {
+                                start: start
+                                    .as_ref()
+                                    .map(|e| rewrite_scalarized_section_refs(e, scalarized)),
+                                end: end
+                                    .as_ref()
+                                    .map(|e| rewrite_scalarized_section_refs(e, scalarized)),
+                                stride: stride
+                                    .as_ref()
+                                    .map(|e| rewrite_scalarized_section_refs(e, scalarized)),
+                            }
+                        }
+                    },
+                })
+                .collect();
+            Spanned::new(
+                Expr::FunctionCall {
+                    callee: new_callee,
+                    args: new_args,
+                },
+                expr.span,
+            )
+        }
+        Expr::BinaryOp { op, left, right } => Spanned::new(
+            Expr::BinaryOp {
+                op: op.clone(),
+                left: Box::new(rewrite_scalarized_section_refs(left, scalarized)),
+                right: Box::new(rewrite_scalarized_section_refs(right, scalarized)),
+            },
+            expr.span,
+        ),
+        Expr::UnaryOp { op, operand } => Spanned::new(
+            Expr::UnaryOp {
+                op: op.clone(),
+                operand: Box::new(rewrite_scalarized_section_refs(operand, scalarized)),
+            },
+            expr.span,
+        ),
+        Expr::ParenExpr { inner } => Spanned::new(
+            Expr::ParenExpr {
+                inner: Box::new(rewrite_scalarized_section_refs(inner, scalarized)),
+            },
+            expr.span,
+        ),
+        _ => expr.clone(),
+    }
+}
+
+fn rewrite_scalarized_section_refs_stmt(
+    stmt: &SpannedStmt,
+    scalarized: &[String],
+) -> SpannedStmt {
+    use crate::ast::Spanned;
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        Stmt::Assignment { target, value } => Spanned::new(
+            Stmt::Assignment {
+                target: rewrite_scalarized_section_refs(target, scalarized),
+                value: rewrite_scalarized_section_refs(value, scalarized),
+            },
+            stmt.span,
+        ),
+        _ => stmt.clone(),
+    }
+}
+
 fn collect_array_names(
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
