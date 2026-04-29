@@ -10810,6 +10810,49 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
+    // F2018 §16.9.96: HUGE(X) returns the largest representable value
+    // of X's type/kind. The value-driven `lower_intrinsic("huge",
+    // ...)` arm reads the lowered value's IR type, which for an array
+    // actual is the descriptor pointer — not the element type — so
+    // the match falls through and the call is emitted as a bare
+    // `bl _huge` external. Surfaced in stdlib `stdlib_sorting`'s
+    // `if (array_size > huge(index))` (where `index` is an
+    // explicit-shape `integer(int32)` dummy with shape `(0:)`).
+    // The new AST-level pre-handler resolves the actual's element
+    // type via `find_symbol_any_scope`/`type_info_to_ir_type` and
+    // emits the constant directly, also covering TINY/EPSILON/
+    // PRECISION/RANGE/DIGITS for the same shape.
+    let src = write_program(
+        "subroutine sub(index)\n  use iso_fortran_env, only: int32\n  implicit none\n  integer(int32), intent(out) :: index(0:)\n  integer(int32) :: array_size\n  array_size = 5\n  if (array_size > huge(index)) then\n    error stop 1\n  end if\n  index = 0\nend subroutine\n\nprogram t\n  use iso_fortran_env, only: int32\n  implicit none\n  integer(int32) :: idx(5)\n  call sub(idx)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("huge_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("huge_array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "huge over array actual must link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("huge_array run failed");
+    assert!(
+        run.status.success(),
+        "huge over array actual should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
     // Fortran is case-insensitive but Mach-O is not. Module-procedure
     // body emission via `module_procedure_symbol_name` lowercases only
