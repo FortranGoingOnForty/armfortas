@@ -167,6 +167,14 @@ struct LocalInfo {
     runtime_dim_upper: Vec<Option<ValueId>>,
     /// True when the declaration used CLASS(...) rather than TYPE(...).
     is_class: bool,
+    /// Logical kind from the source declaration (1, 2, 4, or 8) when the
+    /// variable is `logical(kind)`. Default-kind logical leaves this as
+    /// Some(4); non-logical declarations leave it None. Needed because
+    /// kind=1/2/8 logicals are stored as `IrType::Int(I8/I16/I64)` to get
+    /// kind-correct storage size, which would otherwise be indistinguishable
+    /// from real integer locals at later lookup points
+    /// (semantic-type recovery, generic dispatch, print formatting, etc.).
+    logical_kind: Option<u8>,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -301,6 +309,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
     }
@@ -321,6 +330,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
     }
@@ -2058,6 +2068,7 @@ fn install_common_locals(
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
             }
@@ -2243,6 +2254,7 @@ fn install_equivalence_locals(
                             is_pointer: false,
                             runtime_dim_upper: vec![None; m.dims.len()],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                 }
@@ -2843,6 +2855,7 @@ fn collect_implicit_locals(
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
                 continue;
@@ -4176,6 +4189,12 @@ fn lower_unit(
                             is_pointer,
                             runtime_dim_upper: vec![],
                             is_class: decl_is_class(pname, decls),
+                            logical_kind: arg_logical_kind_from_decls(
+                                pname,
+                                decls,
+                                Some(&visible_param_consts),
+                                st,
+                            ),
                         };
                         ctx.locals.insert(pname.clone(), info);
                         if decl_is_optional(pname, decls) {
@@ -4618,6 +4637,12 @@ fn lower_unit(
                                 is_pointer,
                                 runtime_dim_upper: vec![],
                                 is_class: decl_is_class(pname, decls),
+                                logical_kind: arg_logical_kind_from_decls(
+                                    pname,
+                                    decls,
+                                    Some(&visible_param_consts),
+                                    st,
+                                ),
                             },
                         );
                         if decl_is_optional(pname, decls) {
@@ -4694,6 +4719,7 @@ fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::DerivedAggregate {
@@ -4723,6 +4749,7 @@ fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                     ctx.result_addr = Some(ValueId(0));
@@ -4764,6 +4791,7 @@ fn lower_unit(
                             is_pointer: true,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                     ctx.result_addr = Some(result_addr);
@@ -4806,6 +4834,7 @@ fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                     ctx.result_addr = Some(result_addr);
@@ -6419,6 +6448,7 @@ fn install_host_param_consts(
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
     }
@@ -6999,6 +7029,7 @@ fn install_one_global(
             is_pointer: info.is_pointer,
             runtime_dim_upper: vec![],
             is_class: false,
+            logical_kind: None,
         },
     );
 }
@@ -7289,6 +7320,7 @@ fn install_globals_as_locals_in(
                                         is_pointer: false,
                                         runtime_dim_upper: vec![],
                                         is_class: false,
+            logical_kind: None,
                                     },
                                 );
                             } else {
@@ -7311,6 +7343,7 @@ fn install_globals_as_locals_in(
                                         is_pointer: false,
                                         runtime_dim_upper: vec![],
                                         is_class: false,
+            logical_kind: None,
                                     },
                                 );
                             }
@@ -7489,6 +7522,7 @@ fn alloc_decls(
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                     continue;
@@ -7524,6 +7558,7 @@ fn alloc_decls(
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                         continue;
@@ -7556,6 +7591,7 @@ fn alloc_decls(
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
                                 is_class: true,
+                                logical_kind: None,
                             },
                         );
                         continue;
@@ -7589,6 +7625,7 @@ fn alloc_decls(
                             is_pointer: is_pointer_attr,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                     continue;
@@ -7759,6 +7796,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                         continue;
@@ -7827,6 +7865,7 @@ fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
+            logical_kind: None,
                                 },
                             );
                         } else {
@@ -7853,6 +7892,7 @@ fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
+            logical_kind: None,
                                 },
                             );
                         }
@@ -7887,6 +7927,7 @@ fn alloc_decls(
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                         continue;
@@ -7928,6 +7969,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                         continue; // skip normal path
@@ -7987,6 +8029,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                         continue;
@@ -8043,6 +8086,11 @@ fn alloc_decls(
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
                             is_class: matches!(type_spec, TypeSpec::Class(_)),
+                            logical_kind: if let TypeSpec::Logical(sel) = type_spec {
+                                Some(extract_kind_with_context(sel, 4, Some(&param_consts), Some(st)))
+                            } else {
+                                None
+                            },
                         },
                     );
                 } else if let Some(specs) = array_spec {
@@ -8134,6 +8182,11 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+                                logical_kind: if let TypeSpec::Logical(sel) = type_spec {
+                                    Some(extract_kind_with_context(sel, 4, Some(&param_consts), Some(st)))
+                                } else {
+                                    None
+                                },
                             },
                         );
                     } else {
@@ -8170,6 +8223,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
                             },
                         );
                     }
@@ -8199,6 +8253,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                     } else {
@@ -8219,6 +8274,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             },
                         );
                     }
@@ -8256,6 +8312,7 @@ fn alloc_decls(
                             is_pointer: true,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                 } else {
@@ -8296,6 +8353,7 @@ fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
+            logical_kind: None,
                                 },
                             );
                             continue;
@@ -8332,6 +8390,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
                             },
                         );
                     } else {
@@ -8351,6 +8410,7 @@ fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
                             },
                         );
                     }
@@ -8441,6 +8501,24 @@ fn init_decls(
                                 None,
                                 None,
                             );
+                        } else if !is_complex_ty(&info.ty) {
+                            // F2018 §7.6.6: scalar initializer broadcast to
+                            // every element of the array. Previously this
+                            // path skipped non-AC initializers and left the
+                            // stack array uninitialized — `logical :: a(4)
+                            // = .true.` returned all-junk for any array
+                            // size > 0. Lower the scalar once, then store
+                            // it at each element offset.
+                            let total: i64 = info.dims.iter().map(|(_, n)| *n).product();
+                            if total > 0 {
+                                let raw = lower_expr(b, locals, init_expr, st);
+                                let val = coerce_to_type(b, raw, &info.ty);
+                                for i in 0..total {
+                                    let idx = b.const_i64(i);
+                                    let slot = b.gep(info.addr, vec![idx], info.ty.clone());
+                                    b.store(val, slot);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -11189,6 +11267,7 @@ fn lower_logical_reduction_intrinsic_ast(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 },
             );
 
@@ -11294,6 +11373,7 @@ fn lower_logical_reduction_intrinsic_ast(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 },
             );
 
@@ -13961,6 +14041,15 @@ fn local_semantic_type_info(
         }
     }
 
+    // F2018 §16.10.5: a `logical(kind)` declaration with kind != 4 is
+    // stored as the matching `Int(width)` to keep storage size and
+    // descriptor stride kind-correct. Without this branch the
+    // recovered semantic type would be `Integer { kind: 1/2/8 }`,
+    // breaking generic dispatch on `logical(int8/16/64)` formals
+    // (sema's `generic_declared_semantic_match` rejects Logical-vs-Integer).
+    if let Some(kind) = info.logical_kind {
+        return Some(TypeInfo::Logical { kind: Some(kind) });
+    }
     let mut peeled = info.ty.clone();
     while let IrType::Ptr(inner) | IrType::Array(inner, _) = peeled {
         peeled = *inner;
@@ -14687,7 +14776,39 @@ fn try_defined_assignment(
     // RHS for ASSIGNMENT(=) is passed by reference to match
     // intent(in) dummy semantics — build a temp slot for scalar
     // values (the common case for user assignment from integer etc).
-    let rhs_for_call = if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+    // For an array actual whose formal is assumed-shape (`v(:)` etc.),
+    // F2018 §15.5.2 requires a descriptor.  Without this, the user
+    // assignment received the array's raw data pointer and read its
+    // first 384 bytes as the descriptor — manifesting as junk
+    // (rank=77M, base=0x0101010101010101 etc.).  stdlib_bitsets'
+    // `set0 = logical1` (overloaded `assign_logint8_64`) is the
+    // motivating repro.
+    let rhs_for_call = if let Expr::Name { name } = &rhs.node {
+        let key = name.to_lowercase();
+        if let Some(info) = ctx.locals.get(&key) {
+            if !info.dims.is_empty() {
+                if local_uses_array_descriptor(info) {
+                    array_descriptor_addr(b, info)
+                } else {
+                    materialize_array_descriptor_for_info(b, info)
+                }
+            } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+                let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
+                let slot = b.alloca(ty);
+                b.store(rhs_val, slot);
+                slot
+            } else {
+                rhs_val
+            }
+        } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+            let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
+            let slot = b.alloca(ty);
+            b.store(rhs_val, slot);
+            slot
+        } else {
+            rhs_val
+        }
+    } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
         let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
         let slot = b.alloca(ty);
         b.store(rhs_val, slot);
@@ -17852,6 +17973,33 @@ fn c_f_pointer_shape_values(
 /// dummies (`character(len=*)`) currently return `CharKind::None`
 /// because the hidden-length ABI parameter that would supply the
 /// runtime length is not yet implemented.
+/// Resolve the logical kind (1, 2, 4, or 8) of a dummy argument with a
+/// `logical(kind)` type spec. Returns None for non-logical arguments.
+/// Mirrors `arg_char_kind_from_decls` for the logical kind case.
+fn arg_logical_kind_from_decls(
+    arg_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: Option<&HashMap<String, ConstScalar>>,
+    st: &SymbolTable,
+) -> Option<u8> {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &decl.node
+        {
+            for entity in entities {
+                if entity.name.to_lowercase() == key {
+                    return type_spec_logical_kind(type_spec, param_consts, Some(st));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn arg_char_kind_from_decls(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
@@ -18893,6 +19041,7 @@ fn install_host_ref_locals(
                 is_pointer: info.is_pointer,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
     }
@@ -20773,6 +20922,24 @@ fn lower_type_spec(ts: &TypeSpec) -> IrType {
     lower_type_spec_st(ts, None)
 }
 
+/// If `ts` is `TypeSpec::Logical(...)`, resolve its kind selector to a
+/// concrete logical kind (1, 2, 4, or 8). Returns None for non-logical
+/// type specifiers.  Used at every LocalInfo construction site that
+/// might be backing a logical declaration so dispatchers and printers
+/// can recover the original Fortran semantics even though the IR type
+/// is `Int(I8/I16/I64)` for kind != 4.
+fn type_spec_logical_kind(
+    ts: &TypeSpec,
+    param_consts: Option<&HashMap<String, ConstScalar>>,
+    st: Option<&SymbolTable>,
+) -> Option<u8> {
+    if let TypeSpec::Logical(sel) = ts {
+        Some(extract_kind_with_context(sel, 4, param_consts, st))
+    } else {
+        None
+    }
+}
+
 fn fixed_char_storage_ir_type(len: i64) -> IrType {
     if len <= 1 {
         IrType::Int(IntWidth::I8)
@@ -20812,7 +20979,23 @@ fn lower_type_spec_with_param_consts(
             IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
         TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
-        TypeSpec::Logical(_) => IrType::Bool,
+        TypeSpec::Logical(sel) => {
+            // F2018 §16.10.5: LOGICAL(KIND=k) where k is one of the supported
+            // logical kinds (1, 2, 4, 8). Storage matches the integer of
+            // the same kind. Default kind=4 keeps `IrType::Bool` so existing
+            // print/compare/coerce paths see a known type. Other kinds map
+            // to the matching `IrType::Int(width)` so storage size,
+            // element stride, and descriptor `elem_size` are kind-correct.
+            // Without this, `logical(int8) :: a(N) = .true.` allocated
+            // 4 N bytes on the stack while the .data path used N bytes,
+            // and `all(a)` walked the descriptor at the wrong stride.
+            match extract_kind_with_context(sel, 4, param_consts, st) {
+                1 => IrType::Int(IntWidth::I8),
+                2 => IrType::Int(IntWidth::I16),
+                8 => IrType::Int(IntWidth::I64),
+                _ => IrType::Bool,
+            }
+        }
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         TypeSpec::Type(name) | TypeSpec::Class(name) => {
             // c_ptr and c_funptr are opaque address types — i64 on ARM64.
@@ -23050,6 +23233,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                 }
@@ -23212,6 +23396,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
+            logical_kind: None,
                         },
                     );
                 }
@@ -23674,6 +23859,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 is_pointer: field.pointer,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             };
                             let source_scalar_layout = if rank == 0 && source_desc.is_none() {
                                 source_expr.and_then(|expr| {
@@ -23966,6 +24152,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 is_pointer: field.pointer,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
+            logical_kind: None,
                             };
                             let elem_size_bytes =
                                 local_storage_size_bytes(&field_info, ctx.type_layouts);
@@ -24646,6 +24833,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
             }
@@ -25535,6 +25723,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     is_pointer: tgt_field.pointer,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 })
                 .or_else(|| {
                     if let Expr::Name { name: tgt_name } = &target.node {
@@ -26513,6 +26702,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
                 addr
@@ -27882,6 +28072,7 @@ fn store_ac_implied_do(
             is_pointer: false,
             runtime_dim_upper: vec![],
             is_class: false,
+            logical_kind: None,
         },
     );
 
@@ -31575,6 +31766,7 @@ fn materialize_scalarized_rank1_constructors(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 },
             );
             Some(synth_name_expr(&name, expr.span))
@@ -32930,6 +33122,7 @@ fn try_lower_elemental_subroutine_call(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 },
             );
             temp_names_to_clean.push(temp_name.clone());
@@ -33211,6 +33404,7 @@ fn lower_rank1_elemental_call_descriptor(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: is_class_actual,
+                    logical_kind: None,
                 },
             );
             array_actuals.push((
@@ -33315,6 +33509,7 @@ fn lower_rank1_elemental_call_descriptor(
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             };
             let (src_ptr, src_len) =
                 char_array_elem_ptr_and_len_from_flat_index(b, &source_info, cur_idx)
@@ -35165,6 +35360,7 @@ fn lower_1d_section_assign(
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
                 Some((index_addr, mapped))
@@ -35521,6 +35717,7 @@ fn lower_forall_nested(
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     },
                 );
                 addr
@@ -36733,6 +36930,7 @@ fn component_intrinsic_local_info(
             is_pointer: field.pointer,
             runtime_dim_upper: vec![],
             is_class: false,
+            logical_kind: None,
         });
     }
     if field.dims.is_empty() {
@@ -36751,6 +36949,7 @@ fn component_intrinsic_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
+            logical_kind: None,
     })
 }
 
@@ -36775,6 +36974,7 @@ fn component_field_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
+            logical_kind: None,
     })
 }
 
@@ -36836,6 +37036,7 @@ fn associate_alias_local_info(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 });
             }
             // All Element subscripts — bind associate-name to a single element.
@@ -36865,6 +37066,7 @@ fn associate_alias_local_info(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 });
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
@@ -36891,6 +37093,7 @@ fn associate_alias_local_info(
                     is_pointer: false,
                     runtime_dim_upper: vec![],
                     is_class: false,
+            logical_kind: None,
                 });
             }
             None
@@ -38451,6 +38654,7 @@ fn component_array_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
+            logical_kind: None,
     })
 }
 
@@ -38649,6 +38853,7 @@ fn expr_is_character_expr(
                                     is_pointer: field.pointer,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
+            logical_kind: None,
                                 },
                             )
                         })
@@ -39275,6 +39480,7 @@ fn ensure_hidden_string_result_local(
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
         return;
@@ -39311,6 +39517,7 @@ fn ensure_hidden_string_result_local(
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
         return;
@@ -39361,6 +39568,7 @@ fn ensure_hidden_string_result_local(
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
+            logical_kind: None,
             },
         );
     }
@@ -40583,6 +40791,7 @@ fn lower_arg_by_ref_full(
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
+            logical_kind: None,
                     };
                     return derived_scalar_storage_addr_for_call(b, &info);
                 }
