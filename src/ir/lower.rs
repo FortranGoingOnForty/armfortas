@@ -35586,7 +35586,7 @@ fn lower_array_assign(
             }
         }
 
-        if let Some((src_desc, _)) = lower_array_expr_descriptor(
+        if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
             b,
             &ctx.locals,
             value,
@@ -35597,6 +35597,28 @@ fn lower_array_assign(
             Some(ctx.descriptor_params),
         ) {
             if !derived_array_needs_deep_copy {
+                // F2018 §10.2.1.3: numeric element type mismatch between
+                // RHS array result and LHS allocatable forces per-element
+                // conversion. The standard `afs_assign_allocatable` memcpys
+                // bytes verbatim, so `real, allocatable :: A(:,:); A =
+                // reshape([6,15,...],[3,3])` would deposit i32 bit
+                // patterns into a real(:,:) buffer and read them back as
+                // denormals. Detect the mismatch and dispatch to the
+                // converting variant.
+                let src_kind_tag = numeric_kind_tag_for_ir_type(&src_elem_ty);
+                let dest_kind_tag = numeric_kind_tag_for_ir_type(&dest_info.ty);
+                if let (Some(sk), Some(dk)) = (src_kind_tag, dest_kind_tag) {
+                    if sk != dk {
+                        let dk_v = b.const_i32(dk);
+                        let sk_v = b.const_i32(sk);
+                        b.call(
+                            FuncRef::External("afs_assign_allocatable_convert".into()),
+                            vec![dest_desc, src_desc, dk_v, sk_v],
+                            IrType::Void,
+                        );
+                        return;
+                    }
+                }
                 b.call(
                     FuncRef::External("afs_assign_allocatable".into()),
                     vec![dest_desc, src_desc],
@@ -36226,6 +36248,31 @@ fn first_arg_is_real(
             }
         })
         .unwrap_or(false)
+}
+
+/// Map a peeled numeric scalar IrType to the kind tag understood by
+/// afs_assign_allocatable_convert: 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64.
+/// Returns None for non-numeric or composite (Array/Ptr) types — callers
+/// should peel pointer/array wrappers first if their LHS info type carries
+/// them.
+fn numeric_kind_tag_for_ir_type(ty: &IrType) -> Option<i32> {
+    let mut probe = ty.clone();
+    loop {
+        match probe {
+            IrType::Ptr(inner) => probe = *inner,
+            IrType::Array(inner, _) => probe = *inner,
+            _ => break,
+        }
+    }
+    match probe {
+        IrType::Int(IntWidth::I8) => Some(0),
+        IrType::Int(IntWidth::I16) => Some(1),
+        IrType::Int(IntWidth::I32) => Some(2),
+        IrType::Int(IntWidth::I64) => Some(3),
+        IrType::Float(FloatWidth::F32) => Some(4),
+        IrType::Float(FloatWidth::F64) => Some(5),
+        _ => None,
+    }
 }
 
 fn first_arg_is_complex(
