@@ -6023,6 +6023,58 @@ fn eval_const_scalar(
                             None
                         }
                     }
+                    "bit_size" => {
+                        // F2018 §16.9.31: BIT_SIZE(I) returns the number of
+                        // bits in the model integer for argument I. Folds at
+                        // compile time when the argument has a known kind.
+                        // Without this, module-level
+                        // `integer, parameter :: K = bit_size(1_8)`
+                        // initializers stored zero in .data — the linked
+                        // binary then read K=0 inside any function that
+                        // imported the module, breaking F2018 §13.7
+                        // semantics. stdlib_random's MAX_INT_BIT_SIZE was
+                        // the failing repro.
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        let kind = match &e.node {
+                            Expr::IntegerLiteral { kind, .. } => match kind.as_deref() {
+                                None => 4,
+                                Some(s) => match s.parse::<i64>().ok() {
+                                    Some(k) => k,
+                                    None => {
+                                        let key = s.to_lowercase();
+                                        match key.as_str() {
+                                            "int8" => 1,
+                                            "int16" => 2,
+                                            "int32" => 4,
+                                            "int64" => 8,
+                                            _ => match param_consts.get(&key).copied() {
+                                                Some(ConstScalar::Int(v)) => v as i64,
+                                                _ => return None,
+                                            },
+                                        }
+                                    }
+                                },
+                            },
+                            Expr::Name { name } => {
+                                let key = name.to_lowercase();
+                                match key.as_str() {
+                                    "int8" => 1,
+                                    "int16" => 2,
+                                    "int32" => 4,
+                                    "int64" => 8,
+                                    _ => match param_consts.get(&key).copied() {
+                                        Some(ConstScalar::Int(v)) => v as i64,
+                                        _ => return None,
+                                    },
+                                }
+                            }
+                            _ => 4,
+                        };
+                        Some(ConstScalar::Int((kind as i128) * 8))
+                    }
                     "selected_real_kind" => {
                         if let Some(ConstScalar::Int(p)) = first_arg {
                             let p = p as i64;
