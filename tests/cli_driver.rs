@@ -11212,6 +11212,129 @@ fn submodule_local_with_use_renamed_kind_through_re_export_has_correct_width() {
 }
 
 #[test]
+fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
+    // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
+    // Without `@use_rename` records, the .amod format collapses
+    // `use stdlib_kinds, only: block_kind => int64` to just
+    // `@uses stdlib_kinds`, so a submodule body that does
+    // `integer(block_kind) :: dummy` cannot resolve `block_kind` after
+    // the parent has been compiled to a binary .amod. Result: kind
+    // selector falls back to default (4), and a 64-bit local is
+    // silently truncated to 32 bits — exactly the failure mode that
+    // dropped bit 32 in stdlib_bitsets's set_bit_64.
+    //
+    // We split the test across two compilation invocations so the
+    // submodule must rehydrate the parent's renames from the .amod
+    // alone (no in-memory symbol table carryover).
+    let parent_src = write_program(
+        "module reexport3\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  public :: int32, int64\nend module\n\nmodule mb_amod\n  use reexport3, only: bits_kind => int32, block_kind => int64\n  type :: ts\n    integer(bits_kind) :: n = 0_bits_kind\n    integer(block_kind) :: blk = 0_block_kind\n  end type\n  interface\n    module subroutine setbit(self, pos)\n      type(ts), intent(inout) :: self\n      integer(bits_kind), intent(in) :: pos\n    end subroutine\n  end interface\nend module\n",
+        "f90",
+    );
+    let parent_dir = parent_src.parent().unwrap().to_path_buf();
+    let parent_obj = unique_path("mb_amod_parent", "o");
+    let compile_parent = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            parent_src.to_str().unwrap(),
+            "-J",
+            parent_dir.to_str().unwrap(),
+            "-o",
+            parent_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile parent failed");
+    assert!(
+        compile_parent.status.success(),
+        "parent compile: {}",
+        String::from_utf8_lossy(&compile_parent.stderr)
+    );
+
+    let sub_src = write_program(
+        "submodule(mb_amod) sub\ncontains\n  module subroutine setbit(self, pos)\n    type(ts), intent(inout) :: self\n    integer(bits_kind), intent(in) :: pos\n    integer(block_kind) :: dummy\n    dummy = ibset(self%blk, pos)\n    self%blk = dummy\n  end subroutine\nend submodule\n",
+        "f90",
+    );
+    let sub_obj = unique_path("amod_use_rename_sub", "o");
+    let compile_sub = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            sub_src.to_str().unwrap(),
+            "-I",
+            parent_dir.to_str().unwrap(),
+            "-J",
+            parent_dir.to_str().unwrap(),
+            "-o",
+            sub_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile sub failed");
+    assert!(
+        compile_sub.status.success(),
+        "sub compile: {}",
+        String::from_utf8_lossy(&compile_sub.stderr)
+    );
+
+    let prog_src = write_program(
+        "program t\n  use mb_amod\n  type(ts) :: s\n  s%n = 33\n  s%blk = 0_8\n  call setbit(s, 32)\n  if (s%blk /= 4294967296_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let prog_obj = unique_path("amod_use_rename_prog", "o");
+    let compile_prog = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            prog_src.to_str().unwrap(),
+            "-I",
+            parent_dir.to_str().unwrap(),
+            "-o",
+            prog_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile prog failed");
+    assert!(
+        compile_prog.status.success(),
+        "prog compile: {}",
+        String::from_utf8_lossy(&compile_prog.stderr)
+    );
+
+    let out = unique_path("amod_use_rename_roundtrip", "bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            prog_obj.to_str().unwrap(),
+            sub_obj.to_str().unwrap(),
+            parent_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&parent_obj);
+    let _ = std::fs::remove_file(&sub_obj);
+    let _ = std::fs::remove_file(&prog_obj);
+    let _ = std::fs::remove_file(&parent_src);
+    let _ = std::fs::remove_file(&sub_src);
+    let _ = std::fs::remove_file(&prog_src);
+    let _ = std::fs::remove_file(parent_dir.join("mb_amod.amod"));
+    let _ = std::fs::remove_file(parent_dir.join("reexport3.amod"));
+}
+
+#[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
