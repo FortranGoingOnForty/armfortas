@@ -36219,6 +36219,25 @@ fn first_arg_is_real(
         .unwrap_or(false)
 }
 
+fn first_arg_is_complex(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+) -> bool {
+    args.first()
+        .and_then(|a| {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                if let Expr::Name { name } = &e.node {
+                    locals.get(&name.to_lowercase()).map(|i| is_complex_ty(&i.ty))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+}
+
 /// Lower an array section expression: a(1:10:2) → create section descriptor.
 fn lower_array_section(
     b: &mut FuncBuilder,
@@ -37322,6 +37341,7 @@ fn lower_array_intrinsic(
                 }
             })?;
             let is_real = first_arg_is_real(args, locals);
+            let is_complex = first_arg_is_complex(args, locals);
             let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero = b.const_i32(0);
             let sz384 = b.const_i64(384);
@@ -37330,7 +37350,9 @@ fn lower_array_intrinsic(
                 vec![result_desc, zero, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            let func = if is_real {
+            let func = if is_complex {
+                "afs_matmul_complex"
+            } else if is_real {
                 "afs_matmul_real8"
             } else {
                 "afs_matmul_int"
