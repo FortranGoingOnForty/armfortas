@@ -3543,6 +3543,18 @@ fn collect_module_globals(
                         }
                     }
                     let init = init_expr.and_then(|e| {
+                        // Complex parameters (e.g. `complex(sp), parameter ::
+                        // one_csp = (1._sp, 0._sp)`) live in a 2-lane Float
+                        // array global; eval_const_global_init only knows
+                        // about scalar Int/Float so it returns None and we'd
+                        // fall back to GlobalInit::Zero. F2018 §13.7 (named
+                        // constants) requires preserving the literal value;
+                        // emit a 2-element FloatArray covering [real, imag].
+                        if let Some(complex_init) =
+                            eval_const_complex_global_init(e, &param_consts, &ir_ty, st)
+                        {
+                            return Some(complex_init);
+                        }
                         if is_parameter {
                             eval_const_global_init_with_any_scope(
                                 e,
@@ -5182,6 +5194,28 @@ fn clamp_const_to_type(v: ConstScalar, target: &IrType) -> ConstScalar {
 /// store, which DOES break SAVE semantics — every new non-foldable
 /// case is a silent off-spec wrong-result, so the folder should
 /// cover as much as possible.
+/// Build a `GlobalInit::FloatArray` for a complex(sp)/complex(dp) parameter
+/// initialized with a complex literal `(re, im)`. Returns None if the target
+/// IR type is not a 2-lane float array or the expression isn't a complex
+/// literal — callers should then try the scalar paths.
+fn eval_const_complex_global_init(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    target: &IrType,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    if !matches!(target, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_))) {
+        return None;
+    }
+    let (re_expr, im_expr) = match &e.node {
+        Expr::ComplexLiteral { real, imag } => (real.as_ref(), imag.as_ref()),
+        _ => return None,
+    };
+    let re = eval_const_scalar_with_any_scope(re_expr, param_consts, st)?.to_float();
+    let im = eval_const_scalar_with_any_scope(im_expr, param_consts, st)?.to_float();
+    Some(GlobalInit::FloatArray(vec![re, im]))
+}
+
 fn eval_const_global_init(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
