@@ -13876,17 +13876,27 @@ fn same_intrinsic_semantic_type(
 fn assignment_expr_type_info(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     use crate::ast::expr::Expr;
 
+    // Prefer scope-aware lookup so a name like `string` resolves to
+    // the current procedure's dummy/local instead of leaking from a
+    // sibling procedure that happens to have a same-named declaration.
+    // See the comment in `try_defined_assignment` for the
+    // stdlib_strings strip_string/strip_char collision.
+    let lookup = |name: &str| -> Option<&crate::sema::symtab::Symbol> {
+        let key = name.to_ascii_lowercase();
+        proc_scope_id
+            .and_then(|sid| st.lookup_in(sid, &key))
+            .or_else(|| st.find_symbol_any_scope(&key))
+    };
+
     match &expr.node {
-        Expr::Name { name } => st
-            .find_symbol_any_scope(&name.to_lowercase())
-            .and_then(|sym| sym.type_info.clone()),
+        Expr::Name { name } => lookup(name).and_then(|sym| sym.type_info.clone()),
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
-                st.find_symbol_any_scope(&name.to_lowercase())
-                    .and_then(|sym| sym.type_info.clone())
+                lookup(name).and_then(|sym| sym.type_info.clone())
             } else {
                 None
             }
@@ -14750,11 +14760,23 @@ fn try_defined_assignment(
         Some(i) => i.clone(),
         None => return false,
     };
+    // Use scope-aware lookup so the LHS type info comes from the
+    // function being lowered, not a sibling procedure with a same-named
+    // local.  In stdlib_strings, both `strip_string` (LHS:
+    // type(string_type)) and `strip_char` (LHS:
+    // character(len=:), allocatable) declare a local named
+    // `stripped_string`.  The legacy `find_symbol_any_scope` picked the
+    // first match (string_type) and made `assign_string_char` a
+    // candidate inside `strip_char`, which then "resolved" and
+    // launched a string_type-expecting subroutine on a character
+    // pointer — segfault.  `lookup_in(proc_scope_id, …)` walks the
+    // current scope's USE chain and host-association ladder per
+    // F2018 §11.2, so cross-procedure name collisions stay isolated.
     let lhs_semantic_ti = ctx
-        .st
-        .find_symbol_any_scope(lhs_key)
+        .proc_scope_id
+        .and_then(|sid| ctx.st.lookup_in(sid, lhs_key))
         .and_then(|sym| sym.type_info.clone());
-    let rhs_semantic_ti = assignment_expr_type_info(rhs, ctx.st);
+    let rhs_semantic_ti = assignment_expr_type_info(rhs, ctx.st, ctx.proc_scope_id);
 
     let semantic_candidates: Vec<String> = sym
         .arg_names
