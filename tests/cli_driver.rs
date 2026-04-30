@@ -11256,6 +11256,48 @@ fn defined_assignment_dispatch_resolves_default_kind_actual_against_explicit_kin
 }
 
 #[test]
+fn defined_assignment_dispatches_when_rhs_descriptor_peels_to_same_scalar_as_lhs() {
+    // Regression: `try_defined_assignment` short-circuited via
+    // `ir_types_dispatch_equal` on the LHS/RHS IR types. For
+    // `arr = derived` where arr is a logical(int32) allocatable
+    // (LHS IrType::Bool) and derived is a 16-byte struct passed as
+    // Ptr(Array(I8, 16)), the IR walker peeled the descriptor through
+    // Ptr → Array → I8 → matched (Bool, Int(_)). The early-return
+    // bypassed the user-defined extract assignment, falling into a
+    // scalar broadcast loop that crashed on a misaligned descriptor.
+    // The gate is now semantic — same TypeInfo category — so a
+    // logical-vs-derived pair correctly routes through the defined
+    // specific.
+    let src = write_program(
+        "module mb\n  type :: counter\n    integer :: total = 0\n  end type\n  interface assignment(=)\n    module subroutine extract(arr, c)\n      use iso_fortran_env, only: int32\n      import :: counter\n      logical(int32), intent(out), allocatable :: arr(:)\n      type(counter), intent(in) :: c\n    end subroutine\n  end interface\nend module\nsubmodule(mb) sub\ncontains\n  module subroutine extract(arr, c)\n    use iso_fortran_env, only: int32\n    logical(int32), intent(out), allocatable :: arr(:)\n    type(counter), intent(in) :: c\n    integer :: i\n    allocate(arr(c%total))\n    do i = 1, c%total\n      arr(i) = .true.\n    end do\n  end subroutine\nend submodule\nprogram t\n  use mb\n  use iso_fortran_env, only: int32\n  type(counter) :: c\n  logical(int32), allocatable :: out_arr(:)\n  c%total = 5\n  out_arr = c\n  if (size(out_arr) /= 5) error stop 1\n  if (.not. all(out_arr)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_lhs_logical_rhs_derived", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
