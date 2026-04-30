@@ -11298,6 +11298,62 @@ fn defined_assignment_dispatches_when_rhs_descriptor_peels_to_same_scalar_as_lhs
 }
 
 #[test]
+fn defined_assignment_lookup_does_not_leak_lhs_type_across_sibling_procedures() {
+    // Regression: `try_defined_assignment` looked up the LHS name via
+    // `find_symbol_any_scope`, which scans every scope and returns
+    // the first match. When sibling module procedures declare a same-
+    // named local with different types — stdlib_strings has both
+    // `strip_string` (`stripped_string` is `type(string_type)`) and
+    // `strip_char` (`stripped_string` is `character(len=:),
+    // allocatable`) — the LHS type info inside `strip_char` was the
+    // string_type from `strip_string`'s scope. That made
+    // `assign_string_char` a candidate, dispatch resolved it, and
+    // `strip_char`'s character-allocatable LHS got passed to a
+    // string_type-expecting subroutine, segfaulting at runtime.
+    // The fix scopes the lookup to the current procedure's own scope
+    // (USE chain + host association per F2018 §11.2).
+    //
+    // The shape mirrors stdlib_strings — `interface assignment(=)`
+    // with a (Derived, Character) specific. `shadow_decl` declares a
+    // `tmp` of the derived type so cross-scope name lookup leaks
+    // `Derived(bag)` into `target_call`, where `tmp` is actually a
+    // character allocatable. With the leak, both IR-level argument
+    // shape checks pass over-permissively (peeling pointer to a
+    // string descriptor ≈ peeling pointer to a struct), so dispatch
+    // resolves and a string-pointer is fed to a struct-expecting
+    // subroutine. With the scope-aware lookup the LHS type info is
+    // honestly Character → no specific matches → intrinsic
+    // assignment runs.
+    let src = write_program(
+        "module mb\n  type :: bag\n    integer :: n = 0\n  end type\n  interface assignment(=)\n    module procedure :: assign_bag_char\n  end interface\ncontains\n  subroutine assign_bag_char(lhs, rhs)\n    type(bag), intent(out) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%n = len(rhs)\n  end subroutine\n  subroutine shadow_decl()\n    type(bag) :: tmp\n  end subroutine\n  subroutine target_call(out_str)\n    character(len=:), allocatable, intent(out) :: out_str\n    character(len=:), allocatable :: tmp\n    tmp = \"hi\"\n    out_str = tmp\n  end subroutine\nend module\nprogram t\n  use mb\n  character(len=:), allocatable :: s\n  call target_call(s)\n  if (s /= \"hi\") error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_lookup_no_leak", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
