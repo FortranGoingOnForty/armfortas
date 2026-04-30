@@ -13842,37 +13842,6 @@ fn fail_unmatched_bound_proc_resolution(
     std::process::exit(1);
 }
 
-/// Two assignment operands share the intrinsic-assignment semantic
-/// shape when both have the same TypeInfo category and (where kind
-/// applies) compatible kinds.  Used as the early-return gate in
-/// try_defined_assignment so a defined-assignment specific is not
-/// shadowed by coincidental IR-type peeling.
-fn same_intrinsic_semantic_type(
-    lhs: &Option<crate::sema::symtab::TypeInfo>,
-    rhs: &Option<crate::sema::symtab::TypeInfo>,
-) -> bool {
-    use crate::sema::symtab::TypeInfo;
-    let (Some(l), Some(r)) = (lhs.as_ref(), rhs.as_ref()) else {
-        return false;
-    };
-    fn kind_eq(a: Option<u8>, b: Option<u8>, default: u8) -> bool {
-        a.unwrap_or(default) == b.unwrap_or(default)
-    }
-    match (l, r) {
-        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Real { kind: a }, TypeInfo::DoublePrecision)
-        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind: a }) => kind_eq(*a, Some(8), 4),
-        (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
-        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Character { .. }, TypeInfo::Character { .. }) => true,
-        (TypeInfo::Derived(a), TypeInfo::Derived(b)) => a.eq_ignore_ascii_case(b),
-        (TypeInfo::Class(a), TypeInfo::Class(b)) => a.eq_ignore_ascii_case(b),
-        _ => false,
-    }
-}
-
 fn assignment_expr_type_info(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
@@ -14807,21 +14776,11 @@ fn try_defined_assignment(
     // cheaper; defer to them.
     let lhs_ty = lhs_info.ty.clone();
     let rhs_ty = b.func().value_type(rhs_val);
-    // Only short-circuit when LHS and RHS share a *semantic* type
-    // (kind-aware), not when their IR representations coincidentally
-    // peel to the same scalar.  Previously `ir_types_dispatch_equal`
-    // on `lv2 = s` (logical(int32) allocatable LHS, type(bitset_64)
-    // RHS) collapsed both to `Bool` because the descriptor's outer
-    // `Ptr(Array(I8, 16))` peeled to `I8` which `(Bool, Int(_))`
-    // accepted.  That bypassed the user-defined extract-assignment
-    // (`logint32_assign_64`) and fell into a scalar broadcast that
-    // crashed.  Defer to semantic equivalence: same TypeInfo category
-    // and (when present) matching kind.
-    if same_intrinsic_semantic_type(&lhs_semantic_ti, &rhs_semantic_ti)
-        && lhs_info.derived_type.is_none()
-    {
-        let _ = (&lhs_ty, &rhs_ty);
-        return false;
+    // Skip for plain scalar/scalar of matching category.
+    if let Some(rt) = rhs_ty.as_ref() {
+        if ir_types_dispatch_equal(&lhs_ty, rt) && lhs_info.derived_type.is_none() {
+            return false;
+        }
     }
 
     // For ASSIGNMENT(=) resolution, the conceptual argument list is
@@ -17257,15 +17216,7 @@ fn arg_matches_declared(
     arg_val: ValueId,
     b: &FuncBuilder,
 ) -> bool {
-    // Defined-assignment dispatch already applied a kind-aware semantic
-    // check via `defined_assignment_arg_semantic_match`; this IR-level
-    // check is a backup. For an *array* actual passed by descriptor
-    // (logical(int32), allocatable :: lv2(:)) the actual_ir arrives as
-    // a fixed byte buffer (Array(I8, 384)) rather than the declared
-    // element type (Bool). Without peeling, `lv2 = set` rejected
-    // `logint32_assign_64` and the assignment fell into a scalar
-    // broadcast path that crashed dereferencing the descriptor.
-    arg_matches_declared_elemental(decl_ti, actual_ir, arg_val, b, true)
+    arg_matches_declared_elemental(decl_ti, actual_ir, arg_val, b, false)
 }
 
 fn arg_matches_declared_elemental(
