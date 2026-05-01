@@ -16540,14 +16540,21 @@ fn emit_resolved_bound_proc_call(
                         );
                         coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                     } else if wants_descriptor {
-                        lower_arg_descriptor(
-                            b,
-                            locals,
-                            e,
-                            st,
-                            type_layouts,
-                            wants_polymorphic_descriptor,
-                        )
+                        // The static-scalar polymorphic view boxes
+                        // non-descriptor actuals into a fresh
+                        // class-star descriptor. We only want it for
+                        // actuals that have no caller descriptor to
+                        // forward — literals and non-Name expressions.
+                        // For Name actuals the regular path returns
+                        // the existing descriptor pointer; passing it
+                        // by reference is required for intent(inout)
+                        // and move_alloc semantics to flow back to
+                        // the caller (the memcpy-and-stamp polymorphic
+                        // view would otherwise hide callee writes
+                        // behind a copy).
+                        let force_box = wants_polymorphic_descriptor
+                            && !matches!(e.node, Expr::Name { .. });
+                        lower_arg_descriptor(b, locals, e, st, type_layouts, force_box)
                     } else if wants_string_descriptor {
                         lower_arg_string_descriptor(b, locals, e, st, type_layouts)
                     } else if wants_bind_c_char {
