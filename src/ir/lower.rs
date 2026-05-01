@@ -19614,6 +19614,14 @@ fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<Hidde
         | SymbolKind::ProcedurePointer => {}
         _ => return None,
     }
+    // Rank check must come BEFORE the Character match arm: a function
+    // returning `character :: cstr(N)` is rank-1, and the caller has to
+    // allocate a 384-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
+    // for the hidden result so the callee's afs_allocate_array prologue
+    // sees a real descriptor with elem_size and dim metadata.
+    if sym.attrs.result_rank > 0 {
+        return Some(HiddenResultAbi::ArrayDescriptor);
+    }
     match sym.type_info.as_ref()? {
         TypeInfo::Character { .. } => {
             if sym.attrs.binding_label.is_some() {
@@ -19623,13 +19631,6 @@ fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<Hidde
             }
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
-        // Non-allocatable array result (automatic or fixed-shape, e.g.
-        // `real, dimension(size(x)) :: w`): caller still allocates the
-        // result descriptor and passes it as a hidden first argument
-        // — same ABI as ALLOCATABLE results.  Required so callers can
-        // iterate the returned array element-wise (binary expressions,
-        // assignments, vector-subscripts).
-        _ if sym.attrs.result_rank > 0 => Some(HiddenResultAbi::ArrayDescriptor),
         TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
         _ => None,
     }
