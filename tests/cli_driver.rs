@@ -11519,6 +11519,68 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 }
 
 #[test]
+fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
+    // F2018 §15.5.2.12 + §7.3.2.3: a `class(*), intent(in), optional`
+    // dummy is passed as a 384-byte descriptor pointer.  When one
+    // procedure forwards the actual to another procedure with the
+    // same `class(*), optional` formal, the call site must route
+    // through `lower_arg_descriptor` (so the actual is forwarded as
+    // a descriptor pointer or null) — not through
+    // `lower_arg_by_ref_full`, which would dereference the dummy
+    // slot to read its first 4 bytes as a "data pointer."  Without
+    // the descriptor flag for `TypeSpec::ClassStar` scalars in
+    // `arg_uses_descriptor_from_decls`, the absent-actual case
+    // dereferenced null and segfaulted at the forwarding callsite —
+    // exactly the path exercised by stdlib_hashmaps's char_map_entry
+    // → key_map_entry forwarding of the optional `class(*) :: other`.
+    let src = write_program(
+        "program p\n\
+           implicit none\n\
+           call outer()\n\
+           call outer(42)\n\
+         contains\n\
+           subroutine outer(x)\n\
+             class(*), intent(in), optional :: x\n\
+             call inner(x)\n\
+           end subroutine\n\
+           subroutine inner(arg)\n\
+             class(*), intent(in), optional :: arg\n\
+             if (present(arg)) then\n\
+               print *, 'P'\n\
+             else\n\
+               print *, 'A'\n\
+             end if\n\
+           end subroutine\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_optional_forward", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected both calls to succeed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("A"), "expected absent path to print A: {}", stdout);
+    assert!(stdout.contains("P"), "expected present path to print P: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
