@@ -44026,36 +44026,70 @@ fn try_lower_transfer_into_array(
             // 2-arg transfer.  SIZE defaults to
             // `ceil(SRC_bytes / MOLD_elem_size)`.  We need SRC's
             // total byte count: total_elems(SRC) * src_elem_size.
-            // This requires SRC to be a whole array we can introspect.
-            let src_info = match whole_array_expr_local_info(
-                b,
-                &ctx.locals,
-                src_expr,
-                ctx.st,
-                ctx.type_layouts,
-            ) {
-                Some(info) => info,
-                None => return false,
-            };
-            let src_total_elems = array_total_elems_value(b, &src_info);
-            let src_elem_size_const = descriptor_element_size_bytes(&src_info);
-            if src_elem_size_const <= 0 {
+            // For a whole-array Name we read from the runtime
+            // descriptor; for an inline array constructor we know
+            // both the element count (constructor length) and the
+            // element size (semantic type) at compile time.
+            let (total_v, scalar_total): (ValueId, Option<i64>) = if let Some(src_info) =
+                whole_array_expr_local_info(b, &ctx.locals, src_expr, ctx.st, ctx.type_layouts)
+            {
+                let src_total_elems = array_total_elems_value(b, &src_info);
+                let src_elem_size_const = descriptor_element_size_bytes(&src_info);
+                if src_elem_size_const <= 0 {
+                    return false;
+                }
+                let src_elem_v = b.const_i64(src_elem_size_const);
+                let total = b.imul(src_total_elems, src_elem_v);
+                (total, None)
+            } else if let Expr::ArrayConstructor { values, .. } = &src_expr.node {
+                // Element count from constructor length.  Elem size
+                // from the constructor's first value's semantic type
+                // (constructors are mono-typed by F2018 §7.8).
+                let n_elems = match const_array_constructor_len(values) {
+                    Some(n) if n > 0 => n,
+                    _ => return false,
+                };
+                let elem_ti = values.first().and_then(|v| {
+                    let crate::ast::expr::AcValue::Expr(expr) = v else {
+                        return None;
+                    };
+                    operator_expr_type_info(
+                        expr,
+                        Some(&ctx.locals),
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    )
+                });
+                let src_elem_size: i64 = match elem_ti {
+                    Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
+                        kind.unwrap_or(4) as i64
+                    }
+                    Some(crate::sema::symtab::TypeInfo::Real { kind }) => {
+                        kind.unwrap_or(4) as i64
+                    }
+                    Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
+                        kind.unwrap_or(4) as i64
+                    }
+                    _ => return false,
+                };
+                let total_bytes = n_elems * src_elem_size;
+                (b.const_i64(total_bytes), Some(total_bytes))
+            } else {
                 return false;
-            }
-            let src_elem_v = b.const_i64(src_elem_size_const);
-            let total = b.imul(src_total_elems, src_elem_v);
+            };
             // ceil(total / scalar_size) for the mold extent.
             let result_size = if scalar_size == 1 {
-                total
+                total_v
+            } else if let Some(total) = scalar_total {
+                let r = (total + scalar_size - 1) / scalar_size;
+                b.const_i64(r)
             } else {
                 let denom = b.const_i64(scalar_size);
-                let one = b.const_i64(1);
                 let denom_minus_one = b.const_i64(scalar_size - 1);
-                let _ = one;
-                let num = b.iadd(total, denom_minus_one);
+                let num = b.iadd(total_v, denom_minus_one);
                 b.idiv(num, denom)
             };
-            (result_size, total)
+            (result_size, total_v)
         }
     } else {
         return false;
