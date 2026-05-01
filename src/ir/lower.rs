@@ -21297,6 +21297,28 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             lower_array_assign(b, ctx, name, &info, value);
                             return;
                         }
+                        // `arr = transfer(src, mold, N)` for an
+                        // allocatable rank-1 array. The source bits get
+                        // memcpy'd into a freshly-allocated descriptor
+                        // (handled by `try_lower_transfer_into_array`
+                        // inside lower_array_assign).  Without this
+                        // route, the generic function-result path treated
+                        // transfer's bit-cast bytes as a source
+                        // descriptor pointer and segfaulted in
+                        // `afs_assign_allocatable` on the first character
+                        // byte (e.g. 0x6d for 'm' in stdlib_hashmaps).
+                        // SIZE may be runtime-evaluated; the descriptor
+                        // path inside try_lower_transfer_into_array
+                        // lowers it via `lower_expr_ctx_tl`.
+                        if local_is_array_like(&info)
+                            && local_uses_array_descriptor(&info)
+                            && info.derived_type.is_none()
+                            && info.char_kind == CharKind::None
+                            && expr_is_transfer_array_call_dynamic(value)
+                        {
+                            lower_array_assign(b, ctx, name, &info, value);
+                            return;
+                        }
                         if local_is_array_like(&info)
                             && (info.char_kind != CharKind::None
                                 || descriptor_backed_runtime_char_array(&info))
@@ -43842,6 +43864,23 @@ fn expr_is_transfer_array_call(value: &crate::ast::expr::SpannedExpr) -> bool {
     eval_const_int(size_expr).map(|n| n >= 1).unwrap_or(false)
 }
 
+/// True when `value` is any TRANSFER call with three args.  SIZE may
+/// be a runtime expression — descriptor-backed allocatable
+/// destinations route through `try_lower_transfer_into_array`'s
+/// runtime-size branch, which lowers SIZE at runtime and allocates
+/// the descriptor accordingly.  Fixed-shape destinations need
+/// `expr_is_transfer_array_call`'s constant-SIZE gate so the static
+/// extent matches.
+fn expr_is_transfer_array_call_dynamic(value: &crate::ast::expr::SpannedExpr) -> bool {
+    let Expr::FunctionCall { callee, args } = &value.node else {
+        return false;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("transfer") && args.len() >= 3
+}
+
 /// Recognize `lhs_array = transfer(SRC, MOLD, SIZE)` with constant
 /// SIZE >= 1 and emit a direct memcpy from the source bytes into the
 /// destination's data buffer. Returns true when handled. F2018
@@ -43876,12 +43915,6 @@ fn try_lower_transfer_into_array(
     let SectionSubscript::Element(size_expr) = &args[2].value else {
         return false;
     };
-    let Some(size) = eval_const_int(size_expr) else {
-        return false;
-    };
-    if size < 1 {
-        return false;
-    }
 
     // Mold scalar byte size from the mold's semantic type.
     let mold_ti = operator_expr_type_info(
@@ -43896,18 +43929,86 @@ fn try_lower_transfer_into_array(
         Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
         _ => return false,
     };
-    let total_bytes: i64 = size * scalar_size;
-    if total_bytes <= 0 {
+
+    // Resolve the SIZE arg.  Constant size is the common case and lets
+    // us emit constant-folded memset/memcpy/allocate.  But hashmap-style
+    // wrappers compute SIZE at runtime (`bytes_char * len(value)`),
+    // and only descriptor-backed allocatable destinations can absorb
+    // that — fixed-shape buffers need a compile-time size to validate
+    // against the destination's static extent.
+    let const_size: Option<i64> = eval_const_int(size_expr).filter(|s| *s >= 1);
+    let descriptor_dest = local_uses_array_descriptor(dest_info);
+    let (size_v, total_v): (ValueId, ValueId) = if let Some(size) = const_size {
+        let total_bytes = size * scalar_size;
+        if total_bytes <= 0 {
+            return false;
+        }
+        (b.const_i64(size), b.const_i64(total_bytes))
+    } else if descriptor_dest {
+        // Lower SIZE at runtime so we can honor `transfer(src, mold,
+        // bytes_char * len(value))`.  Multiply by scalar_size in IR.
+        let size_val = lower_expr_ctx_tl(b, ctx, size_expr);
+        let size_i64 = coerce_to_type(b, size_val, &IrType::Int(IntWidth::I64));
+        let elem_v = b.const_i64(scalar_size);
+        let total = b.imul(size_i64, elem_v);
+        (size_i64, total)
+    } else {
         return false;
+    };
+
+    // For descriptor-backed allocatable destinations, the descriptor
+    // may currently be unallocated (`base_addr = NULL`) or allocated
+    // with a different shape.  F2018 §10.2.1.3 / §7.5.4.6 say the
+    // destination is reallocated to fit the source.  Without this,
+    // `arr = transfer(src, mold, N)` for `integer(int8), allocatable
+    // :: arr(:)` walked into a NULL `dest.base_addr` and the
+    // surrounding caller fell back to `afs_assign_allocatable`,
+    // which dereferenced the raw transfer source bytes as if they
+    // were a source descriptor — segfault on the very first byte.
+    if descriptor_dest {
+        let desc = array_descriptor_addr(b, dest_info);
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero32 = b.const_i32(0);
+        b.store(zero32, stat);
+        // Deallocate first if currently allocated; afs_deallocate_array
+        // is a no-op for unallocated descriptors.
+        b.call(
+            FuncRef::External("afs_deallocate_array".into()),
+            vec![desc, stat],
+            IrType::Void,
+        );
+        // Build the rank-1 dim {1, size, 1} on the stack to feed
+        // afs_allocate_array.  DimDescriptor is three i64 fields
+        // (lower_bound, upper_bound, stride) — store via i64-indexed
+        // GEPs to avoid needing a bitcast helper.
+        let dim_buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 3));
+        let one_v = b.const_i64(1);
+        let idx0 = b.const_i64(0);
+        let idx1 = b.const_i64(1);
+        let idx2 = b.const_i64(2);
+        let lb_dst = b.gep(dim_buf, vec![idx0], IrType::Int(IntWidth::I64));
+        b.store(one_v, lb_dst);
+        let ub_dst = b.gep(dim_buf, vec![idx1], IrType::Int(IntWidth::I64));
+        b.store(size_v, ub_dst);
+        let str_dst = b.gep(dim_buf, vec![idx2], IrType::Int(IntWidth::I64));
+        b.store(one_v, str_dst);
+        let elem_size_v = b.const_i64(scalar_size);
+        let rank_v = b.const_i32(1);
+        b.call(
+            FuncRef::External("afs_allocate_array".into()),
+            vec![desc, elem_size_v, rank_v, dim_buf, stat],
+            IrType::Void,
+        );
     }
 
-    // Destination data pointer.
+    // Destination data pointer.  After the optional allocate above,
+    // a descriptor-backed dest now has a valid `base_addr` of
+    // `total_bytes` bytes.
     let dest_base = array_base_addr(b, dest_info);
 
     // Zero-fill the destination so any tail bytes (when SRC has fewer
     // bytes than total) are deterministic per F2018 §16.9.193.
     let zero_b = b.const_i32(0);
-    let total_v = b.const_i64(total_bytes);
     b.call(
         FuncRef::External("memset".into()),
         vec![dest_base, zero_b, total_v],
@@ -43917,17 +44018,39 @@ fn try_lower_transfer_into_array(
     // Resolve a (src_addr, src_bytes) pair from the SRC expression. We
     // handle the two shapes that show up in stdlib hash code: a whole
     // array Name (`p`, `vx16`) and a scalar (Name or expression).
-    let (src_addr, src_bytes_const): (ValueId, i64) = if let Some((src_desc, src_elem_ty)) =
+    //
+    // Character names need explicit handling — `lower_expr_full` on
+    // `Expr::Name` of a `character(len=N)` local returns the first
+    // byte loaded from the storage (an i8 value), not the address.
+    // Without this branch the else path below spilled the byte into
+    // a 1-byte temp and the memcpy read past the temp's stack slot,
+    // producing transfer results like `109 0 0 -128 1` for "mykey"
+    // (correct first byte, garbage tail).
+    let char_name_src_addr: Option<ValueId> = if let Expr::Name { name } = &src_expr.node {
+        let key = name.to_lowercase();
+        ctx.locals.get(&key).cloned().and_then(|info| {
+            if info.char_kind != CharKind::None {
+                // Use the canonical (ptr, len) helper so each
+                // CharKind shape resolves to its real data pointer:
+                // Fixed → stack buffer, FixedRuntime → heap buffer
+                // via runtime length, Deferred → descriptor's data
+                // ptr, AssumedLen → caller-supplied pointer.  Bare
+                // info.addr was wrong for all kinds except Fixed.
+                local_char_ptr_and_len(b, &info).map(|(ptr, _len)| ptr)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let src_addr: ValueId = if let Some(addr) = char_name_src_addr {
+        addr
+    } else if let Some((src_desc, _src_elem_ty)) =
         whole_array_expr_descriptor(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts))
     {
         // Array source: use the data pointer field of the descriptor.
-        // Without a constant total-bytes guarantee, clamp via memcpy of
-        // total_bytes (per spec we read mold-sized chunks from SRC).
-        let base =
-            b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-        let elem_bytes = ir_scalar_byte_size(&src_elem_ty.ty);
-        // Best-effort byte count; not used to clamp memcpy below.
-        (base, elem_bytes.max(1))
+        b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
     } else {
         // Lower the expression. If it's a scalar value, spill to a
         // stack alloca and use that. If it's already a pointer,
@@ -43944,11 +44067,7 @@ fn try_lower_transfer_into_array(
         );
         let vty = b.func().value_type(v).unwrap_or(IrType::Int(IntWidth::I32));
         match &vty {
-            IrType::Ptr(_) => {
-                // Caller already has the address — best-effort byte count
-                // we don't have here; clamp by total_bytes below.
-                (v, total_bytes)
-            }
+            IrType::Ptr(_) => v,
             IrType::Int(_) | IrType::Float(_) | IrType::Bool => {
                 let sz = ir_scalar_byte_size(&vty);
                 let tmp = b.alloca(IrType::Array(
@@ -43958,24 +44077,21 @@ fn try_lower_transfer_into_array(
                 let zero_off = b.const_i64(0);
                 let dst = b.gep(tmp, vec![zero_off], IrType::Int(IntWidth::I8));
                 b.store(v, dst);
-                (tmp, sz)
+                tmp
             }
             _ => return false,
         }
     };
 
-    // memcpy `min(src_bytes, total_bytes)` bytes. We don't know
-    // src_bytes precisely for descriptor-backed arrays, so just copy
-    // total_bytes — F2018 lets the impl read mold-sized chunks past
-    // SRC, which the zero-fill above handles only on the dest side.
-    // For the patterns we care about (transfer(scalar, mold, n)) the
-    // source is a scalar, so total_bytes >= scalar_bytes always. For
-    // array → array, src and dest commonly have matching shape.
-    let copy_n = total_bytes.min(src_bytes_const.max(total_bytes));
-    let copy_v = b.const_i64(copy_n);
+    // memcpy total_bytes from SRC into the destination buffer.
+    // F2018 §16.9.193 allows reading mold-sized chunks past SRC; the
+    // zero-fill above ensures deterministic dest tail bytes when SRC
+    // is shorter.  We don't know SRC's true byte count in the general
+    // case (especially for runtime-sized transfers), so trust the
+    // user-supplied SIZE — they sized SRC against MOLD.
     b.call(
         FuncRef::External("memcpy".into()),
-        vec![dest_base, src_addr, copy_v],
+        vec![dest_base, src_addr, total_v],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     true
