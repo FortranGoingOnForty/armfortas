@@ -4256,6 +4256,14 @@ fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
+                install_assumed_shape_lower_overrides(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    ctx.st,
+                    type_layouts,
+                );
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
@@ -4682,6 +4690,14 @@ fn lower_unit(
                     }
                 }
                 install_runtime_dim_bounds(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    ctx.st,
+                    type_layouts,
+                );
+                install_assumed_shape_lower_overrides(
                     &mut b,
                     &mut ctx.locals,
                     decls,
@@ -18408,6 +18424,126 @@ fn install_runtime_dim_bounds(
                     slot.runtime_dim_upper = runtime;
                 }
             }
+        }
+    }
+}
+
+/// F2018 §15.5.4.5(2): when a dummy argument is an assumed-shape array
+/// declared with a non-default lower bound (`arr(0:)`, `arr(N:)`, etc.),
+/// the lower bound of each dimension of the dummy is the value specified
+/// in the assumed-shape-spec; the upper bound and extent are derived from
+/// the actual argument's extent.  Without this rebase the callee inherits
+/// the caller's lower (typically 1), and `arr(0)` trips a bounds check
+/// "index 0 outside [1, N]".
+///
+/// Rebase strategy: allocate a fresh 384-byte local descriptor, memcpy
+/// from the caller's pointer, patch each overridden dim's `lower_bound`
+/// and `upper_bound` (extent preserved), then redirect the dummy's slot
+/// to the local descriptor.  All downstream lookups (`compute_flat_elem_offset`,
+/// `lbound`, descriptor-passed actuals to nested calls) automatically see
+/// the rebased view.
+fn install_assumed_shape_lower_overrides(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    use crate::ast::decl::{ArraySpec, Attribute};
+    for decl in decls {
+        let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a {
+                Some(specs)
+            } else {
+                None
+            }
+        });
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            let Some(info) = locals.get(&key) else {
+                continue;
+            };
+            if !info.by_ref || !info.descriptor_arg {
+                continue;
+            }
+            let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
+                continue;
+            };
+
+            // Per-dim: Some(expr) when this dim's declared lower bound is
+            // an explicit non-default (i.e. not literal 1) assumed-shape lower.
+            // Other shapes (Explicit, Deferred, AssumedSize, AssumedRank) take
+            // their lower from info.dims / static path and don't need patching.
+            let mut overrides: Vec<Option<&crate::ast::expr::SpannedExpr>> =
+                Vec::with_capacity(specs.len());
+            let mut any = false;
+            for spec in specs.iter() {
+                let lower_expr = match spec {
+                    ArraySpec::AssumedShape { lower: Some(e) } => Some(e),
+                    _ => None,
+                };
+                let non_default = lower_expr.and_then(|e| {
+                    match eval_const_scalar(e, visible_param_consts) {
+                        Some(ConstScalar::Int(1)) => None,
+                        _ => Some(e),
+                    }
+                });
+                if non_default.is_some() {
+                    any = true;
+                }
+                overrides.push(non_default);
+            }
+            if !any {
+                continue;
+            }
+
+            let slot = info.addr;
+            let original_desc_ptr = b.load(slot);
+            let local_desc = b.alloca(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I8)),
+                384,
+            ));
+            let bytes = b.const_i64(384);
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![local_desc, original_desc_ptr, bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            for (i, lower_expr) in overrides.iter().enumerate() {
+                let Some(lower_expr) = lower_expr else {
+                    continue;
+                };
+                let new_lo_raw = lower_expr_with_optional_layouts(
+                    b,
+                    locals,
+                    lower_expr,
+                    st,
+                    Some(type_layouts),
+                );
+                let new_lo_i64 = match b.func().value_type(new_lo_raw) {
+                    Some(IrType::Int(IntWidth::I64)) => new_lo_raw,
+                    _ => b.int_extend(new_lo_raw, IntWidth::I64, true),
+                };
+                let dim_offset = 24i64 + (i as i64) * 24;
+                let off_lo = b.const_i64(dim_offset);
+                let off_up = b.const_i64(dim_offset + 8);
+                let lo_p = b.gep(local_desc, vec![off_lo], IrType::Int(IntWidth::I8));
+                let up_p = b.gep(local_desc, vec![off_up], IrType::Int(IntWidth::I8));
+                let old_lo = b.load_typed(lo_p, IrType::Int(IntWidth::I64));
+                let old_up = b.load_typed(up_p, IrType::Int(IntWidth::I64));
+                let span = b.isub(old_up, old_lo);
+                let new_up = b.iadd(new_lo_i64, span);
+                b.store(new_lo_i64, lo_p);
+                b.store(new_up, up_p);
+            }
+            b.store(local_desc, slot);
         }
     }
 }
