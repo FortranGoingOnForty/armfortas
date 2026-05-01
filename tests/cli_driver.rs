@@ -11519,6 +11519,53 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 }
 
 #[test]
+fn two_arg_transfer_into_allocatable_handles_array_constructor_source() {
+    // F2018 §16.9.193: TRANSFER(SOURCE, MOLD) without SIZE produces
+    // a rank-1 result of `ceil(bytes(SOURCE) / sizeof(MOLD_elem))`
+    // elements when MOLD is array-shaped.  When SOURCE is an inline
+    // array constructor (e.g. `transfer([1_int64, 2_int64],
+    // [0_int8])`), `whole_array_expr_local_info` returned None and
+    // the lowering bailed; the assignment then fell through to the
+    // generic path and segfaulted.  This came up in
+    // `example_hashmaps_remove`'s "use transfer to int8 arrays for
+    // unsupported key types" case.
+    let src = write_program(
+        "program p\n\
+           use iso_fortran_env, only: int8, int64\n\
+           integer(int8), allocatable :: out(:)\n\
+           out = transfer( [1_int64, 2_int64], [0_int8] )\n\
+           if (size(out) /= 16) error stop 1\n\
+           if (out(1) /= 1) error stop 2\n\
+           if (out(9) /= 2) error stop 3\n\
+           print *, 'ok'\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_constructor_src", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected ceil(16/1)=16 size + per-byte values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deallocate_disassociates_pointer_per_f2018_9_7_3_2() {
     // F2018 §9.7.3.2: a successful DEALLOCATE on a pointer object
     // sets its pointer association status to disassociated.  Without
