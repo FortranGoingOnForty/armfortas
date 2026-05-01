@@ -11443,6 +11443,82 @@ fn iso_fortran_env_character_storage_size_folds_to_eight() {
 }
 
 #[test]
+fn procedure_pointer_component_default_init_resolves_renamed_target() {
+    // F2018 §7.5.4.5 + §11.2.2: a procedure-pointer component with
+    // `=> target_proc` carries a default initial association that must
+    // be applied at every constructor of the type, including the
+    // implicit one used for plain `type(t) :: x` declarations.  The
+    // target name resolves through host-association — including USE
+    // renames — so a layout that captures only the source-level token
+    // can mis-link when, like stdlib_hashmaps, the type's host module
+    // does `use stdlib_hashmap_wrappers, only: default_hasher =>
+    // fnv_1_hasher` and then declares `procedure(...), pointer ::
+    // hasher => default_hasher` on the parent type.
+    //
+    // Without the parser/sema/lower pipeline the lay-out building
+    // pass installs `FieldDefaultInit::ProcedurePointer` for and
+    // `sema::resolve` rewrites bare names to
+    // `afs_modproc_<origin_module>_<proc>` mangle the link target,
+    // every default-constructed instance left the field at zero and
+    // every dispatch through the pointer crashed on a null callsite.
+    let src = write_program(
+        "module mb\n\
+           implicit none\n\
+           abstract interface\n\
+             function ifn(x) result(r)\n\
+               integer, intent(in) :: x\n\
+               integer :: r\n\
+             end function\n\
+           end interface\n\
+           type :: holder\n\
+             procedure(ifn), pointer, nopass :: fn => default_fn\n\
+             integer :: count = 0\n\
+           end type\n\
+         contains\n\
+           function default_fn(x) result(r)\n\
+             integer, intent(in) :: x\n\
+             integer :: r\n\
+             r = x * 2\n\
+           end function\n\
+         end module\n\
+         program p\n\
+           use mb\n\
+           type(holder) :: h\n\
+           integer :: r\n\
+           if (h%count /= 0) error stop 1\n\
+           if (.not. associated(h%fn)) error stop 2\n\
+           r = h%fn(7)\n\
+           if (r /= 14) error stop 3\n\
+           print *, 'ok'\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("proc_ptr_default_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected default_fn(7)=14 to print and exit 0: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
