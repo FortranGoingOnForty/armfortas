@@ -60,6 +60,9 @@ fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaul
                 .join(",");
             format!("D({rendered})")
         }
+        FieldDefaultInit::ProcedurePointer(target) => {
+            format!("P{}", hex_encode_bytes(target.as_bytes()))
+        }
     }
 }
 
@@ -116,6 +119,10 @@ fn decode_nested_field_default_init(
             fields.push((name.to_string(), init));
         }
         return Some(FieldDefaultInit::Derived(fields));
+    }
+    if let Some(value) = encoded.strip_prefix('P') {
+        let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+        return Some(FieldDefaultInit::ProcedurePointer(decoded));
     }
     None
 }
@@ -942,6 +949,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                     let encoded = encode_nested_field_default_init(init);
                     format!(" @init=exprhex:{}", hex_encode_bytes(encoded.as_bytes()))
                 }
+                crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target) => {
+                    format!(" @init=procptr:{}", target)
+                }
             }
         }
         for fp in &layout.final_procs {
@@ -1581,6 +1591,9 @@ fn parse_type(
         if let Some(value) = payload.strip_prefix("exprhex:") {
             let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
             return decode_nested_field_default_init(&decoded);
+        }
+        if let Some(value) = payload.strip_prefix("procptr:") {
+            return Some(FieldDefaultInit::ProcedurePointer(value.to_string()));
         }
         None
     }

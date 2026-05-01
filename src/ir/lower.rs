@@ -5728,6 +5728,13 @@ fn apply_field_default_init_const_bytes(
             }
             wrote
         }
+        crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(_) => {
+            // Function addresses aren't known at compile time
+            // (requires linker relocation), so skip the const-bytes
+            // path.  The runtime emitter writes the address via a
+            // FuncRef::Internal/External call ref at construction.
+            false
+        }
     }
 }
 
@@ -38491,6 +38498,18 @@ fn apply_field_default_init_runtime(
                     registry,
                 );
             }
+        }
+        crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target_symbol) => {
+            // Take the function's link-time address (the layout
+            // builder pre-mangles to `afs_modproc_<mod>_<proc>` for
+            // module procedures) and store the i64 value into the
+            // 8-byte field slot.  See FieldDefaultInit::
+            // ProcedurePointer's comment for why this can't go
+            // through the compile-time const-bytes path.
+            let _ = registry;
+            let addr = b.global_addr(target_symbol, IrType::Int(IntWidth::I8));
+            let addr_int = b.ptr_to_int(addr);
+            b.store(addr_int, field_ptr);
         }
     }
 }

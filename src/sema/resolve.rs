@@ -1669,6 +1669,7 @@ fn collect_derived_type_layouts(
         &const_params,
         &const_derived_field_inits,
     );
+    resolve_proc_pointer_default_targets(st, scope_id, layouts);
     for sub in contains {
         let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
         collect_derived_type_layouts(
@@ -1996,6 +1997,109 @@ fn register_local_type_layouts(
                 layouts.insert(layout);
             }
         }
+    }
+}
+
+/// Resolve procedure-pointer default-init targets stored as bare
+/// source-level names into their link-time symbols.  A field declared
+/// `procedure(iface), pointer :: fn => default_hasher` lands in the
+/// layout with `FieldDefaultInit::ProcedurePointer("default_hasher")`,
+/// but `default_hasher` may itself be a USE-rename for a procedure
+/// living in a different module — `stdlib_hashmaps` aliases
+/// `fnv_1_hasher` from `stdlib_hashmap_wrappers` exactly this way.
+/// This pass walks every layout the file just registered, looks each
+/// proc-pointer target up in its owning type's host-module scope
+/// (chasing USE chains), and rewrites the stored string to the
+/// `afs_modproc_<origin_mod>_<proc>` mangle the runtime initializer
+/// emits via `global_addr`.  Without it the linker reports an
+/// undefined `_afs_modproc_<host_mod>_<alias>` reference at example
+/// link.
+fn resolve_proc_pointer_default_targets(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    layouts: &mut super::type_layout::TypeLayoutRegistry,
+) {
+    use super::type_layout::FieldDefaultInit;
+
+    for layout in layouts.layouts.values_mut() {
+        let owner = match layout.owner_module.as_deref() {
+            Some(m) => m,
+            None => continue,
+        };
+        let owner_scope = match st.find_module_scope(owner) {
+            Some(s) => s,
+            None => scope_id,
+        };
+        for field in layout.fields.iter_mut() {
+            let target_name = match &field.default_init {
+                Some(FieldDefaultInit::ProcedurePointer(name)) => name.clone(),
+                _ => continue,
+            };
+            let resolved = resolve_proc_pointer_link_symbol(st, owner_scope, &target_name);
+            field.default_init = Some(FieldDefaultInit::ProcedurePointer(resolved));
+        }
+    }
+}
+
+/// Walk the symbol table from `from_scope` to find the link-time
+/// symbol that the source name refers to.  Module procedures get the
+/// `afs_modproc_<origin_mod>_<proc>` mangle keyed on the procedure's
+/// declaring module; bare external/intrinsic references fall through
+/// unmodified.  USE associations are followed transitively so renames
+/// like `default_hasher => fnv_1_hasher` resolve to the underlying
+/// procedure's origin module.
+fn resolve_proc_pointer_link_symbol(
+    st: &SymbolTable,
+    from_scope: ScopeId,
+    target: &str,
+) -> String {
+    let key = target.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut current_scope = from_scope;
+    let mut current_name = key.clone();
+
+    loop {
+        if !seen.insert((current_scope, current_name.clone())) {
+            break;
+        }
+        let scope = st.scope(current_scope);
+
+        if let Some(sym) = scope.symbols.get(&current_name) {
+            return mangle_link_symbol_for(sym, scope, &current_name);
+        }
+
+        let assoc = scope
+            .use_associations
+            .iter()
+            .find(|a| a.local_name == current_name);
+        if let Some(assoc) = assoc {
+            current_scope = assoc.source_scope;
+            current_name = assoc.original_name.to_lowercase();
+            continue;
+        }
+
+        break;
+    }
+
+    target.to_string()
+}
+
+fn mangle_link_symbol_for(
+    sym: &super::symtab::Symbol,
+    scope: &super::symtab::Scope,
+    name_in_scope: &str,
+) -> String {
+    use super::symtab::{ScopeKind, SymbolKind};
+    match sym.kind {
+        SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
+            ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
+                "afs_modproc_{}_{}",
+                module_name.to_lowercase(),
+                name_in_scope
+            ),
+            _ => name_in_scope.to_string(),
+        },
+        _ => name_in_scope.to_string(),
     }
 }
 

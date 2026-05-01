@@ -904,13 +904,37 @@ impl<'a> Parser<'a> {
                             String::new()
                         };
 
-                        if self.eat(&TokenKind::Arrow)
-                            && self.peek_text().eq_ignore_ascii_case("null")
-                        {
-                            self.advance();
-                            if self.peek() == &TokenKind::LParen {
+                        // F2008 §4.5.4.5: a procedure pointer
+                        // component may carry a default initial
+                        // association `=> proc_name` or `=> null()`.
+                        // Without capturing the right-hand side the
+                        // pointer field stays uninitialized — calling
+                        // `instance%fn(args)` then jumps through
+                        // garbage memory.  stdlib_hashmaps's
+                        // `procedure(hasher_fun), pointer, nopass ::
+                        // hasher => default_hasher` motivated this fix.
+                        let mut ptr_init: Option<crate::ast::expr::SpannedExpr> = None;
+                        if self.eat(&TokenKind::Arrow) {
+                            let init_start = self.current_span();
+                            if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                let _ = self.expect(&TokenKind::RParen);
+                                if self.peek() == &TokenKind::LParen {
+                                    self.advance();
+                                    let _ = self.expect(&TokenKind::RParen);
+                                }
+                                // Leave ptr_init as None for `=> null()`
+                                // (matches the legacy behaviour, where
+                                // the field is zero-initialised).
+                            } else if self.peek() == &TokenKind::Identifier {
+                                let target_name = self.advance().clone().text;
+                                let span = crate::parser::expr::span_from_to(
+                                    init_start,
+                                    self.prev_span(),
+                                );
+                                ptr_init = Some(crate::ast::Spanned::new(
+                                    crate::ast::expr::Expr::Name { name: target_name },
+                                    span,
+                                ));
                             }
                         }
 
@@ -919,7 +943,7 @@ impl<'a> Parser<'a> {
                             array_spec: None,
                             init: None,
                             char_len: None,
-                            ptr_init: None,
+                            ptr_init,
                         });
 
                         if !self.eat(&TokenKind::Comma) {
