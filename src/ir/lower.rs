@@ -16444,6 +16444,8 @@ fn emit_resolved_bound_proc_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
     let callee_pointer_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+    let callee_class_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
         optional_params
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
@@ -16501,6 +16503,16 @@ fn emit_resolved_bound_proc_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        // F2018 §15.5.2.4: a class(*) dummy needs the actual boxed into
+        // a polymorphic descriptor when the actual is a literal/scalar
+        // expression. The plain-call path threads this through; without
+        // it, the TBP path passed NULL for class(*) literal actuals,
+        // producing SIGSEGV inside the callee on first use.
+        let wants_polymorphic_descriptor = wants_descriptor
+            && callee_class_args
+                .as_ref()
+                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                .unwrap_or(false);
         let value = match slot {
             Some(arg) => match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -16528,7 +16540,14 @@ fn emit_resolved_bound_proc_call(
                         );
                         coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                     } else if wants_descriptor {
-                        lower_arg_descriptor(b, locals, e, st, type_layouts, false)
+                        lower_arg_descriptor(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            wants_polymorphic_descriptor,
+                        )
                     } else if wants_string_descriptor {
                         lower_arg_string_descriptor(b, locals, e, st, type_layouts)
                     } else if wants_bind_c_char {
