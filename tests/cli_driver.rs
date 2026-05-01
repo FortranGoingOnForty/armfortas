@@ -11519,6 +11519,51 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 }
 
 #[test]
+fn deallocate_disassociates_pointer_per_f2018_9_7_3_2() {
+    // F2018 §9.7.3.2: a successful DEALLOCATE on a pointer object
+    // sets its pointer association status to disassociated.  Without
+    // this, `associated()` returned true after deallocate, and
+    // stdlib_hashmap_chaining's recursive `free_map_entry_pool`
+    // (which terminates on `if (.not. associated(pool)) return`)
+    // walked deallocated pool memory, eventually following a stale
+    // `lastpool` from re-init through 47k+ stack frames before
+    // overflowing.
+    let src = write_program(
+        "program p\n\
+           integer, pointer :: p\n\
+           allocate(p)\n\
+           if (.not. associated(p)) error stop 1\n\
+           deallocate(p)\n\
+           if (associated(p)) error stop 2\n\
+           print *, 'ok'\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("dealloc_disassoc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected post-deallocate associated() to be .false.: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
     // F2018 §15.5.2.12 + §7.3.2.3: a `class(*), intent(in), optional`
     // dummy is passed as a 384-byte descriptor pointer.  When one
