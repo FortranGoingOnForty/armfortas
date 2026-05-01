@@ -11974,6 +11974,60 @@ fn cross_unit_char_array_result_uses_array_descriptor_abi() {
 }
 
 #[test]
+fn contained_proc_call_resolves_to_caller_host_not_lexical_last() {
+    // F2018 §11.2.1: a procedure reference inside a contained procedure
+    // resolves through the calling procedure's host chain, not by global
+    // last-match.  Pre-fix `find_procedure_scope_id` did
+    // `st.all_scopes().iter().rev().find_map(...)`, returning the
+    // lexically-last scope with the matching name.  In stdlib_sorting_sort
+    // every kind variant declares its own `introsort`, `partition`,
+    // `insertion_sort`, etc.; calls to `introsort` from inside
+    // `int32_increase_sort` were misrouted to `bitset_large_decrease_sort`'s
+    // introsort (last definition in the submodule).  Repro shape: two
+    // sibling subroutines, each declaring a contained `helper` doing
+    // different work; the last one wins under the bug.
+    let src = write_program(
+        "module sort_collide\n  implicit none\ncontains\n  subroutine sort_a(arr)\n    integer, intent(inout) :: arr(:)\n    call helper(arr)\n  contains\n    subroutine helper(a)\n      integer, intent(inout) :: a(:)\n      integer :: i\n      do i = 1, size(a)\n        a(i) = a(i) * 2\n      end do\n    end subroutine\n  end subroutine\n\n  subroutine sort_b(arr)\n    integer, intent(inout) :: arr(:)\n    call helper(arr)\n  contains\n    subroutine helper(a)\n      integer, intent(inout) :: a(:)\n      integer :: i\n      do i = 1, size(a)\n        a(i) = a(i) + 100\n      end do\n    end subroutine\n  end subroutine\nend module\n\nprogram p\n  use sort_collide\n  implicit none\n  integer :: a(3), b(3)\n  a = [1, 2, 3]\n  b = [10, 20, 30]\n  call sort_a(a)\n  call sort_b(b)\n  print *, a\n  print *, b\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_proc_collision", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success(), "run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    // sort_a's helper multiplies by 2: [1,2,3] -> [2,4,6]
+    // sort_b's helper adds 100:        [10,20,30] -> [110,120,130]
+    // Pre-fix both call sort_b's helper: sort_a's output would be
+    // [101,102,103] (1+100, 2+100, 3+100), not [2,4,6].
+    assert!(
+        stdout.contains("2") && stdout.contains("4") && stdout.contains("6"),
+        "sort_a should call its own helper (×2), not sort_b's (+100): {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("110") && stdout.contains("120") && stdout.contains("130"),
+        "sort_b should call its own helper (+100): {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("101") && !stdout.contains("102") && !stdout.contains("103"),
+        "sort_a output looks like sort_b's helper (+100) ran on sort_a's array: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
