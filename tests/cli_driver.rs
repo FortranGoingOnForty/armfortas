@@ -11673,6 +11673,63 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
 }
 
 #[test]
+fn tbp_dispatch_boxes_class_star_literal_actual_into_descriptor() {
+    // F2018 §15.5.2.4 + §7.3.2.3: a class(*) intent(in) dummy must
+    // receive the actual as a polymorphic descriptor.  The plain-call
+    // path detects this via callee_class_arg_mask and threads
+    // wants_polymorphic_descriptor=true so a literal/scalar actual gets
+    // boxed by box_actual_into_class_star_descriptor.  emit_resolved_-
+    // bound_proc_call (the TBP/method-dispatch path) was missing that
+    // mask lookup and always passed wants_polymorphic_descriptor=false,
+    // which made lower_arg_descriptor fall through every match arm and
+    // return const_i64(0) — a NULL pointer for the class(*) descriptor.
+    // The callee then SIGSEGV'd on first read of the actual's
+    // descriptor metadata.  Reproduces stdlib_hashmaps' set_other_data
+    // crash where map%set_other_data(key, 'Another value', exists)
+    // dispatched through a TBP and forwarded the literal to the
+    // class(*), intent(in) :: other dummy.
+    // Mirrors the stdlib_hashmaps `set_other_data` failure: a TBP that
+    // takes class(*) intent(in) and assigns it into a polymorphic
+    // allocatable component of an entry reached through a pointer.
+    // Pre-fix this segfaulted because the call site passed NULL for
+    // val.  Post-fix the assignment lands.  We don't depend on
+    // SELECT TYPE recovering the dynamic type (that needs a separate
+    // tag-propagation fix); we just verify the call runs to a print
+    // after the polymorphic-component assign and exits cleanly.
+    let src = write_program(
+        "module mod_tbp_class_star\n  implicit none\n  type :: entry_t\n    class(*), allocatable :: other\n  end type\n  type :: entry_ptr_t\n    type(entry_t), pointer :: target => null()\n  end type\n  type :: container_t\n    type(entry_ptr_t), allocatable :: inverse(:)\n  contains\n    procedure :: take => container_take\n  end type\ncontains\n  subroutine container_take(self, val)\n    class(container_t), intent(inout) :: self\n    class(*), intent(in) :: val\n    self%inverse(1)%target%other = val\n    print *, 'AFTER ASSIGN'\n  end subroutine\nend module\n\nprogram p\n  use mod_tbp_class_star\n  implicit none\n  type(container_t) :: c\n  type(entry_t), pointer :: ep\n  allocate(c%inverse(1))\n  allocate(ep)\n  allocate(ep%other, source='A value')\n  c%inverse(1)%target => ep\n  call c%take('Another val')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_class_star_literal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected TBP call with class(*) literal actual to reach AFTER ASSIGN: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("AFTER ASSIGN"),
+        "expected AFTER ASSIGN print: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
