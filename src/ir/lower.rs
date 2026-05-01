@@ -1282,7 +1282,21 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
                     );
                     return !is_deferred_char_scalar;
                 }
-                if specs.is_none() && matches!(type_spec, TypeSpec::Class(_)) {
+                if specs.is_none()
+                    && matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar)
+                {
+                    // Scalar polymorphic dummies (`class(name)` and the
+                    // unlimited `class(*)`) are passed by descriptor —
+                    // the callee receives a 384-byte block. Flagging
+                    // them here lets the call site route through
+                    // `lower_arg_descriptor` so the actual is forwarded
+                    // as a descriptor pointer; without the ClassStar
+                    // arm a `class(*), optional` actual fell through to
+                    // `lower_arg_by_ref_full`, which dereferenced the
+                    // dummy slot and crashed when the actual was absent
+                    // (e.g. stdlib_hashmaps's `char_map_entry` →
+                    // `key_map_entry` forwarding of the optional
+                    // `class(*) :: other`).
                     return true;
                 }
                 return false;
