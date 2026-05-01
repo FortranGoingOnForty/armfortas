@@ -15757,6 +15757,54 @@ fn find_procedure_scope_id(st: &SymbolTable, name: &str) -> Option<crate::sema::
         })
 }
 
+/// F2018 §11.2.1 host-association resolution for procedure references.
+/// When several contained procedures across the unit share a name (each
+/// living under a different host), `find_procedure_scope_id` resolves to
+/// the lexically-last definition. That's wrong inside a unit like
+/// stdlib_sorting_sort, where every kind variant declares its own
+/// `introsort`, `partition`, `insertion_sort`, etc.: a call to
+/// `introsort` from within `int32_increase_sort` must reach
+/// `int32_increase_sort`'s introsort, not bitset_large_decrease_sort's.
+/// Walk the caller's scope ladder; at each ancestor look for a child
+/// scope (or the ancestor itself) whose name matches. The closest match
+/// is the host-associated one Fortran requires.
+fn find_procedure_scope_id_for_caller(
+    st: &SymbolTable,
+    name: &str,
+    caller_scope: Option<crate::sema::symtab::ScopeId>,
+) -> Option<crate::sema::symtab::ScopeId> {
+    let Some(start) = caller_scope else {
+        return find_procedure_scope_id(st, name);
+    };
+    let mut cur = Some(start);
+    while let Some(cur_id) = cur {
+        let cur_scope = st.scope(cur_id);
+        // Self-match (recursive call to caller itself).
+        if scope_matches_procedure_name(cur_scope, name)
+            && scope_has_linkable_parent(st, cur_id)
+        {
+            return Some(cur_id);
+        }
+        // Sibling/host-contained match: any procedure scope whose
+        // parent is `cur_id`. Multiple hosts may share names but
+        // siblings under one host don't, so a parent==cur filter is
+        // unambiguous.
+        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+            (scope.parent == Some(cur_id)
+                && scope_matches_procedure_name(scope, name)
+                && scope_has_linkable_parent(st, idx))
+            .then_some(idx)
+        });
+        if sibling.is_some() {
+            return sibling;
+        }
+        cur = cur_scope.parent;
+    }
+    // Caller-relative search exhausted; fall back to last-match for
+    // module-level / external resolution.
+    find_procedure_scope_id(st, name)
+}
+
 fn lowered_scope_symbol_name(
     st: &SymbolTable,
     internal_funcs: &HashMap<String, u32>,
@@ -15853,7 +15901,18 @@ fn same_unit_func_ref(
     else {
         return FuncRef::External(fallback_call_name);
     };
-    let Some(scope_id) = find_procedure_scope_id(st, matched_key) else {
+    // F2018 §11.2.1: prefer the contained procedure reachable via host
+    // association from the caller. The thread-local
+    // `CURRENT_PROC_SCOPE` is set by `ProcScopeGuard` around every
+    // procedure body lowering, so any call we lower here knows its
+    // host context. Without this, sibling-name collisions in stdlib
+    // (every kind variant has its own `introsort`/`partition`/...)
+    // resolve to the lexically last definition (bitset_large_decrease
+    // in the sort submodule), so `int32_increase_sort`'s introsort
+    // would silently call into bitset_large_decrease's helpers.
+    let caller_scope = current_proc_scope();
+    let Some(scope_id) = find_procedure_scope_id_for_caller(st, matched_key, caller_scope)
+    else {
         return FuncRef::External(fallback_call_name);
     };
     let Some(lowered) = lowered_scope_symbol_name(st, internal_funcs, scope_id) else {
