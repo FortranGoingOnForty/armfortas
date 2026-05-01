@@ -220,7 +220,16 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));
     insert_param_val(st, m, "real_kinds", ik4.clone(), Some(4));
 
-    // Storage size constants (F2008).
+    // Storage size constants (F2008).  Values reflect armfortas's
+    // ARM64/macOS layout: one-byte default character (Fortran wide
+    // characters and EBCDIC are not used), 32-bit default integer/real,
+    // 8-bit file storage units.  stdlib relies on
+    // `character_storage_size`/`bit_size(0_int8)` to compute byte
+    // counts for `transfer(...)` calls — without this entry, the
+    // module parameter folded to 0 and `transfer(value, mold,
+    // bytes_char * len(value))` requested a zero-byte copy, leaving
+    // hashmap key buffers empty and downstream key compares wrong.
+    insert_param_val(st, m, "character_storage_size", ik4.clone(), Some(8));
     insert_param_val(st, m, "file_storage_size", ik4.clone(), Some(8));
     insert_param_val(st, m, "numeric_storage_size", ik4.clone(), Some(32));
     // Coarray stat constants (F2008/F2018).

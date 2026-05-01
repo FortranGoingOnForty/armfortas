@@ -11401,6 +11401,48 @@ fn transfer_into_allocatable_array_with_runtime_size_and_named_char_source() {
 }
 
 #[test]
+fn iso_fortran_env_character_storage_size_folds_to_eight() {
+    // Regression: `character_storage_size` was missing from
+    // armfortas's `iso_fortran_env` registration, so any module
+    // declaring `integer, parameter :: bits_char =
+    // character_storage_size` folded to zero — undeclared parameter
+    // names slip through with a default of 0.  stdlib_hashmap_wrappers
+    // builds key buffers with `transfer(value, mold,
+    // bytes_char * len(value))` where `bytes_char = bits_char /
+    // bits_int8`; with the constant missing, every key was a 0-byte
+    // allocation and the entire stdlib_hashmaps cluster crashed
+    // downstream.  F2008 fixes this constant at 8 for the default
+    // (one-byte) character kind on most ABIs.
+    let src = write_program(
+        "program t\n  use, intrinsic :: iso_fortran_env, only: character_storage_size, file_storage_size, numeric_storage_size, int8\n  implicit none\n  if (character_storage_size /= 8) error stop 1\n  if (file_storage_size /= 8) error stop 2\n  if (numeric_storage_size /= 32) error stop 3\n  if (character_storage_size / bit_size(0_int8) /= 1) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("iso_fortran_env_char_storage", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
