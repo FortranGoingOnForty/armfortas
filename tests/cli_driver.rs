@@ -11783,6 +11783,96 @@ fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
 }
 
 #[test]
+fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
+    // F2018 §15.5.4.5(2): an assumed-shape dummy declared with a
+    // non-default lower bound (e.g. `arr(0:)`) must have the lower
+    // bound of each dimension overridden in the dummy's descriptor
+    // view inside the callee.  Pre-fix the callee inherited the
+    // caller's lower (default 1), and accessing `arr(0)` tripped a
+    // bounds check "index 0 outside [1, N]".  This was the example_sort
+    // failure pattern in stdlib: every `int32_sort`/`int32_increase_sort`
+    // /`partition`/`insertion_sort` declares `array(0:)` and indexes from 0.
+    //
+    // Rebase semantics: the caller's descriptor base_addr stays
+    // shared (writes still propagate), only the lower/upper view is
+    // patched on a fresh local 384-byte descriptor copy.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  a = [3, 1, 2]\n  call my_sort(a)\n  print *, 'sorted=', a\ncontains\n  pure subroutine my_sort(arr)\n    integer, intent(inout) :: arr(0:)\n    integer :: i, j, t, n\n    n = size(arr)\n    do i = 0, n-2\n      do j = 0, n-2-i\n        if (arr(j) > arr(j+1)) then\n          t = arr(j); arr(j) = arr(j+1); arr(j+1) = t\n        end if\n      end do\n    end do\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("assumed_shape_lower_override", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: {} {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("sorted=") && stdout.contains("1") && stdout.contains("2") && stdout.contains("3"),
+        "expected sorted output: {}",
+        stdout
+    );
+    // Crucial: caller sees the writes — the rebase preserved base_addr.
+    let mut nums: Vec<i32> = stdout
+        .split_whitespace()
+        .filter_map(|s| s.parse::<i32>().ok())
+        .collect();
+    nums.dedup();
+    assert!(
+        nums.windows(2).all(|w| w[0] <= w[1]),
+        "expected ascending sorted output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn assumed_shape_lower_override_propagates_through_nested_calls() {
+    // The rebased descriptor must keep the caller's base_addr so that
+    // writes through deeper calls propagate back.  Chains the dummy
+    // through three layers — the same pattern stdlib_sorting uses for
+    // sort → int32_sort → int32_increase_sort → introsort.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  a = [10, 20, 30]\n  call outer(a)\n  print *, a\ncontains\n  subroutine outer(arr)\n    integer, intent(inout) :: arr(0:)\n    call middle(arr)\n  end subroutine\n  subroutine middle(arr)\n    integer, intent(inout) :: arr(0:)\n    call inner(arr)\n  end subroutine\n  subroutine inner(arr)\n    integer, intent(inout) :: arr(0:)\n    arr(0) = 100\n    arr(2) = 300\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_lower_override", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success());
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("100") && stdout.contains("300") && stdout.contains("20"),
+        "expected 100, 20, 300 (inner writes propagated): {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
