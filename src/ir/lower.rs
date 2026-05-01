@@ -619,6 +619,7 @@ pub fn lower_file(
             &contained_host_refs,
             &ambiguous_use_warnings,
             false,
+            None,
         );
     }
     emit_type_bound_lookup_thunks(&mut module, units, st, type_layouts, &internal_funcs);
@@ -1311,6 +1312,23 @@ fn procedure_scope_for_dummy_args(
     proc_name: &str,
     args: &[crate::ast::unit::DummyArg],
 ) -> Option<crate::sema::symtab::ScopeId> {
+    procedure_scope_for_dummy_args_with_host(st, proc_name, args, None)
+}
+
+/// Like `procedure_scope_for_dummy_args` but, when a host scope is
+/// supplied, prefer a match whose parent equals the host. Multiple
+/// contained procedures across the unit may share name + arg signature
+/// (every kind variant in stdlib_sorting_sort declares
+/// `introsort(array, depth_limit)`); the bare name+args lookup picks the
+/// lexically-last match, which is the wrong scope when we're lowering a
+/// contained procedure under a specific host. The host filter resolves
+/// the ambiguity per F2018 §11.2.1.
+fn procedure_scope_for_dummy_args_with_host(
+    st: &SymbolTable,
+    proc_name: &str,
+    args: &[crate::ast::unit::DummyArg],
+    host_scope: Option<crate::sema::symtab::ScopeId>,
+) -> Option<crate::sema::symtab::ScopeId> {
     let expected_args: Vec<String> = args
         .iter()
         .filter_map(|arg| {
@@ -1321,6 +1339,18 @@ fn procedure_scope_for_dummy_args(
             }
         })
         .collect();
+    if let Some(host) = host_scope {
+        let scoped = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+            (scope.parent == Some(host)
+                && scope_matches_procedure_name(scope, proc_name)
+                && scope_has_linkable_parent(st, idx)
+                && scope.arg_order == expected_args)
+            .then_some(idx)
+        });
+        if scoped.is_some() {
+            return scoped;
+        }
+    }
     st.all_scopes()
         .iter()
         .enumerate()
@@ -3818,6 +3848,10 @@ fn lower_unit(
     contained_host_refs: &HashMap<String, Vec<String>>,
     ambiguous_use_warnings: &AmbiguousUseWarnings,
     internal_only: bool,
+    // Sema scope id of the immediate host program unit (when this unit
+    // is a contained procedure). Used to disambiguate same-name +
+    // same-signature contained procedures across hosts.
+    host_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) {
     match &unit.node {
         ProgramUnit::Program {
@@ -3946,6 +3980,7 @@ fn lower_unit(
                     contained_host_refs,
                     ambiguous_use_warnings,
                     true,
+                    ctx.proc_scope_id,
                 );
             }
         }
@@ -4005,6 +4040,7 @@ fn lower_unit(
                         contained_host_refs,
                         ambiguous_use_warnings,
                         internal_only,
+                        host_scope_id,
                     );
                     return;
                 }
@@ -4027,7 +4063,8 @@ fn lower_unit(
                 internal_only,
                 internal_funcs,
             );
-            let proc_scope_id = procedure_scope_for_dummy_args(st, name, args);
+            let proc_scope_id =
+                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
                 collect_decl_param_consts_with_host(decls, host_param_consts);
             let mut params: Vec<Param> = args
@@ -4360,6 +4397,7 @@ fn lower_unit(
                     contained_host_refs,
                     ambiguous_use_warnings,
                     true,
+                    proc_scope_id,
                 );
             }
         }
@@ -4384,7 +4422,8 @@ fn lower_unit(
                 internal_only,
                 internal_funcs,
             );
-            let proc_scope_id = procedure_scope_for_dummy_args(st, name, args);
+            let proc_scope_id =
+                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
                 collect_decl_param_consts_with_host(decls, host_param_consts);
 
@@ -5020,6 +5059,7 @@ fn lower_unit(
                     contained_host_refs,
                     ambiguous_use_warnings,
                     true,
+                    proc_scope_id,
                 );
             }
         }
@@ -5046,6 +5086,19 @@ fn lower_unit(
             // empty host_decls slice.
             let no_host_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
             for sub in contains {
+                let module_scope = module_name.and_then(|n| {
+                    st.all_scopes()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, scope)| match &scope.kind {
+                            crate::sema::symtab::ScopeKind::Module(scope_name)
+                                if scope_name.eq_ignore_ascii_case(n) =>
+                            {
+                                Some(idx)
+                            }
+                            _ => None,
+                        })
+                });
                 lower_unit(
                     module,
                     sub,
@@ -5066,6 +5119,7 @@ fn lower_unit(
                     contained_host_refs,
                     ambiguous_use_warnings,
                     false,
+                    module_scope,
                 );
             }
         }
@@ -5134,6 +5188,16 @@ fn lower_unit(
                 } else {
                     None
                 };
+                let submod_scope = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+                    match &scope.kind {
+                        crate::sema::symtab::ScopeKind::Submodule(scope_name)
+                            if scope_name.eq_ignore_ascii_case(submodule_name) =>
+                        {
+                            Some(idx)
+                        }
+                        _ => None,
+                    }
+                });
                 lower_unit(
                     module,
                     sub,
@@ -5154,6 +5218,7 @@ fn lower_unit(
                     contained_host_refs,
                     ambiguous_use_warnings,
                     false,
+                    submod_scope,
                 );
             }
         }
