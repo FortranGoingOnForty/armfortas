@@ -32819,6 +32819,202 @@ fn lower_reshape_array_expr_descriptor(
     Some((result_desc, elem_ty))
 }
 
+/// F2018 §16.9.193: lower TRANSFER(SOURCE, MOLD [, SIZE]) when used
+/// as an array-actual argument or array expression — produces a fresh
+/// rank-1 descriptor that reinterprets the source's bytes through the
+/// mold's element type. Without this path, an inline `transfer(...)`
+/// at a call site (e.g. `call map%map_entry(transfer([1_int64,...],
+/// [0_int8]), 4)`) falls through every named-intrinsic arm in
+/// lower_array_expr_descriptor, then through lower_arg_descriptor's
+/// fall-throughs, and the callee sees a zeroed descriptor whose
+/// extent is 0.
+///
+/// Strategy: reuse the source's storage (no copy) by pointing the
+/// result descriptor at the source's base_addr with mold's elem_size
+/// and an extent of `SIZE` (when given) or
+/// `ceil(SRC_total_bytes / MOLD_elem_size)`.
+fn lower_transfer_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    use crate::sema::symtab::TypeInfo;
+    if args.len() < 2 {
+        return None;
+    }
+    let SectionSubscript::Element(src_expr) = &args[0].value else {
+        return None;
+    };
+    let SectionSubscript::Element(mold_expr) = &args[1].value else {
+        return None;
+    };
+    let size_expr_opt: Option<&crate::ast::expr::SpannedExpr> = if args.len() >= 3 {
+        match &args[2].value {
+            SectionSubscript::Element(e) => Some(e),
+            _ => return None,
+        }
+    } else {
+        None
+    };
+
+    // F2018 §16.9.193: TRANSFER produces an array result only if MOLD
+    // is array-valued or SIZE is present. With a scalar MOLD and no
+    // SIZE the result is scalar — falling back to the scalar transfer
+    // path (which bit-casts the source value to the mold's IR type).
+    // This guard prevents us from boxing the FNV hash idiom
+    // `transfer([byte,byte,byte,byte], 0_int_hash)` into a rank-1
+    // descriptor; that idiom expects an i32 scalar so `ieor(...)` can
+    // operate on it.  ArrayConstructors are array-valued by definition;
+    // expr_returns_array's conservative classifier doesn't cover them
+    // so we add an explicit check here.
+    let mold_is_array_constructor =
+        matches!(mold_expr.node, Expr::ArrayConstructor { .. });
+    let mold_is_array =
+        mold_is_array_constructor || expr_returns_array(mold_expr, locals, st);
+    if !mold_is_array && size_expr_opt.is_none() {
+        return None;
+    }
+
+    // Mold scalar element size + IR type. Only intrinsic numeric/logical
+    // molds are supported — derived/character molds need additional
+    // descriptor-shape handling we don't emit here.
+    let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
+    let mold_kind = match &mold_ti {
+        TypeInfo::Integer { kind } => kind.unwrap_or(4),
+        TypeInfo::Real { kind } => kind.unwrap_or(4),
+        TypeInfo::Logical { kind } => kind.unwrap_or(4),
+        _ => return None,
+    } as i64;
+    if mold_kind <= 0 {
+        return None;
+    }
+    let mold_ir_ty = type_info_to_ir_type(&mold_ti);
+
+    // Resolve the source's contiguous byte storage and its total size.
+    // Two source forms are supported here:
+    //   * a Name resolving to a whole-array local — read base_addr +
+    //     element count from the runtime descriptor
+    //   * an inline ArrayConstructor — materialize once via
+    //     lower_array_expr_descriptor and read its base_addr; total
+    //     bytes are constant from the constructor length × elem size.
+    let tl = type_layouts?;
+    let (src_base, src_total_bytes_v, src_total_bytes_const): (ValueId, ValueId, Option<i64>) =
+        if let Some(src_info) =
+            whole_array_expr_local_info(b, locals, src_expr, st, tl)
+        {
+            let elem_bytes = descriptor_element_size_bytes(&src_info);
+            if elem_bytes <= 0 {
+                return None;
+            }
+            let total_elems = array_total_elems_value(b, &src_info);
+            let elem_v = b.const_i64(elem_bytes);
+            let total_v = b.imul(total_elems, elem_v);
+            let base = if local_uses_array_descriptor(&src_info) {
+                let desc = array_descriptor_addr(b, &src_info);
+                b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+            } else {
+                let raw = b.ptr_to_int(src_info.addr);
+                b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+            };
+            (base, total_v, None)
+        } else if matches!(src_expr.node, Expr::ArrayConstructor { .. }) {
+            let (src_desc, _) = lower_array_expr_descriptor(
+                b,
+                locals,
+                src_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )?;
+            let base =
+                b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            // Constructor length × first-value elem size for compile-time total.
+            let Expr::ArrayConstructor { values, .. } = &src_expr.node else {
+                unreachable!()
+            };
+            let n_elems = const_array_constructor_len(values).filter(|n| *n > 0)?;
+            let elem_ti = values.first().and_then(|v| {
+                let crate::ast::expr::AcValue::Expr(e) = v else {
+                    return None;
+                };
+                operator_expr_type_info(e, Some(locals), st, type_layouts)
+            })?;
+            let src_elem_bytes: i64 = match elem_ti {
+                TypeInfo::Integer { kind } => kind.unwrap_or(4) as i64,
+                TypeInfo::Real { kind } => kind.unwrap_or(4) as i64,
+                TypeInfo::Logical { kind } => kind.unwrap_or(4) as i64,
+                _ => return None,
+            };
+            let total_const = n_elems * src_elem_bytes;
+            (base, b.const_i64(total_const), Some(total_const))
+        } else {
+            return None;
+        };
+
+    // Result extent: SIZE (constant or runtime) or
+    // ceil(SRC_total_bytes / MOLD_elem_size).
+    let result_extent: ValueId = if let Some(size_expr) = size_expr_opt {
+        if let Some(size_const) = eval_const_int(size_expr).filter(|s| *s >= 0) {
+            b.const_i64(size_const)
+        } else {
+            let raw = lower_expr_full(
+                b,
+                locals,
+                size_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_to_type(b, raw, &IrType::Int(IntWidth::I64))
+        }
+    } else if let Some(total_const) = src_total_bytes_const {
+        let extent = (total_const + mold_kind - 1) / mold_kind;
+        b.const_i64(extent.max(0))
+    } else {
+        let denom = b.const_i64(mold_kind);
+        let denom_minus_one = b.const_i64(mold_kind - 1);
+        let num = b.iadd(src_total_bytes_v, denom_minus_one);
+        b.idiv(num, denom)
+    };
+
+    // Build the rank-1 descriptor.
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(mold_ir_ty.clone())),
+        src_base,
+    );
+    let elem_size_v = b.const_i64(mold_kind);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size_v);
+    let rank = b.const_i32(1);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    let one = b.const_i64(1);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
+    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), result_extent);
+    store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+    let _ = src_total_bytes_v;
+    Some((desc, mold_ir_ty))
+}
+
 /// F2018 §16.9.144: lower PACK(ARRAY, MASK [, VECTOR]) to an
 /// `afs_array_pack` runtime call producing a fresh rank-1 descriptor.
 /// Returns the result descriptor address and the element IR type
@@ -34711,6 +34907,20 @@ fn lower_array_expr_descriptor(
                         contained_host_refs,
                         descriptor_params,
                     );
+                }
+                if name.eq_ignore_ascii_case("transfer") {
+                    if let Some(result) = lower_transfer_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
+                    }
                 }
                 // F2018 §16.9.135: MERGE is elemental. When at least one of the
                 // first two actuals (or the mask) is an array, the result is
