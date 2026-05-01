@@ -11783,6 +11783,107 @@ fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
 }
 
 #[test]
+fn cross_unit_char_array_result_uses_array_descriptor_abi() {
+    // F2018 §15.5.2.13 (function results): a function with rank-1
+    // character result like `character :: cstr(len(value)+1)` must use
+    // the 384-byte ArrayDescriptor hidden-result ABI on both sides of a
+    // module boundary, NOT the 32-byte StringDescriptor ABI.  Pre-fix
+    // callee_hidden_result_abi matched `TypeInfo::Character { .. }`
+    // before checking `result_rank > 0`, so cross-unit calls allocated
+    // a 32-byte StringDescriptor for the hidden first arg, the callee's
+    // afs_allocate_array prologue saw garbage extents, and `size(cstr)`
+    // came back wrong (0 or random).  This is the to_c_char failure in
+    // stdlib_strings: caller in example_to_c_char.f90 hit a bounds
+    // check ("index 1 outside [1, 0]") because the returned descriptor
+    // had extent 0.
+    let dir = unique_dir("cross_unit_char_array_result");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module mtcc\n  implicit none\ncontains\n  pure function to_c_char(value) result(cstr)\n    character(len=*), intent(in) :: value\n    character :: cstr(len(value)+1)\n    integer :: i, lv\n    lv = len(value)\n    do i = 1, lv\n      cstr(i) = value(i:i)\n    end do\n    cstr(lv+1) = char(0)\n  end function\nend module\n",
+    );
+    let prog_src = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use mtcc\n  implicit none\n  character, allocatable :: cstr(:)\n  character(*), parameter :: hello = \"Hello, World!\"\n  cstr = to_c_char(hello)\n  print *, 'size=', size(cstr)\n  if (size(cstr) > 0) print *, 'first=', cstr(1)\nend program\n",
+    );
+    let mod_obj = dir.join("m.o");
+    let prog_obj = dir.join("p.o");
+    let bin = dir.join("p");
+
+    let cm = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile module failed");
+    assert!(
+        cm.status.success(),
+        "module compile: {}",
+        String::from_utf8_lossy(&cm.stderr)
+    );
+
+    let cp = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            prog_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            prog_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile program failed");
+    assert!(
+        cp.status.success(),
+        "program compile: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            prog_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("size=") && stdout.contains("14"),
+        "expected size=14 (len(\"Hello, World!\")+1): {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("first=") && stdout.contains("H"),
+        "expected first=H: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
