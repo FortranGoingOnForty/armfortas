@@ -11730,6 +11730,59 @@ fn tbp_dispatch_boxes_class_star_literal_actual_into_descriptor() {
 }
 
 #[test]
+fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
+    // F2018 §16.9.193: TRANSFER(SOURCE, MOLD [, SIZE]) at a call site
+    // with an array MOLD must produce a rank-1 actual whose extent the
+    // assumed-shape callee sees correctly.  Pre-fix lower_array_expr_-
+    // descriptor had no `transfer` arm: the FunctionCall fell through
+    // pack/reshape/merge/matmul/transpose/conjg/aimag/abs/shape, then
+    // through lower_rank1_elemental_call_descriptor (None for transfer)
+    // and lower_array_function_result_descriptor (also None — transfer
+    // isn't registered as array-returning), and finally lower_arg_-
+    // descriptor's outer arms returned a zeroed descriptor.  size() in
+    // the callee read 0; size>0 guards bypassed the body.  Reproduces
+    // stdlib_hashmaps's map_entry/remove pattern: `call map%map_entry(
+    // transfer([1_int64,2_int64,3_int64],[0_int8]), 4)` — they printed
+    // the early CONFLICT lines then crashed at the transfer call.
+    let src = write_program(
+        "program p\n  use, intrinsic :: iso_fortran_env, only: int8, int64\n  implicit none\n  call sink(transfer([1_int64, 2_int64, 3_int64], [0_int8]))\ncontains\n  subroutine sink(value)\n    integer(int8), intent(in) :: value(:)\n    print *, 'SIZE=', size(value)\n    if (size(value) > 0) print *, 'FIRST=', value(1)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("inline_transfer_actual_extent", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected sink to receive a non-empty array: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("SIZE=") && stdout.contains("24"),
+        "expected SIZE= 24: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("FIRST=") && stdout.contains("1"),
+        "expected FIRST= 1 (first byte of int64 1 little-endian): {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
