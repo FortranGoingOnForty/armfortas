@@ -43897,13 +43897,16 @@ fn expr_is_transfer_array_call(value: &crate::ast::expr::SpannedExpr) -> bool {
     eval_const_int(size_expr).map(|n| n >= 1).unwrap_or(false)
 }
 
-/// True when `value` is any TRANSFER call with three args.  SIZE may
-/// be a runtime expression — descriptor-backed allocatable
-/// destinations route through `try_lower_transfer_into_array`'s
-/// runtime-size branch, which lowers SIZE at runtime and allocates
-/// the descriptor accordingly.  Fixed-shape destinations need
-/// `expr_is_transfer_array_call`'s constant-SIZE gate so the static
-/// extent matches.
+/// True when `value` is any TRANSFER call with at least two args.
+/// SIZE may be omitted (in which case the result extent defaults to
+/// `ceil(SRC_bytes / MOLD_elem_size)` when MOLD is array-shaped per
+/// F2018 §16.9.193) or a runtime expression — descriptor-backed
+/// allocatable destinations route through
+/// `try_lower_transfer_into_array`'s runtime branches, which derive
+/// the size at runtime from the SRC descriptor when SIZE is absent
+/// or lower it directly when SIZE is present.  Fixed-shape
+/// destinations still need `expr_is_transfer_array_call`'s
+/// constant-SIZE gate so the static extent matches.
 fn expr_is_transfer_array_call_dynamic(value: &crate::ast::expr::SpannedExpr) -> bool {
     let Expr::FunctionCall { callee, args } = &value.node else {
         return false;
@@ -43911,7 +43914,7 @@ fn expr_is_transfer_array_call_dynamic(value: &crate::ast::expr::SpannedExpr) ->
     let Expr::Name { name } = &callee.node else {
         return false;
     };
-    name.eq_ignore_ascii_case("transfer") && args.len() >= 3
+    name.eq_ignore_ascii_case("transfer") && args.len() >= 2
 }
 
 /// Recognize `lhs_array = transfer(SRC, MOLD, SIZE)` with constant
@@ -43936,7 +43939,7 @@ fn try_lower_transfer_into_array(
     let Expr::Name { name } = &callee.node else {
         return false;
     };
-    if !name.eq_ignore_ascii_case("transfer") || args.len() < 3 {
+    if !name.eq_ignore_ascii_case("transfer") || args.len() < 2 {
         return false;
     }
     let SectionSubscript::Element(src_expr) = &args[0].value else {
@@ -43945,8 +43948,14 @@ fn try_lower_transfer_into_array(
     let SectionSubscript::Element(mold_expr) = &args[1].value else {
         return false;
     };
-    let SectionSubscript::Element(size_expr) = &args[2].value else {
-        return false;
+    let size_expr_opt: Option<&crate::ast::expr::SpannedExpr> = if args.len() >= 3 {
+        if let SectionSubscript::Element(e) = &args[2].value {
+            Some(e)
+        } else {
+            return false;
+        }
+    } else {
+        None
     };
 
     // Mold scalar byte size from the mold's semantic type.
@@ -43968,8 +43977,14 @@ fn try_lower_transfer_into_array(
     // wrappers compute SIZE at runtime (`bytes_char * len(value)`),
     // and only descriptor-backed allocatable destinations can absorb
     // that — fixed-shape buffers need a compile-time size to validate
-    // against the destination's static extent.
-    let const_size: Option<i64> = eval_const_int(size_expr).filter(|s| *s >= 1);
+    // against the destination's static extent.  When SIZE is omitted
+    // entirely the result rank-1 extent is `ceil(SRC_bytes /
+    // MOLD_elem_size)` (F2018 §16.9.193) — derive that from the source
+    // array descriptor at runtime, which only works for descriptor-
+    // backed destinations (fixed-shape molds need a static extent).
+    let const_size: Option<i64> = size_expr_opt
+        .and_then(|e| eval_const_int(e))
+        .filter(|s| *s >= 1);
     let descriptor_dest = local_uses_array_descriptor(dest_info);
     let (size_v, total_v): (ValueId, ValueId) = if let Some(size) = const_size {
         let total_bytes = size * scalar_size;
@@ -43978,13 +43993,49 @@ fn try_lower_transfer_into_array(
         }
         (b.const_i64(size), b.const_i64(total_bytes))
     } else if descriptor_dest {
-        // Lower SIZE at runtime so we can honor `transfer(src, mold,
-        // bytes_char * len(value))`.  Multiply by scalar_size in IR.
-        let size_val = lower_expr_ctx_tl(b, ctx, size_expr);
-        let size_i64 = coerce_to_type(b, size_val, &IrType::Int(IntWidth::I64));
-        let elem_v = b.const_i64(scalar_size);
-        let total = b.imul(size_i64, elem_v);
-        (size_i64, total)
+        if let Some(size_expr) = size_expr_opt {
+            // Lower SIZE at runtime so we can honor `transfer(src, mold,
+            // bytes_char * len(value))`.  Multiply by scalar_size in IR.
+            let size_val = lower_expr_ctx_tl(b, ctx, size_expr);
+            let size_i64 = coerce_to_type(b, size_val, &IrType::Int(IntWidth::I64));
+            let elem_v = b.const_i64(scalar_size);
+            let total = b.imul(size_i64, elem_v);
+            (size_i64, total)
+        } else {
+            // 2-arg transfer.  SIZE defaults to
+            // `ceil(SRC_bytes / MOLD_elem_size)`.  We need SRC's
+            // total byte count: total_elems(SRC) * src_elem_size.
+            // This requires SRC to be a whole array we can introspect.
+            let src_info = match whole_array_expr_local_info(
+                b,
+                &ctx.locals,
+                src_expr,
+                ctx.st,
+                ctx.type_layouts,
+            ) {
+                Some(info) => info,
+                None => return false,
+            };
+            let src_total_elems = array_total_elems_value(b, &src_info);
+            let src_elem_size_const = descriptor_element_size_bytes(&src_info);
+            if src_elem_size_const <= 0 {
+                return false;
+            }
+            let src_elem_v = b.const_i64(src_elem_size_const);
+            let total = b.imul(src_total_elems, src_elem_v);
+            // ceil(total / scalar_size) for the mold extent.
+            let result_size = if scalar_size == 1 {
+                total
+            } else {
+                let denom = b.const_i64(scalar_size);
+                let one = b.const_i64(1);
+                let denom_minus_one = b.const_i64(scalar_size - 1);
+                let _ = one;
+                let num = b.iadd(total, denom_minus_one);
+                b.idiv(num, denom)
+            };
+            (result_size, total)
+        }
     } else {
         return false;
     };
