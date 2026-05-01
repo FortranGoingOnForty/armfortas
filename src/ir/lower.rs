@@ -24766,6 +24766,20 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
                             b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                            // F2018 §9.7.3.2: deallocating a pointer
+                            // disassociates it.  Null the slot so a
+                            // subsequent `associated()` returns false
+                            // and `=> null()`-style sentinels work.
+                            // Without this, free_map_entry_pool's
+                            // `if (.not. associated(pool)) return`
+                            // never fires for re-deallocated pools
+                            // and recurses until stack overflow.
+                            let null_v = b.const_i64(0);
+                            let null_p = b.int_to_ptr(
+                                null_v,
+                                IrType::Int(IntWidth::I8),
+                            );
+                            b.store(null_p, field_ptr);
                             continue;
                         }
                     }
@@ -24802,6 +24816,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             let ptr = b
                                 .load_typed(slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                             b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                            // Null the pointer slot per F2018 §9.7.3.2.
+                            let null_v = b.const_i64(0);
+                            let null_p = b.int_to_ptr(
+                                null_v,
+                                IrType::Int(IntWidth::I8),
+                            );
+                            b.store(null_p, slot);
                         } else {
                             let ptr = b.load_typed(
                                 info.addr,
