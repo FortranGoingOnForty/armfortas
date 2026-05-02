@@ -12082,6 +12082,46 @@ fn computed_goto_dispatches_to_indexed_label() {
 }
 
 #[test]
+fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
+    // F2018 §16.9.81/§16.9.187/§16.9.92: numeric inquiry intrinsics
+    // (EPSILON, TINY, HUGE) folded at compile time when the operand
+    // is a literal of known kind. Module-level
+    // `parameter :: tol = epsilon(1.0_dp)` previously stored zero,
+    // since eval_const_scalar lacked a fold for these intrinsics —
+    // breaking every Lentz-style convergence loop in
+    // stdlib_specialfunctions_gamma (whose `do ... if (abs(y-1) < tol_dp) exit`
+    // ran forever when tol_dp was 0). Without this fold the
+    // stdlib_specialfunctions_gamma cluster (gamma_p/gamma_q/ligamma/
+    // uigamma + the gamma_rvs PRNG) all hung at runtime.
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  real(dp), parameter :: eps_dp = epsilon(1.0_dp)\n  real(dp), parameter :: tin_dp = tiny(1.0_dp)\n  real, parameter :: eps_sp = epsilon(1.0)\n  real, parameter :: tin_sp = tiny(1.0)\n  integer, parameter :: hu_int = huge(1)\nend module\nprogram p\n  use m\n  implicit none\n  if (eps_dp <= 0.0_dp .or. eps_dp > 1.0e-15_dp) error stop 1\n  if (tin_dp <= 0.0_dp .or. tin_dp > 1.0e-300_dp) error stop 2\n  if (eps_sp <= 0.0 .or. eps_sp > 1.0e-6) error stop 3\n  if (tin_sp <= 0.0 .or. tin_sp > 1.0e-37) error stop 4\n  if (hu_int < 2147483000) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("epsilon_tiny_huge_fold", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
