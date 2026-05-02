@@ -5080,6 +5080,55 @@ fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
 }
 
 #[test]
+fn whole_fixed_char_array_print_dispatches_to_string_writer() {
+    // List-directed and unformatted whole-array PRINT for a fixed-len
+    // character array used to fall through to `afs_write_int` because
+    // `lower_whole_array_print_simple` only matched Int/Float/Bool — the
+    // load `[i8 x N]` was reinterpreted as a packed integer, so
+    // `print *, c` for `character(len=3) :: c(3)` emitted things like
+    // `1635017059` instead of `cat`. Per F2018 §10.10.4 list-directed
+    // output of a character array writes each element through the
+    // character edit-descriptor; element-by-element loop must call
+    // `afs_write_string(unit, ptr, len)`.
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=3) :: c(3) = ['cat', 'apt', 'bat']\n  print *, c\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("whole_fixed_char_array_print", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success(), "run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("cat") && stdout.contains("apt") && stdout.contains("bat"),
+        "expected three character elements, got: {}",
+        stdout
+    );
+    // Pre-fix output was integer reinterpretation of element bytes —
+    // reject any line that looks like a 9-digit decimal.
+    for line in stdout.lines() {
+        for tok in line.split_whitespace() {
+            assert!(
+                !(tok.len() >= 9 && tok.chars().all(|c| c.is_ascii_digit() || c == '-')),
+                "looks like int-reinterpretation of char bytes: token={} line={}",
+                tok,
+                line
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn whole_fixed_char_array_scalar_fill_preserves_element_slots() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens = ''\n  tokens(2) = 'line'\n  if (trim(tokens(2)) /= 'line') error stop 1\n  print *, trim(tokens(2))\nend program p\n",
