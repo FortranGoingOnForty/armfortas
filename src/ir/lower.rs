@@ -6442,6 +6442,62 @@ fn eval_const_scalar(
                         // operand to a float for further folding.
                         Some(ConstScalar::Float(first_arg?.to_float()))
                     }
+                    "epsilon" | "tiny" | "huge" => {
+                        // F2018 §16.9.81 / §16.9.187 / §16.9.92: numeric
+                        // inquiry intrinsics. Folded at compile time so
+                        // module-level `parameter :: tol = epsilon(1.0_dp)`
+                        // initializers store the right value rather than
+                        // zero. Without this fold every dependent runtime
+                        // check (Lentz convergence in stdlib_specialfunctions
+                        // _gamma's gpx_*, etc.) sees tol == 0 and never
+                        // exits.
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        // Determine the operand's kind. Float literal: check
+                        // suffix (1.0d0 → 8). Integer literal → 4. Named
+                        // constant — look up in param_consts to recover
+                        // its kind by value range.
+                        enum Kind { F32, F64, I32, I64 }
+                        let kind = match &e.node {
+                            Expr::RealLiteral { text, kind, .. } => {
+                                let lower = text.to_ascii_lowercase();
+                                if let Some(k) = kind.as_deref() {
+                                    match k.parse::<i64>().ok() {
+                                        Some(8) => Kind::F64,
+                                        Some(4) => Kind::F32,
+                                        _ => match k.to_ascii_lowercase().as_str() {
+                                            "dp" | "real64" => Kind::F64,
+                                            _ => Kind::F32,
+                                        },
+                                    }
+                                } else if lower.contains('d') {
+                                    Kind::F64
+                                } else {
+                                    Kind::F32
+                                }
+                            }
+                            Expr::IntegerLiteral { kind, .. } => {
+                                match kind.as_deref().and_then(|s| s.parse::<i64>().ok()) {
+                                    Some(8) => Kind::I64,
+                                    _ => Kind::I32,
+                                }
+                            }
+                            _ => return None,
+                        };
+                        match (key.as_str(), kind) {
+                            ("epsilon", Kind::F32) => Some(ConstScalar::Float(f32::EPSILON as f64)),
+                            ("epsilon", Kind::F64) => Some(ConstScalar::Float(f64::EPSILON)),
+                            ("tiny", Kind::F32) => Some(ConstScalar::Float(f32::MIN_POSITIVE as f64)),
+                            ("tiny", Kind::F64) => Some(ConstScalar::Float(f64::MIN_POSITIVE)),
+                            ("huge", Kind::F32) => Some(ConstScalar::Float(f32::MAX as f64)),
+                            ("huge", Kind::F64) => Some(ConstScalar::Float(f64::MAX)),
+                            ("huge", Kind::I32) => Some(ConstScalar::Int(i32::MAX as i128)),
+                            ("huge", Kind::I64) => Some(ConstScalar::Int(i64::MAX as i128)),
+                            _ => None,
+                        }
+                    }
                     "max" | "min" => {
                         // Variadic — fold as long as every arg folds.
                         let mut acc: Option<ConstScalar> = None;
