@@ -31054,7 +31054,17 @@ fn lower_whole_array_write(
 ) {
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    // Fixed-length CHARACTER arrays must dispatch to afs_write_string
+    // with (ptr, len). Without this, the element load was treated as a
+    // packed-integer chunk and fed to afs_write_int — `print *, c` for
+    // `character(len=3) :: c(3)` printed integers like `1635017059`
+    // instead of `cat`.
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
     let writer = match &info.ty {
+        _ if char_fixed_len.is_some() => "afs_write_string",
         IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
@@ -31088,12 +31098,21 @@ fn lower_whole_array_write(
     let elem_bytes_v = b.const_i64(elem_bytes);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-    let elem = b.load_typed(ptr, info.ty.clone());
-    b.call(
-        FuncRef::External(writer.into()),
-        vec![unit, elem],
-        IrType::Void,
-    );
+    if let Some(len) = char_fixed_len {
+        let len_v = b.const_i64(len);
+        b.call(
+            FuncRef::External(writer.into()),
+            vec![unit, ptr, len_v],
+            IrType::Void,
+        );
+    } else {
+        let elem = b.load_typed(ptr, info.ty.clone());
+        b.call(
+            FuncRef::External(writer.into()),
+            vec![unit, elem],
+            IrType::Void,
+        );
+    }
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
     b.store(next, i_addr);
