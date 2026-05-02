@@ -1663,6 +1663,12 @@ fn smp_function_result_info(
     // (the result variable from sema's Function processing). If absent
     // (e.g. .amod-loaded interface where only dummies are stored), fall
     // back to a synthetic Symbol from the function symbol's type_info.
+    //
+    // For .amod-loaded modules, the result variable is recorded under
+    // a synthetic `__amod_result_<name>` key to avoid collision with
+    // user locals when both share the same proc scope. Strip that
+    // prefix so the synthesized Function decl uses the original name
+    // (`res`), matching what the SMP body's source code references.
     for (key, sym) in &scope.symbols {
         if arg_set.contains(key) {
             continue;
@@ -1672,7 +1678,14 @@ fn smp_function_result_info(
             crate::sema::symtab::SymbolKind::Variable
                 | crate::sema::symtab::SymbolKind::Parameter
         ) {
-            return Some((sym.name.clone(), sym.clone()));
+            let name = sym
+                .name
+                .strip_prefix("__amod_result_")
+                .map(str::to_string)
+                .unwrap_or_else(|| sym.name.clone());
+            let mut sym_clone = sym.clone();
+            sym_clone.name = name.clone();
+            return Some((name, sym_clone));
         }
     }
     // No result variable in the scope — synthesize one from the
