@@ -11922,6 +11922,45 @@ fn assumed_shape_lower_override_propagates_through_nested_calls() {
 }
 
 #[test]
+fn rank_remap_pointer_assignment_builds_2d_descriptor() {
+    // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
+    // contiguous 1-D target as a 2-D array. The destination descriptor
+    // must record the requested rank, bounds, and stride=1, while
+    // base_addr points at the source's data.  Pre-fix the LHS path
+    // bailed out (target is `Expr::FunctionCall` with Range subscripts,
+    // not a plain Name), leaving the pointer's descriptor zeroed —
+    // `xmat(i,j)` then tripped a bounds check against `[1, 0]`.
+    // stdlib_linalg's solve/chol/eig/inverse/svd routines do this
+    // pattern; ~25 stdlib examples were silently failing.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable, target :: x(:)\n  real, pointer :: xmat(:,:)\n  integer :: n, nrhs\n  allocate(x(6))\n  x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]\n  n = 3\n  nrhs = 2\n  xmat(1:n, 1:nrhs) => x\n  if (xmat(1,1) /= 1.0) error stop 1\n  if (xmat(2,1) /= 2.0) error stop 2\n  if (xmat(3,1) /= 3.0) error stop 3\n  if (xmat(1,2) /= 4.0) error stop 4\n  if (xmat(2,2) /= 5.0) error stop 5\n  if (xmat(3,2) /= 6.0) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_remap_pointer_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
