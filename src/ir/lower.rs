@@ -26119,6 +26119,43 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             //
             // In both cases the target must be a simple Name for now;
             // component-access and slice targets are follow-up work.
+
+            // Rank-remapping pointer assignment, F2018 §10.2.2.3:
+            //   `xmat(1:n, 1:nrhs) => x`   (1-D `x` reinterpreted as 2-D)
+            // The LHS is a FunctionCall in the AST whose subscripts are
+            // Range bounds, not array indices. The previous fall-through
+            // path treated this as scalar pointer assignment and never
+            // populated the destination descriptor — `xmat(i,j)` then
+            // tripped a bounds check against `[1, 0]`. stdlib_linalg's
+            // solve/chol/eig/inverse/svd/norm all do this; ~25 stdlib
+            // examples were blocked.
+            if let Expr::FunctionCall { callee, args } = &target.node {
+                if let Expr::Name { name: tgt_name } = &callee.node {
+                    let tgt_key = tgt_name.to_lowercase();
+                    let is_remap_target = ctx
+                        .locals
+                        .get(&tgt_key)
+                        .map(|info| {
+                            info.is_pointer && local_uses_array_descriptor(info)
+                        })
+                        .unwrap_or(false);
+                    let all_ranges = !args.is_empty()
+                        && args.iter().all(|a| {
+                            matches!(
+                                a.value,
+                                crate::ast::expr::SectionSubscript::Range { .. }
+                            )
+                        });
+                    if is_remap_target && all_ranges {
+                        if lower_rank_remap_pointer_assignment(
+                            b, ctx, &tgt_key, args, value,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+            }
+
             let component_target =
                 resolve_component_field_access(b, &ctx.locals, target, ctx.st, ctx.type_layouts)
                     .filter(|(_, field)| field.pointer);
@@ -31216,6 +31253,110 @@ fn store_byte_aggregate_field(
         _ => val,
     };
     b.store(stored, ptr);
+}
+
+/// F2018 §10.2.2.3 rank-remapping pointer assignment:
+///   `pmat(L1:U1, L2:U2, ...) => array1d`
+/// Build a multi-rank descriptor in the LHS pointer slot pointing at
+/// the source's base storage. Returns false if the shape isn't supported
+/// (e.g. RHS is a complex expression we can't trivially resolve to a
+/// single contiguous base + element size).
+fn lower_rank_remap_pointer_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    tgt_key: &str,
+    target_args: &[crate::ast::expr::Argument],
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    use crate::ast::expr::Expr;
+    let tgt_info = match ctx.locals.get(tgt_key).cloned() {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Source must be a Name resolvable to a local with array storage,
+    // so we can read its base_addr and element size. Defer fancier RHS
+    // shapes (sections, function calls) to future work.
+    let src_name = match &value.node {
+        Expr::Name { name } => name.clone(),
+        _ => return false,
+    };
+    let src_info = match ctx.locals.get(&src_name.to_lowercase()).cloned() {
+        Some(i) => i,
+        None => return false,
+    };
+    if src_info.dims.is_empty() && !src_info.allocatable && !src_info.descriptor_arg {
+        return false;
+    }
+
+    // Compute (lower, upper, stride=1) from each Range subscript.
+    let mut bounds: Vec<(ValueId, ValueId)> = Vec::with_capacity(target_args.len());
+    for arg in target_args {
+        let crate::ast::expr::SectionSubscript::Range { start, end, stride } = &arg.value else {
+            return false;
+        };
+        if stride.is_some() {
+            return false;
+        }
+        let lo = match start {
+            Some(e) => {
+                let v = lower_expr_ctx(b, ctx, e);
+                match b.func().value_type(v) {
+                    Some(IrType::Int(IntWidth::I64)) => v,
+                    _ => b.int_extend(v, IntWidth::I64, true),
+                }
+            }
+            None => b.const_i64(1),
+        };
+        let hi = match end {
+            Some(e) => {
+                let v = lower_expr_ctx(b, ctx, e);
+                match b.func().value_type(v) {
+                    Some(IrType::Int(IntWidth::I64)) => v,
+                    _ => b.int_extend(v, IntWidth::I64, true),
+                }
+            }
+            None => return false,
+        };
+        bounds.push((lo, hi));
+    }
+
+    let src_base = array_data_ptr_for_call(b, &src_info);
+    let elem_bytes = ir_scalar_byte_size(&src_info.ty);
+
+    let desc = array_descriptor_addr(b, &tgt_info);
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        src_base,
+    );
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes_v);
+    let rank = b.const_i32(bounds.len() as i32);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    // flags: bit 1 marks pointer association (matches existing
+    // section-RHS path at the array-pointer-section site above).
+    let flags = b.const_i32(2);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+
+    let one = b.const_i64(1);
+    for (i, (lo, hi)) in bounds.iter().enumerate() {
+        let dim_off = 24 + (i as i64) * 24;
+        store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), *lo);
+        store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), *hi);
+        store_byte_aggregate_field(b, desc, dim_off + 16, IrType::Int(IntWidth::I64), one);
+    }
+    true
 }
 
 fn array_data_ptr_for_call(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
