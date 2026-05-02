@@ -4396,6 +4396,14 @@ fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
+                install_explicit_shape_dummy_rebase(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    ctx.st,
+                    type_layouts,
+                );
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
@@ -4835,6 +4843,14 @@ fn lower_unit(
                     type_layouts,
                 );
                 install_assumed_shape_lower_overrides(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    ctx.st,
+                    type_layouts,
+                );
+                install_explicit_shape_dummy_rebase(
                     &mut b,
                     &mut ctx.locals,
                     decls,
@@ -18793,6 +18809,192 @@ fn install_assumed_shape_lower_overrides(
                 let new_up = b.iadd(new_lo_i64, span);
                 b.store(new_lo_i64, lo_p);
                 b.store(new_up, up_p);
+            }
+            b.store(local_desc, slot);
+        }
+    }
+}
+
+/// F2018 §15.5.2.4(13) — argument storage association: when a dummy is
+/// declared with explicit shape `a(lda, *)` (or any explicit-shape spec)
+/// and the actual argument is, say, an array element designator, the
+/// caller's descriptor may have rank 0 or otherwise misshapen dim
+/// metadata. The dummy MUST present the storage as a multi-dim array
+/// with bounds taken from its own declaration.
+///
+/// This rebase fires for descriptor_arg dummies whose spec is explicit-
+/// shape (first dim Explicit, optionally with `*` last). It allocates a
+/// fresh local descriptor, memcpys the caller's so we keep base_addr +
+/// elem_size, then patches:
+///   - rank = number of declared dims
+///   - dim[i].lower = spec lower (or 1)
+///   - dim[i].upper = spec upper (runtime expression)
+///   - dim[i].stride = dim[i-1].extent  (column-major contiguous)
+/// The assumed-size `*` last dim leaves upper untouched — `last_dim_assumed_size`
+/// already suppresses bounds checks on it.
+fn install_explicit_shape_dummy_rebase(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    _visible_param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    use crate::ast::decl::{ArraySpec, Attribute};
+    for decl in decls {
+        let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a {
+                Some(specs)
+            } else {
+                None
+            }
+        });
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            let Some(info) = locals.get(&key) else {
+                continue;
+            };
+            if !info.by_ref || !info.descriptor_arg {
+                continue;
+            }
+            let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
+                continue;
+            };
+            if specs.is_empty() {
+                continue;
+            }
+            // We rebase only when the FIRST dim is Explicit (i.e. an
+            // explicit-shape spec like `a(lda, *)` or `a(m, n)`). Pure
+            // assumed-shape `a(:, :)` and friends keep the caller's
+            // metadata, which is correct for them.
+            if !matches!(specs[0], ArraySpec::Explicit { .. }) {
+                continue;
+            }
+            // Earlier dims must all be Explicit; only the last may be
+            // AssumedSize. Anything else (Deferred, AssumedShape,
+            // AssumedRank) is shape-ambiguous and not our case.
+            let last_idx = specs.len() - 1;
+            for (i, spec) in specs.iter().enumerate() {
+                let ok = match spec {
+                    ArraySpec::Explicit { .. } => true,
+                    ArraySpec::AssumedSize { .. } if i == last_idx => true,
+                    _ => false,
+                };
+                if !ok {
+                    return; // bail on this entity (continue isn't enough — already filtered specs)
+                }
+            }
+
+            let rank = specs.len() as i32;
+            let slot = info.addr;
+            let original_desc_ptr = b.load(slot);
+            let local_desc = b.alloca(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I8)),
+                384,
+            ));
+            let bytes = b.const_i64(384);
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![local_desc, original_desc_ptr, bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            // rank is at byte offset 16 (i32)
+            let off_rank = b.const_i64(16);
+            let rank_p = b.gep(local_desc, vec![off_rank], IrType::Int(IntWidth::I8));
+            let rank_val = b.const_i32(rank);
+            b.store(rank_val, rank_p);
+
+            let one64 = b.const_i64(1);
+            let mut prev_extent: Option<ValueId> = None;
+            for (i, spec) in specs.iter().enumerate() {
+                let dim_offset = 24i64 + (i as i64) * 24;
+                let off_lo = b.const_i64(dim_offset);
+                let off_up = b.const_i64(dim_offset + 8);
+                let off_st = b.const_i64(dim_offset + 16);
+                let lo_p = b.gep(local_desc, vec![off_lo], IrType::Int(IntWidth::I8));
+                let up_p = b.gep(local_desc, vec![off_up], IrType::Int(IntWidth::I8));
+                let st_p = b.gep(local_desc, vec![off_st], IrType::Int(IntWidth::I8));
+
+                match spec {
+                    ArraySpec::Explicit { lower, upper } => {
+                        let new_lo = lower
+                            .as_ref()
+                            .map(|e| {
+                                let v = lower_expr_with_optional_layouts(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    Some(type_layouts),
+                                );
+                                match b.func().value_type(v) {
+                                    Some(IrType::Int(IntWidth::I64)) => v,
+                                    _ => b.int_extend(v, IntWidth::I64, true),
+                                }
+                            })
+                            .unwrap_or_else(|| b.const_i64(1));
+                        let new_up = {
+                            let v = lower_expr_with_optional_layouts(
+                                b,
+                                locals,
+                                upper,
+                                st,
+                                Some(type_layouts),
+                            );
+                            match b.func().value_type(v) {
+                                Some(IrType::Int(IntWidth::I64)) => v,
+                                _ => b.int_extend(v, IntWidth::I64, true),
+                            }
+                        };
+                        b.store(new_lo, lo_p);
+                        b.store(new_up, up_p);
+                        // stride = product of prior extents (column-major)
+                        let stride_val = prev_extent.unwrap_or(one64);
+                        b.store(stride_val, st_p);
+                        // update extent for next dim's stride
+                        let span = b.isub(new_up, new_lo);
+                        let extent = b.iadd(span, one64);
+                        let new_cum = match prev_extent {
+                            None => extent,
+                            Some(p) => b.imul(p, extent),
+                        };
+                        prev_extent = Some(new_cum);
+                    }
+                    ArraySpec::AssumedSize { lower } => {
+                        let new_lo = lower
+                            .as_ref()
+                            .map(|e| {
+                                let v = lower_expr_with_optional_layouts(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    Some(type_layouts),
+                                );
+                                match b.func().value_type(v) {
+                                    Some(IrType::Int(IntWidth::I64)) => v,
+                                    _ => b.int_extend(v, IntWidth::I64, true),
+                                }
+                            })
+                            .unwrap_or_else(|| b.const_i64(1));
+                        b.store(new_lo, lo_p);
+                        // upper for `*` is unbounded; leave the caller's
+                        // value or use lower (so [lo, lo] is the trivial
+                        // accept range when bounds checking is on). Our
+                        // `last_dim_assumed_size` flag suppresses the
+                        // check on this dim anyway.
+                        b.store(new_lo, up_p);
+                        let stride_val = prev_extent.unwrap_or(one64);
+                        b.store(stride_val, st_p);
+                    }
+                    _ => unreachable!(),
+                }
             }
             b.store(local_desc, slot);
         }
