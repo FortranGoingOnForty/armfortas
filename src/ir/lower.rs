@@ -14684,6 +14684,19 @@ fn operator_expr_type_info(
             kind: Some(1),
         }),
         Expr::ComponentAccess { base, component } => {
+            // Recognise complex part designators (F2008 §6.2) before
+            // descending into derived-type field lookup — `c%re` / `c%im`
+            // are real(k) when c is complex(k).
+            if let Some(base_ti) = operator_expr_type_info(base, locals, st, type_layouts) {
+                let lc_component = component.to_lowercase();
+                if matches!(&base_ti, TypeInfo::Complex { .. })
+                    && (lc_component == "re" || lc_component == "im")
+                {
+                    if let TypeInfo::Complex { kind } = base_ti {
+                        return Some(TypeInfo::Real { kind });
+                    }
+                }
+            }
             if let Some(tl) = type_layouts {
                 if let Some(base_ti) = operator_expr_type_info(base, locals, st, Some(tl)) {
                     let type_name = match base_ti {
@@ -14817,8 +14830,22 @@ fn generic_actual_expr_type_info(
             name_expr_type_info(locals.get(&key), symbol_ti.as_ref())
         }
         Expr::ComponentAccess { base, component } => {
+            // F2008 §6.2: complex part designator. `c%re` / `c%im` of a
+            // complex(k) value is real(k). Without this generic dispatch
+            // sees Unknown and silently falls back to the integer
+            // overload — stdlib's `linspace_n_1_cdp_cdp` calls
+            // `linspace(start%re, end%re, n)` and was routing to the
+            // int32 specific despite the real(dp) actuals.
+            let base_ti = generic_actual_expr_type_info(base, locals, st, type_layouts)?;
+            let lc_component = component.to_lowercase();
+            if matches!(&base_ti, TypeInfo::Complex { .. })
+                && (lc_component == "re" || lc_component == "im")
+            {
+                if let TypeInfo::Complex { kind } = base_ti {
+                    return Some(TypeInfo::Real { kind });
+                }
+            }
             let tl = type_layouts?;
-            let base_ti = generic_actual_expr_type_info(base, locals, st, Some(tl))?;
             let type_name = match base_ti {
                 TypeInfo::Derived(name) | TypeInfo::Class(name) => name,
                 _ => return None,
@@ -44733,6 +44760,42 @@ fn lower_expr_full(
         }
 
         Expr::ComponentAccess { base, component } => {
+            // F2008 §6.2: complex part designator. `c%re` of a complex(k)
+            // value returns the real part as real(k); `c%im` returns the
+            // imaginary part. Layout is two side-by-side f32/f64 lanes
+            // (re at offset 0, im at offset kind-bytes). Without this
+            // arm both designators fell through to the const_i32(0)
+            // fallback, silently producing 0 for `start%re` etc.
+            let lc_component = component.to_lowercase();
+            if lc_component == "re" || lc_component == "im" {
+                let base_ti = operator_expr_type_info(base, Some(locals), st, type_layouts);
+                if let Some(crate::sema::symtab::TypeInfo::Complex { kind }) = base_ti {
+                    let kind_bytes = kind.unwrap_or(4) as i64;
+                    let elem_ty = if kind_bytes == 8 {
+                        IrType::Float(FloatWidth::F64)
+                    } else {
+                        IrType::Float(FloatWidth::F32)
+                    };
+                    let base_addr = lower_expr_full(
+                        b,
+                        locals,
+                        base,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    let off = if lc_component == "re" {
+                        0
+                    } else {
+                        kind_bytes
+                    };
+                    let off_v = b.const_i64(off);
+                    let lane_ptr = b.gep(base_addr, vec![off_v], IrType::Int(IntWidth::I8));
+                    return b.load_typed(lane_ptr, elem_ty);
+                }
+            }
             if let Some(tl) = type_layouts {
                 if let Expr::Name { name } = &base.node {
                     if let Some(value) =

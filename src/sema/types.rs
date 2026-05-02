@@ -643,8 +643,26 @@ pub fn expr_type(
             }
         }
 
-        // Component access: base%component — would need derived type definitions to resolve
-        Expr::ComponentAccess { .. } => FortranType::Unknown,
+        // Component access: base%component.
+        //
+        // F2008 §6.2 introduces `%re` / `%im` complex part designators —
+        // a complex(k) value's `%re` and `%im` are real(k). Without this,
+        // generic dispatch on a `complex%re` actual sees Unknown and
+        // falls back to the first specific (typically the integer
+        // overload) — silently miscompiling stdlib code like
+        // `linspace(start%re, end%re, n)` inside the complex variant.
+        // Derived types still need type_layouts for field resolution
+        // (handled by operator_expr_type_info's tl path).
+        Expr::ComponentAccess { base, component } => {
+            let base_ty = expr_type(base, symtab);
+            let lc = component.to_lowercase();
+            match (lc.as_str(), &base_ty) {
+                ("re" | "im", FortranType::Complex { kind }) => {
+                    FortranType::Real { kind: *kind }
+                }
+                _ => FortranType::Unknown,
+            }
+        }
 
         // Unary operations
         Expr::UnaryOp { op, operand } => {
