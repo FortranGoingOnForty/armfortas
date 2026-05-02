@@ -25131,6 +25131,44 @@ fn f77_statement_function_in_subroutine_inlines_per_scope() {
 }
 
 #[test]
+fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
+    // F2008 §6.2: c%re / c%im on a complex(k) value yield real(k).
+    // Prior behavior:
+    //   - lower_expr_full's ComponentAccess arm fell through to
+    //     b.const_i32(0), so `tmp = c%re` silently stored 0.
+    //   - generic_actual_expr_type_info / operator_expr_type_info /
+    //     sema::types::expr_type all returned Unknown for the
+    //     ComponentAccess on a complex base, so `gen(c%re)` dispatched
+    //     to the integer overload of `gen` instead of the real one —
+    //     surfaced as stdlib's linspace_n_1_cdp_cdp routing
+    //     `linspace(start%re, end%re, n)` through the int32 specific.
+    let src = write_program(
+        "module mdisp\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  interface gen\n    module procedure gen_int\n    module procedure gen_real\n  end interface\ncontains\n  function gen_int(x) result(r)\n    integer, intent(in) :: x\n    real(dp) :: r\n    r = real(x, dp) - 1.0_dp\n  end function\n  function gen_real(x) result(r)\n    real(dp), intent(in) :: x\n    real(dp) :: r\n    r = x + 100.0_dp\n  end function\nend module\nprogram p\n  use mdisp\n  implicit none\n  complex(dp) :: c\n  real(dp) :: tmp\n  c = cmplx(3.5_dp, 4.5_dp, kind=dp)\n  tmp = c%re\n  if (abs(tmp - 3.5_dp) > 1.0e-12_dp) error stop 1\n  tmp = c%im\n  if (abs(tmp - 4.5_dp) > 1.0e-12_dp) error stop 2\n  if (abs(gen(c%re) - 103.5_dp) > 1.0e-12_dp) error stop 3\n  if (abs(gen(c%im) - 104.5_dp) > 1.0e-12_dp) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_re_im_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex %re dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex %re dispatch compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("complex %re dispatch run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex %re dispatch run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
     // Same logspace pattern as the single-file test but with the
     // submodule body in a SEPARATE compilation unit from the parent
