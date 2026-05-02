@@ -1394,9 +1394,18 @@ fn inject_separate_module_procedure_args(
     };
 
     // Find the matching procedure scope inside the parent module.
+    // F2008-style submodules declare the procedure inside an explicit
+    // `interface ... end interface` block at module scope, which adds
+    // an intermediate Interface scope between the module and the
+    // procedure scope. Tolerate one Interface hop.
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
-        if scope.parent != Some(parent_module_scope) {
+        let direct_parent_matches = scope.parent == Some(parent_module_scope);
+        let via_interface = scope.parent.map(|pid| {
+            matches!(st.scope(pid).kind, ScopeKind::Interface)
+                && st.scope(pid).parent == Some(parent_module_scope)
+        }).unwrap_or(false);
+        if !direct_parent_matches && !via_interface {
             return None;
         }
         match &scope.kind {
