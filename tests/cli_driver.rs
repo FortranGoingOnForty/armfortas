@@ -25131,6 +25131,86 @@ fn f77_statement_function_in_subroutine_inlines_per_scope() {
 }
 
 #[test]
+fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
+    // Same logspace pattern as the single-file test but with the
+    // submodule body in a SEPARATE compilation unit from the parent
+    // module — the case stdlib actually uses (stdlib_math.F90 declares
+    // logspace_1_iint32_n's interface; stdlib_math_logspace.f90 has
+    // the body). The parent's .amod must preserve the result var's
+    // explicit-shape bound expressions so the body's TU rebuilds the
+    // same Explicit { upper: Name(n) } and allocates the runtime-shape
+    // buffer in the prologue. Without preservation, the .amod loader
+    // reconstructed the result as AssumedShape and the prologue's
+    // runtime-shape allocation was skipped — leaving the caller with
+    // a NULL base_addr that crashed on the assignment memcpy.
+    let parent_src = write_program(
+        "module mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  interface\n    pure module function gen_n(start, n) result(res)\n      integer, intent(in) :: start\n      integer, intent(in) :: n\n      real(dp) :: res(n)\n    end function\n  end interface\nend module\n",
+        "f90",
+    );
+    let sub_src = write_program(
+        "submodule (mtop) mimpl\ncontains\n  module procedure gen_n\n    integer :: i\n    do i = 1, n\n      res(i) = real(start + i, dp)\n    end do\n  end procedure\nend submodule\n",
+        "f90",
+    );
+    let main_src = write_program(
+        "program p\n  use mtop\n  implicit none\n  integer, parameter :: n = 5\n  real(dp) :: r(n)\n  r = gen_n(10, n)\n  if (abs(r(1) - 11.0d0) > 1.0d-12) error stop 1\n  if (abs(r(5) - 15.0d0) > 1.0d-12) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let parent_o = unique_path("smp_split_parent", "o");
+    let sub_o = unique_path("smp_split_sub", "o");
+    let main_o = unique_path("smp_split_main", "o");
+    let out = unique_path("smp_split_runtime_shape", "bin");
+    let mod_dir = unique_dir("smp_split_mods");
+    let work_dir = mod_dir.as_path();
+
+    let compile_one = |src: &std::path::Path, obj: &std::path::Path| {
+        let r = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .args(["-J", work_dir.to_str().unwrap()])
+            .args(["-I", work_dir.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            r.status.success(),
+            "compile of {:?} failed: {}",
+            src,
+            String::from_utf8_lossy(&r.stderr)
+        );
+    };
+    compile_one(&parent_src, &parent_o);
+    compile_one(&sub_src, &sub_o);
+    compile_one(&main_src, &main_o);
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            main_o.to_str().unwrap(),
+            parent_o.to_str().unwrap(),
+            sub_o.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "split-file SMP runtime-shape result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all(&mod_dir);
+}
+
+#[test]
 fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
     // Stdlib pattern (logspace, linspace, lapack/blas wrappers): parent
     // module has an `interface ... end interface` declaring a function
