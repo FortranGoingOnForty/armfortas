@@ -12000,6 +12000,50 @@ fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
 }
 
 #[test]
+fn array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor() {
+    // F2018 §15.5.2.4(13): when the actual argument is an array element
+    // designator and the dummy is an explicit-shape array, the dummy is
+    // associated with the designated element and the elements that
+    // follow in array element order. The dummy MUST present its own
+    // shape (taken from its declaration) — not the caller's, which may
+    // be rank-0 or otherwise misshapen.
+    //
+    // Pre-fix the call site lowered `outer(... a(1, 2))` (an Element
+    // FunctionCall) via materialize_scalar_element_descriptor_from_info,
+    // producing a rank-0 descriptor. At the callee, afs_array_lbound /
+    // afs_array_ubound on dim 1 returned the (1, 0) sentinel, and the
+    // first b(i, j) write tripped "index 1 outside [1, 0]". This is the
+    // exact failure path that kept stdlib_linalg's solve / chol / svd
+    // examples broken — sgetrf2 calls strsm with a(1, n1+1).
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  pure subroutine inner(lda, m, n, b)\n    integer, intent(in) :: lda, m, n\n    real, intent(inout) :: b(lda, *)\n    integer :: i, j\n    do j = 1, n\n      do i = 1, m\n        b(i, j) = b(i, j) + 1.0\n      end do\n    end do\n  end subroutine\n  pure subroutine outer(a, lda)\n    real, intent(inout) :: a(lda, *)\n    integer, intent(in) :: lda\n    call inner(lda, lda, 2, a(1, 2))\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  real :: x(3, 4)\n  integer :: i\n  x = reshape([(real(i), i=1, 12)], [3, 4])\n  call outer(x, 3)\n  if (x(1, 2) /= 5.0) error stop 1\n  if (x(2, 2) /= 6.0) error stop 2\n  if (x(3, 2) /= 7.0) error stop 3\n  if (x(1, 3) /= 8.0) error stop 4\n  if (x(1, 1) /= 1.0) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elem_to_explicit_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
