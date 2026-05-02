@@ -23,6 +23,87 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
+/// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
+/// is `lower:upper` or just `upper`. Returns None if any dim is not
+/// `Explicit` (assumed-shape, deferred, etc. round-trip via the
+/// existing rank-based reconstruction in `load_external_module`).
+///
+/// Used to preserve runtime-shape result bounds across split-file
+/// submodule compilation. Examples:
+///   `(n)`             → `Explicit { lower: None, upper: Name(n) }`
+///   `(max(n, 0))`     → `Explicit { lower: None, upper: max(n,0) }`
+///   `(1:n, 1:m)`      → two-dim Explicit with both bounds
+fn stringify_array_bounds(specs: &[crate::ast::decl::ArraySpec]) -> Option<String> {
+    use crate::ast::decl::ArraySpec;
+    let mut parts: Vec<String> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            ArraySpec::Explicit { lower, upper } => {
+                let upper_s = upper.to_sexpr();
+                if let Some(lo) = lower {
+                    parts.push(format!("{}:{}", lo.to_sexpr(), upper_s));
+                } else {
+                    parts.push(upper_s);
+                }
+            }
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("({})", parts.join("; ")))
+}
+
+/// Parse a `(dim1; dim2; ...)`-encoded array bounds string back into
+/// a Vec<ArraySpec> by re-lexing and re-parsing each bound expression
+/// via the regular Fortran parser. Returns None if the string is
+/// malformed or any bound expr fails to parse — in that case the
+/// loader falls back to its rank-based AssumedShape reconstruction.
+pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArraySpec>> {
+    use crate::ast::decl::ArraySpec;
+    let inner = s.strip_prefix('(').and_then(|s| s.strip_suffix(')'))?;
+    let mut specs = Vec::new();
+    for dim in inner.split(';') {
+        let dim = dim.trim();
+        if dim.is_empty() {
+            return None;
+        }
+        // Find the first `:` at depth 0 (parens/brackets) to split
+        // lower:upper. Don't split on `:` inside function calls.
+        let mut depth: i32 = 0;
+        let mut split_at: Option<usize> = None;
+        for (idx, ch) in dim.char_indices() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ':' if depth == 0 => {
+                    split_at = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (lower_str, upper_str) = match split_at {
+            Some(i) => (Some(&dim[..i]), &dim[i + 1..]),
+            None => (None, dim),
+        };
+        let upper = parse_simple_expr(upper_str.trim())?;
+        let lower = match lower_str {
+            Some(s) => Some(parse_simple_expr(s.trim())?),
+            None => None,
+        };
+        specs.push(ArraySpec::Explicit { lower, upper });
+    }
+    Some(specs)
+}
+
+fn parse_simple_expr(src: &str) -> Option<crate::ast::expr::SpannedExpr> {
+    let tokens = crate::lexer::Lexer::tokenize(src, 0).ok()?;
+    let mut parser = crate::parser::Parser::new(&tokens);
+    parser.parse_expr().ok()
+}
+
 fn hex_encode_bytes(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -593,6 +674,56 @@ fn emit_procedure(
                 write!(out, ", result_name={}", result_var_name).unwrap();
             }
         }
+        // Sprint35-SMP Phase 3: serialize the result variable's
+        // explicit-shape bounds so split-file submodule bodies (where
+        // the body's TU loads the parent module from .amod) can rebuild
+        // a same-shape ArraySpec at load time. Without this, the body's
+        // `res(i) = …` lowers against an AssumedShape result and the
+        // function prologue fails to allocate the runtime-shape buffer.
+        if !sym.attrs.allocatable && !sym.attrs.pointer && sym.attrs.result_rank > 0 {
+            let bounds = st
+                .scopes
+                .iter()
+                .find(|s| {
+                    let matches_name = match &s.kind {
+                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                            n.eq_ignore_ascii_case(name)
+                        }
+                        _ => false,
+                    };
+                    if !matches_name {
+                        return false;
+                    }
+                    let Some(parent_id) = s.parent else {
+                        return false;
+                    };
+                    parent_id == mod_scope_id
+                        || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                            && st.scope(parent_id).parent == Some(mod_scope_id)
+                })
+                .and_then(|pscope| {
+                    let arg_set: std::collections::HashSet<String> = pscope
+                        .arg_order
+                        .iter()
+                        .map(|n| n.to_lowercase())
+                        .collect();
+                    pscope
+                        .symbols
+                        .iter()
+                        .find(|(key, sym)| {
+                            !arg_set.contains(*key)
+                                && matches!(
+                                    sym.kind,
+                                    SymbolKind::Variable | SymbolKind::Parameter
+                                )
+                        })
+                        .map(|(_, sym)| sym.attrs.array_spec.clone())
+                })
+                .and_then(|specs| stringify_array_bounds(&specs));
+            if let Some(s) = bounds {
+                write!(out, ", result_array_bounds=\"{}\"", s).unwrap();
+            }
+        }
     } else {
         write!(out, "@subroutine {}", sym.name).unwrap();
     }
@@ -1122,6 +1253,13 @@ pub struct AmodProc {
     /// references the result by its declared name rather than by the
     /// function name.
     pub result_name: Option<String>,
+    /// Stringified explicit-shape bounds for the result variable.
+    /// `(b1; b2; ...)` per dim, where each is `lower:upper` or just
+    /// `upper`. Preserves runtime-shape result sizing across split-file
+    /// submodule compilation: SMP body lowering needs `Explicit { upper:
+    /// Name(dummy) }` to allocate the result in the prologue. None for
+    /// scalar / allocatable / pointer / non-runtime-shape results.
+    pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
     pub access: Access,
@@ -1483,6 +1621,11 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         // them for optimization but not for correctness).
     }
 
+    let result_array_bounds = attrs_str
+        .split(", ")
+        .find_map(|attr| attr.strip_prefix("result_array_bounds="))
+        .map(|s| s.trim_matches('"').to_string());
+
     AmodProc {
         name,
         kind,
@@ -1491,6 +1634,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_pointer,
         result_rank,
         result_name,
+        result_array_bounds,
         pure,
         elemental,
         access,

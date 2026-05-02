@@ -1221,8 +1221,29 @@ fn load_external_module(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)
             );
+            // Sprint35-SMP Phase 3: prefer the .amod-preserved
+            // explicit-shape bounds when available so split-file
+            // submodule lowering of `res = …` allocates a runtime-shape
+            // result in the function prologue. Falls through to the
+            // legacy AssumedShape template when bounds aren't in .amod
+            // (rank-only, allocatable, or pointer results).
+            let parsed_bounds = proc
+                .result_array_bounds
+                .as_deref()
+                .and_then(amod::parse_array_bounds);
             let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
                 Vec::new()
+            } else if let Some(specs) = parsed_bounds {
+                if specs.len() == proc.result_rank as usize {
+                    specs
+                } else {
+                    let template = if proc.result_allocatable || proc.result_pointer {
+                        ArraySpec::Deferred
+                    } else {
+                        ArraySpec::AssumedShape { lower: None }
+                    };
+                    vec![template; proc.result_rank as usize]
+                }
             } else {
                 let template = if proc.result_allocatable || proc.result_pointer {
                     ArraySpec::Deferred
