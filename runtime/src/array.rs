@@ -3594,6 +3594,92 @@ pub extern "C" fn afs_array_abs_complex(
     }
 }
 
+/// F2018 §16.9.43 CMPLX(re, im, kind) over real arrays.
+///
+/// Allocates a complex(out_lane_bytes) result of the same shape as `re_source`
+/// and writes one element per source element with re[i] in lane 0 and
+/// im[i] (or 0 when im_source is null) in lane 1. Handles cross-kind
+/// inputs (real(sp) ↔ real(dp)) by reading the per-side elem_size.
+///
+/// `out_lane_bytes` is 4 (single) or 8 (double); result elem_size is
+/// `2 * out_lane_bytes`.
+#[no_mangle]
+pub extern "C" fn afs_array_cmplx(
+    re_source: *const ArrayDescriptor,
+    im_source: *const ArrayDescriptor,
+    out_lane_bytes: i32,
+    result: *mut ArrayDescriptor,
+) {
+    if re_source.is_null() || result.is_null() {
+        return;
+    }
+    let re = unsafe { &*re_source };
+    if re.base_addr.is_null() {
+        return;
+    }
+    let im_opt = if im_source.is_null() {
+        None
+    } else {
+        let im = unsafe { &*im_source };
+        if im.base_addr.is_null() { None } else { Some(im) }
+    };
+    let lane = out_lane_bytes.max(4) as usize;
+    let elem_size = 2 * lane;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(re.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: re.dims[i].lower_bound,
+            upper_bound: re.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if re.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, elem_size as i64, re.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = re.total_elements() as usize;
+    let re_elem = re.elem_size.max(1) as usize;
+    let im_elem = im_opt.map(|im| im.elem_size.max(1) as usize).unwrap_or(0);
+    let re_buf = re.base_addr as *const u8;
+    let im_buf = im_opt
+        .map(|im| im.base_addr as *const u8)
+        .unwrap_or(ptr::null());
+    let rp_buf = res.base_addr;
+    for i in 0..total {
+        let dst_off = i * elem_size;
+        unsafe {
+            // Read real lane as f64 from source kind.
+            let r_val: f64 = match re_elem {
+                4 => *(re_buf.add(i * 4) as *const f32) as f64,
+                8 => *(re_buf.add(i * 8) as *const f64),
+                _ => 0.0,
+            };
+            // Read imag lane (zero when source absent).
+            let i_val: f64 = if im_buf.is_null() {
+                0.0
+            } else {
+                match im_elem {
+                    4 => *(im_buf.add(i * 4) as *const f32) as f64,
+                    8 => *(im_buf.add(i * 8) as *const f64),
+                    _ => 0.0,
+                }
+            };
+            // Write per result kind.
+            match lane {
+                4 => {
+                    *(rp_buf.add(dst_off) as *mut f32) = r_val as f32;
+                    *(rp_buf.add(dst_off + 4) as *mut f32) = i_val as f32;
+                }
+                8 => {
+                    *(rp_buf.add(dst_off) as *mut f64) = r_val;
+                    *(rp_buf.add(dst_off + 8) as *mut f64) = i_val;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// F2018 §16.9.144 PACK(ARRAY, MASK [, VECTOR]).
 ///
 /// Walks `source` and `mask` element-by-element (mask is interpreted
