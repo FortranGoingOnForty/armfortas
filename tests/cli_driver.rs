@@ -12044,6 +12044,44 @@ fn array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor() {
 }
 
 #[test]
+fn computed_goto_dispatches_to_indexed_label() {
+    // F2018 §11.2.3: `GO TO (l1, l2, ..., ln) expr` evaluates the integer
+    // expr; if 1 <= expr <= n, branches to label[expr]; otherwise falls
+    // through. Pre-fix the lowering had NO case for Stmt::ComputedGoto,
+    // so every selector fell through silently. This silently broke every
+    // LAPACK driver that uses computed goto for parameter validation —
+    // most visibly stdlib_ilaenv (block-size lookup), which fell into
+    // its "invalid ispec" path returning -1, breaking getri/inverse and
+    // a long tail of linalg routines that pre-allocate workspaces.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ispec, total, expected\n  total = 0\n  do ispec = 0, 6\n    call test_branch(ispec, total)\n  end do\n  expected = 1 + 2 + 3 + 1000 + 1000 + 1000 + 1000\n  if (total /= expected) error stop 1\n  print *, 'ok'\ncontains\n  subroutine test_branch(ispec, total)\n    integer, intent(in) :: ispec\n    integer, intent(inout) :: total\n    go to (10, 20, 30) ispec\n    total = total + 1000\n    return\n    10 total = total + 1\n       return\n    20 total = total + 2\n       return\n    30 total = total + 3\n       return\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("computed_goto", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
