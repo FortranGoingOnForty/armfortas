@@ -175,6 +175,14 @@ struct LocalInfo {
     /// from real integer locals at later lookup points
     /// (semantic-type recovery, generic dispatch, print formatting, etc.).
     logical_kind: Option<u8>,
+    /// True for explicit-shape dummy arrays whose last dimension is
+    /// `*` (assumed-size, F2018 §8.5.8.5). Such a dummy carries no
+    /// upper bound on the last dim — accesses past `size(actual)` are
+    /// legal as long as the underlying storage permits — so bounds
+    /// checks must be skipped on that dim. The caller's descriptor
+    /// (or the static `(1, 0)` sentinel emitted by extract_array_dims)
+    /// would otherwise reject every legal access.
+    last_dim_assumed_size: bool,
 }
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
@@ -310,6 +318,7 @@ impl<'a> LowerCtx<'a> {
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
     }
@@ -331,6 +340,7 @@ impl<'a> LowerCtx<'a> {
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
     }
@@ -1321,6 +1331,61 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
     false
 }
 
+/// True when this dummy arg's array spec is explicit-shape with `*` in
+/// the last dimension (e.g. `a(lda, *)`). Such a dummy carries no upper
+/// bound on the last dim per F2018 §8.5.8.5 and bounds checks must be
+/// skipped on that dim. Returns false for assumed-shape `(:, :)`,
+/// allocatable, deferred, and assumed-rank dummies.
+fn arg_last_dim_assumed_size_from_decls(
+    arg_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> bool {
+    let key = arg_name.to_lowercase();
+    for decl in decls {
+        if let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        {
+            let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
+                if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                    Some(specs)
+                } else {
+                    None
+                }
+            });
+            for entity in entities {
+                if entity.name.to_lowercase() != key {
+                    continue;
+                }
+                let specs = match entity.array_spec.as_ref().or(attr_dims) {
+                    Some(s) => s,
+                    None => return false,
+                };
+                if specs.is_empty() {
+                    return false;
+                }
+                // Only the LAST dim being AssumedSize qualifies.  An all-
+                // assumed-shape `(:, :)` has every spec as AssumedShape
+                // and is handled differently (uses the runtime descriptor's
+                // dim metadata, which the caller has set up correctly).
+                let last_idx = specs.len() - 1;
+                if !matches!(specs[last_idx], ArraySpec::AssumedSize { .. }) {
+                    return false;
+                }
+                // Earlier dims must be explicit (not assumed-shape/deferred);
+                // otherwise we may be looking at a malformed mix.
+                for spec in &specs[..last_idx] {
+                    if !matches!(spec, ArraySpec::Explicit { .. }) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn procedure_scope_for_dummy_args(
     st: &SymbolTable,
     proc_name: &str,
@@ -2127,6 +2192,7 @@ fn install_common_locals(
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
             }
@@ -2313,6 +2379,7 @@ fn install_equivalence_locals(
                             runtime_dim_upper: vec![None; m.dims.len()],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                 }
@@ -2914,6 +2981,7 @@ fn collect_implicit_locals(
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
                 continue;
@@ -4272,6 +4340,7 @@ fn lower_unit(
                                 Some(&visible_param_consts),
                                 st,
                             ),
+                            last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
                         };
                         ctx.locals.insert(pname.clone(), info);
                         if decl_is_optional(pname, decls) {
@@ -4732,6 +4801,7 @@ fn lower_unit(
                                     Some(&visible_param_consts),
                                     st,
                                 ),
+                                last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
                             },
                         );
                         if decl_is_optional(pname, decls) {
@@ -4817,6 +4887,7 @@ fn lower_unit(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::DerivedAggregate {
@@ -4847,6 +4918,7 @@ fn lower_unit(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                     ctx.result_addr = Some(ValueId(0));
@@ -4889,6 +4961,7 @@ fn lower_unit(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                     ctx.result_addr = Some(result_addr);
@@ -4932,6 +5005,7 @@ fn lower_unit(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                     ctx.result_addr = Some(result_addr);
@@ -6579,6 +6653,7 @@ fn install_host_param_consts(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
     }
@@ -7160,6 +7235,7 @@ fn install_one_global(
             runtime_dim_upper: vec![],
             is_class: false,
             logical_kind: None,
+            last_dim_assumed_size: false,
         },
     );
 }
@@ -7451,6 +7527,7 @@ fn install_globals_as_locals_in(
                                         runtime_dim_upper: vec![],
                                         is_class: false,
             logical_kind: None,
+                                        last_dim_assumed_size: false,
                                     },
                                 );
                             } else {
@@ -7474,6 +7551,7 @@ fn install_globals_as_locals_in(
                                         runtime_dim_upper: vec![],
                                         is_class: false,
             logical_kind: None,
+                                        last_dim_assumed_size: false,
                                     },
                                 );
                             }
@@ -7653,6 +7731,7 @@ fn alloc_decls(
                                 .unwrap_or_default(),
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                     continue;
@@ -7689,6 +7768,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue;
@@ -7722,6 +7802,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: true,
                                 logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue;
@@ -7756,6 +7837,7 @@ fn alloc_decls(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                     continue;
@@ -7927,6 +8009,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue;
@@ -7996,6 +8079,7 @@ fn alloc_decls(
                                     runtime_dim_upper: vec![],
                                     is_class: false,
             logical_kind: None,
+                                    last_dim_assumed_size: false,
                                 },
                             );
                         } else {
@@ -8023,6 +8107,7 @@ fn alloc_decls(
                                     runtime_dim_upper: vec![],
                                     is_class: false,
             logical_kind: None,
+                                    last_dim_assumed_size: false,
                                 },
                             );
                         }
@@ -8058,6 +8143,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue;
@@ -8100,6 +8186,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue; // skip normal path
@@ -8160,6 +8247,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                         continue;
@@ -8221,6 +8309,7 @@ fn alloc_decls(
                             } else {
                                 None
                             },
+                                                    last_dim_assumed_size: false,
                         },
                     );
                 } else if let Some(specs) = array_spec {
@@ -8317,6 +8406,7 @@ fn alloc_decls(
                                 } else {
                                     None
                                 },
+                                                            last_dim_assumed_size: false,
                             },
                         );
                     } else {
@@ -8354,6 +8444,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
                                 logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
+                                                            last_dim_assumed_size: false,
                             },
                         );
                     }
@@ -8384,6 +8475,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                     } else {
@@ -8405,6 +8497,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             },
                         );
                     }
@@ -8443,6 +8536,7 @@ fn alloc_decls(
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                 } else {
@@ -8484,6 +8578,7 @@ fn alloc_decls(
                                     runtime_dim_upper: vec![],
                                     is_class: false,
             logical_kind: None,
+                                    last_dim_assumed_size: false,
                                 },
                             );
                             continue;
@@ -8521,6 +8616,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
                                 logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
+                                                            last_dim_assumed_size: false,
                             },
                         );
                     } else {
@@ -8541,6 +8637,7 @@ fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
                                 logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
+                                                            last_dim_assumed_size: false,
                             },
                         );
                     }
@@ -11408,6 +11505,7 @@ fn lower_logical_reduction_intrinsic_ast(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 },
             );
 
@@ -11514,6 +11612,7 @@ fn lower_logical_reduction_intrinsic_ast(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 },
             );
 
@@ -19520,6 +19619,7 @@ fn install_host_ref_locals(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
     }
@@ -23735,6 +23835,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                 }
@@ -23898,6 +23999,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             runtime_dim_upper: vec![],
                             is_class: false,
             logical_kind: None,
+                            last_dim_assumed_size: false,
                         },
                     );
                 }
@@ -24361,6 +24463,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             };
                             let source_scalar_layout = if rank == 0 && source_desc.is_none() {
                                 source_expr.and_then(|expr| {
@@ -24654,6 +24757,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 runtime_dim_upper: vec![],
                                 is_class: false,
             logical_kind: None,
+                                last_dim_assumed_size: false,
                             };
                             let elem_size_bytes =
                                 local_storage_size_bytes(&field_info, ctx.type_layouts);
@@ -25356,6 +25460,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
             }
@@ -26283,6 +26388,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 })
                 .or_else(|| {
                     if let Expr::Name { name: tgt_name } = &target.node {
@@ -27262,6 +27368,7 @@ fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) 
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
                 addr
@@ -27590,6 +27697,7 @@ fn compute_flat_elem_offset(
         let mut flat: Option<ValueId> = None;
         let mut cum_stride: Option<ValueId> = None; // i64
         let one64 = b.const_i64(1);
+        let last_arg_idx = args.len().saturating_sub(1);
         for (dim_idx, arg) in args.iter().enumerate() {
             let sub_raw = match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -27610,7 +27718,14 @@ fn compute_flat_elem_offset(
                 vec![desc, dim],
                 IrType::Int(IntWidth::I64),
             );
-            emit_bounds_check(b, sub, lo, up);
+            // F2018 §8.5.8.5: skip bounds check on the assumed-size
+            // last dim of an explicit-shape dummy; the descriptor's
+            // dim metadata for that slot reflects the caller's shape,
+            // not the dummy's "no upper bound" semantics.
+            let skip_bounds = info.last_dim_assumed_size && dim_idx == last_arg_idx;
+            if !skip_bounds {
+                emit_bounds_check(b, sub, lo, up);
+            }
 
             let adjusted = b.isub(sub, lo);
 
@@ -27642,6 +27757,14 @@ fn compute_flat_elem_offset(
     let mut stride_static: i64 = 1;
     let mut stride_dynamic: Option<ValueId> = None;
 
+    // F2018 §8.5.8.5: an assumed-size dummy `a(lda, *)` carries no
+    // upper bound on its last dim — accesses past `size(actual)` are
+    // legal as long as the underlying storage permits. extract_array_dims
+    // encodes such dims as (1, 0). We must NOT bounds-check those: the
+    // synthesized [1, 0] range would reject every legal access.
+    let last_dim_assumed_size = info.last_dim_assumed_size;
+    let last_dim_idx = info.dims.len().saturating_sub(1);
+
     for (dim_idx, arg) in args.iter().enumerate() {
         let subscript = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
@@ -27664,7 +27787,10 @@ fn compute_flat_elem_offset(
             Some(v) => v,
             None => b.const_i64(lower + extent - 1),
         };
-        emit_bounds_check(b, subscript64, lower_val, upper_val);
+        let skip_bounds = last_dim_assumed_size && dim_idx == last_dim_idx;
+        if !skip_bounds {
+            emit_bounds_check(b, subscript64, lower_val, upper_val);
+        }
         let adjusted = b.isub(subscript64, lower_val);
 
         // Accumulate the offset. If we have any runtime stride on
@@ -28632,6 +28758,7 @@ fn store_ac_implied_do(
             runtime_dim_upper: vec![],
             is_class: false,
             logical_kind: None,
+            last_dim_assumed_size: false,
         },
     );
 
@@ -32449,6 +32576,7 @@ fn materialize_scalarized_rank1_constructors(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 },
             );
             Some(synth_name_expr(&name, expr.span))
@@ -34001,6 +34129,7 @@ fn try_lower_elemental_subroutine_call(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 },
             );
             temp_names_to_clean.push(temp_name.clone());
@@ -34283,6 +34412,7 @@ fn lower_rank1_elemental_call_descriptor(
                     runtime_dim_upper: vec![],
                     is_class: is_class_actual,
                     logical_kind: None,
+                    last_dim_assumed_size: false,
                 },
             );
             array_actuals.push((
@@ -34388,6 +34518,7 @@ fn lower_rank1_elemental_call_descriptor(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             };
             let (src_ptr, src_len) =
                 char_array_elem_ptr_and_len_from_flat_index(b, &source_info, cur_idx)
@@ -36253,6 +36384,7 @@ fn lower_1d_section_assign(
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
                 Some((index_addr, mapped))
@@ -36610,6 +36742,7 @@ fn lower_forall_nested(
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     },
                 );
                 addr
@@ -37823,6 +37956,7 @@ fn component_intrinsic_local_info(
             runtime_dim_upper: vec![],
             is_class: false,
             logical_kind: None,
+            last_dim_assumed_size: false,
         });
     }
     if field.dims.is_empty() {
@@ -37842,6 +37976,7 @@ fn component_intrinsic_local_info(
         runtime_dim_upper: vec![],
         is_class: false,
             logical_kind: None,
+        last_dim_assumed_size: false,
     })
 }
 
@@ -37867,6 +38002,7 @@ fn component_field_local_info(
         runtime_dim_upper: vec![],
         is_class: false,
             logical_kind: None,
+        last_dim_assumed_size: false,
     })
 }
 
@@ -37929,6 +38065,7 @@ fn associate_alias_local_info(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 });
             }
             // All Element subscripts — bind associate-name to a single element.
@@ -37959,6 +38096,7 @@ fn associate_alias_local_info(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 });
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
@@ -37986,6 +38124,7 @@ fn associate_alias_local_info(
                     runtime_dim_upper: vec![],
                     is_class: false,
             logical_kind: None,
+                    last_dim_assumed_size: false,
                 });
             }
             None
@@ -39559,6 +39698,7 @@ fn component_array_local_info(
         runtime_dim_upper: vec![],
         is_class: false,
             logical_kind: None,
+        last_dim_assumed_size: false,
     })
 }
 
@@ -39758,6 +39898,7 @@ fn expr_is_character_expr(
                                     runtime_dim_upper: vec![],
                                     is_class: false,
             logical_kind: None,
+                                    last_dim_assumed_size: false,
                                 },
                             )
                         })
@@ -40385,6 +40526,7 @@ fn ensure_hidden_string_result_local(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
         return;
@@ -40422,6 +40564,7 @@ fn ensure_hidden_string_result_local(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
         return;
@@ -40473,6 +40616,7 @@ fn ensure_hidden_string_result_local(
                 runtime_dim_upper: vec![],
                 is_class: false,
             logical_kind: None,
+                last_dim_assumed_size: false,
             },
         );
     }
@@ -41696,6 +41840,7 @@ fn lower_arg_by_ref_full(
                         runtime_dim_upper: vec![],
                         is_class: false,
             logical_kind: None,
+                        last_dim_assumed_size: false,
                     };
                     return derived_scalar_storage_addr_for_call(b, &info);
                 }
