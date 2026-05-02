@@ -22315,6 +22315,16 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                         | "shape"
                                                         | "pack"
                                                         | "spread"
+                                                        // cmplx(re, im, kind) over real
+                                                        // arrays: lower_array_expr_descriptor
+                                                        // has a dedicated arm (afs_array_cmplx).
+                                                        // Without this entry the assignment
+                                                        // routes through lower_expr_ctx_tl,
+                                                        // which calls scalar lower_intrinsic
+                                                        // with null-pointer probes and emits
+                                                        // a single complex(4) const-zero
+                                                        // buffer — wrong shape and wrong kind.
+                                                        | "cmplx"
                                                 )
                                             } else {
                                                 false
@@ -36005,6 +36015,133 @@ fn lower_array_expr_descriptor(
                                     );
                                     return Some((result_desc, IrType::Float(fw)));
                                 }
+                            }
+                        }
+                    }
+                }
+                // F2018 §16.9.43: CMPLX(re [, im] [, kind]) over real
+                // arrays. The whole-call form `res = cmplx(x, y, kind=dp)`
+                // (where x, y are real(dp) arrays) used to fall through
+                // to the scalar `lower_intrinsic("cmplx")` path with
+                // null-pointer probe values, producing a single
+                // complex(4) buffer whose halves were const-zero —
+                // breaking stdlib's linspace_complex / logspace_complex
+                // / schur_complex examples with an "unhandled coercion
+                // Ptr(Array(F32),2) → Array(F64,2)" warning at the
+                // assignment.
+                if name.eq_ignore_ascii_case("cmplx") {
+                    let re_arg = args.first().and_then(|a| match &a.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+                        _ => None,
+                    });
+                    if let Some(re_expr) = re_arg {
+                        if let Some((re_desc, re_elem_ty)) = lower_array_expr_descriptor(
+                            b,
+                            locals,
+                            re_expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        ) {
+                            // Source must be a real array — match Float
+                            // element type. Skip any complex/integer
+                            // case (cmplx of complex/int is handled
+                            // scalarly).
+                            if let IrType::Float(src_fw) = &re_elem_ty {
+                                let src_lane_bytes: i64 = match src_fw {
+                                    FloatWidth::F64 => 8,
+                                    FloatWidth::F32 => 4,
+                                };
+                                // Walk the actual args; identify im (positional
+                                // arg 1 with no keyword, OR keyword `y=`) and
+                                // kind (keyword `kind=` OR positional arg 2).
+                                let mut im_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+                                let mut kind_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+                                let mut positional_idx: usize = 0;
+                                for a in args.iter() {
+                                    let crate::ast::expr::SectionSubscript::Element(e) = &a.value
+                                    else {
+                                        continue;
+                                    };
+                                    match a.keyword.as_deref().map(str::to_ascii_lowercase) {
+                                        Some(ref kw) if kw == "x" => { /* re — already handled */ }
+                                        Some(ref kw) if kw == "y" => im_expr = Some(e),
+                                        Some(ref kw) if kw == "kind" => kind_expr = Some(e),
+                                        Some(_) => {}
+                                        None => {
+                                            match positional_idx {
+                                                0 => { /* re */ }
+                                                1 => im_expr = Some(e),
+                                                2 => kind_expr = Some(e),
+                                                _ => {}
+                                            }
+                                            positional_idx += 1;
+                                        }
+                                    }
+                                }
+                                let im_pair = im_expr.and_then(|e| {
+                                    lower_array_expr_descriptor(
+                                        b,
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    )
+                                });
+                                let im_desc = if let Some((d, _)) = im_pair {
+                                    d
+                                } else {
+                                    b.const_i64(0)
+                                };
+                                // Default out kind = source kind. If a kind
+                                // arg is present, lower it and try to
+                                // const-extract.
+                                let mut out_lane_bytes: i64 = src_lane_bytes;
+                                if let Some(kind_e) = kind_expr {
+                                    let kv = lower_expr_full(
+                                        b,
+                                        locals,
+                                        kind_e,
+                                        st,
+                                        type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                    );
+                                    if let Some(k) = extract_const_int_from_value(b, kv) {
+                                        out_lane_bytes = k;
+                                    }
+                                }
+                                let out_lane_v = b.const_i32(out_lane_bytes as i32);
+                                let result_desc = b.alloca(IrType::Array(
+                                    Box::new(IrType::Int(IntWidth::I8)),
+                                    384,
+                                ));
+                                let zero_b = b.const_i32(0);
+                                let sz384 = b.const_i64(384);
+                                b.call(
+                                    FuncRef::External("memset".into()),
+                                    vec![result_desc, zero_b, sz384],
+                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                );
+                                b.call(
+                                    FuncRef::External("afs_array_cmplx".into()),
+                                    vec![re_desc, im_desc, out_lane_v, result_desc],
+                                    IrType::Void,
+                                );
+                                let out_fw = if out_lane_bytes == 8 {
+                                    FloatWidth::F64
+                                } else {
+                                    FloatWidth::F32
+                                };
+                                let elem_ty =
+                                    IrType::Array(Box::new(IrType::Float(out_fw)), 2);
+                                return Some((result_desc, elem_ty));
                             }
                         }
                     }
