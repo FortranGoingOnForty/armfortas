@@ -1056,47 +1056,61 @@ fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
 /// Collect which positional parameters are `character(len=*)` — assumed
 /// length.  These need hidden-length i64 parameters appended to the
 /// function signature and the call site.
+/// Compute the `character(len=*)` flag mask for a procedure's dummy
+/// args from its declarations alone. Used by both the global collector
+/// and self-aware sites (where bare-name map lookups produce the wrong
+/// answer when several contained procedures across different hosts
+/// share an arg name).
+fn compute_char_len_star_flags(
+    args: &[crate::ast::unit::DummyArg],
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> Vec<bool> {
+    use crate::ast::unit::DummyArg;
+    args.iter()
+        .filter_map(|a| {
+            if let DummyArg::Name(n) = a {
+                Some(n.to_lowercase())
+            } else {
+                None
+            }
+        })
+        .map(|pname| {
+            for d in decls {
+                if let crate::ast::decl::Decl::TypeDecl {
+                    type_spec,
+                    entities,
+                    ..
+                } = &d.node
+                {
+                    if entities.iter().any(|e| e.name.to_lowercase() == pname) {
+                        if let TypeSpec::Character(Some(sel)) = type_spec {
+                            if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Star)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        })
+        .collect()
+}
+
 fn collect_char_len_star_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
-        let param_names: Vec<String> = args
+        if args
             .iter()
-            .filter_map(|a| {
-                if let DummyArg::Name(n) = a {
-                    Some(n.to_lowercase())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if param_names.is_empty() {
+            .filter(|a| matches!(a, DummyArg::Name(_)))
+            .count()
+            == 0
+        {
             return;
         }
-        let flags: Vec<bool> = param_names
-            .iter()
-            .map(|pname| {
-                for d in decls {
-                    if let crate::ast::decl::Decl::TypeDecl {
-                        type_spec,
-                        entities,
-                        ..
-                    } = &d.node
-                    {
-                        if entities.iter().any(|e| e.name.to_lowercase() == *pname) {
-                            if let TypeSpec::Character(Some(sel)) = type_spec {
-                                if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Star)) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-                false
-            })
-            .collect();
+        let flags = compute_char_len_star_flags(args, decls);
         if flags.iter().any(|f| *f) {
             out.insert(name.to_lowercase(), flags);
         }
@@ -4107,11 +4121,23 @@ fn lower_unit(
                 .collect();
             // Append hidden-length i64 params for character(len=*) dummies.
             // Per the standard Fortran ABI, these trail the normal params.
+            //
+            // Compute flags from this procedure's own decls — a bare-name
+            // lookup against `char_len_star_params` collides when several
+            // contained procedures across different hosts share an arg
+            // name (stdlib_sorting_sort has nine `helper`/`introsort`/etc
+            // contained sets, only the character variant declares
+            // `character(len=*)` actuals, but the map key is just
+            // "introsort"; without this the integer variants of
+            // `insertion_sort` would receive the char variant's flags and
+            // their bodies would lower as character arrays, calling
+            // `afs_compare_char` on integer data and silently failing to
+            // sort).
             let mut hidden_len_params: Vec<(String, ValueId)> = Vec::new();
-            let own_cls = char_len_star_params.get(&name.to_lowercase());
-            if let Some(flags) = own_cls {
+            let own_cls_flags = compute_char_len_star_flags(args, decls);
+            if own_cls_flags.iter().any(|f| *f) {
                 let normal_count = params.len();
-                for (i, (flag, arg)) in flags.iter().zip(args.iter()).enumerate() {
+                for (i, (flag, arg)) in own_cls_flags.iter().zip(args.iter()).enumerate() {
                     if *flag {
                         if let DummyArg::Name(n) = arg {
                             let hid_id = ValueId((normal_count + hidden_len_params.len()) as u32);
@@ -4567,10 +4593,12 @@ fn lower_unit(
             // body reads or writes. See `build_host_ref_params`.
             let mut func_params = func_params;
             let mut hidden_len_params: Vec<(String, ValueId)> = Vec::new();
-            let own_cls = char_len_star_params.get(&name.to_lowercase());
-            if let Some(flags) = own_cls {
+            // See sister site above for why we compute from decls
+            // instead of looking up the bare-name map.
+            let own_cls_flags = compute_char_len_star_flags(args, decls);
+            if own_cls_flags.iter().any(|f| *f) {
                 let normal_count = func_params.len();
-                for (flag, arg) in flags.iter().zip(args.iter()) {
+                for (flag, arg) in own_cls_flags.iter().zip(args.iter()) {
                     if *flag {
                         if let DummyArg::Name(n) = arg {
                             let hid_id = ValueId((normal_count + hidden_len_params.len()) as u32);
