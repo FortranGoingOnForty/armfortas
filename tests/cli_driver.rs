@@ -11961,6 +11961,45 @@ fn rank_remap_pointer_assignment_builds_2d_descriptor() {
 }
 
 #[test]
+fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
+    // F2018 §8.5.8.5: an explicit-shape dummy with `*` last dim
+    // (e.g. `a(lda, *)`) carries no upper bound on the last dim —
+    // accesses past the actual's nominal extent are legal as long as
+    // the underlying storage permits.  Pre-fix the lowering emitted
+    // a bounds check against the (1, 0) sentinel that extract_array_dims
+    // produces for AssumedSize, so every index past 0 fired
+    // "index 1 outside [1, 0]".  This pattern shows up throughout LAPACK
+    // (gesv/getrf/getrs/laswp all take `b(ldb, *)`) and is what kept
+    // example_solve1 silently failing inside stdlib_linalg.
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine inner(lda, n, a)\n    integer, intent(in) :: lda, n\n    real, intent(inout) :: a(lda, *)\n    integer :: i, k\n    do k = 1, n\n      do i = 1, lda\n        if (a(i, k) /= real((k-1)*lda + i)) error stop 1\n      end do\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  real, allocatable, target :: x(:)\n  real, pointer :: xmat(:,:)\n  allocate(x(12))\n  x = [(real(i), i=1,12)]\n  xmat(1:3, 1:4) => x\n  call inner(3, 4, xmat)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("assumed_size_dummy_last_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
