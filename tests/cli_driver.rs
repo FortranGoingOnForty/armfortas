@@ -25129,3 +25129,51 @@ fn f77_statement_function_in_subroutine_inlines_per_scope() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
+    // Stdlib pattern (logspace, linspace, lapack/blas wrappers): parent
+    // module has an `interface ... end interface` declaring a function
+    // with explicit-shape result whose size depends on a dummy arg, and
+    // the submodule provides the implementation via the abbreviated
+    // `module procedure NAME ... end procedure` body form. Sema must
+    // propagate dummy args + result variable into the SMP body scope
+    // through the intermediate Interface scope, and IR lowering must
+    // recurse via the synthetic Function path so the runtime-shape
+    // result is allocated in the prologue. Without the fix the SMP body
+    // lowered as a no-arg subroutine, the array store was dropped, and
+    // the caller's r = gen_n(...) memcpy hit NULL src.
+    let src = write_program(
+        "module mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  interface\n    pure module function gen_n(start, n) result(res)\n      integer, intent(in) :: start\n      integer, intent(in) :: n\n      real(dp) :: res(n)\n    end function\n  end interface\nend module\nsubmodule (mtop) mimpl\ncontains\n  module procedure gen_n\n    integer :: i\n    do i = 1, n\n      res(i) = real(start + i, dp)\n    end do\n  end procedure\nend submodule\nprogram p\n  use mtop\n  implicit none\n  integer, parameter :: n = 5\n  real(dp) :: r(n)\n  r = gen_n(10, n)\n  if (abs(r(1) - 11.0d0) > 1.0d-12) error stop 1\n  if (abs(r(5) - 15.0d0) > 1.0d-12) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("smp_explicit_iface_runtime_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("smp explicit iface compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "smp explicit iface compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("smp explicit iface run failed");
+    assert!(
+        run.status.success(),
+        "smp explicit iface run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected smp explicit iface output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
