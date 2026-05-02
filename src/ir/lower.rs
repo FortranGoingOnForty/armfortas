@@ -25691,6 +25691,42 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             }
         }
 
+        Stmt::ComputedGoto { labels, selector } => {
+            // F2018 §11.2.3: `GO TO (l1, l2, ..., ln) expr` evaluates `expr`
+            // (integer); if 1 <= expr <= n, branches to label expr; otherwise
+            // falls through to the next statement.
+            //
+            // Lower as a chain of (icmp eq expr, k) branches: for each
+            // k = 1..n create (cond_br to labels[k-1], else fallthrough).
+            // The fallthrough block is what the next statement sees.
+            if labels.is_empty() {
+                // Empty list — purely a fall-through with side effect of
+                // evaluating the selector. Just lower the expression.
+                let _ = lower_expr_ctx(b, ctx, selector);
+                return;
+            }
+            let sel_raw = lower_expr_ctx(b, ctx, selector);
+            let sel_i32 = match b.func().value_type(sel_raw) {
+                Some(IrType::Int(IntWidth::I32)) => sel_raw,
+                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(sel_raw, IntWidth::I32),
+                Some(IrType::Int(_)) => b.int_extend(sel_raw, IntWidth::I32, true),
+                _ => sel_raw,
+            };
+            for (i, label) in labels.iter().enumerate() {
+                let Some(&target_bb) = ctx.label_blocks.get(label) else {
+                    continue;
+                };
+                let key = (i + 1) as i32;
+                let key_val = b.const_i32(key);
+                let matches = b.icmp(CmpOp::Eq, sel_i32, key_val);
+                let next_check = b.create_block("computed_goto_next");
+                b.cond_branch(matches, target_bb, vec![], next_check, vec![]);
+                b.set_block(next_check);
+            }
+            // Falling out of the loop, current block is the post-chain
+            // block — execution continues into whatever statement follows.
+        }
+
         Stmt::Labeled { label, stmt: inner } => {
             // Create an edge from the current block into the label's block (fall-through),
             // then switch to the label's block and lower the inner statement.
