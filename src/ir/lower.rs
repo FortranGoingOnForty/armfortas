@@ -18950,6 +18950,7 @@ fn install_assumed_shape_lower_overrides(
 ///   - dim[i].lower = spec lower (or 1)
 ///   - dim[i].upper = spec upper (runtime expression)
 ///   - dim[i].stride = dim[i-1].extent  (column-major contiguous)
+///
 /// The assumed-size `*` last dim leaves upper untouched — `last_dim_assumed_size`
 /// already suppresses bounds checks on it.
 fn install_explicit_shape_dummy_rebase(
@@ -26619,12 +26620,13 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                 crate::ast::expr::SectionSubscript::Range { .. }
                             )
                         });
-                    if is_remap_target && all_ranges {
-                        if lower_rank_remap_pointer_assignment(
+                    if is_remap_target
+                        && all_ranges
+                        && lower_rank_remap_pointer_assignment(
                             b, ctx, &tgt_key, args, value,
-                        ) {
-                            return;
-                        }
+                        )
+                    {
+                        return;
                     }
                 }
             }
@@ -36059,7 +36061,7 @@ fn lower_array_expr_descriptor(
                         _ => None,
                     });
                     if let Some(re_expr) = re_arg {
-                        if let Some((re_desc, re_elem_ty)) = lower_array_expr_descriptor(
+                        if let Some((re_desc, IrType::Float(src_fw))) = lower_array_expr_descriptor(
                             b,
                             locals,
                             re_expr,
@@ -36073,7 +36075,7 @@ fn lower_array_expr_descriptor(
                             // element type. Skip any complex/integer
                             // case (cmplx of complex/int is handled
                             // scalarly).
-                            if let IrType::Float(src_fw) = &re_elem_ty {
+                            {
                                 let src_lane_bytes: i64 = match src_fw {
                                     FloatWidth::F64 => 8,
                                     FloatWidth::F32 => 4,
@@ -45419,7 +45421,7 @@ fn try_lower_transfer_into_array(
     // array descriptor at runtime, which only works for descriptor-
     // backed destinations (fixed-shape molds need a static extent).
     let const_size: Option<i64> = size_expr_opt
-        .and_then(|e| eval_const_int(e))
+        .and_then(eval_const_int)
         .filter(|s| *s >= 1);
     let descriptor_dest = local_uses_array_descriptor(dest_info);
     let (size_v, total_v): (ValueId, ValueId) = if let Some(size) = const_size {
