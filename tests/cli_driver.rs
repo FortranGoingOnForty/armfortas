@@ -25676,6 +25676,61 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 }
 
 #[test]
+fn strided_section_scalar_broadcast_writes_every_strided_slot() {
+    // Regression: `arr(1::7) = SCALAR` for a fixed-shape integer
+    // array only wrote arr(1), leaving arr(8), arr(15) untouched.
+    // Same family across allocatable real/integer/logical arrays.
+    //
+    // Root cause was in the runtime's `DimDescriptor::extent()`. The
+    // formula was `(upper - lower) / stride + 1` — designed for
+    // dim descriptors that encoded original-array-coordinate bounds
+    // with a logical stride. But every other DimDescriptor site in
+    // the codebase uses the convention `(lower=1, upper=count,
+    // stride=memory_step_in_elements)`, and the IR-side extent at
+    // lower.rs:28443 already computes `upper - lower + 1` with no
+    // stride division. `afs_create_section` produced
+    // `(1, count, memory_stride)`; for a stride-7 section over an
+    // arr(20) yielding count=3, `extent()` returned `(3-1)/7+1 = 1`,
+    // so `afs_array_size` reported 1 and the lowering's
+    // section-assign loop ran exactly once — only the first slot was
+    // written. Aligning the runtime formula with the IR convention
+    // (drop the stride division) makes both views agree and a
+    // strided whole-section assign covers every position.
+    //
+    // Visible at runtime via `count(logi)` returning 21 (the
+    // count of slots that did get touched at later stride boundaries
+    // due to compounding) instead of 143 in
+    // `example_bitsets_bit_count`'s setup `logi(1::7) = .true.`
+    // pattern.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: arr(20) = 0\n  real :: r(20) = 0.0\n  logical :: l(20) = .false.\n  arr(1::7) = 99\n  r(1::7) = 9.5\n  l(1::7) = .true.\n  if (arr(1) /= 99 .or. arr(8) /= 99 .or. arr(15) /= 99) error stop 1\n  if (arr(2) /= 0 .or. arr(7) /= 0) error stop 2\n  if (count(arr == 99) /= 3) error stop 3\n  if (r(1) /= 9.5 .or. r(8) /= 9.5 .or. r(15) /= 9.5) error stop 4\n  if (count(r == 9.5) /= 3) error stop 5\n  if (.not. (l(1) .and. l(8) .and. l(15))) error stop 6\n  if (l(2) .or. l(7)) error stop 7\n  if (count(l) /= 3) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("strided_section_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("strided-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "strided-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("strided-section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "strided-section: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
