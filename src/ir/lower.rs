@@ -40350,7 +40350,61 @@ fn expr_is_character_expr(
                                     }))
                         })
                         .unwrap_or(false)
-            } else if let Expr::ComponentAccess { .. } = &callee.node {
+            } else if let Expr::ComponentAccess {
+                base: tbp_base,
+                component: tbp_component,
+            } = &callee.node
+            {
+                // F2008 §4.5.4 type-bound procedure call: `obj%method()`
+                // where `method` is a TBP (not a data field). The data-
+                // field lookups below return None for a TBP since TBPs
+                // don't appear in `layout.fields`. Without this branch
+                // the print path mis-classifies a TBP returning
+                // `character(:), allocatable :: r` as non-character and
+                // emits a scalar writer that reads the descriptor
+                // pointer as an integer — surfaced as a silently
+                // empty `print *, e%print()` for stdlib_linalg_state's
+                // state_message TBP.
+                let tbp_char = type_layouts.and_then(|tl| {
+                    let (_, base_type) =
+                        resolve_component_base_for_method(b, locals, tbp_base, st, tl)?;
+                    let layout = tl.get(&base_type)?;
+                    let bp = layout.bound_proc(tbp_component)?;
+                    // The TBP `target_name` carries the mangled IR symbol
+                    // (e.g. `afs_modproc_mod_proc`); the symbol table is
+                    // keyed by the source-level procedure name. Strip the
+                    // mangling prefix and the leading module segment so
+                    // the lookup hits the function symbol with its
+                    // type_info populated.
+                    let raw_target = bp.target_name.as_str();
+                    let stripped = raw_target
+                        .strip_prefix("afs_modproc_")
+                        .map(|s| {
+                            // Format: afs_modproc_<module>_<proc>. Module
+                            // name itself can contain underscores, so
+                            // try progressively shorter prefixes until
+                            // the symtab finds a match.
+                            let mut candidates: Vec<String> = Vec::new();
+                            candidates.push(s.to_string());
+                            let mut cursor = s;
+                            while let Some(idx) = cursor.find('_') {
+                                cursor = &cursor[idx + 1..];
+                                candidates.push(cursor.to_string());
+                            }
+                            candidates
+                        })
+                        .unwrap_or_else(|| vec![raw_target.to_string()]);
+                    let target = stripped
+                        .iter()
+                        .find_map(|cand| st.find_symbol_any_scope(cand))?;
+                    Some(matches!(
+                        target.type_info,
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    ))
+                });
+                if let Some(true) = tbp_char {
+                    return true;
+                }
                 type_layouts
                     .and_then(|tl| {
                         component_array_local_info(b, locals, callee, st, tl).or_else(|| {
