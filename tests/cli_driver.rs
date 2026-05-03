@@ -25297,6 +25297,52 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn declared_init_reshape_populates_fixed_shape_stack_array() {
+    // F2018 §16.9.169 RESHAPE used as a declared initializer for a
+    // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
+    // handled `Expr::ArrayConstructor` and bare scalar literal
+    // initializers; everything else (including
+    // `reshape([...], [...])`) silently fell through with no stores
+    // emitted, leaving the stack array with garbage stack bytes.
+    // example_var, example_savetxt, and many stdlib examples that
+    // initialize a 2-D test matrix via `real :: y(2,3) =
+    // reshape([1.,2.,3.,4.,5.,6.], [2,3])` saw `y(1,1)` come back as
+    // a junk float (e.g. -3.29e30), `sum(y)` returning NaN/inf, and
+    // var(y) crashing downstream when the resulting NaN-filled
+    // descriptor was passed into stdlib_stats. New `init_decls` arm
+    // recognises `reshape(SOURCE, SHAPE)` where SOURCE is an array
+    // constructor and feeds the values straight into the existing
+    // AC writer (column-major, contiguous source — pure layout
+    // reinterpretation).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])\n  if (y(1, 1) /= 1.0) error stop 1\n  if (y(2, 1) /= 2.0) error stop 2\n  if (y(1, 2) /= 3.0) error stop 3\n  if (y(2, 3) /= 6.0) error stop 4\n  if (sum(y) /= 21.0) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("decl_init_reshape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("decl-init-reshape compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "decl-init-reshape compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("decl-init-reshape run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "decl-init-reshape run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
     // F2008 §11.2.3: `use M, only: x` brings only `x` into scope. It
     // must NOT make M's same-named generic interfaces visible — even
