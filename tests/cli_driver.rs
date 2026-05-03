@@ -25297,6 +25297,47 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn print_tbp_returning_allocatable_char_writes_full_string() {
+    // F2008 §4.5.4 TBP call inline in PRINT: `print *, e%method()` where
+    // method returns `character(len=:), allocatable :: r`. Pre-fix the
+    // print-path's char-expression check (`expr_is_character_expr`)
+    // had a ComponentAccess-callee branch that only inspected data
+    // fields — it returned None for a TBP (which lives in
+    // `bound_procs`, not `fields`). The print loop fell into the
+    // scalar-numeric writer, treated the descriptor pointer as an
+    // integer, and produced a silently empty line. Surfaced as
+    // example_state1/state2/error_state1/error_state2 and the FS
+    // examples (cwd/exists/delete_file/...) all SEGV-ing or
+    // outputting blanks because their state_type%print() and
+    // state_type%print_msg() calls landed in the wrong arm.
+    let src = write_program(
+        "module mst\n  implicit none\n  type :: t\n     integer :: x = 42\n  contains\n     procedure :: msg => t_msg\n  end type\ncontains\n  pure function t_msg(this) result(r)\n     class(t), intent(in) :: this\n     character(len=:), allocatable :: r\n     r = 'hello world'\n  end function\nend module\n\nprogram p\n  use mst\n  type(t) :: e\n  print *, e%msg()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_alloc_char_print", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("tbp print compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "tbp print compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("tbp print run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("hello world"),
+        "tbp print run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
     // Regression: stdlib_math_linspace's `linspace_n_1_cdp_cdp` is the
     // abbreviated SMP body form
