@@ -8841,6 +8841,35 @@ fn init_decls(
                                     b.store(val, slot);
                                 }
                             }
+                        } else if let Some(values) =
+                            extract_reshape_source_ac(&init_expr.node)
+                        {
+                            // F2018 §16.9.169 RESHAPE used as a declared
+                            // initializer for a fixed-shape stack array.
+                            // The source AC is laid out column-major into
+                            // the destination; for a contiguous source the
+                            // reshape is a pure reinterpretation, so we
+                            // can store the flat element list straight
+                            // into the slot via the existing AC writer.
+                            // Pre-fix `reshape([...], [...])` initializers
+                            // were silently dropped here, leaving every
+                            // rank-2+ stack array with garbage data — every
+                            // example that did `real :: y(2,3) =
+                            // reshape([1.,2.,3.,4.,5.,6.], [2,3])` saw
+                            // y(1,1) come back as a junk float.
+                            store_ac_values_into(
+                                b,
+                                locals,
+                                info.addr,
+                                &info.ty,
+                                info.derived_type.as_deref(),
+                                values,
+                                st,
+                                type_layouts,
+                                None,
+                                None,
+                                None,
+                            );
                         }
                         continue;
                     }
@@ -28749,6 +28778,59 @@ fn lower_runtime_array_constructor_descriptor(
 /// alloca-backed offset. The DO variable is installed in a
 /// clone of `locals` so the inner expression can reference it.
 ///
+/// Recognise `reshape(SOURCE, SHAPE [, ...])` where SOURCE is an
+/// array constructor and return its values. Used by `init_decls`
+/// to populate fixed-shape stack arrays declared with
+/// `real :: y(2,3) = reshape([1.,2.,...], [2,3])`. The reshape's
+/// SOURCE list is laid out column-major into the destination, which
+/// for a contiguous source matches a flat element-by-element store
+/// (the existing AC writer's behavior). PAD/ORDER variants aren't
+/// folded here — they fall back to silently skipping init the same
+/// way they used to (visible if the user mixes them in declared
+/// initializers, which is rare).
+fn extract_reshape_source_ac(expr: &crate::ast::expr::Expr) -> Option<&[crate::ast::expr::AcValue]> {
+    use crate::ast::expr::{Expr, SectionSubscript};
+    let Expr::FunctionCall { callee, args } = expr else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("reshape") {
+        return None;
+    }
+    if args.len() < 2 {
+        return None;
+    }
+    // Source is positional arg 0 OR keyword `source`. Don't accept if
+    // PAD/ORDER are present — that needs a real reshape evaluator.
+    for a in args.iter().skip(2) {
+        if let Some(k) = &a.keyword {
+            let k = k.to_ascii_lowercase();
+            if k != "shape" {
+                return None;
+            }
+        }
+    }
+    let src_arg = if let Some(named) = args
+        .iter()
+        .find(|a| a.keyword.as_deref().map(str::to_ascii_lowercase) == Some("source".into()))
+    {
+        named
+    } else if args[0].keyword.is_none() {
+        &args[0]
+    } else {
+        return None;
+    };
+    let SectionSubscript::Element(src_expr) = &src_arg.value else {
+        return None;
+    };
+    let Expr::ArrayConstructor { values, .. } = &src_expr.node else {
+        return None;
+    };
+    Some(values.as_slice())
+}
+
 /// Audit BLOCKING-1: previously the implied-do branch silently
 /// skipped all stores and advanced a compile-time counter,
 /// leaving the destination buffer with whatever stack bytes
