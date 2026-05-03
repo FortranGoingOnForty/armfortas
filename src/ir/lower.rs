@@ -21212,9 +21212,26 @@ fn lower_string_expr_full(
                         }
                     }
                     "char" | "achar" => {
-                        // CHAR/ACHAR(i) -> 1-byte buffer.
+                        // CHAR/ACHAR(i) -> 1-byte buffer. Forward the
+                        // lowering context: the integer argument may
+                        // contain ICHAR of a component-substring such
+                        // as `ichar(a%raw(i:i))`, which only resolves
+                        // through `expr_is_character_expr`'s
+                        // ComponentAccess arm when `type_layouts` is
+                        // available — otherwise the substring fast
+                        // path is skipped and a const-zero pointer
+                        // gets fed into afs_ichar_ptr.
                         if let Some(arg) = first_char_arg {
-                            let int_val = lower_expr(b, locals, arg, st);
+                            let int_val = lower_expr_full(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let i32_val = match b.func().value_type(int_val) {
                                 Some(IrType::Int(IntWidth::I64)) => {
                                     b.int_trunc(int_val, IntWidth::I32)
