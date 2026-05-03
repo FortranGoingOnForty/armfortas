@@ -25295,3 +25295,42 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
+    // F2018 §16.9.43: CMPLX(re, im, kind) is elemental — applied to
+    // real arrays it yields a complex array of the requested kind.
+    // Prior behavior: the assignment `res = cmplx(x, y, kind=dp)`
+    // (where x, y are real(dp) arrays) routed through the scalar
+    // `lower_intrinsic("cmplx")` path with null-pointer probe values,
+    // producing a single complex(4) const-zero buffer. Surfaced as
+    // `coerce_to_type: unhandled coercion Ptr(Array(Float(F32),2)) →
+    // Array(Float(F64),2)` and crashed stdlib's linspace_complex /
+    // logspace_complex / schur_complex examples at runtime. Fix:
+    // route whole-array cmplx through afs_array_cmplx, which honors
+    // the kind argument and writes a properly-shaped complex array.
+    let src = write_program(
+        "module mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  interface\n    pure module function gen_n(n) result(res)\n      integer, intent(in) :: n\n      complex(dp) :: res(max(n, 0))\n    end function\n  end interface\nend module\nsubmodule (mtop) mimpl\ncontains\n  module procedure gen_n\n    real(dp) :: x(max(n, 0))\n    real(dp) :: y(max(n, 0))\n    integer :: i\n    do i = 1, n\n      x(i) = real(i, dp)\n      y(i) = real(i + 100, dp)\n    end do\n    res = cmplx(x, y, kind=dp)\n  end procedure\nend submodule\nprogram p\n  use mtop\n  implicit none\n  integer, parameter :: n = 5\n  complex(dp) :: r(n)\n  r = gen_n(n)\n  if (abs(real(r(1)) - 1.0d0) > 1.0d-12) error stop 1\n  if (abs(aimag(r(1)) - 101.0d0) > 1.0d-12) error stop 2\n  if (abs(real(r(n)) - 5.0d0) > 1.0d-12) error stop 3\n  if (abs(aimag(r(n)) - 105.0d0) > 1.0d-12) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_whole_array_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cmplx whole-array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "cmplx whole-array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("cmplx whole-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "cmplx whole-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
