@@ -397,6 +397,7 @@ fn resolve_unit(
                         original_name: sym_name.clone(),
                         source_scope: pid,
                         is_submodule_access: true,
+                        from_bare_use: true,
                     });
                 }
             }
@@ -661,6 +662,7 @@ fn process_uses(
                                     original_name: name.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                             OnlyItem::Generic(name) => {
@@ -669,6 +671,7 @@ fn process_uses(
                                     original_name: name.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                             OnlyItem::Rename(rename) => {
@@ -677,6 +680,7 @@ fn process_uses(
                                     original_name: rename.remote.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                         }
@@ -696,15 +700,19 @@ fn process_uses(
                             original_name: name.clone(),
                             source_scope: mod_scope,
                             is_submodule_access: false,
+                            from_bare_use: true,
                         });
                     }
-                    // Apply renames.
+                    // Apply renames. Renames inside a bare USE rebind a
+                    // single name; the name itself is no longer bare so
+                    // it doesn't extend transitive lookup.
                     for rename in renames {
                         st.add_use_association(UseAssociation {
                             local_name: rename.local.clone(),
                             original_name: rename.remote.clone(),
                             source_scope: mod_scope,
                             is_submodule_access: false,
+                            from_bare_use: false,
                         });
                     }
                 }
@@ -1032,6 +1040,7 @@ fn load_external_module(
                     original_name: name,
                     source_scope: dep_scope,
                     is_submodule_access: false,
+                    from_bare_use: true,
                 });
             }
         }
@@ -1056,6 +1065,7 @@ fn load_external_module(
             original_name: rename.original.clone(),
             source_scope: src_scope,
             is_submodule_access: false,
+            from_bare_use: false,
         });
     }
 
