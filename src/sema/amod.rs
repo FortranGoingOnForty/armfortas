@@ -1553,6 +1553,45 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     }
 }
 
+/// Split a comma-separated attribute list while honoring paren depth and
+/// double-quoted strings. The naive `split(", ")` mangled values like
+/// `result_array_bounds="(max(n, 0))"` because the inner `, ` between
+/// `n` and `0` matched the separator and split the value across two
+/// chunks — losing the bounds and forcing the resolver to fall back to
+/// AssumedShape, which broke runtime-shape result allocation for
+/// abbreviated SMP bodies pulling specs out of .amod.
+fn split_attrs_top_level(attrs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = attrs.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            '"' if !in_quote => in_quote = true,
+            '"' if in_quote => in_quote = false,
+            '(' | '[' if !in_quote => depth += 1,
+            ')' | ']' if !in_quote => depth -= 1,
+            ',' if !in_quote && depth == 0 => {
+                let chunk = attrs[start..i].trim();
+                if !chunk.is_empty() {
+                    out.push(chunk.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = attrs[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
 fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
     let is_func = header.starts_with("@function ");
     let rest = if is_func {
@@ -1563,8 +1602,36 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     // Parse: name [-> return_type][, pure][, elemental]
     let (name_and_ret, attrs_str) = {
-        let parts: Vec<&str> = rest.splitn(2, ", ").collect();
-        (parts[0], parts.get(1).copied().unwrap_or(""))
+        // Use depth-aware split so attribute values containing commas
+        // inside parens (e.g. `result_array_bounds="(max(n, 0))"`)
+        // don't split prematurely on the inner `, `.
+        let mut depth: i32 = 0;
+        let mut in_quote = false;
+        let mut split_at: Option<usize> = None;
+        let bytes = rest.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            match ch {
+                '"' if !in_quote => in_quote = true,
+                '"' if in_quote => in_quote = false,
+                '(' | '[' if !in_quote => depth += 1,
+                ')' | ']' if !in_quote => depth -= 1,
+                ',' if !in_quote && depth == 0 => {
+                    split_at = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        match split_at {
+            Some(idx) => (
+                rest[..idx].trim_end(),
+                rest[idx + 1..].trim_start(),
+            ),
+            None => (rest.trim(), ""),
+        }
     };
 
     let (name, return_type) = if let Some(arrow_idx) = name_and_ret.find(" -> ") {
@@ -1575,29 +1642,30 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         (name_and_ret.trim().to_string(), None)
     };
 
-    let pure = attrs_str.contains("pure");
-    let elemental = attrs_str.contains("elemental");
-    let result_allocatable = attrs_str.contains("result_allocatable");
-    let result_pointer = attrs_str.contains("result_pointer");
-    let result_rank = attrs_str
-        .split(", ")
+    let attr_chunks = split_attrs_top_level(attrs_str);
+    let pure = attr_chunks.iter().any(|a| a == "pure");
+    let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
+    let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
+    let result_rank = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
     // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
     // source used a `result(NAME)` clause that differs from the
     // function name. Otherwise the result variable shares the name.
-    let result_name = attrs_str
-        .split(", ")
+    let result_name = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("result_name="))
         .map(|s| s.trim().to_string());
-    let access = if attrs_str.split(", ").any(|attr| attr == "private") {
+    let access = if attr_chunks.iter().any(|attr| attr == "private") {
         Access::Private
     } else {
         Access::Public
     };
-    let binding_label = attrs_str
-        .split(", ")
+    let binding_label = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
 
     let kind = if is_func {
@@ -1621,8 +1689,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         // them for optimization but not for correctness).
     }
 
-    let result_array_bounds = attrs_str
-        .split(", ")
+    let result_array_bounds = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("result_array_bounds="))
         .map(|s| s.trim_matches('"').to_string());
 
