@@ -25374,6 +25374,86 @@ fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
 }
 
 #[test]
+fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
+    // F2008 §4.5.10: a structure constructor `T(args)` always yields a
+    // scalar of type T. The rank-aware specific dispatcher inspects the
+    // actual argument's rank to discriminate between scalar and array
+    // formals; pre-fix `actual_expr_rank` returned `None` for any
+    // FunctionCall whose callee was not a known local array. That made
+    // the rank filter say "actual rank unknown — accept any formal",
+    // and dispatch picked an array specific (`prepend_sarray`,
+    // `string_type, dimension(:)`) for a scalar derived-type
+    // constructor actual (`string_type("...")`). The callee then
+    // dereferenced the scalar's first 8 bytes as `dims[0].lower`,
+    // segfaulting in `_platform_memmove`.
+    //
+    // The motivating repro was stdlib_stringlist_type's
+    // `string_type("Element No. two") // first_stringlist`, which
+    // crashed step 2 of example_stringlist_type_concatenate_operator.
+    // Two-module multi-file build mirrors the stdlib shape: the user
+    // module declares two specifics differing only by LHS rank, and
+    // the program invokes the operator with a derived-type
+    // constructor on the LHS.
+    let dir = unique_dir("user_op_constructor_rank");
+    let m = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  private\n  public :: t, sink, operator(//)\n  type :: t\n     integer :: n = 0\n  end type\n  type :: sink\n     integer :: tag = 0\n  end type\n  interface operator(//)\n     module procedure prepend_scalar\n     module procedure prepend_array\n  end interface\ncontains\n  pure function prepend_scalar(lhs, rhs) result(c)\n     type(t), intent(in) :: lhs\n     type(sink), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'scalar'\n  end function\n  pure function prepend_array(lhs, rhs) result(c)\n     type(t), intent(in) :: lhs(:)\n     type(sink), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'array'\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only : t, sink, operator(//)\n  implicit none\n  type(sink) :: s\n  character(len=:), allocatable :: r\n  r = t(7) // s\n  if (r /= 'scalar') error stop 1\n  r = [t(1), t(2)] // s\n  if (r /= 'array') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("m.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "constructor-rank dispatch: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
