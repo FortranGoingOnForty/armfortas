@@ -25297,6 +25297,97 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
+    // F2008 §11.2.3: `use M, only: x` brings only `x` into scope. It
+    // must NOT make M's same-named generic interfaces visible — even
+    // implicitly via transitive USE-chain walks. Pre-fix
+    // `lookup_in_guarded` chased the source_scope of every UA whose
+    // local_name == original_name (which is also true for plain only-
+    // form imports), so `use stdlib_string_type, only: string_type`
+    // exposed `operator(//)` from stdlib_string_type. When the user
+    // module's own `interface operator(//)` was being processed,
+    // `merged_visible_generic_specifics` looked up `operator(//)` in
+    // the user scope, hit the leaked symbol, and merged
+    // stdlib_string_type's specifics (concat_char_string,
+    // concat_string_char, concat_string_string) into the user's
+    // generic. The runtime symptom in stdlib_ansi was
+    // `fg_color_red // "x" // style_reset` dispatching to
+    // concat_char_string (expecting char // string_type), feeding it
+    // an ansi_code where it expected a string_type, and crashing in
+    // afs_string_allocated with a misaligned pointer dereference.
+    //
+    // Multi-file build (each module compiled to its own .amod and .o)
+    // — matches the stdlib_ansi/stdlib_string_type shape exactly. A
+    // single-file repro hits a separate, pre-existing intra-TU
+    // dispatch bug that's orthogonal to the leak.
+    let dir = unique_dir("use_only_no_leak");
+    let mod_a = write_program_in(
+        &dir,
+        "other_ops.f90",
+        "module other_ops\n  implicit none\n  private\n  public :: t_other, operator(//)\n  type :: t_other\n     integer :: x = 1\n  end type\n  interface operator(//)\n     module procedure other_concat_other\n     module procedure other_concat_char\n     module procedure char_concat_other\n  end interface\ncontains\n  pure function other_concat_other(a, b) result(c)\n     type(t_other), intent(in) :: a, b\n     character(len=:), allocatable :: c\n     c = 'oo'\n  end function\n  pure function other_concat_char(a, b) result(c)\n     type(t_other), intent(in) :: a\n     character(len=*), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'oc'\n  end function\n  pure function char_concat_other(a, b) result(c)\n     character(len=*), intent(in) :: a\n     type(t_other), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'co'\n  end function\nend module\n",
+    );
+    let mod_b = write_program_in(
+        &dir,
+        "user_ops.f90",
+        "module user_ops\n  use other_ops, only : t_other\n  implicit none\n  private\n  public :: t_user, operator(//)\n  type :: t_user\n     integer :: y = 2\n  end type\n  interface operator(//)\n     module procedure user_concat_char\n     module procedure char_concat_user\n  end interface\ncontains\n  pure function user_concat_char(a, b) result(c)\n     type(t_user), intent(in) :: a\n     character(len=*), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'uc'\n  end function\n  pure function char_concat_user(a, b) result(c)\n     character(len=*), intent(in) :: a\n     type(t_user), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'cu'\n  end function\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use user_ops, only : t_user, operator(//)\n  implicit none\n  type(t_user) :: u\n  character(len=:), allocatable :: r\n  r = ('a' // 'b') // u\n  if (r /= 'cu') error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let obj_a = dir.join("other_ops.o");
+    let obj_b = dir.join("user_ops.o");
+    let obj_p = dir.join("p.o");
+    let bin = dir.join("p");
+
+    for (src, obj) in [(&mod_a, &obj_a), (&mod_b, &obj_b), (&prog, &obj_p)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            obj_a.to_str().unwrap(),
+            obj_b.to_str().unwrap(),
+            obj_p.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "use-only-no-leak run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
     // `class(T), intent(inout) :: to` expects the caller to pass the
