@@ -65,11 +65,20 @@ pub struct DimDescriptor {
 
 impl DimDescriptor {
     /// Number of elements along this dimension.
+    ///
+    /// Throughout this codebase a `DimDescriptor`'s `(lower_bound,
+    /// upper_bound)` are the section's logical 1-based bounds and the
+    /// `stride` field records the *memory* step (in elements) between
+    /// adjacent logical positions — see `afs_create_section` and the
+    /// matching IR loop body in `lower_array_assign`. The IR-level
+    /// extent computation at lower.rs:28443 already uses
+    /// `upper - lower + 1` and ignores stride; this Rust-side formula
+    /// is the runtime mirror, so it must do the same.
     pub fn extent(&self) -> i64 {
-        if self.stride == 0 || self.upper_bound < self.lower_bound {
+        if self.upper_bound < self.lower_bound {
             0
         } else {
-            self.upper_bound.saturating_sub(self.lower_bound) / self.stride + 1
+            self.upper_bound - self.lower_bound + 1
         }
     }
 }
@@ -267,9 +276,12 @@ mod tests {
         };
         assert_eq!(dim.extent(), 10);
 
+        // Memory-stride convention: bounds are the section's logical
+        // 1-based positions and stride is the inter-element memory
+        // step. extent is `upper - lower + 1`, independent of stride.
         let dim2 = DimDescriptor {
             lower_bound: 1,
-            upper_bound: 10,
+            upper_bound: 5,
             stride: 2,
         };
         assert_eq!(dim2.extent(), 5);
